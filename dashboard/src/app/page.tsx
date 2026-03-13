@@ -1,65 +1,125 @@
-import Image from "next/image";
+import {
+  Wallet,
+  TrendingUp,
+  BarChart3,
+  ArrowDownRight,
+} from 'lucide-react';
+import { StatCard } from '@/components/ui/DataCard';
+import { DataCard } from '@/components/ui/DataCard';
+import { Table } from '@/components/ui/Table';
+import { StatusBadge } from '@/components/ui/StatusBadge';
 
-export default function Home() {
+/* ---------- Mock data ---------- */
+
+interface Trade {
+  id: string;
+  pair: string;
+  side: 'Long' | 'Short';
+  entry: string;
+  exit: string;
+  pnl: string;
+  time: string;
+}
+
+const recentTrades: Trade[] = [
+  { id: '1', pair: 'BTC/USDT', side: 'Long', entry: '$67,420', exit: '$68,180', pnl: '+$152.40', time: '14:32' },
+  { id: '2', pair: 'BTC/USDT', side: 'Short', entry: '$68,350', exit: '$67,890', pnl: '+$92.00', time: '13:15' },
+  { id: '3', pair: 'BTC/USDT', side: 'Long', entry: '$67,100', exit: '$67,050', pnl: '-$10.00', time: '11:48' },
+  { id: '4', pair: 'BTC/USDT', side: 'Long', entry: '$66,800', exit: '$67,300', pnl: '+$100.00', time: '10:22' },
+  { id: '5', pair: 'BTC/USDT', side: 'Short', entry: '$67,500', exit: '$67,680', pnl: '-$48.90', time: '09:05' },
+];
+
+const tradeColumns = [
+  { key: 'pair', header: 'Pair' },
+  {
+    key: 'side',
+    header: 'Side',
+    render: (row: Trade) => (
+      <StatusBadge
+        status={row.side}
+        variant={row.side === 'Long' ? 'success' : 'error'}
+        size="sm"
+      />
+    ),
+  },
+  { key: 'entry', header: 'Entry' },
+  { key: 'exit', header: 'Exit' },
+  {
+    key: 'pnl',
+    header: 'PnL',
+    render: (row: Trade) => (
+      <span
+        className={
+          row.pnl.startsWith('+')
+            ? 'text-status-success font-medium'
+            : 'text-status-error font-medium'
+        }
+      >
+        {row.pnl}
+      </span>
+    ),
+  },
+  { key: 'time', header: 'Time', hideOnMobile: true },
+];
+
+/* ---------- Page ---------- */
+
+export default function DashboardPage() {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <div className="flex flex-col gap-6">
+      {/* Stat cards */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          icon={Wallet}
+          label="Portfolio Value"
+          value="$12,450.00"
+          change={2.4}
+          changeType="increase"
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+        <StatCard
+          icon={TrendingUp}
+          label="Daily PnL"
+          value="+$285.50"
+          change={1.8}
+          changeType="increase"
+        />
+        <StatCard
+          icon={BarChart3}
+          label="Open Positions"
+          value="3"
+        />
+        <StatCard
+          icon={ArrowDownRight}
+          label="Max Drawdown"
+          value="4.2%"
+          change={0.3}
+          changeType="decrease"
+        />
+      </div>
+
+      {/* Equity curve placeholder */}
+      <DataCard title="Equity Curve" description="Portfolio performance over time">
+        <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
+          <div className="text-center">
+            <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
+              <TrendingUp className="h-5 w-5 text-text-muted" />
+            </div>
+            <p className="text-sm font-medium text-text-muted">Equity Curve Chart</p>
+            <p className="mt-1 text-xs text-text-light">
+              Recharts area chart will render here
+            </p>
+          </div>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+      </DataCard>
+
+      {/* Recent trades */}
+      <DataCard title="Recent Trades" description="Last 5 executed trades">
+        <Table
+          columns={tradeColumns}
+          data={recentTrades}
+          keyExtractor={(row) => row.id}
+        />
+      </DataCard>
     </div>
   );
 }

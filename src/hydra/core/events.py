@@ -69,7 +69,7 @@ class MarketDataEvent(Event):
 class BarEvent(MarketDataEvent):
     """A completed OHLCV bar."""
 
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     timeframe: Timeframe = Timeframe.M1
     ohlcv: OHLCV | None = None
     exchange_id: ExchangeId = "binance"
@@ -80,7 +80,7 @@ class BarEvent(MarketDataEvent):
 class TradeEvent(MarketDataEvent):
     """A single trade tick from the exchange."""
 
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     price: Decimal = Decimal("0")
     quantity: Decimal = Decimal("0")
     side: Side = Side.BUY
@@ -93,7 +93,7 @@ class TradeEvent(MarketDataEvent):
 class OrderBookEvent(MarketDataEvent):
     """Order book snapshot or delta."""
 
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     bids: tuple[tuple[Decimal, Decimal], ...] = ()
     asks: tuple[tuple[Decimal, Decimal], ...] = ()
     exchange_id: ExchangeId = "binance"
@@ -104,7 +104,7 @@ class OrderBookEvent(MarketDataEvent):
 class FundingRateEvent(MarketDataEvent):
     """Perpetual futures funding rate update."""
 
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     rate: Decimal = Decimal("0")
     next_funding_time: datetime | None = None
     exchange_id: ExchangeId = "binance"
@@ -127,7 +127,7 @@ class SignalEvent(Event):
 class EntrySignal(SignalEvent):
     """Signal to enter a position."""
 
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     direction: Direction = Direction.LONG
     strength: Decimal = Decimal("0")
     strategy_id: str = ""
@@ -140,7 +140,7 @@ class EntrySignal(SignalEvent):
 class ExitSignal(SignalEvent):
     """Signal to exit a position."""
 
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     direction: Direction = Direction.FLAT
     strategy_id: str = ""
     exchange_id: ExchangeId = "binance"
@@ -173,7 +173,7 @@ class OrderFillEvent(OrderEvent):
     """An order has been filled (fully or partially)."""
 
     order_id: str = ""
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     side: Side = Side.BUY
     order_type: OrderType = OrderType.MARKET
     quantity: Decimal = Decimal("0")
@@ -190,7 +190,7 @@ class OrderCancelEvent(OrderEvent):
     """An order has been cancelled."""
 
     order_id: str = ""
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     exchange_id: ExchangeId = "binance"
     reason: str = ""
     event_type: str = field(default="order_cancel", init=False)
@@ -201,7 +201,7 @@ class OrderRejectEvent(OrderEvent):
     """An order has been rejected."""
 
     order_id: str = ""
-    symbol: Symbol = ""
+    symbol: Symbol = field(default=Symbol(""))
     exchange_id: ExchangeId = "binance"
     reason: str = ""
     event_type: str = field(default="order_reject", init=False)

@@ -72,7 +72,8 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         data = yaml.safe_load(f)
     if data is None:
         return {}
-    return _resolve_env_vars(data)
+    resolved = _resolve_env_vars(data)
+    return dict(resolved) if isinstance(resolved, dict) else {}
 
 
 # ---------------------------------------------------------------------------
