@@ -15,8 +15,42 @@ permissions:
   packages: write
 
 jobs:
+  version:
+    name: Determine Version
+    runs-on: [self-hosted, hydra]
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Login to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Compute next semver tag
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          # Get latest semver tag from GHCR for hydra-engine
+          LATEST=$(gh api user/packages/container/hydra-engine/versions \
+            --jq '[.[].metadata.container.tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(split(".") | map(tonumber)) | last // empty' 2>/dev/null || true)
+
+          if [ -z "$LATEST" ]; then
+            NEXT="0.1.0"
+          else
+            MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            MINOR=$(echo "$LATEST" | cut -d. -f2)
+            PATCH=$(echo "$LATEST" | cut -d. -f3)
+            NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+
+          echo "Latest: ${LATEST:-none}, Next: $NEXT"
+          echo "tag=$NEXT" >> $GITHUB_OUTPUT
+
   build:
     name: Build ${{ matrix.image }}
+    needs: version
     runs-on: [self-hosted, hydra]
     strategy:
       matrix:
@@ -34,21 +68,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Set image tag
-        id: tag
-        run: echo "sha=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Build image
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
         run: |
           docker build --load \
             -f ${{ matrix.dockerfile }} \
-            -t ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.tag.outputs.sha }} \
-            -t ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:main \
+            -t "${IMAGE}:${TAG}" \
+            -t "${IMAGE}:main" \
             ${{ matrix.context }}
 
       - name: Push image
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
         run: |
-          docker push ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.tag.outputs.sha }}
-          docker push ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:main
+          docker push "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:main"
