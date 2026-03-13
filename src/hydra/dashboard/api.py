@@ -171,3 +171,13 @@ async def ws_signals(websocket: WebSocket) -> None:
 async def ws_risk(websocket: WebSocket) -> None:
     """Risk status changes."""
     await _ws_handler("risk", websocket)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
