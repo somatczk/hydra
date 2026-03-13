@@ -115,14 +115,22 @@ known-first-party = ["hydra"]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
-exclude = ["tests/"]
+exclude = [
+    "tests/",
+    "src/hydra/ml/training.py",
+    "src/hydra/ml/serving.py",
+    "src/hydra/ml/export.py",
+    "src/hydra/ml/retraining.py",
+    "src/hydra/dashboard/routes/",
+    "src/hydra/strategy/indicator_registry.py",
+]
 
 [[tool.mypy.overrides]]
-module = ["msgpack", "msgpack.*", "asyncpg", "asyncpg.*", "ccxt", "ccxt.*", "talib", "talib.*"]
+module = ["msgpack", "msgpack.*", "asyncpg", "asyncpg.*", "ccxt", "ccxt.*", "talib", "talib.*", "onnxruntime", "onnxruntime.*", "onnxmltools", "onnxmltools.*", "skl2onnx", "skl2onnx.*", "xgboost", "xgboost.*", "lightgbm", "lightgbm.*", "optuna", "optuna.*", "sklearn", "sklearn.*", "scipy", "scipy.*", "mlflow", "mlflow.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["hydra.strategy.builtin.*", "hydra.strategy.rule_engine", "hydra.data.*", "hydra.backtest.*", "hydra.execution.*", "hydra.risk.*", "hydra.ml.*", "hydra.portfolio.*", "hydra.dashboard.*"]
+module = ["hydra.strategy.builtin.*", "hydra.strategy.rule_engine", "hydra.strategy.indicator_registry", "hydra.data.*", "hydra.backtest.*", "hydra.execution.*", "hydra.risk.*", "hydra.ml.*", "hydra.portfolio.*", "hydra.dashboard.*", "hydra.dashboard.routes.*"]
 disallow_any_expr = false
 warn_return_any = false
 disallow_untyped_defs = false

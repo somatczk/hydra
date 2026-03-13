@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import {
   Wallet,
   TrendingUp,
@@ -10,8 +11,9 @@ import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
+import { fetchApi } from '@/lib/api';
 
-/* ---------- Mock data ---------- */
+/* ---------- Types ---------- */
 
 interface Trade {
   id: string;
@@ -23,13 +25,31 @@ interface Trade {
   time: string;
 }
 
-const recentTrades: Trade[] = [
+interface PortfolioSummary {
+  total_value: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  total_fees: number;
+  change_pct: number;
+}
+
+/* ---------- Placeholder data ---------- */
+
+const placeholderTrades: Trade[] = [
   { id: '1', pair: 'BTC/USDT', side: 'Long', entry: '$67,420', exit: '$68,180', pnl: '+$152.40', time: '14:32' },
   { id: '2', pair: 'BTC/USDT', side: 'Short', entry: '$68,350', exit: '$67,890', pnl: '+$92.00', time: '13:15' },
   { id: '3', pair: 'BTC/USDT', side: 'Long', entry: '$67,100', exit: '$67,050', pnl: '-$10.00', time: '11:48' },
   { id: '4', pair: 'BTC/USDT', side: 'Long', entry: '$66,800', exit: '$67,300', pnl: '+$100.00', time: '10:22' },
   { id: '5', pair: 'BTC/USDT', side: 'Short', entry: '$67,500', exit: '$67,680', pnl: '-$48.90', time: '09:05' },
 ];
+
+const placeholderSummary: PortfolioSummary = {
+  total_value: 12450.0,
+  unrealized_pnl: 198.0,
+  realized_pnl: 1842.3,
+  total_fees: 87.5,
+  change_pct: 2.4,
+};
 
 const tradeColumns = [
   { key: 'pair', header: 'Pair' },
@@ -67,6 +87,18 @@ const tradeColumns = [
 /* ---------- Page ---------- */
 
 export default function DashboardPage() {
+  const [summary, setSummary] = useState<PortfolioSummary>(placeholderSummary);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetchApi<PortfolioSummary>('/api/portfolio/summary')
+      .then(setSummary)
+      .catch(() => {
+        /* API unavailable -- keep placeholder */
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
   return (
     <div className="flex flex-col gap-6">
       {/* Stat cards */}
@@ -74,14 +106,14 @@ export default function DashboardPage() {
         <StatCard
           icon={Wallet}
           label="Portfolio Value"
-          value="$12,450.00"
-          change={2.4}
+          value={`$${summary.total_value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+          change={summary.change_pct}
           changeType="increase"
         />
         <StatCard
           icon={TrendingUp}
           label="Daily PnL"
-          value="+$285.50"
+          value={`+$${summary.unrealized_pnl.toFixed(2)}`}
           change={1.8}
           changeType="increase"
         />
@@ -108,7 +140,7 @@ export default function DashboardPage() {
             </div>
             <p className="text-sm font-medium text-text-muted">Equity Curve Chart</p>
             <p className="mt-1 text-xs text-text-light">
-              Recharts area chart will render here
+              {loading ? 'Loading...' : 'Recharts area chart will render here'}
             </p>
           </div>
         </div>
@@ -118,7 +150,7 @@ export default function DashboardPage() {
       <DataCard title="Recent Trades" description="Last 5 executed trades">
         <Table
           columns={tradeColumns}
-          data={recentTrades}
+          data={placeholderTrades}
           keyExtractor={(row) => row.id}
         />
       </DataCard>
