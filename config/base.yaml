@@ -1,0 +1,39 @@
+platform:
+  name: hydra
+  version: "0.1.0"
+
+database:
+  host: ${HYDRA_DB_HOST}
+  port: ${HYDRA_DB_PORT}
+  name: ${HYDRA_DB_NAME}
+  user: ${HYDRA_DB_USER}
+  password: ${HYDRA_DB_PASSWORD}
+
+redis:
+  url: ${HYDRA_REDIS_URL}
+
+exchanges: {}
+
+trading:
+  testnet: true
+  paper_trading: true
+  default_symbols:
+    - BTCUSDT
+
+logging:
+  level: ${HYDRA_LOG_LEVEL:INFO}
+  format: ${HYDRA_LOG_FORMAT:json}
+
+api:
+  host: ${HYDRA_API_HOST:0.0.0.0}
+  port: ${HYDRA_API_PORT:8000}
+  cors_origins:
+    - ${HYDRA_CORS_ORIGINS:http://localhost:3000}
+
+telegram:
+  bot_token: ${HYDRA_TELEGRAM_BOT_TOKEN:}
+  chat_id: ${HYDRA_TELEGRAM_CHAT_ID:}
+
+ml:
+  models_dir: ${HYDRA_MODELS_DIR:/app/models}
+  inference_timeout_ms: 5

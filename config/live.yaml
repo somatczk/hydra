@@ -1,0 +1,57 @@
+trading:
+  testnet: false
+  paper_trading: false
+
+exchanges:
+  binance:
+    api_key: ${BINANCE_API_KEY}
+    api_secret: ${BINANCE_API_SECRET}
+    market_types:
+      - spot
+      - futures
+  bybit:
+    api_key: ${BYBIT_API_KEY}
+    api_secret: ${BYBIT_API_SECRET}
+    market_types:
+      - spot
+      - futures
+  kraken:
+    api_key: ${KRAKEN_API_KEY}
+    api_secret: ${KRAKEN_API_SECRET}
+    market_types:
+      - spot
+  okx:
+    api_key: ${OKX_API_KEY}
+    api_secret: ${OKX_API_SECRET}
+    passphrase: ${OKX_PASSPHRASE}
+    market_types:
+      - spot
+      - futures
+
+risk:
+  max_position_pct: 0.10
+  max_risk_per_trade: 0.02
+  max_portfolio_heat: 0.06
+  daily_loss_limit: 0.03
+  consecutive_loss_pause: 5
+  circuit_breakers:
+    tier1:
+      drawdown_pct: 0.03
+      action: reduce_size_50
+      auto_reset_hours: 24
+    tier2:
+      drawdown_pct: 0.05
+      action: halt_new_trades
+      auto_reset_hours: 48
+    tier3:
+      drawdown_pct: 0.10
+      action: flatten_all
+      auto_reset_hours: 72
+    tier4:
+      drawdown_pct: 0.15
+      action: emergency_shutdown
+      auto_reset_hours: null
+
+logging:
+  level: INFO
+  format: json

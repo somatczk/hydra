@@ -1,0 +1,75 @@
+# Desktop ML training stack (requires NVIDIA GPU + CUDA)
+services:
+  ml-training:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ml
+    container_name: hydra-ml-training
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      HYDRA_DB_HOST: timescaledb
+      HYDRA_DB_PORT: 5432
+      HYDRA_DB_NAME: hydra
+      HYDRA_DB_USER: hydra
+      HYDRA_DB_PASSWORD: ${HYDRA_DB_PASSWORD}
+    volumes:
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
+      - ml-models:/app/models
+      - ml-data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.19.0
+    container_name: hydra-mlflow
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: sqlite:///mlflow/mlflow.db
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    volumes:
+      - mlflow-data:/mlflow
+    command: mlflow server --host 0.0.0.0 --port 5000
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ml
+    container_name: hydra-jupyter
+    restart: unless-stopped
+    runtime: nvidia
+    ports:
+      - "8888:8888"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ml-models:/app/models
+      - ml-data:/app/data
+      - notebooks:/app/notebooks
+    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  ml-models:
+  ml-data:
+  mlflow-data:
+  notebooks:

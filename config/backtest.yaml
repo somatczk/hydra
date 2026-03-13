@@ -1,0 +1,28 @@
+trading:
+  testnet: false
+  paper_trading: false
+
+backtest:
+  default_initial_capital: 10000.0
+  default_commission:
+    spot_maker: 0.00075
+    spot_taker: 0.00075
+    futures_maker: 0.0002
+    futures_taker: 0.0005
+  slippage:
+    spread_factor: 0.5
+    volume_impact_factor: 0.1
+  walkforward:
+    in_sample_months: 6
+    out_of_sample_months: 2
+    min_trades: 30
+  cpcv:
+    purge_days: 5
+    embargo_days: 2
+  vectorbt:
+    max_param_combinations: 10000
+    deflated_sharpe_threshold: 1.5
+
+logging:
+  level: DEBUG
+  format: colored
