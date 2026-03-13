@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -16,8 +16,8 @@ from hydra.core.events import (
     HeartbeatEvent,
 )
 from hydra.core.types import (
-    Direction,
     OHLCV,
+    Direction,
     Symbol,
     Timeframe,
 )
@@ -165,9 +165,9 @@ class TestOrdering:
 
         await bus.subscribe("bar", handler)
 
-        ts1 = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        ts3 = datetime(2024, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
-        ts2 = datetime(2024, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+        ts1 = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        ts3 = datetime(2024, 1, 1, 2, 0, 0, tzinfo=UTC)
+        ts2 = datetime(2024, 1, 1, 1, 0, 0, tzinfo=UTC)
 
         ohlcv = OHLCV(
             Decimal("1"), Decimal("2"), Decimal("0.5"), Decimal("1.5"), Decimal("100"), ts1

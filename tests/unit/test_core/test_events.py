@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import msgpack
@@ -36,9 +36,9 @@ from hydra.core.events import (
     event_to_dict,
 )
 from hydra.core.types import (
+    OHLCV,
     Direction,
     MarketType,
-    OHLCV,
     OrderRequest,
     OrderStatus,
     OrderType,
@@ -46,7 +46,6 @@ from hydra.core.types import (
     Symbol,
     Timeframe,
 )
-
 
 # ---------------------------------------------------------------------------
 # Base Event
@@ -61,7 +60,7 @@ class TestBaseEvent:
 
     def test_auto_timestamp(self) -> None:
         e = Event()
-        assert e.timestamp.tzinfo == timezone.utc
+        assert e.timestamp.tzinfo == UTC
 
     def test_event_type(self) -> None:
         e = Event()
@@ -85,7 +84,7 @@ class TestEventHierarchy:
         assert e.event_type == "market_data"
 
     def test_bar_event(self) -> None:
-        ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        ts = datetime(2024, 1, 1, tzinfo=UTC)
         ohlcv = OHLCV(
             Decimal("1"), Decimal("2"), Decimal("0.5"), Decimal("1.5"), Decimal("100"), ts
         )
@@ -275,7 +274,7 @@ class TestEventSerialization:
         assert restored.event_type == "event"
 
     def test_bar_event_roundtrip(self) -> None:
-        ts = datetime(2024, 3, 15, 10, 0, 0, tzinfo=timezone.utc)
+        ts = datetime(2024, 3, 15, 10, 0, 0, tzinfo=UTC)
         ohlcv = OHLCV(
             open=Decimal("65000.50"),
             high=Decimal("65500.00"),
