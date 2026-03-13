@@ -45,7 +45,7 @@ models/
 # Data
 *.csv
 *.parquet
-data/
+/data/
 
 # Node (dashboard)
 dashboard/node_modules/
