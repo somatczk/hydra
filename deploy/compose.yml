@@ -1,0 +1,179 @@
+# Local development deployment (mirrors romulus/stacks/hydra/compose.yml)
+# Usage: docker compose -f deploy/compose.yml up --build
+
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.engine
+    container_name: hydra-engine
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "8080:8080"
+    environment:
+      HYDRA_DB_HOST: timescaledb
+      HYDRA_DB_PORT: "5432"
+      HYDRA_DB_NAME: hydra
+      HYDRA_DB_USER: hydra
+      HYDRA_DB_PASSWORD: ${HYDRA_DB_PASSWORD:-hydra_dev}
+      HYDRA_REDIS_URL: redis://redis:6379
+      HYDRA_LOG_LEVEL: ${HYDRA_LOG_LEVEL:-INFO}
+      HYDRA_LOG_FORMAT: json
+      HYDRA_TELEGRAM_BOT_TOKEN: ${HYDRA_TELEGRAM_BOT_TOKEN:-}
+      HYDRA_TELEGRAM_CHAT_ID: ${HYDRA_TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ml-models:/app/models:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - hydra
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: hydra-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://engine:8080
+    depends_on:
+      - engine
+    networks:
+      - hydra
+
+  backtest-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backtest
+    container_name: hydra-backtest-worker
+    restart: unless-stopped
+    environment:
+      HYDRA_DB_HOST: timescaledb
+      HYDRA_DB_PORT: "5432"
+      HYDRA_DB_NAME: hydra
+      HYDRA_DB_USER: hydra
+      HYDRA_DB_PASSWORD: ${HYDRA_DB_PASSWORD:-hydra_dev}
+      HYDRA_REDIS_URL: redis://redis:6379
+      HYDRA_LOG_LEVEL: ${HYDRA_LOG_LEVEL:-INFO}
+      HYDRA_LOG_FORMAT: json
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - hydra
+
+  timescaledb:
+    image: timescale/timescaledb:2.17.2-pg16
+    container_name: hydra-timescaledb
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: hydra
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: ${HYDRA_DB_PASSWORD:-hydra_dev}
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hydra
+
+  redis:
+    image: redis:7-alpine
+    container_name: hydra-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hydra
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: hydra-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus-rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    configs:
+      - source: prometheus-config
+        target: /etc/prometheus/prometheus.yml
+    depends_on:
+      - engine
+    networks:
+      - hydra
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: hydra-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-hydra_grafana}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/hydra.json
+    volumes:
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/hydra.json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - hydra
+
+configs:
+  prometheus-config:
+    content: |
+      global:
+        scrape_interval: 15s
+        evaluation_interval: 15s
+
+      rule_files:
+        - /etc/prometheus/rules.yml
+
+      scrape_configs:
+        - job_name: hydra
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["engine:8080"]
+              labels:
+                service: hydra-engine
+
+        - job_name: node
+          static_configs:
+            - targets: ["node-exporter:9100"]
+
+volumes:
+  timescaledb-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  ml-models:
+
+networks:
+  hydra:
+    driver: bridge

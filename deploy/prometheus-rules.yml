@@ -1,0 +1,108 @@
+groups:
+  - name: hydra-trading
+    interval: 30s
+    rules:
+      - alert: HydraDrawdownExceedsThreshold
+        expr: hydra_drawdown_pct > 10
+        for: 1m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Hydra drawdown exceeds 10%"
+          description: "Current drawdown is {{ $value | printf \"%.2f\" }}%. Circuit breakers should have been triggered."
+          runbook_url: "https://docs.hydra.internal/runbooks/drawdown"
+
+      - alert: HydraExchangeWSDisconnected
+        expr: increase(hydra_ws_reconnects_total[5m]) > 3
+        for: 1m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Exchange WebSocket reconnecting too frequently"
+          description: "Exchange {{ $labels.exchange_id }} has reconnected {{ $value | printf \"%.0f\" }} times in the last 5 minutes."
+
+      - alert: HydraOrderFillLatencyHigh
+        expr: histogram_quantile(0.99, rate(hydra_order_fill_latency_seconds_bucket[5m])) > 5
+        for: 2m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Order fill latency p99 exceeds 5 seconds"
+          description: "The 99th percentile order fill latency is {{ $value | printf \"%.2f\" }}s, indicating exchange slowness or connectivity issues."
+
+      - alert: HydraDataGapDetected
+        expr: hydra_data_gap_seconds > 120
+        for: 1m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: "Market data gap detected"
+          description: "No market data received for {{ $labels.exchange_id }}/{{ $labels.symbol }} in {{ $value | printf \"%.0f\" }} seconds."
+
+      - alert: HydraReconciliationMismatch
+        expr: hydra_reconciliation_mismatch == 1
+        for: 2m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Position reconciliation mismatch detected"
+          description: "Local position state diverges from exchange for {{ $labels.exchange_id }}/{{ $labels.symbol }}. Manual intervention may be required."
+
+      - alert: HydraEngineDown
+        expr: up{job="hydra"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: infra
+        annotations:
+          summary: "Hydra engine is down"
+          description: "The Hydra trading engine has been unreachable for over 2 minutes. All trading activity is halted."
+          runbook_url: "https://docs.hydra.internal/runbooks/engine-down"
+
+  - name: hydra-system
+    interval: 30s
+    rules:
+      - alert: HydraEventBusLatencyHigh
+        expr: histogram_quantile(0.99, rate(hydra_event_bus_latency_seconds_bucket[5m])) > 0.5
+        for: 3m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Event bus latency p99 exceeds 500ms"
+          description: "Redis Streams event bus is slow — p99 latency is {{ $value | printf \"%.3f\" }}s. Check Redis health."
+
+      - alert: HydraExchangeAPILatencyHigh
+        expr: histogram_quantile(0.99, sum by (le, exchange_id) (rate(hydra_exchange_api_latency_seconds_bucket[5m]))) > 10
+        for: 2m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Exchange API latency p99 exceeds 10 seconds"
+          description: "Exchange {{ $labels.exchange_id }} REST API p99 is {{ $value | printf \"%.2f\" }}s."
+
+      - alert: HydraMLInferenceLatencyHigh
+        expr: histogram_quantile(0.99, sum by (le, model_name) (rate(hydra_ml_inference_latency_seconds_bucket[5m]))) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "ML inference latency p99 exceeds 100ms"
+          description: "Model {{ $labels.model_name }} inference p99 is {{ $value | printf \"%.3f\" }}s, exceeding the 5ms budget."
+
+      - alert: HydraHighMemoryUsage
+        expr: process_resident_memory_bytes{job="hydra"} > 2147483648
+        for: 5m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "Hydra process using over 2 GiB of memory"
+          description: "RSS is {{ $value | humanize1024 }}B. Investigate for memory leaks."
