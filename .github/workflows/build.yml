@@ -16,7 +16,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.image }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, hydra]
     strategy:
       matrix:
         include:

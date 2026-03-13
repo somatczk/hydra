@@ -9,7 +9,7 @@ on:
 jobs:
   bump:
     name: Update Romulus Dockerfiles
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, hydra]
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
