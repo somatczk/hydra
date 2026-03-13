@@ -8,6 +8,7 @@ AND/OR operators and indicator conditions.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import Direction, Symbol
@@ -19,7 +20,7 @@ from hydra.strategy.rule_engine import evaluate_condition_group
 class RuleBasedStrategy(BaseStrategy):
     """Strategy driven by declarative condition trees from YAML config."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._rules = self._parse_rules()
 
@@ -36,7 +37,7 @@ class RuleBasedStrategy(BaseStrategy):
         )
 
     @staticmethod
-    def _parse_group(data: dict | None) -> ConditionGroup | None:
+    def _parse_group(data: dict[str, Any] | None) -> ConditionGroup | None:
         if data is None:
             return None
         return ConditionGroup(**data)
