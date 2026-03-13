@@ -33,7 +33,7 @@ dependencies = [
     # Dashboard backend
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
-    "websockets>=14.1,<15",
+    "websockets>=14.1,<17",
     # Telegram
     "python-telegram-bot>=21.9,<22",
     # Observability
