@@ -16,7 +16,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.image }}
-    runs-on: [self-hosted, romulus]
+    runs-on: [self-hosted, hydra]
     strategy:
       matrix:
         include:
