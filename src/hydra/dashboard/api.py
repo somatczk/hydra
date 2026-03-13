@@ -62,17 +62,28 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/metrics", tags=["observability"])
-async def metrics() -> str:
-    """Expose Prometheus metrics in text format.
+async def metrics() -> Any:
+    """Expose Prometheus metrics in OpenMetrics / text format.
 
-    Uses lazy import to avoid pulling prometheus_client at module level.
+    Uses lazy import to avoid pulling ``prometheus_client`` at module level.
+    Returns a ``Response`` with the correct ``Content-Type`` header so that
+    Prometheus can scrape the endpoint without issues.
     """
     try:
         import prometheus_client
+        from starlette.responses import Response
 
-        return prometheus_client.generate_latest().decode("utf-8")
+        # Ensure metric collectors are registered before generating output
+        from hydra.dashboard.metrics import _ensure_initialized
+
+        _ensure_initialized()
+
+        return Response(
+            content=prometheus_client.generate_latest(),
+            media_type=prometheus_client.CONTENT_TYPE_LATEST,
+        )
     except ImportError:
-        return "# prometheus_client not installed\n"
+        return {"error": "prometheus_client not installed"}
 
 
 # ---------------------------------------------------------------------------
