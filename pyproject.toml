@@ -12,7 +12,7 @@ dependencies = [
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.7,<3",
     "pyyaml>=6.0,<7",
-    "structlog>=24.4,<25",
+    "structlog>=24.4,<26",
     "msgpack>=1.1,<2",
     "redis[hiredis]>=5.2,<6",
     # Data
