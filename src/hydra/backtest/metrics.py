@@ -296,7 +296,7 @@ def _compute_deflated_sharpe(
 
     Returns the DSR as a probability (0-1 range, from a one-sided normal CDF).
     """
-    from scipy import stats  # type: ignore[import-untyped]
+    from scipy import stats
 
     if n_trials <= 0 or n_returns < 2:
         return 0.0

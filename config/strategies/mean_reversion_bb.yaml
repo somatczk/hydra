@@ -1,0 +1,20 @@
+id: mean-reversion-bb
+name: Mean Reversion Bollinger Bands
+strategy_class: hydra.strategy.builtin.mean_reversion.MeanReversionBBStrategy
+enabled: false
+symbols:
+  - BTCUSDT
+exchange:
+  exchange_id: binance
+  market_type: spot
+timeframes:
+  primary: 1h
+parameters:
+  required_history: 30
+  bb_period: 20
+  bb_std: 2.0
+  vol_sma_period: 20
+  vol_multiplier: 1.5
+position_sizing:
+  method: fixed_fractional
+  risk_pct: 0.02
