@@ -1,10 +1,12 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { Zap, TrendingUp, Signal, Clock } from 'lucide-react';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { cn } from '@/components/ui/cn';
+import { fetchApi } from '@/lib/api';
 
-/* ---------- Mock data ---------- */
+/* ---------- Types ---------- */
 
 interface Strategy {
   id: string;
@@ -20,7 +22,22 @@ interface Strategy {
   lastSignal: string;
 }
 
-const strategies: Strategy[] = [
+interface ApiStrategy {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  enabled: boolean;
+  performance: {
+    total_pnl: number;
+    win_rate: number;
+    total_trades: number;
+  };
+}
+
+/* ---------- Placeholder data ---------- */
+
+const placeholderStrategies: Strategy[] = [
   {
     id: '1',
     name: 'LSTM Momentum',
@@ -75,16 +92,63 @@ const strategies: Strategy[] = [
   },
 ];
 
+function toStatusVariant(status: string): 'success' | 'warning' | 'info' | 'neutral' {
+  switch (status) {
+    case 'Active': return 'success';
+    case 'Paused': return 'warning';
+    case 'Backtesting': return 'info';
+    default: return 'neutral';
+  }
+}
+
+function mapApiStrategies(data: ApiStrategy[]): Strategy[] {
+  return data.map((s) => ({
+    id: s.id,
+    name: s.name,
+    description: s.description,
+    status: s.status as Strategy['status'],
+    statusVariant: toStatusVariant(s.status),
+    pnl: s.performance.total_pnl !== 0
+      ? `${s.performance.total_pnl >= 0 ? '+' : ''}$${Math.abs(s.performance.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+      : 'N/A',
+    pnlPositive: s.performance.total_pnl >= 0,
+    signals: 0,
+    trades: s.performance.total_trades,
+    winRate: s.performance.win_rate > 0 ? `${s.performance.win_rate}%` : 'N/A',
+    lastSignal: 'N/A',
+  }));
+}
+
 /* ---------- Page ---------- */
 
 export default function StrategiesPage() {
+  const [strategies, setStrategies] = useState<Strategy[]>(placeholderStrategies);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetchApi<ApiStrategy[]>('/api/strategies')
+      .then((data) => setStrategies(mapApiStrategies(data)))
+      .catch(() => { /* keep placeholder */ })
+      .finally(() => setLoading(false));
+  }, []);
+
+  const handleToggle = async (id: string) => {
+    try {
+      await fetchApi(`/api/strategies/${id}/toggle`, { method: 'POST' });
+      const data = await fetchApi<ApiStrategy[]>('/api/strategies');
+      setStrategies(mapApiStrategies(data));
+    } catch {
+      /* toggle failed -- keep current state */
+    }
+  };
+
   return (
     <div className="flex flex-col gap-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm text-text-muted">
-            {strategies.filter((s) => s.status === 'Active').length} active strategies
+            {loading ? 'Loading...' : `${strategies.filter((s) => s.status === 'Active').length} active strategies`}
           </p>
         </div>
       </div>
@@ -175,6 +239,8 @@ export default function StrategiesPage() {
                 aria-checked={strategy.status === 'Active'}
                 aria-label={`${strategy.status === 'Active' ? 'Disable' : 'Enable'} ${strategy.name}`}
                 tabIndex={0}
+                onClick={() => handleToggle(strategy.id)}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleToggle(strategy.id); }}
               >
                 <div
                   className={cn(

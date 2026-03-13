@@ -1,10 +1,12 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, Activity, TrendingDown } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { cn } from '@/components/ui/cn';
+import { fetchApi } from '@/lib/api';
 
-/* ---------- Circuit breaker tiers ---------- */
+/* ---------- Types ---------- */
 
 interface CircuitBreaker {
   tier: string;
@@ -18,56 +20,95 @@ interface CircuitBreaker {
   icon: typeof ShieldCheck;
 }
 
-const circuitBreakers: CircuitBreaker[] = [
-  {
-    tier: 'Tier 1',
-    label: 'Position Level',
-    threshold: '2% per position',
-    currentValue: '0.8%',
-    status: 'Normal',
-    color: 'text-status-success',
-    bgColor: 'bg-status-success/10',
-    borderColor: 'border-status-success/30',
-    icon: ShieldCheck,
-  },
-  {
-    tier: 'Tier 2',
-    label: 'Strategy Level',
-    threshold: '5% daily loss per strategy',
-    currentValue: '1.2%',
-    status: 'Normal',
-    color: 'text-status-success',
-    bgColor: 'bg-status-success/10',
-    borderColor: 'border-status-success/30',
-    icon: ShieldCheck,
-  },
-  {
-    tier: 'Tier 3',
-    label: 'Portfolio Level',
-    threshold: '10% daily portfolio loss',
-    currentValue: '3.8%',
-    status: 'Warning',
-    color: 'text-status-warning',
-    bgColor: 'bg-status-warning/10',
-    borderColor: 'border-status-warning/30',
-    icon: AlertTriangle,
-  },
-  {
-    tier: 'Tier 4',
-    label: 'System Kill Switch',
-    threshold: '15% daily loss - halt all trading',
-    currentValue: '3.8%',
-    status: 'Normal',
-    color: 'text-status-error',
-    bgColor: 'bg-status-error/10',
-    borderColor: 'border-status-error/30',
-    icon: Ban,
-  },
+interface ApiRiskStatus {
+  current_drawdown: number;
+  max_drawdown_limit: number;
+  daily_loss: number;
+  daily_loss_limit: number;
+  circuit_breakers: Array<{
+    tier: number;
+    label: string;
+    threshold: string;
+    current_value: number;
+    status: string;
+  }>;
+}
+
+/* ---------- Placeholder data ---------- */
+
+function statusToColors(s: string) {
+  switch (s) {
+    case 'Warning':
+      return { color: 'text-status-warning', bgColor: 'bg-status-warning/10', borderColor: 'border-status-warning/30', icon: AlertTriangle };
+    case 'Alert':
+    case 'Tripped':
+      return { color: 'text-status-error', bgColor: 'bg-status-error/10', borderColor: 'border-status-error/30', icon: Ban };
+    default:
+      return { color: 'text-status-success', bgColor: 'bg-status-success/10', borderColor: 'border-status-success/30', icon: ShieldCheck };
+  }
+}
+
+const placeholderBreakers: CircuitBreaker[] = [
+  { tier: 'Tier 1', label: 'Position Level', threshold: '2% per position', currentValue: '0.8%', status: 'Normal', color: 'text-status-success', bgColor: 'bg-status-success/10', borderColor: 'border-status-success/30', icon: ShieldCheck },
+  { tier: 'Tier 2', label: 'Strategy Level', threshold: '5% daily loss per strategy', currentValue: '1.2%', status: 'Normal', color: 'text-status-success', bgColor: 'bg-status-success/10', borderColor: 'border-status-success/30', icon: ShieldCheck },
+  { tier: 'Tier 3', label: 'Portfolio Level', threshold: '10% daily portfolio loss', currentValue: '3.8%', status: 'Warning', color: 'text-status-warning', bgColor: 'bg-status-warning/10', borderColor: 'border-status-warning/30', icon: AlertTriangle },
+  { tier: 'Tier 4', label: 'System Kill Switch', threshold: '15% daily loss - halt all trading', currentValue: '3.8%', status: 'Normal', color: 'text-status-error', bgColor: 'bg-status-error/10', borderColor: 'border-status-error/30', icon: Ban },
 ];
+
+interface RiskState {
+  circuitBreakers: CircuitBreaker[];
+  drawdown: number;
+  maxDrawdown: number;
+  dailyLoss: number;
+}
+
+const placeholderState: RiskState = {
+  circuitBreakers: placeholderBreakers,
+  drawdown: 4.2,
+  maxDrawdown: 15.0,
+  dailyLoss: 48.90,
+};
+
+function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
+  const breakers: CircuitBreaker[] = data.circuit_breakers.map((cb) => {
+    const colors = statusToColors(cb.status);
+    // Tier 4 always uses error colour scheme even when Normal
+    const finalColors = cb.tier === 4
+      ? { color: 'text-status-error', bgColor: 'bg-status-error/10', borderColor: 'border-status-error/30', icon: Ban }
+      : colors;
+    return {
+      tier: `Tier ${cb.tier}`,
+      label: cb.label,
+      threshold: cb.threshold,
+      currentValue: `${cb.current_value}%`,
+      status: cb.status as CircuitBreaker['status'],
+      ...finalColors,
+    };
+  });
+  return {
+    circuitBreakers: breakers,
+    drawdown: data.current_drawdown,
+    maxDrawdown: data.max_drawdown_limit,
+    dailyLoss: data.daily_loss,
+  };
+}
 
 /* ---------- Page ---------- */
 
 export default function RiskPage() {
+  const [state, setState] = useState<RiskState>(placeholderState);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetchApi<ApiRiskStatus>('/api/risk/status')
+      .then((data) => setState(mapApiRiskStatus(data)))
+      .catch(() => { /* keep placeholder */ })
+      .finally(() => setLoading(false));
+  }, []);
+
+  const { circuitBreakers, drawdown, maxDrawdown } = state;
+  const drawdownPct = maxDrawdown > 0 ? (drawdown / maxDrawdown) * 100 : 0;
+
   return (
     <div className="flex flex-col gap-6">
       {/* Circuit breaker status cards */}
@@ -114,7 +155,7 @@ export default function RiskPage() {
 
       {/* Gauges row */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Drawdown gauge placeholder */}
+        {/* Drawdown gauge */}
         <DataCard title="Current Drawdown" description="Real-time portfolio drawdown from peak">
           <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
             <div className="text-center">
@@ -122,28 +163,28 @@ export default function RiskPage() {
                 <TrendingDown className="h-5 w-5 text-text-muted" />
               </div>
               <p className="text-sm font-medium text-text-muted">Drawdown Gauge</p>
-              <p className="mt-1 text-xs text-text-light">4.2% / 15.0% max</p>
+              <p className="mt-1 text-xs text-text-light">{drawdown}% / {maxDrawdown}% max</p>
             </div>
           </div>
           <div className="mt-4 space-y-2">
             <div className="flex justify-between text-xs">
               <span className="text-text-muted">Current Drawdown</span>
-              <span className="font-medium text-status-warning">4.2%</span>
+              <span className="font-medium text-status-warning">{drawdown}%</span>
             </div>
             <div className="h-3 rounded-full bg-bg-tertiary overflow-hidden">
               <div
                 className="h-full rounded-full bg-status-warning transition-all"
-                style={{ width: '28%' }}
+                style={{ width: `${drawdownPct}%` }}
               />
             </div>
             <div className="flex justify-between text-xs text-text-light">
               <span>0%</span>
-              <span>15% (Kill switch)</span>
+              <span>{maxDrawdown}% (Kill switch)</span>
             </div>
           </div>
         </DataCard>
 
-        {/* Daily loss tracker placeholder */}
+        {/* Daily loss tracker */}
         <DataCard title="Daily Loss Tracker" description="Cumulative losses today">
           <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
             <div className="text-center">
@@ -151,12 +192,14 @@ export default function RiskPage() {
                 <Activity className="h-5 w-5 text-text-muted" />
               </div>
               <p className="text-sm font-medium text-text-muted">Daily Loss Chart</p>
-              <p className="mt-1 text-xs text-text-light">Hourly loss accumulation</p>
+              <p className="mt-1 text-xs text-text-light">
+                {loading ? 'Loading...' : 'Hourly loss accumulation'}
+              </p>
             </div>
           </div>
           <div className="mt-4 space-y-2">
             {[
-              { label: 'Max daily loss', value: '-$48.90', color: 'text-status-error' },
+              { label: 'Max daily loss', value: `-$${state.dailyLoss.toFixed(2)}`, color: 'text-status-error' },
               { label: 'Net daily PnL', value: '+$285.50', color: 'text-status-success' },
               { label: 'Losing trades today', value: '2 / 7', color: 'text-text-primary' },
               { label: 'Risk utilization', value: '38%', color: 'text-text-primary' },

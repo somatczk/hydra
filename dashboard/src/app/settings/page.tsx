@@ -1,13 +1,15 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { Globe, Bell, Cog, CheckCircle, XCircle } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
+import { fetchApi } from '@/lib/api';
 
-/* ---------- Exchange data ---------- */
+/* ---------- Types ---------- */
 
 interface Exchange {
   id: string;
@@ -18,16 +20,78 @@ interface Exchange {
   lastSync: string;
 }
 
-const exchanges: Exchange[] = [
+interface ApiExchange {
+  id: string;
+  name: string;
+  connected: boolean;
+  api_key_set: boolean;
+  last_sync: string;
+}
+
+interface PlatformConfig {
+  trading_mode: string;
+  default_pair: string;
+  default_timeframe: string;
+  max_concurrent_strategies: number;
+}
+
+/* ---------- Placeholder data ---------- */
+
+const logoMap: Record<string, string> = {
+  binance: 'B',
+  bybit: 'BY',
+  kraken: 'K',
+  okx: 'O',
+};
+
+const placeholderExchanges: Exchange[] = [
   { id: 'binance', name: 'Binance', logo: 'B', connected: true, apiKeySet: true, lastSync: '2 min ago' },
   { id: 'bybit', name: 'Bybit', logo: 'BY', connected: true, apiKeySet: true, lastSync: '5 min ago' },
   { id: 'kraken', name: 'Kraken', logo: 'K', connected: false, apiKeySet: false, lastSync: 'Never' },
   { id: 'okx', name: 'OKX', logo: 'O', connected: false, apiKeySet: true, lastSync: '3 days ago' },
 ];
 
+function mapApiExchanges(data: ApiExchange[]): Exchange[] {
+  return data.map((e) => ({
+    id: e.id,
+    name: e.name,
+    logo: logoMap[e.id] || e.name[0],
+    connected: e.connected,
+    apiKeySet: e.api_key_set,
+    lastSync: e.last_sync,
+  }));
+}
+
 /* ---------- Page ---------- */
 
 export default function SettingsPage() {
+  const [exchanges, setExchanges] = useState<Exchange[]>(placeholderExchanges);
+  const [config, setConfig] = useState<PlatformConfig | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([
+      fetchApi<ApiExchange[]>('/api/system/exchanges').catch(() => null),
+      fetchApi<PlatformConfig>('/api/system/config').catch(() => null),
+    ])
+      .then(([ex, cfg]) => {
+        if (ex) setExchanges(mapApiExchanges(ex));
+        if (cfg) setConfig(cfg);
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  const handleSaveConfig = async () => {
+    try {
+      await fetchApi('/api/system/config', {
+        method: 'PUT',
+        body: JSON.stringify(config),
+      });
+    } catch {
+      /* API unavailable */
+    }
+  };
+
   return (
     <div className="flex flex-col gap-6">
       {/* Exchange connections */}
@@ -162,14 +226,14 @@ export default function SettingsPage() {
           <Input
             label="Max Concurrent Strategies"
             type="number"
-            defaultValue="5"
+            defaultValue={config?.max_concurrent_strategies?.toString() ?? '5'}
             hint="Maximum number of strategies running simultaneously"
           />
         </div>
         <div className="mt-4 flex justify-end">
-          <Button variant="primary">
+          <Button variant="primary" onClick={handleSaveConfig}>
             <Cog className="h-4 w-4" />
-            Save Configuration
+            {loading ? 'Loading...' : 'Save Configuration'}
           </Button>
         </div>
       </DataCard>

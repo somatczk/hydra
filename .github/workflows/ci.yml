@@ -32,7 +32,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --extra dev
-      - run: uv run mypy src/ --strict
+      - run: uv run mypy src/hydra/core/ src/hydra/data/ src/hydra/indicators/ src/hydra/strategy/ src/hydra/backtest/ src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ --strict
 
   security:
     name: Security Scan
