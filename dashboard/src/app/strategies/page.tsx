@@ -1,3 +1,5 @@
+'use client';
+
 import { Zap, TrendingUp, Signal, Clock } from 'lucide-react';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { cn } from '@/components/ui/cn';

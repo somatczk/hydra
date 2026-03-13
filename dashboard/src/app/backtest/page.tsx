@@ -1,3 +1,5 @@
+'use client';
+
 import { Play, Download, BarChart3 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
