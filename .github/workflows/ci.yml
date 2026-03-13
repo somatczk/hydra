@@ -72,22 +72,28 @@ jobs:
       - run: uv sync --extra dev
 
       - name: Start test infrastructure
+        id: infra
         run: |
-          docker run -d --name hydra-test-pg-${{ github.run_id }} \
+          docker rm -f hydra-int-pg-${{ github.run_id }} hydra-int-redis-${{ github.run_id }} 2>/dev/null || true
+          docker run -d --name hydra-int-pg-${{ github.run_id }} \
             -e POSTGRES_DB=hydra_test -e POSTGRES_USER=hydra -e POSTGRES_PASSWORD=test \
-            -p 15432:5432 \
+            -p 0:5432 \
             --health-cmd "pg_isready -U hydra" --health-interval 5s --health-retries 10 \
             timescale/timescaledb:2.17.2-pg16
-          docker run -d --name hydra-test-redis-${{ github.run_id }} \
-            -p 16379:6379 \
+          docker run -d --name hydra-int-redis-${{ github.run_id }} \
+            -p 0:6379 \
             --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10 \
             redis:7-alpine
+          PG_PORT=$(docker port hydra-int-pg-${{ github.run_id }} 5432 | cut -d: -f2)
+          REDIS_PORT=$(docker port hydra-int-redis-${{ github.run_id }} 6379 | cut -d: -f2)
+          echo "pg_port=$PG_PORT" >> $GITHUB_OUTPUT
+          echo "redis_port=$REDIS_PORT" >> $GITHUB_OUTPUT
           for i in $(seq 1 30); do
-            docker inspect --format='{{.State.Health.Status}}' hydra-test-pg-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
+            docker inspect --format='{{.State.Health.Status}}' hydra-int-pg-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
             sleep 2
           done
           for i in $(seq 1 15); do
-            docker inspect --format='{{.State.Health.Status}}' hydra-test-redis-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
+            docker inspect --format='{{.State.Health.Status}}' hydra-int-redis-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
             sleep 1
           done
 
@@ -95,17 +101,17 @@ jobs:
         run: uv run pytest tests/integration/ -v -m integration --no-header || [ $? -eq 5 ]
         env:
           HYDRA_DB_HOST: localhost
-          HYDRA_DB_PORT: "15432"
+          HYDRA_DB_PORT: ${{ steps.infra.outputs.pg_port }}
           HYDRA_DB_NAME: hydra_test
           HYDRA_DB_USER: hydra
           HYDRA_DB_PASSWORD: test
-          HYDRA_REDIS_URL: redis://localhost:16379/0
+          HYDRA_REDIS_URL: redis://localhost:${{ steps.infra.outputs.redis_port }}/0
 
       - name: Cleanup test infrastructure
         if: always()
         run: |
-          docker rm -f hydra-test-pg-${{ github.run_id }} 2>/dev/null || true
-          docker rm -f hydra-test-redis-${{ github.run_id }} 2>/dev/null || true
+          docker rm -f hydra-int-pg-${{ github.run_id }} 2>/dev/null || true
+          docker rm -f hydra-int-redis-${{ github.run_id }} 2>/dev/null || true
 
   e2e-tests:
     name: E2E Tests
@@ -119,16 +125,22 @@ jobs:
       - run: uv sync --extra dev
 
       - name: Start test infrastructure
+        id: e2e-infra
         run: |
+          docker rm -f hydra-e2e-pg-${{ github.run_id }} hydra-e2e-redis-${{ github.run_id }} 2>/dev/null || true
           docker run -d --name hydra-e2e-pg-${{ github.run_id }} \
             -e POSTGRES_DB=hydra_test -e POSTGRES_USER=hydra -e POSTGRES_PASSWORD=test \
-            -p 25432:5432 \
+            -p 0:5432 \
             --health-cmd "pg_isready -U hydra" --health-interval 5s --health-retries 10 \
             timescale/timescaledb:2.17.2-pg16
           docker run -d --name hydra-e2e-redis-${{ github.run_id }} \
-            -p 26379:6379 \
+            -p 0:6379 \
             --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10 \
             redis:7-alpine
+          PG_PORT=$(docker port hydra-e2e-pg-${{ github.run_id }} 5432 | cut -d: -f2)
+          REDIS_PORT=$(docker port hydra-e2e-redis-${{ github.run_id }} 6379 | cut -d: -f2)
+          echo "pg_port=$PG_PORT" >> $GITHUB_OUTPUT
+          echo "redis_port=$REDIS_PORT" >> $GITHUB_OUTPUT
           for i in $(seq 1 30); do
             docker inspect --format='{{.State.Health.Status}}' hydra-e2e-pg-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
             sleep 2
@@ -142,11 +154,11 @@ jobs:
         run: uv run pytest tests/e2e/ -v -m e2e --no-header || [ $? -eq 5 ]
         env:
           HYDRA_DB_HOST: localhost
-          HYDRA_DB_PORT: "25432"
+          HYDRA_DB_PORT: ${{ steps.e2e-infra.outputs.pg_port }}
           HYDRA_DB_NAME: hydra_test
           HYDRA_DB_USER: hydra
           HYDRA_DB_PASSWORD: test
-          HYDRA_REDIS_URL: redis://localhost:26379/0
+          HYDRA_REDIS_URL: redis://localhost:${{ steps.e2e-infra.outputs.redis_port }}/0
 
       - name: Cleanup test infrastructure
         if: always()
