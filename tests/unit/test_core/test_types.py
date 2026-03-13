@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
 from hydra.core.types import (
+    OHLCV,
     Direction,
     MarketType,
-    OHLCV,
     OrderFill,
     OrderRequest,
     OrderStatus,
@@ -21,7 +21,6 @@ from hydra.core.types import (
     Symbol,
     Timeframe,
 )
-
 
 # ---------------------------------------------------------------------------
 # Symbol
@@ -124,7 +123,7 @@ class TestMarketType:
 
 class TestOHLCV:
     def test_create(self) -> None:
-        ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        ts = datetime(2024, 1, 1, tzinfo=UTC)
         bar = OHLCV(
             open=Decimal("42000.50"),
             high=Decimal("42500.00"),
@@ -147,7 +146,7 @@ class TestOHLCV:
             low=Decimal("0.5"),
             close=Decimal("1.5"),
             volume=Decimal("100"),
-            timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            timestamp=datetime(2024, 1, 1, tzinfo=UTC),
         )
         with pytest.raises(FrozenInstanceError):
             bar.open = Decimal("999")  # type: ignore[misc]
@@ -159,7 +158,7 @@ class TestOHLCV:
             low=Decimal("0.00000001"),
             close=Decimal("0.00000002"),
             volume=Decimal("0.00000001"),
-            timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            timestamp=datetime(2024, 1, 1, tzinfo=UTC),
         )
         assert bar.open == Decimal("0.00000001")
 
@@ -172,16 +171,16 @@ class TestOHLCV:
             volume=Decimal("100"),
             timestamp=datetime(2024, 1, 1),
         )
-        assert bar.timestamp.tzinfo == timezone.utc
+        assert bar.timestamp.tzinfo == UTC
 
     def test_equality(self) -> None:
-        ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        ts = datetime(2024, 1, 1, tzinfo=UTC)
         bar1 = OHLCV(Decimal("1"), Decimal("2"), Decimal("0.5"), Decimal("1.5"), Decimal("100"), ts)
         bar2 = OHLCV(Decimal("1"), Decimal("2"), Decimal("0.5"), Decimal("1.5"), Decimal("100"), ts)
         assert bar1 == bar2
 
     def test_hash(self) -> None:
-        ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        ts = datetime(2024, 1, 1, tzinfo=UTC)
         bar = OHLCV(Decimal("1"), Decimal("2"), Decimal("0.5"), Decimal("1.5"), Decimal("100"), ts)
         # Frozen dataclasses are hashable
         assert hash(bar) is not None
@@ -270,7 +269,7 @@ class TestOrderRequest:
 
 class TestOrderFill:
     def test_create(self) -> None:
-        ts = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        ts = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
         fill = OrderFill(
             order_id="ord-123",
             symbol=Symbol("BTCUSDT"),
