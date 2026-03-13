@@ -510,3 +510,20 @@ class BacktestRunner:
                 market_type=config.exchange.market_type,
             )
         return None
+
+
+if __name__ == "__main__":
+    import asyncio
+    import signal as _signal
+
+    async def _worker() -> None:
+        """Backtest worker: waits for jobs (placeholder)."""
+        stop = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (_signal.SIGTERM, _signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+        logger.info("Backtest worker started, waiting for jobs...")
+        await stop.wait()
+        logger.info("Backtest worker shutting down.")
+
+    asyncio.run(_worker())
