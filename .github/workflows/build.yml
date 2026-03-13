@@ -9,10 +9,14 @@ on:
       - 'dashboard/**'
       - 'pyproject.toml'
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
     name: Build ${{ matrix.image }}
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
