@@ -1,3 +1,5 @@
+'use client';
+
 import { Wrench, Eye, Save, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';

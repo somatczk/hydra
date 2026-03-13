@@ -1,3 +1,5 @@
+'use client';
+
 import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, Activity, TrendingDown } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { cn } from '@/components/ui/cn';

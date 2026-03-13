@@ -1,3 +1,5 @@
+'use client';
+
 import { CandlestickChart, ArrowUpDown } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';

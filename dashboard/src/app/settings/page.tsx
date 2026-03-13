@@ -1,3 +1,5 @@
+'use client';
+
 import { Globe, Bell, Cog, CheckCircle, XCircle } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
