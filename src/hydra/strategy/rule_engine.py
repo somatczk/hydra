@@ -6,6 +6,7 @@ Evaluates condition trees against indicator values from the strategy context.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 
 import numpy as np
 from numpy import ndarray
@@ -27,7 +28,7 @@ def _get_indicator_values(
     symbol: str,
     timeframe: Timeframe,
     indicator_name: str,
-    params: dict,
+    params: Mapping[str, object],
 ) -> ndarray:
     """Fetch indicator values from the context or compute directly."""
     return ctx.indicator(indicator_name, symbol, timeframe, **params)
