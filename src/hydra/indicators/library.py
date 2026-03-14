@@ -392,6 +392,29 @@ def bollinger_bands(
     return upper, middle, lower
 
 
+def bollinger_upper(data: ndarray, period: int = 20, std_dev: float = 2.0) -> ndarray:
+    """Upper Bollinger Band."""
+    upper, _, _ = bollinger_bands(data, period, std_dev)
+    return upper
+
+
+def bollinger_middle(data: ndarray, period: int = 20, std_dev: float = 2.0) -> ndarray:
+    """Middle Bollinger Band (SMA)."""
+    _, middle, _ = bollinger_bands(data, period, std_dev)
+    return middle
+
+
+def bollinger_lower(data: ndarray, period: int = 20, std_dev: float = 2.0) -> ndarray:
+    """Lower Bollinger Band."""
+    _, _, lower = bollinger_bands(data, period, std_dev)
+    return lower
+
+
+def close(data: ndarray) -> ndarray:
+    """Return close prices (identity — for use as a condition indicator)."""
+    return data
+
+
 def keltner_channels(
     high: ndarray,
     low: ndarray,

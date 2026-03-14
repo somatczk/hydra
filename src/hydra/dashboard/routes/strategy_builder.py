@@ -170,13 +170,14 @@ class SaveResponse(BaseModel):
 
 
 class StrategySummary(BaseModel):
-    """Summary of a saved rule-based strategy."""
+    """Summary of a saved strategy."""
 
     id: str
     name: str
     description: str
     enabled: bool
     filename: str
+    editable: bool = True
 
 
 class StrategyDetail(BaseModel):
@@ -277,8 +278,8 @@ def _generate_sample_bars(count: int) -> list[OHLCV]:
     return bars
 
 
-def _parse_strategy_yaml(path: Path) -> dict[str, Any] | None:
-    """Read a YAML strategy file, returning None if not a RuleBasedStrategy."""
+def _parse_any_strategy_yaml(path: Path) -> dict[str, Any] | None:
+    """Read any YAML strategy file."""
     try:
         with path.open() as f:
             data = yaml.safe_load(f)
@@ -286,17 +287,25 @@ def _parse_strategy_yaml(path: Path) -> dict[str, Any] | None:
         return None
     if not isinstance(data, dict):
         return None
+    return data
+
+
+def _parse_strategy_yaml(path: Path) -> dict[str, Any] | None:
+    """Read a YAML strategy file, returning None if not a RuleBasedStrategy."""
+    data = _parse_any_strategy_yaml(path)
+    if data is None:
+        return None
     if data.get("strategy_class") != _RULE_BASED_CLASS:
         return None
     return data
 
 
 def _find_strategy_file(strategy_id: str) -> Path | None:
-    """Scan config directory for a RuleBasedStrategy YAML with matching id."""
+    """Scan config directory for a strategy YAML with matching id."""
     if not _CONFIG_DIR.is_dir():
         return None
     for path in _CONFIG_DIR.glob("*.yaml"):
-        data = _parse_strategy_yaml(path)
+        data = _parse_any_strategy_yaml(path)
         if data is not None and data.get("id") == strategy_id:
             return path
     return None
@@ -539,15 +548,16 @@ async def save_strategy(request: SaveRequest) -> SaveResponse:
 
 @router.get("/strategies", response_model=list[StrategySummary])
 async def list_strategies() -> list[StrategySummary]:
-    """List all saved rule-based strategies."""
+    """List all saved strategies."""
     if not _CONFIG_DIR.is_dir():
         return []
     strategies: list[StrategySummary] = []
     for path in sorted(_CONFIG_DIR.glob("*.yaml")):
-        data = _parse_strategy_yaml(path)
+        data = _parse_any_strategy_yaml(path)
         if data is None:
             continue
         params = data.get("parameters", {})
+        is_rule_based = data.get("strategy_class") == _RULE_BASED_CLASS
         strategies.append(
             StrategySummary(
                 id=data.get("id", path.stem),
@@ -555,6 +565,7 @@ async def list_strategies() -> list[StrategySummary]:
                 description=params.get("description", ""),
                 enabled=data.get("enabled", False),
                 filename=path.name,
+                editable=is_rule_based,
             )
         )
     return strategies

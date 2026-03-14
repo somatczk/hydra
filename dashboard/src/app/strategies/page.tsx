@@ -17,6 +17,7 @@ interface Strategy {
   status: 'Active' | 'Draft';
   statusVariant: 'success' | 'neutral';
   enabled: boolean;
+  editable: boolean;
 }
 
 interface BuilderStrategy {
@@ -25,6 +26,7 @@ interface BuilderStrategy {
   description: string;
   enabled: boolean;
   filename: string;
+  editable: boolean;
 }
 
 /* ---------- Helpers ---------- */
@@ -37,6 +39,7 @@ function mapBuilderStrategies(data: BuilderStrategy[]): Strategy[] {
     status: s.enabled ? 'Active' : 'Draft',
     statusVariant: s.enabled ? 'success' : 'neutral',
     enabled: s.enabled,
+    editable: s.editable,
   }));
 }
 
@@ -130,13 +133,15 @@ export default function StrategiesPage() {
             {/* Action buttons */}
             <div className="mt-4 flex items-center justify-between border-t border-border-default pt-3">
               <div className="flex items-center gap-2">
-                <button
-                  onClick={() => router.push(`/builder?strategy=${strategy.id}`)}
-                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
-                >
-                  <Edit2 className="h-3 w-3" />
-                  Edit
-                </button>
+                {strategy.editable && (
+                  <button
+                    onClick={() => router.push(`/builder?strategy=${strategy.id}`)}
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                  >
+                    <Edit2 className="h-3 w-3" />
+                    Edit
+                  </button>
+                )}
                 <button
                   onClick={() => router.push(`/backtest?strategy=${strategy.id}`)}
                   className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"

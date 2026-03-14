@@ -18,6 +18,7 @@ from hydra.dashboard.routes.strategy_builder import (
 )
 from hydra.dashboard.routes.strategy_builder import (
     _find_strategy_file,
+    _parse_any_strategy_yaml,
     _parse_strategy_yaml,
 )
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
@@ -883,7 +884,7 @@ async def list_backtest_strategies() -> list[dict[str, str]]:
     strategies: list[dict[str, str]] = []
     if _STRATEGY_CONFIG_DIR.is_dir():
         for path in sorted(_STRATEGY_CONFIG_DIR.glob("*.yaml")):
-            data = _parse_strategy_yaml(path)
+            data = _parse_any_strategy_yaml(path)
             if data is not None:
                 strategies.append(
                     {

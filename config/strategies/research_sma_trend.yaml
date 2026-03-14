@@ -1,0 +1,39 @@
+id: research-sma-trend
+name: "Research: SMA Trend-Following"
+strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy
+enabled: false
+symbols:
+  - BTCUSDT
+exchange:
+  exchange_id: binance
+  market_type: SPOT
+timeframes:
+  primary: 1d
+parameters:
+  rules:
+    entry_long:
+      operator: AND
+      conditions:
+        - indicator: ema
+          params: {period: 20}
+          comparator: crosses_above
+          value: "sma:period=50"
+        - indicator: rsi
+          params: {period: 14}
+          comparator: greater_than
+          value: 45
+    exit_long:
+      operator: AND
+      conditions:
+        - indicator: ema
+          params: {period: 20}
+          comparator: crosses_below
+          value: "sma:period=50"
+    entry_short: null
+    exit_short: null
+  required_history: 60
+  description: "Detzel et al. 2021 / Grayscale 2023. EMA(20)/SMA(50) crossover trend-following. Long-only. Sharpe 1.9, avoids major drawdowns. RSI>45 filter reduces whipsaws in sideways markets."
+position_sizing:
+  method: fixed_fractional
+  risk_per_trade_pct: 2.0
+  max_position_pct: 25.0
