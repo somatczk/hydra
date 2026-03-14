@@ -541,15 +541,27 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
 
         strategy_cls, config = _load_strategy_config(body.strategy_id)
         runner = BacktestRunner()
-        result = await runner.run(
-            strategy_class=strategy_cls,
-            strategy_config=config,
-            bars=bars,
-            initial_capital=Decimal(str(body.initial_capital)),
-            symbol="BTCUSDT",
-            timeframe=tf,
-            on_progress=_report_progress,
-        )
+
+        # Run backtest in a thread with its own event loop so the main
+        # FastAPI loop stays responsive for other API requests.
+        def _run_in_thread() -> Any:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    runner.run(
+                        strategy_class=strategy_cls,
+                        strategy_config=config,
+                        bars=bars,
+                        initial_capital=Decimal(str(body.initial_capital)),
+                        symbol="BTCUSDT",
+                        timeframe=tf,
+                        on_progress=_report_progress,
+                    )
+                )
+            finally:
+                loop.close()
+
+        result = await asyncio.to_thread(_run_in_thread)
 
         _TASKS[task_id]["progress"] = 90.0
 
