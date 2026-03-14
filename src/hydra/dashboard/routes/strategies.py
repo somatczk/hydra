@@ -163,16 +163,17 @@ def _row_to_strategy(row: Any) -> dict[str, Any]:
 
 
 _STRATEGIES_QUERY = (
-    "SELECT s.id, s.name, s.exchange_id, s.enabled, "
+    "SELECT ts.strategy_id AS id, ts.strategy_id AS name, "
+    "ts.exchange_id, TRUE AS enabled, "
     "COALESCE(SUM(t.pnl), 0) AS total_pnl, "
     "COUNT(t.id) AS total_trades, "
     "COALESCE("
     "  COUNT(CASE WHEN t.pnl > 0 THEN 1 END)::float "
     "  / NULLIF(COUNT(t.id), 0) * 100, 0"
     ") AS win_rate "
-    "FROM seed_strategies s "
-    "LEFT JOIN seed_trades t ON s.id = t.strategy_id "
-    "GROUP BY s.id, s.name, s.exchange_id, s.enabled"
+    "FROM trading_sessions ts "
+    "LEFT JOIN trades t ON ts.strategy_id = t.strategy_id "
+    "GROUP BY ts.strategy_id, ts.exchange_id"
 )
 
 
@@ -232,36 +233,12 @@ async def update_strategy(strategy_id: str, body: StrategyUpdateRequest) -> dict
 
 
 @router.post("/{strategy_id}/toggle", response_model=ToggleResponse)
-async def toggle_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
-    """Enable or disable a strategy."""
-    pool = _pool_from_request(request)
-    if pool is None:
-        strat = _get_strategy(strategy_id)
-        strat["enabled"] = not strat["enabled"]
-        strat["status"] = _status_from_enabled(strat["enabled"])
-        return {"id": strategy_id, "enabled": strat["enabled"]}
-
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "UPDATE seed_strategies SET enabled = NOT enabled "
-                "WHERE id = $1 RETURNING id, enabled",
-                strategy_id,
-            )
-        if row is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Strategy {strategy_id} not found",
-            )
-        return {"id": row["id"], "enabled": row["enabled"]}
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Failed to toggle strategy %s in DB", strategy_id)
-        strat = _get_strategy(strategy_id)
-        strat["enabled"] = not strat["enabled"]
-        strat["status"] = _status_from_enabled(strat["enabled"])
-        return {"id": strategy_id, "enabled": strat["enabled"]}
+async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
+    """Enable or disable a strategy (in-memory only)."""
+    strat = _get_strategy(strategy_id)
+    strat["enabled"] = not strat["enabled"]
+    strat["status"] = _status_from_enabled(strat["enabled"])
+    return {"id": strategy_id, "enabled": strat["enabled"]}
 
 
 @router.get("/{strategy_id}/performance", response_model=StrategyPerformance)

@@ -307,21 +307,18 @@ class PaperTradingExecutor:
                 await conn.execute(
                     """
                     INSERT INTO trades
-                        (symbol, direction, entry_price, exit_price, quantity,
-                         pnl, fees, strategy_id, exchange_id, entry_time,
-                         exit_time, source)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'paper')
+                        (symbol, side, price, quantity, fee, pnl,
+                         strategy_id, exchange_id, timestamp, source)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'paper')
                     """,
                     symbol,
                     side.upper(),
                     price,
-                    price,
                     quantity,
-                    Decimal("0"),
                     fee,
+                    Decimal("0"),
                     self._strategy_id,
                     self._exchange_id,
-                    now,
                     now,
                 )
         except Exception:

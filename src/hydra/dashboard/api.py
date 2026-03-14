@@ -226,6 +226,7 @@ async def _init_session_manager() -> None:
     mgr = SessionManager(db_pool=pool)
     if pool is not None:
         await mgr.load_recent_sessions()
+        await mgr.recover_running_sessions()
     app.state.session_manager = mgr
 
 
@@ -234,7 +235,7 @@ async def _shutdown_session_manager() -> None:
     """Stop all trading sessions on shutdown."""
     mgr = getattr(app.state, "session_manager", None)
     if mgr is not None:
-        await mgr.stop_all()
+        await mgr.graceful_shutdown()
 
 
 @app.on_event("shutdown")
@@ -336,12 +337,60 @@ async def _run_migrations() -> None:
             await conn.execute(
                 "INSERT INTO risk_config (scope) VALUES ('global') ON CONFLICT (scope) DO NOTHING"
             )
-            # Add source column to existing tables
+            # Production tables for trades, positions, balance snapshots
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id SERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity NUMERIC(24,8) NOT NULL,
+                    price NUMERIC(24,8) NOT NULL,
+                    fee NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    strategy_id TEXT NOT NULL,
+                    exchange_id TEXT NOT NULL DEFAULT 'binance',
+                    source TEXT NOT NULL DEFAULT 'live',
+                    session_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
             await conn.execute(
-                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'live'"
+                "CREATE INDEX IF NOT EXISTS ix_trades_strategy ON trades(strategy_id)"
             )
+            await conn.execute("CREATE INDEX IF NOT EXISTS ix_trades_ts ON trades(timestamp)")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS positions (
+                    id SERIAL PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    session_id TEXT,
+                    exchange_id TEXT NOT NULL DEFAULT 'binance',
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    quantity NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    avg_entry_price NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    unrealized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    realized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'live',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (session_id, symbol)
+                )
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS balance_snapshots (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    total_value NUMERIC(24,8) NOT NULL,
+                    unrealized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    realized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    drawdown_pct NUMERIC(8,4) NOT NULL DEFAULT 0,
+                    peak_value NUMERIC(24,8) NOT NULL DEFAULT 0
+                )
+            """)
             await conn.execute(
-                "ALTER TABLE positions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'live'"
+                "CREATE INDEX IF NOT EXISTS ix_balance_snap_ts ON balance_snapshots(timestamp)"
             )
 
             # Backtest results persistence (idempotent)

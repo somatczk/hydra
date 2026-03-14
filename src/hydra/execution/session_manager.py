@@ -391,6 +391,96 @@ class SessionManager:
         except Exception:
             logger.exception("Failed to persist session %s", session.session_id)
 
+    async def graceful_shutdown(self) -> None:
+        """Stop in-memory engines/tasks but leave DB status as 'running' for recovery."""
+        for session in self._sessions.values():
+            if session.status != "running":
+                continue
+            if session._engine is not None:
+                await session._engine.stop()
+            if session._task is not None and not session._task.done():
+                session._task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await session._task
+        logger.info("Graceful shutdown complete — sessions left as 'running' in DB for recovery")
+
+    async def recover_running_sessions(self) -> None:
+        """Recover sessions that were left as 'running' in DB after a graceful shutdown."""
+        if self._db_pool is None:
+            return
+        try:
+            async with self._db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT * FROM trading_sessions WHERE status = 'running'")
+            for row in rows:
+                sid = row["id"]
+                strategy_id = row["strategy_id"]
+                trading_mode = row["trading_mode"]
+                try:
+                    cfg = self._find_strategy_config(strategy_id)
+
+                    session = TradingSession(
+                        session_id=sid,
+                        strategy_id=strategy_id,
+                        trading_mode=trading_mode,
+                        status="running",
+                        exchange_id=row["exchange_id"],
+                        symbols=row["symbols"],
+                        timeframe=row["timeframe"],
+                        paper_capital=row["paper_capital"],
+                        started_at=row["started_at"],
+                    )
+
+                    event_bus = InMemoryEventBus()
+                    context = StrategyContext()
+                    hydra_config = load_config()
+                    engine = StrategyEngine(
+                        config=hydra_config,
+                        event_bus=event_bus,
+                        context=context,
+                    )
+                    await engine.load_strategy_from_config(cfg)
+
+                    executor: Any
+                    if trading_mode == "paper":
+                        initial_bal = {
+                            "USDT": row["paper_capital"] or Decimal("10000"),
+                        }
+                        executor = PaperTradingExecutor(
+                            exchange_id=cfg.exchange.exchange_id,
+                            initial_balances=initial_bal,
+                            db_pool=self._db_pool,
+                            strategy_id=strategy_id,
+                        )
+                    else:
+                        from hydra.execution.exchange_client import ExchangeClient
+
+                        executor = ExchangeClient(
+                            exchange_id=cfg.exchange.exchange_id,
+                            config={},
+                        )
+
+                    order_manager = OrderManager(executor=executor, event_bus=event_bus)
+
+                    session._engine = engine
+                    session._event_bus = event_bus
+                    session._order_manager = order_manager
+                    session._executor = executor
+                    session._task = asyncio.create_task(self._run_session(session))
+
+                    self._sessions[sid] = session
+                    logger.info("Recovered session %s for strategy %s", sid, strategy_id)
+                except Exception:
+                    logger.exception("Failed to recover session %s", sid)
+                    # Mark as error so we don't retry endlessly
+                    async with self._db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE trading_sessions SET status = 'error', "
+                            "error_message = 'Recovery failed' WHERE id = $1",
+                            sid,
+                        )
+        except Exception:
+            logger.exception("Failed to query running sessions for recovery")
+
     async def load_recent_sessions(self) -> None:
         """Load recent sessions from DB into memory (for API display)."""
         if self._db_pool is None:

@@ -255,32 +255,20 @@ class TestStrategiesWithPool:
         data = resp.json()
         assert data["name"] == "LSTM Momentum"
 
-    def test_toggle_strategy_in_db(self) -> None:
-        pool, conn = _make_mock_pool()
-        conn.fetchrow = AsyncMock(return_value={"id": "db-strat", "enabled": False})
+    def test_toggle_strategy_with_pool_uses_memory(self) -> None:
+        """Toggle is always in-memory now (no seed_strategies table)."""
+        pool, _conn = _make_mock_pool()
 
         client = TestClient(_make_app(pool=pool))
-        resp = client.post("/api/strategies/db-strat/toggle")
+        resp = client.post("/api/strategies/strat-1/toggle")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["id"] == "db-strat"
-        assert data["enabled"] is False
+        assert data["id"] == "strat-1"
+        assert "enabled" in data
 
-    def test_toggle_strategy_not_found_in_db(self) -> None:
-        pool, conn = _make_mock_pool()
-        conn.fetchrow = AsyncMock(return_value=None)
+    def test_toggle_strategy_not_found(self) -> None:
+        pool, _conn = _make_mock_pool()
 
         client = TestClient(_make_app(pool=pool))
         resp = client.post("/api/strategies/nonexistent/toggle")
         assert resp.status_code == 404
-
-    def test_toggle_strategy_db_exception_falls_back(self) -> None:
-        pool, conn = _make_mock_pool()
-        conn.fetchrow = AsyncMock(side_effect=RuntimeError("DB down"))
-
-        client = TestClient(_make_app(pool=pool))
-        resp = client.post("/api/strategies/strat-2/toggle")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["id"] == "strat-2"
-        assert "enabled" in data

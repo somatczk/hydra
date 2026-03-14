@@ -198,9 +198,9 @@ async def get_summary(request: Request) -> PortfolioSummary | dict:
         async with pool.acquire() as conn:
             snapshot = await conn.fetchrow(
                 "SELECT total_value, unrealized_pnl, realized_pnl "
-                "FROM seed_balance_snapshots ORDER BY timestamp DESC LIMIT 1"
+                "FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
             )
-            fees_row = await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM seed_trades")
+            fees_row = await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades")
 
             if snapshot is None:
                 return PortfolioSummary()
@@ -236,7 +236,7 @@ async def get_positions(request: Request) -> list[dict]:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, strategy_id, exchange_id, symbol, direction, quantity, "
-                "avg_entry_price, unrealized_pnl, realized_pnl FROM seed_positions"
+                "avg_entry_price, unrealized_pnl, realized_pnl FROM positions"
             )
 
         positions: list[dict] = []
@@ -281,7 +281,7 @@ async def get_equity_curve(request: Request) -> list[dict]:
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT timestamp, total_value FROM seed_balance_snapshots ORDER BY timestamp"
+                "SELECT timestamp, total_value FROM balance_snapshots ORDER BY timestamp"
             )
 
         return [
@@ -307,7 +307,7 @@ async def get_daily_pnl(request: Request) -> list[dict]:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT date_trunc('day', timestamp) AS date, SUM(pnl) AS pnl "
-                "FROM seed_trades GROUP BY date ORDER BY date"
+                "FROM trades GROUP BY date ORDER BY date"
             )
 
         return [
@@ -336,7 +336,7 @@ async def get_monthly_returns(request: Request) -> list[dict]:
                 "  to_char(date_trunc('month', timestamp), 'YYYY-MM') AS month, "
                 "  (array_agg(total_value ORDER BY timestamp ASC))[1] AS first_val, "
                 "  (array_agg(total_value ORDER BY timestamp DESC))[1] AS last_val "
-                "FROM seed_balance_snapshots "
+                "FROM balance_snapshots "
                 "GROUP BY date_trunc('month', timestamp) "
                 "ORDER BY date_trunc('month', timestamp)"
             )
@@ -363,10 +363,7 @@ async def get_attribution(request: Request) -> list[dict]:
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT s.name, SUM(t.pnl) AS pnl "
-                "FROM seed_trades t "
-                "JOIN seed_strategies s ON t.strategy_id = s.id "
-                "GROUP BY s.name"
+                "SELECT strategy_id AS name, SUM(pnl) AS pnl FROM trades GROUP BY strategy_id"
             )
 
         total_pnl = sum(float(r["pnl"]) for r in rows)
@@ -396,7 +393,7 @@ async def get_trades(request: Request) -> list[dict]:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, symbol, side, price, quantity, fee, pnl, timestamp "
-                "FROM seed_trades ORDER BY timestamp DESC LIMIT 20"
+                "FROM trades ORDER BY timestamp DESC LIMIT 20"
             )
 
         return [

@@ -16,6 +16,7 @@ import {
   ResponsiveContainer,
   CartesianGrid,
 } from 'recharts';
+import Link from 'next/link';
 import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
@@ -237,11 +238,14 @@ export default function DashboardPage() {
           change={1.8}
           changeType="increase"
         />
-        <StatCard
-          icon={BarChart3}
-          label="Open Positions"
-          value={positionCount.toLocaleString('en-US')}
-        />
+        <Link href="/trading" className="block">
+          <StatCard
+            icon={BarChart3}
+            label="Open Positions"
+            value={positionCount.toLocaleString('en-US')}
+            className="cursor-pointer hover:border-border-hover"
+          />
+        </Link>
         <StatCard
           icon={ArrowDownRight}
           label="Max Drawdown"
