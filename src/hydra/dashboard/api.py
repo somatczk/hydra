@@ -301,6 +301,10 @@ async def _run_migrations() -> None:
                 "ALTER TABLE backtest_results"
                 " ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''"
             )
+            await conn.execute(
+                "ALTER TABLE backtest_results"
+                " ADD COLUMN IF NOT EXISTS transactions JSONB NOT NULL DEFAULT '[]'"
+            )
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS backtest_result_trades (
                     id SERIAL PRIMARY KEY,

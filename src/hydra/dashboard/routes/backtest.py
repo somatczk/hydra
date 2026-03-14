@@ -211,8 +211,10 @@ async def _persist_result_to_db(pool: Any, result: dict[str, Any]) -> None:
             await conn.execute(
                 """INSERT INTO backtest_results
                        (id, strategy, period, status, total_trades, win_rate,
-                        total_pnl, max_drawdown, sharpe_ratio, equity_curve, name)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
+                        total_pnl, max_drawdown, sharpe_ratio, equity_curve, name,
+                        transactions)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11,
+                           $12::jsonb)
                    ON CONFLICT (id) DO UPDATE SET
                        status = EXCLUDED.status,
                        total_trades = EXCLUDED.total_trades,
@@ -221,7 +223,8 @@ async def _persist_result_to_db(pool: Any, result: dict[str, Any]) -> None:
                        max_drawdown = EXCLUDED.max_drawdown,
                        sharpe_ratio = EXCLUDED.sharpe_ratio,
                        equity_curve = EXCLUDED.equity_curve,
-                       name = EXCLUDED.name""",
+                       name = EXCLUDED.name,
+                       transactions = EXCLUDED.transactions""",
                 result["id"],
                 result["strategy"],
                 result["period"],
@@ -233,6 +236,7 @@ async def _persist_result_to_db(pool: Any, result: dict[str, Any]) -> None:
                 metrics.get("sharpe_ratio", 0.0),
                 json.dumps(result.get("equity_curve", [])),
                 result.get("name", ""),
+                json.dumps(result.get("transactions", [])),
             )
             trades = result.get("trades", [])
             if trades:
@@ -268,7 +272,8 @@ async def populate_cache_from_db(pool: Any) -> None:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, strategy, period, status, total_trades, win_rate, "
-                "total_pnl, max_drawdown, sharpe_ratio, equity_curve, name "
+                "total_pnl, max_drawdown, sharpe_ratio, equity_curve, name, "
+                "transactions "
                 "FROM backtest_results ORDER BY created_at DESC"
             )
             for row in rows:
@@ -282,6 +287,9 @@ async def populate_cache_from_db(pool: Any) -> None:
                 equity_curve = row["equity_curve"]
                 if isinstance(equity_curve, str):
                     equity_curve = json.loads(equity_curve)
+                transactions = row["transactions"]
+                if isinstance(transactions, str):
+                    transactions = json.loads(transactions)
                 _RESULTS[result_id] = {
                     "id": result_id,
                     "strategy": row["strategy"],
@@ -307,6 +315,7 @@ async def populate_cache_from_db(pool: Any) -> None:
                         }
                         for t in trade_rows
                     ],
+                    "transactions": transactions,
                 }
             # Seed defaults into DB if table is empty
             if not rows:
@@ -619,15 +628,31 @@ async def list_results(request: Request) -> list[dict[str, Any]]:
 @router.get("/results/{result_id}", response_model=BacktestResultDetail)
 async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
     """Get detailed backtest result including equity curve and trades."""
-    pool = getattr(request.app.state, "db_pool", None)
+    # Prefer in-memory cache (most complete/fresh data, includes transactions)
+    if result_id in _RESULTS:
+        r = _RESULTS[result_id]
+        return {
+            "id": r["id"],
+            "strategy": r["strategy"],
+            "period": r["period"],
+            "status": r["status"],
+            "name": r.get("name", ""),
+            "stopped_reason": r.get("stopped_reason"),
+            "metrics": r["metrics"],
+            "equity_curve": r.get("equity_curve", []),
+            "trades": r.get("trades", []),
+            "transactions": r.get("transactions", []),
+        }
 
-    # Try DB first
+    # Fall back to DB
+    pool = getattr(request.app.state, "db_pool", None)
     if pool is not None:
         try:
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT id, strategy, period, status, total_trades, win_rate, "
-                    "total_pnl, max_drawdown, sharpe_ratio, equity_curve, name "
+                    "total_pnl, max_drawdown, sharpe_ratio, equity_curve, name, "
+                    "transactions "
                     "FROM backtest_results WHERE id = $1",
                     result_id,
                 )
@@ -641,6 +666,9 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
                     equity_curve = row["equity_curve"]
                     if isinstance(equity_curve, str):
                         equity_curve = json.loads(equity_curve)
+                    transactions = row["transactions"]
+                    if isinstance(transactions, str):
+                        transactions = json.loads(transactions)
                     return {
                         "id": row["id"],
                         "strategy": row["strategy"],
@@ -666,29 +694,15 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
                             }
                             for t in trade_rows
                         ],
+                        "transactions": transactions,
                     }
         except Exception:
             logger.debug("Failed to load backtest %s from DB", result_id, exc_info=True)
 
-    # Fall back to in-memory
-    if result_id not in _RESULTS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Result {result_id} not found",
-        )
-    r = _RESULTS[result_id]
-    return {
-        "id": r["id"],
-        "strategy": r["strategy"],
-        "period": r["period"],
-        "status": r["status"],
-        "name": r.get("name", ""),
-        "stopped_reason": r.get("stopped_reason"),
-        "metrics": r["metrics"],
-        "equity_curve": r.get("equity_curve", []),
-        "trades": r.get("trades", []),
-        "transactions": r.get("transactions", []),
-    }
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Result {result_id} not found",
+    )
 
 
 @router.patch("/results/{result_id}", response_model=BacktestResultSummary)
