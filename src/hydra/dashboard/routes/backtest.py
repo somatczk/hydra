@@ -61,6 +61,17 @@ class BacktestTradeRecord(BaseModel):
     pnl: float
 
 
+class BacktestTransaction(BaseModel):
+    trade_id: int
+    type: str  # "entry" or "exit"
+    time: str
+    side: str
+    price: float
+    quantity: float
+    fee: float
+    pnl: float | None = None
+
+
 class BacktestMetrics(BaseModel):
     total_trades: int = 0
     win_rate: float = 0.0
@@ -88,6 +99,7 @@ class BacktestResultDetail(BaseModel):
     metrics: BacktestMetrics = Field(default_factory=BacktestMetrics)
     equity_curve: list[dict[str, Any]] = Field(default_factory=list)
     trades: list[BacktestTradeRecord] = Field(default_factory=list)
+    transactions: list[BacktestTransaction] = Field(default_factory=list)
 
 
 class BacktestRenameRequest(BaseModel):
@@ -498,6 +510,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
                 }
                 for t in result.trades
             ],
+            "transactions": result.transactions,
         }
 
         # Persist to DB
@@ -674,6 +687,7 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
         "metrics": r["metrics"],
         "equity_curve": r.get("equity_curve", []),
         "trades": r.get("trades", []),
+        "transactions": r.get("transactions", []),
     }
 
 

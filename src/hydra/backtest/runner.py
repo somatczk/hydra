@@ -388,6 +388,65 @@ class BacktestRunner:
         pending_orders: list[OrderRequest] = []
         stopped_reason: str | None = None
 
+        # Transaction tracking (individual fills linked by trade_id)
+        transactions: list[dict] = []
+        _trade_counter = 0
+        _position_trade_ids: dict[str, int] = {}
+
+        def _next_trade_id() -> int:
+            nonlocal _trade_counter
+            _trade_counter += 1
+            return _trade_counter
+
+        def _fill_side_str(side: Side) -> str:
+            return "Buy" if side == Side.BUY else "Sell"
+
+        def _record_entry_txn(fill: OrderFill, sym_key: str, *, is_new: bool) -> None:
+            if is_new:
+                tid = _next_trade_id()
+                _position_trade_ids[sym_key] = tid
+            else:
+                tid = _position_trade_ids.get(sym_key, _next_trade_id())
+            transactions.append(
+                {
+                    "trade_id": tid,
+                    "type": "entry",
+                    "time": fill.timestamp.isoformat() if fill.timestamp else "",
+                    "side": _fill_side_str(fill.side),
+                    "price": float(fill.price),
+                    "quantity": float(fill.quantity),
+                    "fee": float(fill.fee),
+                    "pnl": None,
+                }
+            )
+
+        def _record_exit_txn(
+            fill_or_bar: OrderFill | OHLCV,
+            sym_key: str,
+            *,
+            side: Side,
+            quantity: Decimal,
+            fee: Decimal,
+            pnl: Decimal,
+            timestamp: datetime | None = None,
+        ) -> None:
+            tid = _position_trade_ids.pop(sym_key, 0)
+            ts = timestamp or (fill_or_bar.timestamp if hasattr(fill_or_bar, "timestamp") else None)
+            transactions.append(
+                {
+                    "trade_id": tid,
+                    "type": "exit",
+                    "time": ts.isoformat() if ts else "",
+                    "side": _fill_side_str(side),
+                    "price": float(
+                        fill_or_bar.price if hasattr(fill_or_bar, "price") else fill_or_bar.close
+                    ),
+                    "quantity": float(quantity),
+                    "fee": float(fee),
+                    "pnl": float(pnl),
+                }
+            )
+
         # Main replay loop
         sym = Symbol(symbol)
         for i, bar in enumerate(bars):
@@ -411,9 +470,24 @@ class BacktestRunner:
                     avg_volume=avg_volume,
                 )
                 if fill is not None:
+                    sym_key = str(fill.symbol)
+                    had_position = sym_key in tracker.positions
+
                     trade = tracker.apply_fill(fill)
+
                     if trade is not None:
                         trades.append(trade)
+                        _record_exit_txn(
+                            fill,
+                            sym_key,
+                            side=fill.side,
+                            quantity=fill.quantity,
+                            fee=fill.fee,
+                            pnl=trade.pnl,
+                        )
+                    else:
+                        _record_entry_txn(fill, sym_key, is_new=not had_position)
+
                     # Notify strategy of fill
                     fill_event = OrderFillEvent(
                         order_id=fill.order_id,
@@ -470,6 +544,7 @@ class BacktestRunner:
             if tracker.equity <= Decimal("0"):
                 for sym_key in list(tracker.positions.keys()):
                     pos = tracker.positions[sym_key]
+                    close_side = Side.SELL if pos["direction"] == Direction.LONG else Side.BUY
                     trade = tracker.close_position(
                         sym_key,
                         pos["quantity"],
@@ -479,6 +554,15 @@ class BacktestRunner:
                     )
                     if trade:
                         trades.append(trade)
+                        _record_exit_txn(
+                            bar,
+                            sym_key,
+                            side=close_side,
+                            quantity=trade.quantity,
+                            fee=Decimal("0"),
+                            pnl=trade.pnl,
+                            timestamp=bar.timestamp,
+                        )
                 equity_curve.append(tracker.equity)
                 timestamps.append(bar.timestamp)
                 stopped_reason = "margin_call"
@@ -487,6 +571,31 @@ class BacktestRunner:
         # Strategy shutdown
         await strategy.on_stop()
 
+        # Force-close any remaining open positions at final bar price
+        if bars and tracker.positions:
+            last_bar = bars[-1]
+            for sym_key in list(tracker.positions.keys()):
+                pos = tracker.positions[sym_key]
+                close_side = Side.SELL if pos["direction"] == Direction.LONG else Side.BUY
+                trade = tracker.close_position(
+                    sym_key,
+                    pos["quantity"],
+                    last_bar.close,
+                    Decimal("0"),
+                    last_bar.timestamp,
+                )
+                if trade:
+                    trades.append(trade)
+                    _record_exit_txn(
+                        last_bar,
+                        sym_key,
+                        side=close_side,
+                        quantity=trade.quantity,
+                        fee=Decimal("0"),
+                        pnl=trade.pnl,
+                        timestamp=last_bar.timestamp,
+                    )
+
         # Calculate metrics
         result = calculate_metrics(
             equity_curve=equity_curve,
@@ -494,6 +603,7 @@ class BacktestRunner:
             timestamps=timestamps,
         )
         result.stopped_reason = stopped_reason
+        result.transactions = transactions
         return result
 
     @staticmethod

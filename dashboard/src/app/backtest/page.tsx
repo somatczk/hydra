@@ -48,7 +48,7 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
   return data.map((r) => {
     const m = r.metrics;
     const pnlStr = m.total_pnl !== 0
-      ? `${m.total_pnl >= 0 ? '+' : ''}$${Math.abs(m.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+      ? `${m.total_pnl >= 0 ? '+' : '-'}$${Math.abs(m.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
       : 'N/A';
     return {
       id: r.id,

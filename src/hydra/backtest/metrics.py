@@ -15,6 +15,9 @@ from typing import Any
 import numpy as np
 from numpy import ndarray
 
+# Type alias for individual fill transactions (entry/exit, linked by trade_id)
+TransactionRecord = dict[str, Any]
+
 # ---------------------------------------------------------------------------
 # Trade dataclass
 # ---------------------------------------------------------------------------
@@ -88,6 +91,9 @@ class BacktestResult:
     drawdown_series: list[Decimal] = field(default_factory=list)
     trades: list[Trade] = field(default_factory=list)
     monthly_returns: dict[str, Decimal] = field(default_factory=dict)
+
+    # Individual fill transactions (entry/exit, linked by trade_id)
+    transactions: list[TransactionRecord] = field(default_factory=list)
 
     # Early termination
     stopped_reason: str | None = None

@@ -59,6 +59,16 @@ interface ApiBacktestDetail {
     exit_price: number;
     pnl: number;
   }>;
+  transactions: Array<{
+    trade_id: number;
+    type: string;
+    time: string;
+    side: string;
+    price: number;
+    quantity: number;
+    fee: number;
+    pnl: number | null;
+  }>;
 }
 
 interface Verification {
@@ -74,15 +84,18 @@ interface Verification {
   all_passed: boolean;
 }
 
-interface TradeRow {
+interface TxnRow {
   id: string;
-  entryTime: string;
-  exitTime: string;
+  tradeId: number;
+  type: string;
+  time: string;
   side: string;
-  entryPrice: string;
-  exitPrice: string;
-  pnl: number;
+  price: string;
+  quantity: string;
+  fee: string;
+  pnl: number | null;
   pnlFormatted: string;
+  isOpen: boolean;
 }
 
 /* ---------- Page ---------- */
@@ -162,44 +175,68 @@ export default function BacktestDetailPage() {
 
   const ChartTooltip = useMemo(() => makeCustomTooltip(resolution), [resolution]);
 
-  const tradeRows: TradeRow[] = useMemo(() => {
+  const txnRows: TxnRow[] = useMemo(() => {
     if (!detail) return [];
-    return detail.trades.map((t, i) => ({
+    const txns = detail.transactions ?? [];
+    // Determine which trade_ids have an exit (= closed)
+    const exitIds = new Set(txns.filter(t => t.type === 'exit').map(t => t.trade_id));
+    return txns.map((t, i) => ({
       id: String(i),
-      entryTime: new Date(t.entry_time).toLocaleString(),
-      exitTime: new Date(t.exit_time).toLocaleString(),
+      tradeId: t.trade_id,
+      type: t.type,
+      time: new Date(t.time).toLocaleString(),
       side: t.side,
-      entryPrice: `$${t.entry_price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-      exitPrice: `$${t.exit_price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+      price: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+      quantity: t.quantity.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''),
+      fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '—',
       pnl: t.pnl,
-      pnlFormatted: `${t.pnl >= 0 ? '+' : ''}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+      pnlFormatted: t.pnl != null
+        ? `${t.pnl >= 0 ? '+' : '-'}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+        : '—',
+      isOpen: t.type === 'entry' && !exitIds.has(t.trade_id),
     }));
   }, [detail]);
 
-  const tradeColumns = [
-    { key: 'entryTime', header: 'Entry Time' },
-    { key: 'exitTime', header: 'Exit Time', hideOnMobile: true },
+  const txnColumns = [
     {
-      key: 'side',
-      header: 'Side',
-      render: (row: TradeRow) => (
+      key: 'tradeId',
+      header: '#',
+      render: (row: TxnRow) => <span className="text-text-muted">#{row.tradeId}</span>,
+    },
+    {
+      key: 'type',
+      header: 'Type',
+      render: (row: TxnRow) => (
         <StatusBadge
-          status={row.side}
-          variant={row.side.toLowerCase().includes('long') ? 'success' : 'error'}
+          status={row.isOpen ? 'Open' : row.type === 'entry' ? 'Entry' : 'Exit'}
+          variant={row.isOpen ? 'warning' : row.type === 'entry' ? 'info' : 'neutral'}
           size="sm"
         />
       ),
     },
-    { key: 'entryPrice', header: 'Entry Price', hideOnMobile: true },
-    { key: 'exitPrice', header: 'Exit Price', hideOnMobile: true },
+    { key: 'time', header: 'Time' },
+    {
+      key: 'side',
+      header: 'Side',
+      render: (row: TxnRow) => (
+        <StatusBadge
+          status={row.side}
+          variant={row.side === 'Buy' ? 'success' : 'error'}
+          size="sm"
+        />
+      ),
+    },
+    { key: 'price', header: 'Price' },
+    { key: 'quantity', header: 'Qty', hideOnMobile: true },
+    { key: 'fee', header: 'Fee', hideOnMobile: true },
     {
       key: 'pnl',
       header: 'PnL',
-      render: (row: TradeRow) => (
+      render: (row: TxnRow) => row.pnl != null ? (
         <span className={row.pnl >= 0 ? 'text-status-success font-medium' : 'text-status-error font-medium'}>
           {row.pnlFormatted}
         </span>
-      ),
+      ) : <span className="text-text-muted">—</span>,
     },
   ];
 
@@ -292,7 +329,7 @@ export default function BacktestDetailPage() {
         <DataCard padding="sm">
           <p className="text-xs text-text-muted">Total PnL</p>
           <p className={`text-lg font-bold ${detail.metrics.total_pnl >= 0 ? 'text-status-success' : 'text-status-error'}`}>
-            {detail.metrics.total_pnl >= 0 ? '+' : ''}${Math.abs(detail.metrics.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            {detail.metrics.total_pnl >= 0 ? '+' : '-'}${Math.abs(detail.metrics.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}
           </p>
         </DataCard>
         <DataCard padding="sm">
@@ -406,13 +443,13 @@ export default function BacktestDetailPage() {
         </DataCard>
       )}
 
-      {/* Trades table */}
-      <DataCard title="Trades" description={`${detail.trades.length} trades executed`}>
+      {/* Transactions table */}
+      <DataCard title="Transactions" description={`${txnRows.length} fills recorded`}>
         <Table
-          columns={tradeColumns}
-          data={tradeRows}
+          columns={txnColumns}
+          data={txnRows}
           keyExtractor={(row) => row.id}
-          emptyMessage="No trades recorded"
+          emptyMessage="No transactions recorded"
         />
       </DataCard>
     </div>
