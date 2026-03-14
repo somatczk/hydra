@@ -695,6 +695,28 @@ async def update_strategy(strategy_id: str, request: SaveRequest) -> SaveRespons
     )
 
 
+@router.post("/strategies/{strategy_id}/toggle")
+async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
+    """Toggle the enabled flag of a saved strategy."""
+    path = _find_strategy_file(strategy_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+
+    data = _parse_any_strategy_yaml(path)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+
+    data["enabled"] = not data.get("enabled", False)
+
+    try:
+        with path.open("w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update: {exc}") from exc
+
+    return {"id": strategy_id, "enabled": data["enabled"]}
+
+
 @router.delete("/strategies/{strategy_id}")
 async def delete_strategy(strategy_id: str) -> Response:
     """Delete a saved rule-based strategy."""

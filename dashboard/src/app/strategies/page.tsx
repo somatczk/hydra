@@ -67,7 +67,7 @@ export default function StrategiesPage() {
 
   const handleToggle = async (id: string) => {
     try {
-      await fetchApi(`/api/strategies/${id}/toggle`, { method: 'POST' });
+      await fetchApi(`/api/builder/strategies/${id}/toggle`, { method: 'POST' });
       fetchStrategies();
     } catch {
       /* toggle failed */
