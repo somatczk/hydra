@@ -65,7 +65,7 @@ jobs:
             dockerfile: docker/Dockerfile.backtest
             context: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Login to GHCR
         env:

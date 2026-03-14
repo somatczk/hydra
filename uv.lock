@@ -288,9 +288,9 @@ name = "build"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "os_name == 'nt'" },
-    { name = "packaging" },
-    { name = "pyproject-hooks" },
+    { name = "colorama", marker = "os_name == 'nt' and sys_platform != 'win32'" },
+    { name = "packaging", marker = "sys_platform != 'win32'" },
+    { name = "pyproject-hooks", marker = "sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/18/94eaffda7b329535d91f00fe605ab1f1e5cd68b2074d03f255c7d250687d/build-1.4.0.tar.gz", hash = "sha256:f1b91b925aa322be454f8330c6fb48b465da993d1e7e7e6fa35027ec49f3c936", size = 50054 }
 wheels = [
@@ -1457,7 +1457,7 @@ requires-dist = [
     { name = "onnxmltools", marker = "extra == 'ml-training'", specifier = ">=1.12,<2" },
     { name = "onnxruntime", specifier = ">=1.20,<2" },
     { name = "optuna", marker = "extra == 'ml-training'", specifier = ">=4.1,<5" },
-    { name = "pandas", specifier = ">=2.2,<3" },
+    { name = "pandas", specifier = ">=2.2,<4" },
     { name = "prometheus-client", specifier = ">=0.21,<1" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
@@ -1467,13 +1467,13 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0,<7" },
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.14,<4" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3,<3" },
-    { name = "python-telegram-bot", specifier = ">=21.9,<22" },
+    { name = "python-telegram-bot", specifier = ">=21.9,<23" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "redis", extras = ["hiredis"], specifier = ">=5.2,<6" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8,<1" },
     { name = "scikit-learn", marker = "extra == 'ml-training'", specifier = ">=1.6,<2" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3" },
-    { name = "structlog", specifier = ">=24.4,<25" },
+    { name = "structlog", specifier = ">=24.4,<26" },
     { name = "ta-lib", marker = "sys_platform != 'win32'", specifier = ">=0.5,<1" },
     { name = "testcontainers", extras = ["postgres", "redis"], marker = "extra == 'dev'", specifier = ">=4.9,<5" },
     { name = "torch", marker = "extra == 'ml-training'", specifier = ">=2.5,<3" },
@@ -1481,8 +1481,8 @@ requires-dist = [
     { name = "types-redis", marker = "extra == 'dev'", specifier = ">=4.6" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
     { name = "vectorbt", specifier = ">=0.26,<1" },
-    { name = "websockets", specifier = ">=14.1,<15" },
-    { name = "xgboost", marker = "extra == 'ml-training'", specifier = ">=2.1,<3" },
+    { name = "websockets", specifier = ">=14.1,<17" },
+    { name = "xgboost", marker = "extra == 'ml-training'", specifier = ">=2.1,<4" },
 ]
 provides-extras = ["ml-training", "dev"]
 
@@ -3870,8 +3870,8 @@ name = "ta-lib"
 version = "0.6.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "build" },
-    { name = "numpy" },
+    { name = "build", marker = "sys_platform != 'win32'" },
+    { name = "numpy", marker = "sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ba/ec/27114f6255e6723783d4c4366810620a4347375ebf66f8aea86d9dd58ffd/ta_lib-0.6.8.tar.gz", hash = "sha256:3a9195299df9d7d2a6e9d16bebd6b706b0ea99e4b871864c4b034c2577e21a77", size = 380772 }
 wheels = [
