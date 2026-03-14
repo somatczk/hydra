@@ -95,9 +95,22 @@ function BacktestPageContent() {
   const [timeframe, setTimeframe] = useState('1h');
   const [initialCapital, setInitialCapital] = useState('10000');
   const [backtestName, setBacktestName] = useState('');
-  const [pollingTaskId, setPollingTaskId] = useState<string | null>(null);
+  const [pollingTaskId, setPollingTaskId] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') return localStorage.getItem('backtest_task_id');
+    return null;
+  });
   const [progress, setProgress] = useState(0);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Sync pollingTaskId to localStorage
+  useEffect(() => {
+    if (pollingTaskId) {
+      localStorage.setItem('backtest_task_id', pollingTaskId);
+      setRunning(true);
+    } else {
+      localStorage.removeItem('backtest_task_id');
+    }
+  }, [pollingTaskId]);
 
   const fetchResults = async () => {
     try {
