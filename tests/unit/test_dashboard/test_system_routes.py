@@ -339,3 +339,120 @@ class TestSystemHealth:
             assert resp.status_code == 200
             data = resp.json()
             assert data["overall"] == "degraded"
+
+
+# ---------------------------------------------------------------------------
+# Exchange connect / disconnect endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestExchangeConnect:
+    def test_connect_exchange_success(self) -> None:
+        """POST connect stores credentials and returns success."""
+        app = _make_app(pool=None)
+        client = TestClient(app)
+        resp = client.post(
+            "/api/system/exchanges/binance/connect",
+            json={"api_key": "key123", "api_secret": "secret456"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == "binance"
+        assert data["name"] == "Binance"
+        assert data["connected"] is True
+        assert "Successfully connected" in data["message"]
+
+    def test_connect_exchange_with_passphrase(self) -> None:
+        """POST connect with optional passphrase."""
+        app = _make_app(pool=None)
+        client = TestClient(app)
+        resp = client.post(
+            "/api/system/exchanges/okx/connect",
+            json={"api_key": "key", "api_secret": "secret", "passphrase": "pass123"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == "okx"
+        assert data["connected"] is True
+
+    def test_connect_unknown_exchange_returns_404(self) -> None:
+        """POST connect with unknown exchange ID returns 404."""
+        app = _make_app(pool=None)
+        client = TestClient(app)
+        resp = client.post(
+            "/api/system/exchanges/unknown/connect",
+            json={"api_key": "key", "api_secret": "secret"},
+        )
+        assert resp.status_code == 404
+
+    def test_disconnect_exchange_success(self) -> None:
+        """DELETE connect removes credentials."""
+        app = _make_app(pool=None)
+        client = TestClient(app)
+        # First connect
+        client.post(
+            "/api/system/exchanges/binance/connect",
+            json={"api_key": "key", "api_secret": "secret"},
+        )
+        # Then disconnect
+        resp = client.delete("/api/system/exchanges/binance/connect")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is False
+        assert "Disconnected" in data["message"]
+
+    def test_disconnect_unknown_exchange_returns_404(self) -> None:
+        """DELETE connect with unknown exchange returns 404."""
+        app = _make_app(pool=None)
+        client = TestClient(app)
+        resp = client.delete("/api/system/exchanges/unknown/connect")
+        assert resp.status_code == 404
+
+    def test_connect_reflects_in_exchanges_list(self) -> None:
+        """After connecting, GET exchanges shows the exchange as connected."""
+        env = {
+            "BINANCE_API_KEY": "",
+            "BYBIT_API_KEY": "",
+            "KRAKEN_API_KEY": "",
+            "OKX_API_KEY": "",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            app = _make_app(pool=None)
+            client = TestClient(app)
+            # Connect binance via the endpoint
+            client.post(
+                "/api/system/exchanges/binance/connect",
+                json={"api_key": "key", "api_secret": "secret"},
+            )
+            # Check exchanges list
+            resp = client.get("/api/system/exchanges")
+            assert resp.status_code == 200
+            data = resp.json()
+            binance = next(e for e in data if e["id"] == "binance")
+            assert binance["api_key_set"] is True
+            assert binance["connected"] is True
+
+    def test_disconnect_reflects_in_exchanges_list(self) -> None:
+        """After disconnecting, GET exchanges shows the exchange as disconnected."""
+        env = {
+            "BINANCE_API_KEY": "",
+            "BYBIT_API_KEY": "",
+            "KRAKEN_API_KEY": "",
+            "OKX_API_KEY": "",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            app = _make_app(pool=None)
+            client = TestClient(app)
+            # Connect then disconnect
+            client.post(
+                "/api/system/exchanges/binance/connect",
+                json={"api_key": "key", "api_secret": "secret"},
+            )
+            client.delete("/api/system/exchanges/binance/connect")
+            # Check exchanges list
+            resp = client.get("/api/system/exchanges")
+            assert resp.status_code == 200
+            data = resp.json()
+            binance = next(e for e in data if e["id"] == "binance")
+            assert binance["api_key_set"] is False
+            assert binance["connected"] is False

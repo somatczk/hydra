@@ -8,6 +8,7 @@ import { Select } from '@/components/ui/Select';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
+import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDialog';
 
 /* ---------- Types ---------- */
 
@@ -80,6 +81,8 @@ export default function SettingsPage() {
     'Strategy Signals': false,
     'System Health': true,
   });
+  const [selectedExchange, setSelectedExchange] = useState<Exchange | null>(null);
+  const [modalOpen, setModalOpen] = useState(false);
 
   useEffect(() => {
     Promise.all([
@@ -98,6 +101,13 @@ export default function SettingsPage() {
       })
       .finally(() => setLoading(false));
   }, []);
+
+  const refreshExchanges = async () => {
+    try {
+      const ex = await fetchApi<ApiExchange[]>('/api/system/exchanges');
+      setExchanges(mapApiExchanges(ex));
+    } catch { /* ignore */ }
+  };
 
   const handleSaveConfig = async () => {
     try {
@@ -163,7 +173,14 @@ export default function SettingsPage() {
                 <span className="text-xs text-text-muted">
                   API Key: {exchange.apiKeySet ? 'Configured' : 'Not set'}
                 </span>
-                <Button variant={exchange.connected ? 'ghost' : 'outline'} size="sm">
+                <Button
+                  variant={exchange.connected ? 'ghost' : 'outline'}
+                  size="sm"
+                  onClick={() => {
+                    setSelectedExchange(exchange);
+                    setModalOpen(true);
+                  }}
+                >
                   {exchange.connected ? 'Manage' : 'Connect'}
                 </Button>
               </div>
@@ -274,6 +291,12 @@ export default function SettingsPage() {
           </Button>
         </div>
       </DataCard>
+      <ExchangeConnectDialog
+        open={modalOpen}
+        onClose={() => { setModalOpen(false); setSelectedExchange(null); }}
+        exchange={selectedExchange}
+        onUpdated={refreshExchanges}
+      />
     </div>
   );
 }

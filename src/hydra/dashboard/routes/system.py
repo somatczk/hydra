@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -39,6 +39,13 @@ def _get_system_config(request: Request) -> dict[str, Any]:
 def _set_system_config(request: Request, config: dict[str, Any]) -> None:
     """Persist system config to app state."""
     request.app.state.system_config = config
+
+
+def _get_exchange_credentials(request: Request) -> dict[str, Any]:
+    """Return exchange credentials store from app state."""
+    if not hasattr(request.app.state, "exchange_credentials"):
+        request.app.state.exchange_credentials = {}
+    return request.app.state.exchange_credentials
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +84,19 @@ class ServiceHealth(BaseModel):
 class SystemHealth(BaseModel):
     overall: str  # healthy | degraded | down
     services: list[ServiceHealth]
+
+
+class ExchangeConnectRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    passphrase: str | None = None
+
+
+class ExchangeConnectResponse(BaseModel):
+    id: str
+    name: str
+    connected: bool
+    message: str
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +201,11 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for exchange_id, display_name, env_key in _EXCHANGE_DEFS:
         api_key_set = bool(os.environ.get(env_key))
-        connected = db_connected and api_key_set
+        # Also check runtime-stored credentials
+        creds = _get_exchange_credentials(request)
+        if exchange_id in creds:
+            api_key_set = True
+        connected = api_key_set and (db_connected or exchange_id in creds)
         last_sync = "Active" if connected else ("Not connected" if not api_key_set else "Standby")
 
         results.append(
@@ -195,6 +219,52 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
         )
 
     return results if results else _EXCHANGES_PLACEHOLDER
+
+
+@router.post("/exchanges/{exchange_id}/connect", response_model=ExchangeConnectResponse)
+async def connect_exchange(
+    exchange_id: str, body: ExchangeConnectRequest, request: Request
+) -> dict[str, Any]:
+    """Store exchange API credentials and mark as connected."""
+    known_ids = {eid for eid, _, _ in _EXCHANGE_DEFS}
+    if exchange_id not in known_ids:
+        raise HTTPException(status_code=404, detail=f"Unknown exchange: {exchange_id}")
+
+    display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
+    creds = _get_exchange_credentials(request)
+    creds[exchange_id] = {
+        "api_key": body.api_key,
+        "api_secret": body.api_secret,
+        "passphrase": body.passphrase,
+    }
+    logger.info("Exchange credentials stored for %s", exchange_id)
+
+    return {
+        "id": exchange_id,
+        "name": display_name,
+        "connected": True,
+        "message": f"Successfully connected to {display_name}",
+    }
+
+
+@router.delete("/exchanges/{exchange_id}/connect", response_model=ExchangeConnectResponse)
+async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, Any]:
+    """Remove stored exchange credentials."""
+    known_ids = {eid for eid, _, _ in _EXCHANGE_DEFS}
+    if exchange_id not in known_ids:
+        raise HTTPException(status_code=404, detail=f"Unknown exchange: {exchange_id}")
+
+    display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
+    creds = _get_exchange_credentials(request)
+    creds.pop(exchange_id, None)
+    logger.info("Exchange credentials removed for %s", exchange_id)
+
+    return {
+        "id": exchange_id,
+        "name": display_name,
+        "connected": False,
+        "message": f"Disconnected from {display_name}",
+    }
 
 
 @router.get("/health", response_model=SystemHealth)

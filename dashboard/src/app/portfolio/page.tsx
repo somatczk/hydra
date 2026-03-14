@@ -6,9 +6,16 @@ import {
   TrendingUp,
   TrendingDown,
   Receipt,
-  LineChart,
-  ArrowDownRight,
 } from 'lucide-react';
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid,
+} from 'recharts';
 import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
 import { fetchApi } from '@/lib/api';
@@ -35,6 +42,9 @@ interface Position {
   pnl_pct: number;
 }
 
+interface EquityPoint { timestamp: string; value: number; }
+interface DailyPnl { date: string; pnl: number; }
+
 /* ---------- Placeholder data ---------- */
 
 const placeholderSummary: PortfolioSummary = {
@@ -51,21 +61,56 @@ const placeholderPositions = [
   { label: 'Cash (USDT)', allocation: 40, value: '$4,980.00' },
 ];
 
+/* ---------- Utilities ---------- */
+
+function computeDrawdown(curve: EquityPoint[]): Array<{ timestamp: string; drawdown: number }> {
+  let peak = 0;
+  return curve.map((p) => {
+    if (p.value > peak) peak = p.value;
+    const dd = peak > 0 ? ((peak - p.value) / peak) * 100 : 0;
+    return { timestamp: p.timestamp, drawdown: dd };
+  });
+}
+
+function formatXTick(timestamp: string): string {
+  const d = new Date(timestamp);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function formatYTick(value: number): string {
+  return `$${(value / 1000).toFixed(0)}k`;
+}
+
+function formatDrawdownTick(value: number): string {
+  return `${value.toFixed(1)}%`;
+}
+
 /* ---------- Page ---------- */
 
 export default function PortfolioPage() {
   const [summary, setSummary] = useState<PortfolioSummary>(placeholderSummary);
   const [positions, setPositions] = useState<Position[]>([]);
+  const [equityCurve, setEquityCurve] = useState<EquityPoint[]>([]);
+  const [dailyPnl, setDailyPnl] = useState<DailyPnl[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isDark, setIsDark] = useState(false);
+
+  useEffect(() => {
+    setIsDark(document.documentElement.classList.contains('dark'));
+  }, []);
 
   useEffect(() => {
     Promise.all([
       fetchApi<PortfolioSummary>('/api/portfolio/summary').catch(() => null),
       fetchApi<Position[]>('/api/portfolio/positions').catch(() => null),
+      fetchApi<EquityPoint[]>('/api/portfolio/equity-curve').catch(() => null),
+      fetchApi<DailyPnl[]>('/api/portfolio/daily-pnl').catch(() => null),
     ])
-      .then(([s, p]) => {
+      .then(([s, p, ec, dp]) => {
         if (s) setSummary(s);
         if (p) setPositions(p);
+        if (ec) setEquityCurve(ec);
+        if (dp) setDailyPnl(dp);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -82,6 +127,12 @@ export default function PortfolioPage() {
         };
       })
     : placeholderPositions;
+
+  const drawdownData = computeDrawdown(equityCurve);
+
+  const accentColor = isDark ? '#2383e2' : '#2563eb';
+  const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
+  const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
 
   const fmt = (v: number) => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
 
@@ -123,32 +174,121 @@ export default function PortfolioPage() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {/* Equity Curve */}
         <DataCard title="Equity Curve" description="Portfolio value over time">
-          <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-            <div className="text-center">
-              <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
-                <LineChart className="h-5 w-5 text-text-muted" />
-              </div>
-              <p className="text-sm font-medium text-text-muted">Equity Curve</p>
-              <p className="mt-1 text-xs text-text-light">
-                {loading ? 'Loading...' : 'Recharts area chart'}
+          {equityCurve.length === 0 ? (
+            <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
+              <p className="text-sm text-text-muted">
+                {loading ? 'Loading...' : 'No data'}
               </p>
             </div>
-          </div>
+          ) : (
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={equityCurve} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="portfolioEquityGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={accentColor} stopOpacity={0.2} />
+                      <stop offset="95%" stopColor={accentColor} stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />
+                  <XAxis
+                    dataKey="timestamp"
+                    tickFormatter={formatXTick}
+                    tick={{ fontSize: 11, fill: textMuted }}
+                    axisLine={false}
+                    tickLine={false}
+                    minTickGap={40}
+                  />
+                  <YAxis
+                    tickFormatter={formatYTick}
+                    tick={{ fontSize: 11, fill: textMuted }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={44}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: isDark ? '#1e2433' : '#ffffff',
+                      border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
+                      borderRadius: '8px',
+                      fontSize: '12px',
+                    }}
+                    formatter={(v: number) => [`$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 'Value']}
+                    labelFormatter={formatXTick}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="value"
+                    stroke={accentColor}
+                    strokeWidth={2}
+                    fill="url(#portfolioEquityGradient)"
+                    dot={false}
+                    activeDot={{ r: 4, fill: accentColor, strokeWidth: 0 }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
         </DataCard>
 
         {/* Drawdown Chart */}
         <DataCard title="Drawdown" description="Maximum drawdown over time">
-          <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-            <div className="text-center">
-              <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
-                <ArrowDownRight className="h-5 w-5 text-text-muted" />
-              </div>
-              <p className="text-sm font-medium text-text-muted">Drawdown Chart</p>
-              <p className="mt-1 text-xs text-text-light">
-                {loading ? 'Loading...' : 'Recharts bar chart'}
+          {equityCurve.length === 0 ? (
+            <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
+              <p className="text-sm text-text-muted">
+                {loading ? 'Loading...' : 'No data'}
               </p>
             </div>
-          </div>
+          ) : (
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={drawdownData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="portfolioDrawdownGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#ef4444" stopOpacity={0.2} />
+                      <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />
+                  <XAxis
+                    dataKey="timestamp"
+                    tickFormatter={formatXTick}
+                    tick={{ fontSize: 11, fill: textMuted }}
+                    axisLine={false}
+                    tickLine={false}
+                    minTickGap={40}
+                  />
+                  <YAxis
+                    tickFormatter={formatDrawdownTick}
+                    tick={{ fontSize: 11, fill: textMuted }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={44}
+                    reversed
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: isDark ? '#1e2433' : '#ffffff',
+                      border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
+                      borderRadius: '8px',
+                      fontSize: '12px',
+                    }}
+                    formatter={(v: number) => [`${v.toFixed(2)}%`, 'Drawdown']}
+                    labelFormatter={formatXTick}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="drawdown"
+                    stroke="#ef4444"
+                    strokeWidth={2}
+                    fill="url(#portfolioDrawdownGradient)"
+                    dot={false}
+                    activeDot={{ r: 4, fill: '#ef4444', strokeWidth: 0 }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
         </DataCard>
       </div>
 

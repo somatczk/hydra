@@ -1,7 +1,19 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, Activity, TrendingDown } from 'lucide-react';
+import { ShieldCheck, ShieldAlert, AlertTriangle, Ban } from 'lucide-react';
+import {
+  RadialBarChart,
+  RadialBar,
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  Cell,
+} from 'recharts';
 import { DataCard } from '@/components/ui/DataCard';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
@@ -99,11 +111,15 @@ function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
   };
 }
 
+interface DailyPnl { date: string; pnl: number; }
+
 /* ---------- Page ---------- */
 
 export default function RiskPage() {
   const [state, setState] = useState<RiskState>(placeholderState);
   const [loading, setLoading] = useState(true);
+  const [dailyPnl, setDailyPnl] = useState<DailyPnl[]>([]);
+  const [isDark, setIsDark] = useState(false);
   const [riskEvents] = useState<RiskEvent[]>([
     { time: '14:32', message: 'Position stop-loss triggered on BTC/USDT short at $68,180', severity: 'warning' },
     { time: '11:15', message: 'Strategy cooldown activated for Breakout Scanner after 3 consecutive losses', severity: 'warning' },
@@ -111,10 +127,20 @@ export default function RiskPage() {
   ]);
 
   useEffect(() => {
+    setIsDark(document.documentElement.classList.contains('dark'));
+  }, []);
+
+  useEffect(() => {
     fetchApi<ApiRiskStatus>('/api/risk/status')
       .then((data) => setState(mapApiRiskStatus(data)))
       .catch(() => { /* keep placeholder */ })
       .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    fetchApi<DailyPnl[]>('/api/portfolio/daily-pnl')
+      .then((data) => setDailyPnl(data))
+      .catch(() => { /* keep empty */ });
   }, []);
 
   const { circuitBreakers, drawdown, maxDrawdown } = state;
@@ -168,13 +194,34 @@ export default function RiskPage() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {/* Drawdown gauge */}
         <DataCard title="Current Drawdown" description="Real-time portfolio drawdown from peak">
-          <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-            <div className="text-center">
-              <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
-                <TrendingDown className="h-5 w-5 text-text-muted" />
-              </div>
-              <p className="text-sm font-medium text-text-muted">Drawdown Gauge</p>
-              <p className="mt-1 text-xs text-text-light">{drawdown}% / {maxDrawdown}% max</p>
+          <div className="relative h-48">
+            <ResponsiveContainer width="100%" height="100%">
+              <RadialBarChart
+                cx="50%"
+                cy="100%"
+                innerRadius="60%"
+                outerRadius="90%"
+                startAngle={180}
+                endAngle={0}
+                data={[{ value: drawdownPct }]}
+              >
+                <RadialBar
+                  dataKey="value"
+                  cornerRadius={4}
+                  background={{ fill: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)' }}
+                  fill={drawdownPct < 40 ? '#22c55e' : drawdownPct < 70 ? '#f59e0b' : '#ef4444'}
+                />
+              </RadialBarChart>
+            </ResponsiveContainer>
+            {/* Center label — positioned over the flat edge of the semicircle */}
+            <div className="absolute bottom-2 left-0 right-0 flex flex-col items-center">
+              <span className={cn(
+                'text-2xl font-bold font-display',
+                drawdownPct < 40 ? 'text-status-success' : drawdownPct < 70 ? 'text-status-warning' : 'text-status-error',
+              )}>
+                {drawdown.toFixed(1)}%
+              </span>
+              <span className="text-xs text-text-muted">of {maxDrawdown}% limit</span>
             </div>
           </div>
           <div className="mt-4 space-y-2">
@@ -197,17 +244,55 @@ export default function RiskPage() {
 
         {/* Daily loss tracker */}
         <DataCard title="Daily Loss Tracker" description="Cumulative losses today">
-          <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-            <div className="text-center">
-              <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
-                <Activity className="h-5 w-5 text-text-muted" />
-              </div>
-              <p className="text-sm font-medium text-text-muted">Daily Loss Chart</p>
-              <p className="mt-1 text-xs text-text-light">
-                {loading ? 'Loading...' : 'Hourly loss accumulation'}
+          {dailyPnl.length === 0 ? (
+            <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
+              <p className="text-sm text-text-muted">
+                {loading ? 'Loading...' : 'No data'}
               </p>
             </div>
-          </div>
+          ) : (
+            <div className="h-48">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={dailyPnl} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)'} vertical={false} />
+                  <XAxis
+                    dataKey="date"
+                    tick={{ fontSize: 11, fill: isDark ? 'rgba(255,255,255,0.44)' : '#475569' }}
+                    axisLine={false}
+                    tickLine={false}
+                    minTickGap={20}
+                  />
+                  <YAxis
+                    tickFormatter={(v: number) => `$${v >= 0 ? '' : '-'}${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 0 })}`}
+                    tick={{ fontSize: 11, fill: isDark ? 'rgba(255,255,255,0.44)' : '#475569' }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={52}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: isDark ? '#1e2433' : '#ffffff',
+                      border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
+                      borderRadius: '8px',
+                      fontSize: '12px',
+                    }}
+                    formatter={(v: number) => [
+                      `${v >= 0 ? '+' : ''}$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+                      'PnL',
+                    ]}
+                  />
+                  <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
+                    {dailyPnl.map((entry, index) => (
+                      <Cell
+                        key={`cell-${index}`}
+                        fill={entry.pnl >= 0 ? '#22c55e' : '#ef4444'}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
           <div className="mt-4 space-y-2">
             {[
               { label: 'Max daily loss', value: `-$${state.dailyLoss.toFixed(2)}`, color: 'text-status-error' },

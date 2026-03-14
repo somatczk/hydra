@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { Play, Download, BarChart3 } from 'lucide-react';
 import {
   AreaChart,
@@ -20,6 +20,8 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
 
 /* ---------- Types ---------- */
+
+type TimeResolution = 'hours' | 'days' | 'months';
 
 interface BacktestRun {
   id: string;
@@ -108,8 +110,29 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
 
 /* ---------- Recharts helpers ---------- */
 
-function formatXTick(timestamp: string): string {
+function aggregateEquityCurve(data: EquityPoint[], resolution: TimeResolution): EquityPoint[] {
+  if (resolution === 'hours') return data;
+
+  const groups = new Map<string, EquityPoint>();
+  for (const point of data) {
+    const d = new Date(point.timestamp);
+    const key = resolution === 'days'
+      ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    // Last value per group wins — iterating in order gives us that for free
+    groups.set(key, point);
+  }
+  return Array.from(groups.values());
+}
+
+function formatXTick(timestamp: string, resolution: TimeResolution = 'days'): string {
   const d = new Date(timestamp);
+  if (resolution === 'hours') {
+    return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+  if (resolution === 'months') {
+    return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+  }
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
@@ -117,17 +140,19 @@ function formatYTick(value: number): string {
   return `$${(value / 1000).toFixed(0)}k`;
 }
 
-const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number }>; label?: string }) => {
-  if (!active || !payload?.length) return null;
-  return (
-    <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
-      <p className="text-xs text-text-muted">{label ? formatXTick(label) : ''}</p>
-      <p className="text-sm font-medium text-text-primary">
-        ${payload[0].value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-      </p>
-    </div>
-  );
-};
+function makeCustomTooltip(resolution: TimeResolution) {
+  return function CustomTooltip({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number }>; label?: string }) {
+    if (!active || !payload?.length) return null;
+    return (
+      <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
+        <p className="text-xs text-text-muted">{label ? formatXTick(label, resolution) : ''}</p>
+        <p className="text-sm font-medium text-text-primary">
+          ${payload[0].value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+        </p>
+      </div>
+    );
+  };
+}
 
 /* ---------- Page ---------- */
 
@@ -144,6 +169,7 @@ export default function BacktestPage() {
   const [selectedDetail, setSelectedDetail] = useState<ApiBacktestDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [isDark, setIsDark] = useState(false);
+  const [resolution, setResolution] = useState<TimeResolution>('days');
 
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
@@ -222,6 +248,13 @@ export default function BacktestPage() {
   const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
   const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
 
+  const chartData = useMemo(
+    () => selectedDetail ? aggregateEquityCurve(selectedDetail.equity_curve, resolution) : [],
+    [selectedDetail, resolution],
+  );
+
+  const ChartTooltip = useMemo(() => makeCustomTooltip(resolution), [resolution]);
+
   const columns = [
     { key: 'strategy', header: 'Strategy' },
     { key: 'period', header: 'Period', hideOnMobile: true },
@@ -299,10 +332,24 @@ export default function BacktestPage() {
           </div>
         ) : selectedDetail ? (
           <div className="flex flex-col gap-4">
+            {/* Resolution switcher */}
+            <div className="flex items-center gap-1">
+              {(['hours', 'days', 'months'] as TimeResolution[]).map((r) => (
+                <Button
+                  key={r}
+                  size="sm"
+                  variant={resolution === r ? 'outline' : 'ghost'}
+                  onClick={() => setResolution(r)}
+                >
+                  {r.charAt(0).toUpperCase() + r.slice(1)}
+                </Button>
+              ))}
+            </div>
+
             {/* Equity curve chart */}
             <div className="h-56">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={selectedDetail.equity_curve} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
                   <defs>
                     <linearGradient id="backtestGradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor={accentColor} stopOpacity={0.2} />
@@ -312,7 +359,7 @@ export default function BacktestPage() {
                   <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />
                   <XAxis
                     dataKey="timestamp"
-                    tickFormatter={formatXTick}
+                    tickFormatter={(ts) => formatXTick(ts, resolution)}
                     tick={{ fontSize: 11, fill: textMuted }}
                     axisLine={false}
                     tickLine={false}
@@ -325,7 +372,7 @@ export default function BacktestPage() {
                     tickLine={false}
                     width={44}
                   />
-                  <Tooltip content={<CustomTooltip />} />
+                  <Tooltip content={<ChartTooltip />} />
                   <Area
                     type="monotone"
                     dataKey="value"

@@ -1,8 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { CandlestickChart, ArrowUpDown } from 'lucide-react';
-import { createChart, ColorType, type IChartApi, type UTCTimestamp } from 'lightweight-charts';
+import { ArrowUpDown } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
@@ -166,33 +165,6 @@ const tradeHistoryColumns = [
   },
 ];
 
-/* ---------- Sample candle data ---------- */
-
-interface CandleBar {
-  time: UTCTimestamp;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-}
-
-function generateCandleData(count: number): CandleBar[] {
-  const data: CandleBar[] = [];
-  let price = 68000;
-  const now = Math.floor(Date.now() / 1000);
-  for (let i = count; i > 0; i--) {
-    const time = (now - i * 3600) as UTCTimestamp; // hourly candles
-    const change = (Math.random() - 0.48) * 500;
-    const open = price;
-    price = Math.max(price + change, 50000);
-    const close = price;
-    const high = Math.max(open, close) + Math.random() * 200;
-    const low = Math.min(open, close) - Math.random() * 200;
-    data.push({ time, open, high, low, close });
-  }
-  return data;
-}
-
 /* ---------- Page ---------- */
 
 export default function TradingPage() {
@@ -200,8 +172,7 @@ export default function TradingPage() {
   const [recentTrades, setRecentTrades] = useState<RecentTrade[]>(placeholderTrades);
   const [loading, setLoading] = useState(true);
 
-  const containerRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<IChartApi | null>(null);
+  const widgetContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     Promise.all([
@@ -214,56 +185,32 @@ export default function TradingPage() {
     ]).finally(() => setLoading(false));
   }, []);
 
-  // Create the lightweight-charts candlestick chart
   useEffect(() => {
-    if (!containerRef.current) return;
+    const container = widgetContainerRef.current;
+    if (!container) return;
 
     const isDark = document.documentElement.classList.contains('dark');
 
-    const chart = createChart(containerRef.current, {
-      layout: {
-        background: { type: ColorType.Solid, color: 'transparent' },
-        textColor: isDark ? 'rgba(255,255,255,0.44)' : '#475569',
-      },
-      grid: {
-        vertLines: { color: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)' },
-        horzLines: { color: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)' },
-      },
-      width: containerRef.current.clientWidth,
-      height: containerRef.current.clientHeight,
-      timeScale: { timeVisible: true, secondsVisible: false },
+    const script = document.createElement('script');
+    script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+    script.type = 'text/javascript';
+    script.async = true;
+    script.innerHTML = JSON.stringify({
+      autosize: true,
+      symbol: 'BINANCE:BTCUSDT',
+      interval: '60',
+      timezone: 'Etc/UTC',
+      theme: isDark ? 'dark' : 'light',
+      style: '1',
+      locale: 'en',
+      allow_symbol_change: true,
+      support_host: 'https://www.tradingview.com',
     });
 
-    chartRef.current = chart;
-
-    const series = chart.addCandlestickSeries({
-      upColor: isDark ? '#35a569' : '#22c55e',
-      downColor: isDark ? '#eb5757' : '#ef4444',
-      borderVisible: false,
-      wickUpColor: isDark ? '#35a569' : '#22c55e',
-      wickDownColor: isDark ? '#eb5757' : '#ef4444',
-    });
-
-    series.setData(generateCandleData(100));
-    chart.timeScale().fitContent();
-
-    // Resize observer keeps chart dimensions in sync with container
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (entry && chartRef.current) {
-        chartRef.current.applyOptions({
-          width: entry.contentRect.width,
-          height: entry.contentRect.height,
-        });
-      }
-    });
-
-    observer.observe(containerRef.current);
+    container.appendChild(script);
 
     return () => {
-      observer.disconnect();
-      chart.remove();
-      chartRef.current = null;
+      container.innerHTML = '';
     };
   }, []);
 
@@ -271,7 +218,9 @@ export default function TradingPage() {
     <div className="flex flex-col gap-6">
       {/* Candlestick chart */}
       <DataCard title="BTC/USDT" description="Live price chart">
-        <div ref={containerRef} className="h-80 md:h-[28rem] w-full" />
+        <div className="tradingview-widget-container h-80 md:h-[28rem] w-full" ref={widgetContainerRef}>
+          <div className="tradingview-widget-container__widget h-full w-full" />
+        </div>
       </DataCard>
 
       {/* Open positions */}

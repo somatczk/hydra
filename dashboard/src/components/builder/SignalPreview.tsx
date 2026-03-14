@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Eye, TrendingUp, TrendingDown, BarChart3 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
+import { fetchApi } from '@/lib/api';
 import type { PreviewResponse, PreviewSignal, BuilderState, SerializedConditionGroup } from './types';
 
 interface SignalPreviewProps {
@@ -47,18 +48,10 @@ export function SignalPreview({ state }: SignalPreviewProps) {
     };
 
     try {
-      const response = await fetch('/api/builder/preview', {
+      const data = await fetchApi<PreviewResponse>('/api/builder/preview', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
       });
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.detail || 'Preview failed');
-      }
-
-      const data: PreviewResponse = await response.json();
       setPreview(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Preview failed');
