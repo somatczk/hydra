@@ -8,6 +8,8 @@ import { Select } from '@/components/ui/Select';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import { logger } from '@/lib/logger';
 import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDialog';
 
 /* ---------- Types ---------- */
@@ -70,6 +72,7 @@ function mapApiExchanges(data: ApiExchange[]): Exchange[] {
 /* ---------- Page ---------- */
 
 export default function SettingsPage() {
+  const { toast } = useToast();
   const [exchanges, setExchanges] = useState<Exchange[]>(placeholderExchanges);
   const [config, setConfig] = useState<PlatformConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -78,7 +81,6 @@ export default function SettingsPage() {
   const [defaultTimeframe, setDefaultTimeframe] = useState('1h');
   const [maxStrategies, setMaxStrategies] = useState('5');
   const [paperCapital, setPaperCapital] = useState('10000');
-  const [saved, setSaved] = useState(false);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [notifications, setNotifications] = useState<Record<string, boolean>>({
     'Trade Executions': true,
@@ -116,7 +118,7 @@ export default function SettingsPage() {
     try {
       const ex = await fetchApi<ApiExchange[]>('/api/system/exchanges');
       setExchanges(mapApiExchanges(ex));
-    } catch { /* ignore */ }
+    } catch (err) { logger.warn('Settings', 'Failed to refresh exchanges', err); }
   };
 
   const handleSaveConfig = async () => {
@@ -130,10 +132,10 @@ export default function SettingsPage() {
           max_concurrent_strategies: Number(maxStrategies),
         }),
       });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch {
-      /* API unavailable */
+      toast('success', 'Platform configuration saved');
+    } catch (err) {
+      logger.error('Settings', 'Failed to save config', err);
+      toast('error', 'Failed to save configuration');
     }
   };
 
@@ -312,9 +314,6 @@ export default function SettingsPage() {
           />
         </div>
         <div className="mt-4 flex items-center justify-end gap-3">
-          {saved && (
-            <span className="text-sm font-medium text-status-success">Configuration saved</span>
-          )}
           <Button variant="primary" onClick={handleSaveConfig}>
             <Cog className="h-4 w-4" />
             {loading ? 'Loading...' : 'Save Configuration'}

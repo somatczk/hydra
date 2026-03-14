@@ -2,11 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square } from 'lucide-react';
+import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square, Eye } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
 
@@ -72,6 +74,7 @@ function sessionStatusVariant(session: TradingSession | null): 'success' | 'warn
 
 export default function StrategiesPage() {
   const router = useRouter();
+  const { toast } = useToast();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [sessions, setSessions] = useState<TradingSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -88,8 +91,8 @@ export default function StrategiesPage() {
       ]);
       setSessions(sessData);
       setStrategies(mapBuilderStrategies(stratData, sessData));
-    } catch {
-      /* keep empty */
+    } catch (err) {
+      logger.warn('Strategies', 'Failed to fetch strategies', err);
     } finally {
       setLoading(false);
     }
@@ -100,9 +103,11 @@ export default function StrategiesPage() {
   const handleToggle = async (id: string) => {
     try {
       await fetchApi(`/api/builder/strategies/${id}/toggle`, { method: 'POST' });
+      toast('success', 'Strategy toggled');
       fetchData();
-    } catch {
-      /* toggle failed */
+    } catch (err) {
+      logger.error('Strategies', 'Failed to toggle strategy', err);
+      toast('error', 'Failed to toggle strategy');
     }
   };
 
@@ -111,9 +116,11 @@ export default function StrategiesPage() {
     setDeletingId(id);
     try {
       await fetchApi(`/api/builder/strategies/${id}`, { method: 'DELETE' });
+      toast('success', 'Strategy deleted');
       fetchData();
     } catch (err) {
-      alert(`Failed to delete: ${err instanceof Error ? err.message : 'unknown error'}`);
+      logger.error('Strategies', 'Failed to delete strategy', err);
+      toast('error', `Failed to delete: ${err instanceof Error ? err.message : 'unknown error'}`);
     } finally {
       setDeletingId(null);
     }
@@ -129,9 +136,11 @@ export default function StrategiesPage() {
           trading_mode: 'paper',
         }),
       });
+      toast('success', 'Paper session started');
       fetchData();
     } catch (err) {
-      alert(`Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
+      logger.error('Strategies', 'Failed to start paper session', err);
+      toast('error', `Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
     } finally {
       setStartingId(null);
     }
@@ -148,9 +157,11 @@ export default function StrategiesPage() {
           trading_mode: 'live',
         }),
       });
+      toast('success', 'Live session started');
       fetchData();
     } catch (err) {
-      alert(`Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
+      logger.error('Strategies', 'Failed to start live session', err);
+      toast('error', `Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
     } finally {
       setStartingId(null);
     }
@@ -160,9 +171,11 @@ export default function StrategiesPage() {
     setStoppingId(sessionId);
     try {
       await fetchApi(`/api/trading/sessions/${sessionId}`, { method: 'DELETE' });
+      toast('success', 'Session stopped');
       fetchData();
     } catch (err) {
-      alert(`Failed to stop: ${err instanceof Error ? err.message : 'unknown error'}`);
+      logger.error('Strategies', 'Failed to stop session', err);
+      toast('error', `Failed to stop: ${err instanceof Error ? err.message : 'unknown error'}`);
     } finally {
       setStoppingId(null);
     }
@@ -212,50 +225,67 @@ export default function StrategiesPage() {
                   size="sm"
                 />
                 {strategy.session && (
-                  <StatusBadge
-                    status={sessionStatusLabel(strategy.session)}
-                    variant={sessionStatusVariant(strategy.session)}
-                    size="sm"
-                  />
+                  <button
+                    onClick={() => router.push(`/trading/${strategy.session!.session_id}`)}
+                    className="cursor-pointer"
+                  >
+                    <StatusBadge
+                      status={sessionStatusLabel(strategy.session)}
+                      variant={sessionStatusVariant(strategy.session)}
+                      size="sm"
+                    />
+                  </button>
                 )}
               </div>
             </div>
 
-            {/* Trading controls */}
-            <div className="mt-3 flex items-center gap-2">
-              {strategy.session ? (
-                <Button
-                  variant="danger"
-                  size="sm"
-                  onClick={() => handleStop(strategy.session!.session_id)}
-                  loading={stoppingId === strategy.session.session_id}
-                >
-                  <Square className="h-3 w-3" />
-                  Stop
-                </Button>
-              ) : (
-                <>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => handleStartPaper(strategy.id)}
-                    loading={startingId === strategy.id}
-                  >
-                    <Play className="h-3 w-3" />
-                    Start Paper
-                  </Button>
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={() => handleStartLive(strategy.id)}
-                    loading={startingId === strategy.id}
-                  >
-                    <Play className="h-3 w-3" />
-                    Start Live
-                  </Button>
-                </>
-              )}
-            </div>
+            {/* Trading controls — only show on Active strategies or when a session is running */}
+            {(strategy.status === 'Active' || strategy.session) && (
+              <div className="mt-3 flex items-center gap-2">
+                {strategy.session ? (
+                  <>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => handleStop(strategy.session!.session_id)}
+                      loading={stoppingId === strategy.session.session_id}
+                    >
+                      <Square className="h-3 w-3" />
+                      Stop
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => router.push(`/trading/${strategy.session!.session_id}`)}
+                    >
+                      <Eye className="h-3 w-3" />
+                      View
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleStartPaper(strategy.id)}
+                      loading={startingId === strategy.id}
+                    >
+                      <Play className="h-3 w-3" />
+                      Start Paper
+                    </Button>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => handleStartLive(strategy.id)}
+                      loading={startingId === strategy.id}
+                    >
+                      <Play className="h-3 w-3" />
+                      Start Live
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
 
             {/* Action buttons */}
             <div className="mt-3 flex items-center justify-between border-t border-border-default pt-3">
@@ -287,17 +317,21 @@ export default function StrategiesPage() {
               </div>
               <div
                 className={cn(
-                  'relative h-6 w-11 cursor-pointer rounded-full transition-colors',
+                  'relative h-6 w-11 rounded-full transition-colors',
+                  strategy.session
+                    ? 'cursor-not-allowed opacity-50'
+                    : 'cursor-pointer',
                   strategy.status === 'Active'
                     ? 'bg-status-success'
                     : 'bg-bg-active',
                 )}
                 role="switch"
                 aria-checked={strategy.status === 'Active'}
+                aria-disabled={!!strategy.session}
                 aria-label={`${strategy.status === 'Active' ? 'Disable' : 'Enable'} ${strategy.name}`}
-                tabIndex={0}
-                onClick={() => handleToggle(strategy.id)}
-                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleToggle(strategy.id); }}
+                tabIndex={strategy.session ? -1 : 0}
+                onClick={() => { if (!strategy.session) handleToggle(strategy.id); }}
+                onKeyDown={(e) => { if (!strategy.session && (e.key === 'Enter' || e.key === ' ')) handleToggle(strategy.id); }}
               >
                 <div
                   className={cn(

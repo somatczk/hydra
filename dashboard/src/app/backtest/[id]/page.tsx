@@ -25,6 +25,8 @@ import { Input } from '@/components/ui/Input';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import { logger } from '@/lib/logger';
 import {
   type TimeResolution,
   type EquityPoint,
@@ -103,6 +105,7 @@ interface TxnRow {
 export default function BacktestDetailPage() {
   const params = useParams();
   const router = useRouter();
+  const { toast } = useToast();
   const resultId = params.id as string;
 
   const [detail, setDetail] = useState<ApiBacktestDetail | null>(null);
@@ -132,8 +135,8 @@ export default function BacktestDetailPage() {
         setDetail(d);
         setEditName(d.name || '');
         setVerification(v);
-      } catch {
-        /* 404 or API unavailable */
+      } catch (err) {
+        logger.warn('BacktestDetail', 'Failed to load backtest', err);
       } finally {
         setLoading(false);
       }
@@ -150,17 +153,19 @@ export default function BacktestDetailPage() {
       });
       setDetail({ ...detail, name: editName });
       setEditing(false);
-    } catch {
-      /* API unavailable */
+      toast('success', 'Backtest renamed');
+    } catch (err) {
+      toast('error', 'Failed to rename backtest');
     }
   };
 
   const handleDelete = async () => {
     try {
       await fetchApi<undefined>(`/api/backtest/results/${resultId}`, { method: 'DELETE' });
+      toast('success', 'Backtest deleted');
       router.push('/backtest');
-    } catch {
-      /* API unavailable */
+    } catch (err) {
+      toast('error', 'Failed to delete backtest');
     }
   };
 

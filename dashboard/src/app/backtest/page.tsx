@@ -10,6 +10,8 @@ import { Select } from '@/components/ui/Select';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
 
@@ -85,6 +87,7 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
 function BacktestPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { toast } = useToast();
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
@@ -154,8 +157,15 @@ function BacktestPageContent() {
           setRunning(false);
           setProgress(0);
           fetchResults();
+          if (status.status === 'completed') {
+            toast('success', 'Backtest completed');
+          } else {
+            toast('error', 'Backtest failed');
+            logger.error('Backtest', 'Backtest failed');
+          }
         }
       } catch {
+        logger.warn('Backtest', 'Polling failed, stopping');
         clearInterval(interval);
         setPollingTaskId(null);
         setRunning(false);
@@ -179,13 +189,16 @@ function BacktestPageContent() {
           timeframe,
         }),
       });
+      toast('info', 'Backtest started');
       if (result.task_id) {
         setPollingTaskId(result.task_id);
       } else {
         fetchResults();
         setRunning(false);
       }
-    } catch {
+    } catch (err) {
+      logger.error('Backtest', 'Failed to start backtest', err);
+      toast('error', 'Failed to start backtest');
       setRunning(false);
     }
   };
@@ -193,9 +206,11 @@ function BacktestPageContent() {
   const handleDelete = async (id: string) => {
     try {
       await fetchApi<undefined>(`/api/backtest/results/${id}`, { method: 'DELETE' });
+      toast('success', 'Backtest deleted');
       setBacktestRuns((prev) => prev.filter((r) => r.id !== id));
-    } catch {
-      /* API unavailable */
+    } catch (err) {
+      logger.error('Backtest', 'Failed to delete backtest', err);
+      toast('error', 'Failed to delete backtest');
     } finally {
       setDeletingId(null);
     }

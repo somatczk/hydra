@@ -38,6 +38,50 @@ class SessionResponse(BaseModel):
     error_message: str | None = None
 
 
+class PositionItem(BaseModel):
+    symbol: str
+    direction: str
+    quantity: float
+    avg_entry_price: float
+    unrealized_pnl: float
+
+
+class TradeItem(BaseModel, extra="allow"):
+    id: str | None = None
+    symbol: str | None = None
+    side: str | None = None
+    quantity: float = 0
+    price: float = 0
+    fee: float = 0
+    pnl: float = 0
+    timestamp: str | None = None
+
+
+class SessionMetrics(BaseModel):
+    balance: dict[str, float] = Field(default_factory=dict)
+    total_pnl: float = 0
+    win_rate: float = 0
+    total_trades: int = 0
+    open_positions: int = 0
+
+
+class SessionDetailResponse(BaseModel):
+    session_id: str
+    strategy_id: str
+    trading_mode: str
+    status: str
+    exchange_id: str
+    symbols: list[str]
+    timeframe: str
+    paper_capital: float | None = None
+    started_at: str | None = None
+    stopped_at: str | None = None
+    error_message: str | None = None
+    metrics: SessionMetrics = Field(default_factory=SessionMetrics)
+    positions: list[PositionItem] = Field(default_factory=list)
+    trades: list[TradeItem] = Field(default_factory=list)
+
+
 class KillSwitchResponse(BaseModel):
     active: bool
     message: str
@@ -142,6 +186,22 @@ async def list_sessions(request: Request) -> list[dict[str, Any]]:
     """List all trading sessions (running + recent stopped)."""
     mgr = _get_session_manager(request)
     return [_session_to_dict(s) for s in mgr.list_sessions()]
+
+
+@router.get("/sessions/{session_id}/detail", response_model=SessionDetailResponse)
+async def get_session_detail(session_id: str, request: Request) -> dict[str, Any]:
+    """Full session detail with runtime metrics, positions and trades."""
+    mgr = _get_session_manager(request)
+
+    try:
+        detail = await mgr.get_session_detail(session_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    return detail
 
 
 # ---------------------------------------------------------------------------

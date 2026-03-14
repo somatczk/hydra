@@ -211,6 +211,103 @@ class SessionManager:
         """Return a session by ID."""
         return self._sessions.get(session_id)
 
+    async def get_session_detail(self, session_id: str) -> dict[str, Any]:
+        """Return session metadata + live executor state (or DB trades if stopped)."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session {session_id} not found")
+
+        detail: dict[str, Any] = {
+            "session_id": session.session_id,
+            "strategy_id": session.strategy_id,
+            "trading_mode": session.trading_mode,
+            "status": session.status,
+            "exchange_id": session.exchange_id,
+            "symbols": session.symbols,
+            "timeframe": session.timeframe,
+            "paper_capital": float(session.paper_capital) if session.paper_capital else None,
+            "started_at": session.started_at.isoformat() if session.started_at else None,
+            "stopped_at": session.stopped_at.isoformat() if session.stopped_at else None,
+            "error_message": session.error_message,
+        }
+
+        # Gather live data from executor or DB trades
+        balance: dict[str, float] = {}
+        positions: list[dict[str, Any]] = []
+        trades: list[dict[str, Any]] = []
+
+        if session.status == "running" and session._executor is not None:
+            # Live executor state
+            raw_balance = await session._executor.fetch_balance()
+            balance = {k: float(v) for k, v in raw_balance.items()}
+            raw_positions = await session._executor.fetch_positions()
+            positions = [
+                {
+                    "symbol": p["symbol"],
+                    "direction": p["side"],
+                    "quantity": p["contracts"],
+                    "avg_entry_price": p["entryPrice"],
+                    "unrealized_pnl": p["unrealizedPnl"],
+                }
+                for p in raw_positions
+            ]
+            trades = list(session._executor._filled_orders)
+        else:
+            # Stopped/error: load trades from DB
+            trades = await self._load_session_trades(session)
+
+        # Compute metrics from trades
+        total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
+        winning = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
+        total_trades = len(trades)
+        win_rate = (winning / total_trades * 100) if total_trades > 0 else 0.0
+
+        detail["metrics"] = {
+            "balance": balance,
+            "total_pnl": total_pnl,
+            "win_rate": round(win_rate, 1),
+            "total_trades": total_trades,
+            "open_positions": len(positions),
+        }
+        detail["positions"] = positions
+        detail["trades"] = trades
+
+        return detail
+
+    async def _load_session_trades(self, session: TradingSession) -> list[dict[str, Any]]:
+        """Load trades from DB for a stopped session."""
+        if self._db_pool is None:
+            return []
+        try:
+            source = session.trading_mode  # 'paper' or 'live'
+            async with self._db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, symbol, side, quantity, price, fee, pnl, timestamp
+                    FROM trades
+                    WHERE strategy_id = $1 AND source = $2
+                    ORDER BY timestamp ASC
+                    """,
+                    session.strategy_id,
+                    source,
+                )
+                return [
+                    {
+                        "id": str(row["id"]),
+                        "symbol": row["symbol"],
+                        "side": row["side"],
+                        "quantity": float(row["quantity"]) if row["quantity"] else 0,
+                        "price": float(row["price"]) if row["price"] else 0,
+                        "fee": float(row["fee"]) if row["fee"] else 0,
+                        "pnl": float(row["pnl"]) if row["pnl"] else 0,
+                        "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
+                    }
+                    for row in rows
+                ]
+        except Exception:
+            logger.exception("Failed to load trades for session %s", session.session_id)
+            return []
+
     # -- Internal helpers ----------------------------------------------------
 
     def _find_strategy_config(self, strategy_id: str) -> StrategyConfig:

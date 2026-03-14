@@ -5,6 +5,8 @@ import { X, Plug, Unplug } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { fetchApi } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import { logger } from '@/lib/logger';
 
 interface Exchange {
   id: string;
@@ -20,6 +22,7 @@ interface ExchangeConnectDialogProps {
 }
 
 export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: ExchangeConnectDialogProps) {
+  const { toast } = useToast();
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [passphrase, setPassphrase] = useState('');
@@ -44,6 +47,8 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
           ...(passphrase.trim() ? { passphrase: passphrase.trim() } : {}),
         }),
       });
+      logger.info('Settings', `Exchange ${exchange.name} connected`);
+      toast('success', `${exchange.name} connected`);
       onUpdated();
       onClose();
     } catch (err) {
@@ -60,6 +65,8 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
       await fetchApi(`/api/system/exchanges/${exchange.id}/connect`, {
         method: 'DELETE',
       });
+      logger.info('Settings', `Exchange ${exchange.name} disconnected`);
+      toast('info', `${exchange.name} disconnected`);
       onUpdated();
       onClose();
     } catch (err) {

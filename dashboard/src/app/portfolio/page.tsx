@@ -19,6 +19,7 @@ import {
 import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
 import { fetchApi } from '@/lib/api';
+import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
 
@@ -88,6 +89,7 @@ function formatDrawdownTick(value: number): string {
 /* ---------- Page ---------- */
 
 export default function PortfolioPage() {
+  useEffect(() => { logger.info('Portfolio', 'Page mounted'); }, []);
   const [summary, setSummary] = useState<PortfolioSummary>(placeholderSummary);
   const [positions, setPositions] = useState<Position[]>([]);
   const [equityCurve, setEquityCurve] = useState<EquityPoint[]>([]);

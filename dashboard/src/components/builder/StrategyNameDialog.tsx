@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { fetchApi } from '@/lib/api';
+import { logger } from '@/lib/logger';
 import type { BuilderState, SerializedConditionGroup } from './types';
 
 interface StrategyNameDialogProps {
@@ -121,9 +122,11 @@ export function StrategyNameDialog({
         body: JSON.stringify(requestBody),
       });
 
+      logger.info('Builder', `Strategy "${name}" ${isEditing ? 'updated' : 'saved'}`);
       onSaved(name);
       onClose();
     } catch (err) {
+      logger.error('Builder', 'Failed to save strategy', err);
       setError(err instanceof Error ? err.message : 'Save failed');
     } finally {
       setSaving(false);

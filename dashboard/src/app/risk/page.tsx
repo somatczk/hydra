@@ -19,6 +19,8 @@ import { Input } from '@/components/ui/Input';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
+import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
 
@@ -128,6 +130,7 @@ interface DailyPnl { date: string; pnl: number; }
 /* ---------- Page ---------- */
 
 export default function RiskPage() {
+  const { toast } = useToast();
   const [state, setState] = useState<RiskState>(placeholderState);
   const [loading, setLoading] = useState(true);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl[]>([]);
@@ -145,7 +148,6 @@ export default function RiskPage() {
   const [maxDailyLossPct, setMaxDailyLossPct] = useState('3');
   const [maxDrawdownPct, setMaxDrawdownPct] = useState('15');
   const [maxConcurrentPositions, setMaxConcurrentPositions] = useState('10');
-  const [configSaved, setConfigSaved] = useState(false);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
 
@@ -156,14 +158,14 @@ export default function RiskPage() {
   useEffect(() => {
     fetchApi<ApiRiskStatus>('/api/risk/status')
       .then((data) => setState(mapApiRiskStatus(data)))
-      .catch(() => { /* keep placeholder */ })
+      .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); })
       .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
     fetchApi<DailyPnl[]>('/api/portfolio/daily-pnl')
       .then((data) => setDailyPnl(data))
-      .catch(() => { /* keep empty */ });
+      .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); });
   }, []);
 
   // Fetch risk config from DB
@@ -178,7 +180,7 @@ export default function RiskPage() {
         setMaxConcurrentPositions(cfg.max_concurrent_positions.toString());
         setKillSwitchActive(cfg.kill_switch_active);
       })
-      .catch(() => { /* use defaults */ });
+      .catch((err) => { logger.warn('Risk', 'Failed to fetch risk config', err); });
   }, []);
 
   const handleSaveRiskConfig = async () => {
@@ -193,10 +195,10 @@ export default function RiskPage() {
           max_concurrent_positions: parseInt(maxConcurrentPositions, 10),
         }),
       });
-      setConfigSaved(true);
-      setTimeout(() => setConfigSaved(false), 3000);
-    } catch {
-      alert('Failed to save risk configuration');
+      toast('success', 'Risk configuration saved');
+    } catch (err) {
+      logger.error('Risk', 'Failed to save risk config', err);
+      toast('error', 'Failed to save risk configuration');
     }
   };
 
@@ -209,12 +211,17 @@ export default function RiskPage() {
       if (killSwitchActive) {
         await fetchApi('/api/trading/kill-switch', { method: 'DELETE' });
         setKillSwitchActive(false);
+        toast('success', 'Kill switch deactivated');
+        logger.warn('Risk', 'Kill switch deactivated');
       } else {
         await fetchApi('/api/trading/kill-switch', { method: 'POST' });
         setKillSwitchActive(true);
+        toast('warning', 'Kill switch ACTIVATED — all trading halted');
+        logger.warn('Risk', 'KILL SWITCH ACTIVATED');
       }
-    } catch {
-      alert('Failed to toggle kill switch');
+    } catch (err) {
+      logger.error('Risk', 'Failed to toggle kill switch', err);
+      toast('error', 'Failed to toggle kill switch');
     } finally {
       setKillSwitchLoading(false);
     }
@@ -441,12 +448,7 @@ export default function RiskPage() {
             hint="Maximum number of open positions"
           />
         </div>
-        <div className="mt-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            {configSaved && (
-              <span className="text-sm font-medium text-status-success">Configuration saved</span>
-            )}
-          </div>
+        <div className="mt-4 flex items-center justify-end">
           <div className="flex items-center gap-3">
             <Button variant="primary" onClick={handleSaveRiskConfig}>
               Save Risk Limits

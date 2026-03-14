@@ -6,6 +6,7 @@ import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
+import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
 
@@ -182,6 +183,7 @@ const tradeHistoryColumns = [
 /* ---------- Page ---------- */
 
 export default function TradingPage() {
+  useEffect(() => { logger.info('Trading', 'Page mounted'); }, []);
   const [openPositions, setOpenPositions] = useState<Position[]>(placeholderPositions);
   const [recentTrades, setRecentTrades] = useState<RecentTrade[]>(placeholderTrades);
   const [sessions, setSessions] = useState<TradingSession[]>([]);

@@ -11,6 +11,7 @@ import { StrategyNameDialog } from '@/components/builder/StrategyNameDialog';
 import { useSearchParams } from 'next/navigation';
 import { useToast } from '@/components/ui/Toast';
 import { fetchApi } from '@/lib/api';
+import { logger } from '@/lib/logger';
 import type {
   BuilderState,
   BuilderAction,
@@ -327,8 +328,8 @@ function BuilderPageContent() {
         ]);
         if (indData && indData.length > 0) setIndicators(indData);
         if (compData && compData.length > 0) setComparators(compData);
-      } catch {
-        // Use default data if API is not available
+      } catch (err) {
+        logger.warn('Builder', 'Failed to fetch indicators/comparators', err);
       }
     };
     fetchData();
@@ -341,15 +342,18 @@ function BuilderPageContent() {
     fetchApi<StrategyDetail>(`/api/builder/strategies/${strategyId}`)
       .then((detail) => {
         dispatch({ type: 'LOAD_STRATEGY', payload: detail });
+        logger.info('Builder', `Loaded strategy "${detail.name}"`);
         toast('success', `Loaded strategy "${detail.name}"`);
       })
       .catch((err) => {
+        logger.error('Builder', 'Failed to load strategy', err);
         toast('error', `Failed to load strategy: ${err instanceof Error ? err.message : 'not found'}`);
       });
   }, [searchParams, toast]);
 
   const handleSaved = useCallback(
     (name: string) => {
+      logger.info('Builder', `Strategy "${name}" saved`);
       toast('success', `Strategy "${name}" saved successfully`);
     },
     [toast],

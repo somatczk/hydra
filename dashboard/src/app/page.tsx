@@ -21,6 +21,7 @@ import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
+import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
 
@@ -181,6 +182,7 @@ const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?:
 /* ---------- Page ---------- */
 
 export default function DashboardPage() {
+  useEffect(() => { logger.info('Dashboard', 'Page mounted'); }, []);
   const [summary, setSummary] = useState<PortfolioSummary>(placeholderSummary);
   const [recentTrades, setRecentTrades] = useState<Trade[]>(placeholderTrades);
   const [positionCount, setPositionCount] = useState<number>(3);

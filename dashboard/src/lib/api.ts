@@ -5,6 +5,8 @@
  * Falls back gracefully when the API is unreachable.
  */
 
+import { logger } from './logger';
+
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000');
@@ -40,19 +42,34 @@ export async function fetchApi<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
+  const method = options?.method ?? 'GET';
   const url = `${API_BASE}${path}`;
-  const res = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options?.headers as Record<string, string> | undefined),
-    },
-    ...options,
-  });
+  const t0 = performance.now();
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options?.headers as Record<string, string> | undefined),
+      },
+      ...options,
+    });
+  } catch (err) {
+    const ms = Math.round(performance.now() - t0);
+    logger.error('API', `${method} ${path} NETWORK_ERROR (${ms}ms)`, err);
+    throw err;
+  }
+
+  const ms = Math.round(performance.now() - t0);
 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
+    logger.error('API', `${method} ${path} -> ${res.status} (${ms}ms)`, text);
     throw new ApiError(res.status, text);
   }
+
+  logger.info('API', `${method} ${path} -> ${res.status} (${ms}ms)`);
 
   if (res.status === 204) {
     return undefined as T;
@@ -77,23 +94,33 @@ export function useWebSocket(
   onMessage: (data: unknown) => void,
 ): WebSocket | null {
   try {
+    logger.info('WS', `Connecting to ${path}`);
     const ws = new WebSocket(`${WS_BASE}${path}`);
+
+    ws.onopen = () => {
+      logger.info('WS', `Connected to ${path}`);
+    };
 
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         onMessage(data);
       } catch {
-        // Non-JSON message; ignore
+        logger.warn('WS', `Non-JSON message on ${path}`);
       }
     };
 
     ws.onerror = () => {
-      // Silently handle -- dashboard degrades gracefully
+      logger.warn('WS', `Error on ${path}`);
+    };
+
+    ws.onclose = (event) => {
+      logger.info('WS', `Disconnected from ${path} (code=${event.code})`);
     };
 
     return ws;
-  } catch {
+  } catch (err) {
+    logger.error('WS', `Failed to connect to ${path}`, err);
     return null;
   }
 }
