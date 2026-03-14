@@ -2,13 +2,20 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Zap, Plus, Edit2, Trash2, BarChart3 } from 'lucide-react';
+import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 
 /* ---------- Types ---------- */
+
+interface TradingSession {
+  session_id: string;
+  strategy_id: string;
+  trading_mode: string;
+  status: string;
+}
 
 interface Strategy {
   id: string;
@@ -18,6 +25,7 @@ interface Strategy {
   statusVariant: 'success' | 'neutral';
   enabled: boolean;
   editable: boolean;
+  session: TradingSession | null;
 }
 
 interface BuilderStrategy {
@@ -31,16 +39,33 @@ interface BuilderStrategy {
 
 /* ---------- Helpers ---------- */
 
-function mapBuilderStrategies(data: BuilderStrategy[]): Strategy[] {
-  return data.map((s) => ({
-    id: s.id,
-    name: s.name,
-    description: s.description || 'Rule-based strategy',
-    status: s.enabled ? 'Active' : 'Draft',
-    statusVariant: s.enabled ? 'success' : 'neutral',
-    enabled: s.enabled,
-    editable: s.editable,
-  }));
+function mapBuilderStrategies(data: BuilderStrategy[], sessions: TradingSession[]): Strategy[] {
+  return data.map((s) => {
+    const session = sessions.find(
+      (sess) => sess.strategy_id === s.id && sess.status === 'running'
+    ) ?? null;
+
+    return {
+      id: s.id,
+      name: s.name,
+      description: s.description || 'Rule-based strategy',
+      status: s.enabled ? 'Active' : 'Draft',
+      statusVariant: s.enabled ? 'success' : 'neutral',
+      enabled: s.enabled,
+      editable: s.editable,
+      session,
+    };
+  });
+}
+
+function sessionStatusLabel(session: TradingSession | null): string {
+  if (!session) return '';
+  return session.trading_mode === 'paper' ? 'Paper Running' : 'Live Running';
+}
+
+function sessionStatusVariant(session: TradingSession | null): 'success' | 'warning' | 'info' | 'neutral' {
+  if (!session) return 'neutral';
+  return session.trading_mode === 'paper' ? 'info' : 'warning';
 }
 
 /* ---------- Page ---------- */
@@ -48,14 +73,21 @@ function mapBuilderStrategies(data: BuilderStrategy[]): Strategy[] {
 export default function StrategiesPage() {
   const router = useRouter();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [sessions, setSessions] = useState<TradingSession[]>([]);
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [startingId, setStartingId] = useState<string | null>(null);
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
 
-  const fetchStrategies = async () => {
+  const fetchData = async () => {
     setLoading(true);
     try {
-      const data = await fetchApi<BuilderStrategy[]>('/api/builder/strategies');
-      setStrategies(mapBuilderStrategies(data));
+      const [stratData, sessData] = await Promise.all([
+        fetchApi<BuilderStrategy[]>('/api/builder/strategies').catch(() => [] as BuilderStrategy[]),
+        fetchApi<TradingSession[]>('/api/trading/sessions').catch(() => [] as TradingSession[]),
+      ]);
+      setSessions(sessData);
+      setStrategies(mapBuilderStrategies(stratData, sessData));
     } catch {
       /* keep empty */
     } finally {
@@ -63,12 +95,12 @@ export default function StrategiesPage() {
     }
   };
 
-  useEffect(() => { fetchStrategies(); }, []);
+  useEffect(() => { fetchData(); }, []);
 
   const handleToggle = async (id: string) => {
     try {
       await fetchApi(`/api/builder/strategies/${id}/toggle`, { method: 'POST' });
-      fetchStrategies();
+      fetchData();
     } catch {
       /* toggle failed */
     }
@@ -79,11 +111,60 @@ export default function StrategiesPage() {
     setDeletingId(id);
     try {
       await fetchApi(`/api/builder/strategies/${id}`, { method: 'DELETE' });
-      fetchStrategies();
+      fetchData();
     } catch (err) {
       alert(`Failed to delete: ${err instanceof Error ? err.message : 'unknown error'}`);
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  const handleStartPaper = async (strategyId: string) => {
+    setStartingId(strategyId);
+    try {
+      await fetchApi('/api/trading/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          strategy_id: strategyId,
+          trading_mode: 'paper',
+        }),
+      });
+      fetchData();
+    } catch (err) {
+      alert(`Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
+    } finally {
+      setStartingId(null);
+    }
+  };
+
+  const handleStartLive = async (strategyId: string) => {
+    if (!confirm('Start LIVE trading? Real funds will be used.')) return;
+    setStartingId(strategyId);
+    try {
+      await fetchApi('/api/trading/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          strategy_id: strategyId,
+          trading_mode: 'live',
+        }),
+      });
+      fetchData();
+    } catch (err) {
+      alert(`Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
+    } finally {
+      setStartingId(null);
+    }
+  };
+
+  const handleStop = async (sessionId: string) => {
+    setStoppingId(sessionId);
+    try {
+      await fetchApi(`/api/trading/sessions/${sessionId}`, { method: 'DELETE' });
+      fetchData();
+    } catch (err) {
+      alert(`Failed to stop: ${err instanceof Error ? err.message : 'unknown error'}`);
+    } finally {
+      setStoppingId(null);
     }
   };
 
@@ -124,15 +205,60 @@ export default function StrategiesPage() {
                   </p>
                 </div>
               </div>
-              <StatusBadge
-                status={strategy.status}
-                variant={strategy.statusVariant}
-                size="sm"
-              />
+              <div className="flex flex-col items-end gap-1">
+                <StatusBadge
+                  status={strategy.status}
+                  variant={strategy.statusVariant}
+                  size="sm"
+                />
+                {strategy.session && (
+                  <StatusBadge
+                    status={sessionStatusLabel(strategy.session)}
+                    variant={sessionStatusVariant(strategy.session)}
+                    size="sm"
+                  />
+                )}
+              </div>
+            </div>
+
+            {/* Trading controls */}
+            <div className="mt-3 flex items-center gap-2">
+              {strategy.session ? (
+                <Button
+                  variant="danger"
+                  size="sm"
+                  onClick={() => handleStop(strategy.session!.session_id)}
+                  loading={stoppingId === strategy.session.session_id}
+                >
+                  <Square className="h-3 w-3" />
+                  Stop
+                </Button>
+              ) : (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleStartPaper(strategy.id)}
+                    loading={startingId === strategy.id}
+                  >
+                    <Play className="h-3 w-3" />
+                    Start Paper
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => handleStartLive(strategy.id)}
+                    loading={startingId === strategy.id}
+                  >
+                    <Play className="h-3 w-3" />
+                    Start Live
+                  </Button>
+                </>
+              )}
             </div>
 
             {/* Action buttons */}
-            <div className="mt-4 flex items-center justify-between border-t border-border-default pt-3">
+            <div className="mt-3 flex items-center justify-between border-t border-border-default pt-3">
               <div className="flex items-center gap-2">
                 {strategy.editable && (
                   <button

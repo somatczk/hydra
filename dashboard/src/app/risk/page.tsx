@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ShieldCheck, ShieldAlert, AlertTriangle, Ban } from 'lucide-react';
+import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, OctagonX } from 'lucide-react';
 import {
   RadialBarChart,
   RadialBar,
@@ -15,6 +15,8 @@ import {
   Cell,
 } from 'recharts';
 import { DataCard } from '@/components/ui/DataCard';
+import { Input } from '@/components/ui/Input';
+import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 
@@ -44,6 +46,16 @@ interface ApiRiskStatus {
     current_value: number;
     status: string;
   }>;
+}
+
+interface RiskConfig {
+  scope: string;
+  max_position_pct: number;
+  max_risk_per_trade: number;
+  max_daily_loss_pct: number;
+  max_drawdown_pct: number;
+  max_concurrent_positions: number;
+  kill_switch_active: boolean;
 }
 
 /* ---------- Placeholder data ---------- */
@@ -126,6 +138,17 @@ export default function RiskPage() {
     { time: '09:00', message: 'Daily risk limits reset. All circuit breakers cleared.', severity: 'info' },
   ]);
 
+  // Risk config form state
+  const [riskConfig, setRiskConfig] = useState<RiskConfig | null>(null);
+  const [maxPositionPct, setMaxPositionPct] = useState('10');
+  const [maxRiskPerTrade, setMaxRiskPerTrade] = useState('2');
+  const [maxDailyLossPct, setMaxDailyLossPct] = useState('3');
+  const [maxDrawdownPct, setMaxDrawdownPct] = useState('15');
+  const [maxConcurrentPositions, setMaxConcurrentPositions] = useState('10');
+  const [configSaved, setConfigSaved] = useState(false);
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [killSwitchLoading, setKillSwitchLoading] = useState(false);
+
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
   }, []);
@@ -143,11 +166,81 @@ export default function RiskPage() {
       .catch(() => { /* keep empty */ });
   }, []);
 
+  // Fetch risk config from DB
+  useEffect(() => {
+    fetchApi<RiskConfig>('/api/risk/config')
+      .then((cfg) => {
+        setRiskConfig(cfg);
+        setMaxPositionPct((cfg.max_position_pct * 100).toFixed(0));
+        setMaxRiskPerTrade((cfg.max_risk_per_trade * 100).toFixed(0));
+        setMaxDailyLossPct((cfg.max_daily_loss_pct * 100).toFixed(0));
+        setMaxDrawdownPct((cfg.max_drawdown_pct * 100).toFixed(0));
+        setMaxConcurrentPositions(cfg.max_concurrent_positions.toString());
+        setKillSwitchActive(cfg.kill_switch_active);
+      })
+      .catch(() => { /* use defaults */ });
+  }, []);
+
+  const handleSaveRiskConfig = async () => {
+    try {
+      await fetchApi('/api/risk/config', {
+        method: 'PUT',
+        body: JSON.stringify({
+          max_position_pct: parseFloat(maxPositionPct) / 100,
+          max_risk_per_trade: parseFloat(maxRiskPerTrade) / 100,
+          max_daily_loss_pct: parseFloat(maxDailyLossPct) / 100,
+          max_drawdown_pct: parseFloat(maxDrawdownPct) / 100,
+          max_concurrent_positions: parseInt(maxConcurrentPositions, 10),
+        }),
+      });
+      setConfigSaved(true);
+      setTimeout(() => setConfigSaved(false), 3000);
+    } catch {
+      alert('Failed to save risk configuration');
+    }
+  };
+
+  const handleKillSwitch = async () => {
+    if (!killSwitchActive) {
+      if (!confirm('ACTIVATE KILL SWITCH?\n\nThis will immediately stop ALL trading sessions. Are you sure?')) return;
+    }
+    setKillSwitchLoading(true);
+    try {
+      if (killSwitchActive) {
+        await fetchApi('/api/trading/kill-switch', { method: 'DELETE' });
+        setKillSwitchActive(false);
+      } else {
+        await fetchApi('/api/trading/kill-switch', { method: 'POST' });
+        setKillSwitchActive(true);
+      }
+    } catch {
+      alert('Failed to toggle kill switch');
+    } finally {
+      setKillSwitchLoading(false);
+    }
+  };
+
   const { circuitBreakers, drawdown, maxDrawdown } = state;
   const drawdownPct = maxDrawdown > 0 ? (drawdown / maxDrawdown) * 100 : 0;
 
   return (
     <div className="flex flex-col gap-6">
+      {/* Kill switch banner */}
+      {killSwitchActive && (
+        <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <OctagonX className="h-6 w-6 text-status-error" />
+            <div>
+              <p className="text-sm font-semibold text-status-error">Kill Switch Active</p>
+              <p className="text-xs text-text-muted">All trading is halted. No new sessions can start.</p>
+            </div>
+          </div>
+          <Button variant="outline" size="sm" onClick={handleKillSwitch} loading={killSwitchLoading}>
+            Release Kill Switch
+          </Button>
+        </div>
+      )}
+
       {/* Circuit breaker status cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {circuitBreakers.map((cb) => (
@@ -308,6 +401,65 @@ export default function RiskPage() {
           </div>
         </DataCard>
       </div>
+
+      {/* Editable risk limits */}
+      <DataCard title="Risk Limits" description="Configure global risk management parameters">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+          <Input
+            label="Max Position Size (%)"
+            type="number"
+            value={maxPositionPct}
+            onChange={(e) => setMaxPositionPct(e.target.value)}
+            hint="Maximum % of portfolio per position"
+          />
+          <Input
+            label="Max Risk Per Trade (%)"
+            type="number"
+            value={maxRiskPerTrade}
+            onChange={(e) => setMaxRiskPerTrade(e.target.value)}
+            hint="Maximum risk per individual trade"
+          />
+          <Input
+            label="Max Daily Loss (%)"
+            type="number"
+            value={maxDailyLossPct}
+            onChange={(e) => setMaxDailyLossPct(e.target.value)}
+            hint="Daily loss limit before trading halt"
+          />
+          <Input
+            label="Max Drawdown (%)"
+            type="number"
+            value={maxDrawdownPct}
+            onChange={(e) => setMaxDrawdownPct(e.target.value)}
+            hint="Maximum drawdown before kill switch"
+          />
+          <Input
+            label="Max Concurrent Positions"
+            type="number"
+            value={maxConcurrentPositions}
+            onChange={(e) => setMaxConcurrentPositions(e.target.value)}
+            hint="Maximum number of open positions"
+          />
+        </div>
+        <div className="mt-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            {configSaved && (
+              <span className="text-sm font-medium text-status-success">Configuration saved</span>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <Button variant="primary" onClick={handleSaveRiskConfig}>
+              Save Risk Limits
+            </Button>
+            {!killSwitchActive && (
+              <Button variant="danger" onClick={handleKillSwitch} loading={killSwitchLoading}>
+                <OctagonX className="h-4 w-4" />
+                Kill Switch
+              </Button>
+            )}
+          </div>
+        </div>
+      </DataCard>
 
       {/* Risk alerts */}
       <DataCard title="Recent Risk Events" description="Risk management actions taken today">

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUpDown } from 'lucide-react';
+import { ArrowUpDown, OctagonX } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
@@ -50,6 +50,20 @@ interface ApiRecentTrade {
   fee: number;
   pnl: number;
   timestamp: string;
+}
+
+interface TradingSession {
+  session_id: string;
+  strategy_id: string;
+  trading_mode: string;
+  status: string;
+  symbols: string[];
+  timeframe: string;
+  started_at: string | null;
+}
+
+interface RiskConfig {
+  kill_switch_active: boolean;
 }
 
 /* ---------- Placeholder data ---------- */
@@ -170,6 +184,8 @@ const tradeHistoryColumns = [
 export default function TradingPage() {
   const [openPositions, setOpenPositions] = useState<Position[]>(placeholderPositions);
   const [recentTrades, setRecentTrades] = useState<RecentTrade[]>(placeholderTrades);
+  const [sessions, setSessions] = useState<TradingSession[]>([]);
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const widgetContainerRef = useRef<HTMLDivElement>(null);
@@ -182,6 +198,12 @@ export default function TradingPage() {
       fetchApi<ApiRecentTrade[]>('/api/portfolio/trades')
         .then((data) => setRecentTrades(mapApiTrades(data)))
         .catch(() => { /* keep placeholder */ }),
+      fetchApi<TradingSession[]>('/api/trading/sessions')
+        .then((data) => setSessions(data.filter((s) => s.status === 'running')))
+        .catch(() => { /* keep empty */ }),
+      fetchApi<RiskConfig>('/api/risk/config')
+        .then((cfg) => setKillSwitchActive(cfg.kill_switch_active))
+        .catch(() => { /* keep false */ }),
     ]).finally(() => setLoading(false));
   }, []);
 
@@ -214,8 +236,53 @@ export default function TradingPage() {
     };
   }, []);
 
+  const runningSessions = sessions.filter((s) => s.status === 'running');
+
   return (
     <div className="flex flex-col gap-6">
+      {/* Kill switch banner */}
+      {killSwitchActive && (
+        <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center gap-3">
+          <OctagonX className="h-6 w-6 text-status-error shrink-0" />
+          <div>
+            <p className="text-sm font-semibold text-status-error">Kill Switch Active</p>
+            <p className="text-xs text-text-muted">
+              All trading is halted. Release the kill switch from the Risk page to resume.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Active sessions */}
+      {runningSessions.length > 0 && (
+        <DataCard title="Running Sessions" description="Currently active trading sessions">
+          <div className="space-y-2">
+            {runningSessions.map((session) => (
+              <div
+                key={session.session_id}
+                className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3"
+              >
+                <div className="flex items-center gap-3">
+                  <StatusBadge
+                    status={session.trading_mode === 'paper' ? 'Paper' : 'Live'}
+                    variant={session.trading_mode === 'paper' ? 'info' : 'warning'}
+                    size="sm"
+                  />
+                  <div>
+                    <p className="text-sm font-medium text-text-primary">{session.strategy_id}</p>
+                    <p className="text-xs text-text-muted">
+                      {session.symbols.join(', ')} &middot; {session.timeframe}
+                      {session.started_at && ` &middot; Started ${new Date(session.started_at).toLocaleTimeString()}`}
+                    </p>
+                  </div>
+                </div>
+                <StatusBadge status="Running" variant="success" size="sm" />
+              </div>
+            ))}
+          </div>
+        </DataCard>
+      )}
+
       {/* Candlestick chart */}
       <DataCard title="BTC/USDT" description="Live price chart">
         <div className="tradingview-widget-container h-[28rem] md:h-[36rem] w-full" ref={widgetContainerRef}>

@@ -8,6 +8,7 @@ plus configurable slippage; limit / stop orders stay pending until
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -21,6 +22,8 @@ from hydra.core.types import (
     OrderType,
     Side,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Internal pending order representation
@@ -79,11 +82,15 @@ class PaperTradingExecutor:
         initial_balances: dict[str, Decimal] | None = None,
         slippage_pct: Decimal = Decimal("0.001"),
         fee_pct: Decimal = Decimal("0.001"),
+        db_pool: Any = None,
+        strategy_id: str = "",
     ) -> None:
         self._exchange_id = exchange_id
         self._balances: dict[str, Decimal] = dict(initial_balances or {"USDT": Decimal("10000")})
         self._slippage_pct = slippage_pct
         self._fee_pct = fee_pct
+        self._db_pool = db_pool
+        self._strategy_id = strategy_id
 
         # State
         self._pending_orders: list[_PendingOrder] = []
@@ -272,7 +279,53 @@ class PaperTradingExecutor:
             "filled": True,
         }
         self._filled_orders.append(fill_dict)
+
+        # Persist paper trade to DB (fire-and-forget)
+        if self._db_pool is not None:
+            import asyncio
+
+            _task = asyncio.ensure_future(
+                self._persist_fill(symbol, side, quantity, fill_price, fee)
+            )
+            # prevent GC before completion
+            _task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
         return fill_dict
+
+    async def _persist_fill(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        fee: Decimal,
+    ) -> None:
+        """Persist a paper trading fill to the trades table."""
+        try:
+            now = datetime.now(UTC)
+            async with self._db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO trades
+                        (symbol, direction, entry_price, exit_price, quantity,
+                         pnl, fees, strategy_id, exchange_id, entry_time,
+                         exit_time, source)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'paper')
+                    """,
+                    symbol,
+                    side.upper(),
+                    price,
+                    price,
+                    quantity,
+                    Decimal("0"),
+                    fee,
+                    self._strategy_id,
+                    self._exchange_id,
+                    now,
+                    now,
+                )
+        except Exception:
+            logger.exception("Failed to persist paper fill for %s", symbol)
 
     def _update_position(
         self,

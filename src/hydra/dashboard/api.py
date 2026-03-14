@@ -19,6 +19,7 @@ from hydra.dashboard.routes import (
     strategies,
     strategy_builder,
     system,
+    trading,
 )
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ app.add_middleware(
 )
 
 app.state.system_config = None
+app.state.session_manager = None
 
 # Include all route modules
 app.include_router(strategies.router)
@@ -50,6 +52,7 @@ app.include_router(risk.router)
 app.include_router(models.router)
 app.include_router(system.router)
 app.include_router(strategy_builder.router)
+app.include_router(trading.router)
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +217,26 @@ async def _init_db_pool() -> None:
         app.state.db_pool = None
 
 
+@app.on_event("startup")
+async def _init_session_manager() -> None:
+    """Initialize the trading SessionManager."""
+    from hydra.execution.session_manager import SessionManager
+
+    pool = getattr(app.state, "db_pool", None)
+    mgr = SessionManager(db_pool=pool)
+    if pool is not None:
+        await mgr.load_recent_sessions()
+    app.state.session_manager = mgr
+
+
+@app.on_event("shutdown")
+async def _shutdown_session_manager() -> None:
+    """Stop all trading sessions on shutdown."""
+    mgr = getattr(app.state, "session_manager", None)
+    if mgr is not None:
+        await mgr.stop_all()
+
+
 @app.on_event("shutdown")
 async def _close_db_pool() -> None:
     """Close the DB pool on shutdown."""
@@ -279,6 +302,47 @@ async def _run_migrations() -> None:
                     "SELECT create_hypertable("
                     "'ts.funding_rates', 'timestamp', if_not_exists => TRUE)"
                 )
+
+            # Trading sessions & risk config (Phase 2)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS trading_sessions (
+                    id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    trading_mode TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'stopped',
+                    exchange_id TEXT NOT NULL DEFAULT 'binance',
+                    symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT'],
+                    timeframe TEXT NOT NULL DEFAULT '1h',
+                    paper_capital NUMERIC(24,8),
+                    started_at TIMESTAMPTZ,
+                    stopped_at TIMESTAMPTZ,
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS risk_config (
+                    id SERIAL PRIMARY KEY,
+                    scope TEXT NOT NULL UNIQUE,
+                    max_position_pct NUMERIC(8,4) DEFAULT 0.10,
+                    max_risk_per_trade NUMERIC(8,4) DEFAULT 0.02,
+                    max_daily_loss_pct NUMERIC(8,4) DEFAULT 0.03,
+                    max_drawdown_pct NUMERIC(8,4) DEFAULT 0.15,
+                    max_concurrent_positions INTEGER DEFAULT 10,
+                    kill_switch_active BOOLEAN DEFAULT FALSE,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO risk_config (scope) VALUES ('global') ON CONFLICT (scope) DO NOTHING"
+            )
+            # Add source column to existing tables
+            await conn.execute(
+                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'live'"
+            )
+            await conn.execute(
+                "ALTER TABLE positions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'live'"
+            )
 
             # Backtest results persistence (idempotent)
             await conn.execute("""

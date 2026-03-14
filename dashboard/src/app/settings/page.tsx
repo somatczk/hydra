@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Globe, Bell, Cog, CheckCircle, XCircle } from 'lucide-react';
+import { Globe, Bell, Cog, CheckCircle, XCircle, OctagonX } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
@@ -34,6 +34,10 @@ interface PlatformConfig {
   default_pair: string;
   default_timeframe: string;
   max_concurrent_strategies: number;
+}
+
+interface RiskConfig {
+  kill_switch_active: boolean;
 }
 
 /* ---------- Placeholder data ---------- */
@@ -73,7 +77,9 @@ export default function SettingsPage() {
   const [defaultPair, setDefaultPair] = useState('btcusdt');
   const [defaultTimeframe, setDefaultTimeframe] = useState('1h');
   const [maxStrategies, setMaxStrategies] = useState('5');
+  const [paperCapital, setPaperCapital] = useState('10000');
   const [saved, setSaved] = useState(false);
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [notifications, setNotifications] = useState<Record<string, boolean>>({
     'Trade Executions': true,
     'Risk Alerts': true,
@@ -88,8 +94,9 @@ export default function SettingsPage() {
     Promise.all([
       fetchApi<ApiExchange[]>('/api/system/exchanges').catch(() => null),
       fetchApi<PlatformConfig>('/api/system/config').catch(() => null),
+      fetchApi<RiskConfig>('/api/risk/config').catch(() => null),
     ])
-      .then(([ex, cfg]) => {
+      .then(([ex, cfg, risk]) => {
         if (ex) setExchanges(mapApiExchanges(ex));
         if (cfg) {
           setConfig(cfg);
@@ -97,6 +104,9 @@ export default function SettingsPage() {
           setDefaultPair(cfg.default_pair);
           setDefaultTimeframe(cfg.default_timeframe);
           setMaxStrategies(cfg.max_concurrent_strategies.toString());
+        }
+        if (risk) {
+          setKillSwitchActive(risk.kill_switch_active);
         }
       })
       .finally(() => setLoading(false));
@@ -129,6 +139,19 @@ export default function SettingsPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      {/* Kill switch warning banner */}
+      {killSwitchActive && (
+        <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center gap-3">
+          <OctagonX className="h-6 w-6 text-status-error shrink-0" />
+          <div>
+            <p className="text-sm font-semibold text-status-error">Kill Switch Active</p>
+            <p className="text-xs text-text-muted">
+              All trading is halted. Release the kill switch from the Risk page to resume trading.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Exchange connections */}
       <DataCard title="Exchange Connections" description="Manage your exchange API connections">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -279,6 +302,13 @@ export default function SettingsPage() {
             value={maxStrategies}
             onChange={(e) => setMaxStrategies(e.target.value)}
             hint="Maximum number of strategies running simultaneously"
+          />
+          <Input
+            label="Paper Trading Capital (USDT)"
+            type="number"
+            value={paperCapital}
+            onChange={(e) => setPaperCapital(e.target.value)}
+            hint="Starting balance for paper trading sessions"
           />
         </div>
         <div className="mt-4 flex items-center justify-end gap-3">
