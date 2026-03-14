@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { X, Save } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
@@ -12,6 +12,9 @@ interface StrategyNameDialogProps {
   onClose: () => void;
   state: BuilderState;
   onSaved: (name: string) => void;
+  editingId?: string | null;
+  initialName?: string;
+  initialDescription?: string;
 }
 
 const EXCHANGE_OPTIONS = [
@@ -41,6 +44,9 @@ export function StrategyNameDialog({
   onClose,
   state,
   onSaved,
+  editingId,
+  initialName,
+  initialDescription,
 }: StrategyNameDialogProps) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -50,7 +56,17 @@ export function StrategyNameDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (open) {
+      setName(initialName || '');
+      setDescription(initialDescription || '');
+      setError(null);
+    }
+  }, [open, initialName, initialDescription]);
+
   if (!open) return null;
+
+  const isEditing = !!editingId;
 
   const handleSave = async () => {
     if (!name.trim()) {
@@ -94,8 +110,13 @@ export function StrategyNameDialog({
     };
 
     try {
-      const response = await fetch('/api/builder/save', {
-        method: 'POST',
+      const url = isEditing
+        ? `/api/builder/strategies/${editingId}`
+        : '/api/builder/save';
+      const method = isEditing ? 'PUT' : 'POST';
+
+      const response = await fetch(url, {
+        method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
       });
@@ -127,7 +148,9 @@ export function StrategyNameDialog({
       <div className="relative w-full max-w-lg rounded-xl border border-border-default bg-bg-elevated p-6 shadow-xl mx-4">
         {/* Header */}
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold text-text-primary">Save Strategy</h3>
+          <h3 className="text-lg font-semibold text-text-primary">
+            {isEditing ? 'Edit Strategy' : 'Save Strategy'}
+          </h3>
           <button
             type="button"
             onClick={onClose}
@@ -193,7 +216,7 @@ export function StrategyNameDialog({
             </Button>
             <Button variant="primary" onClick={handleSave} loading={saving}>
               <Save className="h-4 w-4" />
-              Save Strategy
+              {isEditing ? 'Update Strategy' : 'Save Strategy'}
             </Button>
           </div>
         </div>

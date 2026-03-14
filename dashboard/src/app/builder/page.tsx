@@ -1,13 +1,14 @@
 'use client';
 
 import { useReducer, useEffect, useState, useCallback } from 'react';
-import { Save } from 'lucide-react';
+import { Save, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { RuleSection } from '@/components/builder/RuleSection';
 import { TimeframeSelector } from '@/components/builder/TimeframeSelector';
 import { RiskConfigurator } from '@/components/builder/RiskConfigurator';
 import { SignalPreview } from '@/components/builder/SignalPreview';
 import { StrategyNameDialog } from '@/components/builder/StrategyNameDialog';
+import { SavedStrategies } from '@/components/builder/SavedStrategies';
 import { useToast } from '@/components/ui/Toast';
 import { fetchApi } from '@/lib/api';
 import type {
@@ -18,12 +19,13 @@ import type {
   IndicatorSchema,
   ComparatorSchema,
   ConditionParams,
-  RiskConfig,
   StopLossConfig,
   TakeProfitConfig,
   SizingConfig,
   TimeframeConfig,
   RuleSection as RuleSectionKey,
+  StrategyDetail,
+  SerializedConditionGroup,
 } from '@/components/builder/types';
 
 /* ---------- Initial state ---------- */
@@ -51,6 +53,9 @@ const initialState: BuilderState = {
       maxPositionPct: 10.0,
     },
   },
+  editingId: null,
+  strategyName: '',
+  strategyDescription: '',
 };
 
 /* ---------- ID generation ---------- */
@@ -59,6 +64,24 @@ let conditionCounter = 0;
 function newConditionId(): string {
   conditionCounter += 1;
   return `cond_${conditionCounter}_${Date.now()}`;
+}
+
+/* ---------- Helpers ---------- */
+
+function apiGroupToBuilder(
+  group: SerializedConditionGroup | null,
+): BuilderConditionGroup {
+  if (!group) return emptyGroup();
+  return {
+    operator: group.operator as 'AND' | 'OR',
+    conditions: group.conditions.map((c) => ({
+      id: crypto.randomUUID(),
+      indicator: c.indicator,
+      params: c.params,
+      comparator: c.comparator,
+      value: c.value,
+    })),
+  };
 }
 
 /* ---------- Reducer ---------- */
@@ -152,6 +175,41 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
           sizing: { ...state.risk.sizing, ...action.sizing },
         },
       };
+    case 'LOAD_STRATEGY': {
+      const { payload } = action;
+      return {
+        entryLong: apiGroupToBuilder(payload.rules.entry_long),
+        exitLong: apiGroupToBuilder(payload.rules.exit_long),
+        entryShort: apiGroupToBuilder(payload.rules.entry_short),
+        exitShort: apiGroupToBuilder(payload.rules.exit_short),
+        timeframes: {
+          primary: payload.timeframes.primary,
+          confirmation: payload.timeframes.confirmation || undefined,
+          entry: payload.timeframes.entry || undefined,
+        },
+        risk: {
+          stopLoss: {
+            method: (payload.risk.stop_loss_method as 'atr' | 'fixed_pct') || 'atr',
+            value: payload.risk.stop_loss_value ?? 2.0,
+          },
+          takeProfit: {
+            method: (payload.risk.take_profit_method as 'atr' | 'fixed_pct') || 'atr',
+            value: payload.risk.take_profit_value ?? 3.0,
+          },
+          sizing: {
+            method:
+              (payload.risk.sizing_method as SizingConfig['method']) || 'fixed_fractional',
+            riskPerTradePct: payload.risk.sizing_params?.risk_per_trade_pct ?? 1.0,
+            maxPositionPct: payload.risk.sizing_params?.max_position_pct ?? 10.0,
+          },
+        },
+        editingId: payload.id,
+        strategyName: payload.name,
+        strategyDescription: payload.description,
+      };
+    }
+    case 'RESET':
+      return initialState;
     default:
       return state;
   }
@@ -256,6 +314,7 @@ export default function BuilderPage() {
   const [indicators, setIndicators] = useState<IndicatorSchema[]>(DEFAULT_INDICATORS);
   const [comparators, setComparators] = useState<ComparatorSchema[]>(DEFAULT_COMPARATORS);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
   const { toast } = useToast();
 
   /* Fetch indicators and comparators from API */
@@ -278,9 +337,15 @@ export default function BuilderPage() {
   const handleSaved = useCallback(
     (name: string) => {
       toast('success', `Strategy "${name}" saved successfully`);
+      setRefreshKey((k) => k + 1);
     },
     [toast],
   );
+
+  const handleEdit = useCallback((detail: StrategyDetail) => {
+    dispatch({ type: 'LOAD_STRATEGY', payload: detail });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, []);
 
   return (
     <div className="flex flex-col gap-6">
@@ -291,6 +356,13 @@ export default function BuilderPage() {
           Build trading strategies visually using indicators and conditions
         </p>
       </div>
+
+      {/* Saved strategies */}
+      <SavedStrategies
+        refreshKey={refreshKey}
+        onEdit={handleEdit}
+        onDelete={() => setRefreshKey((k) => k + 1)}
+      />
 
       {/* Rule sections */}
       <div className="flex flex-col gap-4">
@@ -358,15 +430,25 @@ export default function BuilderPage() {
       {/* Signal preview */}
       <SignalPreview state={state} />
 
-      {/* Save button */}
-      <div className="flex justify-end">
+      {/* Action buttons */}
+      <div className="flex justify-end gap-3">
+        {state.editingId && (
+          <Button
+            variant="outline"
+            size="lg"
+            onClick={() => dispatch({ type: 'RESET' })}
+          >
+            <Plus className="h-4 w-4" />
+            New Strategy
+          </Button>
+        )}
         <Button
           variant="primary"
           size="lg"
           onClick={() => setSaveDialogOpen(true)}
         >
           <Save className="h-4 w-4" />
-          Save Strategy
+          {state.editingId ? 'Update Strategy' : 'Save Strategy'}
         </Button>
       </div>
 
@@ -376,6 +458,9 @@ export default function BuilderPage() {
         onClose={() => setSaveDialogOpen(false)}
         state={state}
         onSaved={handleSaved}
+        editingId={state.editingId}
+        initialName={state.strategyName}
+        initialDescription={state.strategyDescription}
       />
     </div>
   );

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from hydra.backtest.runner import BacktestRunner
@@ -169,10 +169,35 @@ class SaveResponse(BaseModel):
     message: str
 
 
+class StrategySummary(BaseModel):
+    """Summary of a saved rule-based strategy."""
+
+    id: str
+    name: str
+    description: str
+    enabled: bool
+    filename: str
+
+
+class StrategyDetail(BaseModel):
+    """Full detail of a saved rule-based strategy for editing."""
+
+    id: str
+    name: str
+    description: str
+    enabled: bool
+    exchange_id: str
+    symbol: str
+    rules: RuleSetInput
+    timeframes: TimeframeInput
+    risk: RiskInput
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+_RULE_BASED_CLASS = "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
 _VALID_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d", "1w"}
 _VALID_EXCHANGES = {"binance", "bybit", "kraken", "okx"}
 
@@ -250,6 +275,41 @@ def _generate_sample_bars(count: int) -> list[OHLCV]:
         bars.append(bar)
 
     return bars
+
+
+def _parse_strategy_yaml(path: Path) -> dict[str, Any] | None:
+    """Read a YAML strategy file, returning None if not a RuleBasedStrategy."""
+    try:
+        with path.open() as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("strategy_class") != _RULE_BASED_CLASS:
+        return None
+    return data
+
+
+def _find_strategy_file(strategy_id: str) -> Path | None:
+    """Scan config directory for a RuleBasedStrategy YAML with matching id."""
+    if not _CONFIG_DIR.is_dir():
+        return None
+    for path in _CONFIG_DIR.glob("*.yaml"):
+        data = _parse_strategy_yaml(path)
+        if data is not None and data.get("id") == strategy_id:
+            return path
+    return None
+
+
+def _to_condition_group_input(group_data: dict[str, Any] | None) -> ConditionGroupInput | None:
+    """Convert a raw rules dict entry to a ConditionGroupInput."""
+    if group_data is None:
+        return None
+    return ConditionGroupInput(
+        operator=group_data.get("operator", "AND"),
+        conditions=[ConditionInput(**c) for c in group_data.get("conditions", [])],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -475,3 +535,168 @@ async def save_strategy(request: SaveRequest) -> SaveResponse:
         config_path=str(config_path),
         message=f"Strategy '{request.name}' saved successfully",
     )
+
+
+@router.get("/strategies", response_model=list[StrategySummary])
+async def list_strategies() -> list[StrategySummary]:
+    """List all saved rule-based strategies."""
+    if not _CONFIG_DIR.is_dir():
+        return []
+    strategies: list[StrategySummary] = []
+    for path in sorted(_CONFIG_DIR.glob("*.yaml")):
+        data = _parse_strategy_yaml(path)
+        if data is None:
+            continue
+        params = data.get("parameters", {})
+        strategies.append(
+            StrategySummary(
+                id=data.get("id", path.stem),
+                name=data.get("name", path.stem),
+                description=params.get("description", ""),
+                enabled=data.get("enabled", False),
+                filename=path.name,
+            )
+        )
+    return strategies
+
+
+@router.get("/strategies/{strategy_id}", response_model=StrategyDetail)
+async def get_strategy(strategy_id: str) -> StrategyDetail:
+    """Get full detail of a saved rule-based strategy for editing."""
+    path = _find_strategy_file(strategy_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+
+    data = _parse_strategy_yaml(path)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+
+    params = data.get("parameters", {})
+    rules_data = params.get("rules", {})
+    exchange = data.get("exchange", {})
+    symbols = data.get("symbols", ["BTCUSDT"])
+    timeframes_data = data.get("timeframes", {})
+    sizing = data.get("position_sizing", {})
+
+    rules = RuleSetInput(
+        entry_long=_to_condition_group_input(rules_data.get("entry_long")),
+        exit_long=_to_condition_group_input(rules_data.get("exit_long")),
+        entry_short=_to_condition_group_input(rules_data.get("entry_short")),
+        exit_short=_to_condition_group_input(rules_data.get("exit_short")),
+    )
+
+    return StrategyDetail(
+        id=data.get("id", ""),
+        name=data.get("name", ""),
+        description=params.get("description", ""),
+        enabled=data.get("enabled", False),
+        exchange_id=exchange.get("exchange_id", "binance"),
+        symbol=symbols[0] if symbols else "BTCUSDT",
+        rules=rules,
+        timeframes=TimeframeInput(
+            primary=timeframes_data.get("primary", "1h"),
+            confirmation=timeframes_data.get("confirmation"),
+            entry=timeframes_data.get("entry"),
+        ),
+        risk=RiskInput(
+            sizing_method=sizing.get("method", "fixed_fractional"),
+            sizing_params={
+                "risk_per_trade_pct": sizing.get("risk_per_trade_pct", 1.0),
+                "max_position_pct": sizing.get("max_position_pct", 10.0),
+            },
+        ),
+    )
+
+
+@router.put("/strategies/{strategy_id}", response_model=SaveResponse)
+async def update_strategy(strategy_id: str, request: SaveRequest) -> SaveResponse:
+    """Update an existing rule-based strategy YAML config."""
+    path = _find_strategy_file(strategy_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+
+    # Validate rules
+    try:
+        rule_set = _validate_rules(request.rules)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rules: {exc}") from exc
+
+    # Validate exchange
+    if request.exchange_id not in _VALID_EXCHANGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid exchange: {request.exchange_id}. Must be one of {_VALID_EXCHANGES}",
+        )
+
+    # Validate timeframes
+    if request.timeframes.primary not in _VALID_TIMEFRAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid primary timeframe: {request.timeframes.primary}",
+        )
+
+    # Build config dict preserving original id
+    config_dict: dict[str, Any] = {
+        "id": strategy_id,
+        "name": request.name,
+        "strategy_class": _RULE_BASED_CLASS,
+        "enabled": request.enable_immediately,
+        "symbols": [request.symbol],
+        "exchange": {
+            "exchange_id": request.exchange_id,
+            "market_type": "SPOT",
+        },
+        "timeframes": {
+            "primary": request.timeframes.primary,
+        },
+        "parameters": {
+            "rules": rule_set.model_dump(mode="json"),
+            "required_history": 50,
+            "description": request.description,
+        },
+        "position_sizing": {
+            "method": request.risk.sizing_method,
+            "risk_per_trade_pct": request.risk.sizing_params.get("risk_per_trade_pct", 1.0),
+            "max_position_pct": request.risk.sizing_params.get("max_position_pct", 10.0),
+        },
+    }
+
+    # Add optional timeframes
+    if request.timeframes.confirmation:
+        config_dict["timeframes"]["confirmation"] = request.timeframes.confirmation
+    if request.timeframes.entry:
+        config_dict["timeframes"]["entry"] = request.timeframes.entry
+
+    try:
+        with path.open("w") as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write config file: {exc}",
+        ) from exc
+
+    return SaveResponse(
+        id=strategy_id,
+        name=request.name,
+        config_path=str(path),
+        message=f"Strategy '{request.name}' updated successfully",
+    )
+
+
+@router.delete("/strategies/{strategy_id}")
+async def delete_strategy(strategy_id: str) -> Response:
+    """Delete a saved rule-based strategy."""
+    path = _find_strategy_file(strategy_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete strategy file: {exc}",
+        ) from exc
+
+    return Response(status_code=204)

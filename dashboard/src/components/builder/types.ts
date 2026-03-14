@@ -81,6 +81,9 @@ export interface BuilderState {
   exitShort: BuilderConditionGroup;
   timeframes: TimeframeConfig;
   risk: RiskConfig;
+  editingId: string | null;
+  strategyName: string;
+  strategyDescription: string;
 }
 
 /* ---------- Preview types ---------- */
@@ -139,6 +142,40 @@ export interface SerializedConditionGroup {
   conditions: SerializedCondition[];
 }
 
+/* ---------- Strategy CRUD types ---------- */
+
+export interface StrategySummary {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  filename: string;
+}
+
+export interface StrategyDetail {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  exchange_id: string;
+  symbol: string;
+  rules: {
+    entry_long: SerializedConditionGroup | null;
+    exit_long: SerializedConditionGroup | null;
+    entry_short: SerializedConditionGroup | null;
+    exit_short: SerializedConditionGroup | null;
+  };
+  timeframes: { primary: string; confirmation?: string; entry?: string };
+  risk: {
+    stop_loss_method: string;
+    stop_loss_value: number;
+    take_profit_method: string;
+    take_profit_value: number;
+    sizing_method: string;
+    sizing_params: Record<string, number>;
+  };
+}
+
 /* ---------- Reducer actions ---------- */
 
 export type BuilderAction =
@@ -156,6 +193,8 @@ export type BuilderAction =
   | { type: 'SET_RISK'; risk: Partial<RiskConfig> }
   | { type: 'SET_STOP_LOSS'; stopLoss: Partial<StopLossConfig> }
   | { type: 'SET_TAKE_PROFIT'; takeProfit: Partial<TakeProfitConfig> }
-  | { type: 'SET_SIZING'; sizing: Partial<SizingConfig> };
+  | { type: 'SET_SIZING'; sizing: Partial<SizingConfig> }
+  | { type: 'LOAD_STRATEGY'; payload: StrategyDetail }
+  | { type: 'RESET' };
 
 export type RuleSection = 'entryLong' | 'exitLong' | 'entryShort' | 'exitShort';
