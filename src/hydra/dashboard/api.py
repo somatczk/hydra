@@ -174,6 +174,77 @@ async def ws_risk(websocket: WebSocket) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup: auto-run migrations
+# ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+async def _run_migrations() -> None:
+    """Apply database migrations on startup if DATABASE_URL is set."""
+    import os
+
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        return
+
+    try:
+        import asyncpg
+
+        conn = await asyncpg.connect(dsn)
+        try:
+            # Check if ts schema exists
+            row = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'ts')"
+            )
+            if row:
+                return  # Already migrated
+
+            # Run the initial migration SQL inline (same as 001_initial_schema.py)
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE")
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS ts")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ts.ohlcv_1m (
+                    exchange TEXT NOT NULL, symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL, timestamp TIMESTAMPTZ NOT NULL,
+                    open NUMERIC NOT NULL, high NUMERIC NOT NULL,
+                    low NUMERIC NOT NULL, close NUMERIC NOT NULL,
+                    volume NUMERIC NOT NULL,
+                    UNIQUE (exchange, symbol, timeframe, timestamp)
+                )
+            """)
+            await conn.execute(
+                "SELECT create_hypertable('ts.ohlcv_1m', 'timestamp', if_not_exists => TRUE)"
+            )
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ts.trades (
+                    exchange TEXT NOT NULL, symbol TEXT NOT NULL,
+                    trade_id TEXT NOT NULL, price NUMERIC NOT NULL,
+                    quantity NUMERIC NOT NULL, side TEXT NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL
+                )
+            """)
+            await conn.execute(
+                "SELECT create_hypertable('ts.trades', 'timestamp', if_not_exists => TRUE)"
+            )
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ts.funding_rates (
+                    exchange TEXT NOT NULL, symbol TEXT NOT NULL,
+                    rate NUMERIC NOT NULL, next_funding_time TIMESTAMPTZ,
+                    timestamp TIMESTAMPTZ NOT NULL
+                )
+            """)
+            await conn.execute(
+                "SELECT create_hypertable('ts.funding_rates', 'timestamp', if_not_exists => TRUE)"
+            )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning("Migration skipped: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
