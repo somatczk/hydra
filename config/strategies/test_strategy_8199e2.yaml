@@ -1,0 +1,35 @@
+id: test_strategy_8199e2
+name: Test Strategy
+strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy
+enabled: false
+symbols:
+- BTCUSDT
+exchange:
+  exchange_id: binance
+  market_type: SPOT
+timeframes:
+  primary: 1h
+parameters:
+  rules:
+    entry_long:
+      operator: AND
+      conditions:
+      - indicator: rsi
+        params: {}
+        comparator: crosses_below
+        value: 30.0
+    exit_long:
+      operator: AND
+      conditions:
+      - indicator: rsi
+        params: {}
+        comparator: crosses_above
+        value: 70.0
+    entry_short: null
+    exit_short: null
+  required_history: 50
+  description: A test strategy
+position_sizing:
+  method: fixed_fractional
+  risk_per_trade_pct: 1.0
+  max_position_pct: 10.0
