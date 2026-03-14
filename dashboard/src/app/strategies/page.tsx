@@ -14,26 +14,9 @@ interface Strategy {
   id: string;
   name: string;
   description: string;
-  status: 'Active' | 'Paused' | 'Backtesting' | 'Draft';
-  statusVariant: 'success' | 'warning' | 'info' | 'neutral';
-  pnl: string;
-  pnlPositive: boolean;
-  trades: number;
-  winRate: string;
-  source: 'db' | 'builder';
-}
-
-interface ApiStrategy {
-  id: string;
-  name: string;
-  description: string;
-  status: string;
+  status: 'Active' | 'Draft';
+  statusVariant: 'success' | 'neutral';
   enabled: boolean;
-  performance: {
-    total_pnl: number;
-    win_rate: number;
-    total_trades: number;
-  };
 }
 
 interface BuilderStrategy {
@@ -46,32 +29,6 @@ interface BuilderStrategy {
 
 /* ---------- Helpers ---------- */
 
-function toStatusVariant(status: string): 'success' | 'warning' | 'info' | 'neutral' {
-  switch (status) {
-    case 'Active': return 'success';
-    case 'Paused': return 'warning';
-    case 'Backtesting': return 'info';
-    default: return 'neutral';
-  }
-}
-
-function mapApiStrategies(data: ApiStrategy[]): Strategy[] {
-  return data.map((s) => ({
-    id: s.id,
-    name: s.name,
-    description: s.description,
-    status: s.status as Strategy['status'],
-    statusVariant: toStatusVariant(s.status),
-    pnl: s.performance.total_pnl !== 0
-      ? `${s.performance.total_pnl >= 0 ? '+' : ''}$${Math.abs(s.performance.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
-      : 'N/A',
-    pnlPositive: s.performance.total_pnl >= 0,
-    trades: s.performance.total_trades,
-    winRate: s.performance.win_rate > 0 ? `${s.performance.win_rate}%` : 'N/A',
-    source: 'db' as const,
-  }));
-}
-
 function mapBuilderStrategies(data: BuilderStrategy[]): Strategy[] {
   return data.map((s) => ({
     id: s.id,
@@ -79,11 +36,7 @@ function mapBuilderStrategies(data: BuilderStrategy[]): Strategy[] {
     description: s.description || 'Rule-based strategy',
     status: s.enabled ? 'Active' : 'Draft',
     statusVariant: s.enabled ? 'success' : 'neutral',
-    pnl: 'N/A',
-    pnlPositive: true,
-    trades: 0,
-    winRate: 'N/A',
-    source: 'builder' as const,
+    enabled: s.enabled,
   }));
 }
 
@@ -98,26 +51,8 @@ export default function StrategiesPage() {
   const fetchStrategies = async () => {
     setLoading(true);
     try {
-      const [dbResult, builderResult] = await Promise.allSettled([
-        fetchApi<ApiStrategy[]>('/api/strategies'),
-        fetchApi<BuilderStrategy[]>('/api/builder/strategies'),
-      ]);
-
-      const dbStrategies = dbResult.status === 'fulfilled' ? mapApiStrategies(dbResult.value) : [];
-      const builderStrategies = builderResult.status === 'fulfilled' ? mapBuilderStrategies(builderResult.value) : [];
-
-      // Merge: builder strategies first, then DB (dedupe by id)
-      const seen = new Set<string>();
-      const merged: Strategy[] = [];
-      for (const s of builderStrategies) {
-        seen.add(s.id);
-        merged.push(s);
-      }
-      for (const s of dbStrategies) {
-        if (!seen.has(s.id)) merged.push(s);
-      }
-
-      setStrategies(merged);
+      const data = await fetchApi<BuilderStrategy[]>('/api/builder/strategies');
+      setStrategies(mapBuilderStrategies(data));
     } catch {
       /* keep empty */
     } finally {
@@ -192,35 +127,6 @@ export default function StrategiesPage() {
               />
             </div>
 
-            {/* Stats row */}
-            <div className="mt-4 grid grid-cols-3 gap-3">
-              <div>
-                <p className="text-xs text-text-muted">PnL</p>
-                <p
-                  className={cn(
-                    'text-sm font-semibold',
-                    strategy.pnlPositive
-                      ? 'text-status-success'
-                      : 'text-status-error',
-                  )}
-                >
-                  {strategy.pnl}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-text-muted">Win Rate</p>
-                <p className="text-sm font-semibold text-text-primary">
-                  {strategy.winRate}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-text-muted">Trades</p>
-                <p className="text-sm font-semibold text-text-primary">
-                  {strategy.trades}
-                </p>
-              </div>
-            </div>
-
             {/* Action buttons */}
             <div className="mt-4 flex items-center justify-between border-t border-border-default pt-3">
               <div className="flex items-center gap-2">
@@ -231,22 +137,20 @@ export default function StrategiesPage() {
                   <Edit2 className="h-3 w-3" />
                   Edit
                 </button>
-                {strategy.source === 'builder' && (
-                  <button
-                    onClick={() => handleDelete(strategy.id)}
-                    disabled={deletingId === strategy.id}
-                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-status-error/10 hover:text-status-error transition-colors disabled:opacity-50"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                    {deletingId === strategy.id ? 'Deleting...' : 'Delete'}
-                  </button>
-                )}
                 <button
                   onClick={() => router.push(`/backtest?strategy=${strategy.id}`)}
                   className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
                 >
                   <BarChart3 className="h-3 w-3" />
                   Backtest
+                </button>
+                <button
+                  onClick={() => handleDelete(strategy.id)}
+                  disabled={deletingId === strategy.id}
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-status-error/10 hover:text-status-error transition-colors disabled:opacity-50"
+                >
+                  <Trash2 className="h-3 w-3" />
+                  {deletingId === strategy.id ? 'Deleting...' : 'Delete'}
                 </button>
               </div>
               <div
