@@ -218,7 +218,7 @@ export default function TradingPage() {
     <div className="flex flex-col gap-6">
       {/* Candlestick chart */}
       <DataCard title="BTC/USDT" description="Live price chart">
-        <div className="tradingview-widget-container h-80 md:h-[28rem] w-full" ref={widgetContainerRef}>
+        <div className="tradingview-widget-container h-[28rem] md:h-[36rem] w-full" ref={widgetContainerRef}>
           <div className="tradingview-widget-container__widget h-full w-full" />
         </div>
       </DataCard>

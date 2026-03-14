@@ -240,52 +240,96 @@ async def _run_migrations() -> None:
             row = await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'ts')"
             )
-            if row:
-                return  # Already migrated
+            if not row:
+                # Run the initial migration SQL inline (same as 001_initial_schema.py)
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE")
+                await conn.execute("CREATE SCHEMA IF NOT EXISTS ts")
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ts.ohlcv_1m (
+                        exchange TEXT NOT NULL, symbol TEXT NOT NULL,
+                        timeframe TEXT NOT NULL, timestamp TIMESTAMPTZ NOT NULL,
+                        open NUMERIC NOT NULL, high NUMERIC NOT NULL,
+                        low NUMERIC NOT NULL, close NUMERIC NOT NULL,
+                        volume NUMERIC NOT NULL,
+                        UNIQUE (exchange, symbol, timeframe, timestamp)
+                    )
+                """)
+                await conn.execute(
+                    "SELECT create_hypertable('ts.ohlcv_1m', 'timestamp', if_not_exists => TRUE)"
+                )
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ts.trades (
+                        exchange TEXT NOT NULL, symbol TEXT NOT NULL,
+                        trade_id TEXT NOT NULL, price NUMERIC NOT NULL,
+                        quantity NUMERIC NOT NULL, side TEXT NOT NULL,
+                        timestamp TIMESTAMPTZ NOT NULL
+                    )
+                """)
+                await conn.execute(
+                    "SELECT create_hypertable('ts.trades', 'timestamp', if_not_exists => TRUE)"
+                )
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ts.funding_rates (
+                        exchange TEXT NOT NULL, symbol TEXT NOT NULL,
+                        rate NUMERIC NOT NULL, next_funding_time TIMESTAMPTZ,
+                        timestamp TIMESTAMPTZ NOT NULL
+                    )
+                """)
+                await conn.execute(
+                    "SELECT create_hypertable("
+                    "'ts.funding_rates', 'timestamp', if_not_exists => TRUE)"
+                )
 
-            # Run the initial migration SQL inline (same as 001_initial_schema.py)
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE")
-            await conn.execute("CREATE SCHEMA IF NOT EXISTS ts")
+            # Backtest results persistence (idempotent)
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS ts.ohlcv_1m (
-                    exchange TEXT NOT NULL, symbol TEXT NOT NULL,
-                    timeframe TEXT NOT NULL, timestamp TIMESTAMPTZ NOT NULL,
-                    open NUMERIC NOT NULL, high NUMERIC NOT NULL,
-                    low NUMERIC NOT NULL, close NUMERIC NOT NULL,
-                    volume NUMERIC NOT NULL,
-                    UNIQUE (exchange, symbol, timeframe, timestamp)
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id TEXT PRIMARY KEY,
+                    strategy TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    total_trades INTEGER NOT NULL DEFAULT 0,
+                    win_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    total_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    max_drawdown DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    sharpe_ratio DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    equity_curve JSONB NOT NULL DEFAULT '[]',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
-            await conn.execute(
-                "SELECT create_hypertable('ts.ohlcv_1m', 'timestamp', if_not_exists => TRUE)"
-            )
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS ts.trades (
-                    exchange TEXT NOT NULL, symbol TEXT NOT NULL,
-                    trade_id TEXT NOT NULL, price NUMERIC NOT NULL,
-                    quantity NUMERIC NOT NULL, side TEXT NOT NULL,
-                    timestamp TIMESTAMPTZ NOT NULL
+                CREATE TABLE IF NOT EXISTS backtest_result_trades (
+                    id SERIAL PRIMARY KEY,
+                    backtest_id TEXT NOT NULL REFERENCES backtest_results(id)
+                        ON DELETE CASCADE,
+                    entry_time TIMESTAMPTZ NOT NULL,
+                    exit_time TIMESTAMPTZ NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price DOUBLE PRECISION NOT NULL,
+                    exit_price DOUBLE PRECISION NOT NULL,
+                    pnl DOUBLE PRECISION NOT NULL
                 )
             """)
-            await conn.execute(
-                "SELECT create_hypertable('ts.trades', 'timestamp', if_not_exists => TRUE)"
-            )
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS ts.funding_rates (
-                    exchange TEXT NOT NULL, symbol TEXT NOT NULL,
-                    rate NUMERIC NOT NULL, next_funding_time TIMESTAMPTZ,
-                    timestamp TIMESTAMPTZ NOT NULL
-                )
+                CREATE INDEX IF NOT EXISTS ix_backtest_result_trades_backtest
+                    ON backtest_result_trades(backtest_id)
             """)
-            await conn.execute(
-                "SELECT create_hypertable('ts.funding_rates', 'timestamp', if_not_exists => TRUE)"
-            )
         finally:
             await conn.close()
     except Exception as exc:
         import logging
 
         logging.getLogger(__name__).warning("Migration skipped: %s", exc)
+
+
+@app.on_event("startup")
+async def _populate_backtest_cache() -> None:
+    """Warm the in-memory backtest cache from DB."""
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        return
+    from hydra.dashboard.routes.backtest import populate_cache_from_db
+
+    await populate_cache_from_db(pool)
 
 
 # ---------------------------------------------------------------------------

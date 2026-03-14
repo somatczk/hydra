@@ -194,13 +194,13 @@ export default function RiskPage() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {/* Drawdown gauge */}
         <DataCard title="Current Drawdown" description="Real-time portfolio drawdown from peak">
-          <div className="relative h-48">
+          <div className="relative h-40">
             <ResponsiveContainer width="100%" height="100%">
               <RadialBarChart
                 cx="50%"
-                cy="100%"
-                innerRadius="60%"
-                outerRadius="90%"
+                cy="80%"
+                innerRadius="70%"
+                outerRadius="100%"
                 startAngle={180}
                 endAngle={0}
                 data={[{ value: drawdownPct }]}
@@ -214,7 +214,7 @@ export default function RiskPage() {
               </RadialBarChart>
             </ResponsiveContainer>
             {/* Center label — positioned over the flat edge of the semicircle */}
-            <div className="absolute bottom-2 left-0 right-0 flex flex-col items-center">
+            <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center">
               <span className={cn(
                 'text-2xl font-bold font-display',
                 drawdownPct < 40 ? 'text-status-success' : drawdownPct < 70 ? 'text-status-warning' : 'text-status-error',
