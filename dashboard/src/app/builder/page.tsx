@@ -339,9 +339,14 @@ function BuilderPageContent() {
     const strategyId = searchParams.get('strategy');
     if (!strategyId) return;
     fetchApi<StrategyDetail>(`/api/builder/strategies/${strategyId}`)
-      .then((detail) => dispatch({ type: 'LOAD_STRATEGY', payload: detail }))
-      .catch(() => { /* strategy not found */ });
-  }, [searchParams]);
+      .then((detail) => {
+        dispatch({ type: 'LOAD_STRATEGY', payload: detail });
+        toast('success', `Loaded strategy "${detail.name}"`);
+      })
+      .catch((err) => {
+        toast('error', `Failed to load strategy: ${err instanceof Error ? err.message : 'not found'}`);
+      });
+  }, [searchParams, toast]);
 
   const handleSaved = useCallback(
     (name: string) => {

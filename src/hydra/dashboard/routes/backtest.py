@@ -46,6 +46,7 @@ class BacktestRunRequest(BaseModel):
     end_date: str
     initial_capital: float = 10000.0
     name: str = ""
+    timeframe: str = "1h"
 
 
 class BacktestRunResponse(BaseModel):
@@ -342,7 +343,23 @@ async def populate_cache_from_db(pool: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _generate_sample_bars(count: int, seed: int = 42, start: datetime | None = None) -> list[OHLCV]:
+_TIMEFRAME_MINUTES: dict[str, int] = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440,
+}
+
+
+def _generate_sample_bars(
+    count: int,
+    seed: int = 42,
+    start: datetime | None = None,
+    timeframe: str = "1h",
+) -> list[OHLCV]:
     """Generate synthetic OHLCV bars using a random-walk price series."""
     import numpy as np
 
@@ -350,6 +367,7 @@ def _generate_sample_bars(count: int, seed: int = 42, start: datetime | None = N
     base_price = 42000.0
     bars: list[OHLCV] = []
     bar_start = start or datetime(2024, 1, 1, tzinfo=UTC)
+    interval_minutes = _TIMEFRAME_MINUTES.get(timeframe, 60)
 
     price = base_price
     for i in range(count):
@@ -369,7 +387,7 @@ def _generate_sample_bars(count: int, seed: int = 42, start: datetime | None = N
             low=Decimal(str(round(low_price, 2))),
             close=Decimal(str(round(price, 2))),
             volume=Decimal(str(round(volume, 2))),
-            timestamp=bar_start + timedelta(hours=i),
+            timestamp=bar_start + timedelta(minutes=i * interval_minutes),
         )
         bars.append(bar)
 
@@ -494,13 +512,25 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
                     task_id,
                 )
 
+        # Resolve timeframe
+        try:
+            tf = Timeframe(body.timeframe)
+        except ValueError:
+            tf = Timeframe.H1
+        tf_minutes = _TIMEFRAME_MINUTES.get(body.timeframe, 60)
+
         # Fallback to synthetic bars
         if not bars:
             start = datetime.fromisoformat(body.start_date)
             end = datetime.fromisoformat(body.end_date)
-            hours = int((end - start).total_seconds() / 3600)
-            bar_count = max(hours, 200)
-            bars = _generate_sample_bars(bar_count, seed=hash(task_id) % 2**31, start=start)
+            total_minutes = int((end - start).total_seconds() / 60)
+            bar_count = max(total_minutes // tf_minutes, 200)
+            bars = _generate_sample_bars(
+                bar_count,
+                seed=hash(task_id) % 2**31,
+                start=start,
+                timeframe=body.timeframe,
+            )
 
         _TASKS[task_id]["progress"] = 30.0
 
@@ -512,7 +542,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
             bars=bars,
             initial_capital=Decimal(str(body.initial_capital)),
             symbol="BTCUSDT",
-            timeframe=Timeframe.H1,
+            timeframe=tf,
         )
 
         _TASKS[task_id]["progress"] = 90.0

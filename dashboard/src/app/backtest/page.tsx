@@ -92,6 +92,7 @@ function BacktestPageContent() {
   const [strategyId, setStrategyId] = useState(searchParams.get('strategy') || FALLBACK_STRATEGIES[0].id);
   const [startDate, setStartDate] = useState('2026-01-01');
   const [endDate, setEndDate] = useState('2026-03-01');
+  const [timeframe, setTimeframe] = useState('1h');
   const [initialCapital, setInitialCapital] = useState('10000');
   const [backtestName, setBacktestName] = useState('');
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(null);
@@ -158,6 +159,7 @@ function BacktestPageContent() {
           end_date: endDate,
           initial_capital: Number(initialCapital),
           name: backtestName,
+          timeframe,
         }),
       });
       if (result.task_id) {
@@ -246,13 +248,27 @@ function BacktestPageContent() {
     <div className="flex flex-col gap-6">
       {/* Runner form */}
       <DataCard title="Run Backtest" description="Configure and execute a new backtest run">
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-5">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-6">
           <Select
             label="Strategy"
             options={strategies.map((s) => ({ value: s.id, label: s.name }))}
             value={strategyId}
             onChange={(e) => setStrategyId(e.target.value)}
             placeholder="Select strategy..."
+          />
+          <Select
+            label="Timeframe"
+            options={[
+              { value: '1m', label: '1 Minute' },
+              { value: '5m', label: '5 Minutes' },
+              { value: '15m', label: '15 Minutes' },
+              { value: '30m', label: '30 Minutes' },
+              { value: '1h', label: '1 Hour' },
+              { value: '4h', label: '4 Hours' },
+              { value: '1d', label: '1 Day' },
+            ]}
+            value={timeframe}
+            onChange={(e) => setTimeframe(e.target.value)}
           />
           <Input label="Start Date" type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
           <Input label="End Date" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
