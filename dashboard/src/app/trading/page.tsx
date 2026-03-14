@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUpDown, OctagonX } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { ArrowUpDown, Eye, OctagonX } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
@@ -183,6 +184,7 @@ const tradeHistoryColumns = [
 /* ---------- Page ---------- */
 
 export default function TradingPage() {
+  const router = useRouter();
   useEffect(() => { logger.info('Trading', 'Page mounted'); }, []);
   const [openPositions, setOpenPositions] = useState<Position[]>(placeholderPositions);
   const [recentTrades, setRecentTrades] = useState<RecentTrade[]>(placeholderTrades);
@@ -262,7 +264,8 @@ export default function TradingPage() {
             {runningSessions.map((session) => (
               <div
                 key={session.session_id}
-                className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3"
+                className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3 cursor-pointer hover:border-border-hover transition-colors"
+                onClick={() => router.push(`/trading/${session.session_id}`)}
               >
                 <div className="flex items-center gap-3">
                   <StatusBadge
@@ -278,7 +281,10 @@ export default function TradingPage() {
                     </p>
                   </div>
                 </div>
-                <StatusBadge status="Running" variant="success" size="sm" />
+                <div className="flex items-center gap-2">
+                  <StatusBadge status="Running" variant="success" size="sm" />
+                  <Eye className="h-4 w-4 text-text-muted" />
+                </div>
               </div>
             ))}
           </div>
