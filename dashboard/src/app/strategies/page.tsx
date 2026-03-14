@@ -224,24 +224,22 @@ export default function StrategiesPage() {
             {/* Action buttons */}
             <div className="mt-4 flex items-center justify-between border-t border-border-default pt-3">
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => router.push(`/builder?strategy=${strategy.id}`)}
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                >
+                  <Edit2 className="h-3 w-3" />
+                  Edit
+                </button>
                 {strategy.source === 'builder' && (
-                  <>
-                    <button
-                      onClick={() => router.push(`/builder?strategy=${strategy.id}`)}
-                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
-                    >
-                      <Edit2 className="h-3 w-3" />
-                      Edit
-                    </button>
-                    <button
-                      onClick={() => handleDelete(strategy.id)}
-                      disabled={deletingId === strategy.id}
-                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-status-error/10 hover:text-status-error transition-colors disabled:opacity-50"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                      {deletingId === strategy.id ? 'Deleting...' : 'Delete'}
-                    </button>
-                  </>
+                  <button
+                    onClick={() => handleDelete(strategy.id)}
+                    disabled={deletingId === strategy.id}
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-status-error/10 hover:text-status-error transition-colors disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    {deletingId === strategy.id ? 'Deleting...' : 'Delete'}
+                  </button>
                 )}
                 <button
                   onClick={() => router.push(`/backtest?strategy=${strategy.id}`)}

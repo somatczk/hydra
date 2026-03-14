@@ -342,13 +342,14 @@ async def populate_cache_from_db(pool: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _generate_sample_bars(count: int, seed: int = 42) -> list[OHLCV]:
+def _generate_sample_bars(count: int, seed: int = 42, start: datetime | None = None) -> list[OHLCV]:
     """Generate synthetic OHLCV bars using a random-walk price series."""
     import numpy as np
 
     rng = np.random.default_rng(seed)
     base_price = 42000.0
     bars: list[OHLCV] = []
+    bar_start = start or datetime(2024, 1, 1, tzinfo=UTC)
 
     price = base_price
     for i in range(count):
@@ -368,7 +369,7 @@ def _generate_sample_bars(count: int, seed: int = 42) -> list[OHLCV]:
             low=Decimal(str(round(low_price, 2))),
             close=Decimal(str(round(price, 2))),
             volume=Decimal(str(round(volume, 2))),
-            timestamp=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(hours=i),
+            timestamp=bar_start + timedelta(hours=i),
         )
         bars.append(bar)
 
@@ -499,7 +500,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
             end = datetime.fromisoformat(body.end_date)
             hours = int((end - start).total_seconds() / 3600)
             bar_count = max(hours, 200)
-            bars = _generate_sample_bars(bar_count, seed=hash(task_id) % 2**31)
+            bars = _generate_sample_bars(bar_count, seed=hash(task_id) % 2**31, start=start)
 
         _TASKS[task_id]["progress"] = 30.0
 

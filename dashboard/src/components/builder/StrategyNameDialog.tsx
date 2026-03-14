@@ -5,6 +5,7 @@ import { X, Save } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
+import { fetchApi } from '@/lib/api';
 import type { BuilderState, SerializedConditionGroup } from './types';
 
 interface StrategyNameDialogProps {
@@ -115,16 +116,10 @@ export function StrategyNameDialog({
         : '/api/builder/save';
       const method = isEditing ? 'PUT' : 'POST';
 
-      const response = await fetch(url, {
+      await fetchApi(url, {
         method,
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
       });
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.detail || 'Save failed');
-      }
 
       onSaved(name);
       onClose();
