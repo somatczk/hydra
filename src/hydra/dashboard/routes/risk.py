@@ -110,7 +110,7 @@ _CIRCUIT_BREAKERS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 
-def _pool_from_request(request: Request) -> object | None:
+def _pool_from_request(request: Request) -> Any:
     return getattr(request.app.state, "db_pool", None)
 
 

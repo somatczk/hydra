@@ -124,6 +124,7 @@ class SessionManager:
         engine = StrategyEngine(config=hydra_config, event_bus=event_bus, context=context)
         await engine.load_strategy_from_config(cfg)
 
+        executor: Any
         if trading_mode == "paper":
             initial_bal = {"USDT": paper_capital or Decimal("10000")}
             executor = PaperTradingExecutor(
@@ -138,7 +139,7 @@ class SessionManager:
 
             executor = ExchangeClient(
                 exchange_id=cfg.exchange.exchange_id,
-                market_type=str(cfg.exchange.market_type),
+                config={},
             )
 
         order_manager = OrderManager(executor=executor, event_bus=event_bus)
