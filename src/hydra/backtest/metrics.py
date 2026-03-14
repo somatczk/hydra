@@ -89,6 +89,9 @@ class BacktestResult:
     trades: list[Trade] = field(default_factory=list)
     monthly_returns: dict[str, Decimal] = field(default_factory=dict)
 
+    # Early termination
+    stopped_reason: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Metric computation helpers

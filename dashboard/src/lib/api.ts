@@ -54,6 +54,10 @@ export async function fetchApi<T>(
     throw new ApiError(res.status, text);
   }
 
+  if (res.status === 204) {
+    return undefined as T;
+  }
+
   return res.json() as Promise<T>;
 }
 

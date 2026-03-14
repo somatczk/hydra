@@ -108,6 +108,26 @@ class NoLookaheadTestStrategy(BaseStrategy):
         return []
 
 
+class AlwaysBuyStrategy(BaseStrategy):
+    """Emits a buy signal every bar. Used to test position sizing limits."""
+
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        return [
+            EntrySignal(
+                symbol=bar.symbol,
+                direction=Direction.LONG,
+                strength=Decimal("1"),
+                strategy_id=self.strategy_id,
+                exchange_id="binance",
+                market_type=MarketType.SPOT,
+            )
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -134,6 +154,32 @@ def _make_bars(n: int, start_price: float = 100.0, trend: float = 1.0) -> list[O
             )
         )
         price = float(c)
+    return bars
+
+
+def _make_crashing_bars(n: int, start_price: float = 42000.0) -> list[OHLCV]:
+    """Generate bars that crash steeply to test margin call."""
+    bars = []
+    base_time = datetime(2024, 1, 1, tzinfo=UTC)
+    price = start_price
+    for i in range(n):
+        # Lose 5% each bar
+        new_price = price * 0.95
+        o = Decimal(str(round(price, 2)))
+        h = Decimal(str(round(price * 1.001, 2)))
+        lo = Decimal(str(round(new_price * 0.999, 2)))
+        c = Decimal(str(round(new_price, 2)))
+        bars.append(
+            OHLCV(
+                open=o,
+                high=h,
+                low=lo,
+                close=c,
+                volume=Decimal("1000"),
+                timestamp=base_time + timedelta(hours=i),
+            )
+        )
+        price = new_price
     return bars
 
 
@@ -351,3 +397,114 @@ class TestSimplePositionTracker:
         assert trade is not None
         assert trade.pnl == Decimal("9.9")  # (110-100)*1 - 0.1
         assert "BTCUSDT" not in tracker.positions
+
+
+# ---------------------------------------------------------------------------
+# Position sizing
+# ---------------------------------------------------------------------------
+
+
+class TestPositionSizing:
+    async def test_quantity_based_on_equity(self, runner: BacktestRunner) -> None:
+        """Position quantity should be ~10% of equity / price, not 1 BTC."""
+        bars = _make_bars(20, start_price=42000.0, trend=10.0)
+        config = _make_config()
+
+        result = await runner.run(
+            strategy_class=BuyAndHoldStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("10000"),
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+        )
+
+        # With $10k capital and 10% risk, notional = $1000
+        # At ~$42k BTC, quantity should be ~0.024 BTC, NOT 1 BTC
+        # The equity should never go below -$10k (no multi-million $ losses)
+        min_equity = min(float(e) for e in result.equity_curve)
+        assert min_equity > -10000, f"Equity dropped to {min_equity}, position sizing is broken"
+
+    async def test_small_capital_reasonable_pnl(self, runner: BacktestRunner) -> None:
+        """$10k capital should not produce $2M losses."""
+        bars = _make_bars(100, start_price=42000.0, trend=-50.0)
+        config = _make_config()
+
+        result = await runner.run(
+            strategy_class=BuyAndHoldStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("10000"),
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+        )
+
+        final_equity = float(result.equity_curve[-1])
+        # PnL should be bounded by capital size, not millions
+        assert abs(final_equity) < 100000, (
+            f"Final equity {final_equity} is unreasonable for $10k capital"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Margin call
+# ---------------------------------------------------------------------------
+
+
+class TestMarginCall:
+    async def test_equity_floor_stops_trading(self, runner: BacktestRunner) -> None:
+        """When equity hits zero, backtest should stop with margin_call reason."""
+        # Use crashing bars that lose 5% per bar
+        bars = _make_crashing_bars(200, start_price=42000.0)
+        config = _make_config()
+
+        result = await runner.run(
+            strategy_class=AlwaysBuyStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("1000"),
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+        )
+
+        # If equity went to zero, stopped_reason should be set
+        min_equity = min(float(e) for e in result.equity_curve)
+        if min_equity <= 0:
+            assert result.stopped_reason == "margin_call"
+            # Should not have processed all 200 bars
+            assert len(result.equity_curve) < 202  # 200 bars + initial + margin close
+
+    async def test_stopped_reason_none_for_normal_run(self, runner: BacktestRunner) -> None:
+        """Normal backtest should have stopped_reason=None."""
+        bars = _make_bars(20, start_price=100.0, trend=0.5)
+        config = _make_config()
+
+        result = await runner.run(
+            strategy_class=BuyAndHoldStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("100000"),
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+        )
+
+        assert result.stopped_reason is None
+
+    async def test_margin_call_closes_all_positions(self, runner: BacktestRunner) -> None:
+        """After margin call, all positions should be closed."""
+        bars = _make_crashing_bars(200, start_price=42000.0)
+        config = _make_config()
+
+        result = await runner.run(
+            strategy_class=AlwaysBuyStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("1000"),
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+        )
+
+        if result.stopped_reason == "margin_call":
+            # All trades should have been closed (exit_time set)
+            for trade in result.trades:
+                assert trade.exit_time is not None

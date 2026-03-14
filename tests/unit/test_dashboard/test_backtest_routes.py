@@ -5,6 +5,9 @@ Tests cover:
 - GET /status returns correct status for known/unknown tasks
 - GET /results returns list of summaries
 - GET /results/{id} returns detail or 404
+- PATCH /results/{id} renames a result
+- DELETE /results/{id} removes a result
+- GET /results/{id}/verify recomputes metrics
 - ``_generate_sample_bars`` produces correct count and valid OHLCV bars
 - ``_default_strategy_config`` returns valid StrategyConfig
 - Background task lifecycle: queued -> running -> completed
@@ -200,6 +203,18 @@ class TestRunBacktest:
         )
         assert resp.status_code == 202
 
+    def test_run_with_name(self, client: TestClient) -> None:
+        resp = client.post(
+            "/api/backtest/run",
+            json={
+                "strategy_id": "strat-1",
+                "start_date": "2026-01-01",
+                "end_date": "2026-03-01",
+                "name": "My Test Backtest",
+            },
+        )
+        assert resp.status_code == 202
+
 
 # ---------------------------------------------------------------------------
 # GET /status/{task_id} endpoint
@@ -249,6 +264,13 @@ class TestBacktestResults:
             assert "period" in item
             assert "status" in item
             assert "metrics" in item
+            assert "name" in item
+
+    def test_list_results_includes_name(self, client: TestClient) -> None:
+        resp = client.get("/api/backtest/results")
+        data = resp.json()
+        bt1 = next(r for r in data if r["id"] == "bt-1")
+        assert bt1["name"] == "LSTM Momentum Q1"
 
     def test_get_result_detail(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/results/bt-1")
@@ -259,6 +281,12 @@ class TestBacktestResults:
         assert "trades" in data
         assert "metrics" in data
         assert data["metrics"]["total_trades"] == 142
+        assert data["name"] == "LSTM Momentum Q1"
+
+    def test_get_result_detail_includes_stopped_reason(self, client: TestClient) -> None:
+        resp = client.get("/api/backtest/results/bt-1")
+        data = resp.json()
+        assert "stopped_reason" in data
 
     def test_get_result_not_found(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/results/nonexistent")
@@ -275,6 +303,92 @@ class TestBacktestResults:
         assert "entry_price" in trade
         assert "exit_price" in trade
         assert "pnl" in trade
+
+
+# ---------------------------------------------------------------------------
+# PATCH /results/{id} -- rename
+# ---------------------------------------------------------------------------
+
+
+class TestRenameBacktest:
+    def test_rename_result(self, client: TestClient) -> None:
+        resp = client.patch(
+            "/api/backtest/results/bt-1",
+            json={"name": "New Name"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["name"] == "New Name"
+        assert data["id"] == "bt-1"
+
+    def test_rename_persists_in_list(self, client: TestClient) -> None:
+        client.patch("/api/backtest/results/bt-2", json={"name": "Renamed"})
+        resp = client.get("/api/backtest/results")
+        data = resp.json()
+        bt2 = next(r for r in data if r["id"] == "bt-2")
+        assert bt2["name"] == "Renamed"
+
+    def test_rename_not_found(self, client: TestClient) -> None:
+        resp = client.patch(
+            "/api/backtest/results/nonexistent",
+            json={"name": "Nope"},
+        )
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# DELETE /results/{id}
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteBacktest:
+    def test_delete_result(self, client: TestClient) -> None:
+        resp = client.delete("/api/backtest/results/bt-1")
+        assert resp.status_code == 204
+
+    def test_delete_removes_from_list(self, client: TestClient) -> None:
+        client.delete("/api/backtest/results/bt-1")
+        resp = client.get("/api/backtest/results")
+        ids = [r["id"] for r in resp.json()]
+        assert "bt-1" not in ids
+
+    def test_delete_makes_detail_404(self, client: TestClient) -> None:
+        client.delete("/api/backtest/results/bt-1")
+        resp = client.get("/api/backtest/results/bt-1")
+        assert resp.status_code == 404
+
+    def test_delete_not_found(self, client: TestClient) -> None:
+        resp = client.delete("/api/backtest/results/nonexistent")
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /results/{id}/verify
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyBacktest:
+    def test_verify_result(self, client: TestClient) -> None:
+        resp = client.get("/api/backtest/results/bt-1/verify")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "trade_count_match" in data
+        assert "win_rate_match" in data
+        assert "total_pnl_match" in data
+        assert "all_passed" in data
+        assert isinstance(data["computed_trade_count"], int)
+        assert isinstance(data["computed_total_pnl"], float)
+
+    def test_verify_seed_data_fails(self, client: TestClient) -> None:
+        """Seed data has incomplete trades, so verification should fail."""
+        resp = client.get("/api/backtest/results/bt-1/verify")
+        data = resp.json()
+        # bt-1 reports 142 trades but only has 1 in the trades array
+        assert data["trade_count_match"] is False
+
+    def test_verify_not_found(self, client: TestClient) -> None:
+        resp = client.get("/api/backtest/results/nonexistent/verify")
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +426,52 @@ class TestBacktestBackgroundTask:
         assert "equity_curve" in result
         assert "trades" in result
         assert "metrics" in result
+
+    @pytest.mark.asyncio
+    async def test_task_stores_name(self) -> None:
+        """Background task should store the name from the request."""
+        task_id = "test-name"
+        body = BacktestRunRequest(
+            strategy_id="strat-1",
+            start_date="2026-01-01",
+            end_date="2026-02-01",
+            initial_capital=10000.0,
+            name="My Named Backtest",
+        )
+        _TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "progress": 0.0,
+            "request": body.model_dump(),
+        }
+
+        await _run_backtest_task(task_id, body, pool=None)
+
+        result_id = _TASKS[task_id]["result_id"]
+        assert _RESULTS[result_id]["name"] == "My Named Backtest"
+
+    @pytest.mark.asyncio
+    async def test_task_stores_stopped_reason(self) -> None:
+        """Background task should store stopped_reason from the engine result."""
+        task_id = "test-stopped"
+        body = BacktestRunRequest(
+            strategy_id="strat-1",
+            start_date="2026-01-01",
+            end_date="2026-02-01",
+            initial_capital=10000.0,
+        )
+        _TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "progress": 0.0,
+            "request": body.model_dump(),
+        }
+
+        await _run_backtest_task(task_id, body, pool=None)
+
+        result_id = _TASKS[task_id]["result_id"]
+        # stopped_reason should be present (None for normal runs)
+        assert "stopped_reason" in _RESULTS[result_id]
 
     @pytest.mark.asyncio
     async def test_task_handles_failure(self) -> None:

@@ -293,9 +293,14 @@ async def _run_migrations() -> None:
                     max_drawdown DOUBLE PRECISION NOT NULL DEFAULT 0,
                     sharpe_ratio DOUBLE PRECISION NOT NULL DEFAULT 0,
                     equity_curve JSONB NOT NULL DEFAULT '[]',
+                    name TEXT NOT NULL DEFAULT '',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
+            await conn.execute(
+                "ALTER TABLE backtest_results"
+                " ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''"
+            )
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS backtest_result_trades (
                     id SERIAL PRIMARY KEY,

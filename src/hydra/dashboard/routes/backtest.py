@@ -38,6 +38,7 @@ class BacktestRunRequest(BaseModel):
     start_date: str
     end_date: str
     initial_capital: float = 10000.0
+    name: str = ""
 
 
 class BacktestRunResponse(BaseModel):
@@ -73,6 +74,7 @@ class BacktestResultSummary(BaseModel):
     strategy: str
     period: str
     status: str
+    name: str = ""
     metrics: BacktestMetrics = Field(default_factory=BacktestMetrics)
 
 
@@ -81,9 +83,28 @@ class BacktestResultDetail(BaseModel):
     strategy: str
     period: str
     status: str
+    name: str = ""
+    stopped_reason: str | None = None
     metrics: BacktestMetrics = Field(default_factory=BacktestMetrics)
     equity_curve: list[dict[str, Any]] = Field(default_factory=list)
     trades: list[BacktestTradeRecord] = Field(default_factory=list)
+
+
+class BacktestRenameRequest(BaseModel):
+    name: str
+
+
+class BacktestVerification(BaseModel):
+    trade_count_match: bool
+    win_rate_match: bool
+    total_pnl_match: bool
+    computed_trade_count: int
+    computed_win_rate: float
+    computed_total_pnl: float
+    reported_trade_count: int
+    reported_win_rate: float
+    reported_total_pnl: float
+    all_passed: bool
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +120,7 @@ _RESULTS: dict[str, dict[str, Any]] = {
         "strategy": "LSTM Momentum",
         "period": "Jan 1 - Mar 1, 2026",
         "status": "completed",
+        "name": "LSTM Momentum Q1",
         "metrics": {
             "total_trades": 142,
             "win_rate": 67.6,
@@ -127,6 +149,7 @@ _RESULTS: dict[str, dict[str, Any]] = {
         "strategy": "Mean Reversion RSI",
         "period": "Jan 1 - Mar 1, 2026",
         "status": "completed",
+        "name": "Mean Reversion Q1",
         "metrics": {
             "total_trades": 98,
             "win_rate": 58.2,
@@ -146,6 +169,7 @@ _RESULTS: dict[str, dict[str, Any]] = {
         "strategy": "Breakout Scanner",
         "period": "Feb 1 - Mar 1, 2026",
         "status": "completed",
+        "name": "Breakout Feb",
         "metrics": {
             "total_trades": 45,
             "win_rate": 42.2,
@@ -175,8 +199,8 @@ async def _persist_result_to_db(pool: Any, result: dict[str, Any]) -> None:
             await conn.execute(
                 """INSERT INTO backtest_results
                        (id, strategy, period, status, total_trades, win_rate,
-                        total_pnl, max_drawdown, sharpe_ratio, equity_curve)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+                        total_pnl, max_drawdown, sharpe_ratio, equity_curve, name)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
                    ON CONFLICT (id) DO UPDATE SET
                        status = EXCLUDED.status,
                        total_trades = EXCLUDED.total_trades,
@@ -184,7 +208,8 @@ async def _persist_result_to_db(pool: Any, result: dict[str, Any]) -> None:
                        total_pnl = EXCLUDED.total_pnl,
                        max_drawdown = EXCLUDED.max_drawdown,
                        sharpe_ratio = EXCLUDED.sharpe_ratio,
-                       equity_curve = EXCLUDED.equity_curve""",
+                       equity_curve = EXCLUDED.equity_curve,
+                       name = EXCLUDED.name""",
                 result["id"],
                 result["strategy"],
                 result["period"],
@@ -195,6 +220,7 @@ async def _persist_result_to_db(pool: Any, result: dict[str, Any]) -> None:
                 metrics.get("max_drawdown", 0.0),
                 metrics.get("sharpe_ratio", 0.0),
                 json.dumps(result.get("equity_curve", [])),
+                result.get("name", ""),
             )
             trades = result.get("trades", [])
             if trades:
@@ -230,7 +256,7 @@ async def populate_cache_from_db(pool: Any) -> None:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, strategy, period, status, total_trades, win_rate, "
-                "total_pnl, max_drawdown, sharpe_ratio, equity_curve "
+                "total_pnl, max_drawdown, sharpe_ratio, equity_curve, name "
                 "FROM backtest_results ORDER BY created_at DESC"
             )
             for row in rows:
@@ -249,6 +275,7 @@ async def populate_cache_from_db(pool: Any) -> None:
                     "strategy": row["strategy"],
                     "period": row["period"],
                     "status": row["status"],
+                    "name": row["name"],
                     "metrics": {
                         "total_trades": row["total_trades"],
                         "win_rate": row["win_rate"],
@@ -450,6 +477,8 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
             "strategy": body.strategy_id,
             "period": period,
             "status": "completed",
+            "name": body.name,
+            "stopped_reason": result.stopped_reason,
             "metrics": {
                 "total_trades": result.total_trades,
                 "win_rate": round(float(result.win_rate) * 100, 2),
@@ -538,7 +567,7 @@ async def list_results(request: Request) -> list[dict[str, Any]]:
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT id, strategy, period, status, total_trades, win_rate, "
-                    "total_pnl, max_drawdown, sharpe_ratio "
+                    "total_pnl, max_drawdown, sharpe_ratio, name "
                     "FROM backtest_results ORDER BY created_at DESC"
                 )
                 for row in rows:
@@ -547,6 +576,7 @@ async def list_results(request: Request) -> list[dict[str, Any]]:
                         "strategy": row["strategy"],
                         "period": row["period"],
                         "status": row["status"],
+                        "name": row["name"],
                         "metrics": {
                             "total_trades": row["total_trades"],
                             "win_rate": row["win_rate"],
@@ -566,6 +596,7 @@ async def list_results(request: Request) -> list[dict[str, Any]]:
                 "strategy": r["strategy"],
                 "period": r["period"],
                 "status": r["status"],
+                "name": r.get("name", ""),
                 "metrics": r["metrics"],
             }
 
@@ -583,7 +614,7 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT id, strategy, period, status, total_trades, win_rate, "
-                    "total_pnl, max_drawdown, sharpe_ratio, equity_curve "
+                    "total_pnl, max_drawdown, sharpe_ratio, equity_curve, name "
                     "FROM backtest_results WHERE id = $1",
                     result_id,
                 )
@@ -602,6 +633,7 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
                         "strategy": row["strategy"],
                         "period": row["period"],
                         "status": row["status"],
+                        "name": row["name"],
                         "metrics": {
                             "total_trades": row["total_trades"],
                             "win_rate": row["win_rate"],
@@ -631,4 +663,114 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Result {result_id} not found",
         )
-    return _RESULTS[result_id]
+    r = _RESULTS[result_id]
+    return {
+        "id": r["id"],
+        "strategy": r["strategy"],
+        "period": r["period"],
+        "status": r["status"],
+        "name": r.get("name", ""),
+        "stopped_reason": r.get("stopped_reason"),
+        "metrics": r["metrics"],
+        "equity_curve": r.get("equity_curve", []),
+        "trades": r.get("trades", []),
+    }
+
+
+@router.patch("/results/{result_id}", response_model=BacktestResultSummary)
+async def rename_result(
+    result_id: str, body: BacktestRenameRequest, request: Request
+) -> dict[str, Any]:
+    """Rename a backtest result."""
+    if result_id not in _RESULTS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Result {result_id} not found",
+        )
+    _RESULTS[result_id]["name"] = body.name
+
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE backtest_results SET name = $1 WHERE id = $2",
+                    body.name,
+                    result_id,
+                )
+        except Exception:
+            logger.debug("Failed to update name in DB for %s", result_id, exc_info=True)
+
+    r = _RESULTS[result_id]
+    return {
+        "id": r["id"],
+        "strategy": r["strategy"],
+        "period": r["period"],
+        "status": r["status"],
+        "name": r.get("name", ""),
+        "metrics": r["metrics"],
+    }
+
+
+@router.delete("/results/{result_id}", status_code=204)
+async def delete_result(result_id: str, request: Request) -> None:
+    """Delete a backtest result."""
+    if result_id not in _RESULTS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Result {result_id} not found",
+        )
+    _RESULTS.pop(result_id, None)
+
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM backtest_results WHERE id = $1", result_id)
+        except Exception:
+            logger.debug("Failed to delete backtest %s from DB", result_id, exc_info=True)
+
+
+@router.get("/results/{result_id}/verify", response_model=BacktestVerification)
+async def verify_result(result_id: str, request: Request) -> dict[str, Any]:
+    """Verify a backtest result by recomputing metrics from trades."""
+    # Reuse detail fetch logic
+    detail = await get_result_detail(result_id, request)
+
+    trades = detail.get("trades", []) if isinstance(detail, dict) else detail.trades
+    metrics = detail.get("metrics", {}) if isinstance(detail, dict) else detail.metrics
+
+    if isinstance(metrics, dict):
+        reported_trade_count = metrics.get("total_trades", 0)
+        reported_win_rate = metrics.get("win_rate", 0.0)
+        reported_total_pnl = metrics.get("total_pnl", 0.0)
+    else:
+        reported_trade_count = metrics.total_trades
+        reported_win_rate = metrics.win_rate
+        reported_total_pnl = metrics.total_pnl
+
+    # Compute from trades
+    computed_trade_count = len(trades)
+    computed_total_pnl = round(sum(t["pnl"] if isinstance(t, dict) else t.pnl for t in trades), 2)
+    wins = sum(1 for t in trades if (t["pnl"] if isinstance(t, dict) else t.pnl) > 0)
+    computed_win_rate = (
+        round(wins / computed_trade_count * 100, 2) if computed_trade_count > 0 else 0.0
+    )
+
+    # Compare with tolerance
+    trade_count_match = computed_trade_count == reported_trade_count
+    pnl_match = abs(computed_total_pnl - reported_total_pnl) < 0.02
+    win_rate_match = abs(computed_win_rate - reported_win_rate) < 0.2
+
+    return {
+        "trade_count_match": trade_count_match,
+        "win_rate_match": win_rate_match,
+        "total_pnl_match": pnl_match,
+        "computed_trade_count": computed_trade_count,
+        "computed_win_rate": computed_win_rate,
+        "computed_total_pnl": computed_total_pnl,
+        "reported_trade_count": reported_trade_count,
+        "reported_win_rate": reported_win_rate,
+        "reported_total_pnl": reported_total_pnl,
+        "all_passed": trade_count_match and pnl_match and win_rate_match,
+    }

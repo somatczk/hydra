@@ -386,6 +386,7 @@ class BacktestRunner:
 
         # Pending orders (placed by signals, filled on next bar)
         pending_orders: list[OrderRequest] = []
+        stopped_reason: str | None = None
 
         # Main replay loop
         sym = Symbol(symbol)
@@ -457,13 +458,31 @@ class BacktestRunner:
 
             # Convert signals to orders
             for sig in signals:
-                maybe_order = self._signal_to_order(sig, sym, strategy_config, bar)
+                maybe_order = self._signal_to_order(sig, sym, strategy_config, bar, tracker)
                 if maybe_order is not None:
                     pending_orders.append(maybe_order)
 
             # Record equity
             equity_curve.append(tracker.equity)
             timestamps.append(bar.timestamp)
+
+            # Check for margin call — equity depleted
+            if tracker.equity <= Decimal("0"):
+                for sym_key in list(tracker.positions.keys()):
+                    pos = tracker.positions[sym_key]
+                    trade = tracker.close_position(
+                        sym_key,
+                        pos["quantity"],
+                        bar.close,
+                        Decimal("0"),
+                        bar.timestamp,
+                    )
+                    if trade:
+                        trades.append(trade)
+                equity_curve.append(tracker.equity)
+                timestamps.append(bar.timestamp)
+                stopped_reason = "margin_call"
+                break
 
         # Strategy shutdown
         await strategy.on_stop()
@@ -474,6 +493,7 @@ class BacktestRunner:
             trades=trades,
             timestamps=timestamps,
         )
+        result.stopped_reason = stopped_reason
         return result
 
     @staticmethod
@@ -482,29 +502,44 @@ class BacktestRunner:
         symbol: Symbol,
         config: StrategyConfig,
         current_bar: OHLCV,
+        tracker: _SimplePositionTracker,
     ) -> OrderRequest | None:
-        """Convert a signal into an OrderRequest."""
+        """Convert a signal into an OrderRequest with equity-based position sizing."""
         if isinstance(signal, EntrySignal):
+            # Risk 10% of equity per trade
+            available = max(tracker.equity, Decimal("0"))
+            risk_fraction = Decimal("0.1")
+            notional = available * risk_fraction
+            price = current_bar.close
+            if price <= 0:
+                return None
+            quantity = (notional / price).quantize(Decimal("0.00000001"))
+            if quantity <= 0:
+                return None
+
             side = Side.BUY if signal.direction == Direction.LONG else Side.SELL
             return OrderRequest(
                 symbol=symbol,
                 side=side,
                 order_type=OrderType.MARKET,
-                quantity=Decimal("1"),  # Default; in production, position sizer sets this
+                quantity=quantity,
                 strategy_id=signal.strategy_id,
                 exchange_id=signal.exchange_id,
                 market_type=signal.market_type,
             )
         if isinstance(signal, ExitSignal):
-            # Exit: reverse the direction
+            # Close the full position
+            pos = tracker.positions.get(str(symbol))
+            quantity = pos["quantity"] if pos else Decimal("0.00000001")
+
             side = Side.SELL if signal.direction == Direction.FLAT else Side.BUY
             if signal.direction == Direction.FLAT:
-                side = Side.SELL  # Default exit is sell
+                side = Side.SELL
             return OrderRequest(
                 symbol=symbol,
                 side=side,
                 order_type=OrderType.MARKET,
-                quantity=Decimal("1"),
+                quantity=quantity,
                 strategy_id=signal.strategy_id,
                 exchange_id=signal.exchange_id,
                 market_type=config.exchange.market_type,
