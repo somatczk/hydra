@@ -2,6 +2,15 @@
 
 import { useEffect, useState } from 'react';
 import { Play, Download, BarChart3 } from 'lucide-react';
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid,
+} from 'recharts';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
@@ -39,6 +48,34 @@ interface ApiBacktestResult {
   };
 }
 
+interface EquityPoint {
+  timestamp: string;
+  value: number;
+}
+
+interface ApiBacktestDetail {
+  id: string;
+  strategy: string;
+  period: string;
+  status: string;
+  metrics: {
+    total_trades: number;
+    win_rate: number;
+    total_pnl: number;
+    max_drawdown: number;
+    sharpe_ratio: number;
+  };
+  equity_curve: EquityPoint[];
+  trades: Array<{
+    entry_time: string;
+    exit_time: string;
+    side: string;
+    entry_price: number;
+    exit_price: number;
+    pnl: number;
+  }>;
+}
+
 /* ---------- Placeholder data ---------- */
 
 const placeholderRuns: BacktestRun[] = [
@@ -69,29 +106,28 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
   });
 }
 
-const columns = [
-  { key: 'strategy', header: 'Strategy' },
-  { key: 'period', header: 'Period', hideOnMobile: true },
-  { key: 'totalTrades', header: 'Trades', render: (row: BacktestRun) => <span>{row.totalTrades}</span> },
-  { key: 'winRate', header: 'Win Rate' },
-  {
-    key: 'pnl',
-    header: 'PnL',
-    render: (row: BacktestRun) => (
-      <span className={row.pnl.startsWith('+') ? 'text-status-success font-medium' : row.pnl.startsWith('-') ? 'text-status-error font-medium' : 'text-text-muted'}>
-        {row.pnl}
-      </span>
-    ),
-  },
-  { key: 'sharpe', header: 'Sharpe', hideOnMobile: true },
-  {
-    key: 'status',
-    header: 'Status',
-    render: (row: BacktestRun) => (
-      <StatusBadge status={row.status} variant={row.statusVariant} size="sm" />
-    ),
-  },
-];
+/* ---------- Recharts helpers ---------- */
+
+function formatXTick(timestamp: string): string {
+  const d = new Date(timestamp);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function formatYTick(value: number): string {
+  return `$${(value / 1000).toFixed(0)}k`;
+}
+
+const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number }>; label?: string }) => {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
+      <p className="text-xs text-text-muted">{label ? formatXTick(label) : ''}</p>
+      <p className="text-sm font-medium text-text-primary">
+        ${payload[0].value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+      </p>
+    </div>
+  );
+};
 
 /* ---------- Page ---------- */
 
@@ -104,6 +140,14 @@ export default function BacktestPage() {
   const [endDate, setEndDate] = useState('2026-03-01');
   const [initialCapital, setInitialCapital] = useState('10000');
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedDetail, setSelectedDetail] = useState<ApiBacktestDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [isDark, setIsDark] = useState(false);
+
+  useEffect(() => {
+    setIsDark(document.documentElement.classList.contains('dark'));
+  }, []);
 
   useEffect(() => {
     fetchApi<ApiBacktestResult[]>('/api/backtest/results')
@@ -159,6 +203,61 @@ export default function BacktestPage() {
     }
   };
 
+  const handleSelectRun = async (id: string) => {
+    if (selectedRunId === id) return;
+    setSelectedRunId(id);
+    setSelectedDetail(null);
+    setDetailLoading(true);
+    try {
+      const detail = await fetchApi<ApiBacktestDetail>(`/api/backtest/results/${id}`);
+      setSelectedDetail(detail);
+    } catch {
+      /* API unavailable — no detail to show */
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const accentColor = isDark ? '#2383e2' : '#2563eb';
+  const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
+  const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
+
+  const columns = [
+    { key: 'strategy', header: 'Strategy' },
+    { key: 'period', header: 'Period', hideOnMobile: true },
+    { key: 'totalTrades', header: 'Trades', render: (row: BacktestRun) => <span>{row.totalTrades}</span> },
+    { key: 'winRate', header: 'Win Rate' },
+    {
+      key: 'pnl',
+      header: 'PnL',
+      render: (row: BacktestRun) => (
+        <span className={row.pnl.startsWith('+') ? 'text-status-success font-medium' : row.pnl.startsWith('-') ? 'text-status-error font-medium' : 'text-text-muted'}>
+          {row.pnl}
+        </span>
+      ),
+    },
+    { key: 'sharpe', header: 'Sharpe', hideOnMobile: true },
+    {
+      key: 'status',
+      header: 'Status',
+      render: (row: BacktestRun) => (
+        <StatusBadge status={row.status} variant={row.statusVariant} size="sm" />
+      ),
+    },
+    {
+      key: 'actions',
+      header: '',
+      render: (row: BacktestRun) => row.status === 'Completed' ? (
+        <button
+          onClick={() => handleSelectRun(row.id)}
+          className={`text-xs hover:underline ${selectedRunId === row.id ? 'text-accent-primary font-medium' : 'text-text-muted'}`}
+        >
+          View
+        </button>
+      ) : null,
+    },
+  ];
+
   return (
     <div className="flex flex-col gap-6">
       {/* Runner form */}
@@ -192,19 +291,93 @@ export default function BacktestPage() {
         </div>
       </DataCard>
 
-      {/* Results chart placeholder */}
+      {/* Results chart */}
       <DataCard title="Backtest Results" description="Equity curve and performance metrics">
-        <div className="flex h-56 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-          <div className="text-center">
-            <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
-              <BarChart3 className="h-5 w-5 text-text-muted" />
-            </div>
-            <p className="text-sm font-medium text-text-muted">Backtest Equity Curve</p>
-            <p className="mt-1 text-xs text-text-light">
-              {loading ? 'Loading...' : 'Select a completed run to view results'}
-            </p>
+        {detailLoading ? (
+          <div className="flex h-56 items-center justify-center">
+            <p className="text-sm text-text-muted">Loading results...</p>
           </div>
-        </div>
+        ) : selectedDetail ? (
+          <div className="flex flex-col gap-4">
+            {/* Equity curve chart */}
+            <div className="h-56">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={selectedDetail.equity_curve} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="backtestGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={accentColor} stopOpacity={0.2} />
+                      <stop offset="95%" stopColor={accentColor} stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />
+                  <XAxis
+                    dataKey="timestamp"
+                    tickFormatter={formatXTick}
+                    tick={{ fontSize: 11, fill: textMuted }}
+                    axisLine={false}
+                    tickLine={false}
+                    minTickGap={40}
+                  />
+                  <YAxis
+                    tickFormatter={formatYTick}
+                    tick={{ fontSize: 11, fill: textMuted }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={44}
+                  />
+                  <Tooltip content={<CustomTooltip />} />
+                  <Area
+                    type="monotone"
+                    dataKey="value"
+                    stroke={accentColor}
+                    strokeWidth={2}
+                    fill="url(#backtestGradient)"
+                    dot={false}
+                    activeDot={{ r: 4, fill: accentColor, strokeWidth: 0 }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Key metrics row */}
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5 border-t border-border-default pt-4">
+              <div>
+                <p className="text-xs text-text-muted">Total PnL</p>
+                <p className={`text-sm font-semibold ${selectedDetail.metrics.total_pnl >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+                  {selectedDetail.metrics.total_pnl >= 0 ? '+' : ''}${Math.abs(selectedDetail.metrics.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-text-muted">Win Rate</p>
+                <p className="text-sm font-semibold text-text-primary">{selectedDetail.metrics.win_rate.toFixed(1)}%</p>
+              </div>
+              <div>
+                <p className="text-xs text-text-muted">Sharpe Ratio</p>
+                <p className="text-sm font-semibold text-text-primary">{selectedDetail.metrics.sharpe_ratio.toFixed(2)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-text-muted">Max Drawdown</p>
+                <p className="text-sm font-semibold text-status-error">{selectedDetail.metrics.max_drawdown.toFixed(1)}%</p>
+              </div>
+              <div>
+                <p className="text-xs text-text-muted">Total Trades</p>
+                <p className="text-sm font-semibold text-text-primary">{selectedDetail.metrics.total_trades}</p>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex h-56 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
+            <div className="text-center">
+              <div className="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
+                <BarChart3 className="h-5 w-5 text-text-muted" />
+              </div>
+              <p className="text-sm font-medium text-text-muted">Backtest Equity Curve</p>
+              <p className="mt-1 text-xs text-text-light">
+                {loading ? 'Loading...' : 'Select a completed run to view results'}
+              </p>
+            </div>
+          </div>
+        )}
       </DataCard>
 
       {/* Results table */}
