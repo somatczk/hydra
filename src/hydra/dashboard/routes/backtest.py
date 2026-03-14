@@ -13,6 +13,13 @@ from pydantic import BaseModel, Field
 
 from hydra.backtest.runner import BacktestRunner
 from hydra.core.types import OHLCV, Timeframe
+from hydra.dashboard.routes.strategy_builder import (
+    _CONFIG_DIR as _STRATEGY_CONFIG_DIR,
+)
+from hydra.dashboard.routes.strategy_builder import (
+    _find_strategy_file,
+    _parse_strategy_yaml,
+)
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
 from hydra.strategy.condition_schema import (
     Comparator,
@@ -117,6 +124,11 @@ class BacktestVerification(BaseModel):
     reported_win_rate: float
     reported_total_pnl: float
     all_passed: bool
+
+
+class BacktestStrategyOption(BaseModel):
+    id: str
+    name: str
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +420,36 @@ def _default_strategy_config(
     return RuleBasedStrategy, config
 
 
+def _load_strategy_config(
+    strategy_id: str, symbol: str = "BTCUSDT"
+) -> tuple[type[RuleBasedStrategy], StrategyConfig]:
+    """Load strategy config from YAML if available, else fall back to default RSI."""
+    path = _find_strategy_file(strategy_id)
+    if path is not None:
+        data = _parse_strategy_yaml(path)
+        if data is not None:
+            params = data.get("parameters", {})
+            exchange = data.get("exchange", {})
+            symbols = data.get("symbols", [symbol])
+            timeframes_data = data.get("timeframes", {})
+            primary_tf = timeframes_data.get("primary", "1h")
+
+            config = StrategyConfig(
+                id=data.get("id", strategy_id),
+                name=data.get("name", "Backtest Strategy"),
+                strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+                symbols=symbols,
+                exchange=ExchangeStrategyConfig(
+                    exchange_id=exchange.get("exchange_id", "binance"),
+                ),
+                timeframes=TimeframeConfig(primary=Timeframe(primary_tf)),
+                parameters=params,
+            )
+            return RuleBasedStrategy, config
+
+    return _default_strategy_config(strategy_id, symbol)
+
+
 # ---------------------------------------------------------------------------
 # Background task
 # ---------------------------------------------------------------------------
@@ -461,7 +503,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
 
         _TASKS[task_id]["progress"] = 30.0
 
-        strategy_cls, config = _default_strategy_config(body.strategy_id)
+        strategy_cls, config = _load_strategy_config(body.strategy_id)
         runner = BacktestRunner()
         result = await runner.run(
             strategy_class=strategy_cls,
@@ -495,7 +537,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
         result_id = f"bt-{task_id}"
         _RESULTS[result_id] = {
             "id": result_id,
-            "strategy": body.strategy_id,
+            "strategy": config.name,
             "period": period,
             "status": "completed",
             "name": body.name,
@@ -802,3 +844,20 @@ async def verify_result(result_id: str, request: Request) -> dict[str, Any]:
         "reported_total_pnl": reported_total_pnl,
         "all_passed": trade_count_match and pnl_match and win_rate_match,
     }
+
+
+@router.get("/strategies", response_model=list[BacktestStrategyOption])
+async def list_backtest_strategies() -> list[dict[str, str]]:
+    """List strategies available for backtesting."""
+    strategies: list[dict[str, str]] = []
+    if _STRATEGY_CONFIG_DIR.is_dir():
+        for path in sorted(_STRATEGY_CONFIG_DIR.glob("*.yaml")):
+            data = _parse_strategy_yaml(path)
+            if data is not None:
+                strategies.append(
+                    {
+                        "id": data.get("id", path.stem),
+                        "name": data.get("name", path.stem),
+                    }
+                )
+    return strategies

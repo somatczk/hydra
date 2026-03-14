@@ -1,6 +1,6 @@
 'use client';
 
-import { useReducer, useEffect, useState, useCallback } from 'react';
+import { useReducer, useEffect, useState, useCallback, Suspense } from 'react';
 import { Save, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { RuleSection } from '@/components/builder/RuleSection';
@@ -8,7 +8,7 @@ import { TimeframeSelector } from '@/components/builder/TimeframeSelector';
 import { RiskConfigurator } from '@/components/builder/RiskConfigurator';
 import { SignalPreview } from '@/components/builder/SignalPreview';
 import { StrategyNameDialog } from '@/components/builder/StrategyNameDialog';
-import { SavedStrategies } from '@/components/builder/SavedStrategies';
+import { useSearchParams } from 'next/navigation';
 import { useToast } from '@/components/ui/Toast';
 import { fetchApi } from '@/lib/api';
 import type {
@@ -309,12 +309,12 @@ const DEFAULT_COMPARATORS: ComparatorSchema[] = [
 
 /* ---------- Page ---------- */
 
-export default function BuilderPage() {
+function BuilderPageContent() {
   const [state, dispatch] = useReducer(builderReducer, initialState);
   const [indicators, setIndicators] = useState<IndicatorSchema[]>(DEFAULT_INDICATORS);
   const [comparators, setComparators] = useState<ComparatorSchema[]>(DEFAULT_COMPARATORS);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const searchParams = useSearchParams();
   const { toast } = useToast();
 
   /* Fetch indicators and comparators from API */
@@ -334,18 +334,21 @@ export default function BuilderPage() {
     fetchData();
   }, []);
 
+  /* Load strategy from URL param ?strategy={id} */
+  useEffect(() => {
+    const strategyId = searchParams.get('strategy');
+    if (!strategyId) return;
+    fetchApi<StrategyDetail>(`/api/builder/strategies/${strategyId}`)
+      .then((detail) => dispatch({ type: 'LOAD_STRATEGY', payload: detail }))
+      .catch(() => { /* strategy not found */ });
+  }, [searchParams]);
+
   const handleSaved = useCallback(
     (name: string) => {
       toast('success', `Strategy "${name}" saved successfully`);
-      setRefreshKey((k) => k + 1);
     },
     [toast],
   );
-
-  const handleEdit = useCallback((detail: StrategyDetail) => {
-    dispatch({ type: 'LOAD_STRATEGY', payload: detail });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
 
   return (
     <div className="flex flex-col gap-6">
@@ -356,13 +359,6 @@ export default function BuilderPage() {
           Build trading strategies visually using indicators and conditions
         </p>
       </div>
-
-      {/* Saved strategies */}
-      <SavedStrategies
-        refreshKey={refreshKey}
-        onEdit={handleEdit}
-        onDelete={() => setRefreshKey((k) => k + 1)}
-      />
 
       {/* Rule sections */}
       <div className="flex flex-col gap-4">
@@ -463,5 +459,13 @@ export default function BuilderPage() {
         initialDescription={state.strategyDescription}
       />
     </div>
+  );
+}
+
+export default function BuilderPage() {
+  return (
+    <Suspense>
+      <BuilderPageContent />
+    </Suspense>
   );
 }

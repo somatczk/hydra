@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Zap, TrendingUp, Signal, Clock } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { Zap, Plus, Edit2, Trash2, BarChart3 } from 'lucide-react';
+import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
@@ -16,10 +18,9 @@ interface Strategy {
   statusVariant: 'success' | 'warning' | 'info' | 'neutral';
   pnl: string;
   pnlPositive: boolean;
-  signals: number;
   trades: number;
   winRate: string;
-  lastSignal: string;
+  source: 'db' | 'builder';
 }
 
 interface ApiStrategy {
@@ -35,62 +36,15 @@ interface ApiStrategy {
   };
 }
 
-/* ---------- Placeholder data ---------- */
+interface BuilderStrategy {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  filename: string;
+}
 
-const placeholderStrategies: Strategy[] = [
-  {
-    id: '1',
-    name: 'LSTM Momentum',
-    description: 'ML-based momentum strategy using LSTM predictions on 1h BTC/USDT',
-    status: 'Active',
-    statusVariant: 'success',
-    pnl: '+$1,240.50',
-    pnlPositive: true,
-    signals: 47,
-    trades: 32,
-    winRate: '68.7%',
-    lastSignal: '12 min ago',
-  },
-  {
-    id: '2',
-    name: 'Mean Reversion RSI',
-    description: 'RSI-based mean reversion with Bollinger Band confirmation',
-    status: 'Active',
-    statusVariant: 'success',
-    pnl: '+$580.20',
-    pnlPositive: true,
-    signals: 23,
-    trades: 18,
-    winRate: '61.1%',
-    lastSignal: '45 min ago',
-  },
-  {
-    id: '3',
-    name: 'Breakout Scanner',
-    description: 'Volume-weighted breakout detection across multiple timeframes',
-    status: 'Paused',
-    statusVariant: 'warning',
-    pnl: '-$120.00',
-    pnlPositive: false,
-    signals: 8,
-    trades: 5,
-    winRate: '40.0%',
-    lastSignal: '3 hours ago',
-  },
-  {
-    id: '4',
-    name: 'XGBoost Ensemble',
-    description: 'Ensemble of XGBoost models with feature importance weighting',
-    status: 'Backtesting',
-    statusVariant: 'info',
-    pnl: 'N/A',
-    pnlPositive: true,
-    signals: 0,
-    trades: 0,
-    winRate: 'N/A',
-    lastSignal: 'Never',
-  },
-];
+/* ---------- Helpers ---------- */
 
 function toStatusVariant(status: string): 'success' | 'warning' | 'info' | 'neutral' {
   switch (status) {
@@ -112,33 +66,85 @@ function mapApiStrategies(data: ApiStrategy[]): Strategy[] {
       ? `${s.performance.total_pnl >= 0 ? '+' : ''}$${Math.abs(s.performance.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
       : 'N/A',
     pnlPositive: s.performance.total_pnl >= 0,
-    signals: 0,
     trades: s.performance.total_trades,
     winRate: s.performance.win_rate > 0 ? `${s.performance.win_rate}%` : 'N/A',
-    lastSignal: 'N/A',
+    source: 'db' as const,
+  }));
+}
+
+function mapBuilderStrategies(data: BuilderStrategy[]): Strategy[] {
+  return data.map((s) => ({
+    id: s.id,
+    name: s.name,
+    description: s.description || 'Rule-based strategy',
+    status: s.enabled ? 'Active' : 'Draft',
+    statusVariant: s.enabled ? 'success' : 'neutral',
+    pnl: 'N/A',
+    pnlPositive: true,
+    trades: 0,
+    winRate: 'N/A',
+    source: 'builder' as const,
   }));
 }
 
 /* ---------- Page ---------- */
 
 export default function StrategiesPage() {
-  const [strategies, setStrategies] = useState<Strategy[]>(placeholderStrategies);
+  const router = useRouter();
+  const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchApi<ApiStrategy[]>('/api/strategies')
-      .then((data) => setStrategies(mapApiStrategies(data)))
-      .catch(() => { /* keep placeholder */ })
-      .finally(() => setLoading(false));
-  }, []);
+  const fetchStrategies = async () => {
+    setLoading(true);
+    try {
+      const [dbResult, builderResult] = await Promise.allSettled([
+        fetchApi<ApiStrategy[]>('/api/strategies'),
+        fetchApi<BuilderStrategy[]>('/api/builder/strategies'),
+      ]);
+
+      const dbStrategies = dbResult.status === 'fulfilled' ? mapApiStrategies(dbResult.value) : [];
+      const builderStrategies = builderResult.status === 'fulfilled' ? mapBuilderStrategies(builderResult.value) : [];
+
+      // Merge: builder strategies first, then DB (dedupe by id)
+      const seen = new Set<string>();
+      const merged: Strategy[] = [];
+      for (const s of builderStrategies) {
+        seen.add(s.id);
+        merged.push(s);
+      }
+      for (const s of dbStrategies) {
+        if (!seen.has(s.id)) merged.push(s);
+      }
+
+      setStrategies(merged);
+    } catch {
+      /* keep empty */
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { fetchStrategies(); }, []);
 
   const handleToggle = async (id: string) => {
     try {
       await fetchApi(`/api/strategies/${id}/toggle`, { method: 'POST' });
-      const data = await fetchApi<ApiStrategy[]>('/api/strategies');
-      setStrategies(mapApiStrategies(data));
+      fetchStrategies();
     } catch {
-      /* toggle failed -- keep current state */
+      /* toggle failed */
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    setDeletingId(id);
+    try {
+      await fetchApi(`/api/builder/strategies/${id}`, { method: 'DELETE' });
+      fetchStrategies();
+    } catch {
+      /* delete failed */
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -151,6 +157,10 @@ export default function StrategiesPage() {
             {loading ? 'Loading...' : `${strategies.filter((s) => s.status === 'Active').length} active strategies`}
           </p>
         </div>
+        <Button variant="primary" onClick={() => router.push('/builder')}>
+          <Plus className="h-4 w-4" />
+          New Strategy
+        </Button>
       </div>
 
       {/* Strategy cards grid */}
@@ -183,7 +193,7 @@ export default function StrategiesPage() {
             </div>
 
             {/* Stats row */}
-            <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="mt-4 grid grid-cols-3 gap-3">
               <div>
                 <p className="text-xs text-text-muted">PnL</p>
                 <p
@@ -203,31 +213,44 @@ export default function StrategiesPage() {
                   {strategy.winRate}
                 </p>
               </div>
-              <div className="flex items-center gap-1">
-                <Signal className="h-3 w-3 text-text-light" aria-hidden="true" />
-                <div>
-                  <p className="text-xs text-text-muted">Signals</p>
-                  <p className="text-sm font-semibold text-text-primary">
-                    {strategy.signals}
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-1">
-                <Clock className="h-3 w-3 text-text-light" aria-hidden="true" />
-                <div>
-                  <p className="text-xs text-text-muted">Last Signal</p>
-                  <p className="text-sm text-text-secondary">
-                    {strategy.lastSignal}
-                  </p>
-                </div>
+              <div>
+                <p className="text-xs text-text-muted">Trades</p>
+                <p className="text-sm font-semibold text-text-primary">
+                  {strategy.trades}
+                </p>
               </div>
             </div>
 
-            {/* Toggle area */}
+            {/* Action buttons */}
             <div className="mt-4 flex items-center justify-between border-t border-border-default pt-3">
-              <span className="text-xs text-text-muted">
-                {strategy.trades} trades executed
-              </span>
+              <div className="flex items-center gap-2">
+                {strategy.source === 'builder' && (
+                  <>
+                    <button
+                      onClick={() => router.push(`/builder?strategy=${strategy.id}`)}
+                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                    >
+                      <Edit2 className="h-3 w-3" />
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => handleDelete(strategy.id)}
+                      disabled={deletingId === strategy.id}
+                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-status-error/10 hover:text-status-error transition-colors disabled:opacity-50"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                      {deletingId === strategy.id ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => router.push(`/backtest?strategy=${strategy.id}`)}
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                >
+                  <BarChart3 className="h-3 w-3" />
+                  Backtest
+                </button>
+              </div>
               <div
                 className={cn(
                   'relative h-6 w-11 cursor-pointer rounded-full transition-colors',

@@ -1,7 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useEffect, useState, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Play, Download, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
@@ -42,6 +42,20 @@ interface ApiBacktestResult {
   };
 }
 
+interface StrategyOption {
+  id: string;
+  name: string;
+}
+
+/* ---------- Fallback strategies ---------- */
+
+const FALLBACK_STRATEGIES: StrategyOption[] = [
+  { id: 'strat-lstm-momentum', name: 'LSTM Momentum' },
+  { id: 'strat-mean-reversion', name: 'Mean Reversion RSI' },
+  { id: 'strat-funding-arb', name: 'Funding Arb' },
+  { id: 'strat-breakout', name: 'Breakout Scanner' },
+];
+
 /* ---------- Helpers ---------- */
 
 function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
@@ -68,12 +82,14 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
 
 /* ---------- Page ---------- */
 
-export default function BacktestPage() {
+function BacktestPageContent() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
-  const [strategyId, setStrategyId] = useState('strat-lstm-momentum');
+  const [strategies, setStrategies] = useState<StrategyOption[]>(FALLBACK_STRATEGIES);
+  const [strategyId, setStrategyId] = useState(searchParams.get('strategy') || FALLBACK_STRATEGIES[0].id);
   const [startDate, setStartDate] = useState('2026-01-01');
   const [endDate, setEndDate] = useState('2026-03-01');
   const [initialCapital, setInitialCapital] = useState('10000');
@@ -93,6 +109,23 @@ export default function BacktestPage() {
   };
 
   useEffect(() => { fetchResults(); }, []);
+
+  /* Fetch available strategies for the dropdown */
+  useEffect(() => {
+    fetchApi<StrategyOption[]>('/api/backtest/strategies')
+      .then((data) => {
+        if (data.length > 0) {
+          setStrategies(data);
+          const param = searchParams.get('strategy');
+          if (param && data.some((s) => s.id === param)) {
+            setStrategyId(param);
+          } else if (!data.some((s) => s.id === strategyId)) {
+            setStrategyId(data[0].id);
+          }
+        }
+      })
+      .catch(() => { /* keep fallback */ });
+  }, []);
 
   useEffect(() => {
     if (!pollingTaskId) return;
@@ -216,12 +249,7 @@ export default function BacktestPage() {
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-5">
           <Select
             label="Strategy"
-            options={[
-              { value: 'strat-lstm-momentum', label: 'LSTM Momentum' },
-              { value: 'strat-mean-reversion', label: 'Mean Reversion RSI' },
-              { value: 'strat-funding-arb', label: 'Funding Arb' },
-              { value: 'strat-breakout', label: 'Breakout Scanner' },
-            ]}
+            options={strategies.map((s) => ({ value: s.id, label: s.name }))}
             value={strategyId}
             onChange={(e) => setStrategyId(e.target.value)}
             placeholder="Select strategy..."
@@ -253,5 +281,13 @@ export default function BacktestPage() {
         />
       </DataCard>
     </div>
+  );
+}
+
+export default function BacktestPage() {
+  return (
+    <Suspense>
+      <BacktestPageContent />
+    </Suspense>
   );
 }

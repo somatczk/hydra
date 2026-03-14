@@ -6,7 +6,6 @@ export { TimeframeSelector } from './TimeframeSelector';
 export { RiskConfigurator } from './RiskConfigurator';
 export { SignalPreview } from './SignalPreview';
 export { StrategyNameDialog } from './StrategyNameDialog';
-export { SavedStrategies } from './SavedStrategies';
 export type {
   BuilderState,
   BuilderAction,

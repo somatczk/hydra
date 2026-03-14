@@ -28,6 +28,7 @@ from hydra.core.types import (
     OrderFill,
     OrderRequest,
     OrderType,
+    Position,
     Side,
     Symbol,
     Timeframe,
@@ -488,6 +489,25 @@ class BacktestRunner:
                     else:
                         _record_entry_txn(fill, sym_key, is_new=not had_position)
 
+                    # Sync position state to strategy context
+                    pos_data = tracker.positions.get(sym_key)
+                    if pos_data is not None:
+                        context.set_position(
+                            symbol,
+                            Position(
+                                symbol=sym,
+                                direction=pos_data["direction"],
+                                quantity=pos_data["quantity"],
+                                avg_entry_price=pos_data["avg_entry_price"],
+                                unrealized_pnl=Decimal("0"),
+                                realized_pnl=Decimal("0"),
+                                strategy_id=strategy_config.id,
+                                exchange_id=strategy_config.exchange.exchange_id,
+                            ),
+                        )
+                    else:
+                        context.set_position(symbol, None)
+
                     # Notify strategy of fill
                     fill_event = OrderFillEvent(
                         order_id=fill.order_id,
@@ -563,6 +583,7 @@ class BacktestRunner:
                             pnl=trade.pnl,
                             timestamp=bar.timestamp,
                         )
+                    context.set_position(symbol, None)
                 equity_curve.append(tracker.equity)
                 timestamps.append(bar.timestamp)
                 stopped_reason = "margin_call"
@@ -595,6 +616,7 @@ class BacktestRunner:
                         pnl=trade.pnl,
                         timestamp=last_bar.timestamp,
                     )
+                context.set_position(symbol, None)
 
         # Calculate metrics
         result = calculate_metrics(
