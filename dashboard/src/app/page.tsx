@@ -33,6 +33,42 @@ interface PortfolioSummary {
   change_pct: number;
 }
 
+interface ApiRecentTrade {
+  id: string;
+  symbol: string;
+  side: string;
+  price: number;
+  quantity: number;
+  fee: number;
+  pnl: number;
+  timestamp: string;
+}
+
+interface ApiPosition {
+  id: string;
+  pair: string;
+  side: string;
+  size: number;
+  entry_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+  pnl_pct: number;
+}
+
+interface ApiRiskStatus {
+  current_drawdown: number;
+  max_drawdown_limit: number;
+  daily_loss: number;
+  daily_loss_limit: number;
+  circuit_breakers: Array<{
+    tier: number;
+    label: string;
+    threshold: string;
+    current_value: number;
+    status: string;
+  }>;
+}
+
 /* ---------- Placeholder data ---------- */
 
 const placeholderTrades: Trade[] = [
@@ -50,6 +86,27 @@ const placeholderSummary: PortfolioSummary = {
   total_fees: 87.5,
   change_pct: 2.4,
 };
+
+function formatSymbol(symbol: string): string {
+  const match = symbol.match(/^([A-Z]{3,4})(USDT|USD|BUSD|USDC)$/);
+  if (match) return `${match[1]}/${match[2]}`;
+  return symbol;
+}
+
+function mapApiTrades(data: ApiRecentTrade[]): Trade[] {
+  return data.map((t) => {
+    const pnlStr = `${t.pnl >= 0 ? '+' : ''}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+    return {
+      id: t.id,
+      pair: formatSymbol(t.symbol),
+      side: t.side === 'BUY' ? 'Long' as const : 'Short' as const,
+      entry: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+      exit: '-',
+      pnl: pnlStr,
+      time: new Date(t.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }),
+    };
+  });
+}
 
 const tradeColumns = [
   { key: 'pair', header: 'Pair' },
@@ -88,15 +145,26 @@ const tradeColumns = [
 
 export default function DashboardPage() {
   const [summary, setSummary] = useState<PortfolioSummary>(placeholderSummary);
+  const [recentTrades, setRecentTrades] = useState<Trade[]>(placeholderTrades);
+  const [positionCount, setPositionCount] = useState<number>(3);
+  const [maxDrawdown, setMaxDrawdown] = useState<number>(4.2);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetchApi<PortfolioSummary>('/api/portfolio/summary')
-      .then(setSummary)
-      .catch(() => {
-        /* API unavailable -- keep placeholder */
-      })
-      .finally(() => setLoading(false));
+    Promise.all([
+      fetchApi<PortfolioSummary>('/api/portfolio/summary')
+        .then(setSummary)
+        .catch(() => { /* keep placeholder */ }),
+      fetchApi<ApiRecentTrade[]>('/api/portfolio/trades')
+        .then((data) => setRecentTrades(mapApiTrades(data)))
+        .catch(() => { /* keep placeholder */ }),
+      fetchApi<ApiPosition[]>('/api/portfolio/positions')
+        .then((data) => setPositionCount(data.length))
+        .catch(() => { /* keep placeholder */ }),
+      fetchApi<ApiRiskStatus>('/api/risk/status')
+        .then((data) => setMaxDrawdown(data.current_drawdown))
+        .catch(() => { /* keep placeholder */ }),
+    ]).finally(() => setLoading(false));
   }, []);
 
   return (
@@ -120,12 +188,12 @@ export default function DashboardPage() {
         <StatCard
           icon={BarChart3}
           label="Open Positions"
-          value="3"
+          value={positionCount.toLocaleString('en-US')}
         />
         <StatCard
           icon={ArrowDownRight}
           label="Max Drawdown"
-          value="4.2%"
+          value={`${maxDrawdown.toLocaleString('en-US', { minimumFractionDigits: 1 })}%`}
           change={0.3}
           changeType="decrease"
         />
@@ -150,7 +218,7 @@ export default function DashboardPage() {
       <DataCard title="Recent Trades" description="Last 5 executed trades">
         <Table
           columns={tradeColumns}
-          data={placeholderTrades}
+          data={recentTrades}
           keyExtractor={(row) => row.id}
         />
       </DataCard>

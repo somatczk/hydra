@@ -2,16 +2,6 @@
 
 from __future__ import annotations
 
-from hydra.portfolio.pnl import PnLCalculator
-from hydra.portfolio.positions import PositionTracker
-from hydra.portfolio.reconciliation import (
-    BalanceReconciler,
-    Discrepancy,
-    ReconciliationResult,
-    SyncAction,
-    SyncActionType,
-)
-
 __all__ = [
     "BalanceReconciler",
     "Discrepancy",
@@ -21,3 +11,23 @@ __all__ = [
     "SyncAction",
     "SyncActionType",
 ]
+
+_IMPORT_MAP: dict[str, tuple[str, str]] = {
+    "PnLCalculator": ("hydra.portfolio.pnl", "PnLCalculator"),
+    "PositionTracker": ("hydra.portfolio.positions", "PositionTracker"),
+    "BalanceReconciler": ("hydra.portfolio.reconciliation", "BalanceReconciler"),
+    "Discrepancy": ("hydra.portfolio.reconciliation", "Discrepancy"),
+    "ReconciliationResult": ("hydra.portfolio.reconciliation", "ReconciliationResult"),
+    "SyncAction": ("hydra.portfolio.reconciliation", "SyncAction"),
+    "SyncActionType": ("hydra.portfolio.reconciliation", "SyncActionType"),
+}
+
+
+def __getattr__(name: str) -> object:
+    if name in _IMPORT_MAP:
+        module_path, attr = _IMPORT_MAP[name]
+        import importlib
+
+        mod = importlib.import_module(module_path)
+        return getattr(mod, attr)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

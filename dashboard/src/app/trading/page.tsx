@@ -41,6 +41,17 @@ interface ApiPosition {
   pnl_pct: number;
 }
 
+interface ApiRecentTrade {
+  id: string;
+  symbol: string;
+  side: string;
+  price: number;
+  quantity: number;
+  fee: number;
+  pnl: number;
+  timestamp: string;
+}
+
 /* ---------- Placeholder data ---------- */
 
 const placeholderPositions: Position[] = [
@@ -67,6 +78,25 @@ function mapApiPositions(data: ApiPosition[]): Position[] {
     current: fmt(p.current_price),
     pnl: `${p.unrealized_pnl >= 0 ? '+' : ''}${fmt(p.unrealized_pnl)}`,
     pnlPercent: `${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%`,
+  }));
+}
+
+function formatSymbol(symbol: string): string {
+  // "BTCUSDT" -> "BTC/USDT"
+  const match = symbol.match(/^([A-Z]{3,4})(USDT|USD|BUSD|USDC)$/);
+  if (match) return `${match[1]}/${match[2]}`;
+  return symbol;
+}
+
+function mapApiTrades(data: ApiRecentTrade[]): RecentTrade[] {
+  return data.map((t) => ({
+    id: t.id,
+    pair: formatSymbol(t.symbol),
+    side: t.side === 'BUY' ? 'Long' as const : 'Short' as const,
+    size: `${t.quantity.toLocaleString('en-US')} BTC`,
+    price: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+    time: new Date(t.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    status: 'Filled',
   }));
 }
 
@@ -139,13 +169,18 @@ const tradeHistoryColumns = [
 
 export default function TradingPage() {
   const [openPositions, setOpenPositions] = useState<Position[]>(placeholderPositions);
+  const [recentTrades, setRecentTrades] = useState<RecentTrade[]>(placeholderTrades);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetchApi<ApiPosition[]>('/api/portfolio/positions')
-      .then((data) => setOpenPositions(mapApiPositions(data)))
-      .catch(() => { /* keep placeholder */ })
-      .finally(() => setLoading(false));
+    Promise.all([
+      fetchApi<ApiPosition[]>('/api/portfolio/positions')
+        .then((data) => setOpenPositions(mapApiPositions(data)))
+        .catch(() => { /* keep placeholder */ }),
+      fetchApi<ApiRecentTrade[]>('/api/portfolio/trades')
+        .then((data) => setRecentTrades(mapApiTrades(data)))
+        .catch(() => { /* keep placeholder */ }),
+    ]).finally(() => setLoading(false));
   }, []);
 
   return (
@@ -184,7 +219,7 @@ export default function TradingPage() {
         </div>
         <Table
           columns={tradeHistoryColumns}
-          data={placeholderTrades}
+          data={recentTrades}
           keyExtractor={(row) => row.id}
         />
       </DataCard>

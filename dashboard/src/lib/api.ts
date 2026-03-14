@@ -5,10 +5,14 @@
  * Falls back gracefully when the API is unreachable.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL ||
+  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000');
 
-const WS_BASE = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000')
-  .replace(/^http/, 'ws');
+const WS_BASE = (
+  process.env.NEXT_PUBLIC_API_URL ||
+  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
+).replace(/^http/, 'ws');
 
 // ---------------------------------------------------------------------------
 // REST helper

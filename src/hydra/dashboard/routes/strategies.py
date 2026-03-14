@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_STRATEGY_DESCRIPTIONS: dict[str, str] = {
+    "LSTM Momentum": "ML-based momentum strategy using LSTM predictions on 1h BTC/USDT",
+    "Mean Reversion": "RSI-based mean reversion with Bollinger Band confirmation",
+    "Funding Arbitrage": "Cross-exchange funding rate arbitrage between perpetual swaps",
+    "Breakout Scanner": "Volume-weighted breakout detection across multiple timeframes",
+}
+_DEFAULT_DESCRIPTION = "Custom strategy"
+
+
+def _pool_from_request(request: Request) -> object | None:
+    """Return the asyncpg connection pool from app state, or ``None``."""
+    return getattr(request.app.state, "db_pool", None)
+
+
+def _status_from_enabled(enabled: bool) -> str:
+    """Map the ``enabled`` boolean to a human-readable status string."""
+    return "Active" if enabled else "Paused"
 
 
 # ---------------------------------------------------------------------------
@@ -117,21 +142,85 @@ def _get_strategy(strategy_id: str) -> dict[str, Any]:
     return _STRATEGIES[strategy_id]
 
 
+def _row_to_strategy(row: Any) -> dict[str, Any]:
+    """Convert a DB row (from the strategies + aggregated trades query) to a dict."""
+    name = row["name"]
+    return {
+        "id": row["id"],
+        "name": name,
+        "description": _STRATEGY_DESCRIPTIONS.get(name, _DEFAULT_DESCRIPTION),
+        "status": _status_from_enabled(row["enabled"]),
+        "enabled": row["enabled"],
+        "config_yaml": "",
+        "performance": {
+            "total_pnl": round(float(row["total_pnl"]), 2),
+            "win_rate": round(float(row["win_rate"]), 1),
+            "total_trades": row["total_trades"],
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+        },
+    }
+
+
+_STRATEGIES_QUERY = (
+    "SELECT s.id, s.name, s.exchange_id, s.enabled, "
+    "COALESCE(SUM(t.pnl), 0) AS total_pnl, "
+    "COUNT(t.id) AS total_trades, "
+    "COALESCE("
+    "  COUNT(CASE WHEN t.pnl > 0 THEN 1 END)::float "
+    "  / NULLIF(COUNT(t.id), 0) * 100, 0"
+    ") AS win_rate "
+    "FROM seed_strategies s "
+    "LEFT JOIN seed_trades t ON s.id = t.strategy_id "
+    "GROUP BY s.id, s.name, s.exchange_id, s.enabled"
+)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 
 @router.get("", response_model=list[StrategyResponse])
-async def list_strategies() -> list[dict[str, Any]]:
+async def list_strategies(request: Request) -> list[dict[str, Any]]:
     """List all strategy configs with status and performance."""
-    return list(_STRATEGIES.values())
+    pool = _pool_from_request(request)
+    if pool is None:
+        return list(_STRATEGIES.values())
+
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(_STRATEGIES_QUERY)
+        return [_row_to_strategy(row) for row in rows]
+    except Exception:
+        logger.exception("Failed to fetch strategies from DB")
+        return list(_STRATEGIES.values())
 
 
 @router.get("/{strategy_id}", response_model=StrategyResponse)
-async def get_strategy(strategy_id: str) -> dict[str, Any]:
+async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
     """Get a single strategy detail."""
-    return _get_strategy(strategy_id)
+    pool = _pool_from_request(request)
+    if pool is None:
+        return _get_strategy(strategy_id)
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                _STRATEGIES_QUERY + " HAVING s.id = $1",
+                strategy_id,
+            )
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Strategy {strategy_id} not found",
+            )
+        return _row_to_strategy(row)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to fetch strategy %s from DB", strategy_id)
+        return _get_strategy(strategy_id)
 
 
 @router.put("/{strategy_id}", response_model=StrategyResponse)
@@ -143,12 +232,36 @@ async def update_strategy(strategy_id: str, body: StrategyUpdateRequest) -> dict
 
 
 @router.post("/{strategy_id}/toggle", response_model=ToggleResponse)
-async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
+async def toggle_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
     """Enable or disable a strategy."""
-    strat = _get_strategy(strategy_id)
-    strat["enabled"] = not strat["enabled"]
-    strat["status"] = "Active" if strat["enabled"] else "Paused"
-    return {"id": strategy_id, "enabled": strat["enabled"]}
+    pool = _pool_from_request(request)
+    if pool is None:
+        strat = _get_strategy(strategy_id)
+        strat["enabled"] = not strat["enabled"]
+        strat["status"] = _status_from_enabled(strat["enabled"])
+        return {"id": strategy_id, "enabled": strat["enabled"]}
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE seed_strategies SET enabled = NOT enabled "
+                "WHERE id = $1 RETURNING id, enabled",
+                strategy_id,
+            )
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Strategy {strategy_id} not found",
+            )
+        return {"id": row["id"], "enabled": row["enabled"]}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to toggle strategy %s in DB", strategy_id)
+        strat = _get_strategy(strategy_id)
+        strat["enabled"] = not strat["enabled"]
+        strat["status"] = _status_from_enabled(strat["enabled"])
+        return {"id": strategy_id, "enabled": strat["enabled"]}
 
 
 @router.get("/{strategy_id}/performance", response_model=StrategyPerformance)

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" stroke="#a78bfa" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+  <rect width="64" height="64" rx="14" fill="#0f0f17"/>
+  <!-- Body -->
+  <path d="M32 56 C32 56 32 38 32 32"/>
+  <!-- Center head -->
+  <path d="M32 32 C32 24 32 16 32 12"/>
+  <path d="M28 16 L32 8 L36 16"/>
+  <circle cx="30" cy="14" r="1.2" fill="#a78bfa" stroke="none"/>
+  <circle cx="34" cy="14" r="1.2" fill="#a78bfa" stroke="none"/>
+  <!-- Left head -->
+  <path d="M32 36 C26 32 18 26 14 18"/>
+  <path d="M10 22 L12 13 L18 20"/>
+  <circle cx="13" cy="17" r="1.2" fill="#a78bfa" stroke="none"/>
+  <!-- Right head -->
+  <path d="M32 36 C38 32 46 26 50 18"/>
+  <path d="M46 20 L52 13 L54 22"/>
+  <circle cx="51" cy="17" r="1.2" fill="#a78bfa" stroke="none"/>
+  <!-- Tongues -->
+  <path d="M31 8 L29 5 M33 8 L35 5" stroke-width="1.5"/>
+  <path d="M11.5 13 L9 10.5 M13 13 L12 9.5" stroke-width="1.5"/>
+  <path d="M52.5 13 L55 10.5 M51 13 L52 9.5" stroke-width="1.5"/>
+  <!-- Base coil -->
+  <path d="M26 50 C22 52 22 56 28 56 L36 56 C42 56 42 52 38 50"/>
+</svg>

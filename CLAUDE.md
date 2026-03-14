@@ -17,7 +17,6 @@ Bitcoin auto-trading platform with ML-assisted signals, multi-exchange support (
 - `config/` — YAML configuration files
 - `tests/` — pytest tests (unit, integration, e2e, performance)
 - `docker/` — Dockerfiles for each service
-- `deploy/` — Romulus deployment templates
 - `scripts/` — Utility scripts
 
 ## Commands
@@ -51,3 +50,11 @@ make docker-build     # Build all Docker images
 
 ## Module Boundaries
 Each module only imports from `hydra.core` + its declared dependencies. Enforced by import-linter.
+
+## CI/CD
+- PRs trigger lint, type-check, security scan, unit/integration/e2e tests
+- Merge to `main` builds Docker images, pushes to GHCR with auto-incrementing semver tags
+- Dependabot in the romulus repo picks up new image versions weekly and opens PRs
+
+## Deployment
+Deployed via romulus (homelab infra repo) as a Docker Compose stack on ZimaOS. Images are pulled from `ghcr.io/somatczk/hydra-*`.

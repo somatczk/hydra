@@ -55,6 +55,12 @@ const placeholderBreakers: CircuitBreaker[] = [
   { tier: 'Tier 4', label: 'System Kill Switch', threshold: '15% daily loss - halt all trading', currentValue: '3.8%', status: 'Normal', color: 'text-status-error', bgColor: 'bg-status-error/10', borderColor: 'border-status-error/30', icon: Ban },
 ];
 
+interface RiskEvent {
+  time: string;
+  message: string;
+  severity: 'warning' | 'info';
+}
+
 interface RiskState {
   circuitBreakers: CircuitBreaker[];
   drawdown: number;
@@ -98,6 +104,11 @@ function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
 export default function RiskPage() {
   const [state, setState] = useState<RiskState>(placeholderState);
   const [loading, setLoading] = useState(true);
+  const [riskEvents] = useState<RiskEvent[]>([
+    { time: '14:32', message: 'Position stop-loss triggered on BTC/USDT short at $68,180', severity: 'warning' },
+    { time: '11:15', message: 'Strategy cooldown activated for Breakout Scanner after 3 consecutive losses', severity: 'warning' },
+    { time: '09:00', message: 'Daily risk limits reset. All circuit breakers cleared.', severity: 'info' },
+  ]);
 
   useEffect(() => {
     fetchApi<ApiRiskStatus>('/api/risk/status')
@@ -216,11 +227,7 @@ export default function RiskPage() {
       {/* Risk alerts */}
       <DataCard title="Recent Risk Events" description="Risk management actions taken today">
         <div className="space-y-3">
-          {[
-            { time: '14:32', message: 'Position stop-loss triggered on BTC/USDT short at $68,180', severity: 'warning' as const },
-            { time: '11:15', message: 'Strategy cooldown activated for Breakout Scanner after 3 consecutive losses', severity: 'warning' as const },
-            { time: '09:00', message: 'Daily risk limits reset. All circuit breakers cleared.', severity: 'info' as const },
-          ].map((event, idx) => (
+          {riskEvents.map((event, idx) => (
             <div
               key={idx}
               className="flex items-start gap-3 rounded-lg border border-border-default bg-bg-secondary p-3"

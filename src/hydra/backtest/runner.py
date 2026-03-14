@@ -516,6 +516,10 @@ if __name__ == "__main__":
     import asyncio
     import signal as _signal
 
+    from hydra.core.logging import setup_logging
+
+    setup_logging(level="INFO", log_format="json")
+
     async def _worker() -> None:
         """Backtest worker: waits for jobs (placeholder)."""
         stop = asyncio.Event()

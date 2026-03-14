@@ -22,7 +22,11 @@ class TestHealth:
     def test_health_returns_200(self, client: TestClient) -> None:
         resp = client.get("/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        data = resp.json()
+        assert "status" in data
+        # Without a DB pool the health endpoint reports degraded status
+        assert data["status"] in ("ok", "degraded")
+        assert "db" in data
 
 
 # ---------------------------------------------------------------------------
@@ -265,19 +269,29 @@ class TestBuilder:
         data = resp.json()
         assert isinstance(data, list)
         assert len(data) > 0
-        assert "id" in data[0]
-        assert "parameters" in data[0]
+        assert "name" in data[0]
+        assert "params" in data[0]
 
     def test_preview_strategy(self, client: TestClient) -> None:
         resp = client.post(
             "/api/builder/preview",
             json={
-                "conditions": {
-                    "entry": [{"indicator": "rsi", "condition": "crosses_below", "value": 30}],
-                    "exit": [{"indicator": "rsi", "condition": "crosses_above", "value": 70}],
+                "rules": {
+                    "entry_long": {
+                        "operator": "AND",
+                        "conditions": [
+                            {"indicator": "rsi", "comparator": "crosses_below", "value": 30},
+                        ],
+                    },
+                    "exit_long": {
+                        "operator": "AND",
+                        "conditions": [
+                            {"indicator": "rsi", "comparator": "crosses_above", "value": 70},
+                        ],
+                    },
                 },
                 "timeframe": "1h",
-                "pair": "BTC/USDT",
+                "symbol": "BTCUSDT",
             },
         )
         assert resp.status_code == 200
@@ -291,16 +305,26 @@ class TestBuilder:
             json={
                 "name": "Test Strategy",
                 "description": "A test strategy",
-                "conditions": {
-                    "entry": [{"indicator": "rsi", "condition": "crosses_below", "value": 30}],
-                    "exit": [{"indicator": "rsi", "condition": "crosses_above", "value": 70}],
+                "rules": {
+                    "entry_long": {
+                        "operator": "AND",
+                        "conditions": [
+                            {"indicator": "rsi", "comparator": "crosses_below", "value": 30},
+                        ],
+                    },
+                    "exit_long": {
+                        "operator": "AND",
+                        "conditions": [
+                            {"indicator": "rsi", "comparator": "crosses_above", "value": 70},
+                        ],
+                    },
                 },
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 201
         data = resp.json()
-        assert "strategy_id" in data
-        assert "config_yaml" in data
+        assert "id" in data
+        assert "config_path" in data
 
 
 # ---------------------------------------------------------------------------

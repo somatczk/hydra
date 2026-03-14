@@ -99,6 +99,11 @@ export default function BacktestPage() {
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>(placeholderRuns);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [strategyId, setStrategyId] = useState('strat-lstm-momentum');
+  const [startDate, setStartDate] = useState('2026-01-01');
+  const [endDate, setEndDate] = useState('2026-03-01');
+  const [initialCapital, setInitialCapital] = useState('10000');
+  const [pollingTaskId, setPollingTaskId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchApi<ApiBacktestResult[]>('/api/backtest/results')
@@ -107,24 +112,49 @@ export default function BacktestPage() {
       .finally(() => setLoading(false));
   }, []);
 
+  useEffect(() => {
+    if (!pollingTaskId) return;
+    const interval = setInterval(async () => {
+      try {
+        const status = await fetchApi<{ status: string }>(`/api/backtest/status/${pollingTaskId}`);
+        if (status.status === 'completed' || status.status === 'failed') {
+          clearInterval(interval);
+          setPollingTaskId(null);
+          setRunning(false);
+          const data = await fetchApi<ApiBacktestResult[]>('/api/backtest/results');
+          setBacktestRuns(mapApiResults(data));
+        }
+      } catch {
+        clearInterval(interval);
+        setPollingTaskId(null);
+        setRunning(false);
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [pollingTaskId]);
+
   const handleRunBacktest = async () => {
     setRunning(true);
     try {
-      await fetchApi('/api/backtest/run', {
+      const result = await fetchApi<{ task_id: string }>('/api/backtest/run', {
         method: 'POST',
         body: JSON.stringify({
-          strategy_id: 'strat-1',
-          start_date: '2026-01-01',
-          end_date: '2026-03-01',
-          initial_capital: 10000,
+          strategy_id: strategyId,
+          start_date: startDate,
+          end_date: endDate,
+          initial_capital: Number(initialCapital),
         }),
       });
-      // Re-fetch results
-      const data = await fetchApi<ApiBacktestResult[]>('/api/backtest/results');
-      setBacktestRuns(mapApiResults(data));
+      if (result.task_id) {
+        setPollingTaskId(result.task_id);
+      } else {
+        // No task_id returned — fall back to immediate re-fetch
+        const data = await fetchApi<ApiBacktestResult[]>('/api/backtest/results');
+        setBacktestRuns(mapApiResults(data));
+        setRunning(false);
+      }
     } catch {
       /* API unavailable */
-    } finally {
       setRunning(false);
     }
   };
@@ -137,21 +167,23 @@ export default function BacktestPage() {
           <Select
             label="Strategy"
             options={[
-              { value: 'lstm', label: 'LSTM Momentum' },
-              { value: 'rsi', label: 'Mean Reversion RSI' },
-              { value: 'breakout', label: 'Breakout Scanner' },
-              { value: 'xgb', label: 'XGBoost Ensemble' },
+              { value: 'strat-lstm-momentum', label: 'LSTM Momentum' },
+              { value: 'strat-mean-reversion', label: 'Mean Reversion RSI' },
+              { value: 'strat-funding-arb', label: 'Funding Arb' },
+              { value: 'strat-breakout', label: 'Breakout Scanner' },
             ]}
+            value={strategyId}
+            onChange={(e) => setStrategyId(e.target.value)}
             placeholder="Select strategy..."
           />
-          <Input label="Start Date" type="date" defaultValue="2026-01-01" />
-          <Input label="End Date" type="date" defaultValue="2026-03-01" />
-          <Input label="Initial Capital ($)" type="number" placeholder="10000" defaultValue="10000" />
+          <Input label="Start Date" type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+          <Input label="End Date" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+          <Input label="Initial Capital ($)" type="number" value={initialCapital} onChange={(e) => setInitialCapital(e.target.value)} />
         </div>
         <div className="mt-4 flex flex-col gap-3 sm:flex-row">
           <Button variant="primary" onClick={handleRunBacktest} disabled={running}>
             <Play className="h-4 w-4" />
-            {running ? 'Running...' : 'Run Backtest'}
+            {pollingTaskId ? 'Polling results...' : running ? 'Running...' : 'Run Backtest'}
           </Button>
           <Button variant="outline">
             <Download className="h-4 w-4" />

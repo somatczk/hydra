@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/components/ui/cn';
+import { HydraLogo } from '@/components/icons/HydraLogo';
 
 interface NavItem {
   label: string;
@@ -75,7 +76,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             onClick={onClose}
           >
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-primary">
-              <span className="text-sm font-bold text-white">H</span>
+              <HydraLogo className="h-5 w-5 text-white" />
             </div>
             <span className="text-lg font-bold tracking-tight text-text-primary font-display">
               Hydra

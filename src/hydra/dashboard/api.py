@@ -13,11 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from hydra.dashboard.routes import (
     backtest,
-    builder,
     models,
     portfolio,
     risk,
     strategies,
+    strategy_builder,
     system,
 )
 
@@ -40,6 +40,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.state.system_config = None
+
 # Include all route modules
 app.include_router(strategies.router)
 app.include_router(portfolio.router)
@@ -47,7 +49,7 @@ app.include_router(backtest.router)
 app.include_router(risk.router)
 app.include_router(models.router)
 app.include_router(system.router)
-app.include_router(builder.router)
+app.include_router(strategy_builder.router)
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +59,10 @@ app.include_router(builder.router)
 
 @app.get("/health", tags=["health"])
 async def health() -> dict[str, str]:
-    """Simple liveness probe."""
-    return {"status": "ok"}
+    """Liveness probe with DB pool status."""
+    pool = getattr(app.state, "db_pool", None)
+    db_ok = pool is not None and not pool._closed if pool else False
+    return {"status": "ok" if db_ok else "degraded", "db": "connected" if db_ok else "disconnected"}
 
 
 @app.get("/metrics", tags=["observability"])
@@ -174,8 +178,48 @@ async def ws_risk(websocket: WebSocket) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Startup: auto-run migrations
+# Startup: logging, DB pool, migrations
 # ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+async def _init_logging() -> None:
+    """Configure structured logging."""
+    import os
+
+    from hydra.core.logging import setup_logging
+
+    level = os.environ.get("LOG_LEVEL", "INFO")
+    fmt = os.environ.get("LOG_FORMAT", "json")
+    setup_logging(level=level, log_format=fmt)
+
+
+@app.on_event("startup")
+async def _init_db_pool() -> None:
+    """Create shared asyncpg connection pool."""
+    import os
+
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        app.state.db_pool = None
+        return
+    try:
+        import asyncpg
+
+        app.state.db_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning("DB pool creation failed: %s", exc)
+        app.state.db_pool = None
+
+
+@app.on_event("shutdown")
+async def _close_db_pool() -> None:
+    """Close the DB pool on shutdown."""
+    pool = getattr(app.state, "db_pool", None)
+    if pool is not None:
+        await pool.close()
 
 
 @app.on_event("startup")
