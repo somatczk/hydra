@@ -74,13 +74,14 @@ export default function StrategiesPage() {
     }
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, name: string) => {
+    if (!confirm(`Delete strategy "${name}"? This cannot be undone.`)) return;
     setDeletingId(id);
     try {
       await fetchApi(`/api/builder/strategies/${id}`, { method: 'DELETE' });
       fetchStrategies();
-    } catch {
-      /* delete failed */
+    } catch (err) {
+      alert(`Failed to delete: ${err instanceof Error ? err.message : 'unknown error'}`);
     } finally {
       setDeletingId(null);
     }
@@ -150,7 +151,7 @@ export default function StrategiesPage() {
                   Backtest
                 </button>
                 <button
-                  onClick={() => handleDelete(strategy.id)}
+                  onClick={() => handleDelete(strategy.id, strategy.name)}
                   disabled={deletingId === strategy.id}
                   className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-status-error/10 hover:text-status-error transition-colors disabled:opacity-50"
                 >
