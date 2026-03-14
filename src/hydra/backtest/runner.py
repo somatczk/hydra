@@ -7,7 +7,9 @@ fills via FillSimulator, and tracks portfolio state.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -322,6 +324,7 @@ class BacktestRunner:
         commission: CommissionConfig | None = None,
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
+        on_progress: Callable[[float], None] | None = None,
     ) -> BacktestResult:
         """Run a complete backtest.
 
@@ -341,6 +344,8 @@ class BacktestRunner:
             Trading symbol.
         timeframe:
             Bar timeframe.
+        on_progress:
+            Optional callback invoked with progress 0.0-1.0.
         """
         if not bars:
             return calculate_metrics(
@@ -449,8 +454,15 @@ class BacktestRunner:
             )
 
         # Main replay loop
+        total_bars = len(bars)
         sym = Symbol(symbol)
         for i, bar in enumerate(bars):
+            # Yield to event loop periodically so API stays responsive
+            if i % 100 == 0:
+                await asyncio.sleep(0)
+                if on_progress is not None:
+                    on_progress(i / total_bars)
+
             # Advance clock
             clock.advance_to(bar.timestamp)
 

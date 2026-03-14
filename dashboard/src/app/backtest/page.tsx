@@ -96,6 +96,7 @@ function BacktestPageContent() {
   const [initialCapital, setInitialCapital] = useState('10000');
   const [backtestName, setBacktestName] = useState('');
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const fetchResults = async () => {
@@ -132,19 +133,22 @@ function BacktestPageContent() {
     if (!pollingTaskId) return;
     const interval = setInterval(async () => {
       try {
-        const status = await fetchApi<{ status: string }>(`/api/backtest/status/${pollingTaskId}`);
+        const status = await fetchApi<{ status: string; progress: number }>(`/api/backtest/status/${pollingTaskId}`);
+        setProgress(Math.round(status.progress));
         if (status.status === 'completed' || status.status === 'failed') {
           clearInterval(interval);
           setPollingTaskId(null);
           setRunning(false);
+          setProgress(0);
           fetchResults();
         }
       } catch {
         clearInterval(interval);
         setPollingTaskId(null);
         setRunning(false);
+        setProgress(0);
       }
-    }, 2000);
+    }, 1500);
     return () => clearInterval(interval);
   }, [pollingTaskId]);
 
@@ -275,15 +279,28 @@ function BacktestPageContent() {
           <Input label="Initial Capital ($)" type="number" value={initialCapital} onChange={(e) => setInitialCapital(e.target.value)} />
           <Input label="Name (optional)" type="text" value={backtestName} onChange={(e) => setBacktestName(e.target.value)} placeholder="e.g. LSTM Q1 run" />
         </div>
-        <div className="mt-4 flex flex-col gap-3 sm:flex-row">
-          <Button variant="primary" onClick={handleRunBacktest} disabled={running}>
-            <Play className="h-4 w-4" />
-            {pollingTaskId ? 'Polling results...' : running ? 'Running...' : 'Run Backtest'}
-          </Button>
-          <Button variant="outline">
-            <Download className="h-4 w-4" />
-            Export Results
-          </Button>
+        <div className="mt-4 flex flex-col gap-3">
+          <div className="flex gap-3 sm:flex-row">
+            <Button variant="primary" onClick={handleRunBacktest} disabled={running}>
+              <Play className="h-4 w-4" />
+              {running ? `Running${progress > 0 ? ` (${progress}%)` : '...'}` : 'Run Backtest'}
+            </Button>
+            <Button variant="outline">
+              <Download className="h-4 w-4" />
+              Export Results
+            </Button>
+          </div>
+          {running && (
+            <div className="flex items-center gap-3">
+              <div className="flex-1 h-2 rounded-full bg-bg-tertiary overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-accent-primary transition-all duration-500 ease-out"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+              <span className="text-xs text-text-muted w-10 text-right">{progress}%</span>
+            </div>
+          )}
         </div>
       </DataCard>
 

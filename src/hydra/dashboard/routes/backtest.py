@@ -535,6 +535,10 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
 
         _TASKS[task_id]["progress"] = 30.0
 
+        def _report_progress(pct: float) -> None:
+            # Map runner progress (0-1) into the 30-90 range
+            _TASKS[task_id]["progress"] = round(30.0 + pct * 60.0, 1)
+
         strategy_cls, config = _load_strategy_config(body.strategy_id)
         runner = BacktestRunner()
         result = await runner.run(
@@ -544,6 +548,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
             initial_capital=Decimal(str(body.initial_capital)),
             symbol="BTCUSDT",
             timeframe=tf,
+            on_progress=_report_progress,
         )
 
         _TASKS[task_id]["progress"] = 90.0
