@@ -1,10 +1,10 @@
 [project]
 name = "hydra"
-version = "0.2.0"
+version = "1.0.0"
 description = "Bitcoin auto-trading platform"
 readme = "README.md"
 requires-python = ">=3.12"
-license = "MIT"
+license = "LicenseRef-Proprietary"
 authors = [{ name = "somatczk" }]
 
 dependencies = [

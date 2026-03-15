@@ -127,7 +127,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
 
         {/* Footer */}
         <div className="border-t border-border-default px-4 py-3">
-          <p className="text-xs text-text-light">Hydra v0.1.0</p>
+          <p className="text-xs text-text-light">Hydra v{process.env.APP_VERSION}</p>
         </div>
       </aside>
     </>

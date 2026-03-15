@@ -21,32 +21,14 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Login to GHCR
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - uses: actions/checkout@v6
 
-      - name: Compute next semver tag
+      - name: Read version from pyproject.toml
         id: version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OWNER: ${{ github.repository_owner }}
         run: |
-          # Get latest semver tag from GHCR for hydra-engine
-          LATEST=$(gh api user/packages/container/hydra-engine/versions \
-            --jq '[.[].metadata.container.tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(split(".") | map(tonumber)) | last // empty' 2>/dev/null || true)
-
-          if [ -z "$LATEST" ]; then
-            NEXT="0.1.0"
-          else
-            MAJOR=$(echo "$LATEST" | cut -d. -f1)
-            MINOR=$(echo "$LATEST" | cut -d. -f2)
-            PATCH=$(echo "$LATEST" | cut -d. -f3)
-            NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
-          fi
-
-          echo "Latest: ${LATEST:-none}, Next: $NEXT"
-          echo "tag=$NEXT" >> $GITHUB_OUTPUT
+          TAG=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Version: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
   build:
     name: Build ${{ matrix.image }}
@@ -56,13 +38,13 @@ jobs:
       matrix:
         include:
           - image: hydra-engine
-            dockerfile: docker/Dockerfile.engine
+            dockerfile: docker/engine/Dockerfile
             context: .
           - image: hydra-dashboard
-            dockerfile: docker/Dockerfile.dashboard
+            dockerfile: docker/dashboard/Dockerfile
             context: .
           - image: hydra-backtest
-            dockerfile: docker/Dockerfile.backtest
+            dockerfile: docker/backtest/Dockerfile
             context: .
     steps:
       - uses: actions/checkout@v6
