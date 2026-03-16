@@ -42,6 +42,16 @@ class MarketDataRepository:
         self._max_pool_size = max_pool_size
         self._pool: Any = None
 
+    @classmethod
+    def from_pool(cls, pool: Any) -> MarketDataRepository:
+        """Create a repository wrapping an existing asyncpg pool."""
+        repo = cls.__new__(cls)
+        repo._dsn = ""
+        repo._min_pool_size = 0
+        repo._max_pool_size = 0
+        repo._pool = pool
+        return repo
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

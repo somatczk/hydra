@@ -15,10 +15,22 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from hydra.core.config import load_config
 from hydra.core.event_bus import InMemoryEventBus
+from hydra.core.events import BarEvent, EntrySignal, Event, ExitSignal
+from hydra.core.types import (
+    Direction,
+    ExchangeId,
+    MarketType,
+    OrderRequest,
+    OrderType,
+    Side,
+    Symbol,
+    Timeframe,
+)
+from hydra.data.ingestion import ExchangeFeedManager
 from hydra.execution.order_manager import OrderManager
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.strategy.config import StrategyConfig, load_strategy_config
@@ -26,6 +38,17 @@ from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
 
 logger = logging.getLogger(__name__)
+
+
+def _collect_timeframes(cfg: StrategyConfig) -> list[Timeframe]:
+    """Return all timeframes a strategy uses (primary + confirmation + entry)."""
+    tfs = [cfg.timeframes.primary]
+    if cfg.timeframes.confirmation is not None:
+        tfs.append(cfg.timeframes.confirmation)
+    if cfg.timeframes.entry is not None:
+        tfs.append(cfg.timeframes.entry)
+    return tfs
+
 
 # ---------------------------------------------------------------------------
 # Default config / strategy directories
@@ -62,6 +85,8 @@ class TradingSession:
     _event_bus: InMemoryEventBus | None = field(default=None, repr=False)
     _order_manager: OrderManager | None = field(default=None, repr=False)
     _executor: Any = field(default=None, repr=False)
+    _feed: ExchangeFeedManager | None = field(default=None, repr=False)
+    _all_timeframes: list[Timeframe] = field(default_factory=list, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +168,14 @@ class SessionManager:
             )
 
         order_manager = OrderManager(executor=executor, event_bus=event_bus)
+        feed = ExchangeFeedManager(event_bus=event_bus)
 
         session._engine = engine
         session._event_bus = event_bus
         session._order_manager = order_manager
         session._executor = executor
+        session._feed = feed
+        session._all_timeframes = _collect_timeframes(cfg)
 
         # Start engine
         session.status = "running"
@@ -331,6 +359,47 @@ class SessionManager:
         try:
             if session._engine is not None:
                 await session._engine.start()
+
+                # Wire signal→order bridge
+                if session._event_bus and session._order_manager and session._executor:
+                    om = session._order_manager  # capture for closure
+
+                    async def on_bar_price(event: Event) -> None:
+                        if isinstance(event, BarEvent) and event.ohlcv:
+                            session._executor.set_market_price(
+                                str(event.symbol),
+                                event.ohlcv.close,
+                            )
+
+                    async def on_signal(event: Event) -> None:
+                        order = self._signal_to_order(event, session)
+                        if order is not None:
+                            try:
+                                await om.submit_order(order)
+                            except Exception:
+                                logger.exception("Failed to submit order from signal")
+
+                    await session._event_bus.subscribe("bar", on_bar_price)
+                    await session._event_bus.subscribe("entry_signal", on_signal)
+                    await session._event_bus.subscribe("exit_signal", on_signal)
+
+                # Start market data feed
+                if session._feed is not None:
+                    eid = cast(ExchangeId, session.exchange_id)
+
+                    def _ccxt_factory() -> Any:
+                        import ccxt.pro
+
+                        cls = getattr(ccxt.pro, session.exchange_id)
+                        return cls({"enableRateLimit": True})
+
+                    session._feed._exchange_factories[eid] = _ccxt_factory
+                    await session._feed.connect(
+                        exchange_id=eid,
+                        symbols=session.symbols,
+                        timeframes=session._all_timeframes or [Timeframe(session.timeframe)],
+                    )
+
                 # Keep the task alive until cancelled
                 while session.status == "running":
                     await asyncio.sleep(1)
@@ -343,8 +412,49 @@ class SessionManager:
             session.stopped_at = datetime.now(UTC)
             await self._persist_session(session)
 
+    @staticmethod
+    def _signal_to_order(event: Event, session: TradingSession) -> OrderRequest | None:
+        """Convert a signal event into an OrderRequest for the live context."""
+        if isinstance(event, EntrySignal):
+            capital = session.paper_capital or Decimal("10000")
+            risk_fraction = Decimal("0.1")
+            notional = capital * risk_fraction
+            price = session._executor._last_prices.get(str(event.symbol), Decimal("0"))
+            if price <= 0:
+                return None
+            quantity = (notional / price).quantize(Decimal("0.00000001"))
+            if quantity <= 0:
+                return None
+            side = Side.BUY if event.direction == Direction.LONG else Side.SELL
+            return OrderRequest(
+                symbol=Symbol(str(event.symbol)),
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=quantity,
+                strategy_id=event.strategy_id,
+                exchange_id=event.exchange_id,
+                market_type=event.market_type,
+            )
+        if isinstance(event, ExitSignal):
+            pos = session._executor._positions.get(str(event.symbol))
+            quantity = pos.quantity if pos else Decimal("0.00000001")
+            side = Side.SELL if event.direction == Direction.FLAT else Side.BUY
+            return OrderRequest(
+                symbol=Symbol(str(event.symbol)),
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=quantity,
+                strategy_id=event.strategy_id,
+                exchange_id=event.exchange_id,
+                market_type=MarketType.SPOT,
+            )
+        return None
+
     async def _stop_session_internal(self, session: TradingSession) -> None:
         """Stop a session's engine/task and update state."""
+        if session._feed is not None:
+            await session._feed.disconnect_all()
+
         if session._engine is not None:
             await session._engine.stop()
 
@@ -396,6 +506,8 @@ class SessionManager:
         for session in self._sessions.values():
             if session.status != "running":
                 continue
+            if session._feed is not None:
+                await session._feed.disconnect_all()
             if session._engine is not None:
                 await session._engine.stop()
             if session._task is not None and not session._task.done():
@@ -460,11 +572,14 @@ class SessionManager:
                         )
 
                     order_manager = OrderManager(executor=executor, event_bus=event_bus)
+                    feed = ExchangeFeedManager(event_bus=event_bus)
 
                     session._engine = engine
                     session._event_bus = event_bus
                     session._order_manager = order_manager
                     session._executor = executor
+                    session._feed = feed
+                    session._all_timeframes = _collect_timeframes(cfg)
                     session._task = asyncio.create_task(self._run_session(session))
 
                     self._sessions[sid] = session

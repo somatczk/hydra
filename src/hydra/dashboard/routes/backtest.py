@@ -21,6 +21,8 @@ from hydra.dashboard.routes.strategy_builder import (
     _parse_any_strategy_yaml,
     _parse_strategy_yaml,
 )
+from hydra.data.backfill import ExchangeBackfillService
+from hydra.data.storage import MarketDataRepository
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
 from hydra.strategy.condition_schema import (
     Comparator,
@@ -48,6 +50,7 @@ class BacktestRunRequest(BaseModel):
     initial_capital: float = 10000.0
     name: str = ""
     timeframe: str = "1h"
+    fetch_fresh: bool = False
 
 
 class BacktestRunResponse(BaseModel):
@@ -481,6 +484,48 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
     _TASKS[task_id]["progress"] = 10.0
 
     try:
+        # Resolve timeframe early (needed by fresh-fetch and DB query)
+        try:
+            tf = Timeframe(body.timeframe)
+        except ValueError:
+            tf = Timeframe.H1
+        tf_minutes = _TIMEFRAME_MINUTES.get(body.timeframe, 60)
+
+        # Load strategy config → derive symbol
+        strategy_cls, config = _load_strategy_config(body.strategy_id)
+        symbol = config.symbols[0] if config.symbols else "BTCUSDT"
+
+        start_dt = datetime.fromisoformat(body.start_date)
+        end_dt = datetime.fromisoformat(body.end_date)
+
+        # Optionally fetch fresh exchange data before querying DB
+        if body.fetch_fresh and pool is not None:
+            try:
+                repo = MarketDataRepository.from_pool(pool)
+                exchange_id = config.exchange.exchange_id
+
+                def _ccxt_factory() -> Any:
+                    import ccxt
+
+                    cls = getattr(ccxt, exchange_id)
+                    return cls({"enableRateLimit": True})
+
+                backfill = ExchangeBackfillService(
+                    repository=repo,
+                    exchange_factories={exchange_id: _ccxt_factory},
+                )
+                await backfill.bulk_download(
+                    exchange_id=exchange_id,
+                    symbol=symbol,
+                    timeframe=tf,
+                    start=start_dt,
+                    end=end_dt,
+                )
+                await backfill.close()
+            except Exception:
+                logger.warning("Fresh data fetch failed, proceeding with cached", exc_info=True)
+        _TASKS[task_id]["progress"] = 20.0
+
         # Try to load bars from DB
         bars: list[OHLCV] | None = None
         if pool is not None:
@@ -489,9 +534,11 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
                     rows = await conn.fetch(
                         "SELECT timestamp, open, high, low, close, volume "
                         "FROM ts.ohlcv_1m "
-                        "WHERE symbol = $1 AND timestamp >= $2 AND timestamp <= $3 "
+                        "WHERE symbol = $1 AND timeframe = $2 "
+                        "AND timestamp >= $3 AND timestamp <= $4 "
                         "ORDER BY timestamp",
-                        "BTCUSDT",
+                        symbol,
+                        str(tf),
                         body.start_date,
                         body.end_date,
                     )
@@ -513,23 +560,14 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
                     task_id,
                 )
 
-        # Resolve timeframe
-        try:
-            tf = Timeframe(body.timeframe)
-        except ValueError:
-            tf = Timeframe.H1
-        tf_minutes = _TIMEFRAME_MINUTES.get(body.timeframe, 60)
-
         # Fallback to synthetic bars
         if not bars:
-            start = datetime.fromisoformat(body.start_date)
-            end = datetime.fromisoformat(body.end_date)
-            total_minutes = int((end - start).total_seconds() / 60)
+            total_minutes = int((end_dt - start_dt).total_seconds() / 60)
             bar_count = max(total_minutes // tf_minutes, 200)
             bars = _generate_sample_bars(
                 bar_count,
                 seed=hash(task_id) % 2**31,
-                start=start,
+                start=start_dt,
                 timeframe=body.timeframe,
             )
 
@@ -539,7 +577,6 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
             # Map runner progress (0-1) into the 30-90 range
             _TASKS[task_id]["progress"] = round(30.0 + pct * 60.0, 1)
 
-        strategy_cls, config = _load_strategy_config(body.strategy_id)
         runner = BacktestRunner()
 
         # Run backtest in a thread with its own event loop so the main
@@ -553,7 +590,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
                         strategy_config=config,
                         bars=bars,
                         initial_capital=Decimal(str(body.initial_capital)),
-                        symbol="BTCUSDT",
+                        symbol=symbol,
                         timeframe=tf,
                         on_progress=_report_progress,
                     )
