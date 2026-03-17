@@ -197,23 +197,32 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    Promise.all([
-      fetchApi<PortfolioSummary>('/api/portfolio/summary')
-        .then(setSummary)
-        .catch(() => { /* keep placeholder */ }),
-      fetchApi<ApiRecentTrade[]>('/api/portfolio/trades')
-        .then((data) => setRecentTrades(mapApiTrades(data)))
-        .catch(() => { /* keep placeholder */ }),
-      fetchApi<ApiPosition[]>('/api/portfolio/positions')
-        .then((data) => setPositionCount(data.length))
-        .catch(() => { /* keep placeholder */ }),
-      fetchApi<ApiRiskStatus>('/api/risk/status')
-        .then((data) => setMaxDrawdown(data.current_drawdown))
-        .catch(() => { /* keep placeholder */ }),
-      fetchApi<EquityPoint[]>('/api/portfolio/equity-curve')
-        .then((data) => setEquityCurve(data))
-        .catch(() => { /* chart stays empty if API unavailable */ }),
-    ]).finally(() => setLoading(false));
+    const load = async () => {
+      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
+        .catch(() => ({ trading_mode: 'paper' }));
+      const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+      const qs = `?source=${source}`;
+
+      await Promise.all([
+        fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
+          .then(setSummary)
+          .catch(() => { /* keep placeholder */ }),
+        fetchApi<ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
+          .then((data) => setRecentTrades(mapApiTrades(data)))
+          .catch(() => { /* keep placeholder */ }),
+        fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
+          .then((data) => setPositionCount(data.length))
+          .catch(() => { /* keep placeholder */ }),
+        fetchApi<ApiRiskStatus>('/api/risk/status')
+          .then((data) => setMaxDrawdown(data.current_drawdown))
+          .catch(() => { /* keep placeholder */ }),
+        fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
+          .then((data) => setEquityCurve(data))
+          .catch(() => { /* chart stays empty if API unavailable */ }),
+      ]);
+    };
+
+    load().finally(() => setLoading(false));
   }, []);
 
   const accentColor = isDark ? '#2383e2' : '#2563eb';

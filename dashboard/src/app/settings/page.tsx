@@ -36,6 +36,7 @@ interface PlatformConfig {
   default_pair: string;
   default_timeframe: string;
   max_concurrent_strategies: number;
+  paper_capital: number;
 }
 
 interface RiskConfig {
@@ -106,6 +107,7 @@ export default function SettingsPage() {
           setDefaultPair(cfg.default_pair);
           setDefaultTimeframe(cfg.default_timeframe);
           setMaxStrategies(cfg.max_concurrent_strategies.toString());
+          if (cfg.paper_capital) setPaperCapital(cfg.paper_capital.toString());
         }
         if (risk) {
           setKillSwitchActive(risk.kill_switch_active);
@@ -130,6 +132,7 @@ export default function SettingsPage() {
           default_pair: defaultPair,
           default_timeframe: defaultTimeframe,
           max_concurrent_strategies: Number(maxStrategies),
+          paper_capital: Number(paperCapital),
         }),
       });
       toast('success', 'Platform configuration saved');

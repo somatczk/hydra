@@ -386,9 +386,14 @@ async def _run_migrations() -> None:
                     unrealized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
                     realized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
                     drawdown_pct NUMERIC(8,4) NOT NULL DEFAULT 0,
-                    peak_value NUMERIC(24,8) NOT NULL DEFAULT 0
+                    peak_value NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'live'
                 )
             """)
+            await conn.execute(
+                "ALTER TABLE balance_snapshots "
+                "ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'live'"
+            )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_balance_snap_ts ON balance_snapshots(timestamp)"
             )

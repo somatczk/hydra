@@ -376,6 +376,8 @@ class SessionManager:
                         if order is not None:
                             try:
                                 await om.submit_order(order)
+                            except ValueError as exc:
+                                logger.warning("Skipped order from signal: %s", exc)
                             except Exception:
                                 logger.exception("Failed to submit order from signal")
 
@@ -416,7 +418,9 @@ class SessionManager:
     def _signal_to_order(event: Event, session: TradingSession) -> OrderRequest | None:
         """Convert a signal event into an OrderRequest for the live context."""
         if isinstance(event, EntrySignal):
-            capital = session.paper_capital or Decimal("10000")
+            capital = session._executor._balances.get("USDT", Decimal("0"))
+            if capital <= 0:
+                return None
             risk_fraction = Decimal("0.1")
             notional = capital * risk_fraction
             price = session._executor._last_prices.get(str(event.symbol), Decimal("0"))

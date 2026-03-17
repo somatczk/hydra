@@ -81,16 +81,23 @@ export default function StrategiesPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [startingId, setStartingId] = useState<string | null>(null);
   const [stoppingId, setStoppingId] = useState<string | null>(null);
+  const [tradingMode, setTradingMode] = useState<string>('paper');
+  const [paperCapital, setPaperCapital] = useState<number>(10000);
 
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [stratData, sessData] = await Promise.all([
+      const [stratData, sessData, cfg] = await Promise.all([
         fetchApi<BuilderStrategy[]>('/api/builder/strategies').catch(() => [] as BuilderStrategy[]),
         fetchApi<TradingSession[]>('/api/trading/sessions').catch(() => [] as TradingSession[]),
+        fetchApi<{ trading_mode: string; paper_capital?: number }>('/api/system/config').catch(() => null),
       ]);
       setSessions(sessData);
       setStrategies(mapBuilderStrategies(stratData, sessData));
+      if (cfg) {
+        setTradingMode(cfg.trading_mode);
+        if (cfg.paper_capital) setPaperCapital(cfg.paper_capital);
+      }
     } catch (err) {
       logger.warn('Strategies', 'Failed to fetch strategies', err);
     } finally {
@@ -134,6 +141,7 @@ export default function StrategiesPage() {
         body: JSON.stringify({
           strategy_id: strategyId,
           trading_mode: 'paper',
+          paper_capital: paperCapital,
         }),
       });
       toast('success', 'Paper session started');
@@ -264,24 +272,39 @@ export default function StrategiesPage() {
                   </>
                 ) : (
                   <>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleStartPaper(strategy.id)}
-                      loading={startingId === strategy.id}
-                    >
-                      <Play className="h-3 w-3" />
-                      Start Paper
-                    </Button>
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      onClick={() => handleStartLive(strategy.id)}
-                      loading={startingId === strategy.id}
-                    >
-                      <Play className="h-3 w-3" />
-                      Start Live
-                    </Button>
+                    {tradingMode === 'paper' && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleStartPaper(strategy.id)}
+                        loading={startingId === strategy.id}
+                      >
+                        <Play className="h-3 w-3" />
+                        Start Paper
+                      </Button>
+                    )}
+                    {tradingMode === 'live' && (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => handleStartLive(strategy.id)}
+                        loading={startingId === strategy.id}
+                      >
+                        <Play className="h-3 w-3" />
+                        Start Live
+                      </Button>
+                    )}
+                    {tradingMode === 'testnet' && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleStartPaper(strategy.id)}
+                        loading={startingId === strategy.id}
+                      >
+                        <Play className="h-3 w-3" />
+                        Start Testnet
+                      </Button>
+                    )}
                   </>
                 )}
               </div>

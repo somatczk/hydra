@@ -188,7 +188,7 @@ _TRADES_PLACEHOLDER: list[dict] = [
 
 
 @router.get("/summary", response_model=PortfolioSummary)
-async def get_summary(request: Request) -> PortfolioSummary | dict:
+async def get_summary(request: Request, source: str | None = None) -> PortfolioSummary | dict:
     """Total value, unrealized PnL, realized PnL, fees."""
     pool = _pool_from_request(request)
     if pool is None:
@@ -196,11 +196,22 @@ async def get_summary(request: Request) -> PortfolioSummary | dict:
 
     try:
         async with pool.acquire() as conn:
-            snapshot = await conn.fetchrow(
-                "SELECT total_value, unrealized_pnl, realized_pnl "
-                "FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
-            )
-            fees_row = await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades")
+            if source:
+                snapshot = await conn.fetchrow(
+                    "SELECT total_value, unrealized_pnl, realized_pnl "
+                    "FROM balance_snapshots WHERE source = $1 ORDER BY timestamp DESC LIMIT 1",
+                    source,
+                )
+                fees_row = await conn.fetchval(
+                    "SELECT COALESCE(SUM(fee), 0) FROM trades WHERE source = $1",
+                    source,
+                )
+            else:
+                snapshot = await conn.fetchrow(
+                    "SELECT total_value, unrealized_pnl, realized_pnl "
+                    "FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
+                )
+                fees_row = await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades")
 
             if snapshot is None:
                 return PortfolioSummary()
@@ -226,7 +237,7 @@ async def get_summary(request: Request) -> PortfolioSummary | dict:
 
 
 @router.get("/positions", response_model=list[Position])
-async def get_positions(request: Request) -> list[dict]:
+async def get_positions(request: Request, source: str | None = None) -> list[dict]:
     """All open positions across exchanges."""
     pool = _pool_from_request(request)
     if pool is None:
@@ -234,10 +245,21 @@ async def get_positions(request: Request) -> list[dict]:
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, strategy_id, exchange_id, symbol, direction, quantity, "
-                "avg_entry_price, unrealized_pnl, realized_pnl FROM positions"
-            )
+            if source:
+                rows = await conn.fetch(
+                    "SELECT id, strategy_id, exchange_id, symbol, direction, quantity, "
+                    "avg_entry_price, unrealized_pnl, realized_pnl FROM positions "
+                    "WHERE source = $1",
+                    source,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT id, strategy_id, exchange_id, symbol, direction, quantity, "
+                    "avg_entry_price, unrealized_pnl, realized_pnl FROM positions"
+                )
+
+        if not rows:
+            return _POSITIONS
 
         positions: list[dict] = []
         for row in rows:
@@ -272,7 +294,7 @@ async def get_positions(request: Request) -> list[dict]:
 
 
 @router.get("/equity-curve", response_model=list[EquityPoint])
-async def get_equity_curve(request: Request) -> list[dict]:
+async def get_equity_curve(request: Request, source: str | None = None) -> list[dict]:
     """Time series data for the equity chart."""
     pool = _pool_from_request(request)
     if pool is None:
@@ -280,9 +302,19 @@ async def get_equity_curve(request: Request) -> list[dict]:
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT timestamp, total_value FROM balance_snapshots ORDER BY timestamp"
-            )
+            if source:
+                rows = await conn.fetch(
+                    "SELECT timestamp, total_value FROM balance_snapshots "
+                    "WHERE source = $1 ORDER BY timestamp",
+                    source,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT timestamp, total_value FROM balance_snapshots ORDER BY timestamp"
+                )
+
+        if not rows:
+            return _EQUITY_CURVE
 
         return [
             {
@@ -297,7 +329,7 @@ async def get_equity_curve(request: Request) -> list[dict]:
 
 
 @router.get("/daily-pnl", response_model=list[DailyPnl])
-async def get_daily_pnl(request: Request) -> list[dict]:
+async def get_daily_pnl(request: Request, source: str | None = None) -> list[dict]:
     """Daily PnL series."""
     pool = _pool_from_request(request)
     if pool is None:
@@ -305,10 +337,20 @@ async def get_daily_pnl(request: Request) -> list[dict]:
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT date_trunc('day', timestamp) AS date, SUM(pnl) AS pnl "
-                "FROM trades GROUP BY date ORDER BY date"
-            )
+            if source:
+                rows = await conn.fetch(
+                    "SELECT date_trunc('day', timestamp) AS date, SUM(pnl) AS pnl "
+                    "FROM trades WHERE source = $1 GROUP BY date ORDER BY date",
+                    source,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT date_trunc('day', timestamp) AS date, SUM(pnl) AS pnl "
+                    "FROM trades GROUP BY date ORDER BY date"
+                )
+
+        if not rows:
+            return _DAILY_PNL
 
         return [
             {
@@ -323,7 +365,7 @@ async def get_daily_pnl(request: Request) -> list[dict]:
 
 
 @router.get("/monthly-returns", response_model=list[MonthlyReturn])
-async def get_monthly_returns(request: Request) -> list[dict]:
+async def get_monthly_returns(request: Request, source: str | None = None) -> list[dict]:
     """Monthly return percentages derived from balance snapshots."""
     pool = _pool_from_request(request)
     if pool is None:
@@ -331,15 +373,28 @@ async def get_monthly_returns(request: Request) -> list[dict]:
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT "
-                "  to_char(date_trunc('month', timestamp), 'YYYY-MM') AS month, "
-                "  (array_agg(total_value ORDER BY timestamp ASC))[1] AS first_val, "
-                "  (array_agg(total_value ORDER BY timestamp DESC))[1] AS last_val "
-                "FROM balance_snapshots "
-                "GROUP BY date_trunc('month', timestamp) "
-                "ORDER BY date_trunc('month', timestamp)"
-            )
+            if source:
+                rows = await conn.fetch(
+                    "SELECT "
+                    "  to_char(date_trunc('month', timestamp), 'YYYY-MM') AS month, "
+                    "  (array_agg(total_value ORDER BY timestamp ASC))[1] AS first_val, "
+                    "  (array_agg(total_value ORDER BY timestamp DESC))[1] AS last_val "
+                    "FROM balance_snapshots "
+                    "WHERE source = $1 "
+                    "GROUP BY date_trunc('month', timestamp) "
+                    "ORDER BY date_trunc('month', timestamp)",
+                    source,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT "
+                    "  to_char(date_trunc('month', timestamp), 'YYYY-MM') AS month, "
+                    "  (array_agg(total_value ORDER BY timestamp ASC))[1] AS first_val, "
+                    "  (array_agg(total_value ORDER BY timestamp DESC))[1] AS last_val "
+                    "FROM balance_snapshots "
+                    "GROUP BY date_trunc('month', timestamp) "
+                    "ORDER BY date_trunc('month', timestamp)"
+                )
 
         results: list[dict] = []
         for row in rows:
@@ -354,7 +409,7 @@ async def get_monthly_returns(request: Request) -> list[dict]:
 
 
 @router.get("/attribution", response_model=list[AttributionItem])
-async def get_attribution(request: Request) -> list[dict]:
+async def get_attribution(request: Request, source: str | None = None) -> list[dict]:
     """PnL broken down by strategy."""
     pool = _pool_from_request(request)
     if pool is None:
@@ -362,9 +417,16 @@ async def get_attribution(request: Request) -> list[dict]:
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT strategy_id AS name, SUM(pnl) AS pnl FROM trades GROUP BY strategy_id"
-            )
+            if source:
+                rows = await conn.fetch(
+                    "SELECT strategy_id AS name, SUM(pnl) AS pnl "
+                    "FROM trades WHERE source = $1 GROUP BY strategy_id",
+                    source,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT strategy_id AS name, SUM(pnl) AS pnl FROM trades GROUP BY strategy_id"
+                )
 
         total_pnl = sum(float(r["pnl"]) for r in rows)
         return [
@@ -383,7 +445,7 @@ async def get_attribution(request: Request) -> list[dict]:
 
 
 @router.get("/trades", response_model=list[TradeRecord])
-async def get_trades(request: Request) -> list[dict]:
+async def get_trades(request: Request, source: str | None = None) -> list[dict]:
     """Recent trades (last 20, newest first)."""
     pool = _pool_from_request(request)
     if pool is None:
@@ -391,10 +453,20 @@ async def get_trades(request: Request) -> list[dict]:
 
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, symbol, side, price, quantity, fee, pnl, timestamp "
-                "FROM trades ORDER BY timestamp DESC LIMIT 20"
-            )
+            if source:
+                rows = await conn.fetch(
+                    "SELECT id, symbol, side, price, quantity, fee, pnl, timestamp "
+                    "FROM trades WHERE source = $1 ORDER BY timestamp DESC LIMIT 20",
+                    source,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT id, symbol, side, price, quantity, fee, pnl, timestamp "
+                    "FROM trades ORDER BY timestamp DESC LIMIT 20"
+                )
+
+        if not rows:
+            return _TRADES_PLACEHOLDER
 
         return [
             {

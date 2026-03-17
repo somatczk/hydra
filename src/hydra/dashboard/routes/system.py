@@ -66,6 +66,7 @@ class PlatformConfig(BaseModel):
     default_pair: str = "BTC/USDT"
     default_timeframe: str = "1h"
     max_concurrent_strategies: int = 5
+    paper_capital: float = 10000.0
 
 
 class PlatformConfigUpdate(BaseModel):
@@ -73,6 +74,7 @@ class PlatformConfigUpdate(BaseModel):
     default_pair: str | None = None
     default_timeframe: str | None = None
     max_concurrent_strategies: int | None = None
+    paper_capital: float | None = None
 
 
 class ServiceHealth(BaseModel):
@@ -163,12 +165,18 @@ async def get_config(request: Request) -> PlatformConfig:
         max_strategies = int(max_strategies_raw)
     except ValueError:
         max_strategies = 5
+    paper_capital_raw = os.environ.get("HYDRA_PAPER_CAPITAL", "10000")
+    try:
+        paper_capital = float(paper_capital_raw)
+    except ValueError:
+        paper_capital = 10000.0
 
     return PlatformConfig(
         trading_mode=trading_mode,
         default_pair=default_pair,
         default_timeframe=default_timeframe,
         max_concurrent_strategies=max_strategies,
+        paper_capital=paper_capital,
     )
 
 
