@@ -475,8 +475,8 @@ class PaperTradingExecutor:
             from hydra.dashboard.metrics import update_position
 
             pos_now = self._positions.get(symbol)
-            is_open = pos_now and pos_now.direction != Direction.FLAT
-            size = float(pos_now.quantity) if is_open else 0.0
+            is_open = pos_now is not None and pos_now.direction != Direction.FLAT
+            size = float(pos_now.quantity) if pos_now is not None and is_open else 0.0
             update_position(str(symbol), self._exchange_id, size)
         except Exception:
             pass
