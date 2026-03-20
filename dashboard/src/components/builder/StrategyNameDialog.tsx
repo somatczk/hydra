@@ -113,8 +113,8 @@ export function StrategyNameDialog({
 
     try {
       const url = isEditing
-        ? `/api/builder/strategies/${editingId}`
-        : '/api/builder/save';
+        ? `/api/strategies/${editingId}`
+        : '/api/strategies/save';
       const method = isEditing ? 'PUT' : 'POST';
 
       await fetchApi(url, {

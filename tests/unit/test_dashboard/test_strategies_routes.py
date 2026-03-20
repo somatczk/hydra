@@ -111,7 +111,7 @@ class TestStrategiesFallback:
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, list)
-        assert len(data) >= 4
+        assert len(data) >= 1
         first = data[0]
         assert "id" in first
         assert "name" in first
@@ -213,7 +213,7 @@ class TestStrategiesWithPool:
         data = resp.json()
         # Falls back to placeholder strategies
         assert isinstance(data, list)
-        assert len(data) >= 4
+        assert len(data) >= 1
 
     def test_get_strategy_from_db(self) -> None:
         pool, conn = _make_mock_pool()

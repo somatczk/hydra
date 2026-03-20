@@ -7,7 +7,8 @@ import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
-import { fetchApi } from '@/lib/api';
+import { ErrorCard } from '@/components/ui/ErrorCard';
+import { fetchApi, connectWebSocket } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 
@@ -159,15 +160,20 @@ export default function SessionDetailPage() {
 
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
 
   const fetchDetail = useCallback(async () => {
     try {
       const d = await fetchApi<SessionDetail>(`/api/trading/sessions/${sessionId}/detail`);
       setDetail(d);
+      setFetchError(false);
     } catch (err) {
       logger.warn('SessionDetail', 'Failed to fetch session detail', err);
+      setFetchError(true);
     } finally {
       setLoading(false);
     }
@@ -177,16 +183,79 @@ export default function SessionDetailPage() {
     fetchDetail();
   }, [fetchDetail]);
 
-  // Poll every 5s if session is running
+  // WebSocket for live trade updates, with polling fallback
   useEffect(() => {
-    if (detail?.status === 'running') {
-      logger.info('SessionDetail', 'Polling started');
-      intervalRef.current = setInterval(fetchDetail, 5000);
-    }
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+    if (!detail || detail.status !== 'running') return;
+
+    const startPolling = () => {
+      if (!intervalRef.current) {
+        intervalRef.current = setInterval(fetchDetail, 5000);
+      }
     };
-  }, [detail?.status, fetchDetail]);
+
+    // Try WebSocket connection (plain function, not a hook)
+    const ws = connectWebSocket(
+      `/ws/trades?session_id=${sessionId}`,
+      (data) => {
+        const trade = data as TradeItem;
+        setDetail((prev) => {
+          if (!prev) return prev;
+          const updatedTrades = [...prev.trades, trade];
+          const totalPnl = updatedTrades.reduce((sum, t) => sum + t.pnl, 0);
+          const wins = updatedTrades.filter((t) => t.pnl > 0).length;
+          const winRate = updatedTrades.length > 0 ? (wins / updatedTrades.length) * 100 : 0;
+          return {
+            ...prev,
+            trades: updatedTrades,
+            metrics: {
+              ...prev.metrics,
+              total_pnl: totalPnl,
+              total_trades: updatedTrades.length,
+              win_rate: winRate,
+            },
+          };
+        });
+      },
+    );
+
+    if (ws) {
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setWsConnected(true);
+        logger.info('SessionDetail', 'WebSocket connected');
+        // Clear polling if active
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+      };
+      ws.onclose = () => {
+        setWsConnected(false);
+        logger.info('SessionDetail', 'WebSocket disconnected, falling back to polling');
+        startPolling();
+      };
+      ws.onerror = () => {
+        setWsConnected(false);
+        logger.warn('SessionDetail', 'WebSocket error, falling back to polling');
+        startPolling();
+      };
+    } else {
+      // WebSocket failed to connect, use polling
+      logger.info('SessionDetail', 'WebSocket unavailable, using polling');
+      startPolling();
+    }
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [detail?.status, sessionId, fetchDetail]);
 
   const handleStop = async () => {
     setStopping(true);
@@ -204,8 +273,25 @@ export default function SessionDetailPage() {
 
   if (loading) {
     return (
-      <div className="flex h-64 items-center justify-center">
-        <p className="text-sm text-text-muted">Loading session details...</p>
+      <div className="flex flex-col gap-6">
+        <div className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div key={i} className="h-20 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
+          ))}
+        </div>
+        <div className="h-48 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
+      </div>
+    );
+  }
+
+  if (fetchError && !detail) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 py-20">
+        <ErrorCard message="Failed to load session details" onRetry={fetchDetail} />
+        <Button variant="outline" onClick={() => router.push('/strategies')}>
+          <ArrowLeft className="h-4 w-4" /> Back to Strategies
+        </Button>
       </div>
     );
   }
@@ -280,6 +366,13 @@ export default function SessionDetailPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {detail.status === 'running' && (
+            <StatusBadge
+              status={wsConnected ? 'Live' : 'Polling'}
+              variant={wsConnected ? 'success' : 'info'}
+              size="sm"
+            />
+          )}
           <StatusBadge status={modeBadge} variant={modeVariant} />
           <StatusBadge status={detail.status.charAt(0).toUpperCase() + detail.status.slice(1)} variant={statusVariant} />
           {detail.status === 'running' && (
@@ -330,12 +423,16 @@ export default function SessionDetailPage() {
 
       {/* Trade History */}
       <DataCard title="Trade History" description={`${tradeRows.length} fills`}>
-        <Table
-          columns={tradeColumns}
-          data={tradeRows}
-          keyExtractor={(row) => row.id}
-          emptyMessage="No trades recorded"
-        />
+        {tradeRows.length > 0 ? (
+          <Table
+            columns={tradeColumns}
+            data={tradeRows}
+            keyExtractor={(row) => row.id}
+            emptyMessage="No trades recorded"
+          />
+        ) : (
+          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+        )}
       </DataCard>
     </div>
   );

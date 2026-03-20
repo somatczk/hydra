@@ -1,12 +1,15 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { ArrowUpDown, Eye, OctagonX } from 'lucide-react';
+import { ArrowUpDown, Eye, OctagonX, Shield, RotateCcw } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
+import { Button } from '@/components/ui/Button';
+import { ErrorCard } from '@/components/ui/ErrorCard';
 import { fetchApi } from '@/lib/api';
+import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -68,20 +71,23 @@ interface RiskConfig {
   kill_switch_active: boolean;
 }
 
-/* ---------- Placeholder data ---------- */
+interface CircuitBreaker {
+  tier: number;
+  label: string;
+  threshold: string;
+  current_value: number;
+  status: string;
+}
 
-const placeholderPositions: Position[] = [
-  { id: '1', pair: 'BTC/USDT', side: 'Long', size: '0.15 BTC', entry: '$67,420', current: '$68,100', pnl: '+$102.00', pnlPercent: '+1.01%' },
-  { id: '2', pair: 'BTC/USDT', side: 'Short', size: '0.08 BTC', entry: '$68,800', current: '$68,100', pnl: '+$56.00', pnlPercent: '+1.02%' },
-  { id: '3', pair: 'BTC/USDT', side: 'Long', size: '0.20 BTC', entry: '$67,900', current: '$68,100', pnl: '+$40.00', pnlPercent: '+0.29%' },
-];
+interface RiskStatus {
+  current_drawdown: number;
+  max_drawdown_limit: number;
+  daily_loss: number;
+  daily_loss_limit: number;
+  circuit_breakers: CircuitBreaker[];
+}
 
-const placeholderTrades: RecentTrade[] = [
-  { id: '1', pair: 'BTC/USDT', side: 'Long', size: '0.10 BTC', price: '$67,420', time: '14:32:15', status: 'Filled' },
-  { id: '2', pair: 'BTC/USDT', side: 'Short', size: '0.05 BTC', price: '$68,350', time: '13:15:42', status: 'Filled' },
-  { id: '3', pair: 'BTC/USDT', side: 'Long', size: '0.12 BTC', price: '$67,100', time: '11:48:09', status: 'Filled' },
-  { id: '4', pair: 'BTC/USDT', side: 'Long', size: '0.08 BTC', price: '$66,800', time: '10:22:33', status: 'Cancelled' },
-];
+/* ---------- Helpers ---------- */
 
 function mapApiPositions(data: ApiPosition[]): Position[] {
   const fmt = (v: number) => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
@@ -98,7 +104,6 @@ function mapApiPositions(data: ApiPosition[]): Position[] {
 }
 
 function formatSymbol(symbol: string): string {
-  // "BTCUSDT" -> "BTC/USDT"
   const match = symbol.match(/^([A-Z]{3,4})(USDT|USD|BUSD|USDC)$/);
   if (match) return `${match[1]}/${match[2]}`;
   return symbol;
@@ -185,31 +190,50 @@ const tradeHistoryColumns = [
 
 export default function TradingPage() {
   const router = useRouter();
+  const { toast } = useToast();
   useEffect(() => { logger.info('Trading', 'Page mounted'); }, []);
-  const [openPositions, setOpenPositions] = useState<Position[]>(placeholderPositions);
-  const [recentTrades, setRecentTrades] = useState<RecentTrade[]>(placeholderTrades);
+  const [openPositions, setOpenPositions] = useState<Position[] | null>(null);
+  const [recentTrades, setRecentTrades] = useState<RecentTrade[] | null>(null);
   const [sessions, setSessions] = useState<TradingSession[]>([]);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [killSwitchLoading, setKillSwitchLoading] = useState(false);
+  const [circuitBreakers, setCircuitBreakers] = useState<CircuitBreaker[] | null>(null);
+  const [riskStatus, setRiskStatus] = useState<RiskStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
+  const [resettingTier, setResettingTier] = useState<number | null>(null);
 
   const widgetContainerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    Promise.all([
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    setFetchErrors({});
+
+    await Promise.all([
       fetchApi<ApiPosition[]>('/api/portfolio/positions')
         .then((data) => setOpenPositions(mapApiPositions(data)))
-        .catch(() => { /* keep placeholder */ }),
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
       fetchApi<ApiRecentTrade[]>('/api/portfolio/trades')
         .then((data) => setRecentTrades(mapApiTrades(data)))
-        .catch(() => { /* keep placeholder */ }),
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, trades: true })); }),
       fetchApi<TradingSession[]>('/api/trading/sessions')
         .then((data) => setSessions(data.filter((s) => s.status === 'running')))
-        .catch(() => { /* keep empty */ }),
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, sessions: true })); }),
       fetchApi<RiskConfig>('/api/risk/config')
         .then((cfg) => setKillSwitchActive(cfg.kill_switch_active))
-        .catch(() => { /* keep false */ }),
-    ]).finally(() => setLoading(false));
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, riskConfig: true })); }),
+      fetchApi<CircuitBreaker[]>('/api/risk/circuit-breakers')
+        .then(setCircuitBreakers)
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, circuitBreakers: true })); }),
+      fetchApi<RiskStatus>('/api/risk/status')
+        .then(setRiskStatus)
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, riskStatus: true })); }),
+    ]);
+
+    setLoading(false);
   }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
 
   useEffect(() => {
     const container = widgetContainerRef.current;
@@ -240,6 +264,40 @@ export default function TradingPage() {
     };
   }, []);
 
+  const handleToggleKillSwitch = async () => {
+    setKillSwitchLoading(true);
+    try {
+      if (killSwitchActive) {
+        await fetchApi('/api/trading/kill-switch', { method: 'DELETE' });
+        setKillSwitchActive(false);
+        toast('success', 'Kill switch deactivated');
+      } else {
+        await fetchApi('/api/trading/kill-switch', { method: 'POST' });
+        setKillSwitchActive(true);
+        toast('warning', 'Kill switch activated — all trading halted');
+      }
+    } catch (err) {
+      logger.error('Trading', 'Failed to toggle kill switch', err);
+      toast('error', 'Failed to toggle kill switch');
+    } finally {
+      setKillSwitchLoading(false);
+    }
+  };
+
+  const handleResetCircuitBreaker = async (tier: number) => {
+    setResettingTier(tier);
+    try {
+      await fetchApi(`/api/risk/circuit-breakers/${tier}/reset`, { method: 'POST' });
+      toast('success', `Circuit breaker tier ${tier} reset`);
+      loadData();
+    } catch (err) {
+      logger.error('Trading', `Failed to reset circuit breaker tier ${tier}`, err);
+      toast('error', `Failed to reset tier ${tier}`);
+    } finally {
+      setResettingTier(null);
+    }
+  };
+
   const runningSessions = sessions.filter((s) => s.status === 'running');
 
   return (
@@ -251,11 +309,93 @@ export default function TradingPage() {
           <div>
             <p className="text-sm font-semibold text-status-error">Kill Switch Active</p>
             <p className="text-xs text-text-muted">
-              All trading is halted. Release the kill switch from the Risk page to resume.
+              All trading is halted. Release the kill switch to resume.
             </p>
           </div>
         </div>
       )}
+
+      {/* Risk Controls */}
+      <DataCard title="Risk Controls" description="Kill switch, circuit breakers, and daily PnL">
+        <div className="space-y-4">
+          {/* Kill switch toggle */}
+          <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
+            <div className="flex items-center gap-3">
+              <Shield className="h-4 w-4 text-text-muted shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-text-primary">Kill Switch</p>
+                <p className="text-xs text-text-muted">Immediately halt all trading activity</p>
+              </div>
+            </div>
+            <Button
+              variant={killSwitchActive ? 'primary' : 'danger'}
+              size="sm"
+              onClick={handleToggleKillSwitch}
+              loading={killSwitchLoading}
+            >
+              {killSwitchActive ? 'Deactivate' : 'Activate'}
+            </Button>
+          </div>
+
+          {/* Daily PnL vs limit */}
+          {riskStatus && (
+            <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
+              <div>
+                <p className="text-sm font-medium text-text-primary">Daily PnL vs Limit</p>
+                <p className="text-xs text-text-muted">
+                  Loss: ${Math.abs(riskStatus.daily_loss).toFixed(2)} / Limit: ${riskStatus.daily_loss_limit.toFixed(2)}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="w-32 h-2 rounded-full bg-bg-tertiary overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-status-error transition-all"
+                    style={{ width: `${Math.min((Math.abs(riskStatus.daily_loss) / riskStatus.daily_loss_limit) * 100, 100)}%` }}
+                  />
+                </div>
+                <span className="text-xs text-text-muted">
+                  {((Math.abs(riskStatus.daily_loss) / riskStatus.daily_loss_limit) * 100).toFixed(0)}%
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Circuit breakers */}
+          {fetchErrors.circuitBreakers ? (
+            <ErrorCard message="Failed to load circuit breakers" onRetry={loadData} />
+          ) : circuitBreakers && circuitBreakers.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-text-muted">Circuit Breakers</p>
+              {circuitBreakers.map((cb) => (
+                <div key={cb.tier} className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
+                  <div className="flex items-center gap-3">
+                    <StatusBadge
+                      status={cb.status === 'tripped' ? 'Tripped' : 'OK'}
+                      variant={cb.status === 'tripped' ? 'error' : 'success'}
+                      size="sm"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-text-primary">Tier {cb.tier}: {cb.label}</p>
+                      <p className="text-xs text-text-muted">Threshold: {cb.threshold} | Current: {cb.current_value}</p>
+                    </div>
+                  </div>
+                  {cb.status === 'tripped' && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleResetCircuitBreaker(cb.tier)}
+                      loading={resettingTier === cb.tier}
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      Reset
+                    </Button>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </DataCard>
 
       {/* Active sessions */}
       {runningSessions.length > 0 && (
@@ -300,24 +440,50 @@ export default function TradingPage() {
 
       {/* Open positions */}
       <DataCard title="Open Positions" description="Currently active positions">
-        <Table
-          columns={positionColumns}
-          data={openPositions}
-          keyExtractor={(row) => row.id}
-        />
+        {fetchErrors.positions ? (
+          <ErrorCard message="Failed to load positions" onRetry={loadData} />
+        ) : loading ? (
+          <div className="space-y-3">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <div key={i} className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
+            ))}
+          </div>
+        ) : openPositions && openPositions.length > 0 ? (
+          <Table
+            columns={positionColumns}
+            data={openPositions}
+            keyExtractor={(row) => row.id}
+          />
+        ) : (
+          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+        )}
       </DataCard>
 
       {/* Recent trades */}
       <DataCard title="Recent Trades">
-        <div className="flex items-center gap-2 mb-3">
-          <ArrowUpDown className="h-4 w-4 text-text-muted" />
-          <span className="text-xs text-text-muted">Sorted by most recent</span>
-        </div>
-        <Table
-          columns={tradeHistoryColumns}
-          data={recentTrades}
-          keyExtractor={(row) => row.id}
-        />
+        {fetchErrors.trades ? (
+          <ErrorCard message="Failed to load recent trades" onRetry={loadData} />
+        ) : loading ? (
+          <div className="space-y-3">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <div key={i} className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
+            ))}
+          </div>
+        ) : recentTrades && recentTrades.length > 0 ? (
+          <>
+            <div className="flex items-center gap-2 mb-3">
+              <ArrowUpDown className="h-4 w-4 text-text-muted" />
+              <span className="text-xs text-text-muted">Sorted by most recent</span>
+            </div>
+            <Table
+              columns={tradeHistoryColumns}
+              data={recentTrades}
+              keyExtractor={(row) => row.id}
+            />
+          </>
+        ) : (
+          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+        )}
       </DataCard>
     </div>
   );

@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from decimal import Decimal
 from typing import Any
 
-from hydra.core.types import ExchangeId
+from hydra.core.types import Direction, ExchangeId, Position, Symbol
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,7 @@ class ExchangeClient:
             extra["stopPrice"] = float(stop_price)
 
         price_f: float | None = float(price) if price is not None else None
+        t0 = time.monotonic()
         result: dict[str, Any] = await exchange.create_order(
             symbol=symbol,
             type=order_type.lower(),
@@ -127,6 +129,12 @@ class ExchangeClient:
             price=price_f,
             params=extra,
         )
+        try:
+            from hydra.dashboard.metrics import observe_exchange_api_latency
+
+            observe_exchange_api_latency(self._exchange_id, "create_order", time.monotonic() - t0)
+        except Exception:
+            pass
         return result
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
@@ -142,7 +150,14 @@ class ExchangeClient:
     async def fetch_balance(self) -> dict[str, Decimal]:
         """Fetch account balances.  Returns {currency: free_balance}."""
         exchange = self._get_exchange()
+        t0 = time.monotonic()
         raw: dict[str, Any] = await exchange.fetch_balance()
+        try:
+            from hydra.dashboard.metrics import observe_exchange_api_latency
+
+            observe_exchange_api_latency(self._exchange_id, "fetch_balance", time.monotonic() - t0)
+        except Exception:
+            pass
         balances: dict[str, Decimal] = {}
         free: dict[str, Any] = raw.get("free", {})
         for currency, amount in free.items():
@@ -153,17 +168,85 @@ class ExchangeClient:
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Fetch open orders from the exchange."""
         exchange = self._get_exchange()
+        t0 = time.monotonic()
         result: list[dict[str, Any]] = await exchange.fetch_open_orders(symbol)
+        try:
+            from hydra.dashboard.metrics import observe_exchange_api_latency
+
+            latency = time.monotonic() - t0
+            observe_exchange_api_latency(self._exchange_id, "fetch_open_orders", latency)
+        except Exception:
+            pass
         return result
 
     async def fetch_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Fetch open positions (futures only)."""
         exchange = self._get_exchange()
+        t0 = time.monotonic()
         if symbol:
             result: list[dict[str, Any]] = await exchange.fetch_positions([symbol])
         else:
             result = await exchange.fetch_positions()
+        try:
+            from hydra.dashboard.metrics import observe_exchange_api_latency
+
+            latency = time.monotonic() - t0
+            observe_exchange_api_latency(self._exchange_id, "fetch_positions", latency)
+        except Exception:
+            pass
         return result
+
+    # ------------------------------------------------------------------
+    # ExecutorState protocol implementation
+    # ------------------------------------------------------------------
+
+    async def get_balance(self) -> dict[str, Decimal]:
+        """Return exchange balances (ExecutorState protocol)."""
+        return await self.fetch_balance()
+
+    async def get_positions(self, symbol: str | None = None) -> list[Position]:
+        """Return exchange positions as Position objects (ExecutorState protocol)."""
+        raw = await self.fetch_positions(symbol)
+        results: list[Position] = []
+        for p in raw:
+            contracts = p.get("contracts") or p.get("contractSize") or 0
+            if float(contracts) == 0:
+                continue
+            side = str(p.get("side", "")).upper()
+            direction = Direction.LONG if side == "LONG" else Direction.SHORT
+            results.append(
+                Position(
+                    symbol=Symbol(p.get("symbol", "")),
+                    direction=direction,
+                    quantity=Decimal(str(contracts)),
+                    avg_entry_price=Decimal(str(p.get("entryPrice", 0))),
+                    unrealized_pnl=Decimal(str(p.get("unrealizedPnl", 0))),
+                    realized_pnl=Decimal("0"),
+                    strategy_id="",
+                    exchange_id=self._exchange_id,
+                )
+            )
+        return results
+
+    async def get_filled_orders(self) -> list[dict[str, Any]]:
+        """Return filled orders. Live fills are persisted to DB, not held in-memory."""
+        return []
+
+    async def get_last_price(self, symbol: str) -> Decimal:
+        """Fetch the last price via CCXT fetch_ticker (ExecutorState protocol)."""
+        exchange = self._get_exchange()
+        t0 = time.monotonic()
+        ticker: dict[str, Any] = await exchange.fetch_ticker(symbol)
+        try:
+            from hydra.dashboard.metrics import observe_exchange_api_latency
+
+            observe_exchange_api_latency(self._exchange_id, "fetch_ticker", time.monotonic() - t0)
+        except Exception:
+            pass
+        last = ticker.get("last")
+        if last is None:
+            raise ValueError(f"No last price in ticker for {symbol}")
+        return Decimal(str(last))
 
     # ------------------------------------------------------------------
     # Futures-specific
@@ -201,6 +284,12 @@ class ExchangeClient:
                     attempt + 1,
                     max_retries,
                 )
+                try:
+                    from hydra.dashboard.metrics import record_ws_reconnect
+
+                    record_ws_reconnect(self._exchange_id)
+                except Exception:
+                    pass
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30.0)
 

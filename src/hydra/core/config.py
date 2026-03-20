@@ -146,7 +146,7 @@ class MlConfig(BaseModel):
     """Machine learning settings."""
 
     models_dir: str = "/app/models"
-    inference_timeout_ms: int = 5
+    inference_timeout_ms: int = 50
 
 
 class PlatformConfig(BaseModel):

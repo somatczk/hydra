@@ -158,13 +158,14 @@ async def rollback_model(model_id: str) -> dict[str, Any]:
     }
 
 
-@router.post("/retrain", response_model=RetrainResponse)
-async def retrain_models() -> dict[str, str]:
-    """Trigger retraining of ML models."""
+@router.post("/{model_id}/retrain", response_model=RetrainResponse)
+async def retrain_model(model_id: str) -> dict[str, str]:
+    """Trigger retraining of a specific ML model."""
     import uuid
 
+    _get_model(model_id)  # validate model exists
     task_id = f"retrain-{uuid.uuid4().hex[:8]}"
     return {
         "task_id": task_id,
-        "message": "Retraining job started",
+        "message": f"Retraining job started for model {model_id}",
     }

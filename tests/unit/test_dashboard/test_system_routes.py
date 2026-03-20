@@ -274,7 +274,7 @@ class TestSystemHealth:
         """When Redis ping succeeds, Redis shows healthy."""
         mock_redis = MagicMock()
         mock_redis.ping = AsyncMock(return_value=True)
-        mock_redis.aclose = AsyncMock()
+        mock_redis.close = AsyncMock()
 
         env = {"REDIS_URL": "redis://localhost:6379"}
         with (
@@ -293,7 +293,7 @@ class TestSystemHealth:
         """When Redis ping fails, Redis shows down."""
         mock_redis = MagicMock()
         mock_redis.ping = AsyncMock(side_effect=ConnectionError("Connection refused"))
-        mock_redis.aclose = AsyncMock()
+        mock_redis.close = AsyncMock()
 
         env = {"REDIS_URL": "redis://localhost:6379"}
         with (
@@ -314,7 +314,7 @@ class TestSystemHealth:
 
         mock_redis = MagicMock()
         mock_redis.ping = AsyncMock(return_value=True)
-        mock_redis.aclose = AsyncMock()
+        mock_redis.close = AsyncMock()
 
         env = {"REDIS_URL": "redis://localhost:6379"}
         with (

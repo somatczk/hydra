@@ -20,7 +20,9 @@ from hydra.core.types import (
     Direction,
     ExchangeId,
     OrderType,
+    Position,
     Side,
+    Symbol,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,7 @@ class PaperTradingExecutor:
         fee_pct: Decimal = Decimal("0.001"),
         db_pool: Any = None,
         strategy_id: str = "",
+        session_id: str = "",
     ) -> None:
         self._exchange_id = exchange_id
         self._balances: dict[str, Decimal] = dict(initial_balances or {"USDT": Decimal("10000")})
@@ -91,6 +94,7 @@ class PaperTradingExecutor:
         self._fee_pct = fee_pct
         self._db_pool = db_pool
         self._strategy_id = strategy_id
+        self._session_id = session_id
 
         # State
         self._pending_orders: list[_PendingOrder] = []
@@ -242,6 +246,24 @@ class PaperTradingExecutor:
     # Fill execution
     # ------------------------------------------------------------------
 
+    def _compute_close_pnl(
+        self, symbol: str, side: str, quantity: Decimal, fill_price: Decimal
+    ) -> Decimal:
+        """Compute realized PnL when reducing/closing a position."""
+        pos = self._positions.get(symbol)
+        if pos is None:
+            return Decimal("0")
+        # Only closing trades generate PnL
+        is_closing = (pos.direction == Direction.LONG and side.upper() == "SELL") or (
+            pos.direction == Direction.SHORT and side.upper() == "BUY"
+        )
+        if not is_closing:
+            return Decimal("0")
+        closed_qty = min(quantity, pos.quantity)
+        if pos.direction == Direction.LONG:
+            return (fill_price - pos.avg_entry_price) * closed_qty
+        return (pos.avg_entry_price - fill_price) * closed_qty
+
     def _execute_fill(
         self,
         order_id: str,
@@ -253,6 +275,9 @@ class PaperTradingExecutor:
         """Execute a simulated fill: update balances and positions."""
         cost = fill_price * quantity
         fee = cost * self._fee_pct
+
+        # Compute PnL before updating position (needs old entry price)
+        pnl = self._compute_close_pnl(symbol, side, quantity, fill_price)
 
         # Update balances (simplified: assume quote currency is USDT)
         quote = "USDT"
@@ -275,54 +300,122 @@ class PaperTradingExecutor:
             "price": float(fill_price),
             "cost": float(cost),
             "fee": {"cost": float(fee), "currency": quote},
+            "pnl": float(pnl),
             "status": "FILLED",
             "filled": True,
         }
         self._filled_orders.append(fill_dict)
 
-        # Persist paper trade to DB (fire-and-forget)
+        try:
+            from hydra.dashboard.metrics import record_trade
+
+            record_trade(symbol, side, self._strategy_id, self._exchange_id, pnl=float(pnl))
+        except Exception:
+            pass
+
+        # Persist trade, position, and balance snapshot to DB (fire-and-forget)
         if self._db_pool is not None:
             import asyncio
 
             _task = asyncio.ensure_future(
-                self._persist_fill(symbol, side, quantity, fill_price, fee)
+                self._persist_fill_and_state(symbol, side, quantity, fill_price, fee, pnl)
             )
-            # prevent GC before completion
-            _task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+            def _log_persist_error(t: asyncio.Task[None]) -> None:
+                if not t.cancelled() and t.exception():
+                    logger.error("Failed to persist fill: %s", t.exception())
+
+            _task.add_done_callback(_log_persist_error)
 
         return fill_dict
 
-    async def _persist_fill(
+    async def _persist_fill_and_state(
         self,
         symbol: str,
         side: str,
         quantity: Decimal,
         price: Decimal,
         fee: Decimal,
+        pnl: Decimal,
     ) -> None:
-        """Persist a paper trading fill to the trades table."""
+        """Persist trade, position state, and balance snapshot to DB."""
         try:
             now = datetime.now(UTC)
             async with self._db_pool.acquire() as conn:
+                # 1) Trade
                 await conn.execute(
                     """
                     INSERT INTO trades
                         (symbol, side, price, quantity, fee, pnl,
-                         strategy_id, exchange_id, timestamp, source)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'paper')
+                         strategy_id, exchange_id, timestamp, source, session_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'paper', $10)
                     """,
                     symbol,
                     side.upper(),
                     price,
                     quantity,
                     fee,
-                    Decimal("0"),
+                    pnl,
                     self._strategy_id,
                     self._exchange_id,
                     now,
+                    self._session_id or None,
+                )
+
+                # 2) Position upsert
+                pos = self._positions.get(symbol)
+                if pos and pos.direction != Direction.FLAT and pos.quantity > 0:
+                    await conn.execute(
+                        """
+                        INSERT INTO positions
+                            (strategy_id, session_id, exchange_id, symbol,
+                             direction, quantity, avg_entry_price,
+                             unrealized_pnl, realized_pnl, source, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 'paper', $8)
+                        ON CONFLICT (session_id, symbol) DO UPDATE SET
+                            direction = EXCLUDED.direction,
+                            quantity = EXCLUDED.quantity,
+                            avg_entry_price = EXCLUDED.avg_entry_price,
+                            updated_at = EXCLUDED.updated_at
+                        """,
+                        self._strategy_id,
+                        self._session_id or None,
+                        self._exchange_id,
+                        symbol,
+                        pos.direction.value,
+                        pos.quantity,
+                        pos.avg_entry_price,
+                        now,
+                    )
+                elif pos and (pos.direction == Direction.FLAT or pos.quantity <= 0):
+                    # Position closed — remove from DB
+                    await conn.execute(
+                        "DELETE FROM positions WHERE session_id = $1 AND symbol = $2",
+                        self._session_id or None,
+                        symbol,
+                    )
+
+                # 3) Balance snapshot
+                total_value = self._balances.get("USDT", Decimal("0"))
+                # Add position value at last known prices
+                for sym, p in self._positions.items():
+                    if p.direction == Direction.FLAT or p.quantity <= 0:
+                        continue
+                    mark = self._last_prices.get(sym, p.avg_entry_price)
+                    total_value += mark * p.quantity
+
+                await conn.execute(
+                    """
+                    INSERT INTO balance_snapshots
+                        (timestamp, total_value, unrealized_pnl,
+                         realized_pnl, drawdown_pct, peak_value, source)
+                    VALUES ($1, $2, 0, 0, 0, $2, 'paper')
+                    """,
+                    now,
+                    total_value,
                 )
         except Exception:
-            logger.exception("Failed to persist paper fill for %s", symbol)
+            logger.exception("Failed to persist paper state for %s", symbol)
 
     def _update_position(
         self,
@@ -342,6 +435,12 @@ class PaperTradingExecutor:
                 quantity=quantity,
                 avg_entry_price=price,
             )
+            try:
+                from hydra.dashboard.metrics import update_position
+
+                update_position(str(symbol), self._exchange_id, float(quantity))
+            except Exception:
+                pass
             return
 
         if (pos.direction == Direction.LONG and side == Side.BUY) or (
@@ -372,6 +471,16 @@ class PaperTradingExecutor:
             else:
                 pos.quantity -= quantity
 
+        try:
+            from hydra.dashboard.metrics import update_position
+
+            pos_now = self._positions.get(symbol)
+            is_open = pos_now and pos_now.direction != Direction.FLAT
+            size = float(pos_now.quantity) if is_open else 0.0
+            update_position(str(symbol), self._exchange_id, size)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Account queries (match ExchangeClient interface)
     # ------------------------------------------------------------------
@@ -398,6 +507,51 @@ class PaperTradingExecutor:
                 }
             )
         return results
+
+    # ------------------------------------------------------------------
+    # ExecutorState protocol implementation
+    # ------------------------------------------------------------------
+
+    async def get_balance(self) -> dict[str, Decimal]:
+        """Return virtual balances (ExecutorState protocol)."""
+        return dict(self._balances)
+
+    async def get_positions(self, symbol: str | None = None) -> list[Position]:
+        """Return simulated positions as Position objects (ExecutorState protocol)."""
+        results: list[Position] = []
+        for sym, pos in self._positions.items():
+            if pos.direction == Direction.FLAT:
+                continue
+            if symbol is not None and sym != symbol:
+                continue
+            results.append(
+                Position(
+                    symbol=Symbol(pos.symbol),
+                    direction=pos.direction,
+                    quantity=pos.quantity,
+                    avg_entry_price=pos.avg_entry_price,
+                    unrealized_pnl=pos.unrealized_pnl,
+                    realized_pnl=Decimal("0"),
+                    strategy_id=self._strategy_id,
+                    exchange_id=self._exchange_id,
+                )
+            )
+        return results
+
+    async def get_last_price(self, symbol: str) -> Decimal:
+        """Return the last known price for a symbol (ExecutorState protocol)."""
+        price = self._last_prices.get(symbol, Decimal("0"))
+        if price <= 0:
+            raise ValueError(f"No market price available for {symbol}")
+        return price
+
+    # ------------------------------------------------------------------
+    # Account queries (match ExchangeClient interface)
+    # ------------------------------------------------------------------
+
+    async def get_filled_orders(self) -> list[dict[str, Any]]:
+        """Return a copy of all filled orders."""
+        return list(self._filled_orders)
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Return pending orders."""

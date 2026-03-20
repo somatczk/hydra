@@ -47,126 +47,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class _PositionTracker:
-    """Lightweight position tracker for backtest portfolio accounting."""
-
-    def __init__(self, initial_capital: Decimal) -> None:
-        self.cash = initial_capital
-        self.initial_capital = initial_capital
-        # symbol -> {direction, quantity, avg_entry_price, entry_time}
-        self.positions: dict[str, dict] = {}
-
-    @property
-    def equity(self) -> Decimal:
-        """Current equity = cash + unrealized PnL of open positions (mark-to-market)."""
-        return self.cash + sum(self._unrealized_pnl(sym) for sym in self.positions)
-
-    def mark_price(self, symbol: str, price: Decimal) -> None:
-        """Update the mark price for unrealized PnL computation."""
-        if symbol in self.positions:
-            self.positions[symbol]["mark_price"] = price
-
-    def _unrealized_pnl(self, symbol: str) -> Decimal:
-        pos = self.positions.get(symbol)
-        if pos is None:
-            return Decimal("0")
-        mark = pos.get("mark_price", pos["avg_entry_price"])
-        qty = pos["quantity"]
-        entry = pos["avg_entry_price"]
-        if pos["direction"] == Direction.LONG:
-            return (mark - entry) * qty
-        if pos["direction"] == Direction.SHORT:
-            return (entry - mark) * qty
-        return Decimal("0")
-
-    def apply_fill(self, fill: OrderFill, bar_time: datetime | None = None) -> Trade | None:
-        """Apply a fill and return a Trade if a position was closed."""
-        symbol = str(fill.symbol)
-        pos = self.positions.get(symbol)
-
-        if pos is None:
-            # Opening a new position
-            direction = Direction.LONG if fill.side == Side.BUY else Direction.SHORT
-            self.positions[symbol] = {
-                "direction": direction,
-                "quantity": fill.quantity,
-                "avg_entry_price": fill.price,
-                "entry_time": fill.timestamp,
-                "mark_price": fill.price,
-            }
-            # Deduct cost from cash (for longs) or credit (for shorts)
-            self.cash -= fill.fee
-            if direction == Direction.LONG:
-                self.cash -= fill.quantity * fill.price
-            else:
-                self.cash += fill.quantity * fill.price
-            return None
-
-        # Existing position — determine if adding or closing
-        is_closing = (pos["direction"] == Direction.LONG and fill.side == Side.SELL) or (
-            pos["direction"] == Direction.SHORT and fill.side == Side.BUY
-        )
-
-        if is_closing:
-            # Close (full or partial)
-            close_qty = min(fill.quantity, pos["quantity"])
-            entry_price = pos["avg_entry_price"]
-
-            if pos["direction"] == Direction.LONG:
-                pnl = (fill.price - entry_price) * close_qty - fill.fee
-                self.cash += fill.quantity * fill.price - fill.fee
-            else:
-                pnl = (entry_price - fill.price) * close_qty - fill.fee
-                self.cash -= fill.quantity * fill.price
-                self.cash -= fill.fee
-                self.cash += close_qty * entry_price * 2 - close_qty * fill.price
-
-            # Simplify: for a short, cash was credited on entry.
-            # On close (buy), we pay fill.price * qty + fee
-            # PnL = (entry - exit) * qty - fee
-            # Reset the cash calculation for shorts:
-            if pos["direction"] == Direction.SHORT:
-                # Undo the complex calculation above and redo cleanly
-                # Entry credited: +entry_price * qty to cash (already done)
-                # Exit costs: -fill.price * qty - fee
-                self.cash = self.cash  # The complex calc is wrong; let's fix below
-
-            if pos["direction"] != Direction.LONG:
-                pnl = (entry_price - fill.price) * close_qty - fill.fee
-            trade = Trade(
-                entry_time=pos["entry_time"],
-                exit_time=fill.timestamp,
-                symbol=symbol,
-                direction=str(pos["direction"]),
-                entry_price=entry_price,
-                exit_price=fill.price,
-                quantity=close_qty,
-                pnl=pnl,
-                fees=fill.fee,
-            )
-
-            remaining = pos["quantity"] - close_qty
-            if remaining <= 0:
-                del self.positions[symbol]
-            else:
-                pos["quantity"] = remaining
-
-            return trade
-
-        # Adding to position (same direction)
-        total_qty = pos["quantity"] + fill.quantity
-        pos["avg_entry_price"] = (
-            pos["avg_entry_price"] * pos["quantity"] + fill.price * fill.quantity
-        ) / total_qty
-        pos["quantity"] = total_qty
-        self.cash -= fill.fee
-        if pos["direction"] == Direction.LONG:
-            self.cash -= fill.quantity * fill.price
-        else:
-            self.cash += fill.quantity * fill.price
-        return None
-
-
 class _SimplePositionTracker:
     """Simplified position tracker that correctly handles cash accounting."""
 
@@ -247,7 +127,8 @@ class _SimplePositionTracker:
             self.cash += close_qty * price - fee
         else:
             pnl = (entry_price - price) * close_qty - fee
-            self.cash += close_qty * entry_price + (entry_price - price) * close_qty - fee
+            # Short close: receive PnL (no notional was exchanged on open)
+            self.cash += (entry_price - price) * close_qty - fee
 
         trade = Trade(
             entry_time=pos["entry_time"],

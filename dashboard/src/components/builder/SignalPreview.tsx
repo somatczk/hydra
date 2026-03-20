@@ -48,7 +48,7 @@ export function SignalPreview({ state }: SignalPreviewProps) {
     };
 
     try {
-      const data = await fetchApi<PreviewResponse>('/api/builder/preview', {
+      const data = await fetchApi<PreviewResponse>('/api/strategies/preview', {
         method: 'POST',
         body: JSON.stringify(requestBody),
       });

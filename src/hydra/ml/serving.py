@@ -67,6 +67,28 @@ class ModelInference:
             input_name=input_name,
         )
 
+        # Check for forward-look bias in older models
+        import logging as _logging
+
+        _logger = _logging.getLogger(__name__)
+        try:
+            meta = sess.get_modelmeta()
+            custom = meta.custom_metadata_map if meta else {}
+            feature_version = int(custom.get("feature_version", "0"))
+            if feature_version < 2:
+                _logger.warning(
+                    "Model '%s' (feature_version=%d) was trained with "
+                    "forward-look bias in multi-TF features. Retrain recommended.",
+                    model_name,
+                    feature_version,
+                )
+        except Exception:
+            _logger.warning(
+                "Model '%s' has no feature_version metadata. "
+                "May have been trained with forward-look bias. Retrain recommended.",
+                model_name,
+            )
+
     def predict(self, model_name: str, features: ndarray) -> ndarray | None:
         """Run inference on the named model.
 
@@ -92,7 +114,14 @@ class ModelInference:
             if input_data.ndim == 1:
                 input_data = input_data.reshape(1, -1)
 
+            t0 = time.monotonic()
             results = session.run(None, {loaded.input_name: input_data})  # type: ignore[union-attr]
+            try:
+                from hydra.dashboard.metrics import observe_ml_inference_latency
+
+                observe_ml_inference_latency(model_name, time.monotonic() - t0)
+            except Exception:
+                pass
             return np.asarray(results[0])
         except Exception:
             # Fallback: strategy continues without ML

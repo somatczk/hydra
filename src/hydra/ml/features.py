@@ -563,4 +563,11 @@ class FeatureEngineering:
             expanded = np.repeat(block, ratio, axis=0)
             result[target_len - expanded_len :] = expanded
 
+        # Shift by `ratio` rows to prevent forward-look bias:
+        # each higher-TF bar should only be visible after it closes
+        shifted = np.full((target_len, n_features), np.nan, dtype=np.float64)
+        if target_len > ratio:
+            shifted[ratio:] = result[:-ratio]
+        result = shifted
+
         return result

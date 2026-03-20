@@ -1,7 +1,7 @@
 /**
  * Hydra Dashboard API client.
  *
- * Provides `fetchApi` for REST calls and `useWebSocket` for streaming data.
+ * Provides `fetchApi` for REST calls and `connectWebSocket` for streaming data.
  * Falls back gracefully when the API is unreachable.
  */
 
@@ -85,11 +85,14 @@ export async function fetchApi<T>(
 /**
  * Connect to a Hydra WebSocket channel.
  *
+ * This is a plain function (not a React hook) that creates a WebSocket.
+ * Safe to call from useEffect callbacks or event handlers.
+ *
  * @param path      - WS path starting with `/` (e.g. `/ws/market`)
  * @param onMessage - Callback invoked with each parsed JSON message
  * @returns The WebSocket instance (or `null` if connection fails)
  */
-export function useWebSocket(
+export function connectWebSocket(
   path: string,
   onMessage: (data: unknown) => void,
 ): WebSocket | null {

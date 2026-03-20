@@ -1,4 +1,4 @@
-"""Tests for the strategy builder FastAPI routes."""
+"""Tests for the strategy builder endpoints (consolidated under /api/strategies)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from hydra.dashboard.routes.strategy_builder import router
+from hydra.dashboard.routes.strategies import router
 
 
 @pytest.fixture()
@@ -28,7 +28,7 @@ def client(app: FastAPI) -> TestClient:
 
 
 # ---------------------------------------------------------------------------
-# GET /api/builder/indicators
+# GET /api/strategies/indicators
 # ---------------------------------------------------------------------------
 
 
@@ -36,20 +36,20 @@ class TestListIndicators:
     """Tests for the indicators listing endpoint."""
 
     def test_returns_200(self, client: TestClient) -> None:
-        """GET /api/builder/indicators returns 200."""
-        response = client.get("/api/builder/indicators")
+        """GET /api/strategies/indicators returns 200."""
+        response = client.get("/api/strategies/indicators")
         assert response.status_code == 200
 
     def test_returns_list(self, client: TestClient) -> None:
         """Response is a JSON list."""
-        response = client.get("/api/builder/indicators")
+        response = client.get("/api/strategies/indicators")
         data = response.json()
         assert isinstance(data, list)
         assert len(data) > 0
 
     def test_indicator_structure(self, client: TestClient) -> None:
         """Each indicator has name, category, description, params."""
-        response = client.get("/api/builder/indicators")
+        response = client.get("/api/strategies/indicators")
         data = response.json()
         for indicator in data:
             assert "name" in indicator
@@ -60,7 +60,7 @@ class TestListIndicators:
 
     def test_param_structure(self, client: TestClient) -> None:
         """Each param has name and type fields."""
-        response = client.get("/api/builder/indicators")
+        response = client.get("/api/strategies/indicators")
         data = response.json()
         for indicator in data:
             for param in indicator["params"]:
@@ -69,21 +69,21 @@ class TestListIndicators:
 
     def test_rsi_in_list(self, client: TestClient) -> None:
         """RSI should be in the indicator list."""
-        response = client.get("/api/builder/indicators")
+        response = client.get("/api/strategies/indicators")
         data = response.json()
         names = [ind["name"] for ind in data]
         assert "rsi" in names
 
     def test_macd_in_list(self, client: TestClient) -> None:
         """MACD should be in the indicator list."""
-        response = client.get("/api/builder/indicators")
+        response = client.get("/api/strategies/indicators")
         data = response.json()
         names = [ind["name"] for ind in data]
         assert "macd" in names
 
 
 # ---------------------------------------------------------------------------
-# GET /api/builder/comparators
+# GET /api/strategies/comparators
 # ---------------------------------------------------------------------------
 
 
@@ -91,19 +91,19 @@ class TestListComparators:
     """Tests for the comparators listing endpoint."""
 
     def test_returns_200(self, client: TestClient) -> None:
-        """GET /api/builder/comparators returns 200."""
-        response = client.get("/api/builder/comparators")
+        """GET /api/strategies/comparators returns 200."""
+        response = client.get("/api/strategies/comparators")
         assert response.status_code == 200
 
     def test_returns_all_comparators(self, client: TestClient) -> None:
         """Should return all 5 comparator types."""
-        response = client.get("/api/builder/comparators")
+        response = client.get("/api/strategies/comparators")
         data = response.json()
         assert len(data) == 5
 
     def test_comparator_structure(self, client: TestClient) -> None:
         """Each comparator has value, label, description."""
-        response = client.get("/api/builder/comparators")
+        response = client.get("/api/strategies/comparators")
         data = response.json()
         for comp in data:
             assert "value" in comp
@@ -112,7 +112,7 @@ class TestListComparators:
 
     def test_comparator_values(self, client: TestClient) -> None:
         """All expected comparator values are present."""
-        response = client.get("/api/builder/comparators")
+        response = client.get("/api/strategies/comparators")
         data = response.json()
         values = {c["value"] for c in data}
         expected = {"less_than", "greater_than", "crosses_above", "crosses_below", "equals"}
@@ -120,7 +120,7 @@ class TestListComparators:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/builder/save
+# POST /api/strategies/save
 # ---------------------------------------------------------------------------
 
 
@@ -170,23 +170,23 @@ class TestSaveStrategy:
         }
 
     def test_save_returns_201(self, client: TestClient, tmp_path: Path) -> None:
-        """POST /api/builder/save with valid data returns 201."""
-        with patch("hydra.dashboard.routes.strategy_builder._CONFIG_DIR", tmp_path):
-            response = client.post("/api/builder/save", json=self._valid_save_request())
+        """POST /api/strategies/save with valid data returns 201."""
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            response = client.post("/api/strategies/save", json=self._valid_save_request())
         assert response.status_code == 201
 
     def test_save_creates_yaml_file(self, client: TestClient, tmp_path: Path) -> None:
         """Save endpoint creates a YAML file in the config directory."""
-        with patch("hydra.dashboard.routes.strategy_builder._CONFIG_DIR", tmp_path):
-            response = client.post("/api/builder/save", json=self._valid_save_request())
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            response = client.post("/api/strategies/save", json=self._valid_save_request())
         assert response.status_code == 201
         yaml_files = list(tmp_path.glob("*.yaml"))
         assert len(yaml_files) == 1
 
     def test_save_response_structure(self, client: TestClient, tmp_path: Path) -> None:
         """Response has id, name, config_path, message fields."""
-        with patch("hydra.dashboard.routes.strategy_builder._CONFIG_DIR", tmp_path):
-            response = client.post("/api/builder/save", json=self._valid_save_request())
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            response = client.post("/api/strategies/save", json=self._valid_save_request())
         data = response.json()
         assert "id" in data
         assert "name" in data
@@ -198,37 +198,37 @@ class TestSaveStrategy:
         """Invalid exchange_id returns 422."""
         request = self._valid_save_request()
         request["exchange_id"] = "invalid_exchange"
-        with patch("hydra.dashboard.routes.strategy_builder._CONFIG_DIR", tmp_path):
-            response = client.post("/api/builder/save", json=request)
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            response = client.post("/api/strategies/save", json=request)
         assert response.status_code == 422
 
     def test_save_empty_name_returns_422(self, client: TestClient) -> None:
         """Empty strategy name returns 422."""
         request = self._valid_save_request()
         request["name"] = ""
-        response = client.post("/api/builder/save", json=request)
+        response = client.post("/api/strategies/save", json=request)
         assert response.status_code == 422
 
     def test_save_invalid_comparator_returns_422(self, client: TestClient, tmp_path: Path) -> None:
         """Invalid comparator value returns 422."""
         request = self._valid_save_request()
         request["rules"]["entry_long"]["conditions"][0]["comparator"] = "not_a_comparator"
-        with patch("hydra.dashboard.routes.strategy_builder._CONFIG_DIR", tmp_path):
-            response = client.post("/api/builder/save", json=request)
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            response = client.post("/api/strategies/save", json=request)
         assert response.status_code == 422
 
     def test_save_invalid_timeframe_returns_422(self, client: TestClient, tmp_path: Path) -> None:
         """Invalid timeframe returns 422."""
         request = self._valid_save_request()
         request["timeframes"]["primary"] = "2h"
-        with patch("hydra.dashboard.routes.strategy_builder._CONFIG_DIR", tmp_path):
-            response = client.post("/api/builder/save", json=request)
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            response = client.post("/api/strategies/save", json=request)
         assert response.status_code == 422
 
     def test_saved_yaml_is_valid(self, client: TestClient, tmp_path: Path) -> None:
         """The saved YAML file should be loadable and contain the strategy config."""
-        with patch("hydra.dashboard.routes.strategy_builder._CONFIG_DIR", tmp_path):
-            response = client.post("/api/builder/save", json=self._valid_save_request())
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            response = client.post("/api/strategies/save", json=self._valid_save_request())
         assert response.status_code == 201
         yaml_files = list(tmp_path.glob("*.yaml"))
         assert len(yaml_files) == 1
@@ -244,7 +244,7 @@ class TestSaveStrategy:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/builder/preview
+# POST /api/strategies/preview
 # ---------------------------------------------------------------------------
 
 
@@ -284,13 +284,13 @@ class TestPreviewSignals:
         }
 
     def test_preview_returns_200(self, client: TestClient) -> None:
-        """POST /api/builder/preview returns 200 with valid data."""
-        response = client.post("/api/builder/preview", json=self._valid_preview_request())
+        """POST /api/strategies/preview returns 200 with valid data."""
+        response = client.post("/api/strategies/preview", json=self._valid_preview_request())
         assert response.status_code == 200
 
     def test_preview_response_structure(self, client: TestClient) -> None:
         """Response has signals and metrics fields."""
-        response = client.post("/api/builder/preview", json=self._valid_preview_request())
+        response = client.post("/api/strategies/preview", json=self._valid_preview_request())
         data = response.json()
         assert "signals" in data
         assert "metrics" in data
@@ -303,12 +303,12 @@ class TestPreviewSignals:
         """Invalid timeframe in preview returns 422."""
         request = self._valid_preview_request()
         request["timeframe"] = "2h"
-        response = client.post("/api/builder/preview", json=request)
+        response = client.post("/api/strategies/preview", json=request)
         assert response.status_code == 422
 
     def test_preview_invalid_comparator_returns_422(self, client: TestClient) -> None:
         """Invalid comparator in preview returns 422."""
         request = self._valid_preview_request()
         request["rules"]["entry_long"]["conditions"][0]["comparator"] = "invalid"
-        response = client.post("/api/builder/preview", json=request)
+        response = client.post("/api/strategies/preview", json=request)
         assert response.status_code == 422

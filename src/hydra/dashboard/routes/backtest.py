@@ -13,10 +13,10 @@ from pydantic import BaseModel, Field
 
 from hydra.backtest.runner import BacktestRunner
 from hydra.core.types import OHLCV, Timeframe
-from hydra.dashboard.routes.strategy_builder import (
+from hydra.dashboard.routes.strategies import (
     _CONFIG_DIR as _STRATEGY_CONFIG_DIR,
 )
-from hydra.dashboard.routes.strategy_builder import (
+from hydra.dashboard.routes.strategies import (
     _find_strategy_file,
     _parse_any_strategy_yaml,
     _parse_strategy_yaml,

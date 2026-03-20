@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, OctagonX } from 'lucide-react';
+import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, OctagonX, Activity } from 'lucide-react';
 import {
   RadialBarChart,
   RadialBar,
@@ -20,6 +20,7 @@ import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
+import { ErrorCard } from '@/components/ui/ErrorCard';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -60,7 +61,21 @@ interface RiskConfig {
   kill_switch_active: boolean;
 }
 
-/* ---------- Placeholder data ---------- */
+interface VarEstimate {
+  var_95: number;
+  var_99: number;
+  cvar_95: number;
+  portfolio_value: number;
+  calculation_method: string;
+}
+
+interface LiveStatus {
+  kill_switch_active: boolean;
+  running_sessions: number;
+  circuit_breaker_restrictions: Record<string, unknown> | null;
+}
+
+/* ---------- Helpers ---------- */
 
 function statusToColors(s: string) {
   switch (s) {
@@ -74,13 +89,6 @@ function statusToColors(s: string) {
   }
 }
 
-const placeholderBreakers: CircuitBreaker[] = [
-  { tier: 'Tier 1', label: 'Position Level', threshold: '2% per position', currentValue: '0.8%', status: 'Normal', color: 'text-status-success', bgColor: 'bg-status-success/10', borderColor: 'border-status-success/30', icon: ShieldCheck },
-  { tier: 'Tier 2', label: 'Strategy Level', threshold: '5% daily loss per strategy', currentValue: '1.2%', status: 'Normal', color: 'text-status-success', bgColor: 'bg-status-success/10', borderColor: 'border-status-success/30', icon: ShieldCheck },
-  { tier: 'Tier 3', label: 'Portfolio Level', threshold: '10% daily portfolio loss', currentValue: '3.8%', status: 'Warning', color: 'text-status-warning', bgColor: 'bg-status-warning/10', borderColor: 'border-status-warning/30', icon: AlertTriangle },
-  { tier: 'Tier 4', label: 'System Kill Switch', threshold: '15% daily loss - halt all trading', currentValue: '3.8%', status: 'Normal', color: 'text-status-error', bgColor: 'bg-status-error/10', borderColor: 'border-status-error/30', icon: Ban },
-];
-
 interface RiskEvent {
   time: string;
   message: string;
@@ -93,13 +101,6 @@ interface RiskState {
   maxDrawdown: number;
   dailyLoss: number;
 }
-
-const placeholderState: RiskState = {
-  circuitBreakers: placeholderBreakers,
-  drawdown: 4.2,
-  maxDrawdown: 15.0,
-  dailyLoss: 48.90,
-};
 
 function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
   const breakers: CircuitBreaker[] = data.circuit_breakers.map((cb) => {
@@ -127,11 +128,28 @@ function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
 
 interface DailyPnl { date: string; pnl: number; }
 
+function fmtUsd(v: number): string {
+  return `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/* ---------- Skeleton ---------- */
+
+function CardSkeleton() {
+  return (
+    <div className="animate-pulse rounded-xl border border-border-default bg-bg-elevated p-5">
+      <div className="h-4 w-24 rounded bg-bg-tertiary" />
+      <div className="mt-3 h-6 w-16 rounded bg-bg-tertiary" />
+      <div className="mt-2 h-3 w-32 rounded bg-bg-tertiary" />
+    </div>
+  );
+}
+
 /* ---------- Page ---------- */
 
 export default function RiskPage() {
   const { toast } = useToast();
-  const [state, setState] = useState<RiskState>(placeholderState);
+  const [state, setState] = useState<RiskState | null>(null);
+  const [stateError, setStateError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl[]>([]);
   const [isDark, setIsDark] = useState(false);
@@ -140,6 +158,12 @@ export default function RiskPage() {
     { time: '11:15', message: 'Strategy cooldown activated for Breakout Scanner after 3 consecutive losses', severity: 'warning' },
     { time: '09:00', message: 'Daily risk limits reset. All circuit breakers cleared.', severity: 'info' },
   ]);
+
+  // VaR estimate
+  const [varEstimate, setVarEstimate] = useState<VarEstimate | null>(null);
+
+  // Live status (polled)
+  const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
 
   // Risk config form state
   const [riskConfig, setRiskConfig] = useState<RiskConfig | null>(null);
@@ -155,11 +179,34 @@ export default function RiskPage() {
     setIsDark(document.documentElement.classList.contains('dark'));
   }, []);
 
+  // Fetch risk status
   useEffect(() => {
     fetchApi<ApiRiskStatus>('/api/risk/status')
-      .then((data) => setState(mapApiRiskStatus(data)))
-      .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); })
+      .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
+      .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); setStateError(true); })
       .finally(() => setLoading(false));
+  }, []);
+
+  // Fetch VaR estimate
+  useEffect(() => {
+    fetchApi<VarEstimate>('/api/risk/var')
+      .then((data) => setVarEstimate(data))
+      .catch((err) => { logger.warn('Risk', 'Failed to fetch VaR estimate', err); });
+  }, []);
+
+  // Poll live status every 10s
+  useEffect(() => {
+    const fetchLiveStatus = () => {
+      fetchApi<LiveStatus>('/api/risk/live-status')
+        .then((data) => {
+          setLiveStatus(data);
+          setKillSwitchActive(data.kill_switch_active);
+        })
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch live status', err); });
+    };
+    fetchLiveStatus();
+    const interval = setInterval(fetchLiveStatus, 10_000);
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -227,11 +274,26 @@ export default function RiskPage() {
     }
   };
 
-  const { circuitBreakers, drawdown, maxDrawdown } = state;
-  const drawdownPct = maxDrawdown > 0 ? (drawdown / maxDrawdown) * 100 : 0;
-
   return (
     <div className="flex flex-col gap-6">
+      {/* Live status badge */}
+      {liveStatus && (
+        <div className="flex items-center gap-4">
+          <div className={cn(
+            'inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium',
+            liveStatus.kill_switch_active
+              ? 'bg-status-error/10 text-status-error border border-status-error/30'
+              : 'bg-status-success/10 text-status-success border border-status-success/30',
+          )}>
+            <Activity className="h-3.5 w-3.5" />
+            {liveStatus.kill_switch_active ? 'Kill Switch Active' : 'System Normal'}
+          </div>
+          <span className="text-xs text-text-muted">
+            {liveStatus.running_sessions} running session{liveStatus.running_sessions !== 1 ? 's' : ''}
+          </span>
+        </div>
+      )}
+
       {/* Kill switch banner */}
       {killSwitchActive && (
         <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center justify-between">
@@ -249,165 +311,210 @@ export default function RiskPage() {
       )}
 
       {/* Circuit breaker status cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {circuitBreakers.map((cb) => (
-          <div
-            key={cb.tier}
-            className={cn(
-              'rounded-xl border p-4 md:p-5',
-              cb.borderColor,
-              cb.bgColor,
-            )}
-          >
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase tracking-wider text-text-muted">
-                {cb.tier}
-              </span>
-              <cb.icon className={cn('h-5 w-5', cb.color)} aria-hidden="true" />
-            </div>
-            <h3 className="mt-2 text-sm font-semibold text-text-primary">
-              {cb.label}
-            </h3>
-            <p className="mt-1 text-xs text-text-muted">{cb.threshold}</p>
-            <div className="mt-3 flex items-center justify-between">
-              <span className="text-xs text-text-muted">Current</span>
-              <span className={cn('text-lg font-bold font-display', cb.color)}>
-                {cb.currentValue}
-              </span>
-            </div>
-            <div className="mt-2">
-              <span
+      {loading ? (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => <CardSkeleton key={i} />)}
+        </div>
+      ) : stateError || !state ? (
+        <ErrorCard
+          message="Failed to load risk status"
+          onRetry={() => {
+            setLoading(true);
+            setStateError(false);
+            fetchApi<ApiRiskStatus>('/api/risk/status')
+              .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
+              .catch(() => setStateError(true))
+              .finally(() => setLoading(false));
+          }}
+        />
+      ) : (
+        <>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            {state.circuitBreakers.map((cb) => (
+              <div
+                key={cb.tier}
                 className={cn(
-                  'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
+                  'rounded-xl border p-4 md:p-5',
+                  cb.borderColor,
                   cb.bgColor,
-                  cb.color,
                 )}
               >
-                {cb.status}
-              </span>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Gauges row */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Drawdown gauge */}
-        <DataCard title="Current Drawdown" description="Real-time portfolio drawdown from peak">
-          <div className="relative h-40">
-            <ResponsiveContainer width="100%" height="100%">
-              <RadialBarChart
-                cx="50%"
-                cy="80%"
-                innerRadius="70%"
-                outerRadius="100%"
-                startAngle={180}
-                endAngle={0}
-                data={[{ value: drawdownPct }]}
-              >
-                <RadialBar
-                  dataKey="value"
-                  cornerRadius={4}
-                  background={{ fill: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)' }}
-                  fill={drawdownPct < 40 ? '#22c55e' : drawdownPct < 70 ? '#f59e0b' : '#ef4444'}
-                />
-              </RadialBarChart>
-            </ResponsiveContainer>
-            {/* Center label — positioned over the flat edge of the semicircle */}
-            <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center">
-              <span className={cn(
-                'text-2xl font-bold font-display',
-                drawdownPct < 40 ? 'text-status-success' : drawdownPct < 70 ? 'text-status-warning' : 'text-status-error',
-              )}>
-                {drawdown.toFixed(1)}%
-              </span>
-              <span className="text-xs text-text-muted">of {maxDrawdown}% limit</span>
-            </div>
-          </div>
-          <div className="mt-4 space-y-2">
-            <div className="flex justify-between text-xs">
-              <span className="text-text-muted">Current Drawdown</span>
-              <span className="font-medium text-status-warning">{drawdown}%</span>
-            </div>
-            <div className="h-3 rounded-full bg-bg-tertiary overflow-hidden">
-              <div
-                className="h-full rounded-full bg-status-warning transition-all"
-                style={{ width: `${drawdownPct}%` }}
-              />
-            </div>
-            <div className="flex justify-between text-xs text-text-light">
-              <span>0%</span>
-              <span>{maxDrawdown}% (Kill switch)</span>
-            </div>
-          </div>
-        </DataCard>
-
-        {/* Daily loss tracker */}
-        <DataCard title="Daily Loss Tracker" description="Cumulative losses today">
-          {dailyPnl.length === 0 ? (
-            <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-              <p className="text-sm text-text-muted">
-                {loading ? 'Loading...' : 'No data'}
-              </p>
-            </div>
-          ) : (
-            <div className="h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={dailyPnl} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)'} vertical={false} />
-                  <XAxis
-                    dataKey="date"
-                    tick={{ fontSize: 11, fill: isDark ? 'rgba(255,255,255,0.44)' : '#475569' }}
-                    axisLine={false}
-                    tickLine={false}
-                    minTickGap={20}
-                  />
-                  <YAxis
-                    tickFormatter={(v: number) => `$${v >= 0 ? '' : '-'}${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 0 })}`}
-                    tick={{ fontSize: 11, fill: isDark ? 'rgba(255,255,255,0.44)' : '#475569' }}
-                    axisLine={false}
-                    tickLine={false}
-                    width={52}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      background: isDark ? '#1e2433' : '#ffffff',
-                      border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
-                      borderRadius: '8px',
-                      fontSize: '12px',
-                    }}
-                    formatter={(v: number) => [
-                      `${v >= 0 ? '+' : ''}$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-                      'PnL',
-                    ]}
-                  />
-                  <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
-                    {dailyPnl.map((entry, index) => (
-                      <Cell
-                        key={`cell-${index}`}
-                        fill={entry.pnl >= 0 ? '#22c55e' : '#ef4444'}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-          <div className="mt-4 space-y-2">
-            {[
-              { label: 'Max daily loss', value: `-$${state.dailyLoss.toFixed(2)}`, color: 'text-status-error' },
-              { label: 'Net daily PnL', value: '+$285.50', color: 'text-status-success' },
-              { label: 'Losing trades today', value: '2 / 7', color: 'text-text-primary' },
-              { label: 'Risk utilization', value: '38%', color: 'text-text-primary' },
-            ].map((row) => (
-              <div key={row.label} className="flex justify-between text-xs">
-                <span className="text-text-muted">{row.label}</span>
-                <span className={cn('font-medium', row.color)}>{row.value}</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-text-muted">
+                    {cb.tier}
+                  </span>
+                  <cb.icon className={cn('h-5 w-5', cb.color)} aria-hidden="true" />
+                </div>
+                <h3 className="mt-2 text-sm font-semibold text-text-primary">
+                  {cb.label}
+                </h3>
+                <p className="mt-1 text-xs text-text-muted">{cb.threshold}</p>
+                <div className="mt-3 flex items-center justify-between">
+                  <span className="text-xs text-text-muted">Current</span>
+                  <span className={cn('text-lg font-bold font-display', cb.color)}>
+                    {cb.currentValue}
+                  </span>
+                </div>
+                <div className="mt-2">
+                  <span
+                    className={cn(
+                      'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
+                      cb.bgColor,
+                      cb.color,
+                    )}
+                  >
+                    {cb.status}
+                  </span>
+                </div>
               </div>
             ))}
           </div>
-        </DataCard>
-      </div>
+
+          {/* Gauges row */}
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            {/* Drawdown gauge */}
+            <DataCard title="Current Drawdown" description="Real-time portfolio drawdown from peak">
+              {(() => {
+                const drawdownPct = state.maxDrawdown > 0 ? (state.drawdown / state.maxDrawdown) * 100 : 0;
+                return (
+                  <>
+                    <div className="relative h-40">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <RadialBarChart
+                          cx="50%"
+                          cy="80%"
+                          innerRadius="70%"
+                          outerRadius="100%"
+                          startAngle={180}
+                          endAngle={0}
+                          data={[{ value: drawdownPct }]}
+                        >
+                          <RadialBar
+                            dataKey="value"
+                            cornerRadius={4}
+                            background={{ fill: isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)' }}
+                            fill={drawdownPct < 40 ? '#22c55e' : drawdownPct < 70 ? '#f59e0b' : '#ef4444'}
+                          />
+                        </RadialBarChart>
+                      </ResponsiveContainer>
+                      <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center">
+                        <span className={cn(
+                          'text-2xl font-bold font-display',
+                          drawdownPct < 40 ? 'text-status-success' : drawdownPct < 70 ? 'text-status-warning' : 'text-status-error',
+                        )}>
+                          {state.drawdown.toFixed(1)}%
+                        </span>
+                        <span className="text-xs text-text-muted">of {state.maxDrawdown}% limit</span>
+                      </div>
+                    </div>
+                    <div className="mt-4 space-y-2">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-text-muted">Current Drawdown</span>
+                        <span className="font-medium text-status-warning">{state.drawdown}%</span>
+                      </div>
+                      <div className="h-3 rounded-full bg-bg-tertiary overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-status-warning transition-all"
+                          style={{ width: `${drawdownPct}%` }}
+                        />
+                      </div>
+                      <div className="flex justify-between text-xs text-text-light">
+                        <span>0%</span>
+                        <span>{state.maxDrawdown}% (Kill switch)</span>
+                      </div>
+                    </div>
+                  </>
+                );
+              })()}
+            </DataCard>
+
+            {/* Daily loss tracker */}
+            <DataCard title="Daily Loss Tracker" description="Cumulative losses today">
+              {dailyPnl.length === 0 ? (
+                <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
+                  <p className="text-sm text-text-muted">No data</p>
+                </div>
+              ) : (
+                <div className="h-48">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={dailyPnl} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)'} vertical={false} />
+                      <XAxis
+                        dataKey="date"
+                        tick={{ fontSize: 11, fill: isDark ? 'rgba(255,255,255,0.44)' : '#475569' }}
+                        axisLine={false}
+                        tickLine={false}
+                        minTickGap={20}
+                      />
+                      <YAxis
+                        tickFormatter={(v: number) => `$${v >= 0 ? '' : '-'}${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 0 })}`}
+                        tick={{ fontSize: 11, fill: isDark ? 'rgba(255,255,255,0.44)' : '#475569' }}
+                        axisLine={false}
+                        tickLine={false}
+                        width={52}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          background: isDark ? '#1e2433' : '#ffffff',
+                          border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
+                          borderRadius: '8px',
+                          fontSize: '12px',
+                        }}
+                        formatter={(v: number) => [
+                          `${v >= 0 ? '+' : ''}$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+                          'PnL',
+                        ]}
+                      />
+                      <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
+                        {dailyPnl.map((entry, index) => (
+                          <Cell
+                            key={`cell-${index}`}
+                            fill={entry.pnl >= 0 ? '#22c55e' : '#ef4444'}
+                          />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+              <div className="mt-4 space-y-2">
+                {[
+                  { label: 'Max daily loss', value: `-${fmtUsd(state.dailyLoss)}`, color: 'text-status-error' },
+                ].map((row) => (
+                  <div key={row.label} className="flex justify-between text-xs">
+                    <span className="text-text-muted">{row.label}</span>
+                    <span className={cn('font-medium', row.color)}>{row.value}</span>
+                  </div>
+                ))}
+              </div>
+            </DataCard>
+          </div>
+
+          {/* Value at Risk card */}
+          {varEstimate && (
+            <DataCard title="Value at Risk" description={`Method: ${varEstimate.calculation_method.replace(/_/g, ' ')}`}>
+              <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+                <div>
+                  <p className="text-xs text-text-muted">VaR 95%</p>
+                  <p className="mt-1 text-lg font-bold text-status-warning font-display">{fmtUsd(varEstimate.var_95)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-text-muted">VaR 99%</p>
+                  <p className="mt-1 text-lg font-bold text-status-error font-display">{fmtUsd(varEstimate.var_99)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-text-muted">CVaR 95%</p>
+                  <p className="mt-1 text-lg font-bold text-status-error font-display">{fmtUsd(varEstimate.cvar_95)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-text-muted">Portfolio Value</p>
+                  <p className="mt-1 text-lg font-bold text-text-primary font-display">{fmtUsd(varEstimate.portfolio_value)}</p>
+                </div>
+              </div>
+            </DataCard>
+          )}
+        </>
+      )}
 
       {/* Editable risk limits */}
       <DataCard title="Risk Limits" description="Configure global risk management parameters">

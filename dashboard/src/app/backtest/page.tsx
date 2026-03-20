@@ -11,6 +11,7 @@ import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
+import { ErrorCard } from '@/components/ui/ErrorCard';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -49,15 +50,6 @@ interface StrategyOption {
   name: string;
 }
 
-/* ---------- Fallback strategies ---------- */
-
-const FALLBACK_STRATEGIES: StrategyOption[] = [
-  { id: 'strat-lstm-momentum', name: 'LSTM Momentum' },
-  { id: 'strat-mean-reversion', name: 'Mean Reversion RSI' },
-  { id: 'strat-funding-arb', name: 'Funding Arb' },
-  { id: 'strat-breakout', name: 'Breakout Scanner' },
-];
-
 /* ---------- Helpers ---------- */
 
 function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
@@ -91,8 +83,9 @@ function BacktestPageContent() {
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
-  const [strategies, setStrategies] = useState<StrategyOption[]>(FALLBACK_STRATEGIES);
-  const [strategyId, setStrategyId] = useState(searchParams.get('strategy') || FALLBACK_STRATEGIES[0].id);
+  const [strategies, setStrategies] = useState<StrategyOption[]>([]);
+  const [strategyId, setStrategyId] = useState(searchParams.get('strategy') || '');
+  const [strategiesError, setStrategiesError] = useState(false);
   const [startDate, setStartDate] = useState('2026-01-01');
   const [endDate, setEndDate] = useState('2026-03-01');
   const [timeframe, setTimeframe] = useState('1h');
@@ -129,7 +122,8 @@ function BacktestPageContent() {
   useEffect(() => { fetchResults(); }, []);
 
   /* Fetch available strategies for the dropdown */
-  useEffect(() => {
+  const fetchStrategies = () => {
+    setStrategiesError(false);
     fetchApi<StrategyOption[]>('/api/backtest/strategies')
       .then((data) => {
         if (data.length > 0) {
@@ -142,8 +136,12 @@ function BacktestPageContent() {
           }
         }
       })
-      .catch(() => { /* keep fallback */ });
-  }, []);
+      .catch((err) => {
+        logger.warn('Backtest', 'Failed to fetch strategies', err);
+        setStrategiesError(true);
+      });
+  };
+  useEffect(() => { fetchStrategies(); }, []);
 
   useEffect(() => {
     if (!pollingTaskId) return;
@@ -280,6 +278,11 @@ function BacktestPageContent() {
     <div className="flex flex-col gap-6">
       {/* Runner form */}
       <DataCard title="Run Backtest" description="Configure and execute a new backtest run">
+        {strategiesError && (
+          <div className="mb-4">
+            <ErrorCard message="Failed to load strategies" onRetry={fetchStrategies} />
+          </div>
+        )}
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-6">
           <Select
             label="Strategy"
@@ -313,7 +316,19 @@ function BacktestPageContent() {
               <Play className="h-4 w-4" />
               {running ? `Running${progress > 0 ? ` (${progress}%)` : '...'}` : 'Run Backtest'}
             </Button>
-            <Button variant="outline">
+            <Button
+              variant="outline"
+              disabled={backtestRuns.length === 0}
+              onClick={() => {
+                const blob = new Blob([JSON.stringify(backtestRuns, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `backtest-results-${new Date().toISOString().slice(0, 10)}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+            >
               <Download className="h-4 w-4" />
               Export Results
             </Button>

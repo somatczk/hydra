@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
+from typing import Any
 
 from hydra.core.events import RiskCheckResult
 from hydra.core.types import OrderRequest, Position
@@ -80,9 +82,18 @@ class PreTradeRiskManager:
         self,
         config: RiskConfig | None = None,
         circuit_breaker_tier: int = 0,
+        db_pool: Any = None,
     ) -> None:
         self._config = config or RiskConfig()
         self._circuit_breaker_tier = circuit_breaker_tier
+        self._db_pool = db_pool
+
+        # Cached risk state (loaded from DB)
+        self._daily_pnl = Decimal("0")
+        self._daily_pnl_date: date = date.today()
+        self._consecutive_losses = 0
+        self._current_drawdown = Decimal("0")
+        self._peak_portfolio_value = Decimal("0")
 
     @property
     def circuit_breaker_tier(self) -> int:
@@ -131,6 +142,76 @@ class PreTradeRiskManager:
             approved=True,
             reason="All checks approved",
         )
+
+    # ------------------------------------------------------------------
+    # DB-backed risk state tracking
+    # ------------------------------------------------------------------
+
+    async def load_state(self, db_pool: Any = None) -> None:
+        """Load risk state from DB on startup."""
+        pool = db_pool or self._db_pool
+        if pool is None:
+            return
+        self._db_pool = pool
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM risk_state WHERE scope = 'global'")
+                if row is not None:
+                    self._daily_pnl = Decimal(str(row["daily_pnl"]))
+                    self._daily_pnl_date = row["daily_pnl_date"]
+                    self._consecutive_losses = row["consecutive_losses"]
+                    self._current_drawdown = Decimal(str(row["current_drawdown"]))
+                    self._peak_portfolio_value = Decimal(str(row["peak_portfolio_value"]))
+        except Exception:
+            logger.exception("Failed to load risk state from DB")
+
+    async def record_fill(self, pnl: Decimal, portfolio_value: Decimal) -> None:
+        """Update risk state after a fill. Persists to DB."""
+        today = date.today()
+
+        # Reset daily PnL if new day
+        if self._daily_pnl_date != today:
+            self._daily_pnl = Decimal("0")
+            self._daily_pnl_date = today
+
+        self._daily_pnl += pnl
+
+        # Update consecutive losses
+        if pnl < 0:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
+
+        # Update drawdown tracking
+        if portfolio_value > self._peak_portfolio_value:
+            self._peak_portfolio_value = portfolio_value
+        if self._peak_portfolio_value > 0:
+            self._current_drawdown = (
+                self._peak_portfolio_value - portfolio_value
+            ) / self._peak_portfolio_value
+
+        # Persist to DB
+        if self._db_pool is not None:
+            try:
+                async with self._db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE risk_state SET "
+                        "daily_pnl = $1, daily_pnl_date = $2, "
+                        "consecutive_losses = $3, "
+                        "last_loss_at = CASE WHEN $4 < 0 THEN now() ELSE last_loss_at END, "
+                        "current_drawdown = $5, "
+                        "peak_portfolio_value = $6, "
+                        "updated_at = now() "
+                        "WHERE scope = 'global'",
+                        self._daily_pnl,
+                        self._daily_pnl_date,
+                        self._consecutive_losses,
+                        pnl,
+                        self._current_drawdown,
+                        self._peak_portfolio_value,
+                    )
+            except Exception:
+                logger.exception("Failed to persist risk state to DB")
 
     # ------------------------------------------------------------------
     # Individual checks

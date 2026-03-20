@@ -7,6 +7,8 @@ incoming data to ``hydra.core.types``, and publishes events via the event bus.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 from typing import Any
 
 from hydra.core.events import BarEvent, TradeEvent
@@ -20,6 +22,8 @@ logger = get_logger(__name__)
 _INITIAL_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 60.0
 _BACKOFF_FACTOR = 2.0
+_STABLE_THRESHOLD_S = 30.0  # sustained success before resetting backoff
+_MAX_CONSECUTIVE_ERRORS = 5  # recreate exchange after this many consecutive failures
 
 
 class ExchangeFeedManager:
@@ -155,6 +159,16 @@ class ExchangeFeedManager:
     # Internal: watch loops with auto-reconnect
     # ------------------------------------------------------------------
 
+    async def _recreate_exchange(self, exchange_id: ExchangeId) -> Any:
+        """Close and recreate a CCXT exchange instance to get fresh WebSocket state."""
+        old = self._exchanges.pop(exchange_id, None)
+        if old is not None and hasattr(old, "close"):
+            with contextlib.suppress(Exception):
+                await old.close()
+        exchange = await self._get_or_create_exchange(exchange_id)
+        logger.info("Recreated exchange instance", exchange=exchange_id)
+        return exchange
+
     async def _watch_ohlcv_loop(
         self,
         exchange_id: ExchangeId,
@@ -164,6 +178,8 @@ class ExchangeFeedManager:
     ) -> None:
         """Continuously watch OHLCV bars with exponential backoff reconnect."""
         backoff = _INITIAL_BACKOFF_S
+        last_success = time.monotonic()
+        consecutive_errors = 0
 
         while self._running.get(exchange_id, False):
             try:
@@ -181,21 +197,49 @@ class ExchangeFeedManager:
                     )
                     await self._event_bus.publish(event)
 
-                # Reset backoff on success
-                backoff = _INITIAL_BACKOFF_S
+                # Only reset backoff after sustained success
+                consecutive_errors = 0
+                if time.monotonic() - last_success >= _STABLE_THRESHOLD_S:
+                    backoff = _INITIAL_BACKOFF_S
+                last_success = time.monotonic()
+
+                try:
+                    from hydra.dashboard.metrics import update_data_gap
+
+                    update_data_gap(exchange_id, symbol, 0.0)
+                except Exception:
+                    pass
 
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception(
+                consecutive_errors += 1
+                logger.warning(
                     "OHLCV watch error, reconnecting",
                     exchange=exchange_id,
                     symbol=symbol,
                     timeframe=str(timeframe),
                     backoff=backoff,
+                    consecutive_errors=consecutive_errors,
                 )
+                try:
+                    from hydra.dashboard.metrics import update_data_gap
+
+                    update_data_gap(exchange_id, symbol, time.monotonic() - last_success)
+                except Exception:
+                    pass
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * _BACKOFF_FACTOR, _MAX_BACKOFF_S)
+
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    try:
+                        from hydra.dashboard.metrics import record_ws_reconnect
+
+                        record_ws_reconnect(exchange_id)
+                    except Exception:
+                        pass
+                    exchange = await self._recreate_exchange(exchange_id)
+                    consecutive_errors = 0
 
     async def _watch_trades_loop(
         self,
@@ -205,6 +249,8 @@ class ExchangeFeedManager:
     ) -> None:
         """Continuously watch trades with exponential backoff reconnect."""
         backoff = _INITIAL_BACKOFF_S
+        last_success = time.monotonic()
+        consecutive_errors = 0
 
         while self._running.get(exchange_id, False):
             try:
@@ -226,16 +272,32 @@ class ExchangeFeedManager:
                     )
                     await self._event_bus.publish(event)
 
-                backoff = _INITIAL_BACKOFF_S
+                # Only reset backoff after sustained success
+                consecutive_errors = 0
+                if time.monotonic() - last_success >= _STABLE_THRESHOLD_S:
+                    backoff = _INITIAL_BACKOFF_S
+                last_success = time.monotonic()
 
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception(
+                consecutive_errors += 1
+                logger.warning(
                     "Trade watch error, reconnecting",
                     exchange=exchange_id,
                     symbol=symbol,
                     backoff=backoff,
+                    consecutive_errors=consecutive_errors,
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * _BACKOFF_FACTOR, _MAX_BACKOFF_S)
+
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    try:
+                        from hydra.dashboard.metrics import record_ws_reconnect
+
+                        record_ws_reconnect(exchange_id)
+                    except Exception:
+                        pass
+                    exchange = await self._recreate_exchange(exchange_id)
+                    consecutive_errors = 0

@@ -323,8 +323,8 @@ function BuilderPageContent() {
     const fetchData = async () => {
       try {
         const [indData, compData] = await Promise.all([
-          fetchApi<IndicatorSchema[]>('/api/builder/indicators').catch(() => null),
-          fetchApi<ComparatorSchema[]>('/api/builder/comparators').catch(() => null),
+          fetchApi<IndicatorSchema[]>('/api/strategies/indicators').catch(() => null),
+          fetchApi<ComparatorSchema[]>('/api/strategies/comparators').catch(() => null),
         ]);
         if (indData && indData.length > 0) setIndicators(indData);
         if (compData && compData.length > 0) setComparators(compData);
@@ -339,7 +339,7 @@ function BuilderPageContent() {
   useEffect(() => {
     const strategyId = searchParams.get('strategy');
     if (!strategyId) return;
-    fetchApi<StrategyDetail>(`/api/builder/strategies/${strategyId}`)
+    fetchApi<StrategyDetail>(`/api/strategies/${strategyId}`)
       .then((detail) => {
         dispatch({ type: 'LOAD_STRATEGY', payload: detail });
         logger.info('Builder', `Loaded strategy "${detail.name}"`);

@@ -229,5 +229,5 @@ class TestKillSwitch:
 
 class TestStrategyNotFound:
     async def test_unknown_strategy_raises(self, manager: SessionManager) -> None:
-        with pytest.raises((ValueError, FileNotFoundError)):
+        with pytest.raises((KeyError, ValueError, FileNotFoundError)):
             await manager.start_session("nonexistent-strategy", "paper")

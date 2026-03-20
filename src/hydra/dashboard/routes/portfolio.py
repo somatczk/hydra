@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -32,7 +33,7 @@ def _format_pair(symbol: str) -> str:
     return f"{symbol[:3]}/{symbol[3:]}" if len(symbol) > 3 else symbol
 
 
-def _pool_from_request(request: Request) -> object | None:
+def _pool_from_request(request: Request) -> Any:
     """Return the asyncpg connection pool from app state, or ``None``."""
     return getattr(request.app.state, "db_pool", None)
 
@@ -43,11 +44,11 @@ def _pool_from_request(request: Request) -> object | None:
 
 
 class PortfolioSummary(BaseModel):
-    total_value: float = 12450.00
-    unrealized_pnl: float = 198.00
-    realized_pnl: float = 1842.30
-    total_fees: float = 87.50
-    change_pct: float = 2.4
+    total_value: float = 0.0
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    total_fees: float = 0.0
+    change_pct: float = 0.0
 
 
 class Position(BaseModel):
@@ -98,88 +99,9 @@ class TradeRecord(BaseModel):
 # Placeholder data
 # ---------------------------------------------------------------------------
 
-_POSITIONS: list[dict] = [
-    {
-        "id": "pos-1",
-        "pair": "BTC/USDT",
-        "exchange": "binance",
-        "side": "Long",
-        "size": 0.15,
-        "entry_price": 67420.0,
-        "current_price": 68100.0,
-        "unrealized_pnl": 102.0,
-        "pnl_pct": 1.01,
-    },
-    {
-        "id": "pos-2",
-        "pair": "BTC/USDT",
-        "exchange": "bybit",
-        "side": "Short",
-        "size": 0.08,
-        "entry_price": 68800.0,
-        "current_price": 68100.0,
-        "unrealized_pnl": 56.0,
-        "pnl_pct": 1.02,
-    },
-    {
-        "id": "pos-3",
-        "pair": "BTC/USDT",
-        "exchange": "binance",
-        "side": "Long",
-        "size": 0.20,
-        "entry_price": 67900.0,
-        "current_price": 68100.0,
-        "unrealized_pnl": 40.0,
-        "pnl_pct": 0.29,
-    },
-]
-
-_EQUITY_CURVE: list[dict] = [
-    {"timestamp": "2026-03-01T00:00:00Z", "value": 10000.0},
-    {"timestamp": "2026-03-03T00:00:00Z", "value": 10250.0},
-    {"timestamp": "2026-03-05T00:00:00Z", "value": 10480.0},
-    {"timestamp": "2026-03-07T00:00:00Z", "value": 10320.0},
-    {"timestamp": "2026-03-09T00:00:00Z", "value": 10890.0},
-    {"timestamp": "2026-03-11T00:00:00Z", "value": 11450.0},
-    {"timestamp": "2026-03-13T00:00:00Z", "value": 12100.0},
-    {"timestamp": "2026-03-14T00:00:00Z", "value": 12450.0},
-]
-
-_DAILY_PNL: list[dict] = [
-    {"date": "2026-03-08", "pnl": 120.0},
-    {"date": "2026-03-09", "pnl": -45.0},
-    {"date": "2026-03-10", "pnl": 310.0},
-    {"date": "2026-03-11", "pnl": 180.0},
-    {"date": "2026-03-12", "pnl": -60.0},
-    {"date": "2026-03-13", "pnl": 210.0},
-    {"date": "2026-03-14", "pnl": 285.50},
-]
-
-_MONTHLY_RETURNS: list[dict] = [
-    {"month": "2026-01", "return_pct": 5.2},
-    {"month": "2026-02", "return_pct": 8.1},
-    {"month": "2026-03", "return_pct": 2.4},
-]
-
-_ATTRIBUTION: list[dict] = [
-    {"strategy": "LSTM Momentum", "pnl": 1240.50, "pct_of_total": 52.3},
-    {"strategy": "Mean Reversion RSI", "pnl": 580.20, "pct_of_total": 24.5},
-    {"strategy": "Breakout Scanner", "pnl": -120.0, "pct_of_total": -5.1},
-    {"strategy": "Manual Trades", "pnl": 141.60, "pct_of_total": 6.0},
-]
-
-_TRADES_PLACEHOLDER: list[dict] = [
-    {
-        "id": 1,
-        "pair": "BTC/USDT",
-        "side": "BUY",
-        "price": 67420.0,
-        "size": 0.15,
-        "fee": 4.04,
-        "pnl": 102.0,
-        "timestamp": "2026-03-14T12:30:00Z",
-    },
-]
+_EMPTY_SUMMARY = PortfolioSummary(
+    total_value=0, unrealized_pnl=0, realized_pnl=0, total_fees=0, change_pct=0
+)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +114,7 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
     """Total value, unrealized PnL, realized PnL, fees."""
     pool = _pool_from_request(request)
     if pool is None:
-        return PortfolioSummary()
+        return _EMPTY_SUMMARY
 
     try:
         async with pool.acquire() as conn:
@@ -214,7 +136,7 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
                 fees_row = await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades")
 
             if snapshot is None:
-                return PortfolioSummary()
+                return _EMPTY_SUMMARY
 
             total_value = float(snapshot["total_value"])
             unrealized_pnl = float(snapshot["unrealized_pnl"])
@@ -233,7 +155,7 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
             }
     except Exception:
         logger.exception("Failed to fetch portfolio summary from DB")
-        return PortfolioSummary()
+        return _EMPTY_SUMMARY
 
 
 @router.get("/positions", response_model=list[Position])
@@ -241,7 +163,7 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
     """All open positions across exchanges."""
     pool = _pool_from_request(request)
     if pool is None:
-        return _POSITIONS
+        return []
 
     try:
         async with pool.acquire() as conn:
@@ -259,7 +181,7 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
                 )
 
         if not rows:
-            return _POSITIONS
+            return []
 
         positions: list[dict] = []
         for row in rows:
@@ -290,7 +212,7 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
         return positions
     except Exception:
         logger.exception("Failed to fetch positions from DB")
-        return _POSITIONS
+        return []
 
 
 @router.get("/equity-curve", response_model=list[EquityPoint])
@@ -298,7 +220,7 @@ async def get_equity_curve(request: Request, source: str | None = None) -> list[
     """Time series data for the equity chart."""
     pool = _pool_from_request(request)
     if pool is None:
-        return _EQUITY_CURVE
+        return []
 
     try:
         async with pool.acquire() as conn:
@@ -314,7 +236,7 @@ async def get_equity_curve(request: Request, source: str | None = None) -> list[
                 )
 
         if not rows:
-            return _EQUITY_CURVE
+            return []
 
         return [
             {
@@ -325,7 +247,7 @@ async def get_equity_curve(request: Request, source: str | None = None) -> list[
         ]
     except Exception:
         logger.exception("Failed to fetch equity curve from DB")
-        return _EQUITY_CURVE
+        return []
 
 
 @router.get("/daily-pnl", response_model=list[DailyPnl])
@@ -333,7 +255,7 @@ async def get_daily_pnl(request: Request, source: str | None = None) -> list[dic
     """Daily PnL series."""
     pool = _pool_from_request(request)
     if pool is None:
-        return _DAILY_PNL
+        return []
 
     try:
         async with pool.acquire() as conn:
@@ -350,7 +272,7 @@ async def get_daily_pnl(request: Request, source: str | None = None) -> list[dic
                 )
 
         if not rows:
-            return _DAILY_PNL
+            return []
 
         return [
             {
@@ -361,7 +283,7 @@ async def get_daily_pnl(request: Request, source: str | None = None) -> list[dic
         ]
     except Exception:
         logger.exception("Failed to fetch daily PnL from DB")
-        return _DAILY_PNL
+        return []
 
 
 @router.get("/monthly-returns", response_model=list[MonthlyReturn])
@@ -369,7 +291,7 @@ async def get_monthly_returns(request: Request, source: str | None = None) -> li
     """Monthly return percentages derived from balance snapshots."""
     pool = _pool_from_request(request)
     if pool is None:
-        return _MONTHLY_RETURNS
+        return []
 
     try:
         async with pool.acquire() as conn:
@@ -405,7 +327,7 @@ async def get_monthly_returns(request: Request, source: str | None = None) -> li
         return results
     except Exception:
         logger.exception("Failed to fetch monthly returns from DB")
-        return _MONTHLY_RETURNS
+        return []
 
 
 @router.get("/attribution", response_model=list[AttributionItem])
@@ -413,7 +335,7 @@ async def get_attribution(request: Request, source: str | None = None) -> list[d
     """PnL broken down by strategy."""
     pool = _pool_from_request(request)
     if pool is None:
-        return _ATTRIBUTION
+        return []
 
     try:
         async with pool.acquire() as conn:
@@ -441,7 +363,7 @@ async def get_attribution(request: Request, source: str | None = None) -> list[d
         ]
     except Exception:
         logger.exception("Failed to fetch attribution from DB")
-        return _ATTRIBUTION
+        return []
 
 
 @router.get("/trades", response_model=list[TradeRecord])
@@ -449,7 +371,7 @@ async def get_trades(request: Request, source: str | None = None) -> list[dict]:
     """Recent trades (last 20, newest first)."""
     pool = _pool_from_request(request)
     if pool is None:
-        return _TRADES_PLACEHOLDER
+        return []
 
     try:
         async with pool.acquire() as conn:
@@ -466,7 +388,7 @@ async def get_trades(request: Request, source: str | None = None) -> list[dict]:
                 )
 
         if not rows:
-            return _TRADES_PLACEHOLDER
+            return []
 
         return [
             {
@@ -483,4 +405,4 @@ async def get_trades(request: Request, source: str | None = None) -> list[dict]:
         ]
     except Exception:
         logger.exception("Failed to fetch trades from DB")
-        return _TRADES_PLACEHOLDER
+        return []

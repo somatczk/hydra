@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Literal, NewType
+from typing import Literal, NewType, Protocol, runtime_checkable
 
 # ---------------------------------------------------------------------------
 # Simple wrapper types
@@ -85,6 +85,27 @@ class MarketType(StrEnum):
 
     SPOT = "SPOT"
     FUTURES = "FUTURES"
+
+
+# ---------------------------------------------------------------------------
+# Frozen dataclasses (immutable value objects)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Executor state protocol (implemented by PaperTradingExecutor & ExchangeClient)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ExecutorState(Protocol):
+    """Unified async interface for querying executor state."""
+
+    async def get_balance(self) -> dict[str, Decimal]: ...
+
+    async def get_positions(self, symbol: str | None = None) -> list[Position]: ...
+
+    async def get_last_price(self, symbol: str) -> Decimal: ...
 
 
 # ---------------------------------------------------------------------------

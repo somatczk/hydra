@@ -137,16 +137,29 @@ async def start_session(body: StartSessionRequest, request: Request) -> dict[str
 
     capital = Decimal(str(body.paper_capital)) if body.paper_capital else None
 
+    # Load exchange credentials for live sessions
+    credentials = None
+    if body.trading_mode == "live":
+        creds_store = getattr(request.app.state, "exchange_credentials", {})
+        # Strategy config determines the exchange; pass all available credentials
+        credentials = creds_store
+
     try:
         session_id = await mgr.start_session(
             strategy_id=body.strategy_id,
             trading_mode=body.trading_mode,
             paper_capital=capital,
+            credentials=credentials,
         )
     except RuntimeError as exc:
         # Kill switch active
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
     except ValueError as exc:

@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square, Eye } from 'lucide-react';
+import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square, Eye, Shield, ChevronDown, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
+import { Input } from '@/components/ui/Input';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
@@ -19,6 +20,14 @@ interface TradingSession {
   status: string;
 }
 
+interface StrategyPerformance {
+  total_pnl: number;
+  win_rate: number;
+  total_trades: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+}
+
 interface Strategy {
   id: string;
   name: string;
@@ -28,6 +37,7 @@ interface Strategy {
   enabled: boolean;
   editable: boolean;
   session: TradingSession | null;
+  performance: StrategyPerformance | null;
 }
 
 interface BuilderStrategy {
@@ -39,9 +49,21 @@ interface BuilderStrategy {
   editable: boolean;
 }
 
+interface RiskOverrides {
+  max_position_pct: number;
+  max_risk_per_trade: number;
+  max_daily_loss_pct: number;
+  max_drawdown_pct: number;
+  max_concurrent_positions: number;
+}
+
 /* ---------- Helpers ---------- */
 
-function mapBuilderStrategies(data: BuilderStrategy[], sessions: TradingSession[]): Strategy[] {
+function mapBuilderStrategies(
+  data: BuilderStrategy[],
+  sessions: TradingSession[],
+  perfMap: Record<string, StrategyPerformance>,
+): Strategy[] {
   return data.map((s) => {
     const session = sessions.find(
       (sess) => sess.strategy_id === s.id && sess.status === 'running'
@@ -56,6 +78,7 @@ function mapBuilderStrategies(data: BuilderStrategy[], sessions: TradingSession[
       enabled: s.enabled,
       editable: s.editable,
       session,
+      performance: perfMap[s.id] ?? null,
     };
   });
 }
@@ -70,30 +93,50 @@ function sessionStatusVariant(session: TradingSession | null): 'success' | 'warn
   return session.trading_mode === 'paper' ? 'info' : 'warning';
 }
 
+function fmtPnl(v: number): string {
+  const sign = v >= 0 ? '+' : '-';
+  return `${sign}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+}
+
 /* ---------- Page ---------- */
 
 export default function StrategiesPage() {
   const router = useRouter();
   const { toast } = useToast();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
-  const [sessions, setSessions] = useState<TradingSession[]>([]);
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [startingId, setStartingId] = useState<string | null>(null);
   const [stoppingId, setStoppingId] = useState<string | null>(null);
   const [tradingMode, setTradingMode] = useState<string>('paper');
   const [paperCapital, setPaperCapital] = useState<number>(10000);
+  const [riskOverridesOpen, setRiskOverridesOpen] = useState<string | null>(null);
+  const [riskOverrides, setRiskOverrides] = useState<Record<string, RiskOverrides>>({});
+  const [savingRisk, setSavingRisk] = useState<string | null>(null);
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     setLoading(true);
     try {
       const [stratData, sessData, cfg] = await Promise.all([
-        fetchApi<BuilderStrategy[]>('/api/builder/strategies').catch(() => [] as BuilderStrategy[]),
+        fetchApi<BuilderStrategy[]>('/api/strategies').catch(() => [] as BuilderStrategy[]),
         fetchApi<TradingSession[]>('/api/trading/sessions').catch(() => [] as TradingSession[]),
         fetchApi<{ trading_mode: string; paper_capital?: number }>('/api/system/config').catch(() => null),
       ]);
-      setSessions(sessData);
-      setStrategies(mapBuilderStrategies(stratData, sessData));
+
+      // Fetch performance for each strategy in parallel
+      const perfEntries = await Promise.all(
+        stratData.map((s) =>
+          fetchApi<StrategyPerformance>(`/api/strategies/${s.id}/performance`)
+            .then((perf) => [s.id, perf] as const)
+            .catch(() => [s.id, null] as const)
+        ),
+      );
+      const perfMap: Record<string, StrategyPerformance> = {};
+      for (const [id, perf] of perfEntries) {
+        if (perf) perfMap[id] = perf;
+      }
+
+      setStrategies(mapBuilderStrategies(stratData, sessData, perfMap));
       if (cfg) {
         setTradingMode(cfg.trading_mode);
         if (cfg.paper_capital) setPaperCapital(cfg.paper_capital);
@@ -103,13 +146,13 @@ export default function StrategiesPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => { fetchData(); }, []);
+  useEffect(() => { fetchData(); }, [fetchData]);
 
   const handleToggle = async (id: string) => {
     try {
-      await fetchApi(`/api/builder/strategies/${id}/toggle`, { method: 'POST' });
+      await fetchApi(`/api/strategies/${id}/toggle`, { method: 'POST' });
       toast('success', 'Strategy toggled');
       fetchData();
     } catch (err) {
@@ -122,7 +165,7 @@ export default function StrategiesPage() {
     if (!confirm(`Delete strategy "${name}"? This cannot be undone.`)) return;
     setDeletingId(id);
     try {
-      await fetchApi(`/api/builder/strategies/${id}`, { method: 'DELETE' });
+      await fetchApi(`/api/strategies/${id}`, { method: 'DELETE' });
       toast('success', 'Strategy deleted');
       fetchData();
     } catch (err) {
@@ -189,6 +232,60 @@ export default function StrategiesPage() {
     }
   };
 
+  const toggleRiskOverrides = async (strategyId: string) => {
+    if (riskOverridesOpen === strategyId) {
+      setRiskOverridesOpen(null);
+      return;
+    }
+    setRiskOverridesOpen(strategyId);
+    // Load existing overrides if not cached
+    if (!riskOverrides[strategyId]) {
+      try {
+        const cfg = await fetchApi<RiskOverrides>(`/api/risk/config/${strategyId}`);
+        setRiskOverrides((prev) => ({ ...prev, [strategyId]: cfg }));
+      } catch {
+        // No overrides yet — use defaults
+        setRiskOverrides((prev) => ({
+          ...prev,
+          [strategyId]: {
+            max_position_pct: 0.10,
+            max_risk_per_trade: 0.02,
+            max_daily_loss_pct: 0.03,
+            max_drawdown_pct: 0.15,
+            max_concurrent_positions: 10,
+          },
+        }));
+      }
+    }
+  };
+
+  const updateRiskField = (strategyId: string, field: keyof RiskOverrides, value: string) => {
+    setRiskOverrides((prev) => ({
+      ...prev,
+      [strategyId]: {
+        ...prev[strategyId],
+        [field]: field === 'max_concurrent_positions' ? parseInt(value, 10) || 0 : parseFloat(value) / 100 || 0,
+      },
+    }));
+  };
+
+  const handleSaveRiskOverrides = async (strategyId: string) => {
+    setSavingRisk(strategyId);
+    try {
+      const overrides = riskOverrides[strategyId];
+      await fetchApi(`/api/risk/config/${strategyId}`, {
+        method: 'PUT',
+        body: JSON.stringify(overrides),
+      });
+      toast('success', 'Risk overrides saved');
+    } catch (err) {
+      logger.error('Strategies', 'Failed to save risk overrides', err);
+      toast('error', 'Failed to save risk overrides');
+    } finally {
+      setSavingRisk(null);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-6">
       {/* Header */}
@@ -247,7 +344,49 @@ export default function StrategiesPage() {
               </div>
             </div>
 
-            {/* Trading controls — only show on Active strategies or when a session is running */}
+            {/* Performance metrics */}
+            {strategy.performance && (
+              <div className="mt-3 grid grid-cols-5 gap-2 rounded-lg border border-border-default bg-bg-secondary p-2.5">
+                <div className="text-center">
+                  <p className={cn(
+                    'text-sm font-bold',
+                    strategy.performance.total_pnl >= 0 ? 'text-status-success' : 'text-status-error',
+                  )}>
+                    {fmtPnl(strategy.performance.total_pnl)}
+                  </p>
+                  <p className="text-[10px] text-text-muted">PnL</p>
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-bold text-text-primary">
+                    {strategy.performance.win_rate.toFixed(1)}%
+                  </p>
+                  <p className="text-[10px] text-text-muted">Win Rate</p>
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-bold text-text-primary">
+                    {strategy.performance.total_trades}
+                  </p>
+                  <p className="text-[10px] text-text-muted">Trades</p>
+                </div>
+                <div className="text-center">
+                  <p className={cn(
+                    'text-sm font-bold',
+                    strategy.performance.sharpe_ratio >= 1 ? 'text-status-success' : strategy.performance.sharpe_ratio >= 0 ? 'text-text-primary' : 'text-status-error',
+                  )}>
+                    {strategy.performance.sharpe_ratio.toFixed(2)}
+                  </p>
+                  <p className="text-[10px] text-text-muted">Sharpe</p>
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-bold text-status-error">
+                    {strategy.performance.max_drawdown.toFixed(1)}%
+                  </p>
+                  <p className="text-[10px] text-text-muted">Max DD</p>
+                </div>
+              </div>
+            )}
+
+            {/* Trading controls -- only show on Active strategies or when a session is running */}
             {(strategy.status === 'Active' || strategy.session) && (
               <div className="mt-3 flex items-center gap-2">
                 {strategy.session ? (
@@ -309,6 +448,64 @@ export default function StrategiesPage() {
                 )}
               </div>
             )}
+
+            {/* Risk overrides */}
+            <div className="mt-3 border-t border-border-default pt-3">
+              <button
+                onClick={() => toggleRiskOverrides(strategy.id)}
+                className="inline-flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors"
+              >
+                <Shield className="h-3 w-3" />
+                Risk Overrides
+                {riskOverridesOpen === strategy.id ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+              </button>
+              {riskOverridesOpen === strategy.id && riskOverrides[strategy.id] && (
+                <div className="mt-3 space-y-3 rounded-lg border border-border-default bg-bg-secondary p-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <Input
+                      label="Max Position %"
+                      type="number"
+                      value={(riskOverrides[strategy.id].max_position_pct * 100).toFixed(0)}
+                      onChange={(e) => updateRiskField(strategy.id, 'max_position_pct', e.target.value)}
+                    />
+                    <Input
+                      label="Max Risk/Trade %"
+                      type="number"
+                      value={(riskOverrides[strategy.id].max_risk_per_trade * 100).toFixed(0)}
+                      onChange={(e) => updateRiskField(strategy.id, 'max_risk_per_trade', e.target.value)}
+                    />
+                    <Input
+                      label="Max Daily Loss %"
+                      type="number"
+                      value={(riskOverrides[strategy.id].max_daily_loss_pct * 100).toFixed(0)}
+                      onChange={(e) => updateRiskField(strategy.id, 'max_daily_loss_pct', e.target.value)}
+                    />
+                    <Input
+                      label="Max Drawdown %"
+                      type="number"
+                      value={(riskOverrides[strategy.id].max_drawdown_pct * 100).toFixed(0)}
+                      onChange={(e) => updateRiskField(strategy.id, 'max_drawdown_pct', e.target.value)}
+                    />
+                    <Input
+                      label="Max Concurrent Positions"
+                      type="number"
+                      value={riskOverrides[strategy.id].max_concurrent_positions.toString()}
+                      onChange={(e) => updateRiskField(strategy.id, 'max_concurrent_positions', e.target.value)}
+                    />
+                  </div>
+                  <div className="flex justify-end">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleSaveRiskOverrides(strategy.id)}
+                      loading={savingRisk === strategy.id}
+                    >
+                      Save Overrides
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
 
             {/* Action buttons */}
             <div className="mt-3 flex items-center justify-between border-t border-border-default pt-3">

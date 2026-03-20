@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import {
   Wallet,
   TrendingUp,
@@ -21,6 +21,7 @@ import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
+import { ErrorCard } from '@/components/ui/ErrorCard';
 import { fetchApi } from '@/lib/api';
 import { logger } from '@/lib/logger';
 
@@ -85,23 +86,7 @@ interface EquityPoint {
   value: number;
 }
 
-/* ---------- Placeholder data ---------- */
-
-const placeholderTrades: Trade[] = [
-  { id: '1', pair: 'BTC/USDT', side: 'Long', entry: '$67,420', exit: '$68,180', pnl: '+$152.40', time: '14:32' },
-  { id: '2', pair: 'BTC/USDT', side: 'Short', entry: '$68,350', exit: '$67,890', pnl: '+$92.00', time: '13:15' },
-  { id: '3', pair: 'BTC/USDT', side: 'Long', entry: '$67,100', exit: '$67,050', pnl: '-$10.00', time: '11:48' },
-  { id: '4', pair: 'BTC/USDT', side: 'Long', entry: '$66,800', exit: '$67,300', pnl: '+$100.00', time: '10:22' },
-  { id: '5', pair: 'BTC/USDT', side: 'Short', entry: '$67,500', exit: '$67,680', pnl: '-$48.90', time: '09:05' },
-];
-
-const placeholderSummary: PortfolioSummary = {
-  total_value: 12450.0,
-  unrealized_pnl: 198.0,
-  realized_pnl: 1842.3,
-  total_fees: 87.5,
-  change_pct: 2.4,
-};
+/* ---------- Helpers ---------- */
 
 function formatSymbol(symbol: string): string {
   const match = symbol.match(/^([A-Z]{3,4})(USDT|USD|BUSD|USDC)$/);
@@ -184,46 +169,50 @@ const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?:
 
 export default function DashboardPage() {
   useEffect(() => { logger.info('Dashboard', 'Page mounted'); }, []);
-  const [summary, setSummary] = useState<PortfolioSummary>(placeholderSummary);
-  const [recentTrades, setRecentTrades] = useState<Trade[]>(placeholderTrades);
-  const [positionCount, setPositionCount] = useState<number>(3);
-  const [maxDrawdown, setMaxDrawdown] = useState<number>(4.2);
-  const [equityCurve, setEquityCurve] = useState<EquityPoint[]>([]);
+  const [summary, setSummary] = useState<PortfolioSummary | null>(null);
+  const [recentTrades, setRecentTrades] = useState<Trade[] | null>(null);
+  const [positionCount, setPositionCount] = useState<number | null>(null);
+  const [maxDrawdown, setMaxDrawdown] = useState<number | null>(null);
+  const [equityCurve, setEquityCurve] = useState<EquityPoint[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [isDark, setIsDark] = useState(false);
+  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
   }, []);
 
-  useEffect(() => {
-    const load = async () => {
-      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
-        .catch(() => ({ trading_mode: 'paper' }));
-      const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
-      const qs = `?source=${source}`;
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    setFetchErrors({});
 
-      await Promise.all([
-        fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
-          .then(setSummary)
-          .catch(() => { /* keep placeholder */ }),
-        fetchApi<ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
-          .then((data) => setRecentTrades(mapApiTrades(data)))
-          .catch(() => { /* keep placeholder */ }),
-        fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
-          .then((data) => setPositionCount(data.length))
-          .catch(() => { /* keep placeholder */ }),
-        fetchApi<ApiRiskStatus>('/api/risk/status')
-          .then((data) => setMaxDrawdown(data.current_drawdown))
-          .catch(() => { /* keep placeholder */ }),
-        fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
-          .then((data) => setEquityCurve(data))
-          .catch(() => { /* chart stays empty if API unavailable */ }),
-      ]);
-    };
+    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
+      .catch(() => ({ trading_mode: 'paper' }));
+    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    const qs = `?source=${source}`;
 
-    load().finally(() => setLoading(false));
+    await Promise.all([
+      fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
+        .then(setSummary)
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, summary: true })); }),
+      fetchApi<ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
+        .then((data) => setRecentTrades(mapApiTrades(data)))
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, trades: true })); }),
+      fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
+        .then((data) => setPositionCount(data.length))
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
+      fetchApi<ApiRiskStatus>('/api/risk/status')
+        .then((data) => setMaxDrawdown(data.current_drawdown))
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, risk: true })); }),
+      fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
+        .then((data) => setEquityCurve(data))
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, equity: true })); }),
+    ]);
+
+    setLoading(false);
   }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
 
   const accentColor = isDark ? '#2383e2' : '#2563eb';
   const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
@@ -232,45 +221,59 @@ export default function DashboardPage() {
   return (
     <div className="flex flex-col gap-6">
       {/* Stat cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard
-          icon={Wallet}
-          label="Portfolio Value"
-          value={`$${summary.total_value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
-          change={summary.change_pct}
-          changeType="increase"
-        />
-        <StatCard
-          icon={TrendingUp}
-          label="Daily PnL"
-          value={`+$${summary.unrealized_pnl.toFixed(2)}`}
-          change={1.8}
-          changeType="increase"
-        />
-        <Link href="/trading" className="block">
+      {fetchErrors.summary ? (
+        <ErrorCard message="Failed to load portfolio summary" onRetry={loadData} />
+      ) : loading ? (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="h-28 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
+          ))}
+        </div>
+      ) : summary ? (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <StatCard
-            icon={BarChart3}
-            label="Open Positions"
-            value={positionCount.toLocaleString('en-US')}
-            className="cursor-pointer hover:border-border-hover"
+            icon={Wallet}
+            label="Portfolio Value"
+            value={`$${summary.total_value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+            change={summary.change_pct}
+            changeType="increase"
           />
-        </Link>
-        <StatCard
-          icon={ArrowDownRight}
-          label="Max Drawdown"
-          value={`${maxDrawdown.toLocaleString('en-US', { minimumFractionDigits: 1 })}%`}
-          change={0.3}
-          changeType="decrease"
-        />
-      </div>
+          <StatCard
+            icon={TrendingUp}
+            label="Daily PnL"
+            value={`+$${summary.unrealized_pnl.toFixed(2)}`}
+            change={1.8}
+            changeType="increase"
+          />
+          <Link href="/trading" className="block">
+            <StatCard
+              icon={BarChart3}
+              label="Open Positions"
+              value={positionCount != null ? positionCount.toLocaleString('en-US') : '-'}
+              className="cursor-pointer hover:border-border-hover"
+            />
+          </Link>
+          <StatCard
+            icon={ArrowDownRight}
+            label="Max Drawdown"
+            value={maxDrawdown != null ? `${maxDrawdown.toLocaleString('en-US', { minimumFractionDigits: 1 })}%` : '-'}
+            change={0.3}
+            changeType="decrease"
+          />
+        </div>
+      ) : (
+        <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+      )}
 
       {/* Equity curve */}
       <DataCard title="Equity Curve" description="Portfolio performance over time">
-        {loading ? (
+        {fetchErrors.equity ? (
+          <ErrorCard message="Failed to load equity curve" onRetry={loadData} />
+        ) : loading ? (
           <div className="flex h-64 items-center justify-center">
-            <p className="text-sm text-text-muted">Loading...</p>
+            <div className="h-64 w-full animate-pulse rounded-lg bg-bg-tertiary" />
           </div>
-        ) : equityCurve.length > 0 ? (
+        ) : equityCurve && equityCurve.length > 0 ? (
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={equityCurve} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
@@ -324,11 +327,23 @@ export default function DashboardPage() {
 
       {/* Recent trades */}
       <DataCard title="Recent Trades" description="Last 5 executed trades">
-        <Table
-          columns={tradeColumns}
-          data={recentTrades}
-          keyExtractor={(row) => row.id}
-        />
+        {fetchErrors.trades ? (
+          <ErrorCard message="Failed to load recent trades" onRetry={loadData} />
+        ) : loading ? (
+          <div className="space-y-3">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <div key={i} className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
+            ))}
+          </div>
+        ) : recentTrades && recentTrades.length > 0 ? (
+          <Table
+            columns={tradeColumns}
+            data={recentTrades}
+            keyExtractor={(row) => row.id}
+          />
+        ) : (
+          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+        )}
       </DataCard>
     </div>
   );

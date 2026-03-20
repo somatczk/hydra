@@ -1,4 +1,4 @@
-FROM python:3.14-slim AS builder
+FROM python:3.13-slim AS builder
 WORKDIR /app
 RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock README.md ./
@@ -8,14 +8,14 @@ COPY config/ config/
 COPY scripts/ scripts/
 RUN uv sync --no-dev
 
-FROM python:3.14-slim
+FROM python:3.13-slim
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
 COPY --from=builder /app/config /app/config
 COPY --from=builder /app/scripts /app/scripts
 ENV PATH="/app/.venv/bin:$PATH"
-EXPOSE 8000 8080
+EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
 CMD ["python", "-m", "hydra.dashboard.api"]

@@ -99,6 +99,7 @@ class OrderManager:
         event_bus: EventBusLike,
         risk_checker: RiskCheckerLike | None = None,
         portfolio_state: Any = None,
+        portfolio_state_builder: Any = None,
         stale_order_timeout: float = 300.0,
         dedup_window: float = 1.0,
     ) -> None:
@@ -106,6 +107,7 @@ class OrderManager:
         self._event_bus = event_bus
         self._risk_checker = risk_checker
         self._portfolio_state = portfolio_state
+        self._portfolio_state_builder = portfolio_state_builder
 
         # Config
         self._stale_order_timeout = stale_order_timeout
@@ -136,6 +138,9 @@ class OrderManager:
 
         # 2. Pre-trade risk check (if checker configured)
         if self._risk_checker is not None:
+            # Refresh portfolio state if a builder is available
+            if self._portfolio_state_builder is not None:
+                self._portfolio_state = await self._portfolio_state_builder()
             result = await self._risk_checker.check_order(order, self._portfolio_state)
             if not result.approved:
                 raise ValueError(f"Risk check failed: {result.reason}")
@@ -182,6 +187,18 @@ class OrderManager:
                     status=OrderStatus.FILLED,
                 )
             )
+            try:
+                from hydra.dashboard.metrics import observe_order_fill_latency, record_trade
+
+                record_trade(
+                    str(order.symbol),
+                    str(order.side),
+                    order.strategy_id,
+                    order.exchange_id,
+                )
+                observe_order_fill_latency(time.monotonic() - now)
+            except Exception:
+                pass
 
         return order_id
 

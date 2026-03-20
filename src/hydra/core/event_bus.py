@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -48,8 +49,15 @@ class InMemoryEventBus:
         callbacks = list(self._subscribers.get(event_type, []))
         # Also notify wildcard subscribers
         callbacks.extend(self._subscribers.get("*", []))
+        t0 = time.monotonic()
         for callback in callbacks:
             await callback(event)
+        try:
+            from hydra.dashboard.metrics import observe_event_bus_latency
+
+            observe_event_bus_latency(time.monotonic() - t0)
+        except Exception:
+            pass
 
     async def publish_queued(self, event: Event) -> None:
         """Enqueue an event for later ordered processing via ``drain``."""

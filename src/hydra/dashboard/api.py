@@ -11,13 +11,13 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from hydra.core.websocket import manager
 from hydra.dashboard.routes import (
     backtest,
     models,
     portfolio,
     risk,
     strategies,
-    strategy_builder,
     system,
     trading,
 )
@@ -51,7 +51,6 @@ app.include_router(backtest.router)
 app.include_router(risk.router)
 app.include_router(models.router)
 app.include_router(system.router)
-app.include_router(strategy_builder.router)
 app.include_router(trading.router)
 
 
@@ -94,42 +93,8 @@ async def metrics() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket connection manager
+# WebSocket connection manager (imported from hydra.core to avoid circular deps)
 # ---------------------------------------------------------------------------
-
-
-class ConnectionManager:
-    """Tracks active WebSocket connections per channel and broadcasts messages."""
-
-    def __init__(self) -> None:
-        self._connections: dict[str, list[WebSocket]] = {}
-
-    async def connect(self, channel: str, websocket: WebSocket) -> None:
-        await websocket.accept()
-        self._connections.setdefault(channel, []).append(websocket)
-
-    def disconnect(self, channel: str, websocket: WebSocket) -> None:
-        conns = self._connections.get(channel, [])
-        if websocket in conns:
-            conns.remove(websocket)
-
-    async def broadcast(self, channel: str, message: dict[str, Any]) -> None:
-        payload = json.dumps(message)
-        dead: list[WebSocket] = []
-        for ws in self._connections.get(channel, []):
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(channel, ws)
-
-    @property
-    def channels(self) -> dict[str, int]:
-        return {ch: len(conns) for ch, conns in self._connections.items() if conns}
-
-
-manager = ConnectionManager()
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +123,16 @@ async def ws_market(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/trades")
 async def ws_trades(websocket: WebSocket) -> None:
-    """Trade notifications."""
-    await _ws_handler("trades", websocket)
+    """Real-time trade notifications. Accepts ?session_id= query param."""
+    session_id = websocket.query_params.get("session_id")
+    channel = f"trades:{session_id}" if session_id else "trades"
+    await manager.connect(channel, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+            await websocket.send_text(json.dumps({"ack": True, "channel": channel}))
+    except WebSocketDisconnect:
+        manager.disconnect(channel, websocket)
 
 
 @app.websocket("/ws/portfolio")
@@ -215,6 +188,37 @@ async def _init_db_pool() -> None:
 
         logging.getLogger(__name__).warning("DB pool creation failed: %s", exc)
         app.state.db_pool = None
+
+
+@app.on_event("startup")
+async def _load_exchange_credentials() -> None:
+    """Load encrypted exchange credentials from DB into app state on startup."""
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        app.state.exchange_credentials = {}
+        return
+    try:
+        from hydra.core.encryption import decrypt
+
+        creds: dict[str, Any] = {}
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM exchange_credentials")
+            for row in rows:
+                creds[row["exchange_id"]] = {
+                    "api_key": decrypt(row["encrypted_key"]),
+                    "api_secret": decrypt(row["encrypted_secret"]),
+                    "passphrase": (
+                        decrypt(row["encrypted_passphrase"])
+                        if row["encrypted_passphrase"]
+                        else None
+                    ),
+                }
+        app.state.exchange_credentials = creds
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning("Failed to load exchange credentials from DB")
+        app.state.exchange_credentials = {}
 
 
 @app.on_event("startup")
@@ -327,13 +331,23 @@ async def _run_migrations() -> None:
                     scope TEXT NOT NULL UNIQUE,
                     max_position_pct NUMERIC(8,4) DEFAULT 0.10,
                     max_risk_per_trade NUMERIC(8,4) DEFAULT 0.02,
+                    max_portfolio_heat NUMERIC(8,4) DEFAULT 0.06,
                     max_daily_loss_pct NUMERIC(8,4) DEFAULT 0.03,
                     max_drawdown_pct NUMERIC(8,4) DEFAULT 0.15,
+                    max_consecutive_losses INTEGER DEFAULT 5,
                     max_concurrent_positions INTEGER DEFAULT 10,
                     kill_switch_active BOOLEAN DEFAULT FALSE,
                     updated_at TIMESTAMPTZ DEFAULT now()
                 )
             """)
+            await conn.execute(
+                "ALTER TABLE risk_config "
+                "ADD COLUMN IF NOT EXISTS max_portfolio_heat NUMERIC(8,4) DEFAULT 0.06"
+            )
+            await conn.execute(
+                "ALTER TABLE risk_config "
+                "ADD COLUMN IF NOT EXISTS max_consecutive_losses INTEGER DEFAULT 5"
+            )
             await conn.execute(
                 "INSERT INTO risk_config (scope) VALUES ('global') ON CONFLICT (scope) DO NOTHING"
             )
@@ -396,6 +410,44 @@ async def _run_migrations() -> None:
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_balance_snap_ts ON balance_snapshots(timestamp)"
+            )
+
+            # Exchange credentials (encrypted at rest)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS exchange_credentials (
+                    exchange_id TEXT PRIMARY KEY,
+                    encrypted_key TEXT NOT NULL,
+                    encrypted_secret TEXT NOT NULL,
+                    encrypted_passphrase TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+
+            # Notification preferences
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS notification_preferences (
+                    id SERIAL PRIMARY KEY,
+                    preferences JSONB NOT NULL DEFAULT '{}',
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+
+            # Risk state tracking
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS risk_state (
+                    id SERIAL PRIMARY KEY,
+                    scope TEXT NOT NULL UNIQUE DEFAULT 'global',
+                    daily_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    daily_pnl_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                    consecutive_losses INTEGER NOT NULL DEFAULT 0,
+                    last_loss_at TIMESTAMPTZ,
+                    current_drawdown NUMERIC(8,4) NOT NULL DEFAULT 0,
+                    peak_portfolio_value NUMERIC(24,8) NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO risk_state (scope) VALUES ('global') ON CONFLICT (scope) DO NOTHING"
             )
 
             # Backtest results persistence (idempotent)

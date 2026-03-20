@@ -26,6 +26,7 @@ from hydra.core.types import (
     MarketType,
     OrderRequest,
     OrderType,
+    Position,
     Side,
     Symbol,
     Timeframe,
@@ -33,6 +34,7 @@ from hydra.core.types import (
 from hydra.data.ingestion import ExchangeFeedManager
 from hydra.execution.order_manager import OrderManager
 from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.risk.pretrade import PortfolioState, PreTradeRiskManager, RiskConfig
 from hydra.strategy.config import StrategyConfig, load_strategy_config
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
@@ -87,6 +89,7 @@ class TradingSession:
     _executor: Any = field(default=None, repr=False)
     _feed: ExchangeFeedManager | None = field(default=None, repr=False)
     _all_timeframes: list[Timeframe] = field(default_factory=list, repr=False)
+    _reconcile_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +103,107 @@ class SessionManager:
     def __init__(self, db_pool: Any = None) -> None:
         self._sessions: dict[str, TradingSession] = {}
         self._db_pool = db_pool
+        self._risk_manager: PreTradeRiskManager | None = None
+        self._risk_config: dict = {}
+        self._stale_cleanup_task: asyncio.Task[None] | None = None
+
+        self._init_task: asyncio.Task[None] | None = None
+        # Kick off async init if we have a DB pool (safe in running loop only)
+        if self._db_pool is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                self._init_task = loop.create_task(self._init_risk_manager())
+            except RuntimeError:
+                pass  # no running loop — will init on first session start
+
+    # -- Risk manager initialisation ----------------------------------------
+
+    async def _init_risk_manager(self) -> None:
+        """Load global risk config from DB and create the PreTradeRiskManager."""
+        try:
+            async with self._db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM risk_config WHERE scope = 'global'")
+            if row:
+                self._risk_config = dict(row)
+                config = RiskConfig(
+                    max_position_pct=Decimal(str(row.get("max_position_pct", "0.10"))),
+                    max_risk_per_trade=Decimal(str(row.get("max_risk_per_trade", "0.02"))),
+                    max_portfolio_heat=Decimal(str(row.get("max_portfolio_heat", "0.06"))),
+                    max_daily_loss_pct=Decimal(str(row.get("max_daily_loss_pct", "0.03"))),
+                    max_consecutive_losses=int(row.get("max_consecutive_losses", 5)),
+                )
+                self._risk_manager = PreTradeRiskManager(config=config)
+            else:
+                self._risk_manager = PreTradeRiskManager()
+            logger.info("PreTradeRiskManager initialised (from DB: %s)", row is not None)
+        except Exception:
+            logger.exception("Failed to load risk config from DB; using defaults")
+            self._risk_manager = PreTradeRiskManager()
+
+    # -- Portfolio state builder --------------------------------------------
+
+    async def _build_portfolio_state(self, session: TradingSession) -> PortfolioState:
+        """Aggregate current portfolio state from executor + DB risk_state."""
+        positions: list[Position] = []
+        balances: dict[str, Decimal] = {}
+        daily_pnl = Decimal("0")
+        consecutive_losses = 0
+        current_drawdown = Decimal("0")
+        portfolio_value = Decimal("10000")
+
+        if session._executor is not None:
+            balances = await session._executor.get_balance()
+            for sym in session.symbols:
+                pos_list = await session._executor.get_positions(sym)
+                positions.extend(pos_list)
+
+        # Sum portfolio value from balances + position notional values
+        balance_total = sum(balances.values(), Decimal("0"))
+        position_value = Decimal("0")
+        for pos in positions:
+            try:
+                price = await session._executor.get_last_price(str(pos.symbol))
+                position_value += pos.quantity * price
+            except Exception:  # nosec B110
+                pass  # price unavailable — skip position valuation
+        portfolio_value = balance_total + position_value
+
+        # Load risk state from DB if available
+        if self._db_pool is not None:
+            try:
+                async with self._db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT daily_pnl, consecutive_losses, current_drawdown "
+                        "FROM risk_state WHERE scope = 'global'"
+                    )
+                if row:
+                    daily_pnl = Decimal(str(row["daily_pnl"])) if row["daily_pnl"] else Decimal("0")
+                    consecutive_losses = (
+                        int(row["consecutive_losses"]) if row["consecutive_losses"] else 0
+                    )
+                    current_drawdown = (
+                        Decimal(str(row["current_drawdown"]))
+                        if row["current_drawdown"]
+                        else Decimal("0")
+                    )
+            except Exception:
+                logger.debug("Could not load risk_state for session %s", session.session_id)
+
+        try:
+            from hydra.dashboard.metrics import update_portfolio
+
+            update_portfolio(float(portfolio_value), float(current_drawdown), float(daily_pnl))
+        except Exception:
+            pass
+
+        return PortfolioState(
+            positions=positions,
+            balances=balances,
+            daily_pnl=daily_pnl,
+            consecutive_losses=consecutive_losses,
+            current_drawdown=current_drawdown,
+            portfolio_value=portfolio_value,
+        )
 
     # -- Public API ----------------------------------------------------------
 
@@ -108,11 +212,16 @@ class SessionManager:
         strategy_id: str,
         trading_mode: str,
         paper_capital: Decimal | None = None,
+        credentials: dict | None = None,
     ) -> str:
         """Start a new trading session for *strategy_id*.
 
         Returns the session_id.
         """
+        # Ensure risk manager is initialised before proceeding
+        if self._init_task is not None and not self._init_task.done():
+            await self._init_task
+
         # Check kill switch
         if self._db_pool is not None:
             async with self._db_pool.acquire() as conn:
@@ -157,6 +266,7 @@ class SessionManager:
                 initial_balances=initial_bal,
                 db_pool=self._db_pool,
                 strategy_id=strategy_id,
+                session_id=session_id,
             )
         else:
             # Live mode: use ExchangeClient (lazy import to avoid CCXT at startup)
@@ -164,16 +274,31 @@ class SessionManager:
 
             executor = ExchangeClient(
                 exchange_id=cfg.exchange.exchange_id,
-                config={},
+                config=credentials or {},
             )
 
-        order_manager = OrderManager(executor=executor, event_bus=event_bus)
+        # Build portfolio state for risk checks
+        session._executor = executor
+        session._event_bus = event_bus
+        session.symbols = cfg.symbols
+        session.session_id = session_id
+
+        portfolio_state = await self._build_portfolio_state(session)
+
+        async def _state_builder() -> PortfolioState:
+            return await self._build_portfolio_state(session)
+
+        order_manager = OrderManager(
+            executor=executor,
+            event_bus=event_bus,
+            risk_checker=self._risk_manager,
+            portfolio_state=portfolio_state,
+            portfolio_state_builder=_state_builder,
+        )
         feed = ExchangeFeedManager(event_bus=event_bus)
 
         session._engine = engine
-        session._event_bus = event_bus
         session._order_manager = order_manager
-        session._executor = executor
         session._feed = feed
         session._all_timeframes = _collect_timeframes(cfg)
 
@@ -184,6 +309,10 @@ class SessionManager:
         session._task = task
 
         self._sessions[session_id] = session
+
+        # Start stale order cleanup if not already running
+        if self._stale_cleanup_task is None or self._stale_cleanup_task.done():
+            self._stale_cleanup_task = asyncio.create_task(self._stale_order_cleanup_loop())
 
         # Persist to DB
         await self._persist_session(session)
@@ -279,7 +408,7 @@ class SessionManager:
                 }
                 for p in raw_positions
             ]
-            trades = list(session._executor._filled_orders)
+            trades = await session._executor.get_filled_orders()
         else:
             # Stopped/error: load trades from DB
             trades = await self._load_session_trades(session)
@@ -313,10 +442,10 @@ class SessionManager:
                     """
                     SELECT id, symbol, side, quantity, price, fee, pnl, timestamp
                     FROM trades
-                    WHERE strategy_id = $1 AND source = $2
+                    WHERE session_id = $1 AND source = $2
                     ORDER BY timestamp ASC
                     """,
-                    session.strategy_id,
+                    session.session_id,
                     source,
                 )
                 return [
@@ -352,7 +481,7 @@ class SessionManager:
                 cfg.enabled = True
                 return cfg
 
-        raise ValueError(f"Strategy config not found: {strategy_id}")
+        raise KeyError(f"Strategy config not found: {strategy_id}")
 
     async def _run_session(self, session: TradingSession) -> None:
         """Run the strategy engine in its own task."""
@@ -360,19 +489,23 @@ class SessionManager:
             if session._engine is not None:
                 await session._engine.start()
 
-                # Wire signal→order bridge
+                # Wire signal->order bridge
                 if session._event_bus and session._order_manager and session._executor:
                     om = session._order_manager  # capture for closure
 
                     async def on_bar_price(event: Event) -> None:
-                        if isinstance(event, BarEvent) and event.ohlcv:
+                        if (
+                            isinstance(event, BarEvent)
+                            and event.ohlcv
+                            and hasattr(session._executor, "set_market_price")
+                        ):
                             session._executor.set_market_price(
                                 str(event.symbol),
                                 event.ohlcv.close,
                             )
 
                     async def on_signal(event: Event) -> None:
-                        order = self._signal_to_order(event, session)
+                        order = await self._signal_to_order(event, session)
                         if order is not None:
                             try:
                                 await om.submit_order(order)
@@ -384,6 +517,38 @@ class SessionManager:
                     await session._event_bus.subscribe("bar", on_bar_price)
                     await session._event_bus.subscribe("entry_signal", on_signal)
                     await session._event_bus.subscribe("exit_signal", on_signal)
+
+                    # Forward fill events to risk manager
+                    async def on_fill(event: Event) -> None:
+                        if self._risk_manager and session.status == "running":
+                            pnl = Decimal(str(getattr(event, "pnl", 0) or 0))
+                            balance = await session._executor.get_balance()
+                            portfolio_val = sum(balance.values(), Decimal("0"))
+                            await self._risk_manager.record_fill(pnl, portfolio_val)
+
+                    await session._event_bus.subscribe("order_fill", on_fill)
+
+                    # Publish fills to WebSocket ConnectionManager
+                    async def on_fill_ws(event: Event) -> None:
+                        try:
+                            from hydra.core.websocket import manager
+
+                            fill_data = {
+                                "event": "order_fill",
+                                "session_id": session.session_id,
+                                "order_id": getattr(event, "order_id", ""),
+                                "symbol": str(getattr(event, "symbol", "")),
+                                "side": str(getattr(event, "side", "")),
+                                "quantity": str(getattr(event, "quantity", "0")),
+                                "price": str(getattr(event, "price", "0")),
+                                "fee": str(getattr(event, "fee", "0")),
+                                "timestamp": datetime.now(UTC).isoformat(),
+                            }
+                            await manager.broadcast(f"trades:{session.session_id}", fill_data)
+                        except Exception:
+                            logger.debug("Could not broadcast fill to WebSocket")
+
+                    await session._event_bus.subscribe("order_fill", on_fill_ws)
 
                 # Start market data feed
                 if session._feed is not None:
@@ -402,6 +567,12 @@ class SessionManager:
                         timeframes=session._all_timeframes or [Timeframe(session.timeframe)],
                     )
 
+                # Start reconciliation loop for live sessions
+                if session.trading_mode == "live":
+                    session._reconcile_task = asyncio.create_task(
+                        self._reconciliation_loop(session)
+                    )
+
                 # Keep the task alive until cancelled
                 while session.status == "running":
                     await asyncio.sleep(1)
@@ -414,21 +585,28 @@ class SessionManager:
             session.stopped_at = datetime.now(UTC)
             await self._persist_session(session)
 
-    @staticmethod
-    def _signal_to_order(event: Event, session: TradingSession) -> OrderRequest | None:
+    async def _signal_to_order(self, event: Event, session: TradingSession) -> OrderRequest | None:
         """Convert a signal event into an OrderRequest for the live context."""
         if isinstance(event, EntrySignal):
-            capital = session._executor._balances.get("USDT", Decimal("0"))
+            balance = await session._executor.get_balance()
+            capital = balance.get("USDT", Decimal("0"))
             if capital <= 0:
                 return None
-            risk_fraction = Decimal("0.1")
-            notional = capital * risk_fraction
-            price = session._executor._last_prices.get(str(event.symbol), Decimal("0"))
+
+            # Load max_risk_per_trade from risk config
+            max_risk_per_trade = Decimal(str(self._risk_config.get("max_risk_per_trade", "0.02")))
+
+            price = await session._executor.get_last_price(str(event.symbol))
             if price <= 0:
                 return None
-            quantity = (notional / price).quantize(Decimal("0.00000001"))
+
+            # Compute portfolio value from balance for sizing
+            portfolio_value = capital
+            quantity = (portfolio_value * max_risk_per_trade) / price
+            quantity = quantity.quantize(Decimal("0.00000001"))
             if quantity <= 0:
                 return None
+
             side = Side.BUY if event.direction == Direction.LONG else Side.SELL
             return OrderRequest(
                 symbol=Symbol(str(event.symbol)),
@@ -439,10 +617,14 @@ class SessionManager:
                 exchange_id=event.exchange_id,
                 market_type=event.market_type,
             )
+
         if isinstance(event, ExitSignal):
-            pos = session._executor._positions.get(str(event.symbol))
-            quantity = pos.quantity if pos else Decimal("0.00000001")
-            side = Side.SELL if event.direction == Direction.FLAT else Side.BUY
+            positions = await session._executor.get_positions(str(event.symbol))
+            if not positions:
+                return None
+            pos = positions[0]
+            side = Side.SELL if pos.direction == Direction.LONG else Side.BUY
+            quantity = pos.quantity
             return OrderRequest(
                 symbol=Symbol(str(event.symbol)),
                 side=side,
@@ -452,6 +634,7 @@ class SessionManager:
                 exchange_id=event.exchange_id,
                 market_type=MarketType.SPOT,
             )
+
         return None
 
     async def _stop_session_internal(self, session: TradingSession) -> None:
@@ -461,6 +644,11 @@ class SessionManager:
 
         if session._engine is not None:
             await session._engine.stop()
+
+        if session._reconcile_task is not None and not session._reconcile_task.done():
+            session._reconcile_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session._reconcile_task
 
         if session._task is not None and not session._task.done():
             session._task.cancel()
@@ -505,8 +693,79 @@ class SessionManager:
         except Exception:
             logger.exception("Failed to persist session %s", session.session_id)
 
+    # -- Background tasks ----------------------------------------------------
+
+    async def _stale_order_cleanup_loop(self) -> None:
+        """Periodically clean up stale orders across all active sessions."""
+        while True:
+            try:
+                await asyncio.sleep(60)
+                for session in self._sessions.values():
+                    if session.status == "running" and session._order_manager is not None:
+                        try:
+                            cancelled = await session._order_manager.cleanup_stale_orders()
+                            if cancelled:
+                                logger.info(
+                                    "Cleaned up %d stale orders in session %s",
+                                    len(cancelled),
+                                    session.session_id,
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Stale order cleanup failed for session %s",
+                                session.session_id,
+                            )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error in stale order cleanup loop")
+
+    async def _reconciliation_loop(self, session: TradingSession) -> None:
+        """Periodically log position state for live sessions (every 5 minutes)."""
+        while session.status == "running":
+            try:
+                await asyncio.sleep(300)
+                if session.status != "running" or session._executor is None:
+                    break
+
+                balances = await session._executor.get_balance()
+                all_positions: list[Position] = []
+                for sym in session.symbols:
+                    pos_list = await session._executor.get_positions(sym)
+                    all_positions.extend(pos_list)
+
+                try:
+                    from hydra.dashboard.metrics import update_position, update_reconciliation
+
+                    for pos in all_positions:
+                        update_position(str(pos.symbol), session.exchange_id, float(pos.quantity))
+                    for sym in session.symbols:
+                        update_reconciliation(session.exchange_id, sym, mismatch=False)
+                except Exception:
+                    pass
+
+                logger.info(
+                    "Reconciliation [session=%s]: balances=%s, positions=%d, symbols=%s",
+                    session.session_id,
+                    {k: str(v) for k, v in balances.items()},
+                    len(all_positions),
+                    [str(p.symbol) for p in all_positions],
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Reconciliation error for session %s", session.session_id)
+
+    # -- Lifecycle -----------------------------------------------------------
+
     async def graceful_shutdown(self) -> None:
         """Stop in-memory engines/tasks but leave DB status as 'running' for recovery."""
+        # Cancel stale order cleanup
+        if self._stale_cleanup_task is not None and not self._stale_cleanup_task.done():
+            self._stale_cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stale_cleanup_task
+
         for session in self._sessions.values():
             if session.status != "running":
                 continue
@@ -529,8 +788,14 @@ class SessionManager:
                 rows = await conn.fetch("SELECT * FROM trading_sessions WHERE status = 'running'")
             for row in rows:
                 sid = row["id"]
+
+                # Duplicate guard: skip if already tracked in-memory
+                if sid in self._sessions:
+                    continue
+
                 strategy_id = row["strategy_id"]
                 trading_mode = row["trading_mode"]
+                task: asyncio.Task[None] | None = None
                 try:
                     cfg = self._find_strategy_config(strategy_id)
 
@@ -566,31 +831,87 @@ class SessionManager:
                             initial_balances=initial_bal,
                             db_pool=self._db_pool,
                             strategy_id=strategy_id,
+                            session_id=sid,
                         )
                     else:
+                        # Live recovery: load credentials from DB
                         from hydra.execution.exchange_client import ExchangeClient
+
+                        creds: dict[str, Any] = {}
+                        try:
+                            from hydra.core.encryption import decrypt
+
+                            async with self._db_pool.acquire() as conn:
+                                cred_row = await conn.fetchrow(
+                                    "SELECT encrypted_key, encrypted_secret, "
+                                    "encrypted_passphrase "
+                                    "FROM exchange_credentials "
+                                    "WHERE exchange_id = $1",
+                                    cfg.exchange.exchange_id,
+                                )
+                            if cred_row:
+                                creds = {
+                                    "apiKey": decrypt(cred_row["encrypted_key"]),
+                                    "secret": decrypt(cred_row["encrypted_secret"]),
+                                }
+                                if cred_row.get("encrypted_passphrase"):
+                                    creds["password"] = decrypt(cred_row["encrypted_passphrase"])
+                            else:
+                                raise ValueError(
+                                    f"No credentials found for exchange {cfg.exchange.exchange_id}"
+                                )
+                        except ValueError:
+                            raise
+                        except Exception as exc:
+                            raise ValueError(
+                                f"Failed to load credentials for exchange "
+                                f"{cfg.exchange.exchange_id}"
+                            ) from exc
 
                         executor = ExchangeClient(
                             exchange_id=cfg.exchange.exchange_id,
-                            config={},
+                            config=creds,
                         )
 
-                    order_manager = OrderManager(executor=executor, event_bus=event_bus)
+                    # Build portfolio state for risk checks
+                    session._executor = executor
+                    session._event_bus = event_bus
+                    portfolio_state = await self._build_portfolio_state(session)
+
+                    async def _recovery_state_builder(
+                        _s: TradingSession = session,
+                    ) -> PortfolioState:
+                        return await self._build_portfolio_state(_s)
+
+                    order_manager = OrderManager(
+                        executor=executor,
+                        event_bus=event_bus,
+                        risk_checker=self._risk_manager,
+                        portfolio_state=portfolio_state,
+                        portfolio_state_builder=_recovery_state_builder,
+                    )
                     feed = ExchangeFeedManager(event_bus=event_bus)
 
                     session._engine = engine
-                    session._event_bus = event_bus
                     session._order_manager = order_manager
-                    session._executor = executor
                     session._feed = feed
                     session._all_timeframes = _collect_timeframes(cfg)
-                    session._task = asyncio.create_task(self._run_session(session))
+                    task = asyncio.create_task(self._run_session(session))
+                    session._task = task
 
                     self._sessions[sid] = session
                     logger.info("Recovered session %s for strategy %s", sid, strategy_id)
                 except Exception:
                     logger.exception("Failed to recover session %s", sid)
+                    # Cancel the task if it was created
+                    if task is not None and not task.done():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
                     # Mark as error so we don't retry endlessly
+                    if sid in self._sessions:
+                        self._sessions[sid].status = "error"
+                        self._sessions[sid].error_message = "Recovery failed"
                     async with self._db_pool.acquire() as conn:
                         await conn.execute(
                             "UPDATE trading_sessions SET status = 'error', "

@@ -10,7 +10,6 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
-      - "8080:8080"
     environment:
       HYDRA_DB_HOST: timescaledb
       HYDRA_DB_PORT: "5432"
@@ -41,7 +40,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://engine:8080
+      NEXT_PUBLIC_API_URL: http://engine:8000
     depends_on:
       - engine
     networks:
@@ -159,7 +158,7 @@ configs:
         - job_name: hydra
           metrics_path: /metrics
           static_configs:
-            - targets: ["engine:8080"]
+            - targets: ["engine:8000"]
               labels:
                 service: hydra-engine
 

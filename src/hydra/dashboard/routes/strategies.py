@@ -1,18 +1,44 @@
+"""Consolidated strategy routes: list, detail, update, toggle, delete,
+builder indicators/comparators, preview, and save.
+
+Merges the old ``strategy_builder.py`` and ``builder.py`` endpoints into
+a single ``/api/strategies/*`` namespace.
+"""
+
 from __future__ import annotations
 
 import logging
+import re
+import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+import yaml
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
+
+from hydra.core.types import OHLCV, Timeframe
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Config directory for strategy YAML files
+# ---------------------------------------------------------------------------
+
+_CONFIG_DIR = Path(__file__).resolve().parents[4] / "config" / "strategies"
+_RULE_BASED_CLASS = "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
+_VALID_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d", "1w"}
+_VALID_EXCHANGES = {"binance", "bybit", "kraken", "okx"}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 _STRATEGY_DESCRIPTIONS: dict[str, str] = {
     "LSTM Momentum": "ML-based momentum strategy using LSTM predictions on 1h BTC/USDT",
@@ -23,14 +49,46 @@ _STRATEGY_DESCRIPTIONS: dict[str, str] = {
 _DEFAULT_DESCRIPTION = "Custom strategy"
 
 
-def _pool_from_request(request: Request) -> object | None:
-    """Return the asyncpg connection pool from app state, or ``None``."""
+def _pool_from_request(request: Request) -> Any:
     return getattr(request.app.state, "db_pool", None)
 
 
 def _status_from_enabled(enabled: bool) -> str:
-    """Map the ``enabled`` boolean to a human-readable status string."""
     return "Active" if enabled else "Paused"
+
+
+def _name_to_id(name: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", name.strip().lower()).strip("_")
+    return slug or "strategy"
+
+
+def _parse_any_strategy_yaml(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open() as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return None
+    return dict(data) if isinstance(data, dict) else None
+
+
+def _parse_strategy_yaml(path: Path) -> dict[str, Any] | None:
+    """Read a YAML strategy file, returning None if not a RuleBasedStrategy."""
+    data = _parse_any_strategy_yaml(path)
+    if data is None:
+        return None
+    if data.get("strategy_class") != _RULE_BASED_CLASS:
+        return None
+    return data
+
+
+def _find_strategy_file(strategy_id: str) -> Path | None:
+    if not _CONFIG_DIR.is_dir():
+        return None
+    for path in _CONFIG_DIR.glob("*.yaml"):
+        data = _parse_any_strategy_yaml(path)
+        if data is not None and data.get("id") == strategy_id:
+            return path
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +108,7 @@ class StrategyResponse(BaseModel):
     id: str
     name: str
     description: str
-    status: str  # Active | Paused | Backtesting | Draft
+    status: str
     enabled: bool = True
     config_yaml: str = ""
     performance: StrategyPerformance = Field(default_factory=StrategyPerformance)
@@ -65,8 +123,117 @@ class ToggleResponse(BaseModel):
     enabled: bool
 
 
+# Builder-related models
+
+
+class ParamSchema(BaseModel):
+    name: str
+    type: str
+    default: int | float | None = None
+    min: int | float | None = None
+    max: int | float | None = None
+
+
+class IndicatorSchema(BaseModel):
+    name: str
+    category: str
+    description: str
+    params: list[ParamSchema]
+
+
+class ComparatorSchema(BaseModel):
+    value: str
+    label: str
+    description: str
+
+
+class ConditionInput(BaseModel):
+    indicator: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    comparator: str
+    value: float | str
+
+
+class ConditionGroupInput(BaseModel):
+    operator: str = "AND"
+    conditions: list[ConditionInput] = Field(default_factory=list)
+
+
+class RuleSetInput(BaseModel):
+    entry_long: ConditionGroupInput | None = None
+    exit_long: ConditionGroupInput | None = None
+    entry_short: ConditionGroupInput | None = None
+    exit_short: ConditionGroupInput | None = None
+
+
+class TimeframeInput(BaseModel):
+    primary: str = "1h"
+    confirmation: str | None = None
+    entry: str | None = None
+
+
+class RiskInput(BaseModel):
+    stop_loss_method: str = "atr"
+    stop_loss_value: float = 2.0
+    take_profit_method: str = "atr"
+    take_profit_value: float = 3.0
+    sizing_method: str = "fixed_fractional"
+    sizing_params: dict[str, float] = Field(default_factory=dict)
+
+
+class PreviewRequest(BaseModel):
+    rules: RuleSetInput
+    timeframe: str = "1h"
+    symbol: str = "BTCUSDT"
+    bars_count: int = Field(default=200, ge=50, le=1000)
+
+
+class SignalOutput(BaseModel):
+    timestamp: str
+    type: str
+    price: float
+
+
+class MetricsOutput(BaseModel):
+    trades: int
+    win_rate: float
+    pnl: float
+
+
+class PreviewResponse(BaseModel):
+    signals: list[SignalOutput]
+    metrics: MetricsOutput
+
+
+class SaveRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = ""
+    exchange_id: str = "binance"
+    symbol: str = "BTCUSDT"
+    rules: RuleSetInput
+    timeframes: TimeframeInput = Field(default_factory=TimeframeInput)
+    risk: RiskInput = Field(default_factory=RiskInput)
+    enable_immediately: bool = False
+
+
+class SaveResponse(BaseModel):
+    id: str
+    name: str
+    config_path: str
+    message: str
+
+
+class StrategySummary(BaseModel):
+    id: str
+    name: str
+    description: str
+    enabled: bool
+    filename: str
+    editable: bool = True
+
+
 # ---------------------------------------------------------------------------
-# In-memory placeholder data (replaced by DB in production)
+# In-memory placeholder data (fallback when DB is not available)
 # ---------------------------------------------------------------------------
 
 _STRATEGIES: dict[str, dict[str, Any]] = {
@@ -85,51 +252,6 @@ _STRATEGIES: dict[str, dict[str, Any]] = {
             "max_drawdown": 8.2,
         },
     },
-    "strat-2": {
-        "id": "strat-2",
-        "name": "Mean Reversion RSI",
-        "description": "RSI-based mean reversion with Bollinger Band confirmation",
-        "status": "Active",
-        "enabled": True,
-        "config_yaml": "strategy:\n  type: mean_reversion_rsi\n  period: 14\n",
-        "performance": {
-            "total_pnl": 580.20,
-            "win_rate": 61.1,
-            "total_trades": 18,
-            "sharpe_ratio": 1.22,
-            "max_drawdown": 12.4,
-        },
-    },
-    "strat-3": {
-        "id": "strat-3",
-        "name": "Breakout Scanner",
-        "description": "Volume-weighted breakout detection across multiple timeframes",
-        "status": "Paused",
-        "enabled": False,
-        "config_yaml": "strategy:\n  type: breakout_scanner\n  timeframes: [5m, 15m, 1h]\n",
-        "performance": {
-            "total_pnl": -120.00,
-            "win_rate": 40.0,
-            "total_trades": 5,
-            "sharpe_ratio": 0.45,
-            "max_drawdown": 15.8,
-        },
-    },
-    "strat-4": {
-        "id": "strat-4",
-        "name": "XGBoost Ensemble",
-        "description": "Ensemble of XGBoost models with feature importance weighting",
-        "status": "Backtesting",
-        "enabled": False,
-        "config_yaml": "strategy:\n  type: xgboost_ensemble\n",
-        "performance": {
-            "total_pnl": 0.0,
-            "win_rate": 0.0,
-            "total_trades": 0,
-            "sharpe_ratio": 0.0,
-            "max_drawdown": 0.0,
-        },
-    },
 }
 
 
@@ -143,7 +265,6 @@ def _get_strategy(strategy_id: str) -> dict[str, Any]:
 
 
 def _row_to_strategy(row: Any) -> dict[str, Any]:
-    """Convert a DB row (from the strategies + aggregated trades query) to a dict."""
     name = row["name"]
     return {
         "id": row["id"],
@@ -162,6 +283,7 @@ def _row_to_strategy(row: Any) -> dict[str, Any]:
     }
 
 
+# Fixed SQL: use WHERE instead of HAVING for strategy_id filter
 _STRATEGIES_QUERY = (
     "SELECT ts.strategy_id AS id, ts.strategy_id AS name, "
     "ts.exchange_id, TRUE AS enabled, "
@@ -178,7 +300,84 @@ _STRATEGIES_QUERY = (
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Builder helper functions
+# ---------------------------------------------------------------------------
+
+
+def _validate_condition_group(group: ConditionGroupInput | None) -> Any:
+    if group is None or not group.conditions:
+        return None
+
+    from hydra.strategy.condition_schema import (
+        Comparator,
+        Condition,
+        ConditionGroup,
+        LogicOperator,
+    )
+
+    operator = LogicOperator(group.operator)
+    conditions = [
+        Condition(
+            indicator=cond.indicator,
+            params=cond.params,
+            comparator=Comparator(cond.comparator),
+            value=cond.value,
+        )
+        for cond in group.conditions
+    ]
+    return ConditionGroup(operator=operator, conditions=conditions)
+
+
+def _validate_rules(rules: RuleSetInput) -> Any:
+    from hydra.strategy.condition_schema import RuleSet
+
+    return RuleSet(
+        entry_long=_validate_condition_group(rules.entry_long),
+        exit_long=_validate_condition_group(rules.exit_long),
+        entry_short=_validate_condition_group(rules.entry_short),
+        exit_short=_validate_condition_group(rules.exit_short),
+    )
+
+
+def _generate_sample_bars(count: int) -> list[OHLCV]:
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    base_price = 42000.0
+    bars: list[OHLCV] = []
+    price = base_price
+    for i in range(count):
+        change = rng.normal(0, 0.005)
+        price = max(price * (1 + change), 100.0)
+        intra_vol = abs(rng.normal(0, 0.003))
+        open_price = price * (1 + rng.normal(0, 0.001))
+        high_price = max(price, open_price) * (1 + intra_vol)
+        low_price = min(price, open_price) * (1 - intra_vol)
+        volume = abs(rng.normal(1000, 200))
+        bars.append(
+            OHLCV(
+                open=Decimal(str(round(open_price, 2))),
+                high=Decimal(str(round(high_price, 2))),
+                low=Decimal(str(round(low_price, 2))),
+                close=Decimal(str(round(price, 2))),
+                volume=Decimal(str(round(volume, 2))),
+                timestamp=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(hours=i),
+            )
+        )
+    return bars
+
+
+def _to_condition_group_input(group_data: dict[str, Any] | None) -> ConditionGroupInput | None:
+    if group_data is None:
+        return None
+    return ConditionGroupInput(
+        operator=group_data.get("operator", "AND"),
+        conditions=[ConditionInput(**c) for c in group_data.get("conditions", [])],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strategy CRUD endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -188,7 +387,6 @@ async def list_strategies(request: Request) -> list[dict[str, Any]]:
     pool = _pool_from_request(request)
     if pool is None:
         return list(_STRATEGIES.values())
-
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(_STRATEGIES_QUERY)
@@ -198,17 +396,76 @@ async def list_strategies(request: Request) -> list[dict[str, Any]]:
         return list(_STRATEGIES.values())
 
 
+@router.get("/indicators")
+async def list_indicators() -> list[dict[str, Any]]:
+    """List all available indicators with their parameter schemas."""
+    from hydra.strategy.indicator_registry import get_all_indicators
+
+    indicators = get_all_indicators()
+    return [
+        {
+            "name": ind.name,
+            "category": ind.category,
+            "description": ind.description,
+            "params": [
+                {
+                    "name": p.name,
+                    "type": p.type,
+                    "default": p.default,
+                    "min": p.min,
+                    "max": p.max,
+                }
+                for p in ind.params
+            ],
+        }
+        for ind in indicators
+    ]
+
+
+@router.get("/comparators")
+async def list_comparators() -> list[dict[str, str]]:
+    """List all available comparators with descriptions."""
+    from hydra.strategy.condition_schema import Comparator
+
+    return [
+        {
+            "value": Comparator.LESS_THAN.value,
+            "label": "Less Than",
+            "description": "Current indicator value is less than the target value",
+        },
+        {
+            "value": Comparator.GREATER_THAN.value,
+            "label": "Greater Than",
+            "description": "Current indicator value is greater than the target value",
+        },
+        {
+            "value": Comparator.CROSSES_ABOVE.value,
+            "label": "Crosses Above",
+            "description": "Indicator crosses from below to above the target value",
+        },
+        {
+            "value": Comparator.CROSSES_BELOW.value,
+            "label": "Crosses Below",
+            "description": "Indicator crosses from above to below the target value",
+        },
+        {
+            "value": Comparator.EQUALS.value,
+            "label": "Equals",
+            "description": "Current indicator value equals the target value",
+        },
+    ]
+
+
 @router.get("/{strategy_id}", response_model=StrategyResponse)
 async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
     """Get a single strategy detail."""
     pool = _pool_from_request(request)
     if pool is None:
         return _get_strategy(strategy_id)
-
     try:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                _STRATEGIES_QUERY + " HAVING s.id = $1",
+                _STRATEGIES_QUERY + " HAVING ts.strategy_id = $1",
                 strategy_id,
             )
         if row is None:
@@ -232,17 +489,178 @@ async def update_strategy(strategy_id: str, body: StrategyUpdateRequest) -> dict
     return strat
 
 
+@router.get("/{strategy_id}/performance", response_model=StrategyPerformance)
+async def get_strategy_performance(strategy_id: str) -> dict[str, Any]:
+    """Get performance metrics for a strategy."""
+    strat = _get_strategy(strategy_id)
+    return strat["performance"]
+
+
+@router.delete("/{strategy_id}")
+async def delete_strategy(strategy_id: str) -> Response:
+    """Delete a saved strategy."""
+    path = _find_strategy_file(strategy_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete: {exc}") from exc
+    return Response(status_code=204)
+
+
 @router.post("/{strategy_id}/toggle", response_model=ToggleResponse)
 async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
-    """Enable or disable a strategy (in-memory only)."""
+    """Toggle enabled flag of a strategy."""
+    # Try YAML file first
+    path = _find_strategy_file(strategy_id)
+    if path is not None:
+        data = _parse_any_strategy_yaml(path)
+        if data is not None:
+            data["enabled"] = not data.get("enabled", False)
+            try:
+                with path.open("w") as f:
+                    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            return {"id": strategy_id, "enabled": data["enabled"]}
+
+    # Fall back to in-memory
     strat = _get_strategy(strategy_id)
     strat["enabled"] = not strat["enabled"]
     strat["status"] = _status_from_enabled(strat["enabled"])
     return {"id": strategy_id, "enabled": strat["enabled"]}
 
 
-@router.get("/{strategy_id}/performance", response_model=StrategyPerformance)
-async def get_strategy_performance(strategy_id: str) -> dict[str, Any]:
-    """Get performance metrics for a strategy."""
-    strat = _get_strategy(strategy_id)
-    return strat["performance"]
+# ---------------------------------------------------------------------------
+# Builder endpoints (merged from strategy_builder.py)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/preview", response_model=PreviewResponse)
+async def preview_signals(request: PreviewRequest) -> PreviewResponse:
+    """Run a quick backtest on sample data and return signals and metrics."""
+    try:
+        rule_set = _validate_rules(request.rules)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rules: {exc}") from exc
+
+    if request.timeframe not in _VALID_TIMEFRAMES:
+        raise HTTPException(status_code=422, detail=f"Invalid timeframe: {request.timeframe}")
+
+    from hydra.backtest.runner import BacktestRunner
+    from hydra.strategy.builtin.rule_based import RuleBasedStrategy
+    from hydra.strategy.config import ExchangeStrategyConfig, StrategyConfig, TimeframeConfig
+
+    strategy_id = f"preview_{uuid.uuid4().hex[:8]}"
+    config = StrategyConfig(
+        id=strategy_id,
+        name="Preview Strategy",
+        strategy_class=_RULE_BASED_CLASS,
+        symbols=[request.symbol],
+        exchange=ExchangeStrategyConfig(exchange_id="binance"),
+        timeframes=TimeframeConfig(primary=Timeframe(request.timeframe)),
+        parameters={"rules": rule_set.model_dump(), "required_history": 50},
+    )
+
+    bars = _generate_sample_bars(request.bars_count)
+    runner = BacktestRunner()
+    try:
+        result = await runner.run(
+            strategy_class=RuleBasedStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("100000"),
+            symbol=request.symbol,
+            timeframe=Timeframe(request.timeframe),
+        )
+    except Exception as exc:
+        logger.exception("Preview backtest failed")
+        raise HTTPException(status_code=500, detail=f"Backtest error: {exc}") from exc
+
+    signals: list[SignalOutput] = []
+    for trade in result.trades:
+        signals.append(
+            SignalOutput(
+                timestamp=trade.entry_time.isoformat(),
+                type="entry_long" if trade.direction == "LONG" else "entry_short",
+                price=float(trade.entry_price),
+            )
+        )
+        signals.append(
+            SignalOutput(
+                timestamp=trade.exit_time.isoformat(),
+                type="exit_long" if trade.direction == "LONG" else "exit_short",
+                price=float(trade.exit_price),
+            )
+        )
+
+    total_pnl = sum((float(t.pnl) for t in result.trades), 0.0)
+    metrics = MetricsOutput(
+        trades=result.total_trades,
+        win_rate=float(result.win_rate),
+        pnl=round(total_pnl, 2),
+    )
+    return PreviewResponse(signals=signals, metrics=metrics)
+
+
+@router.post("/save", response_model=SaveResponse, status_code=201)
+async def save_strategy(request: SaveRequest) -> SaveResponse:
+    """Validate and save a strategy as a YAML config file."""
+    try:
+        rule_set = _validate_rules(request.rules)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rules: {exc}") from exc
+
+    if request.exchange_id not in _VALID_EXCHANGES:
+        raise HTTPException(status_code=422, detail=f"Invalid exchange: {request.exchange_id}")
+
+    if request.timeframes.primary not in _VALID_TIMEFRAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid timeframe: {request.timeframes.primary}",
+        )
+
+    strategy_id = _name_to_id(request.name)
+    unique_suffix = uuid.uuid4().hex[:6]
+    config_filename = f"{strategy_id}_{unique_suffix}.yaml"
+
+    config_dict: dict[str, Any] = {
+        "id": f"{strategy_id}_{unique_suffix}",
+        "name": request.name,
+        "strategy_class": _RULE_BASED_CLASS,
+        "enabled": request.enable_immediately,
+        "symbols": [request.symbol],
+        "exchange": {"exchange_id": request.exchange_id, "market_type": "SPOT"},
+        "timeframes": {"primary": request.timeframes.primary},
+        "parameters": {
+            "rules": rule_set.model_dump(mode="json"),
+            "required_history": 50,
+            "description": request.description,
+        },
+        "position_sizing": {
+            "method": request.risk.sizing_method,
+            "risk_per_trade_pct": request.risk.sizing_params.get("risk_per_trade_pct", 1.0),
+            "max_position_pct": request.risk.sizing_params.get("max_position_pct", 10.0),
+        },
+    }
+
+    if request.timeframes.confirmation:
+        config_dict["timeframes"]["confirmation"] = request.timeframes.confirmation
+    if request.timeframes.entry:
+        config_dict["timeframes"]["entry"] = request.timeframes.entry
+
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config_path = _CONFIG_DIR / config_filename
+    try:
+        with config_path.open("w") as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write: {exc}") from exc
+
+    return SaveResponse(
+        id=config_dict["id"],
+        name=request.name,
+        config_path=str(config_path),
+        message=f"Strategy '{request.name}' saved successfully",
+    )

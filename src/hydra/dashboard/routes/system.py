@@ -26,7 +26,7 @@ _EXCHANGE_DEFS: list[tuple[str, str, str]] = [
 ]
 
 
-def _pool_from_request(request: Request) -> object | None:
+def _pool_from_request(request: Request) -> Any:
     """Return the asyncpg connection pool from app state, or ``None``."""
     return getattr(request.app.state, "db_pool", None)
 
@@ -239,6 +239,32 @@ async def connect_exchange(
         raise HTTPException(status_code=404, detail=f"Unknown exchange: {exchange_id}")
 
     display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
+    # Encrypt and persist to DB
+    from hydra.core.encryption import encrypt
+
+    pool = _pool_from_request(request)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO exchange_credentials "
+                    "(exchange_id, encrypted_key, encrypted_secret, "
+                    "encrypted_passphrase, updated_at) "
+                    "VALUES ($1, $2, $3, $4, now()) "
+                    "ON CONFLICT (exchange_id) DO UPDATE SET "
+                    "encrypted_key = EXCLUDED.encrypted_key, "
+                    "encrypted_secret = EXCLUDED.encrypted_secret, "
+                    "encrypted_passphrase = EXCLUDED.encrypted_passphrase, "
+                    "updated_at = now()",
+                    exchange_id,
+                    encrypt(body.api_key),
+                    encrypt(body.api_secret),
+                    encrypt(body.passphrase) if body.passphrase else None,
+                )
+        except Exception:
+            logger.exception("Failed to persist encrypted credentials for %s", exchange_id)
+
+    # Keep in app state for fast access (plaintext in memory)
     creds = _get_exchange_credentials(request)
     creds[exchange_id] = {
         "api_key": body.api_key,
@@ -263,8 +289,29 @@ async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, A
         raise HTTPException(status_code=404, detail=f"Unknown exchange: {exchange_id}")
 
     display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
+
+    # Remove from DB
+    pool = _pool_from_request(request)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM exchange_credentials WHERE exchange_id = $1",
+                    exchange_id,
+                )
+        except Exception:
+            logger.exception("Failed to delete credentials for %s", exchange_id)
+
     creds = _get_exchange_credentials(request)
     creds.pop(exchange_id, None)
+    # Evict and close cached exchange client
+    clients = _get_exchange_clients(request)
+    old_client = clients.pop(exchange_id, None)
+    if old_client is not None:
+        try:
+            await old_client.close()
+        except Exception:
+            logger.debug("Failed to close exchange client for %s", exchange_id)
     logger.info("Exchange credentials removed for %s", exchange_id)
 
     return {
@@ -309,7 +356,7 @@ async def get_system_health(request: Request) -> dict[str, Any]:
             r = aioredis.from_url(redis_url, socket_connect_timeout=2)
             await asyncio.wait_for(r.ping(), timeout=3.0)
             elapsed_ms = round((time.monotonic() - start) * 1000, 2)
-            await r.aclose()
+            await r.close()
             services.append({"service": "Redis", "status": "healthy", "latency_ms": elapsed_ms})
         except ImportError:
             services.append(
@@ -335,3 +382,140 @@ async def get_system_health(request: Request) -> dict[str, Any]:
         overall = "degraded"
 
     return {"overall": overall, "services": services}
+
+
+# ---------------------------------------------------------------------------
+# Notification preferences
+# ---------------------------------------------------------------------------
+
+
+class NotificationPreferences(BaseModel):
+    preferences: dict[str, Any] = {}
+
+
+@router.get("/notifications")
+async def get_notifications(request: Request) -> dict[str, Any]:
+    """Get notification preferences."""
+    pool = _pool_from_request(request)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT preferences FROM notification_preferences ORDER BY id LIMIT 1"
+                )
+                if row is not None:
+                    import json
+
+                    prefs = row["preferences"]
+                    if isinstance(prefs, str):
+                        prefs = json.loads(prefs)
+                    return {"preferences": prefs}
+        except Exception:
+            logger.exception("Failed to fetch notification preferences")
+    return {"preferences": {}}
+
+
+@router.put("/notifications")
+async def update_notifications(body: NotificationPreferences, request: Request) -> dict[str, Any]:
+    """Update notification preferences (upsert)."""
+    pool = _pool_from_request(request)
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    try:
+        import json
+
+        prefs_json = json.dumps(body.preferences)
+        async with pool.acquire() as conn:
+            # Upsert: try update first, then insert if no rows exist
+            result = await conn.execute(
+                "UPDATE notification_preferences "
+                "SET preferences = $1::jsonb, updated_at = now() "
+                "WHERE id = (SELECT id FROM notification_preferences ORDER BY id LIMIT 1)",
+                prefs_json,
+            )
+            if result == "UPDATE 0":
+                await conn.execute(
+                    "INSERT INTO notification_preferences (preferences) VALUES ($1::jsonb)",
+                    prefs_json,
+                )
+    except Exception as exc:
+        logger.exception("Failed to update notification preferences")
+        raise HTTPException(status_code=500, detail="Failed to update preferences") from exc
+    return {"preferences": body.preferences}
+
+
+# ---------------------------------------------------------------------------
+# Exchange data endpoints (balance, orders, positions)
+# ---------------------------------------------------------------------------
+
+
+def _get_exchange_clients(request: Request) -> dict[str, Any]:
+    """Return the cached exchange client map from app state."""
+    if not hasattr(request.app.state, "_exchange_clients"):
+        request.app.state._exchange_clients = {}
+    return request.app.state._exchange_clients
+
+
+async def _get_exchange_client(exchange_id: str, request: Request) -> Any:
+    """Return (or create and cache) an ExchangeClient for the given exchange."""
+    clients = _get_exchange_clients(request)
+    if exchange_id in clients:
+        return clients[exchange_id]
+
+    creds = _get_exchange_credentials(request)
+    if exchange_id not in creds:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No credentials stored for {exchange_id}",
+        )
+    from hydra.execution.exchange_client import ExchangeClient
+
+    cred = creds[exchange_id]
+    client = ExchangeClient(
+        exchange_id=exchange_id,  # type: ignore[arg-type]
+        config={
+            "apiKey": cred["api_key"],
+            "secret": cred["api_secret"],
+            **({"password": cred["passphrase"]} if cred.get("passphrase") else {}),
+        },
+        testnet=False,
+    )
+    clients[exchange_id] = client
+    return client
+
+
+@router.get("/exchanges/{exchange_id}/balance")
+async def get_exchange_balance(exchange_id: str, request: Request) -> dict[str, Any]:
+    """Fetch live balance from a configured exchange."""
+    client = await _get_exchange_client(exchange_id, request)
+    try:
+        balances = await client.fetch_balance()
+        return {"exchange_id": exchange_id, "balances": {k: float(v) for k, v in balances.items()}}
+    except Exception as exc:
+        # Evict cached client on error so next request creates a fresh one
+        _get_exchange_clients(request).pop(exchange_id, None)
+        raise HTTPException(status_code=502, detail=f"Exchange error: {exc}") from exc
+
+
+@router.get("/exchanges/{exchange_id}/orders")
+async def get_exchange_orders(exchange_id: str, request: Request) -> dict[str, Any]:
+    """Fetch open orders from a configured exchange."""
+    client = await _get_exchange_client(exchange_id, request)
+    try:
+        orders = await client.fetch_open_orders()
+        return {"exchange_id": exchange_id, "orders": orders}
+    except Exception as exc:
+        _get_exchange_clients(request).pop(exchange_id, None)
+        raise HTTPException(status_code=502, detail=f"Exchange error: {exc}") from exc
+
+
+@router.get("/exchanges/{exchange_id}/positions")
+async def get_exchange_positions(exchange_id: str, request: Request) -> dict[str, Any]:
+    """Fetch open positions from a configured exchange."""
+    client = await _get_exchange_client(exchange_id, request)
+    try:
+        positions = await client.fetch_positions()
+        return {"exchange_id": exchange_id, "positions": positions}
+    except Exception as exc:
+        _get_exchange_clients(request).pop(exchange_id, None)
+        raise HTTPException(status_code=502, detail=f"Exchange error: {exc}") from exc

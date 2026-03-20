@@ -93,14 +93,13 @@ class TestRouterRegistration:
     def _route_paths(self) -> set[str]:
         return {r.path for r in app.routes if hasattr(r, "path")}
 
-    def test_strategy_builder_routes_present(self) -> None:
-        paths = self._route_paths()
-        builder_paths = {p for p in paths if "/api/builder/" in p}
-        assert len(builder_paths) > 0
-
     def test_strategies_routes_present(self) -> None:
         paths = self._route_paths()
         assert any("/api/strategies" in p for p in paths)
+        # Builder endpoints are now consolidated under /api/strategies/
+        assert any("/api/strategies/indicators" in p for p in paths)
+        assert any("/api/strategies/preview" in p for p in paths)
+        assert any("/api/strategies/save" in p for p in paths)
 
     def test_portfolio_routes_present(self) -> None:
         paths = self._route_paths()

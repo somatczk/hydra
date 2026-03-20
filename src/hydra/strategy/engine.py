@@ -123,6 +123,15 @@ class StrategyEngine:
             # Publish signals
             for signal in signals:
                 await self._event_bus.publish(signal)
+                try:
+                    from hydra.dashboard.metrics import record_signal
+
+                    record_signal(
+                        getattr(signal, "strategy_id", sid),
+                        signal.event_type,
+                    )
+                except Exception:
+                    pass
 
     # -- Hot reload ----------------------------------------------------------
 
