@@ -44,6 +44,7 @@ interface SessionMetrics {
 interface SessionDetail {
   session_id: string;
   strategy_id: string;
+  strategy_name: string | null;
   trading_mode: string;
   status: string;
   exchange_id: string;
@@ -358,7 +359,7 @@ export default function SessionDetailPage() {
           </Button>
           <div>
             <h1 className="text-lg font-semibold text-text-primary">
-              {detail.strategy_id}
+              {detail.strategy_name || detail.strategy_id}
             </h1>
             <p className="text-xs text-text-muted">
               {detail.exchange_id} &middot; {detail.symbols.join(', ')} &middot; {detail.timeframe}

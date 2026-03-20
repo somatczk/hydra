@@ -49,6 +49,7 @@ class RiskConfig(BaseModel):
     scope: str = "global"
     max_position_pct: float = 0.10
     max_risk_per_trade: float = 0.02
+    max_portfolio_heat: float = 0.06
     max_daily_loss_pct: float = 0.03
     max_drawdown_pct: float = 0.15
     max_concurrent_positions: int = 10
@@ -58,6 +59,7 @@ class RiskConfig(BaseModel):
 class RiskConfigUpdate(BaseModel):
     max_position_pct: float | None = Field(None, ge=0, le=1)
     max_risk_per_trade: float | None = Field(None, ge=0, le=1)
+    max_portfolio_heat: float | None = Field(None, ge=0, le=1)
     max_daily_loss_pct: float | None = Field(None, ge=0, le=1)
     max_drawdown_pct: float | None = Field(None, ge=0, le=1)
     max_concurrent_positions: int | None = Field(None, ge=1, le=100)
@@ -126,13 +128,15 @@ async def _apply_risk_config_update(pool: Any, scope: str, updates: dict[str, An
             "UPDATE risk_config SET "
             "max_position_pct = $1, "
             "max_risk_per_trade = $2, "
-            "max_daily_loss_pct = $3, "
-            "max_drawdown_pct = $4, "
-            "max_concurrent_positions = $5, "
+            "max_portfolio_heat = $3, "
+            "max_daily_loss_pct = $4, "
+            "max_drawdown_pct = $5, "
+            "max_concurrent_positions = $6, "
             "updated_at = now() "
-            "WHERE scope = $6",
+            "WHERE scope = $7",
             updates.get("max_position_pct", float(row["max_position_pct"])),
             updates.get("max_risk_per_trade", float(row["max_risk_per_trade"])),
+            updates.get("max_portfolio_heat", float(row.get("max_portfolio_heat", 0.06))),
             updates.get("max_daily_loss_pct", float(row["max_daily_loss_pct"])),
             updates.get("max_drawdown_pct", float(row["max_drawdown_pct"])),
             updates.get("max_concurrent_positions", row["max_concurrent_positions"]),
@@ -233,6 +237,7 @@ async def get_risk_config(request: Request) -> dict[str, Any]:
                 "scope": row["scope"],
                 "max_position_pct": float(row["max_position_pct"]),
                 "max_risk_per_trade": float(row["max_risk_per_trade"]),
+                "max_portfolio_heat": float(row.get("max_portfolio_heat", 0.06)),
                 "max_daily_loss_pct": float(row["max_daily_loss_pct"]),
                 "max_drawdown_pct": float(row["max_drawdown_pct"]),
                 "max_concurrent_positions": row["max_concurrent_positions"],
@@ -300,6 +305,7 @@ async def update_strategy_risk_config(
         "scope": row["scope"],
         "max_position_pct": float(row["max_position_pct"]),
         "max_risk_per_trade": float(row["max_risk_per_trade"]),
+        "max_portfolio_heat": float(row.get("max_portfolio_heat", 0.06)),
         "max_daily_loss_pct": float(row["max_daily_loss_pct"]),
         "max_drawdown_pct": float(row["max_drawdown_pct"]),
         "max_concurrent_positions": row["max_concurrent_positions"],

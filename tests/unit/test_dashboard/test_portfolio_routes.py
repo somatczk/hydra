@@ -110,13 +110,22 @@ class TestPortfolioWithPool:
                 "realized_pnl": 1500.00,
             }
         )
-        conn.fetchval = AsyncMock(return_value=85.50)
+        # fetchval called twice: fees then daily_pnl
+        conn.fetchval = AsyncMock(side_effect=[85.50, 42.00])
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"total_value": 10000.00},
+                {"total_value": 12000.50},
+            ]
+        )
         client = TestClient(_make_app(pool=pool))
         resp = client.get("/api/portfolio/summary")
         assert resp.status_code == 200
         data = resp.json()
         assert data["total_value"] == 12000.50
         assert data["total_fees"] == 85.50
+        assert data["daily_pnl"] == 42.00
+        assert data["max_drawdown_pct"] == 0.0  # monotonically increasing curve
 
     def test_positions_from_db(self) -> None:
         pool, conn = _make_mock_pool()

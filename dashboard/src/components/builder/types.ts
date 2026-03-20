@@ -84,6 +84,8 @@ export interface BuilderState {
   editingId: string | null;
   strategyName: string;
   strategyDescription: string;
+  exchangeId: string;
+  symbol: string;
 }
 
 /* ---------- Preview types ---------- */

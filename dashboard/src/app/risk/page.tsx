@@ -55,6 +55,7 @@ interface RiskConfig {
   scope: string;
   max_position_pct: number;
   max_risk_per_trade: number;
+  max_portfolio_heat: number;
   max_daily_loss_pct: number;
   max_drawdown_pct: number;
   max_concurrent_positions: number;
@@ -169,6 +170,7 @@ export default function RiskPage() {
   const [riskConfig, setRiskConfig] = useState<RiskConfig | null>(null);
   const [maxPositionPct, setMaxPositionPct] = useState('10');
   const [maxRiskPerTrade, setMaxRiskPerTrade] = useState('2');
+  const [maxPortfolioHeat, setMaxPortfolioHeat] = useState('6');
   const [maxDailyLossPct, setMaxDailyLossPct] = useState('3');
   const [maxDrawdownPct, setMaxDrawdownPct] = useState('15');
   const [maxConcurrentPositions, setMaxConcurrentPositions] = useState('10');
@@ -222,6 +224,7 @@ export default function RiskPage() {
         setRiskConfig(cfg);
         setMaxPositionPct((cfg.max_position_pct * 100).toFixed(0));
         setMaxRiskPerTrade((cfg.max_risk_per_trade * 100).toFixed(0));
+        setMaxPortfolioHeat((cfg.max_portfolio_heat * 100).toFixed(0));
         setMaxDailyLossPct((cfg.max_daily_loss_pct * 100).toFixed(0));
         setMaxDrawdownPct((cfg.max_drawdown_pct * 100).toFixed(0));
         setMaxConcurrentPositions(cfg.max_concurrent_positions.toString());
@@ -237,6 +240,7 @@ export default function RiskPage() {
         body: JSON.stringify({
           max_position_pct: parseFloat(maxPositionPct) / 100,
           max_risk_per_trade: parseFloat(maxRiskPerTrade) / 100,
+          max_portfolio_heat: parseFloat(maxPortfolioHeat) / 100,
           max_daily_loss_pct: parseFloat(maxDailyLossPct) / 100,
           max_drawdown_pct: parseFloat(maxDrawdownPct) / 100,
           max_concurrent_positions: parseInt(maxConcurrentPositions, 10),
@@ -532,6 +536,13 @@ export default function RiskPage() {
             value={maxRiskPerTrade}
             onChange={(e) => setMaxRiskPerTrade(e.target.value)}
             hint="Maximum risk per individual trade"
+          />
+          <Input
+            label="Max Portfolio Heat (%)"
+            type="number"
+            value={maxPortfolioHeat}
+            onChange={(e) => setMaxPortfolioHeat(e.target.value)}
+            hint="Sum of all position risks as % of portfolio"
           />
           <Input
             label="Max Daily Loss (%)"

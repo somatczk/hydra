@@ -52,6 +52,7 @@ interface BuilderStrategy {
 interface RiskOverrides {
   max_position_pct: number;
   max_risk_per_trade: number;
+  max_portfolio_heat: number;
   max_daily_loss_pct: number;
   max_drawdown_pct: number;
   max_concurrent_positions: number;
@@ -250,6 +251,7 @@ export default function StrategiesPage() {
           [strategyId]: {
             max_position_pct: 0.10,
             max_risk_per_trade: 0.02,
+            max_portfolio_heat: 0.06,
             max_daily_loss_pct: 0.03,
             max_drawdown_pct: 0.15,
             max_concurrent_positions: 10,
@@ -473,6 +475,12 @@ export default function StrategiesPage() {
                       type="number"
                       value={(riskOverrides[strategy.id].max_risk_per_trade * 100).toFixed(0)}
                       onChange={(e) => updateRiskField(strategy.id, 'max_risk_per_trade', e.target.value)}
+                    />
+                    <Input
+                      label="Portfolio Heat %"
+                      type="number"
+                      value={(riskOverrides[strategy.id].max_portfolio_heat * 100).toFixed(0)}
+                      onChange={(e) => updateRiskField(strategy.id, 'max_portfolio_heat', e.target.value)}
                     />
                     <Input
                       label="Max Daily Loss %"

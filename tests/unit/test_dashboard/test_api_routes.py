@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -60,14 +63,76 @@ class TestStrategies:
         data = resp.json()
         assert "enabled" in data
 
-    def test_update_strategy_config(self, client: TestClient) -> None:
-        resp = client.put(
-            "/api/strategies/strat-1",
-            json={"config_yaml": "strategy:\n  updated: true\n"},
+    def test_update_strategy_config(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text(
+            "id: test_strat_api\n"
+            "name: Test\n"
+            "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
+            "enabled: false\n"
+            "symbols:\n"
+            "  - BTCUSDT\n"
+            "exchange:\n"
+            "  exchange_id: binance\n"
+            "  market_type: SPOT\n"
+            "timeframes:\n"
+            "  primary: 1h\n"
+            "parameters:\n"
+            "  required_history: 50\n"
+            "  rules:\n"
+            "    entry_long:\n"
+            "      operator: AND\n"
+            "      conditions:\n"
+            "        - indicator: rsi\n"
+            "          params: {period: 14}\n"
+            "          comparator: less_than\n"
+            "          value: 30\n"
         )
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(app)
+            resp = client.put(
+                "/api/strategies/test_strat_api",
+                json={
+                    "name": "Updated Test",
+                    "description": "",
+                    "exchange_id": "binance",
+                    "symbol": "BTCUSDT",
+                    "rules": {
+                        "entry_long": {
+                            "operator": "AND",
+                            "conditions": [
+                                {
+                                    "indicator": "rsi",
+                                    "params": {"period": 14},
+                                    "comparator": "less_than",
+                                    "value": 30,
+                                }
+                            ],
+                        },
+                        "exit_long": None,
+                        "entry_short": None,
+                        "exit_short": None,
+                    },
+                    "timeframes": {"primary": "1h"},
+                    "risk": {
+                        "stop_loss_method": "atr",
+                        "stop_loss_value": 2.0,
+                        "take_profit_method": "atr",
+                        "take_profit_value": 3.0,
+                        "sizing_method": "fixed_fractional",
+                        "sizing_params": {
+                            "risk_per_trade_pct": 1.0,
+                            "max_position_pct": 10.0,
+                        },
+                    },
+                    "enable_immediately": False,
+                },
+            )
         assert resp.status_code == 200
         data = resp.json()
-        assert "updated: true" in data["config_yaml"]
+        assert data["id"] == "test_strat_api"
+        assert data["name"] == "Updated Test"
+        assert "config_path" in data
 
     def test_strategy_performance(self, client: TestClient) -> None:
         resp = client.get("/api/strategies/strat-1/performance")

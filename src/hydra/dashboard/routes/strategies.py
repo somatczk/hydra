@@ -91,6 +91,18 @@ def _find_strategy_file(strategy_id: str) -> Path | None:
     return None
 
 
+def build_strategy_name_map() -> dict[str, str]:
+    """Return {strategy_id: friendly_name} from all YAML configs."""
+    name_map: dict[str, str] = {}
+    if not _CONFIG_DIR.is_dir():
+        return name_map
+    for path in _CONFIG_DIR.glob("*.yaml"):
+        data = _parse_any_strategy_yaml(path)
+        if data is not None and "id" in data:
+            name_map[data["id"]] = data.get("name", data["id"])
+    return name_map
+
+
 # ---------------------------------------------------------------------------
 # Pydantic response / request models
 # ---------------------------------------------------------------------------
@@ -110,12 +122,9 @@ class StrategyResponse(BaseModel):
     description: str
     status: str
     enabled: bool = True
+    editable: bool = False
     config_yaml: str = ""
     performance: StrategyPerformance = Field(default_factory=StrategyPerformance)
-
-
-class StrategyUpdateRequest(BaseModel):
-    config_yaml: str
 
 
 class ToggleResponse(BaseModel):
@@ -232,6 +241,21 @@ class StrategySummary(BaseModel):
     editable: bool = True
 
 
+class StrategyDetailResponse(BaseModel):
+    id: str
+    name: str
+    description: str
+    status: str
+    enabled: bool = True
+    editable: bool = False
+    exchange_id: str = "binance"
+    symbol: str = "BTCUSDT"
+    rules: RuleSetInput | None = None
+    timeframes: TimeframeInput = Field(default_factory=TimeframeInput)
+    risk: RiskInput = Field(default_factory=RiskInput)
+    performance: StrategyPerformance = Field(default_factory=StrategyPerformance)
+
+
 # ---------------------------------------------------------------------------
 # In-memory placeholder data (fallback when DB is not available)
 # ---------------------------------------------------------------------------
@@ -243,6 +267,7 @@ _STRATEGIES: dict[str, dict[str, Any]] = {
         "description": "ML-based momentum strategy using LSTM predictions on 1h BTC/USDT",
         "status": "Active",
         "enabled": True,
+        "editable": False,
         "config_yaml": "strategy:\n  type: lstm_momentum\n  timeframe: 1h\n",
         "performance": {
             "total_pnl": 1240.50,
@@ -272,6 +297,7 @@ def _row_to_strategy(row: Any) -> dict[str, Any]:
         "description": _STRATEGY_DESCRIPTIONS.get(name, _DEFAULT_DESCRIPTION),
         "status": _status_from_enabled(row["enabled"]),
         "enabled": row["enabled"],
+        "editable": False,
         "config_yaml": "",
         "performance": {
             "total_pnl": round(float(row["total_pnl"]), 2),
@@ -376,6 +402,43 @@ def _to_condition_group_input(group_data: dict[str, Any] | None) -> ConditionGro
     )
 
 
+def _extract_strategy_detail(data: dict[str, Any]) -> dict[str, Any]:
+    """Extract structured builder fields from parsed YAML config."""
+    params = data.get("parameters", {})
+    rules_data = params.get("rules", {})
+    tf_data = data.get("timeframes", {})
+    sizing = data.get("position_sizing", {})
+    exchange = data.get("exchange", {})
+    symbols = data.get("symbols", ["BTCUSDT"])
+
+    return {
+        "exchange_id": exchange.get("exchange_id", "binance"),
+        "symbol": symbols[0] if symbols else "BTCUSDT",
+        "rules": {
+            "entry_long": _to_condition_group_input(rules_data.get("entry_long")),
+            "exit_long": _to_condition_group_input(rules_data.get("exit_long")),
+            "entry_short": _to_condition_group_input(rules_data.get("entry_short")),
+            "exit_short": _to_condition_group_input(rules_data.get("exit_short")),
+        },
+        "timeframes": {
+            "primary": tf_data.get("primary", "1h"),
+            "confirmation": tf_data.get("confirmation"),
+            "entry": tf_data.get("entry"),
+        },
+        "risk": {
+            "stop_loss_method": "atr",
+            "stop_loss_value": 2.0,
+            "take_profit_method": "atr",
+            "take_profit_value": 3.0,
+            "sizing_method": sizing.get("method", "fixed_fractional"),
+            "sizing_params": {
+                "risk_per_trade_pct": sizing.get("risk_per_trade_pct", 1.0),
+                "max_position_pct": sizing.get("max_position_pct", 10.0),
+            },
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Strategy CRUD endpoints
 # ---------------------------------------------------------------------------
@@ -383,17 +446,67 @@ def _to_condition_group_input(group_data: dict[str, Any] | None) -> ConditionGro
 
 @router.get("", response_model=list[StrategyResponse])
 async def list_strategies(request: Request) -> list[dict[str, Any]]:
-    """List all strategy configs with status and performance."""
+    """List all strategy configs from YAML files, merged with DB performance."""
+    # 1. Scan YAML files for strategy definitions
+    strategies: dict[str, dict[str, Any]] = {}
+    if _CONFIG_DIR.is_dir():
+        for path in _CONFIG_DIR.glob("*.yaml"):
+            data = _parse_any_strategy_yaml(path)
+            if data is None or "id" not in data:
+                continue
+            sid = data["id"]
+            name = data.get("name", sid)
+            enabled = data.get("enabled", False)
+            strategy_class = data.get("strategy_class", "")
+            strategies[sid] = {
+                "id": sid,
+                "name": name,
+                "description": data.get("parameters", {}).get("description")
+                or _STRATEGY_DESCRIPTIONS.get(name, _DEFAULT_DESCRIPTION),
+                "status": _status_from_enabled(enabled),
+                "enabled": enabled,
+                "editable": strategy_class == _RULE_BASED_CLASS,
+                "config_yaml": "",
+                "performance": {
+                    "total_pnl": 0.0,
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "sharpe_ratio": 0.0,
+                    "max_drawdown": 0.0,
+                },
+            }
+
+    # 2. Overlay DB performance stats
     pool = _pool_from_request(request)
-    if pool is None:
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT strategy_id, "
+                    "COALESCE(SUM(pnl), 0) AS total_pnl, "
+                    "COUNT(id) AS total_trades, "
+                    "COALESCE("
+                    "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
+                    "  / NULLIF(COUNT(id), 0) * 100, 0"
+                    ") AS win_rate "
+                    "FROM trades GROUP BY strategy_id"
+                )
+            for row in rows:
+                sid = row["strategy_id"]
+                if sid in strategies:
+                    strategies[sid]["performance"] = {
+                        **strategies[sid]["performance"],
+                        "total_pnl": round(float(row["total_pnl"]), 2),
+                        "win_rate": round(float(row["win_rate"]), 1),
+                        "total_trades": row["total_trades"],
+                    }
+        except Exception:
+            logger.exception("Failed to fetch strategy performance from DB")
+
+    if not strategies:
         return list(_STRATEGIES.values())
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(_STRATEGIES_QUERY)
-        return [_row_to_strategy(row) for row in rows]
-    except Exception:
-        logger.exception("Failed to fetch strategies from DB")
-        return list(_STRATEGIES.values())
+
+    return list(strategies.values())
 
 
 @router.get("/indicators")
@@ -456,9 +569,65 @@ async def list_comparators() -> list[dict[str, str]]:
     ]
 
 
-@router.get("/{strategy_id}", response_model=StrategyResponse)
+@router.get("/{strategy_id}", response_model=StrategyDetailResponse)
 async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
-    """Get a single strategy detail."""
+    """Get a single strategy detail with structured builder fields."""
+    # Try YAML first
+    path = _find_strategy_file(strategy_id)
+    if path is not None:
+        data = _parse_any_strategy_yaml(path)
+        if data is not None:
+            name = data.get("name", strategy_id)
+            enabled = data.get("enabled", False)
+            strategy_class = data.get("strategy_class", "")
+            is_rule_based = strategy_class == _RULE_BASED_CLASS
+            description = data.get("parameters", {}).get(
+                "description"
+            ) or _STRATEGY_DESCRIPTIONS.get(name, _DEFAULT_DESCRIPTION)
+            result: dict[str, Any] = {
+                "id": strategy_id,
+                "name": name,
+                "description": description,
+                "status": _status_from_enabled(enabled),
+                "enabled": enabled,
+                "editable": is_rule_based,
+                "performance": {
+                    "total_pnl": 0.0,
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "sharpe_ratio": 0.0,
+                    "max_drawdown": 0.0,
+                },
+            }
+            if is_rule_based:
+                result.update(_extract_strategy_detail(data))
+            # Overlay DB performance
+            pool = _pool_from_request(request)
+            if pool is not None:
+                try:
+                    async with pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
+                            "COUNT(id) AS total_trades, "
+                            "COALESCE("
+                            "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
+                            "  / NULLIF(COUNT(id), 0) * 100, 0"
+                            ") AS win_rate "
+                            "FROM trades WHERE strategy_id = $1",
+                            strategy_id,
+                        )
+                    if row:
+                        result["performance"] = {
+                            **result["performance"],
+                            "total_pnl": round(float(row["total_pnl"]), 2),
+                            "win_rate": round(float(row["win_rate"]), 1),
+                            "total_trades": row["total_trades"],
+                        }
+                except Exception:
+                    logger.exception("Failed to fetch performance for %s", strategy_id)
+            return result
+
+    # Fallback to DB / in-memory
     pool = _pool_from_request(request)
     if pool is None:
         return _get_strategy(strategy_id)
@@ -481,12 +650,71 @@ async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
         return _get_strategy(strategy_id)
 
 
-@router.put("/{strategy_id}", response_model=StrategyResponse)
-async def update_strategy(strategy_id: str, body: StrategyUpdateRequest) -> dict[str, Any]:
-    """Update strategy config (YAML content)."""
-    strat = _get_strategy(strategy_id)
-    strat["config_yaml"] = body.config_yaml
-    return strat
+@router.put("/{strategy_id}", response_model=SaveResponse)
+async def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
+    """Update a rule-based strategy config (structured payload -> YAML)."""
+    path = _find_strategy_file(strategy_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+
+    data = _parse_strategy_yaml(path)
+    if data is None:
+        raise HTTPException(status_code=400, detail="Only rule-based strategies can be edited")
+
+    try:
+        rule_set = _validate_rules(body.rules)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rules: {exc}") from exc
+
+    if body.exchange_id not in _VALID_EXCHANGES:
+        raise HTTPException(status_code=422, detail=f"Invalid exchange: {body.exchange_id}")
+
+    if body.timeframes.primary not in _VALID_TIMEFRAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid timeframe: {body.timeframes.primary}",
+        )
+
+    existing_enabled = data.get("enabled", False)
+    existing_required_history = data.get("parameters", {}).get("required_history", 50)
+
+    config_dict: dict[str, Any] = {
+        "id": strategy_id,
+        "name": body.name,
+        "strategy_class": _RULE_BASED_CLASS,
+        "enabled": True if body.enable_immediately else existing_enabled,
+        "symbols": [body.symbol],
+        "exchange": {"exchange_id": body.exchange_id, "market_type": "SPOT"},
+        "timeframes": {"primary": body.timeframes.primary},
+        "parameters": {
+            "rules": rule_set.model_dump(mode="json"),
+            "required_history": existing_required_history,
+            "description": body.description,
+        },
+        "position_sizing": {
+            "method": body.risk.sizing_method,
+            "risk_per_trade_pct": body.risk.sizing_params.get("risk_per_trade_pct", 1.0),
+            "max_position_pct": body.risk.sizing_params.get("max_position_pct", 10.0),
+        },
+    }
+
+    if body.timeframes.confirmation:
+        config_dict["timeframes"]["confirmation"] = body.timeframes.confirmation
+    if body.timeframes.entry:
+        config_dict["timeframes"]["entry"] = body.timeframes.entry
+
+    try:
+        with path.open("w") as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write: {exc}") from exc
+
+    return SaveResponse(
+        id=strategy_id,
+        name=body.name,
+        config_path=str(path),
+        message=f"Strategy '{body.name}' updated successfully",
+    )
 
 
 @router.get("/{strategy_id}/performance", response_model=StrategyPerformance)

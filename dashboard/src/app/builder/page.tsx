@@ -57,6 +57,8 @@ const initialState: BuilderState = {
   editingId: null,
   strategyName: '',
   strategyDescription: '',
+  exchangeId: 'binance',
+  symbol: 'BTCUSDT',
 };
 
 /* ---------- ID generation ---------- */
@@ -207,6 +209,8 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         editingId: payload.id,
         strategyName: payload.name,
         strategyDescription: payload.description,
+        exchangeId: payload.exchange_id || 'binance',
+        symbol: payload.symbol || 'BTCUSDT',
       };
     }
     case 'RESET':
@@ -466,6 +470,8 @@ function BuilderPageContent() {
         editingId={state.editingId}
         initialName={state.strategyName}
         initialDescription={state.strategyDescription}
+        initialExchangeId={state.exchangeId}
+        initialSymbol={state.symbol}
       />
     </div>
   );

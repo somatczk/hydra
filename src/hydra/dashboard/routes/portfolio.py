@@ -47,6 +47,8 @@ class PortfolioSummary(BaseModel):
     total_value: float = 0.0
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
+    daily_pnl: float = 0.0
+    max_drawdown_pct: float = 0.0
     total_fees: float = 0.0
     change_pct: float = 0.0
 
@@ -86,10 +88,10 @@ class AttributionItem(BaseModel):
 
 class TradeRecord(BaseModel):
     id: int
-    pair: str
+    symbol: str
     side: str
     price: float
-    size: float
+    quantity: float
     fee: float
     pnl: float
     timestamp: str
@@ -128,12 +130,29 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
                     "SELECT COALESCE(SUM(fee), 0) FROM trades WHERE source = $1",
                     source,
                 )
+                daily_pnl_row = await conn.fetchval(
+                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                    "WHERE source = $1 AND timestamp >= date_trunc('day', now())",
+                    source,
+                )
+                equity_rows = await conn.fetch(
+                    "SELECT total_value FROM balance_snapshots "
+                    "WHERE source = $1 ORDER BY timestamp",
+                    source,
+                )
             else:
                 snapshot = await conn.fetchrow(
                     "SELECT total_value, unrealized_pnl, realized_pnl "
                     "FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
                 )
                 fees_row = await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades")
+                daily_pnl_row = await conn.fetchval(
+                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                    "WHERE timestamp >= date_trunc('day', now())"
+                )
+                equity_rows = await conn.fetch(
+                    "SELECT total_value FROM balance_snapshots ORDER BY timestamp"
+                )
 
             if snapshot is None:
                 return _EMPTY_SUMMARY
@@ -142,6 +161,19 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
             unrealized_pnl = float(snapshot["unrealized_pnl"])
             realized_pnl = float(snapshot["realized_pnl"])
             total_fees = float(fees_row)
+            daily_pnl = float(daily_pnl_row)
+
+            # Compute max drawdown from equity curve
+            max_drawdown_pct = 0.0
+            peak = 0.0
+            for row in equity_rows:
+                val = float(row["total_value"])
+                if val > peak:
+                    peak = val
+                if peak > 0:
+                    dd = (peak - val) / peak * 100
+                    if dd > max_drawdown_pct:
+                        max_drawdown_pct = dd
 
             # Derive change_pct from unrealized pnl relative to total value
             change_pct = round(unrealized_pnl / total_value * 100, 2) if total_value else 0.0
@@ -150,6 +182,8 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
                 "total_value": round(total_value, 2),
                 "unrealized_pnl": round(unrealized_pnl, 2),
                 "realized_pnl": round(realized_pnl, 2),
+                "daily_pnl": round(daily_pnl, 2),
+                "max_drawdown_pct": round(max_drawdown_pct, 1),
                 "total_fees": round(total_fees, 2),
                 "change_pct": change_pct,
             }
@@ -393,10 +427,10 @@ async def get_trades(request: Request, source: str | None = None) -> list[dict]:
         return [
             {
                 "id": row["id"],
-                "pair": _format_pair(row["symbol"]),
+                "symbol": row["symbol"],
                 "side": row["side"],
                 "price": float(row["price"]),
-                "size": float(row["quantity"]),
+                "quantity": float(row["quantity"]),
                 "fee": round(float(row["fee"]), 8),
                 "pnl": round(float(row["pnl"]), 2),
                 "timestamp": row["timestamp"].isoformat(),

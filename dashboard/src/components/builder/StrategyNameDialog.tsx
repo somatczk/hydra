@@ -17,6 +17,8 @@ interface StrategyNameDialogProps {
   editingId?: string | null;
   initialName?: string;
   initialDescription?: string;
+  initialExchangeId?: string;
+  initialSymbol?: string;
 }
 
 const EXCHANGE_OPTIONS = [
@@ -49,6 +51,8 @@ export function StrategyNameDialog({
   editingId,
   initialName,
   initialDescription,
+  initialExchangeId,
+  initialSymbol,
 }: StrategyNameDialogProps) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -62,9 +66,11 @@ export function StrategyNameDialog({
     if (open) {
       setName(initialName || '');
       setDescription(initialDescription || '');
+      setExchangeId(initialExchangeId || 'binance');
+      setSymbol(initialSymbol || 'BTCUSDT');
       setError(null);
     }
-  }, [open, initialName, initialDescription]);
+  }, [open, initialName, initialDescription, initialExchangeId, initialSymbol]);
 
   if (!open) return null;
 

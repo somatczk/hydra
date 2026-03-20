@@ -60,6 +60,7 @@ interface ApiRecentTrade {
 interface TradingSession {
   session_id: string;
   strategy_id: string;
+  strategy_name: string | null;
   trading_mode: string;
   status: string;
   symbols: string[];
@@ -414,7 +415,7 @@ export default function TradingPage() {
                     size="sm"
                   />
                   <div>
-                    <p className="text-sm font-medium text-text-primary">{session.strategy_id}</p>
+                    <p className="text-sm font-medium text-text-primary">{session.strategy_name || session.strategy_id}</p>
                     <p className="text-xs text-text-muted">
                       {session.symbols.join(', ')} &middot; {session.timeframe}
                       {session.started_at && ` &middot; Started ${new Date(session.started_at).toLocaleTimeString()}`}

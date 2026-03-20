@@ -119,23 +119,28 @@ export default function PortfolioPage() {
     setLoading(true);
     setFetchErrors({});
 
+    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
+      .catch(() => ({ trading_mode: 'paper' }));
+    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    const qs = `?source=${source}`;
+
     await Promise.all([
-      fetchApi<PortfolioSummary>('/api/portfolio/summary')
+      fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
         .then(setSummary)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, summary: true })); }),
-      fetchApi<Position[]>('/api/portfolio/positions')
+      fetchApi<Position[]>(`/api/portfolio/positions${qs}`)
         .then(setPositions)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
-      fetchApi<EquityPoint[]>('/api/portfolio/equity-curve')
+      fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
         .then(setEquityCurve)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, equity: true })); }),
-      fetchApi<DailyPnl[]>('/api/portfolio/daily-pnl')
+      fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
         .then(setDailyPnl)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, dailyPnl: true })); }),
-      fetchApi<MonthlyReturn[]>('/api/portfolio/monthly-returns')
+      fetchApi<MonthlyReturn[]>(`/api/portfolio/monthly-returns${qs}`)
         .then(setMonthlyReturns)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, monthlyReturns: true })); }),
-      fetchApi<AttributionItem[]>('/api/portfolio/attribution')
+      fetchApi<AttributionItem[]>(`/api/portfolio/attribution${qs}`)
         .then(setAttribution)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, attribution: true })); }),
     ]);

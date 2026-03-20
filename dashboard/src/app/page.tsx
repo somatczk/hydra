@@ -41,6 +41,8 @@ interface PortfolioSummary {
   total_value: number;
   unrealized_pnl: number;
   realized_pnl: number;
+  daily_pnl: number;
+  max_drawdown_pct: number;
   total_fees: number;
   change_pct: number;
 }
@@ -65,20 +67,6 @@ interface ApiPosition {
   current_price: number;
   unrealized_pnl: number;
   pnl_pct: number;
-}
-
-interface ApiRiskStatus {
-  current_drawdown: number;
-  max_drawdown_limit: number;
-  daily_loss: number;
-  daily_loss_limit: number;
-  circuit_breakers: Array<{
-    tier: number;
-    label: string;
-    threshold: string;
-    current_value: number;
-    status: string;
-  }>;
 }
 
 interface EquityPoint {
@@ -172,7 +160,7 @@ export default function DashboardPage() {
   const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [recentTrades, setRecentTrades] = useState<Trade[] | null>(null);
   const [positionCount, setPositionCount] = useState<number | null>(null);
-  const [maxDrawdown, setMaxDrawdown] = useState<number | null>(null);
+  // max_drawdown_pct now comes from portfolio summary
   const [equityCurve, setEquityCurve] = useState<EquityPoint[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [isDark, setIsDark] = useState(false);
@@ -201,9 +189,7 @@ export default function DashboardPage() {
       fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
         .then((data) => setPositionCount(data.length))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
-      fetchApi<ApiRiskStatus>('/api/risk/status')
-        .then((data) => setMaxDrawdown(data.current_drawdown))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, risk: true })); }),
+      // max drawdown now computed from portfolio summary
       fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
         .then((data) => setEquityCurve(data))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, equity: true })); }),
@@ -241,9 +227,9 @@ export default function DashboardPage() {
           <StatCard
             icon={TrendingUp}
             label="Daily PnL"
-            value={`+$${summary.unrealized_pnl.toFixed(2)}`}
-            change={1.8}
-            changeType="increase"
+            value={`${summary.daily_pnl >= 0 ? '+' : ''}$${Math.abs(summary.daily_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+            change={summary.daily_pnl !== 0 ? Math.abs(summary.daily_pnl) : undefined}
+            changeType={summary.daily_pnl >= 0 ? 'increase' : 'decrease'}
           />
           <Link href="/trading" className="block">
             <StatCard
@@ -256,8 +242,8 @@ export default function DashboardPage() {
           <StatCard
             icon={ArrowDownRight}
             label="Max Drawdown"
-            value={maxDrawdown != null ? `${maxDrawdown.toLocaleString('en-US', { minimumFractionDigits: 1 })}%` : '-'}
-            change={0.3}
+            value={`${summary.max_drawdown_pct.toLocaleString('en-US', { minimumFractionDigits: 1 })}%`}
+            change={summary.max_drawdown_pct > 0 ? summary.max_drawdown_pct : undefined}
             changeType="decrease"
           />
         </div>

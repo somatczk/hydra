@@ -9,6 +9,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from hydra.dashboard.routes.strategies import build_strategy_name_map
+
 router = APIRouter(prefix="/api/trading", tags=["trading"])
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ class StartSessionRequest(BaseModel):
 class SessionResponse(BaseModel):
     session_id: str
     strategy_id: str
+    strategy_name: str | None = None
     trading_mode: str
     status: str
     exchange_id: str
@@ -68,6 +71,7 @@ class SessionMetrics(BaseModel):
 class SessionDetailResponse(BaseModel):
     session_id: str
     strategy_id: str
+    strategy_name: str | None = None
     trading_mode: str
     status: str
     exchange_id: str
@@ -174,7 +178,10 @@ async def start_session(body: StartSessionRequest, request: Request) -> dict[str
         ) from exc
 
     session = mgr.get_session(session_id)
-    return _session_to_dict(session)
+    d = _session_to_dict(session)
+    name_map = build_strategy_name_map()
+    d["strategy_name"] = name_map.get(session.strategy_id)
+    return d
 
 
 @router.delete("/sessions/{session_id}", response_model=SessionResponse)
@@ -191,14 +198,23 @@ async def stop_session(session_id: str, request: Request) -> dict[str, Any]:
         ) from exc
 
     session = mgr.get_session(session_id)
-    return _session_to_dict(session)
+    d = _session_to_dict(session)
+    name_map = build_strategy_name_map()
+    d["strategy_name"] = name_map.get(session.strategy_id)
+    return d
 
 
 @router.get("/sessions", response_model=list[SessionResponse])
 async def list_sessions(request: Request) -> list[dict[str, Any]]:
     """List all trading sessions (running + recent stopped)."""
     mgr = _get_session_manager(request)
-    return [_session_to_dict(s) for s in mgr.list_sessions()]
+    name_map = build_strategy_name_map()
+    results = []
+    for s in mgr.list_sessions():
+        d = _session_to_dict(s)
+        d["strategy_name"] = name_map.get(s.strategy_id)
+        results.append(d)
+    return results
 
 
 @router.get("/sessions/{session_id}/detail", response_model=SessionDetailResponse)
@@ -214,6 +230,8 @@ async def get_session_detail(session_id: str, request: Request) -> dict[str, Any
             detail=str(exc),
         ) from exc
 
+    name_map = build_strategy_name_map()
+    detail["strategy_name"] = name_map.get(detail.get("strategy_id", ""))
     return detail
 
 
