@@ -118,6 +118,19 @@ def _ensure_initialized() -> None:
 
     _initialized = True
 
+    # Pre-initialize labeled metrics with defaults so Prometheus always
+    # reports them (even before the first real event).
+    _metrics["exchange_api_latency"].labels(exchange_id="binance", endpoint="init")
+    _metrics["ws_reconnects"].labels(exchange_id="binance")
+    _metrics["ml_inference_latency"].labels(model_name="none")
+    _metrics["signal_count"].labels(strategy_id="none", signal_type="init")
+    _metrics["trades_total"].labels(
+        symbol="BTCUSDT", side="init", strategy_id="none", exchange_id="binance"
+    )
+    _metrics["position_size"].labels(symbol="BTCUSDT", exchange_id="binance")
+    _metrics["data_gap"].labels(exchange_id="binance", symbol="BTCUSDT")
+    _metrics["reconciliation_mismatch"].labels(exchange_id="binance", symbol="BTCUSDT")
+
 
 # ---------------------------------------------------------------------------
 # Accessor helpers — each returns the typed collector
