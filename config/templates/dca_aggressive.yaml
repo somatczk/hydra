@@ -1,0 +1,27 @@
+name: Aggressive DCA Bot
+strategy_class: hydra.strategy.builtin.dca.DCAStrategy
+enabled: false
+symbols:
+  - BTCUSDT
+exchange:
+  exchange_id: binance
+  market_type: SPOT
+timeframes:
+  primary: 1h
+parameters:
+  base_order_size: 200
+  safety_order_size: 100
+  safety_order_count: 8
+  price_deviation_pct: 1.0
+  volume_scale: 1.5
+  step_scale: 1.2
+  take_profit_pct: 1.0
+  max_active_deals: 1
+  start_condition: immediate
+_template_meta:
+  description: Aggressive DCA with 8 safety orders, martingale-style volume scaling. Higher capital requirement, catches deeper dips.
+  type: dca
+  risk_level: aggressive
+  expected_sharpe: 0.6
+  expected_max_drawdown: 20.0
+  recommended_capital: 10000

@@ -1,0 +1,27 @@
+name: Conservative DCA Bot
+strategy_class: hydra.strategy.builtin.dca.DCAStrategy
+enabled: false
+symbols:
+  - BTCUSDT
+exchange:
+  exchange_id: binance
+  market_type: SPOT
+timeframes:
+  primary: 1h
+parameters:
+  base_order_size: 100
+  safety_order_size: 50
+  safety_order_count: 3
+  price_deviation_pct: 1.5
+  volume_scale: 1.2
+  step_scale: 1.0
+  take_profit_pct: 1.5
+  max_active_deals: 1
+  start_condition: immediate
+_template_meta:
+  description: Conservative DCA bot with 3 safety orders and 1.5% take profit. Low risk, steady returns in choppy markets.
+  type: dca
+  risk_level: conservative
+  expected_sharpe: 0.7
+  expected_max_drawdown: 8.0
+  recommended_capital: 3000

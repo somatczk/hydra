@@ -1,0 +1,23 @@
+name: BTC Range Grid
+strategy_class: hydra.strategy.builtin.grid.GridStrategy
+enabled: false
+symbols:
+  - BTCUSDT
+exchange:
+  exchange_id: binance
+  market_type: SPOT
+timeframes:
+  primary: 1h
+parameters:
+  upper_price: 100000
+  lower_price: 70000
+  grid_count: 20
+  total_investment: 5000
+  grid_type: arithmetic
+_template_meta:
+  description: Grid bot for BTC/USDT in the $70K-$100K range. 20 grid levels, arithmetic spacing. Profits from sideways price action.
+  type: grid
+  risk_level: moderate
+  expected_sharpe: 0.8
+  expected_max_drawdown: 15.0
+  recommended_capital: 5000
