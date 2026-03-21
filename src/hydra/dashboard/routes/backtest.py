@@ -1045,6 +1045,16 @@ class HyperoptResultResponse(BaseModel):
     completed_trials: int
 
 
+class HyperoptHistoryEntry(BaseModel):
+    task_id: str
+    status: str
+    strategy_id: str
+    completed_trials: int
+    total_trials: int
+    best_so_far: float | None = None
+    created_at: str
+
+
 # ---------------------------------------------------------------------------
 # Background task
 # ---------------------------------------------------------------------------
@@ -1136,6 +1146,30 @@ async def _run_hyperopt_task(task_id: str, body: HyperoptRunRequest) -> None:
 # ---------------------------------------------------------------------------
 
 
+@router.get(
+    "/hyperopt/history",
+    response_model=list[HyperoptHistoryEntry],
+)
+async def list_hyperopt_history() -> list[dict[str, Any]]:
+    """Return a summary of all hyperopt runs (most recent first)."""
+    entries = []
+    for tid, t in _HYPEROPT_TASKS.items():
+        entries.append(
+            {
+                "task_id": tid,
+                "status": t["status"],
+                "strategy_id": t.get("strategy_id", ""),
+                "completed_trials": t.get("completed_trials", 0),
+                "total_trials": t.get("total_trials", 0),
+                "best_so_far": t.get("best_so_far"),
+                "created_at": t.get("created_at", ""),
+            }
+        )
+    # Most recent first
+    entries.sort(key=lambda e: e["created_at"], reverse=True)
+    return entries
+
+
 @router.post(
     "/hyperopt",
     response_model=HyperoptRunResponse,
@@ -1153,6 +1187,8 @@ async def start_hyperopt(body: HyperoptRunRequest, request: Request) -> dict[str
         "completed_trials": 0,
         "total_trials": body.max_trials,
         "best_so_far": None,
+        "strategy_id": body.strategy_id,
+        "created_at": datetime.now(UTC).isoformat(),
         "request": body.model_dump(),
     }
 

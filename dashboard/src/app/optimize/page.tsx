@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Play, ArrowRight } from 'lucide-react';
+import { Play, ArrowRight, Eye } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
@@ -35,6 +35,17 @@ interface OptimizeResult {
   sharpe: number;
   max_drawdown: number;
 }
+
+interface HyperoptHistoryEntry {
+  task_id: string;
+  status: string;
+  strategy_id: string;
+  completed_trials: number;
+  total_trials: number;
+  best_so_far: number | null;
+  created_at: string;
+}
+
 
 /* ---------- Default param ranges ---------- */
 
@@ -71,6 +82,13 @@ export default function OptimizePage() {
   const [results, setResults] = useState<OptimizeResult[]>([]);
   const [sortKey, setSortKey] = useState<'pnl' | 'win_rate' | 'sharpe' | 'max_drawdown'>('pnl');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [history, setHistory] = useState<HyperoptHistoryEntry[]>([]);
+
+  useEffect(() => {
+    fetchApi<HyperoptHistoryEntry[]>('/api/backtest/hyperopt/history')
+      .then(setHistory)
+      .catch((err) => logger.warn('Optimize', 'Failed to fetch hyperopt history', err));
+  }, []);
 
   useEffect(() => {
     fetchApi<StrategyOption[]>('/api/strategies')
@@ -98,17 +116,27 @@ export default function OptimizePage() {
     if (!pollingTaskId) return;
     const interval = setInterval(async () => {
       try {
-        const status = await fetchApi<{ status: string; progress: number; results?: OptimizeResult[] }>(
-          `/api/backtest/hyperopt/${pollingTaskId}`,
+        const status = await fetchApi<{
+          status: string;
+          completed_trials: number;
+          total_trials: number;
+          results?: OptimizeResult[];
+        }>(`/api/backtest/hyperopt/${pollingTaskId}`);
+        setProgress(
+          status.total_trials > 0
+            ? Math.round((status.completed_trials / status.total_trials) * 100)
+            : 0,
         );
-        setProgress(Math.round(status.progress));
         if (status.status === 'completed' || status.status === 'failed') {
           clearInterval(interval);
           setPollingTaskId(null);
           setRunning(false);
           setProgress(0);
-          if (status.status === 'completed' && status.results) {
-            setResults(status.results);
+          // Refresh history list
+          fetchApi<HyperoptHistoryEntry[]>('/api/backtest/hyperopt/history')
+            .then(setHistory)
+            .catch(() => {});
+          if (status.status === 'completed') {
             toast('success', 'Optimization completed');
           } else {
             toast('error', 'Optimization failed');
@@ -181,6 +209,7 @@ export default function OptimizePage() {
     if (sortedResults.length === 0) return;
     router.push(`/builder?strategy=${strategyId}`);
   };
+
 
   const columns = [
     {
@@ -333,6 +362,59 @@ export default function OptimizePage() {
             columns={columns}
             data={sortedResults}
             keyExtractor={(row) => row.id}
+          />
+        </DataCard>
+      )}
+
+      {/* History */}
+      {history.length > 0 && (
+        <DataCard title="Optimization History" description="Previously completed hyperopt runs">
+          <Table
+            columns={[
+              { key: 'task_id', header: 'Run ID', render: (r: HyperoptHistoryEntry) => <span className="text-xs font-mono">{r.task_id}</span> },
+              { key: 'strategy_id', header: 'Strategy', render: (r: HyperoptHistoryEntry) => <span>{r.strategy_id}</span> },
+              {
+                key: 'status',
+                header: 'Status',
+                render: (r: HyperoptHistoryEntry) => (
+                  <span className={r.status === 'completed' ? 'text-status-success' : r.status === 'failed' ? 'text-status-error' : 'text-text-muted'}>
+                    {r.status}
+                  </span>
+                ),
+              },
+              {
+                key: 'trials',
+                header: 'Trials',
+                render: (r: HyperoptHistoryEntry) => <span>{r.completed_trials}/{r.total_trials}</span>,
+              },
+              {
+                key: 'best_so_far',
+                header: 'Best Sharpe',
+                render: (r: HyperoptHistoryEntry) => <span>{r.best_so_far != null ? r.best_so_far.toFixed(2) : '—'}</span>,
+              },
+              {
+                key: 'created_at',
+                header: 'Date',
+                render: (r: HyperoptHistoryEntry) => (
+                  <span className="text-xs text-text-muted">
+                    {r.created_at ? new Date(r.created_at).toLocaleString() : '—'}
+                  </span>
+                ),
+              },
+              {
+                key: 'actions',
+                header: '',
+                render: (r: HyperoptHistoryEntry) =>
+                  r.status === 'completed' ? (
+                    <Button variant="ghost" size="sm" onClick={() => router.push(`/optimize/${r.task_id}`)}>
+                      <Eye className="h-3.5 w-3.5" />
+                      View
+                    </Button>
+                  ) : null,
+              },
+            ]}
+            data={history}
+            keyExtractor={(r) => r.task_id}
           />
         </DataCard>
       )}
