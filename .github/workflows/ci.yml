@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main]
 
+permissions: {}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -14,6 +16,8 @@ jobs:
   lint:
     name: Lint & Format
     runs-on: [self-hosted, hydra]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -26,6 +30,8 @@ jobs:
   type-check:
     name: Type Check
     runs-on: [self-hosted, hydra]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -37,6 +43,8 @@ jobs:
   security:
     name: Security Scan
     runs-on: [self-hosted, hydra]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -48,6 +56,8 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: [self-hosted, hydra]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -64,6 +74,8 @@ jobs:
   integration-tests:
     name: Integration Tests
     runs-on: [self-hosted, hydra]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -116,6 +128,8 @@ jobs:
   e2e-tests:
     name: E2E Tests
     runs-on: [self-hosted, hydra]
+    permissions:
+      contents: read
     needs: [unit-tests, integration-tests]
     steps:
       - uses: actions/checkout@v6

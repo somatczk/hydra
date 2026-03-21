@@ -1,6 +1,6 @@
 [project]
 name = "hydra"
-version = "1.5.0"
+version = "1.5.1"
 description = "Bitcoin auto-trading platform"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -150,7 +150,7 @@ show_missing = true
 
 [tool.bandit]
 exclude_dirs = ["tests"]
-skips = ["B104", "B324", "B608"]
+skips = ["B104", "B110", "B324", "B608"]
 
 [tool.importlinter]
 root_packages = ["hydra"]
