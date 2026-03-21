@@ -235,6 +235,7 @@ function BacktestPageContent() {
         </span>
       ),
     },
+    { key: 'maxDrawdown', header: 'Max DD', hideOnMobile: true },
     { key: 'sharpe', header: 'Sharpe', hideOnMobile: true },
     {
       key: 'status',

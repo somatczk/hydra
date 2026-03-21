@@ -82,68 +82,7 @@ class RetrainResponse(BaseModel):
 # Placeholder data (fallback when models dir is empty / not mounted)
 # ---------------------------------------------------------------------------
 
-_MODELS: dict[str, dict[str, Any]] = {
-    "model-1": {
-        "id": "model-1",
-        "name": "LSTM Price Predictor",
-        "version": "v2.4.1",
-        "stage": "Production",
-        "metrics": {"accuracy": 72.3, "precision": 68.1},
-        "drift": 0.02,
-        "drift_status": "low",
-        "last_trained": "2 days ago",
-        "file_size": 0,
-        "file_name": "",
-    },
-    "model-2": {
-        "id": "model-2",
-        "name": "XGBoost Signal Classifier",
-        "version": "v3.1.0",
-        "stage": "Production",
-        "metrics": {"accuracy": 78.5, "precision": 74.2},
-        "drift": 0.05,
-        "drift_status": "low",
-        "last_trained": "5 days ago",
-        "file_size": 0,
-        "file_name": "",
-    },
-    "model-3": {
-        "id": "model-3",
-        "name": "Volatility Estimator",
-        "version": "v1.2.0",
-        "stage": "Staging",
-        "metrics": {"accuracy": 81.0, "precision": 76.8},
-        "drift": 0.12,
-        "drift_status": "moderate",
-        "last_trained": "1 day ago",
-        "file_size": 0,
-        "file_name": "",
-    },
-    "model-4": {
-        "id": "model-4",
-        "name": "Sentiment Analyzer",
-        "version": "v0.9.3",
-        "stage": "Training",
-        "metrics": {"accuracy": None, "precision": None},
-        "drift": None,
-        "drift_status": "low",
-        "last_trained": "In progress",
-        "file_size": 0,
-        "file_name": "",
-    },
-    "model-5": {
-        "id": "model-5",
-        "name": "Order Flow Predictor",
-        "version": "v1.0.0",
-        "stage": "Archived",
-        "metrics": {"accuracy": 55.2, "precision": 51.0},
-        "drift": 0.35,
-        "drift_status": "high",
-        "last_trained": "30 days ago",
-        "file_size": 0,
-        "file_name": "",
-    },
-}
+_MODELS: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------

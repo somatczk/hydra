@@ -31,8 +31,9 @@ interface Trade {
   id: string;
   pair: string;
   side: 'Long' | 'Short';
-  entry: string;
-  exit: string;
+  qty: string;
+  price: string;
+  fee: string;
   pnl: string;
   time: string;
 }
@@ -89,10 +90,11 @@ function mapApiTrades(data: ApiRecentTrade[]): Trade[] {
       id: t.id,
       pair: formatSymbol(t.symbol),
       side: t.side === 'BUY' ? 'Long' as const : 'Short' as const,
-      entry: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-      exit: '-',
+      qty: `${t.quantity.toLocaleString('en-US')} BTC`,
+      price: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+      fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '\u2014',
       pnl: pnlStr,
-      time: new Date(t.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }),
+      time: new Date(t.timestamp).toLocaleString('en-US', { dateStyle: 'short', timeStyle: 'medium' }),
     };
   });
 }
@@ -110,8 +112,9 @@ const tradeColumns = [
       />
     ),
   },
-  { key: 'entry', header: 'Entry' },
-  { key: 'exit', header: 'Exit' },
+  { key: 'qty', header: 'Qty', hideOnMobile: true },
+  { key: 'price', header: 'Price' },
+  { key: 'fee', header: 'Fee', hideOnMobile: true },
   {
     key: 'pnl',
     header: 'PnL',
@@ -198,7 +201,11 @@ export default function DashboardPage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 30_000);
+    return () => clearInterval(interval);
+  }, [loadData]);
 
   const accentColor = isDark ? '#2383e2' : '#2563eb';
   const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
@@ -222,13 +229,12 @@ export default function DashboardPage() {
             label="Portfolio Value"
             value={`$${summary.total_value.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
             change={summary.change_pct}
-            changeType="increase"
+            changeType={summary.change_pct >= 0 ? 'increase' : 'decrease'}
           />
           <StatCard
             icon={TrendingUp}
             label="Daily PnL"
             value={`${summary.daily_pnl >= 0 ? '+' : ''}$${Math.abs(summary.daily_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
-            change={summary.daily_pnl !== 0 ? Math.abs(summary.daily_pnl) : undefined}
             changeType={summary.daily_pnl >= 0 ? 'increase' : 'decrease'}
           />
           <Link href="/trading" className="block">
@@ -243,7 +249,6 @@ export default function DashboardPage() {
             icon={ArrowDownRight}
             label="Max Drawdown"
             value={`${summary.max_drawdown_pct.toLocaleString('en-US', { minimumFractionDigits: 1 })}%`}
-            change={summary.max_drawdown_pct > 0 ? summary.max_drawdown_pct : undefined}
             changeType="decrease"
           />
         </div>

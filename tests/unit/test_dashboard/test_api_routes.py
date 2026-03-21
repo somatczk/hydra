@@ -230,38 +230,27 @@ class TestRisk:
 
 
 class TestModels:
-    def test_list_models(self, client: TestClient) -> None:
+    def test_list_models_empty(self, client: TestClient) -> None:
         resp = client.get("/api/models")
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, list)
-        assert len(data) > 0
-        assert "name" in data[0]
-        assert "stage" in data[0]
 
-    def test_get_model_detail(self, client: TestClient) -> None:
-        resp = client.get("/api/models/model-1")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["name"] == "LSTM Price Predictor"
+    def test_get_model_not_found(self, client: TestClient) -> None:
+        resp = client.get("/api/models/nonexistent")
+        assert resp.status_code == 404
 
-    def test_promote_model(self, client: TestClient) -> None:
-        resp = client.post("/api/models/model-3/promote")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["stage"] == "Production"
+    def test_promote_model_not_found(self, client: TestClient) -> None:
+        resp = client.post("/api/models/nonexistent/promote")
+        assert resp.status_code == 404
 
-    def test_rollback_model(self, client: TestClient) -> None:
-        resp = client.post("/api/models/model-1/rollback")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["stage"] == "Staging"
+    def test_rollback_model_not_found(self, client: TestClient) -> None:
+        resp = client.post("/api/models/nonexistent/rollback")
+        assert resp.status_code == 404
 
-    def test_retrain_models(self, client: TestClient) -> None:
-        resp = client.post("/api/models/model-1/retrain")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "task_id" in data
+    def test_retrain_model_not_found(self, client: TestClient) -> None:
+        resp = client.post("/api/models/nonexistent/retrain")
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

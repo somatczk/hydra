@@ -163,13 +163,15 @@ async def _get_risk_config_from_db(pool: Any, scope: str = "global") -> dict[str
 
 
 @router.get("/status", response_model=RiskStatus)
-async def get_risk_status(request: Request) -> dict[str, Any]:
+async def get_risk_status(request: Request, source: str | None = None) -> dict[str, Any]:
     """Current risk status: circuit breaker tiers, drawdown, daily loss."""
     pool = _pool_from_request(request)
     drawdown_limit = 15.0
     daily_loss_limit = 500.0
     current_drawdown = 0.0
     daily_loss = 0.0
+
+    effective_source = source or "paper"
 
     if pool is not None:
         cfg = await _get_risk_config_from_db(pool)
@@ -179,27 +181,38 @@ async def get_risk_status(request: Request) -> dict[str, Any]:
 
         try:
             async with pool.acquire() as conn:
-                # Get paper_capital for limit calculation
+                # Get base capital for limit calculation
                 from hydra.dashboard.routes.system import get_paper_capital
 
-                paper_capital = get_paper_capital(request)
-                daily_loss_limit = paper_capital * daily_loss_limit_pct
+                if effective_source == "paper":
+                    base_capital = get_paper_capital(request)
+                else:
+                    snapshot = await conn.fetchrow(
+                        "SELECT total_value FROM balance_snapshots "
+                        "WHERE source = $1 ORDER BY timestamp DESC LIMIT 1",
+                        effective_source,
+                    )
+                    base_capital = float(snapshot["total_value"]) if snapshot else 10000.0
+                daily_loss_limit = base_capital * daily_loss_limit_pct
 
-                # Daily loss from running paper sessions
+                # Daily loss from running sessions
                 daily_loss_val = await conn.fetchval(
                     "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE source = 'paper' AND timestamp >= date_trunc('day', now()) "
-                    "AND session_id IN (SELECT id FROM trading_sessions WHERE status = 'running')"
+                    "WHERE source = $1 AND timestamp >= date_trunc('day', now()) "
+                    "AND session_id IN "
+                    "(SELECT id FROM trading_sessions WHERE status = 'running')",
+                    effective_source,
                 )
                 daily_loss = abs(float(daily_loss_val)) if float(daily_loss_val) < 0 else 0.0
 
                 # Current drawdown from equity curve peak
                 equity_rows = await conn.fetch(
                     "SELECT total_value FROM balance_snapshots "
-                    "WHERE source = 'paper' ORDER BY timestamp"
+                    "WHERE source = $1 ORDER BY timestamp",
+                    effective_source,
                 )
-                peak = paper_capital
-                latest = paper_capital
+                peak = base_capital
+                latest = base_capital
                 for row in equity_rows:
                     val = float(row["total_value"])
                     if val > peak:
@@ -247,12 +260,13 @@ async def reset_circuit_breaker(tier: int) -> dict[str, Any]:
 
 
 @router.get("/var", response_model=VarEstimate)
-async def get_var(request: Request) -> VarEstimate:
+async def get_var(request: Request, source: str | None = None) -> VarEstimate:
     """Value at Risk estimate computed from daily PnL history."""
     from hydra.dashboard.routes.system import get_paper_capital
 
-    paper_capital = get_paper_capital(request)
-    portfolio_value = paper_capital
+    effective_source = source or "paper"
+    portfolio_value = get_paper_capital(request) if effective_source == "paper" else 10000.0
+
     var_95 = 0.0
     var_99 = 0.0
     cvar_95 = 0.0
@@ -262,25 +276,37 @@ async def get_var(request: Request) -> VarEstimate:
     if pool is not None:
         try:
             async with pool.acquire() as conn:
+                if effective_source != "paper":
+                    snapshot = await conn.fetchrow(
+                        "SELECT total_value FROM balance_snapshots "
+                        "WHERE source = $1 ORDER BY timestamp DESC LIMIT 1",
+                        effective_source,
+                    )
+                    if snapshot:
+                        portfolio_value = float(snapshot["total_value"])
+
                 # Current portfolio value = capital + running session PnL
                 pnl = await conn.fetchval(
                     "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE source = 'paper' AND session_id IN "
-                    "(SELECT id FROM trading_sessions WHERE status = 'running')"
+                    "WHERE source = $1 AND session_id IN "
+                    "(SELECT id FROM trading_sessions WHERE status = 'running')",
+                    effective_source,
                 )
                 fees = await conn.fetchval(
                     "SELECT COALESCE(SUM(fee), 0) FROM trades "
-                    "WHERE source = 'paper' AND session_id IN "
-                    "(SELECT id FROM trading_sessions WHERE status = 'running')"
+                    "WHERE source = $1 AND session_id IN "
+                    "(SELECT id FROM trading_sessions WHERE status = 'running')",
+                    effective_source,
                 )
                 portfolio_value += float(pnl) - float(fees)
 
                 # Daily PnL series for VaR calculation
                 rows = await conn.fetch(
                     "SELECT SUM(pnl) AS daily_pnl FROM trades "
-                    "WHERE source = 'paper' "
+                    "WHERE source = $1 "
                     "GROUP BY date_trunc('day', timestamp) "
-                    "ORDER BY date_trunc('day', timestamp)"
+                    "ORDER BY date_trunc('day', timestamp)",
+                    effective_source,
                 )
                 if len(rows) >= 5:
                     daily_pnls = sorted(float(r["daily_pnl"]) for r in rows)
@@ -356,6 +382,28 @@ async def update_risk_config(body: RiskConfigUpdate, request: Request) -> dict[s
     if mgr is not None:
         await mgr.reload_risk_config()
 
+    return await get_risk_config(request)
+
+
+@router.get("/config/{strategy_id}", response_model=RiskConfig)
+async def get_strategy_risk_config(strategy_id: str, request: Request) -> dict[str, Any]:
+    """Get per-strategy risk overrides (falls back to global config)."""
+    pool = _pool_from_request(request)
+    if pool is not None:
+        row = await _get_risk_config_from_db(pool, scope=strategy_id)
+        if row is not None:
+            return {
+                "scope": row["scope"],
+                "max_position_pct": float(row["max_position_pct"]),
+                "max_risk_per_trade": float(row["max_risk_per_trade"]),
+                "max_portfolio_heat": float(row.get("max_portfolio_heat", 0.06)),
+                "max_daily_loss_pct": float(row["max_daily_loss_pct"]),
+                "max_drawdown_pct": float(row["max_drawdown_pct"]),
+                "max_concurrent_positions": row["max_concurrent_positions"],
+                "kill_switch_active": row["kill_switch_active"],
+            }
+
+    # Fall back to global config
     return await get_risk_config(request)
 
 

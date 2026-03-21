@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, OctagonX, Activity } from 'lucide-react';
 import {
   RadialBarChart,
@@ -177,65 +177,71 @@ export default function RiskPage() {
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
 
+  const sourceRef = useRef<string>('paper');
+
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
   }, []);
 
-  // Fetch risk status
-  useEffect(() => {
-    fetchApi<ApiRiskStatus>('/api/risk/status')
-      .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
-      .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); setStateError(true); })
-      .finally(() => setLoading(false));
+  // Consolidated data loader
+  const loadRiskData = useCallback(async () => {
+    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
+      .catch(() => ({ trading_mode: 'paper' }));
+    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    sourceRef.current = source;
+    const qs = `?source=${source}`;
+
+    await Promise.all([
+      fetchApi<ApiRiskStatus>(`/api/risk/status${qs}`)
+        .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); setStateError(true); }),
+      fetchApi<VarEstimate>(`/api/risk/var${qs}`)
+        .then((data) => setVarEstimate(data))
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch VaR', err); }),
+      fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
+        .then((data) => setDailyPnl(data))
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); }),
+      fetchApi<RiskConfig>('/api/risk/config')
+        .then((riskCfg) => {
+          setRiskConfig(riskCfg);
+          setMaxPositionPct((riskCfg.max_position_pct * 100).toFixed(0));
+          setMaxRiskPerTrade((riskCfg.max_risk_per_trade * 100).toFixed(0));
+          setMaxPortfolioHeat((riskCfg.max_portfolio_heat * 100).toFixed(0));
+          setMaxDailyLossPct((riskCfg.max_daily_loss_pct * 100).toFixed(0));
+          setMaxDrawdownPct((riskCfg.max_drawdown_pct * 100).toFixed(0));
+          setMaxConcurrentPositions(riskCfg.max_concurrent_positions.toString());
+          setKillSwitchActive(riskCfg.kill_switch_active);
+        })
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch risk config', err); }),
+    ]);
+
+    setLoading(false);
   }, []);
 
-  // Fetch VaR estimate
+  // Initial load + 30s polling
   useEffect(() => {
-    fetchApi<VarEstimate>('/api/risk/var')
-      .then((data) => setVarEstimate(data))
-      .catch((err) => { logger.warn('Risk', 'Failed to fetch VaR estimate', err); });
-  }, []);
+    loadRiskData();
+    const interval = setInterval(loadRiskData, 30_000);
+    return () => clearInterval(interval);
+  }, [loadRiskData]);
 
-  // Poll live status every 10s
+  // Poll live status + risk status every 10s for responsive kill switch & drawdown
   useEffect(() => {
     const fetchLiveStatus = () => {
+      const qs = `?source=${sourceRef.current}`;
       fetchApi<LiveStatus>('/api/risk/live-status')
         .then((data) => {
           setLiveStatus(data);
           setKillSwitchActive(data.kill_switch_active);
         })
         .catch((err) => { logger.warn('Risk', 'Failed to fetch live status', err); });
+      fetchApi<ApiRiskStatus>(`/api/risk/status${qs}`)
+        .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
+        .catch(() => {});
     };
     fetchLiveStatus();
     const interval = setInterval(fetchLiveStatus, 10_000);
     return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
-    fetchApi<{ trading_mode: string }>('/api/system/config')
-      .catch(() => ({ trading_mode: 'paper' }))
-      .then((cfg) => {
-        const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
-        return fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl?source=${source}`);
-      })
-      .then((data) => setDailyPnl(data))
-      .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); });
-  }, []);
-
-  // Fetch risk config from DB
-  useEffect(() => {
-    fetchApi<RiskConfig>('/api/risk/config')
-      .then((cfg) => {
-        setRiskConfig(cfg);
-        setMaxPositionPct((cfg.max_position_pct * 100).toFixed(0));
-        setMaxRiskPerTrade((cfg.max_risk_per_trade * 100).toFixed(0));
-        setMaxPortfolioHeat((cfg.max_portfolio_heat * 100).toFixed(0));
-        setMaxDailyLossPct((cfg.max_daily_loss_pct * 100).toFixed(0));
-        setMaxDrawdownPct((cfg.max_drawdown_pct * 100).toFixed(0));
-        setMaxConcurrentPositions(cfg.max_concurrent_positions.toString());
-        setKillSwitchActive(cfg.kill_switch_active);
-      })
-      .catch((err) => { logger.warn('Risk', 'Failed to fetch risk config', err); });
   }, []);
 
   const handleSaveRiskConfig = async () => {
@@ -419,11 +425,11 @@ export default function RiskPage() {
                     <div className="mt-4 space-y-2">
                       <div className="flex justify-between text-xs">
                         <span className="text-text-muted">Current Drawdown</span>
-                        <span className="font-medium text-status-warning">{state.drawdown}%</span>
+                        <span className={cn('font-medium', drawdownPct < 40 ? 'text-status-success' : drawdownPct < 70 ? 'text-status-warning' : 'text-status-error')}>{state.drawdown}%</span>
                       </div>
                       <div className="h-3 rounded-full bg-bg-tertiary overflow-hidden">
                         <div
-                          className="h-full rounded-full bg-status-warning transition-all"
+                          className={cn('h-full rounded-full transition-all', drawdownPct < 40 ? 'bg-status-success' : drawdownPct < 70 ? 'bg-status-warning' : 'bg-status-error')}
                           style={{ width: `${drawdownPct}%` }}
                         />
                       </div>
@@ -488,7 +494,7 @@ export default function RiskPage() {
               )}
               <div className="mt-4 space-y-2">
                 {[
-                  { label: 'Max daily loss', value: `-${fmtUsd(state.dailyLoss)}`, color: 'text-status-error' },
+                  { label: 'Current daily loss', value: `-${fmtUsd(state.dailyLoss)}`, color: 'text-status-error' },
                 ].map((row) => (
                   <div key={row.label} className="flex justify-between text-xs">
                     <span className="text-text-muted">{row.label}</span>
@@ -587,7 +593,7 @@ export default function RiskPage() {
       </DataCard>
 
       {/* Risk alerts */}
-      <DataCard title="Recent Risk Events" description="Risk management actions taken today">
+      <DataCard title="Recent Risk Events" description="Risk management actions taken today (sample data)">
         <div className="space-y-3">
           {riskEvents.map((event, idx) => (
             <div

@@ -161,7 +161,11 @@ export default function StrategiesPage() {
     }
   }, []);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(fetchData, 30_000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
 
   const handleToggle = async (id: string) => {
     try {

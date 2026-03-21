@@ -143,8 +143,8 @@ export default function SettingsPage() {
       fetchApi<RiskConfig>('/api/risk/config')
         .then((risk) => setKillSwitchActive(risk.kill_switch_active))
         .catch(() => {}),
-      fetchApi<Record<string, boolean>>('/api/system/notifications')
-        .then(setNotifications)
+      fetchApi<{ preferences: Record<string, boolean> }>('/api/system/notifications')
+        .then((data) => setNotifications(data.preferences || data as unknown as Record<string, boolean>))
         .catch(() => {
           // Fallback to defaults if API fails
           setNotifications({
@@ -162,14 +162,30 @@ export default function SettingsPage() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
+  // Poll kill switch state every 15s so banner stays in sync
+  useEffect(() => {
+    const pollKillSwitch = () => {
+      fetchApi<{ kill_switch_active: boolean; running_sessions: number }>('/api/risk/live-status')
+        .then((data) => setKillSwitchActive(data.kill_switch_active))
+        .catch(() => {});
+    };
+    const interval = setInterval(pollKillSwitch, 15_000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Fetch exchange detail data with polling
   const fetchExchangeDetail = useCallback(async (exchangeId: string) => {
     try {
-      const [balances, orders, positions] = await Promise.all([
-        fetchApi<ExchangeBalance[]>(`/api/system/exchanges/${exchangeId}/balance`),
-        fetchApi<ExchangeOrder[]>(`/api/system/exchanges/${exchangeId}/orders`),
-        fetchApi<ExchangePosition[]>(`/api/system/exchanges/${exchangeId}/positions`),
+      const [balancesRaw, ordersRaw, positionsRaw] = await Promise.all([
+        fetchApi<{ exchange_id: string; balances: Record<string, number> }>(`/api/system/exchanges/${exchangeId}/balance`),
+        fetchApi<{ exchange_id: string; orders: ExchangeOrder[] }>(`/api/system/exchanges/${exchangeId}/orders`),
+        fetchApi<{ exchange_id: string; positions: ExchangePosition[] }>(`/api/system/exchanges/${exchangeId}/positions`),
       ]);
+      const balances: ExchangeBalance[] = Object.entries(balancesRaw.balances || {}).map(
+        ([currency, amount]) => ({ currency, available: amount, total: amount })
+      );
+      const orders = ordersRaw.orders || [];
+      const positions = positionsRaw.positions || [];
       setExchangeDetails((prev) => ({
         ...prev,
         [exchangeId]: { balances, orders, positions, status: 'live', error: null },
@@ -255,7 +271,7 @@ export default function SettingsPage() {
     try {
       await fetchApi('/api/system/notifications', {
         method: 'PUT',
-        body: JSON.stringify(updated),
+        body: JSON.stringify({ preferences: updated }),
       });
     } catch (err) {
       logger.error('Settings', 'Failed to save notification preferences', err);

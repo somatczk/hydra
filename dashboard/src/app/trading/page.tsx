@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/Button';
 import { ErrorCard } from '@/components/ui/ErrorCard';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
+import { useTheme } from '@/components/layout/ThemeProvider';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -31,8 +32,10 @@ interface RecentTrade {
   side: 'Long' | 'Short';
   size: string;
   price: string;
+  fee: string;
+  pnl: number;
+  pnlFmt: string;
   time: string;
-  status: string;
 }
 
 interface ApiPosition {
@@ -117,8 +120,10 @@ function mapApiTrades(data: ApiRecentTrade[]): RecentTrade[] {
     side: t.side === 'BUY' ? 'Long' as const : 'Short' as const,
     size: `${t.quantity.toLocaleString('en-US')} BTC`,
     price: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-    time: new Date(t.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    status: 'Filled',
+    fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '\u2014',
+    pnl: t.pnl,
+    pnlFmt: `${t.pnl >= 0 ? '+' : ''}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+    time: new Date(t.timestamp).toLocaleString('en-US', { dateStyle: 'short', timeStyle: 'medium' }),
   }));
 }
 
@@ -173,18 +178,23 @@ const tradeHistoryColumns = [
   },
   { key: 'size', header: 'Size' },
   { key: 'price', header: 'Price' },
-  { key: 'time', header: 'Time', hideOnMobile: true },
+  { key: 'fee', header: 'Fee', hideOnMobile: true },
   {
-    key: 'status',
-    header: 'Status',
+    key: 'pnl',
+    header: 'PnL',
     render: (row: RecentTrade) => (
-      <StatusBadge
-        status={row.status}
-        variant={row.status === 'Filled' ? 'success' : 'neutral'}
-        size="sm"
-      />
+      <span
+        className={
+          row.pnl >= 0
+            ? 'text-status-success font-medium'
+            : 'text-status-error font-medium'
+        }
+      >
+        {row.pnlFmt}
+      </span>
     ),
   },
+  { key: 'time', header: 'Time', hideOnMobile: true },
 ];
 
 /* ---------- Page ---------- */
@@ -204,6 +214,7 @@ export default function TradingPage() {
   const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
   const [resettingTier, setResettingTier] = useState<number | null>(null);
 
+  const { resolved: themeResolved } = useTheme();
   const widgetContainerRef = useRef<HTMLDivElement>(null);
 
   const loadData = useCallback(async () => {
@@ -239,13 +250,15 @@ export default function TradingPage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 15_000);
+    return () => clearInterval(interval);
+  }, [loadData]);
 
   useEffect(() => {
     const container = widgetContainerRef.current;
     if (!container) return;
-
-    const isDark = document.documentElement.classList.contains('dark');
 
     const script = document.createElement('script');
     script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
@@ -256,7 +269,7 @@ export default function TradingPage() {
       symbol: 'BINANCE:BTCUSDT',
       interval: '60',
       timezone: 'Etc/UTC',
-      theme: isDark ? 'dark' : 'light',
+      theme: themeResolved === 'dark' ? 'dark' : 'light',
       style: '1',
       locale: 'en',
       allow_symbol_change: true,
@@ -268,7 +281,7 @@ export default function TradingPage() {
     return () => {
       container.innerHTML = '';
     };
-  }, []);
+  }, [themeResolved]);
 
   const handleToggleKillSwitch = async () => {
     setKillSwitchLoading(true);
@@ -356,11 +369,11 @@ export default function TradingPage() {
                 <div className="w-32 h-2 rounded-full bg-bg-tertiary overflow-hidden">
                   <div
                     className="h-full rounded-full bg-status-error transition-all"
-                    style={{ width: `${Math.min((Math.abs(riskStatus.daily_loss) / riskStatus.daily_loss_limit) * 100, 100)}%` }}
+                    style={{ width: `${Math.min((Math.abs(riskStatus.daily_loss) / (riskStatus.daily_loss_limit || 1)) * 100, 100)}%` }}
                   />
                 </div>
                 <span className="text-xs text-text-muted">
-                  {((Math.abs(riskStatus.daily_loss) / riskStatus.daily_loss_limit) * 100).toFixed(0)}%
+                  {((Math.abs(riskStatus.daily_loss) / (riskStatus.daily_loss_limit || 1)) * 100).toFixed(0)}%
                 </span>
               </div>
             </div>

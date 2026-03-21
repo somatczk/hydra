@@ -107,9 +107,7 @@ class TestPortfolioWithPool:
         # realized_pnl, fees, daily_pnl, unrealized_pnl
         # Then fetchrow for snapshot (total_value), then fetch for equity curve
         conn.fetchval = AsyncMock(side_effect=[1500.00, 85.50, 42.00, 200.00])
-        conn.fetchrow = AsyncMock(
-            return_value={"total_value": 12000.50}
-        )
+        conn.fetchrow = AsyncMock(return_value={"total_value": 12000.50})
         conn.fetch = AsyncMock(
             return_value=[
                 {"total_value": 10000.00},

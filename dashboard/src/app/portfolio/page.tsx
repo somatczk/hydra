@@ -31,6 +31,8 @@ interface PortfolioSummary {
   total_value: number;
   unrealized_pnl: number;
   realized_pnl: number;
+  daily_pnl: number;
+  max_drawdown_pct: number;
   total_fees: number;
   change_pct: number;
 }
@@ -51,8 +53,7 @@ interface EquityPoint { timestamp: string; value: number; }
 interface DailyPnl { date: string; pnl: number; }
 
 interface MonthlyReturn {
-  year: number;
-  month: number;
+  month: string;
   return_pct: number;
 }
 
@@ -148,7 +149,11 @@ export default function PortfolioPage() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 30_000);
+    return () => clearInterval(interval);
+  }, [loadData]);
 
   // Derive allocation from API positions
   const allocationItems = positions.length > 0 && summary
@@ -175,8 +180,9 @@ export default function PortfolioPage() {
   const monthlyByYear: Record<number, Record<number, number>> = {};
   if (monthlyReturns) {
     for (const mr of monthlyReturns) {
-      if (!monthlyByYear[mr.year]) monthlyByYear[mr.year] = {};
-      monthlyByYear[mr.year][mr.month] = mr.return_pct;
+      const [year, monthNum] = mr.month.split('-').map(Number);
+      if (!monthlyByYear[year]) monthlyByYear[year] = {};
+      monthlyByYear[year][monthNum] = mr.return_pct;
     }
   }
   const years = Object.keys(monthlyByYear).map(Number).sort();
@@ -199,28 +205,24 @@ export default function PortfolioPage() {
             label="Total Value"
             value={fmt(summary.total_value)}
             change={summary.change_pct}
-            changeType="increase"
+            changeType={summary.change_pct >= 0 ? 'increase' : 'decrease'}
           />
           <StatCard
             icon={TrendingUp}
             label="Unrealized PnL"
-            value={`+${fmt(summary.unrealized_pnl)}`}
-            change={1.6}
-            changeType="increase"
+            value={`${summary.unrealized_pnl >= 0 ? '+' : ''}${fmt(summary.unrealized_pnl)}`}
+            changeType={summary.unrealized_pnl >= 0 ? 'increase' : 'decrease'}
           />
           <StatCard
             icon={TrendingDown}
             label="Realized PnL"
-            value={`+${fmt(summary.realized_pnl)}`}
-            change={12.4}
-            changeType="increase"
+            value={`${summary.realized_pnl >= 0 ? '+' : ''}${fmt(summary.realized_pnl)}`}
+            changeType={summary.realized_pnl >= 0 ? 'increase' : 'decrease'}
           />
           <StatCard
             icon={Receipt}
             label="Total Fees"
             value={fmt(summary.total_fees)}
-            change={0.7}
-            changeType="decrease"
           />
         </div>
       ) : (

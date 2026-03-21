@@ -125,7 +125,11 @@ export default function ModelsPage() {
       .finally(() => setLoading(false));
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(loadData, 30_000);
+    return () => clearInterval(interval);
+  }, [loadData]);
 
   const handlePromote = async (model: Model) => {
     if (!confirm(`Promote "${model.name}" ${model.version} to production?`)) return;

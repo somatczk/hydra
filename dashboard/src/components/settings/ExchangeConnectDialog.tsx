@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { X, Plug, Unplug } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
@@ -28,6 +28,15 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
   const [passphrase, setPassphrase] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setApiKey('');
+      setApiSecret('');
+      setPassphrase('');
+      setError(null);
+    }
+  }, [open, exchange?.id]);
 
   if (!open || !exchange) return null;
 

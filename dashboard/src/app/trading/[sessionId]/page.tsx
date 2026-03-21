@@ -166,6 +166,7 @@ export default function SessionDetailPage() {
   const [wsConnected, setWsConnected] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const statusRef = useRef<string | null>(null);
 
   const fetchDetail = useCallback(async () => {
     try {
@@ -183,6 +184,11 @@ export default function SessionDetailPage() {
   useEffect(() => {
     fetchDetail();
   }, [fetchDetail]);
+
+  // Keep status ref in sync
+  useEffect(() => {
+    if (detail) statusRef.current = detail.status;
+  }, [detail?.status]);
 
   // WebSocket for live trade updates, with polling fallback
   useEffect(() => {
@@ -256,7 +262,8 @@ export default function SessionDetailPage() {
         intervalRef.current = null;
       }
     };
-  }, [detail?.status, sessionId, fetchDetail]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- only reconnect on sessionId change, not status
+  }, [sessionId, fetchDetail]);
 
   const handleStop = async () => {
     setStopping(true);

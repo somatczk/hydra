@@ -340,7 +340,9 @@ function BuilderPageContent() {
         const [indData, compData, modelsData] = await Promise.all([
           fetchApi<IndicatorSchema[]>('/api/strategies/indicators').catch(() => null),
           fetchApi<ComparatorSchema[]>('/api/strategies/comparators').catch(() => null),
-          fetchApi<{ id: string; name: string }[]>('/api/models').catch(() => null),
+          fetchApi<{ id: string; name: string; stage?: string }[]>('/api/models')
+            .then((models) => models?.filter((m) => !m.stage || (m.stage !== 'Archived' && m.stage !== 'Training')) ?? null)
+            .catch(() => null),
         ]);
         if (indData && indData.length > 0) setIndicators(indData);
         if (compData && compData.length > 0) setComparators(compData);
