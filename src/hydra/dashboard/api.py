@@ -365,8 +365,14 @@ async def _run_migrations() -> None:
                     started_at TIMESTAMPTZ,
                     stopped_at TIMESTAMPTZ,
                     error_message TEXT,
+                    positions_at_stop INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
+            """)
+            # Migration: add positions_at_stop column if missing
+            await conn.execute("""
+                ALTER TABLE trading_sessions
+                ADD COLUMN IF NOT EXISTS positions_at_stop INTEGER NOT NULL DEFAULT 0
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS risk_config (

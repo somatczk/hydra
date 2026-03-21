@@ -74,7 +74,10 @@ export default function OptimizePage() {
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [pollingTaskId, setPollingTaskId] = useState<string | null>(null);
+  const [pollingTaskId, setPollingTaskId] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') return localStorage.getItem('hyperopt_task_id');
+    return null;
+  });
   const [maxTrials, setMaxTrials] = useState('100');
   const [params, setParams] = useState<ParamRange[]>(
     DEFAULT_PARAMS.map((p) => ({ ...p })),
@@ -89,6 +92,16 @@ export default function OptimizePage() {
       .then(setHistory)
       .catch((err) => logger.warn('Optimize', 'Failed to fetch hyperopt history', err));
   }, []);
+
+  // Sync pollingTaskId to localStorage
+  useEffect(() => {
+    if (pollingTaskId) {
+      localStorage.setItem('hyperopt_task_id', pollingTaskId);
+      setRunning(true);
+    } else {
+      localStorage.removeItem('hyperopt_task_id');
+    }
+  }, [pollingTaskId]);
 
   useEffect(() => {
     fetchApi<StrategyOption[]>('/api/strategies')

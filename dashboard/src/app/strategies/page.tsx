@@ -18,6 +18,8 @@ interface TradingSession {
   strategy_id: string;
   trading_mode: string;
   status: string;
+  started_at: string | null;
+  stopped_at: string | null;
 }
 
 interface StrategyPerformance {
@@ -86,7 +88,12 @@ function mapBuilderStrategies(
 
 function sessionStatusLabel(session: TradingSession | null): string {
   if (!session) return '';
-  return session.trading_mode === 'paper' ? 'Paper Running' : 'Live Running';
+  const mode = session.trading_mode === 'paper' ? 'Paper Running' : 'Live Running';
+  if (session.started_at) {
+    const dt = new Date(session.started_at);
+    return `${mode} · ${dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, ${dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+  }
+  return mode;
 }
 
 function sessionStatusVariant(session: TradingSession | null): 'success' | 'warning' | 'info' | 'neutral' {
@@ -117,8 +124,8 @@ export default function StrategiesPage() {
   const [savingRisk, setSavingRisk] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
+  const fetchData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [stratData, sessData, cfg] = await Promise.all([
         fetchApi<BuilderStrategy[]>('/api/strategies').catch(() => [] as BuilderStrategy[]),
@@ -164,7 +171,7 @@ export default function StrategiesPage() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 30_000);
+    const interval = setInterval(() => fetchData(true), 30_000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
@@ -172,7 +179,7 @@ export default function StrategiesPage() {
     try {
       await fetchApi(`/api/strategies/${id}/toggle`, { method: 'POST' });
       toast('success', 'Strategy toggled');
-      fetchData();
+      fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to toggle strategy', err);
       toast('error', 'Failed to toggle strategy');
@@ -185,7 +192,7 @@ export default function StrategiesPage() {
     try {
       await fetchApi(`/api/strategies/${id}`, { method: 'DELETE' });
       toast('success', 'Strategy deleted');
-      fetchData();
+      fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to delete strategy', err);
       toast('error', `Failed to delete: ${err instanceof Error ? err.message : 'unknown error'}`);
@@ -207,7 +214,7 @@ export default function StrategiesPage() {
         }),
       });
       toast('success', 'Paper session started');
-      fetchData();
+      fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to start paper session', err);
       toast('error', `Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
@@ -228,7 +235,7 @@ export default function StrategiesPage() {
         }),
       });
       toast('success', 'Live session started');
-      fetchData();
+      fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to start live session', err);
       toast('error', `Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
@@ -242,7 +249,7 @@ export default function StrategiesPage() {
     try {
       await fetchApi(`/api/trading/sessions/${sessionId}`, { method: 'DELETE' });
       toast('success', 'Session stopped');
-      fetchData();
+      fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to stop session', err);
       toast('error', `Failed to stop: ${err instanceof Error ? err.message : 'unknown error'}`);
@@ -333,7 +340,7 @@ export default function StrategiesPage() {
         body: JSON.stringify({ yaml_content: content }),
       });
       toast('success', 'Strategy imported successfully');
-      fetchData();
+      fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to import strategy', err);
       toast('error', `Import failed: ${err instanceof Error ? err.message : 'invalid file'}`);

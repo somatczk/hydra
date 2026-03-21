@@ -541,7 +541,7 @@ export default function TradingPage() {
                     <p className="text-sm font-medium text-text-primary">{session.strategy_name || session.strategy_id}</p>
                     <p className="text-xs text-text-muted">
                       {session.symbols.join(', ')} &middot; {session.timeframe}
-                      {session.started_at && ` &middot; Started ${new Date(session.started_at).toLocaleTimeString()}`}
+                      {session.started_at && ` &middot; Started ${new Date(session.started_at).toLocaleString()}`}
                     </p>
                   </div>
                 </div>

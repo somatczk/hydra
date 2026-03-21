@@ -54,6 +54,7 @@ interface SessionDetail {
   started_at: string | null;
   stopped_at: string | null;
   error_message: string | null;
+  positions_at_stop: number;
   metrics: SessionMetrics;
   positions: PositionItem[];
   trades: TradeItem[];
@@ -353,6 +354,18 @@ export default function SessionDetailPage() {
           <div>
             <p className="text-sm font-medium text-text-primary">Session Error</p>
             <p className="text-xs text-text-muted">{detail.error_message}</p>
+          </div>
+        </div>
+      )}
+
+      {detail.status === 'stopped' && detail.positions_at_stop > 0 && (
+        <div className="flex items-center gap-3 rounded-xl border border-status-warning/30 bg-status-warning/10 px-4 py-3">
+          <AlertTriangle className="h-5 w-5 shrink-0 text-status-warning" />
+          <div>
+            <p className="text-sm font-medium text-text-primary">Positions Not Fully Closed</p>
+            <p className="text-xs text-text-muted">
+              {detail.positions_at_stop} position{detail.positions_at_stop > 1 ? 's' : ''} remained open when this session was stopped. Check the exchange manually.
+            </p>
           </div>
         </div>
       )}

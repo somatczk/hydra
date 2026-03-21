@@ -80,6 +80,7 @@ class TradingSession:
     started_at: datetime | None = None
     stopped_at: datetime | None = None
     error_message: str | None = None
+    positions_at_stop: int = 0
 
     # Runtime components (not persisted)
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -423,6 +424,7 @@ class SessionManager:
             "started_at": session.started_at.isoformat() if session.started_at else None,
             "stopped_at": session.stopped_at.isoformat() if session.stopped_at else None,
             "error_message": session.error_message,
+            "positions_at_stop": session.positions_at_stop,
         }
 
         # Gather live data from executor or DB trades
@@ -806,6 +808,20 @@ class SessionManager:
             except Exception:
                 logger.exception("Failed to flatten positions in session %s", session.session_id)
 
+            # Re-check: warn if any positions remain open after flatten
+            try:
+                remaining = await session._executor.fetch_positions()
+                remaining = [p for p in remaining if abs(float(p.get("contracts", 0))) > 0]
+                session.positions_at_stop = len(remaining)
+                if remaining:
+                    logger.warning(
+                        "Session %s stopped with %d positions still open",
+                        session.session_id,
+                        len(remaining),
+                    )
+            except Exception:
+                logger.exception("Failed to re-check positions in session %s", session.session_id)
+
         if session._feed is not None:
             await session._feed.disconnect_all()
 
@@ -837,13 +853,14 @@ class SessionManager:
                     INSERT INTO trading_sessions
                         (id, strategy_id, trading_mode, status, exchange_id,
                          symbols, timeframe, paper_capital, started_at,
-                         stopped_at, error_message)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                         stopped_at, error_message, positions_at_stop)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                     ON CONFLICT (id) DO UPDATE SET
                         status = EXCLUDED.status,
                         started_at = EXCLUDED.started_at,
                         stopped_at = EXCLUDED.stopped_at,
-                        error_message = EXCLUDED.error_message
+                        error_message = EXCLUDED.error_message,
+                        positions_at_stop = EXCLUDED.positions_at_stop
                     """,
                     session.session_id,
                     session.strategy_id,
@@ -856,6 +873,7 @@ class SessionManager:
                     session.started_at,
                     session.stopped_at,
                     session.error_message,
+                    session.positions_at_stop,
                 )
         except Exception:
             logger.exception("Failed to persist session %s", session.session_id)
@@ -1112,6 +1130,7 @@ class SessionManager:
                             started_at=row["started_at"],
                             stopped_at=row["stopped_at"],
                             error_message=row["error_message"],
+                            positions_at_stop=row.get("positions_at_stop", 0),
                         )
         except Exception:
             logger.exception("Failed to load recent sessions from DB")
