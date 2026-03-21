@@ -727,10 +727,51 @@ async def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
 
 
 @router.get("/{strategy_id}/performance", response_model=StrategyPerformance)
-async def get_strategy_performance(strategy_id: str) -> dict[str, Any]:
+async def get_strategy_performance(strategy_id: str, request: Request) -> dict[str, Any]:
     """Get performance metrics for a strategy."""
-    strat = _get_strategy(strategy_id)
-    return strat["performance"]
+    default_perf = {
+        "total_pnl": 0.0,
+        "win_rate": 0.0,
+        "total_trades": 0,
+        "sharpe_ratio": 0.0,
+        "max_drawdown": 0.0,
+    }
+
+    # Check YAML or in-memory existence
+    path = _find_strategy_file(strategy_id)
+    if path is None and strategy_id not in _STRATEGIES:
+        raise HTTPException(status_code=404, detail=f"Strategy {strategy_id} not found")
+
+    # If in-memory fallback has performance, use it as base
+    if strategy_id in _STRATEGIES:
+        default_perf = _STRATEGIES[strategy_id].get("performance", default_perf)
+
+    # Overlay DB performance if available
+    pool = _pool_from_request(request)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
+                    "COUNT(id) AS total_trades, "
+                    "COALESCE("
+                    "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
+                    "  / NULLIF(COUNT(id), 0) * 100, 0"
+                    ") AS win_rate "
+                    "FROM trades WHERE strategy_id = $1",
+                    strategy_id,
+                )
+            if row and row["total_trades"] > 0:
+                return {
+                    **default_perf,
+                    "total_pnl": round(float(row["total_pnl"]), 2),
+                    "win_rate": round(float(row["win_rate"]), 1),
+                    "total_trades": row["total_trades"],
+                }
+        except Exception:
+            logger.exception("Failed to fetch performance for %s", strategy_id)
+
+    return default_perf
 
 
 @router.delete("/{strategy_id}")
