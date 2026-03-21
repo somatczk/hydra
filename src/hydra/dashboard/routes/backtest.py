@@ -1011,6 +1011,8 @@ class HyperoptRunRequest(BaseModel):
     symbol: str = "BTCUSDT"
     timeframe: str = "1h"
     initial_capital: float = 10000.0
+    start_date: str = ""
+    end_date: str = ""
 
 
 class HyperoptRunResponse(BaseModel):
@@ -1024,6 +1026,10 @@ class HyperoptProgressResponse(BaseModel):
     completed_trials: int
     total_trials: int
     best_so_far: float | None = None
+    current_trial_params: dict[str, Any] | None = None
+    last_trial_sharpe: float | None = None
+    start_date: str = ""
+    end_date: str = ""
 
 
 class TrialRecordResponse(BaseModel):
@@ -1074,12 +1080,25 @@ async def _run_hyperopt_task(task_id: str, body: HyperoptRunRequest) -> None:
         # Load strategy
         strategy_cls, config = _load_strategy_config(body.strategy_id, body.symbol)
 
-        # Generate synthetic bars for the optimisation (1 year of hourly data)
-        bars = _generate_sample_bars(
-            count=8760,
-            seed=hash(task_id) % 2**31,
-            timeframe=body.timeframe,
-        )
+        # Use date range if provided, otherwise generate synthetic 1-year data
+        if body.start_date and body.end_date:
+            start_dt = datetime.fromisoformat(body.start_date).replace(tzinfo=UTC)
+            end_dt = datetime.fromisoformat(body.end_date).replace(tzinfo=UTC)
+            tf_minutes = _TIMEFRAME_MINUTES.get(body.timeframe, 60)
+            total_minutes = int((end_dt - start_dt).total_seconds() / 60)
+            bar_count = max(total_minutes // tf_minutes, 200)
+            bars = _generate_sample_bars(
+                bar_count,
+                seed=hash(task_id) % 2**31,
+                start=start_dt,
+                timeframe=body.timeframe,
+            )
+        else:
+            bars = _generate_sample_bars(
+                count=8760,
+                seed=hash(task_id) % 2**31,
+                timeframe=body.timeframe,
+            )
 
         # Build parameter space
         param_defs = [
@@ -1094,23 +1113,31 @@ async def _run_hyperopt_task(task_id: str, body: HyperoptRunRequest) -> None:
         ]
         space = ParameterSpace(params=param_defs)
 
-        # Progress callback — update task state after each trial
-        async def _on_trial_complete(trial_num: int, completed: int, total: int) -> None:
-            _HYPEROPT_TASKS[task_id]["completed_trials"] = completed
-            _HYPEROPT_TASKS[task_id]["total_trials"] = total
-            # Track best Sharpe seen so far
-            results_so_far = _HYPEROPT_RESULTS.get(task_id)
-            if results_so_far is not None and results_so_far.trials:
-                best = max(r.sharpe for r in results_so_far.trials[:completed])
-                _HYPEROPT_TASKS[task_id]["best_so_far"] = best
+        # Thread-safe progress callback — updates the shared task dict
+        # from the worker thread's event loop.
+        best_sharpe_seen = float("-inf")
+
+        async def _on_trial_complete(
+            trial_num: int,
+            completed: int,
+            total: int,
+            record: Any,
+        ) -> None:
+            nonlocal best_sharpe_seen
+            task_state = _HYPEROPT_TASKS[task_id]
+            task_state["completed_trials"] = completed
+            task_state["total_trials"] = total
+            task_state["last_trial_sharpe"] = record.sharpe
+            task_state["current_trial_params"] = record.params
+            if record.sharpe > best_sharpe_seen:
+                best_sharpe_seen = record.sharpe
+            task_state["best_so_far"] = best_sharpe_seen
 
         # Run in a thread so the backtest coroutines can use their own loop
         def _run_in_thread() -> HyperoptResult:
             loop = asyncio.new_event_loop()
             try:
                 runner = HyperoptRunner(BacktestRunner())
-                # Use a simple wrapper because the thread loop can't share the
-                # main-loop's callbacks; we collect progress after the fact.
                 return loop.run_until_complete(
                     runner.run(
                         strategy_class=strategy_cls,
@@ -1122,6 +1149,7 @@ async def _run_hyperopt_task(task_id: str, body: HyperoptRunRequest) -> None:
                         max_trials=body.max_trials,
                         symbol=body.symbol,
                         timeframe=tf,
+                        on_trial_complete=_on_trial_complete,
                     )
                 )
             finally:
@@ -1211,12 +1239,17 @@ async def get_hyperopt_progress(task_id: str) -> dict[str, Any]:
             detail=f"Hyperopt task {task_id} not found",
         )
     t = _HYPEROPT_TASKS[task_id]
+    req = t.get("request", {})
     return {
         "task_id": task_id,
         "status": t["status"],
         "completed_trials": t["completed_trials"],
         "total_trials": t["total_trials"],
         "best_so_far": t.get("best_so_far"),
+        "current_trial_params": t.get("current_trial_params"),
+        "last_trial_sharpe": t.get("last_trial_sharpe"),
+        "start_date": req.get("start_date", ""),
+        "end_date": req.get("end_date", ""),
     }
 
 

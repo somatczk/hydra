@@ -79,6 +79,17 @@ export default function OptimizePage() {
     return null;
   });
   const [maxTrials, setMaxTrials] = useState('100');
+  const [startDate, setStartDate] = useState('2025-01-01');
+  const [endDate, setEndDate] = useState('2026-03-01');
+  const [trialStatus, setTrialStatus] = useState<{
+    completed: number;
+    total: number;
+    bestSoFar: number | null;
+    lastSharpe: number | null;
+    currentParams: Record<string, number> | null;
+    startDate: string;
+    endDate: string;
+  } | null>(null);
   const [params, setParams] = useState<ParamRange[]>(
     DEFAULT_PARAMS.map((p) => ({ ...p })),
   );
@@ -133,18 +144,32 @@ export default function OptimizePage() {
           status: string;
           completed_trials: number;
           total_trials: number;
-          results?: OptimizeResult[];
+          best_so_far: number | null;
+          current_trial_params: Record<string, number> | null;
+          last_trial_sharpe: number | null;
+          start_date: string;
+          end_date: string;
         }>(`/api/backtest/hyperopt/${pollingTaskId}`);
         setProgress(
           status.total_trials > 0
             ? Math.round((status.completed_trials / status.total_trials) * 100)
             : 0,
         );
+        setTrialStatus({
+          completed: status.completed_trials,
+          total: status.total_trials,
+          bestSoFar: status.best_so_far,
+          lastSharpe: status.last_trial_sharpe,
+          currentParams: status.current_trial_params,
+          startDate: status.start_date,
+          endDate: status.end_date,
+        });
         if (status.status === 'completed' || status.status === 'failed') {
           clearInterval(interval);
           setPollingTaskId(null);
           setRunning(false);
           setProgress(0);
+          setTrialStatus(null);
           // Refresh history list
           fetchApi<HyperoptHistoryEntry[]>('/api/backtest/hyperopt/history')
             .then(setHistory)
@@ -160,6 +185,7 @@ export default function OptimizePage() {
         setPollingTaskId(null);
         setRunning(false);
         setProgress(0);
+        setTrialStatus(null);
       }
     }, 2000);
     return () => clearInterval(interval);
@@ -184,6 +210,8 @@ export default function OptimizePage() {
             strategy_id: strategyId,
             param_space: paramSpace,
             max_trials: parseInt(maxTrials, 10) || 100,
+            start_date: startDate,
+            end_date: endDate,
           }),
         },
       );
@@ -297,7 +325,7 @@ export default function OptimizePage() {
 
       {/* Configuration */}
       <DataCard title="Configuration" description="Select strategy and define parameter search space">
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3 mb-6">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4 mb-6">
           <Select
             label="Strategy"
             options={strategies.map((s) => ({ value: s.id, label: s.name }))}
@@ -310,6 +338,18 @@ export default function OptimizePage() {
             type="number"
             value={maxTrials}
             onChange={(e) => setMaxTrials(e.target.value)}
+          />
+          <Input
+            label="Start Date"
+            type="date"
+            value={startDate}
+            onChange={(e) => setStartDate(e.target.value)}
+          />
+          <Input
+            label="End Date"
+            type="date"
+            value={endDate}
+            onChange={(e) => setEndDate(e.target.value)}
           />
         </div>
 
@@ -349,14 +389,56 @@ export default function OptimizePage() {
             {running ? `Running${progress > 0 ? ` (${progress}%)` : '...'}` : 'Run Optimization'}
           </Button>
           {running && (
-            <div className="flex items-center gap-3">
-              <div className="flex-1 h-2 rounded-full bg-bg-tertiary overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-accent-primary transition-all duration-500 ease-out"
-                  style={{ width: `${progress}%` }}
-                />
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <div className="flex-1 h-2 rounded-full bg-bg-tertiary overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-accent-primary transition-all duration-500 ease-out"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+                <span className="text-xs text-text-muted w-10 text-right">{progress}%</span>
               </div>
-              <span className="text-xs text-text-muted w-10 text-right">{progress}%</span>
+              {trialStatus && (
+                <div className="rounded-lg border border-border-default bg-bg-secondary p-3 space-y-2">
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
+                    <div className="flex justify-between">
+                      <span className="text-text-muted">Trial</span>
+                      <span className="font-mono text-text-primary">{trialStatus.completed} / {trialStatus.total}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-text-muted">Best Sharpe</span>
+                      <span className={`font-mono ${trialStatus.bestSoFar != null && trialStatus.bestSoFar > 0 ? 'text-status-success' : 'text-text-primary'}`}>
+                        {trialStatus.bestSoFar != null ? trialStatus.bestSoFar.toFixed(3) : '—'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-text-muted">Last Trial Sharpe</span>
+                      <span className="font-mono text-text-secondary">
+                        {trialStatus.lastSharpe != null ? trialStatus.lastSharpe.toFixed(3) : '—'}
+                      </span>
+                    </div>
+                    {trialStatus.startDate && trialStatus.endDate && (
+                      <div className="flex justify-between">
+                        <span className="text-text-muted">Period</span>
+                        <span className="font-mono text-text-secondary">{trialStatus.startDate} — {trialStatus.endDate}</span>
+                      </div>
+                    )}
+                  </div>
+                  {trialStatus.currentParams && (
+                    <div className="pt-1 border-t border-border-default">
+                      <p className="text-[10px] text-text-muted mb-1">Last Trial Parameters</p>
+                      <div className="flex flex-wrap gap-2">
+                        {Object.entries(trialStatus.currentParams).map(([k, v]) => (
+                          <span key={k} className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 text-[10px] font-mono text-text-secondary">
+                            {k}=<span className="text-text-primary">{typeof v === 'number' ? v.toFixed(2) : v}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -283,7 +283,7 @@ class HyperoptRunner:
             trial_records.append(record)
 
             if on_trial_complete is not None:
-                await on_trial_complete(trial_num + 1, trial_num + 1, max_trials)
+                await on_trial_complete(trial_num + 1, trial_num + 1, max_trials, record)
 
             # Yield to event loop so API stays responsive
             await asyncio.sleep(0)
@@ -324,7 +324,7 @@ class HyperoptRunner:
             trial_records.append(record)
 
             if on_trial_complete is not None:
-                await on_trial_complete(trial_num + 1, trial_num + 1, total)
+                await on_trial_complete(trial_num + 1, trial_num + 1, total, record)
 
             await asyncio.sleep(0)
 
