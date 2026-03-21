@@ -212,7 +212,12 @@ export default function RiskPage() {
   }, []);
 
   useEffect(() => {
-    fetchApi<DailyPnl[]>('/api/portfolio/daily-pnl')
+    fetchApi<{ trading_mode: string }>('/api/system/config')
+      .catch(() => ({ trading_mode: 'paper' }))
+      .then((cfg) => {
+        const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+        return fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl?source=${source}`);
+      })
       .then((data) => setDailyPnl(data))
       .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); });
   }, []);

@@ -111,59 +111,142 @@ _EMPTY_SUMMARY = PortfolioSummary(
 # ---------------------------------------------------------------------------
 
 
+def _get_paper_capital(request: Request) -> float:
+    """Read the global paper_capital from system config (the central wallet)."""
+    from hydra.dashboard.routes.system import get_paper_capital
+
+    return get_paper_capital(request)
+
+
 @router.get("/summary", response_model=PortfolioSummary)
 async def get_summary(request: Request, source: str | None = None) -> PortfolioSummary | dict:
-    """Total value, unrealized PnL, realized PnL, fees."""
+    """Total value, unrealized PnL, realized PnL, fees.
+
+    For paper mode, total_value uses the central-wallet model:
+    global paper_capital is the "exchange balance", each strategy draws
+    from it.  total_value = paper_capital + realized_pnl + unrealized_pnl.
+    """
     pool = _pool_from_request(request)
     if pool is None:
         return _EMPTY_SUMMARY
 
     try:
         async with pool.acquire() as conn:
+            # Determine running session IDs for the requested source
+            running_ids: list[str] = []
             if source:
+                rows = await conn.fetch(
+                    "SELECT id FROM trading_sessions "
+                    "WHERE status = 'running' AND trading_mode = $1",
+                    source,
+                )
+                running_ids = [r["id"] for r in rows]
+
+            # --- Realized PnL & fees: only from running sessions ---
+            if running_ids:
+                realized_pnl = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                        "WHERE source = $1 AND session_id = ANY($2)",
+                        source,
+                        running_ids,
+                    )
+                )
+                total_fees = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(fee), 0) FROM trades "
+                        "WHERE source = $1 AND session_id = ANY($2)",
+                        source,
+                        running_ids,
+                    )
+                )
+                daily_pnl = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                        "WHERE source = $1 AND session_id = ANY($2) "
+                        "AND timestamp >= date_trunc('day', now())",
+                        source,
+                        running_ids,
+                    )
+                )
+            elif source:
+                realized_pnl = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE source = $1",
+                        source,
+                    )
+                )
+                total_fees = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(fee), 0) FROM trades WHERE source = $1",
+                        source,
+                    )
+                )
+                daily_pnl = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                        "WHERE source = $1 AND timestamp >= date_trunc('day', now())",
+                        source,
+                    )
+                )
+            else:
+                realized_pnl = float(
+                    await conn.fetchval("SELECT COALESCE(SUM(pnl), 0) FROM trades")
+                )
+                total_fees = float(await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades"))
+                daily_pnl = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                        "WHERE timestamp >= date_trunc('day', now())"
+                    )
+                )
+
+            # --- Unrealized PnL: from open positions of running sessions ---
+            if running_ids:
+                unrealized_pnl = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions "
+                        "WHERE source = $1 AND session_id = ANY($2)",
+                        source,
+                        running_ids,
+                    )
+                )
+            elif source:
+                unrealized_pnl = float(
+                    await conn.fetchval(
+                        "SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions WHERE source = $1",
+                        source,
+                    )
+                )
+            else:
+                unrealized_pnl = float(
+                    await conn.fetchval("SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions")
+                )
+
+            # --- Total value: central-wallet model ---
+            # Paper mode: total = global paper_capital + PnL (strategies
+            # draw from the wallet; profit/loss adjusts it).
+            # Live/other: fall back to latest balance snapshot.
+            if source == "paper":
+                wallet = _get_paper_capital(request)
+                total_value = wallet + realized_pnl + unrealized_pnl - total_fees
+            else:
                 snapshot = await conn.fetchrow(
-                    "SELECT total_value, unrealized_pnl, realized_pnl "
-                    "FROM balance_snapshots WHERE source = $1 ORDER BY timestamp DESC LIMIT 1",
-                    source,
+                    "SELECT total_value FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
                 )
-                fees_row = await conn.fetchval(
-                    "SELECT COALESCE(SUM(fee), 0) FROM trades WHERE source = $1",
-                    source,
-                )
-                daily_pnl_row = await conn.fetchval(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE source = $1 AND timestamp >= date_trunc('day', now())",
-                    source,
-                )
+                total_value = float(snapshot["total_value"]) if snapshot else 0.0
+
+            # Max drawdown from equity curve
+            if source:
                 equity_rows = await conn.fetch(
                     "SELECT total_value FROM balance_snapshots "
                     "WHERE source = $1 ORDER BY timestamp",
                     source,
                 )
             else:
-                snapshot = await conn.fetchrow(
-                    "SELECT total_value, unrealized_pnl, realized_pnl "
-                    "FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
-                )
-                fees_row = await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades")
-                daily_pnl_row = await conn.fetchval(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE timestamp >= date_trunc('day', now())"
-                )
                 equity_rows = await conn.fetch(
                     "SELECT total_value FROM balance_snapshots ORDER BY timestamp"
                 )
-
-            if snapshot is None:
-                return _EMPTY_SUMMARY
-
-            total_value = float(snapshot["total_value"])
-            unrealized_pnl = float(snapshot["unrealized_pnl"])
-            realized_pnl = float(snapshot["realized_pnl"])
-            total_fees = float(fees_row)
-            daily_pnl = float(daily_pnl_row)
-
-            # Compute max drawdown from equity curve
             max_drawdown_pct = 0.0
             peak = 0.0
             for row in equity_rows:
@@ -175,8 +258,11 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
                     if dd > max_drawdown_pct:
                         max_drawdown_pct = dd
 
-            # Derive change_pct from unrealized pnl relative to total value
-            change_pct = round(unrealized_pnl / total_value * 100, 2) if total_value else 0.0
+            change_pct = (
+                round((realized_pnl + unrealized_pnl) / total_value * 100, 2)
+                if total_value
+                else 0.0
+            )
 
             return {
                 "total_value": round(total_value, 2),
@@ -214,16 +300,38 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
                     "avg_entry_price, unrealized_pnl, realized_pnl FROM positions"
                 )
 
-        if not rows:
-            return []
+            if not rows:
+                return []
+
+            # Fetch latest prices from OHLCV for all position symbols
+            symbols = list({row["symbol"] for row in rows})
+            latest_prices: dict[str, float] = {}
+            try:
+                for sym in symbols:
+                    price_row = await conn.fetchval(
+                        "SELECT close FROM ts.ohlcv_1m WHERE symbol = $1 "
+                        "ORDER BY timestamp DESC LIMIT 1",
+                        sym,
+                    )
+                    if price_row is not None:
+                        latest_prices[sym] = float(price_row)
+            except Exception:
+                pass  # Table may not exist; fall back to entry price
 
         positions: list[dict] = []
         for row in rows:
             entry_price = float(row["avg_entry_price"])
             quantity = float(row["quantity"])
-            unrealized_pnl = float(row["unrealized_pnl"])
-            # No live feed yet -- use entry price as current price
-            current_price = entry_price
+            direction = row["direction"]
+            symbol = row["symbol"]
+            current_price = latest_prices.get(symbol, entry_price)
+
+            # Recompute unrealized PnL from current price
+            if direction == "LONG":
+                unrealized_pnl = (current_price - entry_price) * quantity
+            else:
+                unrealized_pnl = (entry_price - current_price) * quantity
+
             pnl_pct = (
                 round(unrealized_pnl / (entry_price * quantity) * 100, 2)
                 if entry_price * quantity
@@ -233,13 +341,13 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
             positions.append(
                 {
                     "id": f"pos-{row['id']}",
-                    "pair": _format_pair(row["symbol"]),
+                    "pair": _format_pair(symbol),
                     "exchange": row["exchange_id"],
-                    "side": "Long" if row["direction"] == "LONG" else "Short",
+                    "side": "Long" if direction == "LONG" else "Short",
                     "size": quantity,
                     "entry_price": entry_price,
                     "current_price": current_price,
-                    "unrealized_pnl": unrealized_pnl,
+                    "unrealized_pnl": round(unrealized_pnl, 2),
                     "pnl_pct": pnl_pct,
                 }
             )

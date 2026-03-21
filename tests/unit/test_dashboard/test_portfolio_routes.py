@@ -103,15 +103,13 @@ class TestPortfolioWithPool:
 
     def test_summary_from_db(self) -> None:
         pool, conn = _make_mock_pool()
+        # No source param: fetchval called 4 times:
+        # realized_pnl, fees, daily_pnl, unrealized_pnl
+        # Then fetchrow for snapshot (total_value), then fetch for equity curve
+        conn.fetchval = AsyncMock(side_effect=[1500.00, 85.50, 42.00, 200.00])
         conn.fetchrow = AsyncMock(
-            return_value={
-                "total_value": 12000.50,
-                "unrealized_pnl": 200.00,
-                "realized_pnl": 1500.00,
-            }
+            return_value={"total_value": 12000.50}
         )
-        # fetchval called twice: fees then daily_pnl
-        conn.fetchval = AsyncMock(side_effect=[85.50, 42.00])
         conn.fetch = AsyncMock(
             return_value=[
                 {"total_value": 10000.00},

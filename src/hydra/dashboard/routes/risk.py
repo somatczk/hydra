@@ -167,17 +167,54 @@ async def get_risk_status(request: Request) -> dict[str, Any]:
     """Current risk status: circuit breaker tiers, drawdown, daily loss."""
     pool = _pool_from_request(request)
     drawdown_limit = 15.0
+    daily_loss_limit = 500.0
+    current_drawdown = 0.0
+    daily_loss = 0.0
 
     if pool is not None:
         cfg = await _get_risk_config_from_db(pool)
         if cfg is not None:
             drawdown_limit = float(cfg.get("max_drawdown_pct", 0.15)) * 100
+            daily_loss_limit_pct = float(cfg.get("max_daily_loss_pct", 0.03))
+
+        try:
+            async with pool.acquire() as conn:
+                # Get paper_capital for limit calculation
+                from hydra.dashboard.routes.system import get_paper_capital
+
+                paper_capital = get_paper_capital(request)
+                daily_loss_limit = paper_capital * daily_loss_limit_pct
+
+                # Daily loss from running paper sessions
+                daily_loss_val = await conn.fetchval(
+                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                    "WHERE source = 'paper' AND timestamp >= date_trunc('day', now()) "
+                    "AND session_id IN (SELECT id FROM trading_sessions WHERE status = 'running')"
+                )
+                daily_loss = abs(float(daily_loss_val)) if float(daily_loss_val) < 0 else 0.0
+
+                # Current drawdown from equity curve peak
+                equity_rows = await conn.fetch(
+                    "SELECT total_value FROM balance_snapshots "
+                    "WHERE source = 'paper' ORDER BY timestamp"
+                )
+                peak = paper_capital
+                latest = paper_capital
+                for row in equity_rows:
+                    val = float(row["total_value"])
+                    if val > peak:
+                        peak = val
+                    latest = val
+                if peak > 0:
+                    current_drawdown = round((peak - latest) / peak * 100, 2)
+        except Exception:
+            logger.exception("Failed to compute risk status from DB")
 
     return {
-        "current_drawdown": 4.2,
+        "current_drawdown": current_drawdown,
         "max_drawdown_limit": drawdown_limit,
-        "daily_loss": 48.90,
-        "daily_loss_limit": 500.0,
+        "daily_loss": round(daily_loss, 2),
+        "daily_loss_limit": round(daily_loss_limit, 2),
         "circuit_breakers": _CIRCUIT_BREAKERS,
     }
 
@@ -210,14 +247,61 @@ async def reset_circuit_breaker(tier: int) -> dict[str, Any]:
 
 
 @router.get("/var", response_model=VarEstimate)
-async def get_var() -> VarEstimate:
-    """Value at Risk estimate for the current portfolio."""
+async def get_var(request: Request) -> VarEstimate:
+    """Value at Risk estimate computed from daily PnL history."""
+    from hydra.dashboard.routes.system import get_paper_capital
+
+    paper_capital = get_paper_capital(request)
+    portfolio_value = paper_capital
+    var_95 = 0.0
+    var_99 = 0.0
+    cvar_95 = 0.0
+    method = "historical_simulation"
+
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                # Current portfolio value = capital + running session PnL
+                pnl = await conn.fetchval(
+                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                    "WHERE source = 'paper' AND session_id IN "
+                    "(SELECT id FROM trading_sessions WHERE status = 'running')"
+                )
+                fees = await conn.fetchval(
+                    "SELECT COALESCE(SUM(fee), 0) FROM trades "
+                    "WHERE source = 'paper' AND session_id IN "
+                    "(SELECT id FROM trading_sessions WHERE status = 'running')"
+                )
+                portfolio_value += float(pnl) - float(fees)
+
+                # Daily PnL series for VaR calculation
+                rows = await conn.fetch(
+                    "SELECT SUM(pnl) AS daily_pnl FROM trades "
+                    "WHERE source = 'paper' "
+                    "GROUP BY date_trunc('day', timestamp) "
+                    "ORDER BY date_trunc('day', timestamp)"
+                )
+                if len(rows) >= 5:
+                    daily_pnls = sorted(float(r["daily_pnl"]) for r in rows)
+                    n = len(daily_pnls)
+                    # VaR = loss at percentile (negative values are losses)
+                    idx_95 = max(0, int(n * 0.05))
+                    idx_99 = max(0, int(n * 0.01))
+                    var_95 = abs(min(daily_pnls[idx_95], 0))
+                    var_99 = abs(min(daily_pnls[idx_99], 0))
+                    # CVaR = average of losses beyond VaR
+                    tail = [v for v in daily_pnls[: idx_95 + 1] if v < 0]
+                    cvar_95 = abs(sum(tail) / len(tail)) if tail else var_95
+        except Exception:
+            logger.exception("Failed to compute VaR from DB")
+
     return VarEstimate(
-        var_95=312.50,
-        var_99=487.20,
-        cvar_95=425.80,
-        portfolio_value=12450.0,
-        calculation_method="historical_simulation",
+        var_95=round(var_95, 2),
+        var_99=round(var_99, 2),
+        cvar_95=round(cvar_95, 2),
+        portfolio_value=round(portfolio_value, 2),
+        calculation_method=method,
     )
 
 

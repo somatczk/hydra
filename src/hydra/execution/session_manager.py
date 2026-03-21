@@ -266,7 +266,7 @@ class SessionManager:
 
         executor: Any
         if trading_mode == "paper":
-            initial_bal = {"USDT": paper_capital or Decimal("10000")}
+            initial_bal = {"USDT": paper_capital or Decimal("10000")}  # per-strategy allocation
             executor = PaperTradingExecutor(
                 exchange_id=cfg.exchange.exchange_id,
                 initial_balances=initial_bal,

@@ -150,6 +150,17 @@ _HEALTH_PLACEHOLDER: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
+def get_paper_capital(request: Request) -> float:
+    """Read the paper_capital from system config (single source of truth).
+
+    Used by portfolio and risk routes for the central-wallet model.
+    """
+    cfg = _get_system_config(request)
+    if cfg and "paper_capital" in cfg:
+        return float(cfg["paper_capital"])
+    return PlatformConfig().paper_capital
+
+
 @router.get("/config", response_model=PlatformConfig)
 async def get_config(request: Request) -> PlatformConfig:
     """Return the platform configuration from persisted state or env vars."""
@@ -165,18 +176,12 @@ async def get_config(request: Request) -> PlatformConfig:
         max_strategies = int(max_strategies_raw)
     except ValueError:
         max_strategies = 5
-    paper_capital_raw = os.environ.get("HYDRA_PAPER_CAPITAL", "10000")
-    try:
-        paper_capital = float(paper_capital_raw)
-    except ValueError:
-        paper_capital = 10000.0
 
     return PlatformConfig(
         trading_mode=trading_mode,
         default_pair=default_pair,
         default_timeframe=default_timeframe,
         max_concurrent_strategies=max_strategies,
-        paper_capital=paper_capital,
     )
 
 
