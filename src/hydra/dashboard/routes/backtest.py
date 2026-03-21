@@ -11,7 +11,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from hydra.backtest.hyperopt import HyperoptResult, HyperoptRunner, ParamDef, ParameterSpace
 from hydra.backtest.runner import BacktestRunner
+from hydra.backtest.walkforward import WalkForwardAnalyzer, WalkForwardResult
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes.strategies import (
     _CONFIG_DIR as _STRATEGY_CONFIG_DIR,
@@ -972,3 +974,455 @@ async def list_backtest_strategies() -> list[dict[str, str]]:
                     }
                 )
     return strategies
+
+
+# ===========================================================================
+# Hyperparameter optimisation
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# In-memory state for hyperopt tasks
+# ---------------------------------------------------------------------------
+
+_HYPEROPT_TASKS: dict[str, dict[str, Any]] = {}
+_HYPEROPT_RESULTS: dict[str, HyperoptResult] = {}
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request/response models
+# ---------------------------------------------------------------------------
+
+
+class ParamDefRequest(BaseModel):
+    """Wire representation of a single parameter definition."""
+
+    name: str
+    type: str  # "int" | "float" | "categorical"
+    low: float | None = None
+    high: float | None = None
+    choices: list[Any] = Field(default_factory=list)
+
+
+class HyperoptRunRequest(BaseModel):
+    strategy_id: str
+    param_space: list[ParamDefRequest]
+    method: str = "bayesian"  # "bayesian" | "grid"
+    max_trials: int = Field(default=50, ge=1, le=500)
+    symbol: str = "BTCUSDT"
+    timeframe: str = "1h"
+    initial_capital: float = 10000.0
+
+
+class HyperoptRunResponse(BaseModel):
+    task_id: str
+    status: str = "queued"
+
+
+class HyperoptProgressResponse(BaseModel):
+    task_id: str
+    status: str
+    completed_trials: int
+    total_trials: int
+    best_so_far: float | None = None
+
+
+class TrialRecordResponse(BaseModel):
+    trial_number: int
+    params: dict[str, Any]
+    sharpe: float
+    total_return: float
+    max_drawdown: float
+    total_trades: int
+
+
+class HyperoptResultResponse(BaseModel):
+    task_id: str
+    status: str
+    best_params: dict[str, Any]
+    best_metric: float
+    trials: list[TrialRecordResponse]
+    total_trials: int
+    completed_trials: int
+
+
+# ---------------------------------------------------------------------------
+# Background task
+# ---------------------------------------------------------------------------
+
+
+async def _run_hyperopt_task(task_id: str, body: HyperoptRunRequest) -> None:
+    """Execute a hyperopt run in the background and store results."""
+    _HYPEROPT_TASKS[task_id]["status"] = "running"
+
+    try:
+        # Resolve timeframe
+        try:
+            tf = Timeframe(body.timeframe)
+        except ValueError:
+            tf = Timeframe.H1
+
+        # Load strategy
+        strategy_cls, config = _load_strategy_config(body.strategy_id, body.symbol)
+
+        # Generate synthetic bars for the optimisation (1 year of hourly data)
+        bars = _generate_sample_bars(
+            count=8760,
+            seed=hash(task_id) % 2**31,
+            timeframe=body.timeframe,
+        )
+
+        # Build parameter space
+        param_defs = [
+            ParamDef(
+                name=p.name,
+                type=p.type,  # type: ignore[arg-type]
+                low=p.low,
+                high=p.high,
+                choices=p.choices,
+            )
+            for p in body.param_space
+        ]
+        space = ParameterSpace(params=param_defs)
+
+        # Progress callback — update task state after each trial
+        async def _on_trial_complete(trial_num: int, completed: int, total: int) -> None:
+            _HYPEROPT_TASKS[task_id]["completed_trials"] = completed
+            _HYPEROPT_TASKS[task_id]["total_trials"] = total
+            # Track best Sharpe seen so far
+            results_so_far = _HYPEROPT_RESULTS.get(task_id)
+            if results_so_far is not None and results_so_far.trials:
+                best = max(r.sharpe for r in results_so_far.trials[:completed])
+                _HYPEROPT_TASKS[task_id]["best_so_far"] = best
+
+        # Run in a thread so the backtest coroutines can use their own loop
+        def _run_in_thread() -> HyperoptResult:
+            loop = asyncio.new_event_loop()
+            try:
+                runner = HyperoptRunner(BacktestRunner())
+                # Use a simple wrapper because the thread loop can't share the
+                # main-loop's callbacks; we collect progress after the fact.
+                return loop.run_until_complete(
+                    runner.run(
+                        strategy_class=strategy_cls,
+                        base_config=config,
+                        bars=bars,
+                        initial_capital=Decimal(str(body.initial_capital)),
+                        param_space=space,
+                        method=body.method,  # type: ignore[arg-type]
+                        max_trials=body.max_trials,
+                        symbol=body.symbol,
+                        timeframe=tf,
+                    )
+                )
+            finally:
+                loop.close()
+
+        result = await asyncio.to_thread(_run_in_thread)
+
+        _HYPEROPT_RESULTS[task_id] = result
+        _HYPEROPT_TASKS[task_id]["status"] = "completed"
+        _HYPEROPT_TASKS[task_id]["completed_trials"] = result.completed_trials
+        _HYPEROPT_TASKS[task_id]["total_trials"] = result.total_trials
+        _HYPEROPT_TASKS[task_id]["best_so_far"] = result.best_metric
+
+    except Exception as exc:
+        logger.exception("Hyperopt task %s failed", task_id)
+        _HYPEROPT_TASKS[task_id]["status"] = "failed"
+        _HYPEROPT_TASKS[task_id]["error"] = str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/hyperopt",
+    response_model=HyperoptRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_hyperopt(body: HyperoptRunRequest, request: Request) -> dict[str, Any]:
+    """Start a hyperparameter optimisation run.
+
+    Returns a ``task_id`` to poll for progress and results.
+    """
+    task_id = f"ho-{uuid.uuid4().hex[:8]}"
+    _HYPEROPT_TASKS[task_id] = {
+        "task_id": task_id,
+        "status": "queued",
+        "completed_trials": 0,
+        "total_trials": body.max_trials,
+        "best_so_far": None,
+        "request": body.model_dump(),
+    }
+
+    task = asyncio.create_task(_run_hyperopt_task(task_id, body))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    return {"task_id": task_id, "status": "queued"}
+
+
+@router.get(
+    "/hyperopt/{task_id}",
+    response_model=HyperoptProgressResponse,
+)
+async def get_hyperopt_progress(task_id: str) -> dict[str, Any]:
+    """Poll progress of a running hyperopt task."""
+    if task_id not in _HYPEROPT_TASKS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Hyperopt task {task_id} not found",
+        )
+    t = _HYPEROPT_TASKS[task_id]
+    return {
+        "task_id": task_id,
+        "status": t["status"],
+        "completed_trials": t["completed_trials"],
+        "total_trials": t["total_trials"],
+        "best_so_far": t.get("best_so_far"),
+    }
+
+
+@router.get(
+    "/hyperopt/{task_id}/results",
+    response_model=HyperoptResultResponse,
+)
+async def get_hyperopt_results(task_id: str) -> dict[str, Any]:
+    """Return the full result of a completed hyperopt run."""
+    if task_id not in _HYPEROPT_TASKS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Hyperopt task {task_id} not found",
+        )
+    t = _HYPEROPT_TASKS[task_id]
+    if t["status"] != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Hyperopt task {task_id} is not completed (status: {t['status']})",
+        )
+    result = _HYPEROPT_RESULTS.get(task_id)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No result stored for hyperopt task {task_id}",
+        )
+    return {
+        "task_id": task_id,
+        "status": t["status"],
+        "best_params": result.best_params,
+        "best_metric": result.best_metric,
+        "trials": [
+            {
+                "trial_number": r.trial_number,
+                "params": r.params,
+                "sharpe": r.sharpe,
+                "total_return": r.total_return,
+                "max_drawdown": r.max_drawdown,
+                "total_trades": r.total_trades,
+            }
+            for r in result.trials
+        ],
+        "total_trials": result.total_trials,
+        "completed_trials": result.completed_trials,
+    }
+
+
+# ===========================================================================
+# Walk-forward validation
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# In-memory state for walk-forward tasks
+# ---------------------------------------------------------------------------
+
+_WALKFORWARD_TASKS: dict[str, dict[str, Any]] = {}
+_WALKFORWARD_RESULTS: dict[str, WalkForwardResult] = {}
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request/response models
+# ---------------------------------------------------------------------------
+
+
+class WalkForwardRunRequest(BaseModel):
+    strategy_id: str
+    fold_count: int = Field(default=6, ge=2, le=24)
+    train_pct: float = Field(default=0.75, gt=0.0, lt=1.0)
+    symbol: str = "BTCUSDT"
+    timeframe: str = "1h"
+    initial_capital: float = 10000.0
+
+
+class WalkForwardRunResponse(BaseModel):
+    task_id: str
+    status: str = "queued"
+
+
+class FoldMetricsResponse(BaseModel):
+    fold_index: int
+    in_sample_sharpe: float
+    in_sample_return: float
+    in_sample_drawdown: float
+    in_sample_trades: int
+    out_of_sample_sharpe: float
+    out_of_sample_return: float
+    out_of_sample_drawdown: float
+    out_of_sample_trades: int
+
+
+class WalkForwardResultResponse(BaseModel):
+    task_id: str
+    status: str
+    folds: list[FoldMetricsResponse]
+    aggregated_sharpe: float | None
+    aggregated_return: float | None
+    aggregated_drawdown: float | None
+    out_of_sample_equity: list[float]
+
+
+# ---------------------------------------------------------------------------
+# Background task
+# ---------------------------------------------------------------------------
+
+
+async def _run_walkforward_task(task_id: str, body: WalkForwardRunRequest) -> None:
+    """Execute a walk-forward analysis in the background."""
+    _WALKFORWARD_TASKS[task_id]["status"] = "running"
+
+    try:
+        try:
+            tf = Timeframe(body.timeframe)
+        except ValueError:
+            tf = Timeframe.H1
+
+        # Derive in-sample / out-of-sample month split from fold_count and train_pct.
+        # Use 24 months of total data as a sensible default window.
+        total_months = 24
+        in_sample_months = max(1, round(total_months * body.train_pct / body.fold_count))
+        out_of_sample_months = max(1, round(total_months * (1 - body.train_pct) / body.fold_count))
+
+        strategy_cls, config = _load_strategy_config(body.strategy_id, body.symbol)
+
+        # 2 years of bars at the requested timeframe
+        tf_minutes = _TIMEFRAME_MINUTES.get(body.timeframe, 60)
+        bar_count = (2 * 365 * 24 * 60) // tf_minutes
+        bars = _generate_sample_bars(
+            count=bar_count,
+            seed=hash(task_id) % 2**31,
+            timeframe=body.timeframe,
+        )
+
+        def _run_in_thread() -> WalkForwardResult:
+            loop = asyncio.new_event_loop()
+            try:
+                analyzer = WalkForwardAnalyzer(initial_capital=Decimal(str(body.initial_capital)))
+                return loop.run_until_complete(
+                    analyzer.run_walkforward(
+                        bars=bars,
+                        strategy_class=strategy_cls,
+                        strategy_config=config,
+                        in_sample_months=in_sample_months,
+                        out_of_sample_months=out_of_sample_months,
+                        symbol=body.symbol,
+                        timeframe=tf,
+                    )
+                )
+            finally:
+                loop.close()
+
+        result = await asyncio.to_thread(_run_in_thread)
+
+        _WALKFORWARD_RESULTS[task_id] = result
+        _WALKFORWARD_TASKS[task_id]["status"] = "completed"
+        _WALKFORWARD_TASKS[task_id]["fold_count"] = len(result.folds)
+
+    except Exception as exc:
+        logger.exception("Walk-forward task %s failed", task_id)
+        _WALKFORWARD_TASKS[task_id]["status"] = "failed"
+        _WALKFORWARD_TASKS[task_id]["error"] = str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/walkforward",
+    response_model=WalkForwardRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_walkforward(body: WalkForwardRunRequest, request: Request) -> dict[str, Any]:
+    """Start a walk-forward validation run.
+
+    Returns a ``task_id`` to poll for results.
+    """
+    task_id = f"wf-{uuid.uuid4().hex[:8]}"
+    _WALKFORWARD_TASKS[task_id] = {
+        "task_id": task_id,
+        "status": "queued",
+        "fold_count": 0,
+        "request": body.model_dump(),
+    }
+
+    task = asyncio.create_task(_run_walkforward_task(task_id, body))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    return {"task_id": task_id, "status": "queued"}
+
+
+@router.get(
+    "/walkforward/{task_id}/results",
+    response_model=WalkForwardResultResponse,
+)
+async def get_walkforward_results(task_id: str) -> dict[str, Any]:
+    """Return fold metrics and aggregated OOS equity for a completed walk-forward run."""
+    if task_id not in _WALKFORWARD_TASKS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Walk-forward task {task_id} not found",
+        )
+    t = _WALKFORWARD_TASKS[task_id]
+    if t["status"] != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Walk-forward task {task_id} is not completed (status: {t['status']})",
+        )
+    result = _WALKFORWARD_RESULTS.get(task_id)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No result stored for walk-forward task {task_id}",
+        )
+
+    folds_out: list[dict[str, Any]] = [
+        {
+            "fold_index": fold.fold_index,
+            "in_sample_sharpe": fold.in_sample_metrics.sharpe_ratio,
+            "in_sample_return": float(fold.in_sample_metrics.total_return),
+            "in_sample_drawdown": float(fold.in_sample_metrics.max_drawdown),
+            "in_sample_trades": fold.in_sample_metrics.total_trades,
+            "out_of_sample_sharpe": fold.out_of_sample_metrics.sharpe_ratio,
+            "out_of_sample_return": float(fold.out_of_sample_metrics.total_return),
+            "out_of_sample_drawdown": float(fold.out_of_sample_metrics.max_drawdown),
+            "out_of_sample_trades": fold.out_of_sample_metrics.total_trades,
+        }
+        for fold in result.folds
+    ]
+
+    agg = result.aggregated_oos_metrics
+    oos_equity: list[float] = []
+    if agg is not None:
+        oos_equity = [float(eq) for eq in agg.equity_curve]
+
+    return {
+        "task_id": task_id,
+        "status": t["status"],
+        "folds": folds_out,
+        "aggregated_sharpe": agg.sharpe_ratio if agg is not None else None,
+        "aggregated_return": float(agg.total_return) if agg is not None else None,
+        "aggregated_drawdown": float(agg.max_drawdown) if agg is not None else None,
+        "out_of_sample_equity": oos_equity,
+    }

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
 from hydra.core.types import OHLCV, Timeframe
@@ -944,4 +944,63 @@ async def save_strategy(request: SaveRequest) -> SaveResponse:
         name=request.name,
         config_path=str(config_path),
         message=f"Strategy '{request.name}' saved successfully",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strategy export / import
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{strategy_id}/export")
+async def export_strategy(strategy_id: str) -> Response:
+    """Export a strategy as a downloadable YAML file."""
+    path = _find_strategy_file(strategy_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
+    content = path.read_text()
+    return Response(
+        content=content,
+        media_type="application/x-yaml",
+        headers={"Content-Disposition": f'attachment; filename="{path.name}"'},
+    )
+
+
+@router.post("/import", response_model=SaveResponse, status_code=201)
+async def import_strategy(file: UploadFile) -> SaveResponse:
+    """Import a strategy from an uploaded YAML file."""
+    if not file.filename or not file.filename.endswith((".yaml", ".yml")):
+        raise HTTPException(status_code=422, detail="File must be .yaml or .yml")
+
+    content = await file.read()
+    try:
+        data = yaml.safe_load(content.decode("utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid YAML: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=422, detail="YAML must be a dict")
+
+    # Ensure unique ID
+    import uuid as _uuid
+
+    original_name = data.get("name", "Imported Strategy")
+    suffix = _uuid.uuid4().hex[:6]
+    strategy_id = _name_to_id(original_name) + f"_{suffix}"
+    data["id"] = strategy_id
+    data.setdefault("enabled", False)
+
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _CONFIG_DIR / f"{strategy_id}.yaml"
+    try:
+        with dest.open("w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return SaveResponse(
+        id=strategy_id,
+        name=original_name,
+        config_path=str(dest),
+        message=f"Strategy '{original_name}' imported as '{strategy_id}'",
     )

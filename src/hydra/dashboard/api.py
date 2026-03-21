@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from hydra.core.websocket import manager
 from hydra.dashboard.routes import (
     backtest,
+    market_data,
     models,
     portfolio,
     risk,
@@ -56,6 +57,7 @@ app.include_router(system.router)
 app.include_router(trading.router)
 app.include_router(signals.router)
 app.include_router(templates.router)
+app.include_router(market_data.router)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +379,10 @@ async def _run_migrations() -> None:
                 "CREATE INDEX IF NOT EXISTS ix_trades_strategy ON trades(strategy_id)"
             )
             await conn.execute("CREATE INDEX IF NOT EXISTS ix_trades_ts ON trades(timestamp)")
+            await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''")
+            await conn.execute(
+                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}'"
+            )
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS positions (

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import re
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
@@ -95,6 +98,22 @@ class TradeRecord(BaseModel):
     fee: float
     pnl: float
     timestamp: str
+    strategy_id: str = ""
+    notes: str = ""
+    tags: list[str] = []
+
+
+class TradeListResponse(BaseModel):
+    trades: list[TradeRecord]
+    total: int
+    page: int
+    limit: int
+    pages: int
+
+
+class TradeUpdateRequest(BaseModel):
+    notes: str | None = None
+    tags: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -508,31 +527,82 @@ async def get_attribution(request: Request, source: str | None = None) -> list[d
         return []
 
 
-@router.get("/trades", response_model=list[TradeRecord])
-async def get_trades(request: Request, source: str | None = None) -> list[dict]:
-    """Recent trades (last 20, newest first)."""
+@router.get("/trades", response_model=TradeListResponse)
+async def get_trades(
+    request: Request,
+    source: str | None = None,
+    strategy_id: str | None = None,
+    symbol: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    min_pnl: float | None = None,
+    max_pnl: float | None = None,
+    page: int = 1,
+    limit: int = 20,
+) -> dict:
+    """Filtered, paginated trade journal.
+
+    Returns trade records alongside pagination metadata so clients can
+    implement page controls without a separate count request.
+    """
     pool = _pool_from_request(request)
     if pool is None:
-        return []
+        return {"trades": [], "total": 0, "page": page, "limit": limit, "pages": 0}
+
+    # Clamp inputs to sane bounds
+    page = max(1, page)
+    limit = max(1, min(limit, 500))
+    offset = (page - 1) * limit
+
+    # Build dynamic WHERE clause with positional parameters
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    def _add(condition: str, value: Any) -> None:
+        params.append(value)
+        conditions.append(condition.format(n=len(params)))
+
+    if source is not None:
+        _add("source = ${n}", source)
+    if strategy_id is not None:
+        _add("strategy_id = ${n}", strategy_id)
+    if symbol is not None:
+        _add("symbol = ${n}", symbol)
+    if from_date is not None:
+        _add("timestamp >= ${n}::timestamptz", from_date)
+    if to_date is not None:
+        _add("timestamp <= ${n}::timestamptz", to_date)
+    if min_pnl is not None:
+        _add("pnl >= ${n}", min_pnl)
+    if max_pnl is not None:
+        _add("pnl <= ${n}", max_pnl)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
     try:
         async with pool.acquire() as conn:
-            if source:
-                rows = await conn.fetch(
-                    "SELECT id, symbol, side, price, quantity, fee, pnl, timestamp "
-                    "FROM trades WHERE source = $1 ORDER BY timestamp DESC LIMIT 20",
-                    source,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT id, symbol, side, price, quantity, fee, pnl, timestamp "
-                    "FROM trades ORDER BY timestamp DESC LIMIT 20"
-                )
+            total: int = await conn.fetchval(
+                f"SELECT COUNT(*) FROM trades {where_clause}",  # noqa: S608
+                *params,
+            )
 
-        if not rows:
-            return []
+            # Append LIMIT / OFFSET params after the WHERE params
+            params.append(limit)
+            params.append(offset)
+            limit_n = len(params) - 1
+            offset_n = len(params)
 
-        return [
+            rows = await conn.fetch(
+                f"SELECT id, symbol, side, price, quantity, fee, pnl, timestamp, "  # noqa: S608
+                f"strategy_id, COALESCE(notes, '') AS notes, "
+                f"COALESCE(tags, ARRAY[]::text[]) AS tags "
+                f"FROM trades {where_clause} "
+                f"ORDER BY timestamp DESC "
+                f"LIMIT ${limit_n} OFFSET ${offset_n}",
+                *params,
+            )
+
+        trades = [
             {
                 "id": row["id"],
                 "symbol": row["symbol"],
@@ -542,9 +612,342 @@ async def get_trades(request: Request, source: str | None = None) -> list[dict]:
                 "fee": round(float(row["fee"]), 8),
                 "pnl": round(float(row["pnl"]), 2),
                 "timestamp": row["timestamp"].isoformat(),
+                "strategy_id": row["strategy_id"] or "",
+                "notes": row["notes"],
+                "tags": list(row["tags"]),
             }
             for row in rows
         ]
+
+        pages = (total + limit - 1) // limit if total > 0 else 0
+
+        return {
+            "trades": trades,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": pages,
+        }
     except Exception:
         logger.exception("Failed to fetch trades from DB")
-        return []
+        return {"trades": [], "total": 0, "page": page, "limit": limit, "pages": 0}
+
+
+@router.patch("/trades/{trade_id}", response_model=TradeRecord)
+async def update_trade(trade_id: int, body: TradeUpdateRequest, request: Request) -> dict:
+    """Update journal notes and/or tags on a trade record."""
+    pool = _pool_from_request(request)
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # Build SET clause from provided fields only
+    set_parts: list[str] = []
+    params: list[Any] = []
+
+    def _add_set(clause: str, value: Any) -> None:
+        params.append(value)
+        set_parts.append(clause.format(n=len(params)))
+
+    if body.notes is not None:
+        _add_set("notes = ${n}", body.notes)
+    if body.tags is not None:
+        _add_set("tags = ${n}", body.tags)
+
+    if not set_parts:
+        raise HTTPException(status_code=422, detail="No fields provided for update")
+
+    params.append(trade_id)
+    pk_n = len(params)
+
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"UPDATE trades SET {', '.join(set_parts)} "  # noqa: S608
+                f"WHERE id = ${pk_n} "
+                f"RETURNING id, symbol, side, price, quantity, fee, pnl, timestamp, "
+                f"strategy_id, COALESCE(notes, '') AS notes, "
+                f"COALESCE(tags, ARRAY[]::text[]) AS tags",
+                *params,
+            )
+    except Exception as exc:
+        logger.exception("Failed to update trade %d", trade_id)
+        raise HTTPException(status_code=500, detail="Database error") from exc
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Trade {trade_id} not found")
+
+    return {
+        "id": row["id"],
+        "symbol": row["symbol"],
+        "side": row["side"],
+        "price": float(row["price"]),
+        "quantity": float(row["quantity"]),
+        "fee": round(float(row["fee"]), 8),
+        "pnl": round(float(row["pnl"]), 2),
+        "timestamp": row["timestamp"].isoformat(),
+        "strategy_id": row["strategy_id"] or "",
+        "notes": row["notes"],
+        "tags": list(row["tags"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+_CSV_HEADERS: dict[str, list[str]] = {
+    "generic": ["Date", "Symbol", "Side", "Quantity", "Price", "Fee", "PnL", "Strategy"],
+    "koinly": [
+        "Date",
+        "Sent Amount",
+        "Sent Currency",
+        "Received Amount",
+        "Received Currency",
+        "Fee Amount",
+        "Fee Currency",
+        "Net Worth Amount",
+        "Net Worth Currency",
+        "Label",
+        "Description",
+        "TxHash",
+    ],
+    "turbotax": [
+        "Description of Property",
+        "Date Acquired",
+        "Date Sold",
+        "Proceeds",
+        "Cost Basis",
+        "Gain or Loss",
+    ],
+}
+
+
+def _row_generic(row: Any) -> list[str]:
+    return [
+        row["timestamp"].isoformat(),
+        row["symbol"],
+        row["side"],
+        str(float(row["quantity"])),
+        str(float(row["price"])),
+        str(round(float(row["fee"]), 8)),
+        str(round(float(row["pnl"]), 2)),
+        row["strategy_id"] or "",
+    ]
+
+
+def _row_koinly(row: Any) -> list[str]:
+    """Map a trade row to Koinly CSV format."""
+    side = row["side"].upper()
+    qty = float(row["quantity"])
+    price = float(row["price"])
+    fee = round(float(row["fee"]), 8)
+    pnl = round(float(row["pnl"]), 2)
+    symbol = row["symbol"]
+    m = _PAIR_RE.match(symbol)
+    base = m.group(1) if m else symbol[:3]
+    quote = m.group(2) if m else symbol[3:]
+    proceeds = round(qty * price, 8)
+
+    if side == "BUY":
+        sent_amt, sent_cur = str(proceeds), quote
+        recv_amt, recv_cur = str(qty), base
+    else:
+        sent_amt, sent_cur = str(qty), base
+        recv_amt, recv_cur = str(proceeds), quote
+
+    return [
+        row["timestamp"].isoformat(),
+        sent_amt,
+        sent_cur,
+        recv_amt,
+        recv_cur,
+        str(fee),
+        quote,
+        str(abs(pnl)),
+        quote,
+        "trade",
+        f"{side} {qty} {base}",
+        "",
+    ]
+
+
+def _row_turbotax(row: Any) -> list[str]:
+    """Map a trade row to TurboTax CSV format."""
+    qty = float(row["quantity"])
+    price = float(row["price"])
+    fee = round(float(row["fee"]), 8)
+    pnl = round(float(row["pnl"]), 2)
+    side = row["side"].upper()
+    proceeds = round(qty * price, 8)
+    cost_basis = round(proceeds - pnl - fee, 8)
+    symbol = row["symbol"]
+    m = _PAIR_RE.match(symbol)
+    base = m.group(1) if m else symbol[:3]
+    ts = row["timestamp"].isoformat()
+
+    return [
+        f"{qty} {base} ({side})",
+        ts,  # Date Acquired -- approximated as trade date
+        ts,
+        str(proceeds),
+        str(cost_basis),
+        str(pnl),
+    ]
+
+
+@router.get("/export/csv")
+async def export_trades_csv(
+    request: Request,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    format: str = "generic",
+) -> StreamingResponse:
+    """Export trades as a downloadable CSV file.
+
+    Supported format values: ``generic``, ``koinly``, ``turbotax``.
+    """
+    if format not in _CSV_HEADERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown format '{format}'. Must be one of: {', '.join(_CSV_HEADERS)}",
+        )
+
+    pool = _pool_from_request(request)
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    def _add(condition: str, value: Any) -> None:
+        params.append(value)
+        conditions.append(condition.format(n=len(params)))
+
+    if from_date is not None:
+        _add("timestamp >= ${n}::timestamptz", from_date)
+    if to_date is not None:
+        _add("timestamp <= ${n}::timestamptz", to_date)
+
+    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT id, symbol, side, price, quantity, fee, pnl, timestamp, strategy_id "  # noqa: S608
+                f"FROM trades {where_clause} ORDER BY timestamp ASC",
+                *params,
+            )
+    except Exception as exc:
+        logger.exception("Failed to fetch trades for CSV export")
+        raise HTTPException(status_code=500, detail="Database error") from exc
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_CSV_HEADERS[format])
+
+    row_fn = {"generic": _row_generic, "koinly": _row_koinly, "turbotax": _row_turbotax}[format]
+    for row in rows:
+        writer.writerow(row_fn(row))
+
+    csv_content = buf.getvalue()
+    headers = {"Content-Disposition": f'attachment; filename="hydra_trades_{format}.csv"'}
+    return StreamingResponse(iter([csv_content]), media_type="text/csv", headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# Live performance metrics
+# ---------------------------------------------------------------------------
+
+
+class LiveMetrics(BaseModel):
+    rolling_sharpe_30d: float = 0.0
+    time_weighted_return_30d: float = 0.0
+    avg_trade_duration_hours: float = 0.0
+    trades_per_day: float = 0.0
+
+
+@router.get("/live-metrics", response_model=LiveMetrics)
+async def get_live_metrics(request: Request, source: str | None = None) -> LiveMetrics | dict:
+    """Rolling 30-day performance metrics computed from trade history."""
+    pool = _pool_from_request(request)
+    if pool is None:
+        return LiveMetrics()
+
+    try:
+        async with pool.acquire() as conn:
+            # Daily PnL for last 30 days
+            if source:
+                daily_rows = await conn.fetch(
+                    "SELECT date_trunc('day', timestamp) AS d, SUM(pnl) AS pnl "
+                    "FROM trades WHERE source = $1 "
+                    "AND timestamp >= now() - interval '30 days' "
+                    "GROUP BY d ORDER BY d",
+                    source,
+                )
+            else:
+                daily_rows = await conn.fetch(
+                    "SELECT date_trunc('day', timestamp) AS d, SUM(pnl) AS pnl "
+                    "FROM trades WHERE timestamp >= now() - interval '30 days' "
+                    "GROUP BY d ORDER BY d"
+                )
+            daily_pnls = [float(r["pnl"]) for r in daily_rows]
+
+            # Sharpe ratio (30d daily)
+            import math
+
+            sharpe = 0.0
+            if len(daily_pnls) >= 2:
+                import numpy as np
+
+                arr = np.array(daily_pnls)
+                mean = float(np.mean(arr))
+                std = float(np.std(arr, ddof=1))
+                if std > 0:
+                    sharpe = round(mean / std * math.sqrt(252), 2)
+
+            # Time-weighted return (30d)
+            if source:
+                equity_rows = await conn.fetch(
+                    "SELECT total_value FROM balance_snapshots "
+                    "WHERE source = $1 AND timestamp >= now() - interval '30 days' "
+                    "ORDER BY timestamp",
+                    source,
+                )
+            else:
+                equity_rows = await conn.fetch(
+                    "SELECT total_value FROM balance_snapshots "
+                    "WHERE timestamp >= now() - interval '30 days' "
+                    "ORDER BY timestamp"
+                )
+            twr = 0.0
+            if len(equity_rows) >= 2:
+                first = float(equity_rows[0]["total_value"])
+                last = float(equity_rows[-1]["total_value"])
+                if first > 0:
+                    twr = round((last - first) / first * 100, 2)
+
+            # Trades per day
+            if source:
+                trade_stats = await conn.fetchrow(
+                    "SELECT COUNT(*) AS cnt FROM trades "
+                    "WHERE source = $1 AND timestamp >= now() - interval '30 days'",
+                    source,
+                )
+            else:
+                trade_stats = await conn.fetchrow(
+                    "SELECT COUNT(*) AS cnt FROM trades "
+                    "WHERE timestamp >= now() - interval '30 days'"
+                )
+            cnt = trade_stats["cnt"] if trade_stats else 0
+            days = max(len(daily_pnls), 1)
+            trades_per_day = round(cnt / days, 1) if days > 0 else 0.0
+
+            return {
+                "rolling_sharpe_30d": sharpe,
+                "time_weighted_return_30d": twr,
+                "avg_trade_duration_hours": 0.0,  # Requires entry/exit pairing
+                "trades_per_day": trades_per_day,
+            }
+    except Exception:
+        logger.exception("Failed to compute live metrics")
+        return LiveMetrics()
