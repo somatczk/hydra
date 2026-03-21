@@ -15,6 +15,7 @@ interface RiskConfiguratorProps {
 const STOP_LOSS_METHODS = [
   { value: 'atr', label: 'ATR Multiple' },
   { value: 'fixed_pct', label: 'Fixed Percentage' },
+  { value: 'trailing_stop', label: 'Trailing Stop' },
 ];
 
 const TAKE_PROFIT_METHODS = [
@@ -53,7 +54,13 @@ export function RiskConfigurator({
               }
             />
             <Input
-              label={risk.stopLoss.method === 'atr' ? 'ATR Multiple' : 'Percentage (%)'}
+              label={
+                risk.stopLoss.method === 'atr'
+                  ? 'ATR Multiple'
+                  : risk.stopLoss.method === 'trailing_stop'
+                    ? 'Trail Percentage (%)'
+                    : 'Percentage (%)'
+              }
               type="number"
               value={risk.stopLoss.value}
               min={0.1}
@@ -66,7 +73,9 @@ export function RiskConfigurator({
               hint={
                 risk.stopLoss.method === 'atr'
                   ? 'Multiplier applied to ATR for stop distance'
-                  : 'Fixed percentage below entry price'
+                  : risk.stopLoss.method === 'trailing_stop'
+                    ? 'Stop trails price by this percentage'
+                    : 'Fixed percentage below entry price'
               }
             />
           </div>

@@ -6,6 +6,10 @@ import {
   TrendingUp,
   TrendingDown,
   Receipt,
+  Download,
+  Search,
+  Plus,
+  X,
 } from 'lucide-react';
 import {
   AreaChart,
@@ -22,6 +26,11 @@ import {
 import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
 import { ErrorCard } from '@/components/ui/ErrorCard';
+import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
+import { Select } from '@/components/ui/Select';
+import { Table } from '@/components/ui/Table';
+import { useToast } from '@/components/ui/Toast';
 import { fetchApi } from '@/lib/api';
 import { logger } from '@/lib/logger';
 
@@ -62,6 +71,39 @@ interface AttributionItem {
   pnl: number;
 }
 
+interface StrategyOption {
+  id: string;
+  name: string;
+}
+
+interface Trade {
+  id: string;
+  strategy: string;
+  symbol: string;
+  side: string;
+  entry_time: string;
+  exit_time: string;
+  entry_price: number;
+  exit_price: number;
+  pnl: number;
+  notes: string;
+  tags: string[];
+}
+
+interface TradesResponse {
+  trades: Trade[];
+  total: number;
+  page: number;
+  limit: number;
+  pages: number;
+}
+
+interface SentimentData {
+  value: number;
+  label: string;
+  timestamp: string;
+}
+
 /* ---------- Utilities ---------- */
 
 function computeDrawdown(curve: EquityPoint[]): Array<{ timestamp: string; drawdown: number }> {
@@ -98,10 +140,42 @@ function getReturnColor(pct: number): string {
   return 'bg-status-error';
 }
 
+function getSentimentLabel(value: number): string {
+  if (value <= 24) return 'Extreme Fear';
+  if (value <= 44) return 'Fear';
+  if (value <= 55) return 'Neutral';
+  if (value <= 74) return 'Greed';
+  return 'Extreme Greed';
+}
+
+function getSentimentColor(value: number): string {
+  if (value <= 24) return '#ef4444';
+  if (value <= 44) return '#f97316';
+  if (value <= 55) return '#eab308';
+  if (value <= 74) return '#84cc16';
+  return '#22c55e';
+}
+
+/* ---------- Trade Table Row ---------- */
+
+interface TradeRow {
+  id: string;
+  strategy: string;
+  symbol: string;
+  side: string;
+  entry_time: string;
+  exit_time: string;
+  pnl: number;
+  pnlFormatted: string;
+  notes: string;
+  tags: string[];
+}
+
 /* ---------- Page ---------- */
 
 export default function PortfolioPage() {
   useEffect(() => { logger.info('Portfolio', 'Page mounted'); }, []);
+  const { toast } = useToast();
   const [summary, setSummary] = useState<PortfolioSummary | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [equityCurve, setEquityCurve] = useState<EquityPoint[] | null>(null);
@@ -111,6 +185,35 @@ export default function PortfolioPage() {
   const [loading, setLoading] = useState(true);
   const [isDark, setIsDark] = useState(false);
   const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
+
+  // Sentiment state
+  const [sentiment, setSentiment] = useState<SentimentData | null>(null);
+
+  // Trade journal state
+  const [strategies, setStrategies] = useState<StrategyOption[]>([]);
+  const [filterStrategy, setFilterStrategy] = useState('');
+  const [filterSymbol, setFilterSymbol] = useState('');
+  const [filterFromDate, setFilterFromDate] = useState('');
+  const [filterToDate, setFilterToDate] = useState('');
+  const [filterMinPnl, setFilterMinPnl] = useState('');
+  const [filterMaxPnl, setFilterMaxPnl] = useState('');
+  const [trades, setTrades] = useState<Trade[]>([]);
+  const [tradesTotal, setTradesTotal] = useState(0);
+  const [tradesPage, setTradesPage] = useState(1);
+  const [tradesPages, setTradesPages] = useState(1);
+  const [tradesLoading, setTradesLoading] = useState(false);
+
+  // Inline edit state
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const [editingNoteValue, setEditingNoteValue] = useState('');
+  const [addingTagId, setAddingTagId] = useState<string | null>(null);
+  const [newTagValue, setNewTagValue] = useState('');
+
+  // Export state
+  const [exportFormat, setExportFormat] = useState('generic');
+  const [exportFromDate, setExportFromDate] = useState('');
+  const [exportToDate, setExportToDate] = useState('');
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
@@ -144,6 +247,12 @@ export default function PortfolioPage() {
       fetchApi<AttributionItem[]>(`/api/portfolio/attribution${qs}`)
         .then(setAttribution)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, attribution: true })); }),
+      fetchApi<SentimentData>('/api/market/sentiment')
+        .then(setSentiment)
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, sentiment: true })); }),
+      fetchApi<StrategyOption[]>('/api/strategies')
+        .then((data) => setStrategies(data.map((s) => ({ id: s.id, name: s.name }))))
+        .catch(() => {}),
     ]);
 
     setLoading(false);
@@ -154,6 +263,110 @@ export default function PortfolioPage() {
     const interval = setInterval(loadData, 30_000);
     return () => clearInterval(interval);
   }, [loadData]);
+
+  // Fetch trades with filters
+  const loadTrades = useCallback(async (page = 1) => {
+    setTradesLoading(true);
+    const params = new URLSearchParams();
+    params.set('page', String(page));
+    if (filterStrategy) params.set('strategy_id', filterStrategy);
+    if (filterSymbol) params.set('symbol', filterSymbol);
+    if (filterFromDate) params.set('from_date', filterFromDate);
+    if (filterToDate) params.set('to_date', filterToDate);
+    if (filterMinPnl) params.set('min_pnl', filterMinPnl);
+    if (filterMaxPnl) params.set('max_pnl', filterMaxPnl);
+    try {
+      const res = await fetchApi<TradesResponse>(`/api/portfolio/trades?${params.toString()}`);
+      setTrades(res.trades);
+      setTradesTotal(res.total);
+      setTradesPage(res.page);
+      setTradesPages(res.pages);
+    } catch {
+      toast('error', 'Failed to load trades');
+    } finally {
+      setTradesLoading(false);
+    }
+  }, [filterStrategy, filterSymbol, filterFromDate, filterToDate, filterMinPnl, filterMaxPnl, toast]);
+
+  const handleApplyFilters = () => {
+    loadTrades(1);
+  };
+
+  // Inline note editing
+  const handleNoteSave = async (tradeId: string) => {
+    try {
+      await fetchApi(`/api/portfolio/trades/${tradeId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ notes: editingNoteValue }),
+      });
+      setTrades((prev) => prev.map((t) => t.id === tradeId ? { ...t, notes: editingNoteValue } : t));
+      setEditingNoteId(null);
+    } catch {
+      toast('error', 'Failed to save note');
+    }
+  };
+
+  // Tag management
+  const handleAddTag = async (tradeId: string) => {
+    const tag = newTagValue.trim();
+    if (!tag) return;
+    const trade = trades.find((t) => t.id === tradeId);
+    if (!trade) return;
+    const updatedTags = [...trade.tags, tag];
+    try {
+      await fetchApi(`/api/portfolio/trades/${tradeId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ tags: updatedTags }),
+      });
+      setTrades((prev) => prev.map((t) => t.id === tradeId ? { ...t, tags: updatedTags } : t));
+      setNewTagValue('');
+      setAddingTagId(null);
+    } catch {
+      toast('error', 'Failed to add tag');
+    }
+  };
+
+  const handleRemoveTag = async (tradeId: string, tagIndex: number) => {
+    const trade = trades.find((t) => t.id === tradeId);
+    if (!trade) return;
+    const updatedTags = trade.tags.filter((_, i) => i !== tagIndex);
+    try {
+      await fetchApi(`/api/portfolio/trades/${tradeId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ tags: updatedTags }),
+      });
+      setTrades((prev) => prev.map((t) => t.id === tradeId ? { ...t, tags: updatedTags } : t));
+    } catch {
+      toast('error', 'Failed to remove tag');
+    }
+  };
+
+  // Export handler
+  const handleExport = async () => {
+    setExporting(true);
+    const params = new URLSearchParams();
+    params.set('format', exportFormat);
+    if (exportFromDate) params.set('from_date', exportFromDate);
+    if (exportToDate) params.set('to_date', exportToDate);
+    try {
+      const url = `${process.env.NEXT_PUBLIC_API_URL || window.location.origin}/api/portfolio/export/csv?${params.toString()}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Export failed');
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `trades_${exportFormat}_${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+      toast('success', 'Export downloaded');
+    } catch {
+      toast('error', 'Failed to export trades');
+    } finally {
+      setExporting(false);
+    }
+  };
 
   // Derive allocation from API positions
   const allocationItems = positions.length > 0 && summary
@@ -187,19 +400,141 @@ export default function PortfolioPage() {
   }
   const years = Object.keys(monthlyByYear).map(Number).sort();
 
+  // Trade table columns
+  const tradeColumns = [
+    { key: 'symbol', header: 'Symbol' },
+    { key: 'strategy', header: 'Strategy', hideOnMobile: true },
+    { key: 'side', header: 'Side' },
+    { key: 'entry_time', header: 'Entry', render: (row: TradeRow) => new Date(row.entry_time).toLocaleDateString() },
+    { key: 'exit_time', header: 'Exit', hideOnMobile: true, render: (row: TradeRow) => new Date(row.exit_time).toLocaleDateString() },
+    {
+      key: 'pnl',
+      header: 'PnL',
+      render: (row: TradeRow) => (
+        <span className={row.pnl >= 0 ? 'text-status-success font-medium' : 'text-status-error font-medium'}>
+          {row.pnlFormatted}
+        </span>
+      ),
+    },
+    {
+      key: 'notes',
+      header: 'Notes',
+      render: (row: TradeRow) => (
+        editingNoteId === row.id ? (
+          <input
+            className="h-7 w-32 rounded border border-border-default bg-bg-primary px-2 text-xs text-text-primary focus:outline-none focus:ring-1 focus:ring-border-focus"
+            value={editingNoteValue}
+            onChange={(e) => setEditingNoteValue(e.target.value)}
+            onBlur={() => handleNoteSave(row.id)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleNoteSave(row.id); if (e.key === 'Escape') setEditingNoteId(null); }}
+            autoFocus
+          />
+        ) : (
+          <button
+            className="text-xs text-text-muted hover:text-text-primary cursor-pointer min-w-[60px] text-left"
+            onClick={() => { setEditingNoteId(row.id); setEditingNoteValue(row.notes); }}
+          >
+            {row.notes || 'Add note...'}
+          </button>
+        )
+      ),
+    },
+    {
+      key: 'tags',
+      header: 'Tags',
+      render: (row: TradeRow) => (
+        <div className="flex items-center gap-1 flex-wrap">
+          {row.tags.map((tag, i) => (
+            <span key={i} className="inline-flex items-center gap-0.5 rounded-full bg-accent-primary/10 px-2 py-0.5 text-xs text-accent-primary">
+              {tag}
+              <button onClick={() => handleRemoveTag(row.id, i)} className="hover:text-status-error">
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          ))}
+          {addingTagId === row.id ? (
+            <input
+              className="h-6 w-20 rounded border border-border-default bg-bg-primary px-1.5 text-xs text-text-primary focus:outline-none focus:ring-1 focus:ring-border-focus"
+              value={newTagValue}
+              onChange={(e) => setNewTagValue(e.target.value)}
+              onBlur={() => { if (newTagValue.trim()) handleAddTag(row.id); else setAddingTagId(null); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleAddTag(row.id); if (e.key === 'Escape') { setAddingTagId(null); setNewTagValue(''); } }}
+              autoFocus
+              placeholder="tag"
+            />
+          ) : (
+            <button
+              className="inline-flex items-center justify-center h-5 w-5 rounded-full border border-dashed border-border-default text-text-muted hover:text-text-primary hover:border-border-hover"
+              onClick={() => { setAddingTagId(row.id); setNewTagValue(''); }}
+            >
+              <Plus className="h-3 w-3" />
+            </button>
+          )}
+        </div>
+      ),
+    },
+  ];
+
+  const tradeRows: TradeRow[] = trades.map((t) => ({
+    id: t.id,
+    strategy: t.strategy,
+    symbol: t.symbol,
+    side: t.side,
+    entry_time: t.entry_time,
+    exit_time: t.exit_time,
+    pnl: t.pnl,
+    pnlFormatted: `${t.pnl >= 0 ? '+' : '-'}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+    notes: t.notes,
+    tags: t.tags,
+  }));
+
   return (
     <div className="flex flex-col gap-6">
-      {/* Stat cards */}
+      {/* Export section */}
+      <DataCard title="Export Trades" description="Download trade history for tax reporting">
+        <div className="flex flex-wrap items-end gap-3">
+          <Select
+            label="Format"
+            options={[
+              { value: 'generic', label: 'Generic CSV' },
+              { value: 'koinly', label: 'Koinly' },
+              { value: 'turbotax', label: 'TurboTax' },
+            ]}
+            value={exportFormat}
+            onChange={(e) => setExportFormat(e.target.value)}
+            className="w-40"
+          />
+          <Input
+            label="From"
+            type="date"
+            value={exportFromDate}
+            onChange={(e) => setExportFromDate(e.target.value)}
+            className="w-40"
+          />
+          <Input
+            label="To"
+            type="date"
+            value={exportToDate}
+            onChange={(e) => setExportToDate(e.target.value)}
+            className="w-40"
+          />
+          <Button variant="primary" size="md" onClick={handleExport} loading={exporting}>
+            <Download className="h-4 w-4" /> Export
+          </Button>
+        </div>
+      </DataCard>
+
+      {/* Stat cards + Sentiment */}
       {fetchErrors.summary ? (
         <ErrorCard message="Failed to load portfolio summary" onRetry={loadData} />
       ) : loading ? (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          {Array.from({ length: 4 }).map((_, i) => (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
+          {Array.from({ length: 5 }).map((_, i) => (
             <div key={i} className="h-28 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
           ))}
         </div>
       ) : summary ? (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
           <StatCard
             icon={Wallet}
             label="Total Value"
@@ -224,10 +559,125 @@ export default function PortfolioPage() {
             label="Total Fees"
             value={fmt(summary.total_fees)}
           />
+          {/* Sentiment widget */}
+          {!fetchErrors.sentiment && sentiment ? (
+            <DataCard padding="sm" className="flex flex-col justify-between">
+              <p className="text-xs font-medium text-text-muted">Market Sentiment</p>
+              <div className="mt-2">
+                <div className="relative h-3 w-full rounded-full overflow-hidden bg-gradient-to-r from-red-500 via-yellow-500 to-green-500">
+                  <div
+                    className="absolute top-0 h-full w-1 bg-white rounded-full shadow-md"
+                    style={{ left: `${sentiment.value}%` }}
+                  />
+                </div>
+                <div className="mt-1.5 flex items-center justify-between">
+                  <span className="text-lg font-bold" style={{ color: getSentimentColor(sentiment.value) }}>
+                    {sentiment.value}
+                  </span>
+                  <span className="text-xs font-medium" style={{ color: getSentimentColor(sentiment.value) }}>
+                    {getSentimentLabel(sentiment.value)}
+                  </span>
+                </div>
+              </div>
+            </DataCard>
+          ) : !fetchErrors.sentiment && loading ? (
+            <div className="h-28 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
+          ) : null}
         </div>
       ) : (
         <p className="text-sm text-text-muted text-center py-8">No data yet</p>
       )}
+
+      {/* Trade Journal */}
+      <DataCard title="Trade Journal" description="Filter and review your trades">
+        {/* Filter bar */}
+        <div className="flex flex-wrap items-end gap-3 mb-4">
+          <Select
+            label="Strategy"
+            placeholder="All strategies"
+            options={strategies.map((s) => ({ value: s.id, label: s.name }))}
+            value={filterStrategy}
+            onChange={(e) => setFilterStrategy(e.target.value)}
+            className="w-44"
+          />
+          <Input
+            label="Symbol"
+            placeholder="e.g. BTCUSDT"
+            value={filterSymbol}
+            onChange={(e) => setFilterSymbol(e.target.value)}
+            className="w-36"
+          />
+          <Input
+            label="From"
+            type="date"
+            value={filterFromDate}
+            onChange={(e) => setFilterFromDate(e.target.value)}
+            className="w-40"
+          />
+          <Input
+            label="To"
+            type="date"
+            value={filterToDate}
+            onChange={(e) => setFilterToDate(e.target.value)}
+            className="w-40"
+          />
+          <Input
+            label="Min PnL"
+            type="number"
+            placeholder="0"
+            value={filterMinPnl}
+            onChange={(e) => setFilterMinPnl(e.target.value)}
+            className="w-28"
+          />
+          <Input
+            label="Max PnL"
+            type="number"
+            placeholder="0"
+            value={filterMaxPnl}
+            onChange={(e) => setFilterMaxPnl(e.target.value)}
+            className="w-28"
+          />
+          <Button variant="primary" size="md" onClick={handleApplyFilters}>
+            <Search className="h-4 w-4" /> Apply Filters
+          </Button>
+        </div>
+
+        {/* Trades table */}
+        <Table
+          columns={tradeColumns}
+          data={tradeRows}
+          keyExtractor={(row) => row.id}
+          loading={tradesLoading}
+          emptyMessage="No trades found. Apply filters and click Apply."
+        />
+
+        {/* Pagination */}
+        {tradesPages > 1 && (
+          <div className="flex items-center justify-between mt-4 pt-3 border-t border-border-default">
+            <p className="text-xs text-text-muted">
+              Page {tradesPage} of {tradesPages} ({tradesTotal} trades)
+            </p>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={tradesPage <= 1}
+                onClick={() => loadTrades(tradesPage - 1)}
+              >
+                Prev
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={tradesPage >= tradesPages}
+                onClick={() => loadTrades(tradesPage + 1)}
+              >
+                Next
+              </Button>
+            </div>
+          </div>
+        )}
+      </DataCard>
 
       {/* Charts row */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">

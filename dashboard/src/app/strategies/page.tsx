@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square, Eye, Shield, ChevronDown, ChevronUp } from 'lucide-react';
+import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square, Eye, Shield, ChevronDown, ChevronUp, Download, Upload, LayoutTemplate } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { Input } from '@/components/ui/Input';
@@ -115,6 +115,7 @@ export default function StrategiesPage() {
   const [riskOverridesOpen, setRiskOverridesOpen] = useState<string | null>(null);
   const [riskOverrides, setRiskOverrides] = useState<Record<string, RiskOverrides>>({});
   const [savingRisk, setSavingRisk] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -305,6 +306,40 @@ export default function StrategiesPage() {
     }
   };
 
+  const handleExport = async (id: string, name: string) => {
+    try {
+      const yaml = await fetchApi<string>(`/api/strategies/${id}/export`);
+      const blob = new Blob([typeof yaml === 'string' ? yaml : JSON.stringify(yaml, null, 2)], { type: 'application/x-yaml' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${name.toLowerCase().replace(/\s+/g, '_')}.yaml`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+      toast('success', `Exported "${name}"`);
+    } catch (err) {
+      logger.error('Strategies', 'Failed to export strategy', err);
+      toast('error', 'Failed to export strategy');
+    }
+  };
+
+  const handleImport = async (file: File) => {
+    try {
+      const content = await file.text();
+      await fetchApi('/api/strategies/import', {
+        method: 'POST',
+        body: JSON.stringify({ yaml_content: content }),
+      });
+      toast('success', 'Strategy imported successfully');
+      fetchData();
+    } catch (err) {
+      logger.error('Strategies', 'Failed to import strategy', err);
+      toast('error', `Import failed: ${err instanceof Error ? err.message : 'invalid file'}`);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-6">
       {/* Header */}
@@ -314,10 +349,34 @@ export default function StrategiesPage() {
             {loading ? 'Loading...' : `${strategies.filter((s) => s.status === 'Active').length} active strategies`}
           </p>
         </div>
-        <Button variant="primary" onClick={() => router.push('/builder')}>
-          <Plus className="h-4 w-4" />
-          New Strategy
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={() => router.push('/templates')}>
+            <LayoutTemplate className="h-4 w-4" />
+            Browse Templates
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Upload className="h-4 w-4" />
+            Import Strategy
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".yaml,.yml"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleImport(file);
+              e.target.value = '';
+            }}
+          />
+          <Button variant="primary" onClick={() => router.push('/builder')}>
+            <Plus className="h-4 w-4" />
+            New Strategy
+          </Button>
+        </div>
       </div>
 
       {/* Strategy cards grid */}
@@ -565,6 +624,13 @@ export default function StrategiesPage() {
                 >
                   <BarChart3 className="h-3 w-3" />
                   Backtest
+                </button>
+                <button
+                  onClick={() => handleExport(strategy.id, strategy.name)}
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                >
+                  <Download className="h-3 w-3" />
+                  Export
                 </button>
                 <button
                   onClick={() => handleDelete(strategy.id, strategy.name)}

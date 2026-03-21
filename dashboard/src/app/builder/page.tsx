@@ -1,16 +1,18 @@
 'use client';
 
-import { useReducer, useEffect, useState, useCallback, Suspense } from 'react';
-import { Save, Plus, Brain, ChevronDown, ChevronUp } from 'lucide-react';
+import { useReducer, useEffect, useState, useCallback, useRef, Suspense } from 'react';
+import { Save, Plus, Brain, ChevronDown, ChevronUp, FlaskConical } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Select } from '@/components/ui/Select';
+import { Input } from '@/components/ui/Input';
 import { DataCard } from '@/components/ui/DataCard';
+import { cn } from '@/components/ui/cn';
 import { RuleSection } from '@/components/builder/RuleSection';
 import { TimeframeSelector } from '@/components/builder/TimeframeSelector';
 import { RiskConfigurator } from '@/components/builder/RiskConfigurator';
 import { SignalPreview } from '@/components/builder/SignalPreview';
 import { StrategyNameDialog } from '@/components/builder/StrategyNameDialog';
-import { useSearchParams } from 'next/navigation';
+import { useSearchParams, useRouter } from 'next/navigation';
 import { useToast } from '@/components/ui/Toast';
 import { fetchApi } from '@/lib/api';
 import { logger } from '@/lib/logger';
@@ -198,7 +200,7 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         },
         risk: {
           stopLoss: {
-            method: (payload.risk.stop_loss_method as 'atr' | 'fixed_pct') || 'atr',
+            method: (payload.risk.stop_loss_method as StopLossConfig['method']) || 'atr',
             value: payload.risk.stop_loss_value ?? 2.0,
           },
           takeProfit: {
@@ -330,8 +332,26 @@ function BuilderPageContent() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [availableModels, setAvailableModels] = useState<{ id: string; name: string }[]>([]);
   const [mlOverlayOpen, setMlOverlayOpen] = useState(false);
+  const [strategyType, setStrategyType] = useState<'rule' | 'dca' | 'grid'>('rule');
+  const [dcaConfig, setDcaConfig] = useState({
+    base_order_size: 100,
+    safety_order_size: 50,
+    safety_order_count: 5,
+    price_deviation_pct: 1.0,
+    volume_scale: 1.5,
+    take_profit_pct: 1.5,
+  });
+  const [gridConfig, setGridConfig] = useState({
+    upper_price: 0,
+    lower_price: 0,
+    grid_count: 10,
+    total_investment: 1000,
+    grid_type: 'arithmetic' as 'arithmetic' | 'geometric',
+  });
   const searchParams = useSearchParams();
+  const router = useRouter();
   const { toast } = useToast();
+  const saveAndBacktestRef = useRef(false);
 
   /* Fetch indicators, comparators, and available models from API */
   useEffect(() => {
@@ -371,12 +391,21 @@ function BuilderPageContent() {
   }, [searchParams, toast]);
 
   const handleSaved = useCallback(
-    (name: string) => {
+    (name: string, id: string) => {
       logger.info('Builder', `Strategy "${name}" saved`);
       toast('success', `Strategy "${name}" saved successfully`);
+      if (saveAndBacktestRef.current) {
+        saveAndBacktestRef.current = false;
+        router.push(`/backtest?strategy=${id}&autorun=true`);
+      }
     },
-    [toast],
+    [toast, router],
   );
+
+  const handleSaveAndBacktest = useCallback(() => {
+    saveAndBacktestRef.current = true;
+    setSaveDialogOpen(true);
+  }, []);
 
   return (
     <div className="flex flex-col gap-6">
@@ -388,46 +417,178 @@ function BuilderPageContent() {
         </p>
       </div>
 
-      {/* Rule sections */}
-      <div className="flex flex-col gap-4">
-        {RULE_SECTIONS.map((section) => (
-          <RuleSection
-            key={section.key}
-            title={section.title}
-            description={section.description}
-            group={state[section.key]}
-            indicators={indicators}
-            comparators={comparators}
-            colorClass={section.colorClass}
-            onAddCondition={() =>
-              dispatch({ type: 'ADD_CONDITION', section: section.key })
-            }
-            onRemoveCondition={(conditionId: string) =>
-              dispatch({
-                type: 'REMOVE_CONDITION',
-                section: section.key,
-                conditionId,
-              })
-            }
-            onUpdateCondition={(
-              conditionId: string,
-              field: keyof BuilderCondition,
-              value: string | number | ConditionParams,
-            ) =>
-              dispatch({
-                type: 'UPDATE_CONDITION',
-                section: section.key,
-                conditionId,
-                field,
-                value,
-              })
-            }
-            onSetOperator={(operator: 'AND' | 'OR') =>
-              dispatch({ type: 'SET_OPERATOR', section: section.key, operator })
-            }
-          />
+      {/* Strategy type tabs */}
+      <div className="flex gap-1 rounded-lg border border-border-default bg-bg-secondary p-1">
+        {([
+          { value: 'rule', label: 'Rule-Based' },
+          { value: 'dca', label: 'DCA Bot' },
+          { value: 'grid', label: 'Grid Bot' },
+        ] as const).map((tab) => (
+          <button
+            key={tab.value}
+            onClick={() => setStrategyType(tab.value)}
+            className={cn(
+              'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
+              strategyType === tab.value
+                ? 'bg-bg-elevated text-text-primary shadow-sm'
+                : 'text-text-muted hover:text-text-primary',
+            )}
+          >
+            {tab.label}
+          </button>
         ))}
       </div>
+
+      {/* Rule sections (only for rule-based) */}
+      {strategyType === 'rule' && (
+        <div className="flex flex-col gap-4">
+          {RULE_SECTIONS.map((section) => (
+            <RuleSection
+              key={section.key}
+              title={section.title}
+              description={section.description}
+              group={state[section.key]}
+              indicators={indicators}
+              comparators={comparators}
+              colorClass={section.colorClass}
+              onAddCondition={() =>
+                dispatch({ type: 'ADD_CONDITION', section: section.key })
+              }
+              onRemoveCondition={(conditionId: string) =>
+                dispatch({
+                  type: 'REMOVE_CONDITION',
+                  section: section.key,
+                  conditionId,
+                })
+              }
+              onUpdateCondition={(
+                conditionId: string,
+                field: keyof BuilderCondition,
+                value: string | number | ConditionParams,
+              ) =>
+                dispatch({
+                  type: 'UPDATE_CONDITION',
+                  section: section.key,
+                  conditionId,
+                  field,
+                  value,
+                })
+              }
+              onSetOperator={(operator: 'AND' | 'OR') =>
+                dispatch({ type: 'SET_OPERATOR', section: section.key, operator })
+              }
+            />
+          ))}
+        </div>
+      )}
+
+      {/* DCA Bot Configuration */}
+      {strategyType === 'dca' && (
+        <DataCard title="DCA Bot Configuration" description="Configure Dollar Cost Averaging bot parameters">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Input
+              label="Base Order Size (USDT)"
+              type="number"
+              value={dcaConfig.base_order_size}
+              onChange={(e) => setDcaConfig((prev) => ({ ...prev, base_order_size: parseFloat(e.target.value) || 0 }))}
+              hint="Initial order size when starting a new deal"
+            />
+            <Input
+              label="Safety Order Size (USDT)"
+              type="number"
+              value={dcaConfig.safety_order_size}
+              onChange={(e) => setDcaConfig((prev) => ({ ...prev, safety_order_size: parseFloat(e.target.value) || 0 }))}
+              hint="Size of each safety order to average down"
+            />
+            <Input
+              label="Safety Order Count"
+              type="number"
+              value={dcaConfig.safety_order_count}
+              onChange={(e) => setDcaConfig((prev) => ({ ...prev, safety_order_count: parseInt(e.target.value) || 0 }))}
+              hint="Maximum number of safety orders per deal"
+            />
+            <Input
+              label="Price Deviation (%)"
+              type="number"
+              value={dcaConfig.price_deviation_pct}
+              step={0.1}
+              onChange={(e) => setDcaConfig((prev) => ({ ...prev, price_deviation_pct: parseFloat(e.target.value) || 0 }))}
+              hint="Price drop to trigger each safety order"
+            />
+            <Input
+              label="Volume Scale"
+              type="number"
+              value={dcaConfig.volume_scale}
+              step={0.1}
+              onChange={(e) => setDcaConfig((prev) => ({ ...prev, volume_scale: parseFloat(e.target.value) || 0 }))}
+              hint="Multiplier for each subsequent safety order"
+            />
+            <Input
+              label="Take Profit (%)"
+              type="number"
+              value={dcaConfig.take_profit_pct}
+              step={0.1}
+              onChange={(e) => setDcaConfig((prev) => ({ ...prev, take_profit_pct: parseFloat(e.target.value) || 0 }))}
+              hint="Target profit to close the deal"
+            />
+          </div>
+        </DataCard>
+      )}
+
+      {/* Grid Bot Configuration */}
+      {strategyType === 'grid' && (
+        <DataCard title="Grid Bot Configuration" description="Configure Grid trading bot parameters">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Input
+              label="Upper Price"
+              type="number"
+              value={gridConfig.upper_price}
+              onChange={(e) => setGridConfig((prev) => ({ ...prev, upper_price: parseFloat(e.target.value) || 0 }))}
+              hint="Upper boundary of the grid range"
+            />
+            <Input
+              label="Lower Price"
+              type="number"
+              value={gridConfig.lower_price}
+              onChange={(e) => setGridConfig((prev) => ({ ...prev, lower_price: parseFloat(e.target.value) || 0 }))}
+              hint="Lower boundary of the grid range"
+            />
+            <Input
+              label="Grid Count"
+              type="number"
+              value={gridConfig.grid_count}
+              onChange={(e) => setGridConfig((prev) => ({ ...prev, grid_count: parseInt(e.target.value) || 0 }))}
+              hint="Number of grid levels between upper and lower"
+            />
+            <Input
+              label="Total Investment (USDT)"
+              type="number"
+              value={gridConfig.total_investment}
+              onChange={(e) => setGridConfig((prev) => ({ ...prev, total_investment: parseFloat(e.target.value) || 0 }))}
+              hint="Total capital allocated to the grid"
+            />
+            <div className="md:col-span-2">
+              <label className="block text-xs font-medium text-text-secondary mb-1">Grid Type</label>
+              <div className="flex gap-1 rounded-lg border border-border-default bg-bg-secondary p-1">
+                {(['arithmetic', 'geometric'] as const).map((type) => (
+                  <button
+                    key={type}
+                    onClick={() => setGridConfig((prev) => ({ ...prev, grid_type: type }))}
+                    className={cn(
+                      'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
+                      gridConfig.grid_type === type
+                        ? 'bg-bg-elevated text-text-primary shadow-sm'
+                        : 'text-text-muted hover:text-text-primary',
+                    )}
+                  >
+                    {type.charAt(0).toUpperCase() + type.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </DataCard>
+      )}
 
       {/* Timeframe selector */}
       <TimeframeSelector
@@ -548,6 +709,14 @@ function BuilderPageContent() {
         >
           <Save className="h-4 w-4" />
           {state.editingId ? 'Update Strategy' : 'Save Strategy'}
+        </Button>
+        <Button
+          variant="outline"
+          size="lg"
+          onClick={handleSaveAndBacktest}
+        >
+          <FlaskConical className="h-4 w-4" />
+          Save & Backtest
         </Button>
       </div>
 

@@ -13,7 +13,7 @@ interface StrategyNameDialogProps {
   open: boolean;
   onClose: () => void;
   state: BuilderState;
-  onSaved: (name: string) => void;
+  onSaved: (name: string, id: string) => void;
   editingId?: string | null;
   initialName?: string;
   initialDescription?: string;
@@ -131,13 +131,14 @@ export function StrategyNameDialog({
         : '/api/strategies/save';
       const method = isEditing ? 'PUT' : 'POST';
 
-      await fetchApi(url, {
+      const response = await fetchApi<{ id: string }>(url, {
         method,
         body: JSON.stringify(requestBody),
       });
 
+      const savedId = isEditing ? editingId! : response.id;
       logger.info('Builder', `Strategy "${name}" ${isEditing ? 'updated' : 'saved'}`);
-      onSaved(name);
+      onSaved(name, savedId);
       onClose();
     } catch (err) {
       logger.error('Builder', 'Failed to save strategy', err);

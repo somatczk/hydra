@@ -71,10 +71,12 @@ class ParameterSpace:
         values: dict[str, Any] = {}
         for p in self.params:
             if p.type == "int":
-                assert p.low is not None and p.high is not None
+                if p.low is None or p.high is None:
+                    raise ValueError(f"Param '{p.name}' (int) requires low and high bounds")
                 values[p.name] = trial.suggest_int(p.name, int(p.low), int(p.high))
             elif p.type == "float":
-                assert p.low is not None and p.high is not None
+                if p.low is None or p.high is None:
+                    raise ValueError(f"Param '{p.name}' (float) requires low and high bounds")
                 values[p.name] = trial.suggest_float(p.name, p.low, p.high)
             else:
                 values[p.name] = trial.suggest_categorical(p.name, p.choices)
@@ -94,11 +96,13 @@ class ParameterSpace:
             if p.type == "categorical":
                 per_param.append(list(p.choices))
             elif p.type == "int":
-                assert p.low is not None and p.high is not None
+                if p.low is None or p.high is None:
+                    raise ValueError(f"Param '{p.name}' (int) requires low and high bounds")
                 per_param.append(list(range(int(p.low), int(p.high) + 1)))
             else:
                 # float: use low, midpoint, high as grid candidates
-                assert p.low is not None and p.high is not None
+                if p.low is None or p.high is None:
+                    raise ValueError(f"Param '{p.name}' (float) requires low and high bounds")
                 mid = (p.low + p.high) / 2.0
                 per_param.append([p.low, mid, p.high])
 

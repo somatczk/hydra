@@ -6,6 +6,7 @@ import {
   TrendingUp,
   BarChart3,
   ArrowDownRight,
+  ExternalLink,
 } from 'lucide-react';
 import {
   AreaChart,
@@ -75,12 +76,38 @@ interface EquityPoint {
   value: number;
 }
 
+interface LiveMetrics {
+  rolling_sharpe_30d: number;
+  time_weighted_return_30d: number;
+  trades_per_day: number;
+}
+
+interface NewsItem {
+  title: string;
+  source: string;
+  url: string;
+  published_at: string;
+}
+
 /* ---------- Helpers ---------- */
 
 function formatSymbol(symbol: string): string {
   const match = symbol.match(/^([A-Z]{3,4})(USDT|USD|BUSD|USDC)$/);
   if (match) return `${match[1]}/${match[2]}`;
   return symbol;
+}
+
+function timeAgo(dateStr: string): string {
+  const now = Date.now();
+  const then = new Date(dateStr).getTime();
+  const seconds = Math.floor((now - then) / 1000);
+  if (seconds < 60) return 'just now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 function mapApiTrades(data: ApiRecentTrade[]): Trade[] {
@@ -165,6 +192,8 @@ export default function DashboardPage() {
   const [positionCount, setPositionCount] = useState<number | null>(null);
   // max_drawdown_pct now comes from portfolio summary
   const [equityCurve, setEquityCurve] = useState<EquityPoint[] | null>(null);
+  const [liveMetrics, setLiveMetrics] = useState<LiveMetrics | null>(null);
+  const [news, setNews] = useState<NewsItem[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [isDark, setIsDark] = useState(false);
   const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
@@ -186,16 +215,24 @@ export default function DashboardPage() {
       fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
         .then(setSummary)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, summary: true })); }),
-      fetchApi<ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
-        .then((data) => setRecentTrades(mapApiTrades(data)))
+      fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}&limit=5`)
+        .then((data) => {
+          const trades = Array.isArray(data) ? data : (data.trades ?? []);
+          setRecentTrades(mapApiTrades(trades));
+        })
         .catch(() => { setFetchErrors((prev) => ({ ...prev, trades: true })); }),
       fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
         .then((data) => setPositionCount(data.length))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
-      // max drawdown now computed from portfolio summary
       fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
         .then((data) => setEquityCurve(data))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, equity: true })); }),
+      fetchApi<LiveMetrics>(`/api/portfolio/live-metrics?source=${source}`)
+        .then(setLiveMetrics)
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, liveMetrics: true })); }),
+      fetchApi<NewsItem[]>('/api/market/news')
+        .then((data) => setNews(data.slice(0, 5)))
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, news: true })); }),
     ]);
 
     setLoading(false);
@@ -316,6 +353,34 @@ export default function DashboardPage() {
         )}
       </DataCard>
 
+      {/* Live metrics */}
+      {fetchErrors.liveMetrics ? (
+        <ErrorCard message="Failed to load live metrics" onRetry={loadData} />
+      ) : liveMetrics ? (
+        <DataCard title="Live Performance (30d)">
+          <div className="grid grid-cols-3 gap-4">
+            <div className="rounded-lg border border-border-default bg-bg-secondary p-3 text-center">
+              <p className="text-xs text-text-muted">Rolling Sharpe</p>
+              <p className="mt-1 text-lg font-semibold text-text-primary">
+                {liveMetrics.rolling_sharpe_30d.toFixed(2)}
+              </p>
+            </div>
+            <div className="rounded-lg border border-border-default bg-bg-secondary p-3 text-center">
+              <p className="text-xs text-text-muted">TWR 30d</p>
+              <p className="mt-1 text-lg font-semibold text-text-primary">
+                {(liveMetrics.time_weighted_return_30d * 100).toFixed(2)}%
+              </p>
+            </div>
+            <div className="rounded-lg border border-border-default bg-bg-secondary p-3 text-center">
+              <p className="text-xs text-text-muted">Trades/Day</p>
+              <p className="mt-1 text-lg font-semibold text-text-primary">
+                {liveMetrics.trades_per_day.toFixed(1)}
+              </p>
+            </div>
+          </div>
+        </DataCard>
+      ) : null}
+
       {/* Recent trades */}
       <DataCard title="Recent Trades" description="Last 5 executed trades">
         {fetchErrors.trades ? (
@@ -336,6 +401,39 @@ export default function DashboardPage() {
           <p className="text-sm text-text-muted text-center py-8">No data yet</p>
         )}
       </DataCard>
+
+      {/* Market news */}
+      {fetchErrors.news ? (
+        <ErrorCard message="Failed to load market news" onRetry={loadData} />
+      ) : news && news.length > 0 ? (
+        <DataCard title="Market News">
+          <div className="space-y-3">
+            {news.map((item, i) => (
+              <a
+                key={i}
+                href={item.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-start justify-between gap-3 rounded-lg border border-border-default bg-bg-secondary p-3 transition-colors hover:border-border-hover"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-text-primary truncate">{item.title}</p>
+                  <p className="mt-0.5 text-xs text-text-muted">
+                    {item.source} &middot; {timeAgo(item.published_at)}
+                  </p>
+                </div>
+                <ExternalLink className="h-4 w-4 shrink-0 text-text-muted mt-0.5" />
+              </a>
+            ))}
+          </div>
+          <button
+            className="mt-3 text-xs font-medium text-accent-primary hover:underline"
+            onClick={() => logger.info('Dashboard', 'View all news clicked')}
+          >
+            View All
+          </button>
+        </DataCard>
+      ) : null}
     </div>
   );
 }

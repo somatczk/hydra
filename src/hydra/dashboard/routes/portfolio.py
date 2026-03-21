@@ -250,9 +250,16 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
                 wallet = _get_paper_capital(request)
                 total_value = wallet + realized_pnl + unrealized_pnl - total_fees
             else:
-                snapshot = await conn.fetchrow(
-                    "SELECT total_value FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
-                )
+                if source:
+                    snapshot = await conn.fetchrow(
+                        "SELECT total_value FROM balance_snapshots "
+                        "WHERE source = $1 ORDER BY timestamp DESC LIMIT 1",
+                        source,
+                    )
+                else:
+                    snapshot = await conn.fetchrow(
+                        "SELECT total_value FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
+                    )
                 total_value = float(snapshot["total_value"]) if snapshot else 0.0
 
             # Max drawdown from equity curve

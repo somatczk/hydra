@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Bell, Cog, CheckCircle, XCircle, OctagonX, ChevronDown, ChevronUp } from 'lucide-react';
+import { Bell, Cog, CheckCircle, XCircle, OctagonX, ChevronDown, ChevronUp, Copy, Link } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
@@ -39,6 +39,9 @@ interface PlatformConfig {
   default_timeframe: string;
   max_concurrent_strategies: number;
   paper_capital: number;
+  webhook_secret?: string;
+  discord_webhook_url?: string;
+  slack_webhook_url?: string;
 }
 
 interface RiskConfig {
@@ -85,6 +88,11 @@ const logoMap: Record<string, string> = {
   bybit: 'BY',
   kraken: 'K',
   okx: 'O',
+  coinbase: 'CB',
+  kucoin: 'KU',
+  gateio: 'G',
+  mexc: 'MX',
+  bitget: 'BG',
 };
 
 function mapApiExchanges(data: ApiExchange[]): Exchange[] {
@@ -116,6 +124,10 @@ export default function SettingsPage() {
   const [notifications, setNotifications] = useState<Record<string, boolean> | null>(null);
   const [selectedExchange, setSelectedExchange] = useState<Exchange | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [webhookSecret, setWebhookSecret] = useState('');
+  const [discordWebhookUrl, setDiscordWebhookUrl] = useState('');
+  const [slackWebhookUrl, setSlackWebhookUrl] = useState('');
+  const [savingIntegrations, setSavingIntegrations] = useState(false);
 
   // Exchange detail panels
   const [expandedExchange, setExpandedExchange] = useState<string | null>(null);
@@ -138,6 +150,9 @@ export default function SettingsPage() {
           setDefaultTimeframe(cfg.default_timeframe);
           setMaxStrategies(cfg.max_concurrent_strategies.toString());
           if (cfg.paper_capital) setPaperCapital(cfg.paper_capital.toString());
+          if (cfg.webhook_secret) setWebhookSecret(cfg.webhook_secret);
+          if (cfg.discord_webhook_url) setDiscordWebhookUrl(cfg.discord_webhook_url);
+          if (cfg.slack_webhook_url) setSlackWebhookUrl(cfg.slack_webhook_url);
         })
         .catch(() => { setFetchErrors((prev) => ({ ...prev, config: true })); }),
       fetchApi<RiskConfig>('/api/risk/config')
@@ -567,6 +582,104 @@ export default function SettingsPage() {
         ) : (
           <p className="text-sm text-text-muted text-center py-8">No data yet</p>
         )}
+      </DataCard>
+
+      {/* Webhook Configuration */}
+      <DataCard title="Webhook Configuration" description="Configure webhook endpoint for external signal ingestion">
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-text-secondary mb-1">Webhook URL</label>
+            <div className="flex items-center gap-2">
+              <div className="flex-1 rounded-lg border border-border-default bg-bg-tertiary px-3 py-2 text-sm text-text-muted font-mono">
+                {typeof window !== 'undefined' ? `${window.location.origin}/api/signals/webhook` : '/api/signals/webhook'}
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  const url = `${window.location.origin}/api/signals/webhook`;
+                  navigator.clipboard.writeText(url);
+                  toast('success', 'Webhook URL copied to clipboard');
+                }}
+              >
+                <Copy className="h-4 w-4" />
+                Copy URL
+              </Button>
+            </div>
+          </div>
+          <Input
+            label="Webhook Secret"
+            type="text"
+            value={webhookSecret}
+            onChange={(e) => setWebhookSecret(e.target.value)}
+            hint="Shared secret for verifying webhook payloads"
+          />
+          <div className="flex justify-end">
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={async () => {
+                try {
+                  await fetchApi('/api/system/config', {
+                    method: 'PUT',
+                    body: JSON.stringify({ webhook_secret: webhookSecret }),
+                  });
+                  toast('success', 'Webhook secret saved');
+                } catch {
+                  toast('error', 'Failed to save webhook secret');
+                }
+              }}
+            >
+              Save Secret
+            </Button>
+          </div>
+        </div>
+      </DataCard>
+
+      {/* Integration URLs */}
+      <DataCard title="Integration URLs" description="Connect Discord and Slack for notifications">
+        <div className="space-y-4">
+          <Input
+            label="Discord Webhook URL"
+            type="text"
+            value={discordWebhookUrl}
+            onChange={(e) => setDiscordWebhookUrl(e.target.value)}
+            hint="Discord channel webhook URL for trade notifications"
+          />
+          <Input
+            label="Slack Webhook URL"
+            type="text"
+            value={slackWebhookUrl}
+            onChange={(e) => setSlackWebhookUrl(e.target.value)}
+            hint="Slack incoming webhook URL for trade notifications"
+          />
+          <div className="flex justify-end">
+            <Button
+              variant="primary"
+              size="sm"
+              loading={savingIntegrations}
+              onClick={async () => {
+                setSavingIntegrations(true);
+                try {
+                  await fetchApi('/api/system/config', {
+                    method: 'PUT',
+                    body: JSON.stringify({
+                      discord_webhook_url: discordWebhookUrl,
+                      slack_webhook_url: slackWebhookUrl,
+                    }),
+                  });
+                  toast('success', 'Integration URLs saved');
+                } catch {
+                  toast('error', 'Failed to save integration URLs');
+                }
+                setSavingIntegrations(false);
+              }}
+            >
+              <Link className="h-4 w-4" />
+              Save Integrations
+            </Button>
+          </div>
+        </div>
       </DataCard>
 
       {/* Platform config */}

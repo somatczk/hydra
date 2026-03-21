@@ -2,11 +2,13 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { ArrowUpDown, Eye, OctagonX, Shield, RotateCcw } from 'lucide-react';
+import { ArrowUpDown, Eye, OctagonX, Shield, RotateCcw, Zap } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
+import { Select } from '@/components/ui/Select';
 import { ErrorCard } from '@/components/ui/ErrorCard';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
@@ -89,6 +91,18 @@ interface RiskStatus {
   daily_loss: number;
   daily_loss_limit: number;
   circuit_breakers: CircuitBreaker[];
+}
+
+interface OrderBook {
+  bids: [number, number][];
+  asks: [number, number][];
+}
+
+interface FundingRate {
+  symbol: string;
+  rate: number;
+  next_funding_time: string;
+  annualized: number;
 }
 
 /* ---------- Helpers ---------- */
@@ -213,6 +227,18 @@ export default function TradingPage() {
   const [loading, setLoading] = useState(true);
   const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
   const [resettingTier, setResettingTier] = useState<number | null>(null);
+  const [orderBook, setOrderBook] = useState<OrderBook | null>(null);
+  const [fundingRate, setFundingRate] = useState<FundingRate | null>(null);
+
+  // Quick trade form state
+  const [qtSymbol, setQtSymbol] = useState('BTCUSDT');
+  const [qtSide, setQtSide] = useState<'buy' | 'sell'>('buy');
+  const [qtQuantity, setQtQuantity] = useState('');
+  const [qtOrderType, setQtOrderType] = useState('market');
+  const [qtPrice, setQtPrice] = useState('');
+  const [qtTakeProfit, setQtTakeProfit] = useState('');
+  const [qtStopLoss, setQtStopLoss] = useState('');
+  const [qtSubmitting, setQtSubmitting] = useState(false);
 
   const { resolved: themeResolved } = useTheme();
   const widgetContainerRef = useRef<HTMLDivElement>(null);
@@ -230,8 +256,11 @@ export default function TradingPage() {
       fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
         .then((data) => setOpenPositions(mapApiPositions(data)))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
-      fetchApi<ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
-        .then((data) => setRecentTrades(mapApiTrades(data)))
+      fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
+        .then((data) => {
+          const trades = Array.isArray(data) ? data : (data.trades ?? []);
+          setRecentTrades(mapApiTrades(trades));
+        })
         .catch(() => { setFetchErrors((prev) => ({ ...prev, trades: true })); }),
       fetchApi<TradingSession[]>('/api/trading/sessions')
         .then((data) => setSessions(data.filter((s) => s.status === 'running')))
@@ -245,6 +274,12 @@ export default function TradingPage() {
       fetchApi<RiskStatus>('/api/risk/status')
         .then(setRiskStatus)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, riskStatus: true })); }),
+      fetchApi<OrderBook>('/api/market/orderbook?symbol=BTCUSDT')
+        .then(setOrderBook)
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, orderBook: true })); }),
+      fetchApi<FundingRate>('/api/market/funding-rates/current?symbol=BTCUSDT')
+        .then(setFundingRate)
+        .catch(() => { setFetchErrors((prev) => ({ ...prev, fundingRate: true })); }),
     ]);
 
     setLoading(false);
@@ -255,6 +290,16 @@ export default function TradingPage() {
     const interval = setInterval(loadData, 15_000);
     return () => clearInterval(interval);
   }, [loadData]);
+
+  // Order book auto-refresh every 5s
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchApi<OrderBook>('/api/market/orderbook?symbol=BTCUSDT')
+        .then(setOrderBook)
+        .catch(() => {});
+    }, 5_000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     const container = widgetContainerRef.current;
@@ -314,6 +359,41 @@ export default function TradingPage() {
       toast('error', `Failed to reset tier ${tier}`);
     } finally {
       setResettingTier(null);
+    }
+  };
+
+  const handleQuickTrade = async () => {
+    if (!qtQuantity) {
+      toast('error', 'Quantity is required');
+      return;
+    }
+    setQtSubmitting(true);
+    try {
+      const payload: Record<string, unknown> = {
+        symbol: qtSymbol,
+        side: qtSide,
+        quantity: parseFloat(qtQuantity),
+        order_type: qtOrderType,
+      };
+      if (qtOrderType === 'limit' && qtPrice) payload.price = parseFloat(qtPrice);
+      if (qtTakeProfit) payload.take_profit = parseFloat(qtTakeProfit);
+      if (qtStopLoss) payload.stop_loss = parseFloat(qtStopLoss);
+
+      await fetchApi('/api/trading/quick-trade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      toast('success', `${qtSide.toUpperCase()} order placed for ${qtQuantity} ${qtSymbol}`);
+      setQtQuantity('');
+      setQtPrice('');
+      setQtTakeProfit('');
+      setQtStopLoss('');
+    } catch (err) {
+      logger.error('Trading', 'Quick trade failed', err);
+      toast('error', 'Failed to place order');
+    } finally {
+      setQtSubmitting(false);
     }
   };
 
@@ -413,6 +493,31 @@ export default function TradingPage() {
               ))}
             </div>
           ) : null}
+
+          {/* Funding rate */}
+          {fetchErrors.fundingRate ? (
+            <ErrorCard message="Failed to load funding rate" onRetry={loadData} />
+          ) : fundingRate ? (
+            <div className="space-y-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-text-muted">Funding Rate</p>
+              <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
+                <div>
+                  <p className="text-sm font-medium text-text-primary">{fundingRate.symbol}</p>
+                  <p className="text-xs text-text-muted">
+                    Next: {new Date(fundingRate.next_funding_time).toLocaleTimeString()}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className={`text-sm font-semibold ${fundingRate.rate >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+                    {fundingRate.rate >= 0 ? '+' : ''}{(fundingRate.rate * 100).toFixed(4)}%
+                  </p>
+                  <p className="text-xs text-text-muted">
+                    {(fundingRate.annualized * 100).toFixed(2)}% ann.
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
       </DataCard>
 
@@ -449,6 +554,128 @@ export default function TradingPage() {
           </div>
         </DataCard>
       )}
+
+      {/* Quick Trade */}
+      <DataCard title="Quick Trade">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <Input
+            label="Symbol"
+            value={qtSymbol}
+            onChange={(e) => setQtSymbol(e.target.value)}
+            placeholder="BTCUSDT"
+          />
+          <div className="flex flex-col gap-1.5">
+            <span className="text-sm font-medium text-text-secondary">Side</span>
+            <div className="flex gap-2">
+              <Button
+                variant={qtSide === 'buy' ? 'primary' : 'outline'}
+                size="sm"
+                className={qtSide === 'buy' ? 'bg-status-success hover:bg-status-success/90' : ''}
+                onClick={() => setQtSide('buy')}
+              >
+                Buy
+              </Button>
+              <Button
+                variant={qtSide === 'sell' ? 'danger' : 'outline'}
+                size="sm"
+                onClick={() => setQtSide('sell')}
+              >
+                Sell
+              </Button>
+            </div>
+          </div>
+          <Input
+            label="Quantity"
+            type="number"
+            value={qtQuantity}
+            onChange={(e) => setQtQuantity(e.target.value)}
+            placeholder="0.001"
+          />
+          <Select
+            label="Order Type"
+            value={qtOrderType}
+            onChange={(e) => setQtOrderType(e.target.value)}
+            options={[
+              { value: 'market', label: 'Market' },
+              { value: 'limit', label: 'Limit' },
+            ]}
+          />
+          {qtOrderType === 'limit' && (
+            <Input
+              label="Price"
+              type="number"
+              value={qtPrice}
+              onChange={(e) => setQtPrice(e.target.value)}
+              placeholder="65000"
+            />
+          )}
+          <Input
+            label="Take Profit"
+            type="number"
+            value={qtTakeProfit}
+            onChange={(e) => setQtTakeProfit(e.target.value)}
+            placeholder="Optional"
+          />
+          <Input
+            label="Stop Loss"
+            type="number"
+            value={qtStopLoss}
+            onChange={(e) => setQtStopLoss(e.target.value)}
+            placeholder="Optional"
+          />
+          <div className="flex items-end">
+            <Button
+              variant={qtSide === 'buy' ? 'primary' : 'danger'}
+              fullWidth
+              onClick={handleQuickTrade}
+              loading={qtSubmitting}
+            >
+              <Zap className="h-4 w-4" />
+              {qtSide === 'buy' ? 'Buy' : 'Sell'} {qtSymbol}
+            </Button>
+          </div>
+        </div>
+      </DataCard>
+
+      {/* Order Book */}
+      {fetchErrors.orderBook ? (
+        <ErrorCard message="Failed to load order book" onRetry={loadData} />
+      ) : orderBook ? (
+        <DataCard title="Order Book">
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-status-success">Bids</p>
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs text-text-muted border-b border-border-default pb-1">
+                  <span>Price</span>
+                  <span>Qty</span>
+                </div>
+                {orderBook.bids.slice(0, 10).map(([price, qty], i) => (
+                  <div key={i} className="flex justify-between text-xs">
+                    <span className="text-status-success font-mono">${price.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
+                    <span className="text-text-secondary font-mono">{qty.toFixed(4)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-status-error">Asks</p>
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs text-text-muted border-b border-border-default pb-1">
+                  <span>Price</span>
+                  <span>Qty</span>
+                </div>
+                {orderBook.asks.slice(0, 10).map(([price, qty], i) => (
+                  <div key={i} className="flex justify-between text-xs">
+                    <span className="text-status-error font-mono">${price.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
+                    <span className="text-text-secondary font-mono">{qty.toFixed(4)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </DataCard>
+      ) : null}
 
       {/* Candlestick chart */}
       <DataCard title="BTC/USDT" description="Live price chart">

@@ -204,10 +204,10 @@ class PaperTradingExecutor:
             if raw is None:
                 raise ValueError("trail_pct is required for TRAILING_STOP orders")
             trail_pct = Decimal(str(raw))
-            market_price = self._last_prices.get(symbol)
-            if market_price is None:
+            current_price = self._last_prices.get(symbol)
+            if current_price is None:
                 raise ValueError(f"No market price available for {symbol}")
-            peak_price = market_price
+            peak_price = current_price
 
         # Limit / stop orders go pending
         pending = _PendingOrder(

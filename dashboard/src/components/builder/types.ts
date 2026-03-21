@@ -51,7 +51,7 @@ export interface TimeframeConfig {
 }
 
 export interface StopLossConfig {
-  method: 'atr' | 'fixed_pct';
+  method: 'atr' | 'fixed_pct' | 'trailing_stop';
   value: number;
 }
 

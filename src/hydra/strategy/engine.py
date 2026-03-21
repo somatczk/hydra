@@ -9,14 +9,16 @@ from pathlib import Path
 from hydra.core.config import HydraConfig
 from hydra.core.events import BarEvent, Event
 from hydra.core.protocols import EventBus
-from hydra.strategy.base import BaseStrategy
+from hydra.strategy.base import BaseStrategy, OrderManagementStrategy
 from hydra.strategy.config import StrategyConfig, load_all_strategy_configs
 from hydra.strategy.context import StrategyContext
 
 logger = logging.getLogger(__name__)
 
 
-def _import_strategy_class(dotted_path: str) -> type[BaseStrategy]:
+def _import_strategy_class(
+    dotted_path: str,
+) -> type[BaseStrategy] | type[OrderManagementStrategy]:
     """Import a strategy class from its dotted path.
 
     Example: ``"hydra.strategy.builtin.MomentumRSIMACDStrategy"``
@@ -27,8 +29,11 @@ def _import_strategy_class(dotted_path: str) -> type[BaseStrategy]:
         raise ValueError(msg)
     module = importlib.import_module(module_path)
     cls = getattr(module, class_name)
-    if not (isinstance(cls, type) and issubclass(cls, BaseStrategy)):
-        msg = f"{dotted_path} is not a subclass of BaseStrategy"
+    if not (
+        isinstance(cls, type)
+        and (issubclass(cls, BaseStrategy) or issubclass(cls, OrderManagementStrategy))
+    ):
+        msg = f"{dotted_path} is not a subclass of BaseStrategy or OrderManagementStrategy"
         raise TypeError(msg)
     return cls
 
@@ -50,9 +55,10 @@ class StrategyEngine:
         self._config = config
         self._event_bus = event_bus
         self._context = context
-        self._strategies: dict[str, BaseStrategy] = {}
+        self._strategies: dict[str, BaseStrategy | OrderManagementStrategy] = {}
         self._strategy_configs: dict[str, StrategyConfig] = {}
         self._running = False
+        self.is_order_management: bool = False
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -76,6 +82,8 @@ class StrategyEngine:
         """Import, instantiate, and register a strategy."""
         cls = _import_strategy_class(cfg.strategy_class)
         strategy = cls(config=cfg, context=self._context)
+        if issubclass(cls, OrderManagementStrategy):
+            self.is_order_management = True
         self._strategies[cfg.id] = strategy
         self._strategy_configs[cfg.id] = cfg
         logger.info("Loaded strategy: %s (%s)", cfg.id, cfg.strategy_class)
@@ -99,11 +107,18 @@ class StrategyEngine:
     # -- Event routing -------------------------------------------------------
 
     async def _on_bar_event(self, event: Event) -> None:
-        """Route a bar event to matching strategies."""
+        """Route a bar event to matching signal-based strategies.
+
+        OrderManagementStrategy instances are handled separately by the
+        session manager, so they are skipped here.
+        """
         if not isinstance(event, BarEvent):
             return
         bar = event
         for sid, strategy in self._strategies.items():
+            # OMS strategies are wired separately in session_manager
+            if isinstance(strategy, OrderManagementStrategy):
+                continue
             cfg = self._strategy_configs[sid]
             # Check symbol match
             if str(bar.symbol) not in cfg.symbols:
@@ -157,10 +172,10 @@ class StrategyEngine:
 
     # -- Accessors -----------------------------------------------------------
 
-    def get_strategy(self, strategy_id: str) -> BaseStrategy | None:
+    def get_strategy(self, strategy_id: str) -> BaseStrategy | OrderManagementStrategy | None:
         """Return a loaded strategy by ID, or ``None``."""
         return self._strategies.get(strategy_id)
 
-    def get_all_strategies(self) -> dict[str, BaseStrategy]:
+    def get_all_strategies(self) -> dict[str, BaseStrategy | OrderManagementStrategy]:
         """Return all loaded strategies."""
         return dict(self._strategies)

@@ -9,6 +9,7 @@ import {
   CheckCircle,
   XCircle,
   AlertTriangle,
+  Share2,
 } from 'lucide-react';
 import {
   AreaChart,
@@ -18,6 +19,7 @@ import {
   Tooltip,
   ResponsiveContainer,
   CartesianGrid,
+  Legend,
 } from 'recharts';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
@@ -33,7 +35,6 @@ import {
   aggregateEquityCurve,
   formatXTick,
   formatYTick,
-  makeCustomTooltip,
 } from '../chart-utils';
 
 /* ---------- Types ---------- */
@@ -51,8 +52,14 @@ interface ApiBacktestDetail {
     total_pnl: number;
     max_drawdown: number;
     sharpe_ratio: number;
+    alpha?: number;
+    beta?: number;
+    max_consecutive_wins?: number;
+    max_consecutive_losses?: number;
+    expectancy?: number;
   };
   equity_curve: EquityPoint[];
+  benchmark_equity?: EquityPoint[];
   trades: Array<{
     entry_time: string;
     exit_time: string;
@@ -100,6 +107,12 @@ interface TxnRow {
   isOpen: boolean;
 }
 
+interface MergedEquityPoint {
+  timestamp: string;
+  value: number;
+  benchmark?: number;
+}
+
 /* ---------- Page ---------- */
 
 export default function BacktestDetailPage() {
@@ -120,6 +133,9 @@ export default function BacktestDetailPage() {
 
   // Delete state
   const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // Share state
+  const [sharing, setSharing] = useState(false);
 
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
@@ -154,7 +170,7 @@ export default function BacktestDetailPage() {
       setDetail({ ...detail, name: editName });
       setEditing(false);
       toast('success', 'Backtest renamed');
-    } catch (err) {
+    } catch {
       toast('error', 'Failed to rename backtest');
     }
   };
@@ -164,21 +180,62 @@ export default function BacktestDetailPage() {
       await fetchApi<undefined>(`/api/backtest/results/${resultId}`, { method: 'DELETE' });
       toast('success', 'Backtest deleted');
       router.push('/backtest');
-    } catch (err) {
+    } catch {
       toast('error', 'Failed to delete backtest');
     }
   };
 
+  const handleShare = async () => {
+    setSharing(true);
+    try {
+      const res = await fetchApi<{ share_url: string }>(`/api/backtest/results/${resultId}/share`, {
+        method: 'POST',
+      });
+      await navigator.clipboard.writeText(res.share_url);
+      toast('success', 'Share link copied to clipboard');
+    } catch {
+      toast('error', 'Failed to create share link');
+    } finally {
+      setSharing(false);
+    }
+  };
+
   const accentColor = isDark ? '#2383e2' : '#2563eb';
+  const benchmarkColor = isDark ? 'rgba(255,255,255,0.3)' : '#94a3b8';
   const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
   const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
 
-  const chartData = useMemo(
-    () => detail ? aggregateEquityCurve(detail.equity_curve, resolution) : [],
-    [detail, resolution],
-  );
+  const hasBenchmark = detail?.benchmark_equity && detail.benchmark_equity.length > 0;
 
-  const ChartTooltip = useMemo(() => makeCustomTooltip(resolution), [resolution]);
+  // Merge equity + benchmark into single dataset for the chart
+  const chartData: MergedEquityPoint[] = useMemo(() => {
+    if (!detail) return [];
+    const aggregated = aggregateEquityCurve(detail.equity_curve, resolution);
+    if (!hasBenchmark) return aggregated;
+
+    const benchAggregated = aggregateEquityCurve(detail.benchmark_equity!, resolution);
+    const benchMap = new Map(benchAggregated.map((p) => [p.timestamp, p.value]));
+    return aggregated.map((p) => ({
+      ...p,
+      benchmark: benchMap.get(p.timestamp),
+    }));
+  }, [detail, resolution, hasBenchmark]);
+
+  const CustomTooltip = useMemo(() => {
+    return function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number; dataKey: string }>; label?: string }) {
+      if (!active || !payload?.length) return null;
+      return (
+        <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
+          <p className="text-xs text-text-muted">{label ? formatXTick(label, resolution) : ''}</p>
+          {payload.map((entry) => (
+            <p key={entry.dataKey} className="text-sm font-medium text-text-primary">
+              {entry.dataKey === 'benchmark' ? 'Benchmark' : 'Strategy'}: ${entry.value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            </p>
+          ))}
+        </div>
+      );
+    };
+  }, [resolution]);
 
   const txnRows: TxnRow[] = useMemo(() => {
     if (!detail) return [];
@@ -193,11 +250,11 @@ export default function BacktestDetailPage() {
       side: t.side,
       price: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
       quantity: t.quantity.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''),
-      fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '—',
+      fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '\u2014',
       pnl: t.pnl,
       pnlFormatted: t.pnl != null
         ? `${t.pnl >= 0 ? '+' : '-'}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
-        : '—',
+        : '\u2014',
       isOpen: t.type === 'entry' && !exitIds.has(t.trade_id),
     }));
   }, [detail]);
@@ -241,7 +298,7 @@ export default function BacktestDetailPage() {
         <span className={row.pnl >= 0 ? 'text-status-success font-medium' : 'text-status-error font-medium'}>
           {row.pnlFormatted}
         </span>
-      ) : <span className="text-text-muted">—</span>,
+      ) : <span className="text-text-muted">{'\u2014'}</span>,
     },
   ];
 
@@ -264,6 +321,8 @@ export default function BacktestDetailPage() {
     );
   }
 
+  const { metrics } = detail;
+
   return (
     <div className="flex flex-col gap-6">
       {/* Stopped reason banner */}
@@ -274,7 +333,7 @@ export default function BacktestDetailPage() {
             <p className="text-sm font-medium text-text-primary">Backtest stopped early</p>
             <p className="text-xs text-text-muted">
               {detail.stopped_reason === 'margin_call'
-                ? 'Margin call — equity reached zero'
+                ? 'Margin call \u2014 equity reached zero'
                 : detail.stopped_reason}
             </p>
           </div>
@@ -315,6 +374,9 @@ export default function BacktestDetailPage() {
         </div>
         <div className="flex items-center gap-2">
           <StatusBadge status={detail.status === 'completed' ? 'Completed' : detail.status} variant={detail.status === 'completed' ? 'success' : 'info'} />
+          <Button variant="outline" size="sm" onClick={handleShare} loading={sharing}>
+            <Share2 className="h-4 w-4" /> Share
+          </Button>
           {confirmDelete ? (
             <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/5 px-3 py-1.5">
               <span className="text-xs text-text-primary">Delete this backtest?</span>
@@ -333,29 +395,69 @@ export default function BacktestDetailPage() {
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <DataCard padding="sm">
           <p className="text-xs text-text-muted">Total PnL</p>
-          <p className={`text-lg font-bold ${detail.metrics.total_pnl >= 0 ? 'text-status-success' : 'text-status-error'}`}>
-            {detail.metrics.total_pnl >= 0 ? '+' : '-'}${Math.abs(detail.metrics.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+          <p className={`text-lg font-bold ${metrics.total_pnl >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+            {metrics.total_pnl >= 0 ? '+' : '-'}${Math.abs(metrics.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}
           </p>
         </DataCard>
         <DataCard padding="sm">
           <p className="text-xs text-text-muted">Win Rate</p>
-          <p className="text-lg font-bold text-text-primary">{detail.metrics.win_rate.toFixed(1)}%</p>
+          <p className="text-lg font-bold text-text-primary">{metrics.win_rate.toFixed(1)}%</p>
         </DataCard>
         <DataCard padding="sm">
           <p className="text-xs text-text-muted">Sharpe Ratio</p>
-          <p className="text-lg font-bold text-text-primary">{detail.metrics.sharpe_ratio.toFixed(2)}</p>
+          <p className="text-lg font-bold text-text-primary">{metrics.sharpe_ratio.toFixed(2)}</p>
         </DataCard>
         <DataCard padding="sm">
           <p className="text-xs text-text-muted">Max Drawdown</p>
-          <p className="text-lg font-bold text-status-error">{detail.metrics.max_drawdown.toFixed(1)}%</p>
+          <p className="text-lg font-bold text-status-error">{metrics.max_drawdown.toFixed(1)}%</p>
         </DataCard>
         <DataCard padding="sm">
           <p className="text-xs text-text-muted">Total Trades</p>
-          <p className="text-lg font-bold text-text-primary">{detail.metrics.total_trades}</p>
+          <p className="text-lg font-bold text-text-primary">{metrics.total_trades}</p>
         </DataCard>
       </div>
 
-      {/* Equity curve chart */}
+      {/* Extended metrics row */}
+      {(metrics.alpha !== undefined || metrics.beta !== undefined || metrics.max_consecutive_wins !== undefined || metrics.max_consecutive_losses !== undefined || metrics.expectancy !== undefined) && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+          {metrics.alpha !== undefined && (
+            <DataCard padding="sm">
+              <p className="text-xs text-text-muted">Alpha</p>
+              <p className={`text-lg font-bold ${metrics.alpha >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+                {metrics.alpha >= 0 ? '+' : ''}{metrics.alpha.toFixed(2)}
+              </p>
+            </DataCard>
+          )}
+          {metrics.beta !== undefined && (
+            <DataCard padding="sm">
+              <p className="text-xs text-text-muted">Beta</p>
+              <p className="text-lg font-bold text-text-primary">{metrics.beta.toFixed(2)}</p>
+            </DataCard>
+          )}
+          {metrics.max_consecutive_wins !== undefined && (
+            <DataCard padding="sm">
+              <p className="text-xs text-text-muted">Max Consec. Wins</p>
+              <p className="text-lg font-bold text-status-success">{metrics.max_consecutive_wins}</p>
+            </DataCard>
+          )}
+          {metrics.max_consecutive_losses !== undefined && (
+            <DataCard padding="sm">
+              <p className="text-xs text-text-muted">Max Consec. Losses</p>
+              <p className="text-lg font-bold text-status-error">{metrics.max_consecutive_losses}</p>
+            </DataCard>
+          )}
+          {metrics.expectancy !== undefined && (
+            <DataCard padding="sm">
+              <p className="text-xs text-text-muted">Expectancy</p>
+              <p className={`text-lg font-bold ${metrics.expectancy >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+                {metrics.expectancy >= 0 ? '+' : ''}${metrics.expectancy.toFixed(2)}
+              </p>
+            </DataCard>
+          )}
+        </div>
+      )}
+
+      {/* Equity curve chart with optional benchmark overlay */}
       <DataCard title="Equity Curve">
         <div className="flex items-center gap-1 mb-3">
           {(['hours', 'days', 'months'] as TimeResolution[]).map((r) => (
@@ -394,16 +496,31 @@ export default function BacktestDetailPage() {
                 tickLine={false}
                 width={44}
               />
-              <Tooltip content={<ChartTooltip />} />
+              <Tooltip content={<CustomTooltip />} />
+              {hasBenchmark && <Legend />}
               <Area
                 type="monotone"
                 dataKey="value"
+                name="Strategy"
                 stroke={accentColor}
                 strokeWidth={2}
                 fill="url(#detailGradient)"
                 dot={false}
                 activeDot={{ r: 4, fill: accentColor, strokeWidth: 0 }}
               />
+              {hasBenchmark && (
+                <Area
+                  type="monotone"
+                  dataKey="benchmark"
+                  name="Benchmark"
+                  stroke={benchmarkColor}
+                  strokeWidth={1.5}
+                  strokeDasharray="5 3"
+                  fill="none"
+                  dot={false}
+                  activeDot={{ r: 3, fill: benchmarkColor, strokeWidth: 0 }}
+                />
+              )}
             </AreaChart>
           </ResponsiveContainer>
         </div>

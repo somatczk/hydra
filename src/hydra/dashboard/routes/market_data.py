@@ -157,8 +157,8 @@ def _build_mock_order_book(symbol: str, depth: int = 20) -> dict[str, Any]:
     for i in range(depth):
         bid_price = round(mid - tick * (i + 1), 8)
         ask_price = round(mid + tick * (i + 1), 8)
-        bid_qty = round(random.uniform(0.01, 2.0), 4)  # noqa: S311
-        ask_qty = round(random.uniform(0.01, 2.0), 4)  # noqa: S311
+        bid_qty = round(random.uniform(0.01, 2.0), 4)  # noqa: S311  # nosec B311
+        ask_qty = round(random.uniform(0.01, 2.0), 4)  # noqa: S311  # nosec B311
         bids.append([bid_price, bid_qty])
         asks.append([ask_price, ask_qty])
 

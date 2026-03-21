@@ -121,6 +121,7 @@ class QuickTradeResponse(BaseModel):
     take_profit_order_id: str | None = None
     stop_loss_order_id: str | None = None
     trailing_stop_order_id: str | None = None
+    exit_orders_deferred: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +364,13 @@ async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, An
         "take_profit_order_id": None,
         "stop_loss_order_id": None,
         "trailing_stop_order_id": None,
+        "exit_orders_deferred": False,
     }
+
+    # Don't place TP/SL/trailing orders if the entry is still pending (e.g. LIMIT)
+    if fill["status"] != "FILLED":
+        result["exit_orders_deferred"] = True
+        return result
 
     # Attach take-profit order (LIMIT on the opposite side)
     if body.take_profit is not None:

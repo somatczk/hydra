@@ -138,7 +138,18 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
                     quantity=qty,
                 )
             else:
-                # Entry: place a market order
+                # Entry: auto-compute quantity from session balance if missing
+                if body.quantity is None:
+                    try:
+                        balance = await executor.get_balance()
+                        bal_usdt = balance.get("USDT", Decimal("0"))
+                        price = await executor.get_last_price(body.symbol)
+                        if bal_usdt > 0 and price > 0:
+                            body.quantity = float(
+                                Decimal(str(bal_usdt)) * Decimal("0.01") / Decimal(str(price))
+                            )
+                    except Exception:
+                        logger.debug("Could not auto-compute quantity for %s", body.symbol)
                 if body.quantity is None:
                     raise HTTPException(
                         status_code=422,
@@ -187,7 +198,7 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
 # ---------------------------------------------------------------------------
 
 _TELEGRAM_PATTERN = re.compile(
-    r"(BUY|SELL|LONG|SHORT)\s+(\w+)\s*(?:@\s*(\d+(?:\.\d+)?))?"
+    r"(BUY|SELL|LONG|SHORT)\s+(?:(\d+(?:\.\d+)?)\s+)?(\w+)\s*(?:@\s*(\d+(?:\.\d+)?))?"
     r"(?:\s+TP\s*(\d+(?:\.\d+)?))?(?:\s+SL\s*(\d+(?:\.\d+)?))?",
     re.IGNORECASE,
 )
@@ -220,7 +231,10 @@ async def receive_telegram_signal(body: TelegramSignal, request: Request) -> dic
 
     raw_side = match.group(1).upper()
     side = "buy" if raw_side in ("BUY", "LONG") else "sell"
-    symbol = match.group(2).upper()
+    quantity_str = match.group(2)  # optional quantity before symbol
+    symbol = match.group(3).upper()
+
+    quantity = float(quantity_str) if quantity_str else None
 
     # Convert to standard webhook format and reuse existing handler
     webhook = WebhookSignal(
@@ -229,6 +243,6 @@ async def receive_telegram_signal(body: TelegramSignal, request: Request) -> dic
         action="entry",
         strategy_id=body.strategy_id,
         secret=body.secret,
-        quantity=None,  # Will need quantity from context
+        quantity=quantity,
     )
     return await receive_webhook(webhook, request)

@@ -4,6 +4,7 @@ import { useState, type ReactNode } from 'react';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
 import { BottomTabBar } from './BottomTabBar';
+import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 
 interface AppLayoutProps {
   children: ReactNode;
@@ -11,6 +12,7 @@ interface AppLayoutProps {
 
 export function AppLayout({ children }: AppLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  useKeyboardShortcuts();
 
   return (
     <div className="min-h-screen bg-bg-primary">

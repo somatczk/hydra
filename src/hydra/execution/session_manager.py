@@ -19,7 +19,7 @@ from typing import Any, cast
 
 from hydra.core.config import load_config
 from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import BarEvent, EntrySignal, Event, ExitSignal
+from hydra.core.events import BarEvent, EntrySignal, Event, ExitSignal, OrderFillEvent
 from hydra.core.types import (
     Direction,
     ExchangeId,
@@ -136,15 +136,36 @@ class SessionManager:
             else:
                 self._risk_manager = PreTradeRiskManager()
             logger.info("PreTradeRiskManager initialised (from DB: %s)", row is not None)
+
+            # Load global paper capital from system_config table
+            try:
+                async with self._db_pool.acquire() as conn:
+                    pc_row = await conn.fetchrow(
+                        "SELECT value FROM system_config WHERE key = 'paper_capital'"
+                    )
+                self._global_paper_capital = (
+                    Decimal(str(pc_row["value"])) if pc_row else Decimal("10000")
+                )
+            except Exception:
+                self._global_paper_capital = Decimal("10000")
         except Exception:
             logger.exception("Failed to load risk config from DB; using defaults")
             self._risk_manager = PreTradeRiskManager()
+            self._global_paper_capital = Decimal("10000")
 
     async def reload_risk_config(self) -> None:
         """Re-read risk config from DB and update the live risk manager."""
         if self._db_pool is None:
             return
         await self._init_risk_manager()
+
+    def _total_allocated_paper_capital(self) -> Decimal:
+        """Sum paper_capital of all running paper sessions."""
+        total = Decimal("0")
+        for s in self._sessions.values():
+            if s.status == "running" and s.trading_mode == "paper" and s.paper_capital:
+                total += s.paper_capital
+        return total
 
     # -- Portfolio state builder --------------------------------------------
 
@@ -266,7 +287,17 @@ class SessionManager:
 
         executor: Any
         if trading_mode == "paper":
-            initial_bal = {"USDT": paper_capital or Decimal("10000")}  # per-strategy allocation
+            requested = paper_capital or Decimal("10000")
+            global_cap = getattr(self, "_global_paper_capital", Decimal("10000"))
+            allocated = self._total_allocated_paper_capital()
+            effective = min(requested, global_cap - allocated)
+            if effective <= 0:
+                raise ValueError(
+                    "Insufficient paper capital: "
+                    f"global={global_cap}, allocated={allocated}, requested={requested}"
+                )
+            paper_capital = effective
+            initial_bal = {"USDT": effective}  # per-strategy allocation
             executor = PaperTradingExecutor(
                 exchange_id=cfg.exchange.exchange_id,
                 initial_balances=initial_bal,
@@ -489,6 +520,43 @@ class SessionManager:
 
         raise KeyError(f"Strategy config not found: {strategy_id}")
 
+    async def _execute_order_actions(
+        self, actions: list, executor: Any, session: TradingSession
+    ) -> None:
+        """Dispatch OrderAction items (PlaceOrder/CancelOrder/ModifyOrder) to the executor."""
+        from hydra.strategy.base import CancelOrder, ModifyOrder, PlaceOrder
+
+        for action in actions:
+            try:
+                if isinstance(action, PlaceOrder):
+                    await executor.create_order(
+                        symbol=action.symbol,
+                        side=action.side,
+                        order_type=action.order_type,
+                        quantity=action.quantity,
+                        price=action.price,
+                        stop_price=action.stop_price,
+                        params=action.params or {},
+                    )
+                elif isinstance(action, CancelOrder):
+                    await executor.cancel_order(action.order_id, action.symbol)
+                elif isinstance(action, ModifyOrder):
+                    await executor.cancel_order(action.order_id, action.symbol)
+                    if action.new_price is not None or action.new_quantity is not None:
+                        await executor.create_order(
+                            symbol=action.symbol,
+                            side="BUY",
+                            order_type="LIMIT",
+                            quantity=action.new_quantity or Decimal("0"),
+                            price=action.new_price,
+                        )
+            except Exception:
+                logger.exception(
+                    "Failed to execute order action %s in session %s",
+                    type(action).__name__,
+                    session.session_id,
+                )
+
     async def _run_session(self, session: TradingSession) -> None:
         """Run the strategy engine in its own task."""
         try:
@@ -555,6 +623,51 @@ class SessionManager:
                             logger.debug("Could not broadcast fill to WebSocket")
 
                     await session._event_bus.subscribe("order_fill", on_fill_ws)
+
+                # Wire OrderManagementStrategy if applicable
+                if (
+                    session._engine is not None
+                    and session._engine.is_order_management
+                    and session._executor is not None
+                    and session._event_bus is not None
+                ):
+                    from hydra.strategy.base import OrderManagementStrategy
+
+                    for strategy in session._engine.get_all_strategies().values():
+                        if isinstance(strategy, OrderManagementStrategy):
+                            oms = strategy
+                            ex = session._executor
+
+                            # Execute on_start actions
+                            start_actions = await oms.on_start()
+                            if start_actions:
+                                await self._execute_order_actions(start_actions, ex, session)
+
+                            # On bar events: call strategy's on_bar -> execute actions
+                            async def on_bar_oms(
+                                event: Event,
+                                _oms: Any = oms,
+                                _ex: Any = ex,
+                            ) -> None:
+                                if isinstance(event, BarEvent):
+                                    actions = await _oms.on_bar(event)
+                                    if actions:
+                                        await self._execute_order_actions(actions, _ex, session)
+
+                            await session._event_bus.subscribe("bar", on_bar_oms)
+
+                            # On fill events: call strategy's on_fill -> execute follow-ups
+                            async def on_fill_oms(
+                                event: Event,
+                                _oms: Any = oms,
+                                _ex: Any = ex,
+                            ) -> None:
+                                if isinstance(event, OrderFillEvent):
+                                    actions = await _oms.on_fill(event)
+                                    if actions:
+                                        await self._execute_order_actions(actions, _ex, session)
+
+                            await session._event_bus.subscribe("order_fill", on_fill_oms)
 
                 # Start market data feed
                 if session._feed is not None:

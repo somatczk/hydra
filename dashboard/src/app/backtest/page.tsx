@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, Suspense } from 'react';
+import { useEffect, useState, useRef, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Play, Download, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -97,6 +97,7 @@ function BacktestPageContent() {
   });
   const [progress, setProgress] = useState(0);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const autorunTriggered = useRef(false);
 
   // Sync pollingTaskId to localStorage
   useEffect(() => {
@@ -200,6 +201,15 @@ function BacktestPageContent() {
       setRunning(false);
     }
   };
+
+  // Auto-run backtest when navigating from Save & Backtest
+  useEffect(() => {
+    if (autorunTriggered.current) return;
+    if (searchParams.get('autorun') !== 'true') return;
+    if (!strategyId || running) return;
+    autorunTriggered.current = true;
+    handleRunBacktest();
+  }, [strategyId]);
 
   const handleDelete = async (id: string) => {
     try {

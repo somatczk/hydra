@@ -12,6 +12,8 @@ import {
   ShieldAlert,
   Brain,
   Settings,
+  Layout,
+  SlidersHorizontal,
   X,
   type LucideIcon,
 } from 'lucide-react';
@@ -29,7 +31,9 @@ export const navItems: NavItem[] = [
   { label: 'Trading', href: '/trading', icon: CandlestickChart },
   { label: 'Strategies', href: '/strategies', icon: Zap },
   { label: 'Strategy Builder', href: '/builder', icon: Wrench },
+  { label: 'Templates', href: '/templates', icon: Layout },
   { label: 'Backtest', href: '/backtest', icon: FlaskConical },
+  { label: 'Optimize', href: '/optimize', icon: SlidersHorizontal },
   { label: 'Portfolio', href: '/portfolio', icon: Briefcase },
   { label: 'Risk', href: '/risk', icon: ShieldAlert },
   { label: 'Models', href: '/models', icon: Brain },
