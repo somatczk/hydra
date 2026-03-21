@@ -51,6 +51,11 @@ make docker-build     # Build all Docker images
 ## Module Boundaries
 Each module only imports from `hydra.core` + its declared dependencies. Enforced by import-linter.
 
+## Versioning
+- Version is defined in `pyproject.toml` under `[project] version`
+- When bumping the version, **both `pyproject.toml` AND `uv.lock` must be updated**. Run `uv lock` after changing the version in `pyproject.toml` to sync the lockfile.
+- After pushing to hydra, bump the image tags in `romulus/stacks/hydra/*/Dockerfile` (engine, dashboard, backtest-worker) to match.
+
 ## CI/CD
 - PRs trigger lint, type-check, security scan, unit/integration/e2e tests
 - Merge to `main` builds Docker images, pushes to GHCR with auto-incrementing semver tags
