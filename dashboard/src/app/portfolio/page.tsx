@@ -100,7 +100,7 @@ interface TradesResponse {
 
 interface SentimentData {
   value: number;
-  label: string;
+  classification: string;
   timestamp: string;
 }
 
@@ -247,8 +247,8 @@ export default function PortfolioPage() {
       fetchApi<AttributionItem[]>(`/api/portfolio/attribution${qs}`)
         .then(setAttribution)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, attribution: true })); }),
-      fetchApi<SentimentData>('/api/market/sentiment')
-        .then(setSentiment)
+      fetchApi<SentimentData[]>('/api/market/sentiment')
+        .then((arr) => setSentiment(arr?.[0] ?? null))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, sentiment: true })); }),
       fetchApi<StrategyOption[]>('/api/strategies')
         .then((data) => setStrategies(data.map((s) => ({ id: s.id, name: s.name }))))

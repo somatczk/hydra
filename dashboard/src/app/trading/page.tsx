@@ -101,8 +101,8 @@ interface OrderBook {
 interface FundingRate {
   symbol: string;
   rate: number;
-  next_funding_time: string;
-  annualized: number;
+  next_funding_time: string | null;
+  annualized_rate: number;
 }
 
 /* ---------- Helpers ---------- */
@@ -277,8 +277,8 @@ export default function TradingPage() {
       fetchApi<OrderBook>('/api/market/orderbook?symbol=BTCUSDT')
         .then(setOrderBook)
         .catch(() => { setFetchErrors((prev) => ({ ...prev, orderBook: true })); }),
-      fetchApi<FundingRate>('/api/market/funding-rates/current?symbol=BTCUSDT')
-        .then(setFundingRate)
+      fetchApi<FundingRate[]>('/api/market/funding-rates/current?symbol=BTCUSDT')
+        .then((arr) => setFundingRate(arr?.[0] ?? null))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, fundingRate: true })); }),
     ]);
 
@@ -504,7 +504,7 @@ export default function TradingPage() {
                 <div>
                   <p className="text-sm font-medium text-text-primary">{fundingRate.symbol}</p>
                   <p className="text-xs text-text-muted">
-                    Next: {new Date(fundingRate.next_funding_time).toLocaleTimeString()}
+                    Next: {fundingRate.next_funding_time ? new Date(fundingRate.next_funding_time).toLocaleTimeString() : 'N/A'}
                   </p>
                 </div>
                 <div className="text-right">
@@ -512,7 +512,7 @@ export default function TradingPage() {
                     {fundingRate.rate >= 0 ? '+' : ''}{(fundingRate.rate * 100).toFixed(4)}%
                   </p>
                   <p className="text-xs text-text-muted">
-                    {(fundingRate.annualized * 100).toFixed(2)}% ann.
+                    {(fundingRate.annualized_rate).toFixed(2)}% ann.
                   </p>
                 </div>
               </div>
