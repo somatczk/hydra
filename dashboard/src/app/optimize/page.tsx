@@ -129,17 +129,19 @@ export default function OptimizePage() {
     setRunning(true);
     setResults([]);
     try {
-      const paramRanges: Record<string, { min: number; max: number; step: number }> = {};
-      for (const p of params) {
-        paramRanges[p.name] = { min: p.min, max: p.max, step: p.step };
-      }
+      const paramSpace = params.map((p) => ({
+        name: p.name,
+        type: Number.isInteger(p.min) && Number.isInteger(p.max) && Number.isInteger(p.step) ? 'int' : 'float',
+        low: p.min,
+        high: p.max,
+      }));
       const result = await fetchApi<{ task_id?: string; results?: OptimizeResult[] }>(
         '/api/backtest/hyperopt',
         {
           method: 'POST',
           body: JSON.stringify({
             strategy_id: strategyId,
-            param_ranges: paramRanges,
+            param_space: paramSpace,
             max_trials: parseInt(maxTrials, 10) || 100,
           }),
         },
