@@ -5,6 +5,7 @@ Main entry point for the dashboard REST API and WebSocket endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -157,6 +158,42 @@ async def ws_signals(websocket: WebSocket) -> None:
 async def ws_risk(websocket: WebSocket) -> None:
     """Risk status changes."""
     await _ws_handler("risk", websocket)
+
+
+@app.websocket("/ws/orderbook")
+async def ws_orderbook(websocket: WebSocket) -> None:
+    """Real-time order book depth stream.
+
+    Query params:
+        symbol   — trading pair (default: BTCUSDT)
+        exchange — exchange id  (default: binance)
+
+    Sends the top-20 bid/ask levels every second in the format::
+
+        {"bids": [[price, qty], ...], "asks": [[price, qty], ...],
+         "spread": float, "timestamp": "ISO", "mock": bool}
+    """
+    from hydra.dashboard.routes.market_data import _build_mock_order_book, _fetch_live_order_book
+
+    symbol: str = websocket.query_params.get("symbol", "BTCUSDT")
+    exchange: str = websocket.query_params.get("exchange", "binance")
+
+    await websocket.accept()
+    try:
+        while True:
+            snapshot = await _fetch_live_order_book(symbol, exchange, depth=20)
+            if snapshot is None:
+                snapshot = _build_mock_order_book(symbol, depth=20)
+            await websocket.send_text(json.dumps(snapshot))
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "ws_orderbook error for %s/%s", symbol, exchange, exc_info=True
+        )
 
 
 # ---------------------------------------------------------------------------

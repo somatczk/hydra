@@ -7,6 +7,7 @@ routed to running trading sessions for immediate execution.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from decimal import Decimal
 from typing import Any
@@ -179,3 +180,55 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
         "signal_id": signal_id,
         "message": f"Signal executed on {executed} session(s)",
     }
+
+
+# ---------------------------------------------------------------------------
+# Telegram signal format parser
+# ---------------------------------------------------------------------------
+
+_TELEGRAM_PATTERN = re.compile(
+    r"(BUY|SELL|LONG|SHORT)\s+(\w+)\s*(?:@\s*(\d+(?:\.\d+)?))?"
+    r"(?:\s+TP\s*(\d+(?:\.\d+)?))?(?:\s+SL\s*(\d+(?:\.\d+)?))?",
+    re.IGNORECASE,
+)
+
+
+class TelegramSignal(BaseModel):
+    """Raw text message from a Telegram signal group."""
+
+    text: str
+    strategy_id: str = ""
+    secret: str = ""
+
+
+@router.post("/telegram", response_model=WebhookResponse)
+async def receive_telegram_signal(body: TelegramSignal, request: Request) -> dict[str, Any]:
+    """Parse a Telegram-style text signal and execute it.
+
+    Accepts formats like: ``BUY BTCUSDT @ 85000 TP 87000 SL 84000``
+    """
+    expected_secret = _get_webhook_secret(request)
+    if expected_secret and body.secret != expected_secret:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+    match = _TELEGRAM_PATTERN.search(body.text)
+    if not match:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not parse signal. Expected format: BUY BTCUSDT @ 85000 TP 87000 SL 84000",
+        )
+
+    raw_side = match.group(1).upper()
+    side = "buy" if raw_side in ("BUY", "LONG") else "sell"
+    symbol = match.group(2).upper()
+
+    # Convert to standard webhook format and reuse existing handler
+    webhook = WebhookSignal(
+        symbol=symbol,
+        side=side,
+        action="entry",
+        strategy_id=body.strategy_id,
+        secret=body.secret,
+        quantity=None,  # Will need quantity from context
+    )
+    return await receive_webhook(webhook, request)

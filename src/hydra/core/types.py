@@ -20,7 +20,17 @@ from typing import Literal, NewType, Protocol, runtime_checkable
 Symbol = NewType("Symbol", str)
 """Trading pair symbol, e.g. 'BTCUSDT'."""
 
-ExchangeId = Literal["binance", "bybit", "kraken", "okx"]
+ExchangeId = Literal[
+    "binance",
+    "bybit",
+    "kraken",
+    "okx",
+    "coinbase",
+    "kucoin",
+    "gateio",
+    "mexc",
+    "bitget",
+]
 """Supported exchange identifiers."""
 
 

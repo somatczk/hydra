@@ -43,6 +43,7 @@ class _PendingOrder:
     stop_price: Decimal | None
     trail_pct: Decimal | None = None
     peak_price: Decimal | None = None
+    oco_link: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -143,6 +144,57 @@ class PaperTradingExecutor:
             fill_price = self._apply_slippage(market_price, side)
             return self._execute_fill(order_id, symbol, side, quantity, fill_price)
 
+        if otype == OrderType.OCO:
+            # OCO requires both a TP limit price and a SL stop price.
+            # The caller passes: price=take_profit_price, stop_price=stop_loss_price.
+            if price is None or stop_price is None:
+                raise ValueError(
+                    "OCO orders require both price (take-profit limit) "
+                    "and stop_price (stop-loss trigger)"
+                )
+            oco_link = str(uuid.uuid4())
+            exit_side = "SELL" if side.upper() == "BUY" else "BUY"
+
+            # Take-profit leg (LIMIT)
+            tp_id = str(uuid.uuid4())
+            tp_order = _PendingOrder(
+                order_id=tp_id,
+                symbol=symbol,
+                side=exit_side,
+                order_type=OrderType.LIMIT,
+                quantity=quantity,
+                price=price,
+                stop_price=None,
+                oco_link=oco_link,
+            )
+
+            # Stop-loss leg (STOP_MARKET)
+            sl_id = str(uuid.uuid4())
+            sl_order = _PendingOrder(
+                order_id=sl_id,
+                symbol=symbol,
+                side=exit_side,
+                order_type=OrderType.STOP_MARKET,
+                quantity=quantity,
+                price=None,
+                stop_price=stop_price,
+                oco_link=oco_link,
+            )
+
+            self._pending_orders.extend([tp_order, sl_order])
+            return {
+                "id": order_id,
+                "symbol": symbol,
+                "side": side,
+                "type": otype,
+                "amount": float(quantity),
+                "status": "PENDING",
+                "filled": False,
+                "oco_link": oco_link,
+                "take_profit_order_id": tp_id,
+                "stop_loss_order_id": sl_id,
+            }
+
         # Trailing stop orders need trail_pct and an initial peak_price
         trail_pct: Decimal | None = None
         peak_price: Decimal | None = None
@@ -224,12 +276,25 @@ class PaperTradingExecutor:
                     pending.side,
                     pending.quantity,
                     fill_price,
+                    oco_link=pending.oco_link,
                 )
                 fills.append(fill)
             else:
                 remaining.append(pending)
 
         self._pending_orders = remaining
+
+        # Cancel any pending orders that share an oco_link with a filled order.
+        # _execute_fill embeds "_oco_link" on the fill dict when one is present.
+        if fills:
+            oco_links_to_cancel: set[str] = {
+                link for fill in fills if (link := fill.get("_oco_link")) is not None
+            }
+            if oco_links_to_cancel:
+                self._pending_orders = [
+                    o for o in self._pending_orders if o.oco_link not in oco_links_to_cancel
+                ]
+
         return fills
 
     def _should_trigger(self, order: _PendingOrder, bar: OHLCV) -> bool:
@@ -321,6 +386,8 @@ class PaperTradingExecutor:
         side: str,
         quantity: Decimal,
         fill_price: Decimal,
+        *,
+        oco_link: str | None = None,
     ) -> dict[str, Any]:
         """Execute a simulated fill: update balances and positions."""
         cost = fill_price * quantity
@@ -354,6 +421,8 @@ class PaperTradingExecutor:
             "status": "FILLED",
             "filled": True,
         }
+        if oco_link is not None:
+            fill_dict["_oco_link"] = oco_link
         self._filled_orders.append(fill_dict)
 
         try:

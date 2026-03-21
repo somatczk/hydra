@@ -54,6 +54,8 @@ class RiskConfig(BaseModel):
     max_drawdown_pct: float = 0.15
     max_concurrent_positions: int = 10
     kill_switch_active: bool = False
+    leverage: int = 1
+    margin_mode: str = "isolated"  # "isolated" | "cross"
 
 
 class RiskConfigUpdate(BaseModel):
@@ -63,6 +65,8 @@ class RiskConfigUpdate(BaseModel):
     max_daily_loss_pct: float | None = Field(None, ge=0, le=1)
     max_drawdown_pct: float | None = Field(None, ge=0, le=1)
     max_concurrent_positions: int | None = Field(None, ge=1, le=100)
+    leverage: int | None = Field(None, ge=1, le=125)
+    margin_mode: str | None = None
 
 
 class RiskStatusLive(BaseModel):

@@ -22,10 +22,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _EXCHANGE_CLASS_MAP: dict[str, str] = {
+    # Futures / derivatives class (used for live trading)
     "binance": "binanceusdm",
     "bybit": "bybit",
     "kraken": "krakenfutures",
     "okx": "okx",
+    # coinbase and mexc do not offer a separate futures class via CCXT; fall
+    # back to the spot class so the client can still be instantiated.
+    "coinbase": "coinbase",
+    "kucoin": "kucoinfutures",
+    "gateio": "gateio",
+    "mexc": "mexc",
+    "bitget": "bitget",
 }
 
 _SPOT_EXCHANGE_CLASS_MAP: dict[str, str] = {
@@ -33,6 +41,11 @@ _SPOT_EXCHANGE_CLASS_MAP: dict[str, str] = {
     "bybit": "bybit",
     "kraken": "kraken",
     "okx": "okx",
+    "coinbase": "coinbase",
+    "kucoin": "kucoin",
+    "gateio": "gateio",
+    "mexc": "mexc",
+    "bitget": "bitget",
 }
 
 

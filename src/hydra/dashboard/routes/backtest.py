@@ -1426,3 +1426,44 @@ async def get_walkforward_results(task_id: str) -> dict[str, Any]:
         "aggregated_drawdown": float(agg.max_drawdown) if agg is not None else None,
         "out_of_sample_equity": oos_equity,
     }
+
+
+# ---------------------------------------------------------------------------
+# Backtest result sharing
+# ---------------------------------------------------------------------------
+
+_SHARED_TOKENS: dict[str, str] = {}  # token → result_id
+
+
+@router.post("/results/{result_id}/share")
+async def share_result(result_id: str, request: Request) -> dict[str, str]:
+    """Generate a public sharing token for a backtest result."""
+    import uuid
+
+    # Verify result exists
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM backtest_results WHERE id = $1", result_id
+                )
+                if not exists:
+                    raise HTTPException(status_code=404, detail="Result not found")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    token = uuid.uuid4().hex[:12]
+    _SHARED_TOKENS[token] = result_id
+    return {"token": token, "share_url": f"/api/backtest/shared/{token}"}
+
+
+@router.get("/shared/{token}")
+async def get_shared_result(token: str, request: Request) -> dict[str, Any]:
+    """Public read-only access to a shared backtest result (no auth required)."""
+    result_id = _SHARED_TOKENS.get(token)
+    if result_id is None:
+        raise HTTPException(status_code=404, detail="Shared link not found or expired")
+    return await get_result_detail(result_id, request)

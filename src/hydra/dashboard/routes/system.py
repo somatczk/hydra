@@ -68,6 +68,8 @@ class PlatformConfig(BaseModel):
     max_concurrent_strategies: int = 5
     paper_capital: float = 10000.0
     webhook_secret: str = ""
+    discord_webhook_url: str = ""
+    slack_webhook_url: str = ""
 
 
 class PlatformConfigUpdate(BaseModel):
@@ -77,6 +79,8 @@ class PlatformConfigUpdate(BaseModel):
     max_concurrent_strategies: int | None = None
     paper_capital: float | None = None
     webhook_secret: str | None = None
+    discord_webhook_url: str | None = None
+    slack_webhook_url: str | None = None
 
 
 class ServiceHealth(BaseModel):
@@ -449,6 +453,72 @@ async def update_notifications(body: NotificationPreferences, request: Request) 
         logger.exception("Failed to update notification preferences")
         raise HTTPException(status_code=500, detail="Failed to update preferences") from exc
     return {"preferences": body.preferences}
+
+
+# ---------------------------------------------------------------------------
+# Notification test endpoint
+# ---------------------------------------------------------------------------
+
+
+class NotificationTestResponse(BaseModel):
+    discord_sent: bool
+    slack_sent: bool
+    message: str
+
+
+@router.post("/notifications/test", response_model=NotificationTestResponse)
+async def test_notifications(request: Request) -> NotificationTestResponse:
+    """Send a test message to all configured webhook channels.
+
+    Reads ``discord_webhook_url`` and ``slack_webhook_url`` from the persisted
+    platform config.  Returns the delivery status for each channel.
+    """
+    from hydra.ops.notifications import NotificationDispatcher
+
+    cfg_dict = _get_system_config(request)
+    discord_url: str = cfg_dict.get("discord_webhook_url", "")
+    slack_url: str = cfg_dict.get("slack_webhook_url", "")
+
+    if not discord_url and not slack_url:
+        return NotificationTestResponse(
+            discord_sent=False,
+            slack_sent=False,
+            message=(
+                "No webhook URLs configured. "
+                "Set discord_webhook_url or slack_webhook_url in platform config."
+            ),
+        )
+
+    dispatcher = NotificationDispatcher()
+    dispatcher.configure(discord_url=discord_url, slack_url=slack_url)
+
+    discord_sent = False
+    slack_sent = False
+
+    from hydra.ops.notifications import DiscordWebhookNotifier, SlackWebhookNotifier
+
+    title = "Hydra — Test Notification"
+    body = "This is a test message from the Hydra trading platform."
+
+    if discord_url:
+        notifier = DiscordWebhookNotifier(discord_url)
+        discord_sent = await notifier.send(title, body)
+
+    if slack_url:
+        notifier_slack = SlackWebhookNotifier(slack_url)
+        slack_sent = await notifier_slack.send(title, body)
+
+    parts: list[str] = []
+    if discord_url:
+        parts.append(f"Discord: {'ok' if discord_sent else 'failed'}")
+    if slack_url:
+        parts.append(f"Slack: {'ok' if slack_sent else 'failed'}")
+
+    return NotificationTestResponse(
+        discord_sent=discord_sent,
+        slack_sent=slack_sent,
+        message=", ".join(parts),
+    )
 
 
 # ---------------------------------------------------------------------------

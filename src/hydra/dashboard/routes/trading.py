@@ -99,6 +99,30 @@ class KillSwitchResponse(BaseModel):
     sessions_stopped: int = 0
 
 
+class QuickTradeRequest(BaseModel):
+    symbol: str = "BTCUSDT"
+    side: str  # "buy" | "sell"
+    order_type: str = "MARKET"  # "MARKET" | "LIMIT"
+    quantity: float
+    price: float | None = None  # required for LIMIT
+    take_profit: float | None = None  # TP price
+    stop_loss: float | None = None  # SL price
+    trailing_stop_pct: float | None = None
+
+
+class QuickTradeResponse(BaseModel):
+    order_id: str
+    symbol: str
+    side: str
+    order_type: str
+    quantity: float
+    price: float | None = None
+    status: str
+    take_profit_order_id: str | None = None
+    stop_loss_order_id: str | None = None
+    trailing_stop_order_id: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -270,3 +294,135 @@ async def release_kill_switch(request: Request) -> dict[str, Any]:
         "message": "Kill switch released — trading can resume",
         "sessions_stopped": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Quick-trade endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post("/quick-trade", response_model=QuickTradeResponse)
+async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, Any]:
+    """Place a manual order via an active session that includes the target symbol.
+
+    Finds the first running session whose symbols list contains ``body.symbol``,
+    then delegates order placement to the session's executor.  Optionally attaches
+    take-profit (LIMIT), stop-loss (STOP_MARKET), and trailing-stop orders.
+    """
+    mgr = _get_session_manager(request)
+
+    # Find a running session that covers the requested symbol
+    target_session = None
+    for session in mgr.list_sessions():
+        if session.status == "running" and body.symbol in session.symbols:
+            target_session = session
+            break
+
+    if target_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"No running session found for symbol '{body.symbol}'. "
+                "Start a trading session first."
+            ),
+        )
+
+    executor = target_session._executor
+    if executor is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session executor is not initialised",
+        )
+
+    if body.order_type.upper() == "LIMIT" and body.price is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="price is required for LIMIT orders",
+        )
+
+    try:
+        price_dec = Decimal(str(body.price)) if body.price is not None else None
+        fill = await executor.create_order(
+            body.symbol,
+            body.side.upper(),
+            body.order_type.upper(),
+            Decimal(str(body.quantity)),
+            price_dec,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    result: dict[str, Any] = {
+        "order_id": fill["id"],
+        "symbol": fill["symbol"],
+        "side": fill["side"],
+        "order_type": body.order_type.upper(),
+        "quantity": fill["amount"],
+        "price": fill.get("price"),
+        "status": fill["status"],
+        "take_profit_order_id": None,
+        "stop_loss_order_id": None,
+        "trailing_stop_order_id": None,
+    }
+
+    # Attach take-profit order (LIMIT on the opposite side)
+    if body.take_profit is not None:
+        tp_side = "SELL" if body.side.upper() == "BUY" else "BUY"
+        try:
+            tp_fill = await executor.create_order(
+                body.symbol,
+                tp_side,
+                "LIMIT",
+                Decimal(str(body.quantity)),
+                Decimal(str(body.take_profit)),
+            )
+            result["take_profit_order_id"] = tp_fill["id"]
+        except Exception:
+            logger.warning(
+                "Failed to attach take-profit order for %s %s",
+                body.symbol,
+                body.side,
+                exc_info=True,
+            )
+
+    # Attach stop-loss order (STOP_MARKET on the opposite side)
+    if body.stop_loss is not None:
+        sl_side = "SELL" if body.side.upper() == "BUY" else "BUY"
+        try:
+            sl_fill = await executor.create_order(
+                body.symbol,
+                sl_side,
+                "STOP_MARKET",
+                Decimal(str(body.quantity)),
+                stop_price=Decimal(str(body.stop_loss)),
+            )
+            result["stop_loss_order_id"] = sl_fill["id"]
+        except Exception:
+            logger.warning(
+                "Failed to attach stop-loss order for %s %s",
+                body.symbol,
+                body.side,
+                exc_info=True,
+            )
+
+    # Attach trailing-stop order (TRAILING_STOP on the opposite side)
+    if body.trailing_stop_pct is not None:
+        ts_side = "SELL" if body.side.upper() == "BUY" else "BUY"
+        try:
+            ts_fill = await executor.create_order(
+                body.symbol,
+                ts_side,
+                "TRAILING_STOP",
+                Decimal(str(body.quantity)),
+                params={"trail_pct": str(body.trailing_stop_pct)},
+            )
+            result["trailing_stop_order_id"] = ts_fill["id"]
+        except Exception:
+            logger.warning(
+                "Failed to attach trailing-stop order for %s %s",
+                body.symbol,
+                body.side,
+                exc_info=True,
+            )
+
+    return result
