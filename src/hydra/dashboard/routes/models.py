@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,19 @@ from hydra.core.config import HydraConfig
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)
+
+# Allowed characters for model IDs to prevent path traversal
+_SAFE_MODEL_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+
+
+def _validate_model_id(model_id: str) -> str:
+    """Validate model_id contains no path traversal characters."""
+    if not _SAFE_MODEL_ID.match(model_id) or ".." in model_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid model ID",
+        )
+    return model_id
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +162,7 @@ def _scan_models_dir() -> list[dict[str, Any]]:
 
 def _get_model_from_dir(model_id: str) -> tuple[dict[str, Any], Path] | None:
     """Look up a single model by stem name."""
+    _validate_model_id(model_id)
     models_path = _models_dir()
     onnx_file = models_path / f"{model_id}.onnx"
     if not onnx_file.exists():
@@ -208,6 +223,10 @@ async def upload_model(file: UploadFile) -> dict[str, Any]:
     if not file.filename or not file.filename.endswith(".onnx"):
         raise HTTPException(status_code=422, detail="File must have .onnx extension")
 
+    # Sanitize filename — use only the basename to prevent path traversal
+    safe_filename = Path(file.filename).name
+    _validate_model_id(safe_filename.removesuffix(".onnx"))
+
     content = await file.read()
     if len(content) == 0:
         raise HTTPException(status_code=422, detail="Empty file")
@@ -223,7 +242,7 @@ async def upload_model(file: UploadFile) -> dict[str, Any]:
     models_path = _models_dir()
     models_path.mkdir(parents=True, exist_ok=True)
 
-    dest = models_path / file.filename
+    dest = models_path / safe_filename
     dest.write_bytes(content)
 
     model_id = dest.stem

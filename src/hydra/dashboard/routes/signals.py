@@ -198,8 +198,13 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
 # ---------------------------------------------------------------------------
 
 _TELEGRAM_PATTERN = re.compile(
-    r"(BUY|SELL|LONG|SHORT)\s+(?:(\d+(?:\.\d+)?)\s+)?(\w+)\s*(?:@\s*(\d+(?:\.\d+)?))?"
-    r"(?:\s+TP\s*(\d+(?:\.\d+)?))?(?:\s+SL\s*(\d+(?:\.\d+)?))?",
+    r"(BUY|SELL|LONG|SHORT)"  # side
+    r"[ \t]+"  # required whitespace (no \s to avoid matching newlines)
+    r"(?:(\d+(?:\.\d+)?)[ \t]+)?"  # optional quantity
+    r"([A-Za-z0-9]+)"  # symbol (explicit charset, no \w backtrack)
+    r"(?:[ \t]*@[ \t]*(\d+(?:\.\d+)?))?"  # optional @ price
+    r"(?:[ \t]+TP[ \t]*(\d+(?:\.\d+)?))?"  # optional TP
+    r"(?:[ \t]+SL[ \t]*(\d+(?:\.\d+)?))?",  # optional SL
     re.IGNORECASE,
 )
 
@@ -218,6 +223,9 @@ async def receive_telegram_signal(body: TelegramSignal, request: Request) -> dic
 
     Accepts formats like: ``BUY BTCUSDT @ 85000 TP 87000 SL 84000``
     """
+    if len(body.text) > 500:
+        raise HTTPException(status_code=422, detail="Signal text too long (max 500 chars)")
+
     expected_secret = _get_webhook_secret(request)
     if expected_secret and body.secret != expected_secret:
         raise HTTPException(status_code=401, detail="Invalid secret")
