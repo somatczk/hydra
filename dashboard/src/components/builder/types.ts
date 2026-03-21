@@ -72,6 +72,13 @@ export interface RiskConfig {
   sizing: SizingConfig;
 }
 
+/* ---------- ML Overlay ---------- */
+
+export interface MlOverlay {
+  modelName: string;
+  confidenceThreshold: number;
+}
+
 /* ---------- Full builder state ---------- */
 
 export interface BuilderState {
@@ -81,6 +88,7 @@ export interface BuilderState {
   exitShort: BuilderConditionGroup;
   timeframes: TimeframeConfig;
   risk: RiskConfig;
+  mlOverlay: MlOverlay | null;
   editingId: string | null;
   strategyName: string;
   strategyDescription: string;
@@ -130,6 +138,7 @@ export interface SaveRequest {
     sizing_params: Record<string, number>;
   };
   enable_immediately: boolean;
+  ml_overlay?: { model_name: string; confidence_threshold: number } | null;
 }
 
 export interface SerializedCondition {
@@ -176,6 +185,7 @@ export interface StrategyDetail {
     sizing_method: string;
     sizing_params: Record<string, number>;
   };
+  ml_overlay?: { model_name: string; confidence_threshold: number } | null;
 }
 
 /* ---------- Reducer actions ---------- */
@@ -196,6 +206,7 @@ export type BuilderAction =
   | { type: 'SET_STOP_LOSS'; stopLoss: Partial<StopLossConfig> }
   | { type: 'SET_TAKE_PROFIT'; takeProfit: Partial<TakeProfitConfig> }
   | { type: 'SET_SIZING'; sizing: Partial<SizingConfig> }
+  | { type: 'SET_ML_OVERLAY'; mlOverlay: MlOverlay | null }
   | { type: 'LOAD_STRATEGY'; payload: StrategyDetail }
   | { type: 'RESET' };
 

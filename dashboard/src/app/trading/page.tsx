@@ -210,11 +210,16 @@ export default function TradingPage() {
     setLoading(true);
     setFetchErrors({});
 
+    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
+      .catch(() => ({ trading_mode: 'paper' }));
+    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    const qs = `?source=${source}`;
+
     await Promise.all([
-      fetchApi<ApiPosition[]>('/api/portfolio/positions')
+      fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
         .then((data) => setOpenPositions(mapApiPositions(data)))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
-      fetchApi<ApiRecentTrade[]>('/api/portfolio/trades')
+      fetchApi<ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
         .then((data) => setRecentTrades(mapApiTrades(data)))
         .catch(() => { setFetchErrors((prev) => ({ ...prev, trades: true })); }),
       fetchApi<TradingSession[]>('/api/trading/sessions')

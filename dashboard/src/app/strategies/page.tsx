@@ -111,6 +111,7 @@ export default function StrategiesPage() {
   const [stoppingId, setStoppingId] = useState<string | null>(null);
   const [tradingMode, setTradingMode] = useState<string>('paper');
   const [paperCapital, setPaperCapital] = useState<number>(10000);
+  const [capitalMap, setCapitalMap] = useState<Record<string, string>>({});
   const [riskOverridesOpen, setRiskOverridesOpen] = useState<string | null>(null);
   const [riskOverrides, setRiskOverrides] = useState<Record<string, RiskOverrides>>({});
   const [savingRisk, setSavingRisk] = useState<string | null>(null);
@@ -138,10 +139,21 @@ export default function StrategiesPage() {
       }
 
       setStrategies(mapBuilderStrategies(stratData, sessData, perfMap));
+      const effectiveCapital = cfg?.paper_capital ?? 10000;
       if (cfg) {
         setTradingMode(cfg.trading_mode);
         if (cfg.paper_capital) setPaperCapital(cfg.paper_capital);
       }
+      // Initialize capital for new strategies (don't overwrite user edits)
+      setCapitalMap((prev) => {
+        const next = { ...prev };
+        for (const s of stratData) {
+          if (!(s.id in next)) {
+            next[s.id] = String(effectiveCapital);
+          }
+        }
+        return next;
+      });
     } catch (err) {
       logger.warn('Strategies', 'Failed to fetch strategies', err);
     } finally {
@@ -179,13 +191,14 @@ export default function StrategiesPage() {
 
   const handleStartPaper = async (strategyId: string) => {
     setStartingId(strategyId);
+    const capital = parseFloat(capitalMap[strategyId]) || paperCapital;
     try {
       await fetchApi('/api/trading/sessions', {
         method: 'POST',
         body: JSON.stringify({
           strategy_id: strategyId,
           trading_mode: 'paper',
-          paper_capital: paperCapital,
+          paper_capital: capital,
         }),
       });
       toast('success', 'Paper session started');
@@ -385,6 +398,21 @@ export default function StrategiesPage() {
                   </p>
                   <p className="text-[10px] text-text-muted">Max DD</p>
                 </div>
+              </div>
+            )}
+
+            {/* Per-strategy capital — only when no session is running */}
+            {!strategy.session && strategy.status === 'Active' && tradingMode === 'paper' && (
+              <div className="mt-3 flex items-center gap-2">
+                <label className="text-xs text-text-muted whitespace-nowrap">Capital:</label>
+                <Input
+                  type="number"
+                  value={capitalMap[strategy.id] ?? String(paperCapital)}
+                  onChange={(e) =>
+                    setCapitalMap((prev) => ({ ...prev, [strategy.id]: e.target.value }))
+                  }
+                  className="w-32"
+                />
               </div>
             )}
 

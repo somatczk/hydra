@@ -385,7 +385,13 @@ export default function SessionDetailPage() {
       </div>
 
       {/* Metrics row */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
+        {detail.paper_capital != null && detail.paper_capital > 0 && (
+          <DataCard padding="sm">
+            <p className="text-xs text-text-muted">Starting Capital</p>
+            <p className="text-lg font-bold text-text-primary">{fmtPrice(detail.paper_capital)}</p>
+          </DataCard>
+        )}
         <DataCard padding="sm">
           <p className="text-xs text-text-muted">Balance</p>
           <p className="text-lg font-bold text-text-primary">{balanceDisplay}</p>
@@ -394,6 +400,11 @@ export default function SessionDetailPage() {
           <p className="text-xs text-text-muted">Total PnL</p>
           <p className={`text-lg font-bold ${detail.metrics.total_pnl >= 0 ? 'text-status-success' : 'text-status-error'}`}>
             {fmtUsd(detail.metrics.total_pnl)}
+            {detail.paper_capital != null && detail.paper_capital > 0 && (
+              <span className="text-xs font-normal ml-1">
+                ({(detail.metrics.total_pnl / detail.paper_capital * 100).toFixed(1)}%)
+              </span>
+            )}
           </p>
         </DataCard>
         <DataCard padding="sm">

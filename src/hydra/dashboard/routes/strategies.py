@@ -223,6 +223,7 @@ class SaveRequest(BaseModel):
     timeframes: TimeframeInput = Field(default_factory=TimeframeInput)
     risk: RiskInput = Field(default_factory=RiskInput)
     enable_immediately: bool = False
+    ml_overlay: dict[str, Any] | None = None
 
 
 class SaveResponse(BaseModel):
@@ -254,6 +255,7 @@ class StrategyDetailResponse(BaseModel):
     timeframes: TimeframeInput = Field(default_factory=TimeframeInput)
     risk: RiskInput = Field(default_factory=RiskInput)
     performance: StrategyPerformance = Field(default_factory=StrategyPerformance)
+    ml_overlay: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +413,7 @@ def _extract_strategy_detail(data: dict[str, Any]) -> dict[str, Any]:
     exchange = data.get("exchange", {})
     symbols = data.get("symbols", ["BTCUSDT"])
 
-    return {
+    result: dict[str, Any] = {
         "exchange_id": exchange.get("exchange_id", "binance"),
         "symbol": symbols[0] if symbols else "BTCUSDT",
         "rules": {
@@ -437,6 +439,10 @@ def _extract_strategy_detail(data: dict[str, Any]) -> dict[str, Any]:
             },
         },
     }
+    ml_overlay = data.get("ml_overlay")
+    if ml_overlay:
+        result["ml_overlay"] = ml_overlay
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +704,9 @@ async def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
         },
     }
 
+    if body.ml_overlay:
+        config_dict["ml_overlay"] = body.ml_overlay
+
     if body.timeframes.confirmation:
         config_dict["timeframes"]["confirmation"] = body.timeframes.confirmation
     if body.timeframes.entry:
@@ -872,6 +881,9 @@ async def save_strategy(request: SaveRequest) -> SaveResponse:
             "max_position_pct": request.risk.sizing_params.get("max_position_pct", 10.0),
         },
     }
+
+    if request.ml_overlay:
+        config_dict["ml_overlay"] = request.ml_overlay
 
     if request.timeframes.confirmation:
         config_dict["timeframes"]["confirmation"] = request.timeframes.confirmation

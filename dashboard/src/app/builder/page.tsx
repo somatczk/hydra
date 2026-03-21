@@ -1,8 +1,10 @@
 'use client';
 
 import { useReducer, useEffect, useState, useCallback, Suspense } from 'react';
-import { Save, Plus } from 'lucide-react';
+import { Save, Plus, Brain, ChevronDown, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
+import { Select } from '@/components/ui/Select';
+import { DataCard } from '@/components/ui/DataCard';
 import { RuleSection } from '@/components/builder/RuleSection';
 import { TimeframeSelector } from '@/components/builder/TimeframeSelector';
 import { RiskConfigurator } from '@/components/builder/RiskConfigurator';
@@ -24,6 +26,7 @@ import type {
   TakeProfitConfig,
   SizingConfig,
   TimeframeConfig,
+  MlOverlay,
   RuleSection as RuleSectionKey,
   StrategyDetail,
   SerializedConditionGroup,
@@ -54,6 +57,7 @@ const initialState: BuilderState = {
       maxPositionPct: 10.0,
     },
   },
+  mlOverlay: null,
   editingId: null,
   strategyName: '',
   strategyDescription: '',
@@ -178,6 +182,8 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
           sizing: { ...state.risk.sizing, ...action.sizing },
         },
       };
+    case 'SET_ML_OVERLAY':
+      return { ...state, mlOverlay: action.mlOverlay };
     case 'LOAD_STRATEGY': {
       const { payload } = action;
       return {
@@ -206,6 +212,9 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
             maxPositionPct: payload.risk.sizing_params?.max_position_pct ?? 10.0,
           },
         },
+        mlOverlay: payload.ml_overlay
+          ? { modelName: payload.ml_overlay.model_name, confidenceThreshold: payload.ml_overlay.confidence_threshold }
+          : null,
         editingId: payload.id,
         strategyName: payload.name,
         strategyDescription: payload.description,
@@ -319,19 +328,23 @@ function BuilderPageContent() {
   const [indicators, setIndicators] = useState<IndicatorSchema[]>(DEFAULT_INDICATORS);
   const [comparators, setComparators] = useState<ComparatorSchema[]>(DEFAULT_COMPARATORS);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  const [availableModels, setAvailableModels] = useState<{ id: string; name: string }[]>([]);
+  const [mlOverlayOpen, setMlOverlayOpen] = useState(false);
   const searchParams = useSearchParams();
   const { toast } = useToast();
 
-  /* Fetch indicators and comparators from API */
+  /* Fetch indicators, comparators, and available models from API */
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [indData, compData] = await Promise.all([
+        const [indData, compData, modelsData] = await Promise.all([
           fetchApi<IndicatorSchema[]>('/api/strategies/indicators').catch(() => null),
           fetchApi<ComparatorSchema[]>('/api/strategies/comparators').catch(() => null),
+          fetchApi<{ id: string; name: string }[]>('/api/models').catch(() => null),
         ]);
         if (indData && indData.length > 0) setIndicators(indData);
         if (compData && compData.length > 0) setComparators(compData);
+        if (modelsData) setAvailableModels(modelsData);
       } catch (err) {
         logger.warn('Builder', 'Failed to fetch indicators/comparators', err);
       }
@@ -435,6 +448,81 @@ function BuilderPageContent() {
           dispatch({ type: 'SET_SIZING', sizing })
         }
       />
+
+      {/* ML Model Overlay */}
+      <DataCard>
+        <button
+          onClick={() => setMlOverlayOpen(!mlOverlayOpen)}
+          className="flex w-full items-center justify-between"
+        >
+          <div className="flex items-center gap-2">
+            <Brain className="h-4 w-4 text-text-muted" />
+            <div className="text-left">
+              <p className="text-sm font-semibold text-text-primary">ML Model Overlay</p>
+              <p className="text-xs text-text-muted">Attach an ML model to filter signals</p>
+            </div>
+          </div>
+          {mlOverlayOpen ? <ChevronUp className="h-4 w-4 text-text-muted" /> : <ChevronDown className="h-4 w-4 text-text-muted" />}
+        </button>
+        {mlOverlayOpen && (
+          <div className="mt-4 space-y-4 border-t border-border-default pt-4">
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={state.mlOverlay !== null}
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      dispatch({
+                        type: 'SET_ML_OVERLAY',
+                        mlOverlay: { modelName: availableModels[0]?.id || '', confidenceThreshold: 0.5 },
+                      });
+                    } else {
+                      dispatch({ type: 'SET_ML_OVERLAY', mlOverlay: null });
+                    }
+                  }}
+                  className="h-4 w-4 rounded border-border-default text-accent-primary focus:ring-accent-primary"
+                />
+                <span className="text-sm text-text-secondary">Enable ML overlay</span>
+              </label>
+            </div>
+            {state.mlOverlay && (
+              <div className="grid grid-cols-2 gap-4">
+                <Select
+                  label="Model"
+                  options={availableModels.map((m) => ({ value: m.id, label: m.name }))}
+                  value={state.mlOverlay.modelName}
+                  onChange={(e) =>
+                    dispatch({
+                      type: 'SET_ML_OVERLAY',
+                      mlOverlay: { ...state.mlOverlay!, modelName: e.target.value },
+                    })
+                  }
+                />
+                <div>
+                  <label className="block text-xs font-medium text-text-secondary mb-1">
+                    Confidence Threshold: {state.mlOverlay.confidenceThreshold.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={state.mlOverlay.confidenceThreshold}
+                    onChange={(e) =>
+                      dispatch({
+                        type: 'SET_ML_OVERLAY',
+                        mlOverlay: { ...state.mlOverlay!, confidenceThreshold: parseFloat(e.target.value) },
+                      })
+                    }
+                    className="w-full accent-accent-primary"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </DataCard>
 
       {/* Signal preview */}
       <SignalPreview state={state} />

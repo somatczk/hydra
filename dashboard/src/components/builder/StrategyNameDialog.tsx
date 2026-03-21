@@ -115,6 +115,14 @@ export function StrategyNameDialog({
         },
       },
       enable_immediately: enableImmediately,
+      ...(state.mlOverlay
+        ? {
+            ml_overlay: {
+              model_name: state.mlOverlay.modelName,
+              confidence_threshold: state.mlOverlay.confidenceThreshold,
+            },
+          }
+        : {}),
     };
 
     try {

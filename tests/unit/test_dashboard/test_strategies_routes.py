@@ -320,6 +320,7 @@ class TestStrategiesFallback:
         assert data["exchange_id"] == "bybit"
         assert data["symbol"] == "ETHUSDT"
         assert data["editable"] is True
+        assert data["ml_overlay"] is None
         # Check rules
         assert data["rules"]["entry_long"]["operator"] == "AND"
         assert len(data["rules"]["entry_long"]["conditions"]) == 1
@@ -331,6 +332,99 @@ class TestStrategiesFallback:
         assert data["risk"]["sizing_method"] == "fixed_fractional"
         assert data["risk"]["sizing_params"]["risk_per_trade_pct"] == 2.0
         assert data["risk"]["sizing_params"]["max_position_pct"] == 15.0
+
+    def test_get_strategy_returns_ml_overlay(self, tmp_path: Path) -> None:
+        yaml_content = (
+            "id: ml_strat_1\n"
+            "name: ML Overlay Strategy\n"
+            "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
+            "enabled: true\n"
+            "symbols:\n"
+            "  - BTCUSDT\n"
+            "exchange:\n"
+            "  exchange_id: binance\n"
+            "  market_type: SPOT\n"
+            "timeframes:\n"
+            "  primary: 1h\n"
+            "parameters:\n"
+            "  description: Strategy with ML overlay\n"
+            "  required_history: 50\n"
+            "  rules:\n"
+            "    entry_long:\n"
+            "      operator: AND\n"
+            "      conditions:\n"
+            "        - indicator: rsi\n"
+            "          params: {period: 14}\n"
+            "          comparator: less_than\n"
+            "          value: 30\n"
+            "    exit_long: null\n"
+            "    entry_short: null\n"
+            "    exit_short: null\n"
+            "position_sizing:\n"
+            "  method: fixed_fractional\n"
+            "  risk_per_trade_pct: 1.0\n"
+            "  max_position_pct: 10.0\n"
+            "ml_overlay:\n"
+            "  model_name: lstm_btc\n"
+            "  confidence_threshold: 0.7\n"
+        )
+        (tmp_path / "ml_strat.yaml").write_text(yaml_content)
+
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            resp = client.get("/api/strategies/ml_strat_1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == "ml_strat_1"
+        assert data["ml_overlay"] == {"model_name": "lstm_btc", "confidence_threshold": 0.7}
+
+    def test_save_strategy_with_ml_overlay(self, tmp_path: Path) -> None:
+        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            resp = client.post(
+                "/api/strategies/save",
+                json={
+                    "name": "ML Test Strategy",
+                    "description": "Test with ML overlay",
+                    "exchange_id": "binance",
+                    "symbol": "BTCUSDT",
+                    "rules": {
+                        "entry_long": {
+                            "operator": "AND",
+                            "conditions": [
+                                {
+                                    "indicator": "rsi",
+                                    "params": {"period": 14},
+                                    "comparator": "less_than",
+                                    "value": 30,
+                                }
+                            ],
+                        },
+                        "exit_long": None,
+                        "entry_short": None,
+                        "exit_short": None,
+                    },
+                    "timeframes": {"primary": "1h"},
+                    "risk": {
+                        "stop_loss_method": "atr",
+                        "stop_loss_value": 2.0,
+                        "take_profit_method": "atr",
+                        "take_profit_value": 3.0,
+                        "sizing_method": "fixed_fractional",
+                        "sizing_params": {"risk_per_trade_pct": 1.0, "max_position_pct": 10.0},
+                    },
+                    "enable_immediately": False,
+                    "ml_overlay": {"model_name": "lstm_btc", "confidence_threshold": 0.7},
+                },
+            )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["name"] == "ML Test Strategy"
+        # Verify YAML contains ml_overlay
+        yaml_files = list(tmp_path.glob("*.yaml"))
+        assert len(yaml_files) == 1
+        written = yaml.safe_load(yaml_files[0].read_text())
+        assert written["ml_overlay"] == {"model_name": "lstm_btc", "confidence_threshold": 0.7}
 
     def test_update_non_rule_based_returns_400(self, tmp_path: Path) -> None:
         yaml_content = (

@@ -395,24 +395,39 @@ class PaperTradingExecutor:
                         symbol,
                     )
 
-                # 3) Balance snapshot
+                # 3) Balance snapshot — compute real PnL values
                 total_value = self._balances.get("USDT", Decimal("0"))
-                # Add position value at last known prices
+                unrealized = Decimal("0")
                 for sym, p in self._positions.items():
                     if p.direction == Direction.FLAT or p.quantity <= 0:
                         continue
                     mark = self._last_prices.get(sym, p.avg_entry_price)
-                    total_value += mark * p.quantity
+                    pos_value = mark * p.quantity
+                    total_value += pos_value
+                    if p.direction == Direction.LONG:
+                        unrealized += (mark - p.avg_entry_price) * p.quantity
+                    else:
+                        unrealized += (p.avg_entry_price - mark) * p.quantity
+
+                # Realized PnL = cumulative PnL from all closed trades
+                realized_row = await conn.fetchrow(
+                    "SELECT COALESCE(SUM(pnl), 0) AS total "
+                    "FROM trades WHERE session_id = $1 AND source = 'paper'",
+                    self._session_id or None,
+                )
+                realized = Decimal(str(realized_row["total"])) if realized_row else Decimal("0")
 
                 await conn.execute(
                     """
                     INSERT INTO balance_snapshots
                         (timestamp, total_value, unrealized_pnl,
                          realized_pnl, drawdown_pct, peak_value, source)
-                    VALUES ($1, $2, 0, 0, 0, $2, 'paper')
+                    VALUES ($1, $2, $3, $4, 0, $2, 'paper')
                     """,
                     now,
                     total_value,
+                    unrealized,
+                    realized,
                 )
         except Exception:
             logger.exception("Failed to persist paper state for %s", symbol)
