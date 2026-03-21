@@ -138,13 +138,18 @@ class EntrySignal(SignalEvent):
 
 @dataclass(frozen=True, slots=True)
 class ExitSignal(SignalEvent):
-    """Signal to exit a position."""
+    """Signal to exit a position.
+
+    Set ``close_pct`` to partially close (e.g. 0.5 = close 50%).
+    Default 1.0 closes the entire position.
+    """
 
     symbol: Symbol = field(default=Symbol(""))
     direction: Direction = Direction.FLAT
     strategy_id: str = ""
     exchange_id: ExchangeId = "binance"
     reason: str = ""
+    close_pct: float = 1.0
     event_type: str = field(default="exit_signal", init=False)
 
 

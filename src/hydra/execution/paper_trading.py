@@ -41,6 +41,8 @@ class _PendingOrder:
     quantity: Decimal
     price: Decimal | None
     stop_price: Decimal | None
+    trail_pct: Decimal | None = None
+    peak_price: Decimal | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -141,6 +143,20 @@ class PaperTradingExecutor:
             fill_price = self._apply_slippage(market_price, side)
             return self._execute_fill(order_id, symbol, side, quantity, fill_price)
 
+        # Trailing stop orders need trail_pct and an initial peak_price
+        trail_pct: Decimal | None = None
+        peak_price: Decimal | None = None
+        if otype == OrderType.TRAILING_STOP:
+            p = params or {}
+            raw = p.get("trail_pct")
+            if raw is None:
+                raise ValueError("trail_pct is required for TRAILING_STOP orders")
+            trail_pct = Decimal(str(raw))
+            market_price = self._last_prices.get(symbol)
+            if market_price is None:
+                raise ValueError(f"No market price available for {symbol}")
+            peak_price = market_price
+
         # Limit / stop orders go pending
         pending = _PendingOrder(
             order_id=order_id,
@@ -150,6 +166,8 @@ class PaperTradingExecutor:
             quantity=quantity,
             price=price,
             stop_price=stop_price,
+            trail_pct=trail_pct,
+            peak_price=peak_price,
         )
         self._pending_orders.append(pending)
         return {
@@ -188,6 +206,15 @@ class PaperTradingExecutor:
             # Update last known price
             self._last_prices[bar_symbol] = current_bar.close
 
+            # Update peak_price for trailing stop orders
+            if pending.order_type == OrderType.TRAILING_STOP and pending.peak_price is not None:
+                if pending.side.upper() == "SELL":
+                    # Protecting a long: track the highest high
+                    pending.peak_price = max(pending.peak_price, current_bar.high)
+                else:
+                    # Protecting a short: track the lowest low
+                    pending.peak_price = min(pending.peak_price, current_bar.low)
+
             triggered = self._should_trigger(pending, current_bar)
             if triggered:
                 fill_price = self._determine_fill_price(pending, current_bar)
@@ -224,6 +251,18 @@ class PaperTradingExecutor:
                 return bar.high >= trigger
             return bar.low <= trigger
 
+        if otype in (OrderType.TRAILING_STOP, "TRAILING_STOP"):
+            if order.peak_price is None or order.trail_pct is None:
+                return False
+            if order.side.upper() == "SELL":
+                # Long protection: trigger when price drops trail_pct from peak
+                trigger_price = order.peak_price * (Decimal("1") - order.trail_pct)
+                return bar.low <= trigger_price
+            else:
+                # Short protection: trigger when price rises trail_pct from trough
+                trigger_price = order.peak_price * (Decimal("1") + order.trail_pct)
+                return bar.high >= trigger_price
+
         return False
 
     def _determine_fill_price(self, order: _PendingOrder, bar: OHLCV) -> Decimal:
@@ -239,6 +278,17 @@ class PaperTradingExecutor:
 
         if otype in (OrderType.STOP_LIMIT, "STOP_LIMIT") and order.price is not None:
             return order.price
+
+        if (
+            otype in (OrderType.TRAILING_STOP, "TRAILING_STOP")
+            and order.peak_price is not None
+            and order.trail_pct is not None
+        ):
+            if order.side.upper() == "SELL":
+                trigger = order.peak_price * (Decimal("1") - order.trail_pct)
+            else:
+                trigger = order.peak_price * (Decimal("1") + order.trail_pct)
+            return self._apply_slippage(trigger, order.side)
 
         return self._apply_slippage(bar.close, order.side)
 

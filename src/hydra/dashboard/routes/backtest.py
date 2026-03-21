@@ -90,6 +90,12 @@ class BacktestMetrics(BaseModel):
     total_pnl: float = 0.0
     max_drawdown: float = 0.0
     sharpe_ratio: float = 0.0
+    benchmark_return: float = 0.0
+    alpha: float = 0.0
+    beta: float = 0.0
+    max_consecutive_wins: int = 0
+    max_consecutive_losses: int = 0
+    expectancy: float = 0.0
 
 
 class BacktestResultSummary(BaseModel):
@@ -110,6 +116,7 @@ class BacktestResultDetail(BaseModel):
     stopped_reason: str | None = None
     metrics: BacktestMetrics = Field(default_factory=BacktestMetrics)
     equity_curve: list[dict[str, Any]] = Field(default_factory=list)
+    benchmark_equity: list[dict[str, Any]] = Field(default_factory=list)
     trades: list[BacktestTradeRecord] = Field(default_factory=list)
     transactions: list[BacktestTransaction] = Field(default_factory=list)
 
@@ -616,6 +623,15 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
                 ts_str = bars[-1].timestamp.isoformat()
             equity_curve_out.append({"timestamp": ts_str, "value": float(eq)})
 
+        # Build benchmark equity curve with timestamps from bars
+        benchmark_equity_out: list[dict[str, Any]] = []
+        for idx, eq in enumerate(result.benchmark_equity):
+            if idx < len(bars):
+                ts_str = bars[idx].timestamp.isoformat()
+            else:
+                ts_str = bars[-1].timestamp.isoformat()
+            benchmark_equity_out.append({"timestamp": ts_str, "value": float(eq)})
+
         # Format period string
         period = f"{body.start_date} - {body.end_date}"
 
@@ -634,8 +650,15 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pool: Any) 
                 "total_pnl": round(total_pnl, 2),
                 "max_drawdown": round(float(result.max_drawdown) * 100, 2),
                 "sharpe_ratio": round(result.sharpe_ratio, 2),
+                "benchmark_return": round(float(result.benchmark_return) * 100, 2),
+                "alpha": round(result.alpha, 4),
+                "beta": round(result.beta, 4),
+                "max_consecutive_wins": result.max_consecutive_wins,
+                "max_consecutive_losses": result.max_consecutive_losses,
+                "expectancy": round(float(result.expectancy), 2),
             },
             "equity_curve": equity_curve_out,
+            "benchmark_equity": benchmark_equity_out,
             "trades": [
                 {
                     "entry_time": t.entry_time.isoformat(),
@@ -768,6 +791,7 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
             "stopped_reason": r.get("stopped_reason"),
             "metrics": r["metrics"],
             "equity_curve": r.get("equity_curve", []),
+            "benchmark_equity": r.get("benchmark_equity", []),
             "trades": r.get("trades", []),
             "transactions": r.get("transactions", []),
         }
@@ -811,6 +835,7 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
                             "sharpe_ratio": row["sharpe_ratio"],
                         },
                         "equity_curve": equity_curve,
+                        "benchmark_equity": [],
                         "trades": [
                             {
                                 "entry_time": t["entry_time"].isoformat(),

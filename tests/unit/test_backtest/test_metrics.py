@@ -11,7 +11,11 @@ import pytest
 from hydra.backtest.metrics import (
     BacktestResult,
     Trade,
+    _compute_alpha_beta,
+    _compute_benchmark_equity,
+    _compute_consecutive_wins_losses,
     _compute_drawdown_series,
+    _compute_expectancy,
     _compute_sharpe,
     _compute_sortino,
     _compute_total_return,
@@ -369,3 +373,236 @@ class TestBacktestResult:
         assert result.sharpe_ratio == 0.0
         assert result.trades == []
         assert result.equity_curve == []
+        assert result.benchmark_equity == []
+        assert result.benchmark_return == Decimal("0")
+        assert result.alpha == 0.0
+        assert result.beta == 0.0
+        assert result.max_consecutive_wins == 0
+        assert result.max_consecutive_losses == 0
+        assert result.expectancy == Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# Benchmark equity (buy-and-hold)
+# ---------------------------------------------------------------------------
+
+
+class TestBenchmarkEquity:
+    def test_constant_price(self) -> None:
+        """If price stays constant, benchmark equity equals initial capital."""
+        closes = [Decimal("100"), Decimal("100"), Decimal("100")]
+        result = _compute_benchmark_equity(Decimal("10000"), closes)
+        assert result == [Decimal("10000"), Decimal("10000"), Decimal("10000")]
+
+    def test_price_doubles(self) -> None:
+        """If price doubles, benchmark equity doubles."""
+        closes = [Decimal("100"), Decimal("150"), Decimal("200")]
+        result = _compute_benchmark_equity(Decimal("10000"), closes)
+        assert result[0] == Decimal("10000")
+        assert result[1] == Decimal("15000")
+        assert result[2] == Decimal("20000")
+
+    def test_price_halves(self) -> None:
+        """If price halves, benchmark equity halves."""
+        closes = [Decimal("200"), Decimal("100")]
+        result = _compute_benchmark_equity(Decimal("10000"), closes)
+        assert result[0] == Decimal("10000")
+        assert result[1] == Decimal("5000")
+
+    def test_empty_bars(self) -> None:
+        result = _compute_benchmark_equity(Decimal("10000"), [])
+        assert result == []
+
+    def test_zero_first_close(self) -> None:
+        result = _compute_benchmark_equity(Decimal("10000"), [Decimal("0"), Decimal("100")])
+        assert result == []
+
+    def test_via_calculate_metrics(self) -> None:
+        """Benchmark equity is populated when bar_closes is provided."""
+        equity = [Decimal("10000"), Decimal("10500"), Decimal("11000")]
+        closes = [Decimal("100"), Decimal("110"), Decimal("120")]
+        result = calculate_metrics(
+            equity_curve=equity,
+            trades=[],
+            bar_closes=closes,
+            initial_capital=Decimal("10000"),
+        )
+        assert len(result.benchmark_equity) == 3
+        assert result.benchmark_equity[0] == Decimal("10000")
+        assert result.benchmark_equity[1] == Decimal("11000")
+        assert result.benchmark_equity[2] == Decimal("12000")
+        # benchmark_return = (12000 - 10000) / 10000 = 0.2
+        assert result.benchmark_return == Decimal("0.2")
+
+    def test_no_bar_closes(self) -> None:
+        """Without bar_closes, benchmark fields stay at defaults."""
+        equity = [Decimal("10000"), Decimal("11000")]
+        result = calculate_metrics(equity_curve=equity, trades=[])
+        assert result.benchmark_equity == []
+        assert result.benchmark_return == Decimal("0")
+        assert result.alpha == 0.0
+        assert result.beta == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Alpha and beta
+# ---------------------------------------------------------------------------
+
+
+class TestAlphaBeta:
+    def test_identical_returns(self) -> None:
+        """If strategy returns match benchmark exactly, beta=1 and alpha=0."""
+        returns = np.array([0.01, -0.005, 0.02, -0.01, 0.015], dtype=np.float64)
+        alpha, beta = _compute_alpha_beta(returns, returns, 0.10, 0.10)
+        assert beta == pytest.approx(1.0, abs=1e-6)
+        assert alpha == pytest.approx(0.0, abs=1e-6)
+
+    def test_uncorrelated_returns(self) -> None:
+        """Uncorrelated strategy should have beta near 0."""
+        # Strategy and benchmark are independent
+        rng = np.random.default_rng(42)
+        strategy = rng.normal(0.001, 0.01, 200)
+        benchmark = rng.normal(0.001, 0.01, 200)
+        _alpha, beta = _compute_alpha_beta(strategy, benchmark, 0.05, 0.05)
+        # Beta should be near zero for uncorrelated series
+        assert abs(beta) < 0.3
+
+    def test_zero_variance_benchmark(self) -> None:
+        """Zero-variance benchmark returns beta=0, alpha=0."""
+        strategy = np.array([0.01, 0.02, 0.03], dtype=np.float64)
+        benchmark = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        alpha, beta = _compute_alpha_beta(strategy, benchmark, 0.10, 0.0)
+        assert beta == 0.0
+        assert alpha == 0.0
+
+    def test_short_arrays(self) -> None:
+        """Arrays with fewer than 2 elements return (0, 0)."""
+        alpha, beta = _compute_alpha_beta(np.array([0.01]), np.array([0.01]), 0.1, 0.1)
+        assert alpha == 0.0
+        assert beta == 0.0
+
+    def test_strategy_outperforms(self) -> None:
+        """Strategy that consistently outperforms should have positive alpha."""
+        # Benchmark: varying returns
+        benchmark = np.array([0.01, -0.005, 0.015, -0.01, 0.02], dtype=np.float64)
+        # Strategy: same pattern but shifted up (higher mean)
+        strategy = benchmark + 0.01
+        alpha, _beta = _compute_alpha_beta(strategy, benchmark, 0.20, 0.10)
+        assert alpha > 0
+
+
+# ---------------------------------------------------------------------------
+# Consecutive wins / losses
+# ---------------------------------------------------------------------------
+
+
+class TestConsecutiveWinsLosses:
+    def test_mixed_streak(self) -> None:
+        """W, W, W, L, L, W, L -> max_wins=3, max_losses=2."""
+        trades = [
+            _trade("10"),
+            _trade("5"),
+            _trade("20"),
+            _trade("-10"),
+            _trade("-5"),
+            _trade("15"),
+            _trade("-3"),
+        ]
+        wins, losses = _compute_consecutive_wins_losses(trades)
+        assert wins == 3
+        assert losses == 2
+
+    def test_all_wins(self) -> None:
+        trades = [_trade("10"), _trade("20"), _trade("5")]
+        wins, losses = _compute_consecutive_wins_losses(trades)
+        assert wins == 3
+        assert losses == 0
+
+    def test_all_losses(self) -> None:
+        trades = [_trade("-10"), _trade("-20"), _trade("-5")]
+        wins, losses = _compute_consecutive_wins_losses(trades)
+        assert wins == 0
+        assert losses == 3
+
+    def test_empty_trades(self) -> None:
+        wins, losses = _compute_consecutive_wins_losses([])
+        assert wins == 0
+        assert losses == 0
+
+    def test_single_trade_win(self) -> None:
+        wins, losses = _compute_consecutive_wins_losses([_trade("10")])
+        assert wins == 1
+        assert losses == 0
+
+    def test_breakeven_resets_streak(self) -> None:
+        """A breakeven trade (pnl=0) resets both streaks."""
+        trades = [_trade("10"), _trade("10"), _trade("0"), _trade("10")]
+        wins, _losses = _compute_consecutive_wins_losses(trades)
+        assert wins == 2  # First two wins, then breakeven resets, then one more win
+
+    def test_via_calculate_metrics(self) -> None:
+        trades = [
+            _trade("10"),
+            _trade("5"),
+            _trade("-10"),
+            _trade("-5"),
+            _trade("-3"),
+            _trade("15"),
+        ]
+        result = calculate_metrics(
+            equity_curve=[Decimal("100"), Decimal("112")],
+            trades=trades,
+        )
+        assert result.max_consecutive_wins == 2
+        assert result.max_consecutive_losses == 3
+
+
+# ---------------------------------------------------------------------------
+# Expectancy
+# ---------------------------------------------------------------------------
+
+
+class TestExpectancy:
+    def test_positive_expectancy(self) -> None:
+        """Known trades with positive expectancy."""
+        trades = [
+            _trade("100"),  # win
+            _trade("100"),  # win
+            _trade("-50"),  # loss
+        ]
+        exp = _compute_expectancy(trades)
+        # win_rate = 2/3, avg_win = 100, loss_rate = 1/3, avg_loss = 50
+        # expectancy = (2/3 * 100) - (1/3 * 50) = 66.666... - 16.666... = 50
+        expected = (Decimal("2") / Decimal("3")) * Decimal("100") - (
+            Decimal("1") / Decimal("3")
+        ) * Decimal("50")
+        assert exp == expected
+
+    def test_negative_expectancy(self) -> None:
+        """All losses produce negative expectancy."""
+        trades = [_trade("-10"), _trade("-20")]
+        exp = _compute_expectancy(trades)
+        # win_rate = 0, loss_rate = 1, avg_loss = 15
+        # expectancy = 0 - 1 * 15 = -15
+        assert exp == Decimal("-15")
+
+    def test_all_wins(self) -> None:
+        """All wins: expectancy = avg_win (loss component = 0)."""
+        trades = [_trade("10"), _trade("20")]
+        exp = _compute_expectancy(trades)
+        # win_rate = 1, avg_win = 15, loss_rate = 0, avg_loss = 0
+        assert exp == Decimal("15")
+
+    def test_empty(self) -> None:
+        exp = _compute_expectancy([])
+        assert exp == Decimal("0")
+
+    def test_via_calculate_metrics(self) -> None:
+        trades = [_trade("100"), _trade("-50")]
+        result = calculate_metrics(
+            equity_curve=[Decimal("100"), Decimal("150")],
+            trades=trades,
+        )
+        # win_rate=0.5, avg_win=100, loss_rate=0.5, avg_loss=50
+        # expectancy = 0.5*100 - 0.5*50 = 25
+        assert result.expectancy == Decimal("25")

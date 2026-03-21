@@ -630,7 +630,8 @@ class SessionManager:
                 return None
             pos = positions[0]
             side = Side.SELL if pos.direction == Direction.LONG else Side.BUY
-            quantity = pos.quantity
+            close_pct = getattr(event, "close_pct", 1.0)
+            quantity = pos.quantity * Decimal(str(min(max(close_pct, 0.0), 1.0)))
             return OrderRequest(
                 symbol=Symbol(str(event.symbol)),
                 side=side,

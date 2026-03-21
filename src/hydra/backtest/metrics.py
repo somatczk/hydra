@@ -86,6 +86,17 @@ class BacktestResult:
     deflated_sharpe_ratio: float = 0.0
     probability_of_backtest_overfitting: float = 0.0
 
+    # Benchmark (buy-and-hold)
+    benchmark_equity: list[Decimal] = field(default_factory=list)
+    benchmark_return: Decimal = Decimal("0")
+    alpha: float = 0.0
+    beta: float = 0.0
+
+    # Streak / expectancy
+    max_consecutive_wins: int = 0
+    max_consecutive_losses: int = 0
+    expectancy: Decimal = Decimal("0")
+
     # Series data
     equity_curve: list[Decimal] = field(default_factory=list)
     drawdown_series: list[Decimal] = field(default_factory=list)
@@ -341,6 +352,99 @@ def _compute_deflated_sharpe(
     return dsr
 
 
+def _compute_benchmark_equity(
+    initial_capital: Decimal,
+    bar_closes: list[Decimal],
+) -> list[Decimal]:
+    """Compute buy-and-hold equity curve.
+
+    Returns a list of equity values where each value = initial_capital * (close / first_close).
+    """
+    if not bar_closes or bar_closes[0] == 0:
+        return []
+    first_close = bar_closes[0]
+    return [initial_capital * (close / first_close) for close in bar_closes]
+
+
+def _compute_alpha_beta(
+    strategy_returns: ndarray,
+    benchmark_returns: ndarray,
+    annualized_strategy_return: float,
+    annualized_benchmark_return: float,
+) -> tuple[float, float]:
+    """Compute alpha and beta of strategy versus benchmark.
+
+    beta  = cov(strategy, benchmark) / var(benchmark)
+    alpha = annualized_strategy_return - beta * annualized_benchmark_return
+    """
+    if len(strategy_returns) < 2 or len(benchmark_returns) < 2:
+        return 0.0, 0.0
+    # Ensure arrays are the same length (use shorter)
+    n = min(len(strategy_returns), len(benchmark_returns))
+    s = strategy_returns[:n]
+    b = benchmark_returns[:n]
+    var_b = float(np.var(b, ddof=1))
+    if var_b == 0:
+        return 0.0, 0.0
+    cov_matrix = np.cov(s, b, ddof=1)
+    beta = float(cov_matrix[0][1]) / var_b
+    alpha = annualized_strategy_return - beta * annualized_benchmark_return
+    return alpha, beta
+
+
+def _compute_consecutive_wins_losses(trades: list[Trade]) -> tuple[int, int]:
+    """Compute max consecutive wins and max consecutive losses from trade list."""
+    if not trades:
+        return 0, 0
+
+    max_wins = 0
+    max_losses = 0
+    current_wins = 0
+    current_losses = 0
+
+    for trade in trades:
+        if trade.pnl > 0:
+            current_wins += 1
+            current_losses = 0
+            max_wins = max(max_wins, current_wins)
+        elif trade.pnl < 0:
+            current_losses += 1
+            current_wins = 0
+            max_losses = max(max_losses, current_losses)
+        else:
+            # Breakeven trade resets both streaks
+            current_wins = 0
+            current_losses = 0
+
+    return max_wins, max_losses
+
+
+def _compute_expectancy(trades: list[Trade]) -> Decimal:
+    """Compute expectancy: (win_rate * avg_win) - (loss_rate * avg_loss).
+
+    Returns the expected value per trade.
+    """
+    if not trades:
+        return Decimal("0")
+    total = len(trades)
+    wins = [t for t in trades if t.pnl > 0]
+    losses = [t for t in trades if t.pnl < 0]
+
+    win_rate = Decimal(str(len(wins))) / Decimal(str(total))
+    loss_rate = Decimal(str(len(losses))) / Decimal(str(total))
+
+    avg_win = (
+        sum((t.pnl for t in wins), Decimal("0")) / Decimal(str(len(wins))) if wins else Decimal("0")
+    )
+    avg_loss = (
+        sum((abs(t.pnl) for t in losses), Decimal("0")) / Decimal(str(len(losses)))
+        if losses
+        else Decimal("0")
+    )
+
+    return win_rate * avg_win - loss_rate * avg_loss
+
+
 # ---------------------------------------------------------------------------
 # Main calculation function
 # ---------------------------------------------------------------------------
@@ -352,6 +456,8 @@ def calculate_metrics(
     risk_free_rate: float = 0.0,
     timestamps: list[datetime] | None = None,
     n_trials: int = 1,
+    bar_closes: list[Decimal] | None = None,
+    initial_capital: Decimal = Decimal("100000"),
 ) -> BacktestResult:
     """Compute all backtest metrics from equity curve and trade list.
 
@@ -367,6 +473,10 @@ def calculate_metrics(
         Optional bar timestamps aligned with equity_curve, for monthly returns.
     n_trials:
         Number of strategy configurations tested (for deflated Sharpe).
+    bar_closes:
+        Optional list of bar close prices for buy-and-hold benchmark computation.
+    initial_capital:
+        Starting capital, used to compute benchmark equity curve.
     """
     equity_arr = _decimal_to_float_array(equity_curve)
     returns = _compute_returns(equity_arr)
@@ -407,6 +517,25 @@ def calculate_metrics(
         except Exception:
             dsr = 0.0
 
+    # Benchmark (buy-and-hold)
+    benchmark_equity: list[Decimal] = []
+    benchmark_return = Decimal("0")
+    alpha = 0.0
+    beta = 0.0
+    if bar_closes:
+        benchmark_equity = _compute_benchmark_equity(initial_capital, bar_closes)
+        benchmark_return = _compute_total_return(benchmark_equity)
+        benchmark_arr = _decimal_to_float_array(benchmark_equity)
+        benchmark_returns = _compute_returns(benchmark_arr)
+        ann_benchmark = _compute_annualized_return(benchmark_return, max(len(benchmark_returns), 1))
+        alpha, beta = _compute_alpha_beta(
+            returns, benchmark_returns, float(annualized_return), float(ann_benchmark)
+        )
+
+    # Consecutive wins/losses and expectancy
+    max_consecutive_wins, max_consecutive_losses = _compute_consecutive_wins_losses(trades)
+    expectancy = _compute_expectancy(trades)
+
     return BacktestResult(
         total_return=total_return,
         annualized_return=annualized_return,
@@ -425,6 +554,13 @@ def calculate_metrics(
         avg_trade_duration=tstats["avg_trade_duration"],
         deflated_sharpe_ratio=dsr,
         probability_of_backtest_overfitting=0.0,
+        benchmark_equity=benchmark_equity,
+        benchmark_return=benchmark_return,
+        alpha=alpha,
+        beta=beta,
+        max_consecutive_wins=max_consecutive_wins,
+        max_consecutive_losses=max_consecutive_losses,
+        expectancy=expectancy,
         equity_curve=list(equity_curve),
         drawdown_series=drawdown_list,
         trades=list(trades),

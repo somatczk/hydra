@@ -17,6 +17,7 @@ from hydra.dashboard.routes import (
     models,
     portfolio,
     risk,
+    signals,
     strategies,
     system,
     trading,
@@ -52,6 +53,7 @@ app.include_router(risk.router)
 app.include_router(models.router)
 app.include_router(system.router)
 app.include_router(trading.router)
+app.include_router(signals.router)
 
 
 # ---------------------------------------------------------------------------

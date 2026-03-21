@@ -67,6 +67,7 @@ class PlatformConfig(BaseModel):
     default_timeframe: str = "1h"
     max_concurrent_strategies: int = 5
     paper_capital: float = 10000.0
+    webhook_secret: str = ""
 
 
 class PlatformConfigUpdate(BaseModel):
@@ -75,6 +76,7 @@ class PlatformConfigUpdate(BaseModel):
     default_timeframe: str | None = None
     max_concurrent_strategies: int | None = None
     paper_capital: float | None = None
+    webhook_secret: str | None = None
 
 
 class ServiceHealth(BaseModel):

@@ -314,3 +314,244 @@ class TestPositionTracking:
         btc_positions = await executor.fetch_positions(symbol="BTCUSDT")
         assert len(btc_positions) == 1
         assert btc_positions[0]["symbol"] == "BTCUSDT"
+
+
+# ---------------------------------------------------------------------------
+# Trailing stop order tests
+# ---------------------------------------------------------------------------
+
+
+class TestTrailingStopOrders:
+    """Tests for TRAILING_STOP order type."""
+
+    async def test_trailing_stop_sell_updates_peak_as_price_rises(self) -> None:
+        """Peak price tracks upward with bar highs for SELL trailing stops."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+            slippage_pct=Decimal("0"),
+            fee_pct=Decimal("0"),
+        )
+        executor.set_market_price("BTCUSDT", Decimal("50000"))
+
+        # Open a long position, then place a SELL trailing stop to protect it
+        await executor.create_order(
+            symbol="BTCUSDT", side="BUY", order_type="MARKET", quantity=Decimal("1")
+        )
+        await executor.create_order(
+            symbol="BTCUSDT",
+            side="SELL",
+            order_type="TRAILING_STOP",
+            quantity=Decimal("1"),
+            params={"trail_pct": "0.05"},  # 5% trail
+        )
+
+        # Price rises to 55000 -- peak updates; low stays above trigger (55000*0.95=52250)
+        bar1 = _make_bar(open_="50000", high="55000", low="53000", close="54000")
+        fills = executor.check_pending_orders(bar1)
+        assert len(fills) == 0
+
+        # Price rises further to 60000 -- peak updates; low above trigger (60000*0.95=57000)
+        bar2 = _make_bar(open_="54000", high="60000", low="58000", close="59000")
+        fills = executor.check_pending_orders(bar2)
+        assert len(fills) == 0
+
+        # Peak is now 60000. Trigger = 60000 * 0.95 = 57000.
+        # A bar with low=57500 should NOT trigger
+        bar3 = _make_bar(open_="59000", high="59500", low="57500", close="58000")
+        fills = executor.check_pending_orders(bar3)
+        assert len(fills) == 0
+
+        # A bar with low=56500 SHOULD trigger (below 57000)
+        bar4 = _make_bar(open_="58000", high="58500", low="56500", close="57000")
+        fills = executor.check_pending_orders(bar4)
+        assert len(fills) == 1
+        assert fills[0]["status"] == "FILLED"
+        assert fills[0]["side"] == "SELL"
+
+    async def test_trailing_stop_sell_triggers_on_reversal(self) -> None:
+        """SELL trailing stop triggers when price drops past trail_pct from peak."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+            slippage_pct=Decimal("0"),
+            fee_pct=Decimal("0"),
+        )
+        executor.set_market_price("BTCUSDT", Decimal("10000"))
+
+        await executor.create_order(
+            symbol="BTCUSDT", side="BUY", order_type="MARKET", quantity=Decimal("1")
+        )
+        await executor.create_order(
+            symbol="BTCUSDT",
+            side="SELL",
+            order_type="TRAILING_STOP",
+            quantity=Decimal("1"),
+            params={"trail_pct": "0.10"},  # 10% trail
+        )
+
+        # Peak is initialized at 10000. Trigger = 10000 * 0.90 = 9000.
+        # Bar drops to 8900 -- should trigger immediately
+        bar = _make_bar(open_="10000", high="10000", low="8900", close="9100")
+        fills = executor.check_pending_orders(bar)
+        assert len(fills) == 1
+        assert fills[0]["status"] == "FILLED"
+
+    async def test_trailing_stop_sell_does_not_trigger_while_trending_up(self) -> None:
+        """SELL trailing stop stays pending while price only moves up."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+            slippage_pct=Decimal("0"),
+            fee_pct=Decimal("0"),
+        )
+        executor.set_market_price("BTCUSDT", Decimal("10000"))
+
+        await executor.create_order(
+            symbol="BTCUSDT", side="BUY", order_type="MARKET", quantity=Decimal("1")
+        )
+        await executor.create_order(
+            symbol="BTCUSDT",
+            side="SELL",
+            order_type="TRAILING_STOP",
+            quantity=Decimal("1"),
+            params={"trail_pct": "0.05"},  # 5% trail
+        )
+
+        # Successive bars trending upward -- trail never triggers
+        for price in ["11000", "12000", "13000", "14000", "15000"]:
+            low = str(Decimal(price) - Decimal("200"))
+            bar = _make_bar(open_=price, high=price, low=low, close=price)
+            fills = executor.check_pending_orders(bar)
+            assert len(fills) == 0
+
+        # Confirm order is still pending
+        open_orders = await executor.fetch_open_orders()
+        assert len(open_orders) == 1
+        assert open_orders[0]["type"] == "TRAILING_STOP"
+
+    async def test_trailing_stop_buy_updates_trough_as_price_falls(self) -> None:
+        """Peak (trough) price tracks downward with bar lows for BUY trailing stops."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+            slippage_pct=Decimal("0"),
+            fee_pct=Decimal("0"),
+        )
+        executor.set_market_price("BTCUSDT", Decimal("50000"))
+
+        # Open a short position, then place a BUY trailing stop to protect it
+        await executor.create_order(
+            symbol="BTCUSDT", side="SELL", order_type="MARKET", quantity=Decimal("1")
+        )
+        await executor.create_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="TRAILING_STOP",
+            quantity=Decimal("1"),
+            params={"trail_pct": "0.05"},  # 5% trail
+        )
+
+        # Price drops to 45000 -- trough updates; high stays below trigger (45000*1.05=47250)
+        bar1 = _make_bar(open_="49000", high="47000", low="45000", close="46000")
+        fills = executor.check_pending_orders(bar1)
+        assert len(fills) == 0
+
+        # Price drops further to 40000 -- trough updates; high below trigger (40000*1.05=42000)
+        bar2 = _make_bar(open_="46000", high="41500", low="40000", close="41000")
+        fills = executor.check_pending_orders(bar2)
+        assert len(fills) == 0
+
+        # Trough updates to 39500 (min(40000, 39500)). Trigger = 39500 * 1.05 = 41475.
+        # Bar with high=41000 should NOT trigger
+        bar3 = _make_bar(open_="41000", high="41000", low="39500", close="40500")
+        fills = executor.check_pending_orders(bar3)
+        assert len(fills) == 0
+
+        # Trough is now 39500. Trigger = 39500 * 1.05 = 41475.
+        # Bar with high=42000 SHOULD trigger
+        bar4 = _make_bar(open_="40500", high="42000", low="40000", close="41800")
+        fills = executor.check_pending_orders(bar4)
+        assert len(fills) == 1
+        assert fills[0]["status"] == "FILLED"
+        assert fills[0]["side"] == "BUY"
+
+    async def test_trailing_stop_buy_triggers_on_reversal(self) -> None:
+        """BUY trailing stop triggers when price rises past trail_pct from trough."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+            slippage_pct=Decimal("0"),
+            fee_pct=Decimal("0"),
+        )
+        executor.set_market_price("BTCUSDT", Decimal("10000"))
+
+        await executor.create_order(
+            symbol="BTCUSDT", side="SELL", order_type="MARKET", quantity=Decimal("1")
+        )
+        await executor.create_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="TRAILING_STOP",
+            quantity=Decimal("1"),
+            params={"trail_pct": "0.10"},  # 10% trail
+        )
+
+        # Peak initialized at 10000. Trigger = 10000 * 1.10 = 11000.
+        # Bar high 11500 -- should trigger immediately
+        bar = _make_bar(open_="10000", high="11500", low="9800", close="11000")
+        fills = executor.check_pending_orders(bar)
+        assert len(fills) == 1
+        assert fills[0]["status"] == "FILLED"
+
+    async def test_trailing_stop_fill_price_includes_slippage(self) -> None:
+        """Trailing stop fill price applies slippage to the trigger price."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+            slippage_pct=Decimal("0.01"),  # 1% slippage for easy calculation
+            fee_pct=Decimal("0"),
+        )
+        executor.set_market_price("BTCUSDT", Decimal("10000"))
+
+        await executor.create_order(
+            symbol="BTCUSDT", side="BUY", order_type="MARKET", quantity=Decimal("1")
+        )
+        await executor.create_order(
+            symbol="BTCUSDT",
+            side="SELL",
+            order_type="TRAILING_STOP",
+            quantity=Decimal("1"),
+            params={"trail_pct": "0.10"},  # 10% trail
+        )
+
+        # Peak = 10000, trigger = 10000 * 0.90 = 9000
+        # Sell slippage: 9000 * (1 - 0.01) = 8910
+        bar = _make_bar(open_="10000", high="10000", low="8800", close="9000")
+        fills = executor.check_pending_orders(bar)
+        assert len(fills) == 1
+        assert Decimal(str(fills[0]["price"])) == Decimal("8910")
+
+    async def test_trailing_stop_requires_trail_pct(self) -> None:
+        """Creating a TRAILING_STOP without trail_pct raises ValueError."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+        )
+        executor.set_market_price("BTCUSDT", Decimal("50000"))
+
+        with pytest.raises(ValueError, match="trail_pct is required"):
+            await executor.create_order(
+                symbol="BTCUSDT",
+                side="SELL",
+                order_type="TRAILING_STOP",
+                quantity=Decimal("1"),
+            )
+
+    async def test_trailing_stop_requires_market_price(self) -> None:
+        """Creating a TRAILING_STOP without a known market price raises ValueError."""
+        executor = PaperTradingExecutor(
+            initial_balances={"USDT": Decimal("100000")},
+        )
+        # No market price set for BTCUSDT
+        with pytest.raises(ValueError, match="No market price"):
+            await executor.create_order(
+                symbol="BTCUSDT",
+                side="SELL",
+                order_type="TRAILING_STOP",
+                quantity=Decimal("1"),
+                params={"trail_pct": "0.05"},
+            )

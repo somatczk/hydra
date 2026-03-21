@@ -516,6 +516,8 @@ class BacktestRunner:
             equity_curve=equity_curve,
             trades=trades,
             timestamps=timestamps,
+            bar_closes=[bar.close for bar in bars],
+            initial_capital=initial_capital,
         )
         result.stopped_reason = stopped_reason
         result.transactions = transactions
