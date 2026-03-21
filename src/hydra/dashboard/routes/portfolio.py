@@ -4,6 +4,7 @@ import csv
 import io
 import logging
 import re
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -576,9 +577,9 @@ async def get_trades(
     if symbol is not None:
         _add("symbol = ${n}", symbol)
     if from_date is not None:
-        _add("timestamp >= ${n}::timestamptz", from_date)
+        _add("timestamp >= ${n}", datetime.fromisoformat(from_date))
     if to_date is not None:
-        _add("timestamp <= ${n}::timestamptz", to_date)
+        _add("timestamp <= ${n}", datetime.fromisoformat(to_date))
     if min_pnl is not None:
         _add("pnl >= ${n}", min_pnl)
     if max_pnl is not None:
@@ -831,9 +832,9 @@ async def export_trades_csv(
         conditions.append(condition.format(n=len(params)))
 
     if from_date is not None:
-        _add("timestamp >= ${n}::timestamptz", from_date)
+        _add("timestamp >= ${n}", datetime.fromisoformat(from_date))
     if to_date is not None:
-        _add("timestamp <= ${n}::timestamptz", to_date)
+        _add("timestamp <= ${n}", datetime.fromisoformat(to_date))
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 

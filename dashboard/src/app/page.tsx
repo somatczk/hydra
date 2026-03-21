@@ -368,7 +368,7 @@ export default function DashboardPage() {
             <div className="rounded-lg border border-border-default bg-bg-secondary p-3 text-center">
               <p className="text-xs text-text-muted">TWR 30d</p>
               <p className="mt-1 text-lg font-semibold text-text-primary">
-                {(liveMetrics.time_weighted_return_30d * 100).toFixed(2)}%
+                {liveMetrics.time_weighted_return_30d.toFixed(2)}%
               </p>
             </div>
             <div className="rounded-lg border border-border-default bg-bg-secondary p-3 text-center">

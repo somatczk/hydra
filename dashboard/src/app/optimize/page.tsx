@@ -99,7 +99,7 @@ export default function OptimizePage() {
     const interval = setInterval(async () => {
       try {
         const status = await fetchApi<{ status: string; progress: number; results?: OptimizeResult[] }>(
-          `/api/backtest/optimize/status/${pollingTaskId}`,
+          `/api/backtest/hyperopt/${pollingTaskId}`,
         );
         setProgress(Math.round(status.progress));
         if (status.status === 'completed' || status.status === 'failed') {
@@ -134,7 +134,7 @@ export default function OptimizePage() {
         paramRanges[p.name] = { min: p.min, max: p.max, step: p.step };
       }
       const result = await fetchApi<{ task_id?: string; results?: OptimizeResult[] }>(
-        '/api/backtest/optimize',
+        '/api/backtest/hyperopt',
         {
           method: 'POST',
           body: JSON.stringify({
