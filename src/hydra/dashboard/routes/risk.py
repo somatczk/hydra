@@ -266,6 +266,12 @@ async def update_risk_config(body: RiskConfigUpdate, request: Request) -> dict[s
         )
 
     await _apply_risk_config_update(pool, "global", updates)
+
+    # Hot-reload risk config in running session manager
+    mgr = getattr(request.app.state, "session_manager", None)
+    if mgr is not None:
+        await mgr.reload_risk_config()
+
     return await get_risk_config(request)
 
 

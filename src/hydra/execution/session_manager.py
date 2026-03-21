@@ -140,6 +140,12 @@ class SessionManager:
             logger.exception("Failed to load risk config from DB; using defaults")
             self._risk_manager = PreTradeRiskManager()
 
+    async def reload_risk_config(self) -> None:
+        """Re-read risk config from DB and update the live risk manager."""
+        if self._db_pool is None:
+            return
+        await self._init_risk_manager()
+
     # -- Portfolio state builder --------------------------------------------
 
     async def _build_portfolio_state(self, session: TradingSession) -> PortfolioState:
@@ -638,7 +644,54 @@ class SessionManager:
         return None
 
     async def _stop_session_internal(self, session: TradingSession) -> None:
-        """Stop a session's engine/task and update state."""
+        """Stop a session's engine/task, flatten positions, cancel orders, update state."""
+        # 1. Cancel all open orders
+        if session._order_manager is not None:
+            try:
+                open_ids = [
+                    oid
+                    for oid, t in session._order_manager._orders.items()
+                    if t.status.name in ("PENDING", "SUBMITTED", "PARTIALLY_FILLED")
+                ]
+                for oid in open_ids:
+                    await session._order_manager.cancel_order(oid)
+                if open_ids:
+                    logger.info(
+                        "Cancelled %d open orders in session %s",
+                        len(open_ids),
+                        session.session_id,
+                    )
+            except Exception:
+                logger.exception("Failed to cancel open orders in session %s", session.session_id)
+
+        # 2. Flatten all open positions (market close)
+        if session._executor is not None:
+            try:
+                positions = await session._executor.fetch_positions()
+                for pos in positions:
+                    symbol = pos["symbol"]
+                    side = pos.get("side", "")
+                    qty = abs(float(pos.get("contracts", 0)))
+                    if qty <= 0:
+                        continue
+                    # Close: sell longs, buy shorts
+                    close_side = "sell" if side == "long" else "buy"
+                    await session._executor.create_order(
+                        symbol=symbol,
+                        order_type="market",
+                        side=close_side,
+                        amount=qty,
+                    )
+                    logger.info(
+                        "Closed %s position %.8f %s in session %s",
+                        side,
+                        qty,
+                        symbol,
+                        session.session_id,
+                    )
+            except Exception:
+                logger.exception("Failed to flatten positions in session %s", session.session_id)
+
         if session._feed is not None:
             await session._feed.disconnect_all()
 

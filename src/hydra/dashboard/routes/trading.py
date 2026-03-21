@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from hydra.dashboard.routes.strategies import build_strategy_name_map
 
@@ -58,6 +58,13 @@ class TradeItem(BaseModel, extra="allow"):
     fee: float = 0
     pnl: float = 0
     timestamp: str | None = None
+
+    @field_validator("fee", mode="before")
+    @classmethod
+    def _normalize_fee(cls, v: Any) -> float:
+        if isinstance(v, dict):
+            return float(v.get("cost", 0))
+        return float(v) if v is not None else 0.0
 
 
 class SessionMetrics(BaseModel):
