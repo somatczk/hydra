@@ -262,8 +262,7 @@ export default function SessionDetailPage() {
         intervalRef.current = null;
       }
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- only reconnect on sessionId change, not status
-  }, [sessionId, fetchDetail]);
+  }, [sessionId, fetchDetail, detail?.status]);
 
   const handleStop = async () => {
     setStopping(true);
