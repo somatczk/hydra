@@ -25,6 +25,17 @@ interface ParamRange {
   min: number;
   max: number;
   step: number;
+  type: string;
+}
+
+interface StrategyParamDef {
+  name: string;
+  label: string;
+  type: string;
+  default: number;
+  min: number;
+  max: number;
+  step: number;
 }
 
 interface OptimizeResult {
@@ -46,14 +57,6 @@ interface HyperoptHistoryEntry {
   created_at: string;
 }
 
-
-/* ---------- Default param ranges ---------- */
-
-const DEFAULT_PARAMS: ParamRange[] = [
-  { name: 'rsi_period', label: 'RSI Period', min: 5, max: 50, step: 5 },
-  { name: 'sma_fast', label: 'SMA Fast', min: 5, max: 50, step: 5 },
-  { name: 'sma_slow', label: 'SMA Slow', min: 20, max: 200, step: 10 },
-];
 
 /* ---------- Helpers ---------- */
 
@@ -88,9 +91,8 @@ export default function OptimizePage() {
     startDate: string;
     endDate: string;
   } | null>(null);
-  const [params, setParams] = useState<ParamRange[]>(
-    DEFAULT_PARAMS.map((p) => ({ ...p })),
-  );
+  const [params, setParams] = useState<ParamRange[]>([]);
+  const [paramsLoading, setParamsLoading] = useState(false);
   const [results, setResults] = useState<OptimizeResult[]>([]);
   const [sortKey, setSortKey] = useState<'pnl' | 'win_rate' | 'sharpe' | 'max_drawdown'>('pnl');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
@@ -124,6 +126,33 @@ export default function OptimizePage() {
       })
       .finally(() => setLoading(false));
   }, []);
+
+  // Fetch optimizable params when strategy changes
+  useEffect(() => {
+    if (!strategyId) {
+      setParams([]);
+      return;
+    }
+    setParamsLoading(true);
+    fetchApi<StrategyParamDef[]>(`/api/backtest/strategies/${strategyId}/params`)
+      .then((defs) => {
+        setParams(
+          defs.map((d) => ({
+            name: d.name,
+            label: d.label,
+            min: d.min,
+            max: d.max,
+            step: d.step,
+            type: d.type,
+          })),
+        );
+      })
+      .catch((err) => {
+        logger.warn('Optimize', 'Failed to fetch strategy params', err);
+        setParams([]);
+      })
+      .finally(() => setParamsLoading(false));
+  }, [strategyId]);
 
   const updateParam = (index: number, field: 'min' | 'max' | 'step', value: string) => {
     setParams((prev) => {
@@ -196,7 +225,7 @@ export default function OptimizePage() {
     try {
       const paramSpace = params.map((p) => ({
         name: p.name,
-        type: Number.isInteger(p.min) && Number.isInteger(p.max) && Number.isInteger(p.step) ? 'int' : 'float',
+        type: p.type || 'float',
         low: p.min,
         high: p.max,
       }));
@@ -354,6 +383,12 @@ export default function OptimizePage() {
         {/* Parameter ranges */}
         <div className="space-y-3">
           <p className="text-xs font-medium text-text-secondary">Parameter Ranges</p>
+          {paramsLoading && (
+            <p className="text-xs text-text-muted">Loading parameters...</p>
+          )}
+          {!paramsLoading && params.length === 0 && strategyId && (
+            <p className="text-xs text-text-muted">No optimizable parameters found for this strategy.</p>
+          )}
           {params.map((param, i) => (
             <div key={param.name} className="grid grid-cols-4 gap-3 items-end">
               <div>
@@ -382,7 +417,7 @@ export default function OptimizePage() {
         </div>
 
         <div className="mt-4 flex flex-col gap-3">
-          <Button variant="primary" onClick={handleRun} disabled={running || !strategyId}>
+          <Button variant="primary" onClick={handleRun} disabled={running || !strategyId || params.length === 0}>
             <Play className="h-4 w-4" />
             {running ? `Running${progress > 0 ? ` (${progress}%)` : '...'}` : 'Run Optimization'}
           </Button>

@@ -19,6 +19,7 @@ parameters:
             period: 14
           comparator: greater_than
           value: 50
+          param_key: rsi_period
         - indicator: macd
           params:
             fast: 12
@@ -26,6 +27,7 @@ parameters:
             signal: 9
           comparator: greater_than
           value: 0
+          param_key: macd_fast
     exit_long:
       operator: OR
       conditions:
@@ -34,6 +36,7 @@ parameters:
             period: 14
           comparator: less_than
           value: 40
+          param_key: rsi_period
         - indicator: macd
           params:
             fast: 12
@@ -41,6 +44,7 @@ parameters:
             signal: 9
           comparator: less_than
           value: 0
+          param_key: macd_fast
     entry_short:
       operator: AND
       conditions:
@@ -49,6 +53,7 @@ parameters:
             period: 14
           comparator: less_than
           value: 50
+          param_key: rsi_period
         - indicator: macd
           params:
             fast: 12
@@ -56,6 +61,7 @@ parameters:
             signal: 9
           comparator: less_than
           value: 0
+          param_key: macd_fast
     exit_short:
       operator: OR
       conditions:
@@ -64,6 +70,7 @@ parameters:
             period: 14
           comparator: greater_than
           value: 60
+          param_key: rsi_period
         - indicator: macd
           params:
             fast: 12
@@ -71,6 +78,7 @@ parameters:
             signal: 9
           comparator: greater_than
           value: 0
+          param_key: macd_fast
   required_history: 50
   description: >-
     Multi-indicator confirmation strategy on 4H combining RSI and MACD.

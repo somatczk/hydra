@@ -17,6 +17,39 @@ from hydra.strategy.condition_schema import ConditionGroup, RuleSet
 from hydra.strategy.rule_engine import evaluate_condition_group
 
 
+def _apply_value_ref_overrides(
+    value_str: str,
+    overrides: dict[str, str],
+    top_params: dict[str, Any],
+) -> str:
+    """Replace embedded params in a value string reference.
+
+    Given ``"sma:period=50"`` and overrides ``{"sma_period": "period"}``,
+    if ``top_params["sma_period"]`` is set, replaces ``period=50`` with the
+    new value.
+    """
+    parts = value_str.split(":", maxsplit=1)
+    if len(parts) < 2:
+        return value_str
+
+    ind_name = parts[0]
+    embedded: dict[str, str] = {}
+    for kv in parts[1].split(","):
+        k, _, v = kv.partition("=")
+        embedded[k.strip()] = v.strip()
+
+    for top_key, embedded_key in overrides.items():
+        if top_key in top_params and embedded_key in embedded:
+            raw = top_params[top_key]
+            if isinstance(raw, float) and raw == int(raw):
+                embedded[embedded_key] = str(int(raw))
+            else:
+                embedded[embedded_key] = str(raw)
+
+    param_str = ",".join(f"{k}={v}" for k, v in embedded.items())
+    return f"{ind_name}:{param_str}"
+
+
 class RuleBasedStrategy(BaseStrategy):
     """Strategy driven by declarative condition trees from YAML config."""
 
@@ -60,11 +93,43 @@ class RuleBasedStrategy(BaseStrategy):
             if group is None:
                 continue
             for cond in group.conditions:
+                # Explicit param_key → override cond.params[first_key]
                 if cond.param_key and cond.param_key in top_params and cond.params:
                     primary = next(iter(cond.params))
                     cond.params[primary] = top_params[cond.param_key]
+                # Explicit value_param_key → override cond.value as float
                 if cond.value_param_key and cond.value_param_key in top_params:
                     cond.value = float(top_params[cond.value_param_key])
+                # Explicit value_ref_overrides → modify embedded params in value string
+                if cond.value_ref_overrides and isinstance(cond.value, str):
+                    cond.value = _apply_value_ref_overrides(
+                        cond.value, cond.value_ref_overrides, top_params
+                    )
+                # Auto-match: {indicator}_{param_name} → override cond.params
+                if not cond.param_key:
+                    for pname in list(cond.params):
+                        auto_key = f"{cond.indicator}_{pname}"
+                        if auto_key in top_params:
+                            cond.params[pname] = top_params[auto_key]
+                # Auto-match: {ref_indicator}_{param_name} → override value string
+                if (
+                    not cond.value_ref_overrides
+                    and isinstance(cond.value, str)
+                    and ":" in cond.value
+                ):
+                    value_str: str = cond.value
+                    ref_parts = value_str.split(":", maxsplit=1)
+                    ref_ind = ref_parts[0]
+                    auto_overrides: dict[str, str] = {}
+                    for kv in ref_parts[1].split(","):
+                        k = kv.partition("=")[0].strip()
+                        auto_key = f"{ref_ind}_{k}"
+                        if auto_key in top_params:
+                            auto_overrides[auto_key] = k
+                    if auto_overrides:
+                        cond.value = _apply_value_ref_overrides(
+                            value_str, auto_overrides, top_params
+                        )
 
     @property
     def required_history(self) -> int:

@@ -18,10 +18,13 @@ parameters:
           params: {period: 14}
           comparator: less_than
           value: 30
+          param_key: rsi_period
+          value_param_key: rsi_oversold
         - indicator: macd
           params: {fast: 12, slow: 26, signal: 9}
           comparator: crosses_above
           value: 0
+          param_key: macd_fast
     exit_long:
       operator: OR
       conditions:
@@ -29,10 +32,13 @@ parameters:
           params: {period: 14}
           comparator: greater_than
           value: 70
+          param_key: rsi_period
+          value_param_key: rsi_overbought
         - indicator: macd
           params: {fast: 12, slow: 26, signal: 9}
           comparator: crosses_below
           value: 0
+          param_key: macd_fast
     entry_short:
       operator: AND
       conditions:
@@ -40,10 +46,13 @@ parameters:
           params: {period: 14}
           comparator: greater_than
           value: 70
+          param_key: rsi_period
+          value_param_key: rsi_overbought
         - indicator: macd
           params: {fast: 12, slow: 26, signal: 9}
           comparator: crosses_below
           value: 0
+          param_key: macd_fast
     exit_short:
       operator: OR
       conditions:
@@ -51,10 +60,13 @@ parameters:
           params: {period: 14}
           comparator: less_than
           value: 30
+          param_key: rsi_period
+          value_param_key: rsi_oversold
         - indicator: macd
           params: {fast: 12, slow: 26, signal: 9}
           comparator: crosses_above
           value: 0
+          param_key: macd_fast
   required_history: 50
   description: Momentum strategy combining RSI oversold/overbought with MACD zero-line crossovers for entry confirmation.
 position_sizing:

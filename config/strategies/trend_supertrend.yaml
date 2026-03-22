@@ -19,10 +19,14 @@ parameters:
           params: {period: 50}
           comparator: crosses_above
           value: "ema:period=200"
+          param_key: ema_fast
+          value_ref_overrides:
+            ema_slow: period
         - indicator: rsi
           params: {period: 14}
           comparator: greater_than
           value: 50
+          param_key: rsi_period
     exit_long:
       operator: OR
       conditions:
@@ -30,10 +34,14 @@ parameters:
           params: {period: 50}
           comparator: crosses_below
           value: "ema:period=200"
+          param_key: ema_fast
+          value_ref_overrides:
+            ema_slow: period
         - indicator: rsi
           params: {period: 14}
           comparator: less_than
           value: 35
+          param_key: rsi_period
     entry_short:
       operator: AND
       conditions:
@@ -41,10 +49,14 @@ parameters:
           params: {period: 50}
           comparator: crosses_below
           value: "ema:period=200"
+          param_key: ema_fast
+          value_ref_overrides:
+            ema_slow: period
         - indicator: rsi
           params: {period: 14}
           comparator: less_than
           value: 50
+          param_key: rsi_period
     exit_short:
       operator: OR
       conditions:
@@ -52,10 +64,14 @@ parameters:
           params: {period: 50}
           comparator: crosses_above
           value: "ema:period=200"
+          param_key: ema_fast
+          value_ref_overrides:
+            ema_slow: period
         - indicator: rsi
           params: {period: 14}
           comparator: greater_than
           value: 65
+          param_key: rsi_period
   required_history: 200
   description: Trend-following strategy using EMA(50)/EMA(200) crossover with RSI momentum filter. Confirms trend direction on 4H.
 position_sizing:

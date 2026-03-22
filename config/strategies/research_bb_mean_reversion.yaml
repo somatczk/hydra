@@ -18,10 +18,15 @@ parameters:
           params: {}
           comparator: crosses_below
           value: "bollinger_lower:period=60,std_dev=2.0"
+          value_ref_overrides:
+            bb_period: period
+            bb_std_dev: std_dev
         - indicator: close
           params: {}
           comparator: greater_than
           value: "sma:period=200"
+          value_ref_overrides:
+            trend_sma: period
     exit_long:
       operator: AND
       conditions:
@@ -29,6 +34,9 @@ parameters:
           params: {}
           comparator: crosses_above
           value: "bollinger_middle:period=60,std_dev=2.0"
+          value_ref_overrides:
+            bb_period: period
+            bb_std_dev: std_dev
     entry_short: null
     exit_short: null
   required_history: 210

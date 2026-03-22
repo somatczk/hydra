@@ -1,6 +1,6 @@
 [project]
 name = "hydra"
-version = "2.1.7"
+version = "2.1.8"
 description = "Bitcoin auto-trading platform"
 readme = "README.md"
 requires-python = ">=3.12"

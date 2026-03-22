@@ -161,6 +161,9 @@ class ConditionInput(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     comparator: str
     value: float | str
+    param_key: str | None = None
+    value_param_key: str | None = None
+    value_ref_overrides: dict[str, str] | None = None
 
 
 class ConditionGroupInput(BaseModel):
@@ -350,6 +353,9 @@ def _validate_condition_group(group: ConditionGroupInput | None) -> Any:
             params=cond.params,
             comparator=Comparator(cond.comparator),
             value=cond.value,
+            param_key=cond.param_key,
+            value_param_key=cond.value_param_key,
+            value_ref_overrides=cond.value_ref_overrides,
         )
         for cond in group.conditions
     ]

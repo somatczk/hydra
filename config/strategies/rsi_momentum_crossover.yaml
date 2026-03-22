@@ -19,6 +19,8 @@ parameters:
             period: 14
           comparator: crosses_above
           value: 30
+          param_key: rsi_period
+          value_param_key: rsi_oversold
     exit_long:
       operator: AND
       conditions:
@@ -27,6 +29,8 @@ parameters:
             period: 14
           comparator: crosses_above
           value: 70
+          param_key: rsi_period
+          value_param_key: rsi_overbought
     entry_short:
       operator: AND
       conditions:
@@ -35,6 +39,8 @@ parameters:
             period: 14
           comparator: crosses_below
           value: 70
+          param_key: rsi_period
+          value_param_key: rsi_overbought
     exit_short:
       operator: AND
       conditions:
@@ -43,6 +49,8 @@ parameters:
             period: 14
           comparator: crosses_below
           value: 30
+          param_key: rsi_period
+          value_param_key: rsi_oversold
   required_history: 50
   description: >-
     RSI crossover strategy on 4H timeframe. Research shows Sharpe 5.13,

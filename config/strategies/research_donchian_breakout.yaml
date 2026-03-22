@@ -18,6 +18,8 @@ parameters:
           params: {}
           comparator: crosses_above
           value: "rolling_max:period=60"
+          value_ref_overrides:
+            donchian_period: period
     exit_long:
       operator: AND
       conditions:
@@ -25,6 +27,8 @@ parameters:
           params: {}
           comparator: crosses_below
           value: "rolling_mid:period=60"
+          value_ref_overrides:
+            donchian_period: period
     entry_short: null
     exit_short: null
   required_history: 65

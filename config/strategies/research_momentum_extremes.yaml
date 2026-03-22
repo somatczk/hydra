@@ -18,6 +18,8 @@ parameters:
           params: {}
           comparator: equals
           value: "rolling_max:period=20"
+          value_ref_overrides:
+            lookback: period
     exit_long:
       operator: AND
       conditions:
@@ -25,6 +27,8 @@ parameters:
           params: {}
           comparator: less_than
           value: "rolling_max:period=20"
+          value_ref_overrides:
+            lookback: period
     entry_short: null
     exit_short: null
   required_history: 25

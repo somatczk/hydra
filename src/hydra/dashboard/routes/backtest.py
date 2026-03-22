@@ -976,6 +976,202 @@ async def list_backtest_strategies() -> list[dict[str, str]]:
     return strategies
 
 
+# ---------------------------------------------------------------------------
+# Strategy optimizable parameter extraction
+# ---------------------------------------------------------------------------
+
+
+class StrategyParamDef(BaseModel):
+    """A single optimizable parameter extracted from a strategy's conditions."""
+
+    name: str
+    label: str
+    type: str  # "int" | "float"
+    default: float
+    min: float
+    max: float
+    step: float
+
+
+def _humanize_label(name: str) -> str:
+    """Convert ``sma_period`` to ``SMA Period``."""
+    return " ".join(w.upper() if len(w) <= 3 else w.capitalize() for w in name.split("_"))
+
+
+def _infer_type(value: object) -> str:
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float) and value == int(value):
+        return "int"
+    return "float"
+
+
+def _suggest_range(param_name: str, default: float, param_type: str) -> tuple[float, float, float]:
+    """Return (min, max, step) using indicator registry constraints or heuristic."""
+    from hydra.strategy.indicator_registry import _PARAM_CONSTRAINTS
+
+    constraints = _PARAM_CONSTRAINTS.get(param_name)
+    if constraints:
+        lo = float(constraints["min"])  # type: ignore[arg-type]
+        hi = float(constraints["max"])  # type: ignore[arg-type]
+    else:
+        lo = max(0.1 if param_type == "float" else 1, round(default * 0.25))
+        hi = max(round(default * 4), round(default + 10))
+    step = max(1 if param_type == "int" else 0.1, round((hi - lo) / 20, 2))
+    return lo, hi, step
+
+
+def _parse_value_ref(value_str: str) -> tuple[str, dict[str, str]]:
+    """Parse ``'sma:period=50'`` into ``('sma', {'period': '50'})``."""
+    parts = value_str.split(":", maxsplit=1)
+    if len(parts) < 2:
+        return parts[0], {}
+    embedded: dict[str, str] = {}
+    for kv in parts[1].split(","):
+        k, _, v = kv.partition("=")
+        embedded[k.strip()] = v.strip()
+    return parts[0], embedded
+
+
+def _extract_optimizable_params(rules_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    """Walk all conditions and extract optimizable params."""
+    seen: dict[str, dict[str, Any]] = {}
+
+    for group_name in ("entry_long", "exit_long", "entry_short", "exit_short"):
+        group = rules_dict.get(group_name)
+        if not group or not group.get("conditions"):
+            continue
+        for cond in group["conditions"]:
+            indicator = cond.get("indicator", "")
+            params = cond.get("params", {})
+            value = cond.get("value")
+            param_key = cond.get("param_key")
+            value_param_key = cond.get("value_param_key")
+            value_ref_overrides = cond.get("value_ref_overrides")
+
+            # 1. param_key → indicator params
+            if param_key and params:
+                primary_key = next(iter(params))
+                default = params[primary_key]
+                if param_key not in seen:
+                    ptype = _infer_type(default)
+                    lo, hi, step = _suggest_range(primary_key, float(default), ptype)
+                    seen[param_key] = {
+                        "name": param_key,
+                        "label": _humanize_label(param_key),
+                        "type": ptype,
+                        "default": float(default),
+                        "min": lo,
+                        "max": hi,
+                        "step": step,
+                    }
+
+            # 2. value_param_key → numeric threshold
+            if value_param_key and isinstance(value, (int, float)) and value_param_key not in seen:
+                ptype = _infer_type(value)
+                default_val = float(value)
+                lo = max(0, round(default_val * 0.25))
+                hi = round(default_val * 3) if default_val > 0 else 100
+                step = max(1.0, round((hi - lo) / 20, 2))
+                seen[value_param_key] = {
+                    "name": value_param_key,
+                    "label": _humanize_label(value_param_key),
+                    "type": ptype,
+                    "default": default_val,
+                    "min": lo,
+                    "max": hi,
+                    "step": step,
+                }
+
+            # 3. value_ref_overrides → value string embedded params
+            if value_ref_overrides and isinstance(value, str):
+                _, embedded = _parse_value_ref(value)
+                for top_key, embedded_key in value_ref_overrides.items():
+                    if top_key not in seen and embedded_key in embedded:
+                        raw = embedded[embedded_key]
+                        try:
+                            default_val = float(raw)
+                        except ValueError:
+                            continue
+                        ptype = "int" if "." not in raw else "float"
+                        lo, hi, step = _suggest_range(embedded_key, default_val, ptype)
+                        seen[top_key] = {
+                            "name": top_key,
+                            "label": _humanize_label(top_key),
+                            "type": ptype,
+                            "default": default_val,
+                            "min": lo,
+                            "max": hi,
+                            "step": step,
+                        }
+
+            # 4. Auto-extract fallback (no annotations)
+            if not param_key and params:
+                for pname, pval in params.items():
+                    auto_key = f"{indicator}_{pname}"
+                    if auto_key not in seen and isinstance(pval, (int, float)):
+                        ptype = _infer_type(pval)
+                        lo, hi, step = _suggest_range(pname, float(pval), ptype)
+                        seen[auto_key] = {
+                            "name": auto_key,
+                            "label": _humanize_label(auto_key),
+                            "type": ptype,
+                            "default": float(pval),
+                            "min": lo,
+                            "max": hi,
+                            "step": step,
+                        }
+
+            if not value_ref_overrides and isinstance(value, str) and ":" in value:
+                ref_ind, embedded = _parse_value_ref(value)
+                for ek, ev in embedded.items():
+                    auto_key = f"{ref_ind}_{ek}"
+                    if auto_key not in seen:
+                        try:
+                            default_val = float(ev)
+                        except ValueError:
+                            continue
+                        ptype = "int" if "." not in ev else "float"
+                        lo, hi, step = _suggest_range(ek, default_val, ptype)
+                        seen[auto_key] = {
+                            "name": auto_key,
+                            "label": _humanize_label(auto_key),
+                            "type": ptype,
+                            "default": default_val,
+                            "min": lo,
+                            "max": hi,
+                            "step": step,
+                        }
+
+    return list(seen.values())
+
+
+@router.get(
+    "/strategies/{strategy_id}/params",
+    response_model=list[StrategyParamDef],
+)
+async def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
+    """Extract optimizable parameters from a strategy's condition tree."""
+    if not _STRATEGY_CONFIG_DIR.is_dir():
+        return []
+    target = None
+    for path in _STRATEGY_CONFIG_DIR.glob("*.yaml"):
+        data = _parse_any_strategy_yaml(path)
+        if data and data.get("id") == strategy_id:
+            target = path
+            break
+    if target is None:
+        return []
+
+    data = _parse_any_strategy_yaml(target)
+    if data is None:
+        return []
+    rules_dict = data.get("parameters", {}).get("rules", {})
+    if not rules_dict:
+        return []
+    return _extract_optimizable_params(rules_dict)
+
+
 # ===========================================================================
 # Hyperparameter optimisation
 # ===========================================================================

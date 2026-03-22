@@ -19,6 +19,9 @@ parameters:
             period: 20
           comparator: crosses_above
           value: "sma:period=50"
+          param_key: sma_fast
+          value_ref_overrides:
+            sma_slow: period
     exit_long:
       operator: AND
       conditions:
@@ -27,6 +30,9 @@ parameters:
             period: 20
           comparator: crosses_below
           value: "sma:period=50"
+          param_key: sma_fast
+          value_ref_overrides:
+            sma_slow: period
     entry_short:
       operator: AND
       conditions:
@@ -35,6 +41,9 @@ parameters:
             period: 20
           comparator: crosses_below
           value: "sma:period=50"
+          param_key: sma_fast
+          value_ref_overrides:
+            sma_slow: period
     exit_short:
       operator: AND
       conditions:
@@ -43,6 +52,9 @@ parameters:
             period: 20
           comparator: crosses_above
           value: "sma:period=50"
+          param_key: sma_fast
+          value_ref_overrides:
+            sma_slow: period
   required_history: 60
   description: >-
     Dual SMA crossover trend-following strategy on 1H. Research: 1-week MA

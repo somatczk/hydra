@@ -18,6 +18,8 @@ parameters:
           params: {}
           comparator: greater_than
           value: "sma:period=50"
+          value_ref_overrides:
+            sma_period: period
     exit_long:
       operator: AND
       conditions:
@@ -25,6 +27,8 @@ parameters:
           params: {}
           comparator: less_than
           value: "sma:period=50"
+          value_ref_overrides:
+            sma_period: period
     entry_short: null
     exit_short: null
   required_history: 60

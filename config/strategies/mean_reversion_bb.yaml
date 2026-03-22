@@ -18,10 +18,15 @@ parameters:
           params: {}
           comparator: crosses_below
           value: "bollinger_lower:period=20,std_dev=2.0"
+          value_ref_overrides:
+            bb_period: period
+            bb_std_dev: std_dev
         - indicator: rsi
           params: {period: 14}
           comparator: less_than
           value: 30
+          param_key: rsi_period
+          value_param_key: rsi_oversold
     exit_long:
       operator: OR
       conditions:
@@ -29,10 +34,14 @@ parameters:
           params: {}
           comparator: crosses_above
           value: "bollinger_middle:period=20,std_dev=2.0"
+          value_ref_overrides:
+            bb_period: period
+            bb_std_dev: std_dev
         - indicator: rsi
           params: {period: 14}
           comparator: greater_than
           value: 60
+          param_key: rsi_period
     entry_short:
       operator: AND
       conditions:
@@ -40,10 +49,15 @@ parameters:
           params: {}
           comparator: crosses_above
           value: "bollinger_upper:period=20,std_dev=2.0"
+          value_ref_overrides:
+            bb_period: period
+            bb_std_dev: std_dev
         - indicator: rsi
           params: {period: 14}
           comparator: greater_than
           value: 70
+          param_key: rsi_period
+          value_param_key: rsi_overbought
     exit_short:
       operator: OR
       conditions:
@@ -51,10 +65,14 @@ parameters:
           params: {}
           comparator: crosses_below
           value: "bollinger_middle:period=20,std_dev=2.0"
+          value_ref_overrides:
+            bb_period: period
+            bb_std_dev: std_dev
         - indicator: rsi
           params: {period: 14}
           comparator: less_than
           value: 40
+          param_key: rsi_period
   required_history: 30
   description: RSI-based mean reversion with Bollinger Band confirmation. Enters on band touches with RSI extremes, exits at mid-band.
 position_sizing:
