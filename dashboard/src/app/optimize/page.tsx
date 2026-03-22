@@ -53,8 +53,6 @@ const DEFAULT_PARAMS: ParamRange[] = [
   { name: 'rsi_period', label: 'RSI Period', min: 5, max: 50, step: 5 },
   { name: 'sma_fast', label: 'SMA Fast', min: 5, max: 50, step: 5 },
   { name: 'sma_slow', label: 'SMA Slow', min: 20, max: 200, step: 10 },
-  { name: 'stop_loss_pct', label: 'Stop Loss %', min: 0.5, max: 5.0, step: 0.5 },
-  { name: 'take_profit_pct', label: 'Take Profit %', min: 0.5, max: 10.0, step: 0.5 },
 ];
 
 /* ---------- Helpers ---------- */

@@ -410,6 +410,52 @@ def bollinger_lower(data: ndarray, period: int = 20, std_dev: float = 2.0) -> nd
     return lower
 
 
+def rolling_max(data: ndarray, period: int) -> ndarray:
+    """Rolling maximum over the last *period* values.
+
+    Equivalent to the upper Donchian channel computed on closes.
+    NaN for the first ``period - 1`` elements.
+    """
+    if period <= 0:
+        return np.full_like(data, np.nan, dtype=np.float64)
+    data_f = data.astype(np.float64)
+    n = len(data_f)
+    result = np.full(n, np.nan, dtype=np.float64)
+    if n < period:
+        return result
+    for i in range(period - 1, n):
+        result[i] = np.max(data_f[i - period + 1 : i + 1])
+    return result
+
+
+def rolling_min(data: ndarray, period: int) -> ndarray:
+    """Rolling minimum over the last *period* values.
+
+    Equivalent to the lower Donchian channel computed on closes.
+    NaN for the first ``period - 1`` elements.
+    """
+    if period <= 0:
+        return np.full_like(data, np.nan, dtype=np.float64)
+    data_f = data.astype(np.float64)
+    n = len(data_f)
+    result = np.full(n, np.nan, dtype=np.float64)
+    if n < period:
+        return result
+    for i in range(period - 1, n):
+        result[i] = np.min(data_f[i - period + 1 : i + 1])
+    return result
+
+
+def rolling_mid(data: ndarray, period: int) -> ndarray:
+    """Rolling midpoint: (rolling_max + rolling_min) / 2.
+
+    Equivalent to the Donchian channel midline on closes.
+    NaN for the first ``period - 1`` elements.
+    """
+    result: ndarray = (rolling_max(data, period) + rolling_min(data, period)) / 2.0
+    return result
+
+
 def close(data: ndarray) -> ndarray:
     """Return close prices (identity — for use as a condition indicator)."""
     return data

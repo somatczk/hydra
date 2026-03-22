@@ -23,6 +23,7 @@ class RuleBasedStrategy(BaseStrategy):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._rules = self._parse_rules()
+        self._apply_param_overrides()
 
     def _parse_rules(self) -> RuleSet:
         """Parse the ``rules`` dict from strategy parameters into a RuleSet."""
@@ -41,6 +42,29 @@ class RuleBasedStrategy(BaseStrategy):
         if data is None:
             return None
         return ConditionGroup(**data)
+
+    def _apply_param_overrides(self) -> None:
+        """Override condition params from top-level strategy parameters.
+
+        When a condition has ``param_key`` set, the first key in its ``params``
+        dict is overridden with the matching value from top-level parameters.
+        Similarly ``value_param_key`` overrides the condition's ``value``.
+        """
+        top_params = self._config.parameters
+        for group in [
+            self._rules.entry_long,
+            self._rules.exit_long,
+            self._rules.entry_short,
+            self._rules.exit_short,
+        ]:
+            if group is None:
+                continue
+            for cond in group.conditions:
+                if cond.param_key and cond.param_key in top_params and cond.params:
+                    primary = next(iter(cond.params))
+                    cond.params[primary] = top_params[cond.param_key]
+                if cond.value_param_key and cond.value_param_key in top_params:
+                    cond.value = float(top_params[cond.value_param_key])
 
     @property
     def required_history(self) -> int:

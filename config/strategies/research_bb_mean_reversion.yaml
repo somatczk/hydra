@@ -1,5 +1,5 @@
 id: research-bb-mean-reversion
-name: "Research: BB Mean-Reversion"
+name: "Research: BB Mean-Reversion with Trend Filter"
 strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy
 enabled: false
 symbols:
@@ -17,26 +17,22 @@ parameters:
         - indicator: close
           params: {}
           comparator: crosses_below
-          value: "bollinger_lower:period=20,std_dev=2.0"
-        - indicator: rsi
-          params: {period: 14}
-          comparator: less_than
-          value: 30
+          value: "bollinger_lower:period=60,std_dev=2.0"
+        - indicator: close
+          params: {}
+          comparator: greater_than
+          value: "sma:period=200"
     exit_long:
-      operator: OR
+      operator: AND
       conditions:
         - indicator: close
           params: {}
           comparator: crosses_above
-          value: "bollinger_middle:period=20,std_dev=2.0"
-        - indicator: rsi
-          params: {period: 14}
-          comparator: greater_than
-          value: 60
+          value: "bollinger_middle:period=60,std_dev=2.0"
     entry_short: null
     exit_short: null
-  required_history: 200
-  description: "Day et al. 2023 / Glucksmann ETH Zurich. Buy at lower BB touch with RSI<30 confirmation. Exit at middle BB. Long-only. Enhanced version achieved Sharpe 3.2. Only 34% time in market provides natural drawdown protection."
+  required_history: 210
+  description: "Day et al. 2023: BB(60,2) AHPR >50%. SMA(200) trend filter per Gerritsen et al.: counter-trend BB underperforms BH without regime gating. Long-only."
 position_sizing:
   method: fixed_fractional
   risk_per_trade_pct: 1.5

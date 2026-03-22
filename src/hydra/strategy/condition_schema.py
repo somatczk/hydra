@@ -41,6 +41,8 @@ class Condition(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     comparator: Comparator
     value: float | str  # float literal or another indicator reference
+    param_key: str | None = None  # Override condition.params[first_key] from top-level params
+    value_param_key: str | None = None  # Override condition.value (numeric thresholds only)
 
 
 class ConditionGroup(BaseModel):

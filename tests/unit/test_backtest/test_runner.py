@@ -91,6 +91,68 @@ class BuyThenSellStrategy(BaseStrategy):
         return []
 
 
+class ShortThenExitStrategy(BaseStrategy):
+    """Enter SHORT on bar 3, exit on bar 6."""
+
+    _bar_count = 0
+    _entered = False
+
+    @property
+    def required_history(self) -> int:
+        return 2
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        self._bar_count += 1
+        if self._bar_count == 3 and not self._entered:
+            self._entered = True
+            return [
+                EntrySignal(
+                    symbol=bar.symbol,
+                    direction=Direction.SHORT,
+                    strength=Decimal("1"),
+                    strategy_id=self.strategy_id,
+                    exchange_id="binance",
+                    market_type=MarketType.FUTURES,
+                )
+            ]
+        if self._bar_count == 6 and self._entered:
+            self._entered = False
+            return [
+                ExitSignal(
+                    symbol=bar.symbol,
+                    direction=Direction.FLAT,
+                    strategy_id=self.strategy_id,
+                    exchange_id="binance",
+                    reason="take_profit",
+                )
+            ]
+        return []
+
+
+class ExitOnlyStrategy(BaseStrategy):
+    """Emits an ExitSignal on bar 3 without ever entering a position."""
+
+    _bar_count = 0
+
+    @property
+    def required_history(self) -> int:
+        return 2
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        self._bar_count += 1
+        if self._bar_count == 3:
+            return [
+                ExitSignal(
+                    symbol=bar.symbol,
+                    direction=Direction.FLAT,
+                    strategy_id=self.strategy_id,
+                    exchange_id="binance",
+                    reason="spurious_exit",
+                )
+            ]
+        return []
+
+
 class NoLookaheadTestStrategy(BaseStrategy):
     """Records bar data seen at each on_bar call to verify no lookahead."""
 
@@ -260,6 +322,61 @@ class TestBasicBacktest:
 # ---------------------------------------------------------------------------
 # No-lookahead
 # ---------------------------------------------------------------------------
+
+
+class TestShortExitFix:
+    """Regression tests for SHORT exit signals (Bug: exits compounded instead of closing)."""
+
+    async def test_short_exit_closes_position(self, runner: BacktestRunner) -> None:
+        """SHORT entry + EXIT should produce a completed trade with reasonable PnL."""
+        bars = _make_bars(20, start_price=42000.0, trend=-10.0)
+        config = StrategyConfig(
+            id="test_short",
+            name="Test Short",
+            strategy_class="test.ShortThenExit",
+            symbols=["BTCUSDT"],
+            exchange={"exchange_id": "binance", "market_type": "FUTURES"},
+        )
+
+        result = await runner.run(
+            strategy_class=ShortThenExitStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("100000"),
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+        )
+
+        assert result.total_trades >= 1, "SHORT entry + exit should produce a trade"
+        # PnL should be reasonable, not quadrillions
+        for trade in result.trades:
+            assert abs(float(trade.pnl)) < 100000, (
+                f"Trade PnL {trade.pnl} is unreasonable"
+            )
+        # Final equity should be close to initial capital
+        final_equity = float(result.equity_curve[-1])
+        assert abs(final_equity - 100000) < 50000, (
+            f"Final equity {final_equity} is unreasonable for $100k capital"
+        )
+
+    async def test_exit_signal_no_position_is_noop(self, runner: BacktestRunner) -> None:
+        """ExitSignal with no open position should not create phantom orders."""
+        bars = _make_bars(20, start_price=100.0, trend=0.5)
+        config = _make_config()
+
+        result = await runner.run(
+            strategy_class=ExitOnlyStrategy,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal("100000"),
+            symbol="BTCUSDT",
+            timeframe=Timeframe.H1,
+        )
+
+        assert result.total_trades == 0, "Exit with no position should produce 0 trades"
+        assert result.equity_curve[-1] == Decimal("100000"), (
+            "Capital should be unchanged when no trades occur"
+        )
 
 
 class TestNoLookahead:

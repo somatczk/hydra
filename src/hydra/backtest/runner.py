@@ -555,13 +555,12 @@ class BacktestRunner:
                 market_type=signal.market_type,
             )
         if isinstance(signal, ExitSignal):
-            # Close the full position
             pos = tracker.positions.get(str(symbol))
-            quantity = pos["quantity"] if pos else Decimal("0.00000001")
-
-            side = Side.SELL if signal.direction == Direction.FLAT else Side.BUY
-            if signal.direction == Direction.FLAT:
-                side = Side.SELL
+            if pos is None:
+                return None  # No position to close
+            quantity = pos["quantity"]
+            # Determine side from position direction, not signal direction
+            side = Side.SELL if pos["direction"] == Direction.LONG else Side.BUY
             return OrderRequest(
                 symbol=symbol,
                 side=side,

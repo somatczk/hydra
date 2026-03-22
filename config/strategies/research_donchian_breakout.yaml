@@ -1,5 +1,5 @@
 id: research-donchian-breakout
-name: "Research: Donchian Breakout Ensemble"
+name: "Research: Donchian Breakout (60d)"
 strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy
 enabled: false
 symbols:
@@ -17,26 +17,18 @@ parameters:
         - indicator: close
           params: {}
           comparator: crosses_above
-          value: "bollinger_upper:period=15,std_dev=2.0"
-        - indicator: rsi
-          params: {period: 14}
-          comparator: greater_than
-          value: 55
+          value: "rolling_max:period=60"
     exit_long:
-      operator: OR
+      operator: AND
       conditions:
         - indicator: close
           params: {}
           comparator: crosses_below
-          value: "bollinger_lower:period=15,std_dev=2.0"
-        - indicator: rsi
-          params: {period: 14}
-          comparator: less_than
-          value: 40
+          value: "rolling_mid:period=60"
     entry_short: null
     exit_short: null
-  required_history: 30
-  description: "Zarattini et al. 2025 / QuantifiedStrategies. Donchian-style breakout adapted to BB upper band break with RSI momentum confirmation. Long-only. Calmar ratio ~1.58, 19% max drawdown."
+  required_history: 65
+  description: "Zarattini et al. 2025 single-horizon (60d) approximation. Full ensemble: CAGR ~30%, Sharpe ~1.58, max DD ~19%. Donchian on closes, not highs/lows. Mid-channel trailing stop."
 position_sizing:
   method: fixed_fractional
   risk_per_trade_pct: 2.0

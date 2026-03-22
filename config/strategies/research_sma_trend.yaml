@@ -1,5 +1,5 @@
 id: research-sma-trend
-name: "Research: SMA Trend-Following"
+name: "Research: SMA Trend Timing"
 strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy
 enabled: false
 symbols:
@@ -14,25 +14,21 @@ parameters:
     entry_long:
       operator: AND
       conditions:
-        - indicator: ema
-          params: {period: 20}
-          comparator: crosses_above
-          value: "sma:period=50"
-        - indicator: rsi
-          params: {period: 14}
+        - indicator: close
+          params: {}
           comparator: greater_than
-          value: 45
+          value: "sma:period=50"
     exit_long:
       operator: AND
       conditions:
-        - indicator: ema
-          params: {period: 20}
-          comparator: crosses_below
+        - indicator: close
+          params: {}
+          comparator: less_than
           value: "sma:period=50"
     entry_short: null
     exit_short: null
   required_history: 60
-  description: "Detzel et al. 2021 / Grayscale 2023. EMA(20)/SMA(50) crossover trend-following. Long-only. Sharpe 1.9, avoids major drawdowns. RSI>45 filter reduces whipsaws in sideways markets."
+  description: "Detzel et al. 2021 / Grayscale 2023. Price > SMA(50) → long, else cash. Sharpe 1.9 vs 1.3 BH (Jan 2012–Jul 2023). MA(5–100) timing improves Sharpe and reduces drawdowns."
 position_sizing:
   method: fixed_fractional
   risk_per_trade_pct: 2.0

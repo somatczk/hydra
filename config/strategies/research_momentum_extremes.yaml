@@ -1,5 +1,5 @@
 id: research-momentum-extremes
-name: "Research: Momentum at Extremes"
+name: "Research: Momentum at Extremes (MAX)"
 strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy
 enabled: false
 symbols:
@@ -14,29 +14,21 @@ parameters:
     entry_long:
       operator: AND
       conditions:
-        - indicator: rsi
-          params: {period: 10}
-          comparator: greater_than
-          value: 65
-        - indicator: ema
-          params: {period: 5}
-          comparator: crosses_above
-          value: "ema:period=20"
+        - indicator: close
+          params: {}
+          comparator: equals
+          value: "rolling_max:period=20"
     exit_long:
-      operator: OR
+      operator: AND
       conditions:
-        - indicator: rsi
-          params: {period: 10}
+        - indicator: close
+          params: {}
           comparator: less_than
-          value: 45
-        - indicator: ema
-          params: {period: 5}
-          comparator: crosses_below
-          value: "ema:period=20"
+          value: "rolling_max:period=20"
     entry_short: null
     exit_short: null
-  required_history: 30
-  description: "Padysak & Vojtko 2022, OOS-confirmed by Beluska & Vojtko 2024. MAX strategy: buy at local 10-day highs (RSI>65 + short EMA breakout). Trend-following component survived 2022 bear market. Long-only. Return/vol ratio 2.06."
+  required_history: 25
+  description: "Quantpedia 2022 / Beluska & Vojtko 2024. MAX(20) trend leg only. Hold BTC on day t+1 if close_t == rolling_max(20). Return/vol 2.06. OOS: MAX held up, MIN degraded — using MAX only."
 position_sizing:
   method: fixed_fractional
   risk_per_trade_pct: 2.0
