@@ -1,4 +1,4 @@
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim AS builder
 WORKDIR /app
 RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock README.md ./
@@ -8,7 +8,7 @@ COPY config/ config/
 COPY scripts/ scripts/
 RUN uv sync --no-dev --extra ml-training
 
-FROM python:3.13-slim
+FROM python:3.14-slim
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
