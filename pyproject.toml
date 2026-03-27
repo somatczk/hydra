@@ -58,7 +58,7 @@ ml-training = [
 ]
 dev = [
     "pytest>=8.3,<9",
-    "pytest-asyncio>=0.25,<1",
+    "pytest-asyncio>=0.25,<2",
     "pytest-cov>=6.0,<7",
     "pytest-mock>=3.14,<4",
     "pytest-benchmark>=5.1,<6",
