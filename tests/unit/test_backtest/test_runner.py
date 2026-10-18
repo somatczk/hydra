@@ -350,9 +350,7 @@ class TestShortExitFix:
         assert result.total_trades >= 1, "SHORT entry + exit should produce a trade"
         # PnL should be reasonable, not quadrillions
         for trade in result.trades:
-            assert abs(float(trade.pnl)) < 100000, (
-                f"Trade PnL {trade.pnl} is unreasonable"
-            )
+            assert abs(float(trade.pnl)) < 100000, f"Trade PnL {trade.pnl} is unreasonable"
         # Final equity should be close to initial capital
         final_equity = float(result.equity_curve[-1])
         assert abs(final_equity - 100000) < 50000, (
