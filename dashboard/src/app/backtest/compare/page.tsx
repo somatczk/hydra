@@ -293,9 +293,9 @@ export default function BacktestComparePage() {
                       if (!active || !payload?.length) return null;
                       return (
                         <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
-                          <p className="text-xs text-text-muted">{label ? formatXTick(label, resolution) : ''}</p>
+                          <p className="text-xs text-text-muted">{label != null ? formatXTick(String(label), resolution) : ''}</p>
                           {payload.map((p) => (
-                            <p key={p.dataKey} className="text-sm font-medium text-text-primary">
+                            <p key={String(p.dataKey)} className="text-sm font-medium text-text-primary">
                               {p.dataKey === 'valueA' ? 'A' : 'B'}: ${(p.value as number)?.toLocaleString('en-US', { minimumFractionDigits: 2 }) ?? 'N/A'}
                             </p>
                           ))}

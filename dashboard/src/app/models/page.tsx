@@ -351,7 +351,7 @@ export default function ModelsPage() {
                     borderRadius: '8px',
                     fontSize: '12px',
                   }}
-                  formatter={(v: number) => [`${v.toFixed(1)}%`, 'Accuracy']}
+                  formatter={(v) => [`${Number(v).toFixed(1)}%`, 'Accuracy']}
                 />
                 <Bar dataKey="accuracy" radius={[3, 3, 0, 0]}>
                   {accuracyChartData.map((entry, index) => (
