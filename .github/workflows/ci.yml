@@ -15,7 +15,7 @@ concurrency:
 jobs:
   lint:
     name: Lint & Format
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -29,7 +29,7 @@ jobs:
 
   type-check:
     name: Type Check
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -42,7 +42,7 @@ jobs:
 
   security:
     name: Security Scan
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -55,7 +55,7 @@ jobs:
 
   unit-tests:
     name: Unit Tests
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -73,7 +73,7 @@ jobs:
 
   integration-tests:
     name: Integration Tests
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -127,7 +127,7 @@ jobs:
 
   e2e-tests:
     name: E2E Tests
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     needs: [unit-tests, integration-tests]
