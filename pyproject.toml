@@ -42,7 +42,7 @@ dependencies = [
     "cryptography>=46.0.5,<47",
     # Security constraints for transitive deps
     "pyasn1>=0.6.4",
-    "python-multipart>=0.0.22",
+    "python-multipart>=0.0.31",
 ]
 
 [project.optional-dependencies]
