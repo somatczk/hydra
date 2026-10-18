@@ -10,7 +10,7 @@ authors = [{ name = "somatczk" }]
 dependencies = [
     # Core
     "pydantic>=2.10,<3",
-    "pydantic-settings>=2.7,<3",
+    "pydantic-settings>=2.16.0,<3",
     "pyyaml>=6.0,<7",
     "structlog>=26.1.0,<27",
     "msgpack>=1.1,<2",
