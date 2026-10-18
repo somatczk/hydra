@@ -29,7 +29,7 @@ jobs:
         run: |
           TAG=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "Version: $TAG"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.image }}
@@ -57,14 +57,26 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
+      # version tags are releases and never move; a rebuild without a version bump only updates main and sha
+      - name: Tags
+        id: tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          VERSION: ${{ needs.version.outputs.tag }}
+        run: |
+          release="$IMAGE:$VERSION"
+          if docker buildx imagetools inspect "$release" >/dev/null 2>&1; then
+            echo "::notice::$release already exists, bump the version in pyproject.toml to release"
+            release=""
+          fi
+          printf 'list<<EOF\n%s:main\n%s:sha-%s\n%s\nEOF\n' "$IMAGE" "$IMAGE" "${GITHUB_SHA::7}" "$release" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.version.outputs.tag }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:main
+          tags: ${{ steps.tags.outputs.list }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
