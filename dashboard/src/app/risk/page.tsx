@@ -475,10 +475,10 @@ export default function RiskPage() {
                           borderRadius: '8px',
                           fontSize: '12px',
                         }}
-                        formatter={(v: number) => [
+                        formatter={(raw) => { const v = Number(raw); return [
                           `${v >= 0 ? '+' : ''}$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
                           'PnL',
-                        ]}
+                        ]; }}
                       />
                       <Bar dataKey="pnl" radius={[3, 3, 0, 0]}>
                         {dailyPnl.map((entry, index) => (
