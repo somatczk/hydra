@@ -71,6 +71,26 @@ jobs:
           name: test-results
           path: junit.xml
 
+  dashboard:
+    name: Dashboard Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          # same major as docker/dashboard/Dockerfile
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
