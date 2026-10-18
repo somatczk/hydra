@@ -22,7 +22,7 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Read version from pyproject.toml
         id: version
@@ -48,7 +48,7 @@ jobs:
             dockerfile: docker/backtest/Dockerfile
             context: .
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Login to GHCR
         env:
