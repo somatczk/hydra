@@ -52,7 +52,7 @@ ml-training = [
     "scikit-learn>=1.6,<2",
     "torch>=2.5,<3",
     "optuna>=4.1,<5",
-    "mlflow>=3.9,<4",
+    "mlflow>=3.16.0,<4",
     "onnxmltools>=1.12,<2",
     "finrl>=0.3,<1",
 ]
