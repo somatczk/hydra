@@ -39,7 +39,7 @@ dependencies = [
     # Observability
     "prometheus-client>=0.21,<1",
     # Encryption
-    "cryptography>=46.0.5,<47",
+    "cryptography>=50.0.0,<51",
     # Security constraints for transitive deps
     "pyasn1>=0.6.4",
     "python-multipart>=0.0.31",
