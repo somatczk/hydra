@@ -20,7 +20,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync --extra dev
@@ -34,7 +34,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync --extra dev
@@ -47,7 +47,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync --extra dev
@@ -60,7 +60,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync --extra dev
@@ -84,11 +84,13 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           # same major as docker/dashboard/Dockerfile
-          node-version: 22
+          node-version: 26
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
       - run: npm run lint
+      # TypeScript 7; lint and next build use the TypeScript 6 API package
+      - run: npm run typecheck
       - run: npm run build
 
   integration-tests:
@@ -98,7 +100,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync --extra dev
@@ -111,11 +113,11 @@ jobs:
             -e POSTGRES_DB=hydra_test -e POSTGRES_USER=hydra -e POSTGRES_PASSWORD=test \
             -p 0:5432 \
             --health-cmd "pg_isready -U hydra" --health-interval 5s --health-retries 10 \
-            timescale/timescaledb:2.17.2-pg16
+            timescale/timescaledb:2.30.2-pg16
           docker run -d --name hydra-int-redis-${{ github.run_id }} \
             -p 0:6379 \
             --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10 \
-            redis:7-alpine
+            redis:8-alpine
           PG_PORT=$(docker port hydra-int-pg-${{ github.run_id }} 5432 | cut -d: -f2)
           REDIS_PORT=$(docker port hydra-int-redis-${{ github.run_id }} 6379 | cut -d: -f2)
           echo "pg_port=$PG_PORT" >> $GITHUB_OUTPUT
@@ -153,7 +155,7 @@ jobs:
     needs: [unit-tests, integration-tests]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
       - run: uv sync --extra dev
@@ -166,11 +168,11 @@ jobs:
             -e POSTGRES_DB=hydra_test -e POSTGRES_USER=hydra -e POSTGRES_PASSWORD=test \
             -p 0:5432 \
             --health-cmd "pg_isready -U hydra" --health-interval 5s --health-retries 10 \
-            timescale/timescaledb:2.17.2-pg16
+            timescale/timescaledb:2.30.2-pg16
           docker run -d --name hydra-e2e-redis-${{ github.run_id }} \
             -p 0:6379 \
             --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10 \
-            redis:7-alpine
+            redis:8-alpine
           PG_PORT=$(docker port hydra-e2e-pg-${{ github.run_id }} 5432 | cut -d: -f2)
           REDIS_PORT=$(docker port hydra-e2e-redis-${{ github.run_id }} 6379 | cut -d: -f2)
           echo "pg_port=$PG_PORT" >> $GITHUB_OUTPUT

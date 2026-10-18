@@ -91,7 +91,9 @@ class TestRouterRegistration:
     """Verify expected route prefixes are registered in the app."""
 
     def _route_paths(self) -> set[str]:
-        return {r.path for r in app.routes if hasattr(r, "path")}
+        # HTTP routes from the OpenAPI schema (FastAPI 0.146+ keeps included routers nested
+        # in app.routes), websockets are registered on the app itself
+        return set(app.openapi()["paths"]) | {r.path for r in app.routes if hasattr(r, "path")}
 
     def test_strategies_routes_present(self) -> None:
         paths = self._route_paths()
