@@ -33,6 +33,7 @@ jobs:
           [ -n "${PR:-}" ] || { echo "no open Dependabot PR for $HEAD_BRANCH"; exit 0; }
           hold() { echo "leaving #$PR for review ($1): $TITLE"; exit 0; }
           [[ "$TITLE" == *" in /docker/"* ]] && hold "base image"
+          [[ "$TITLE" =~ to\ v?[0-9.]+(a|b|rc|alpha|beta|dev|pre)[0-9.]* ]] && hold "pre-release"
           # groups only carry minor/patch updates (see dependabot.yml)
           if [[ "$TITLE" != *" group "* ]]; then
             [[ "$TITLE" =~ from\ v?([0-9]+)\.([0-9]+)[^\ ]*\ to\ v?([0-9]+)\.([0-9]+) ]] || hold "unparsed version"

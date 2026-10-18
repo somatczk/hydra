@@ -23,6 +23,9 @@ updates:
     groups:
       python:
         update-types: [minor, patch]
+      python-security:
+        applies-to: security-updates
+        update-types: [minor, patch]
 
   - package-ecosystem: npm
     directory: /dashboard
@@ -32,6 +35,9 @@ updates:
       default-days: 7
     groups:
       dashboard:
+        update-types: [minor, patch]
+      dashboard-security:
+        applies-to: security-updates
         update-types: [minor, patch]
 
   - package-ecosystem: docker
