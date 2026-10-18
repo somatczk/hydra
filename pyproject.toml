@@ -41,7 +41,7 @@ dependencies = [
     # Encryption
     "cryptography>=46.0.5,<47",
     # Security constraints for transitive deps
-    "pyasn1>=0.6.3",
+    "pyasn1>=0.6.4",
     "python-multipart>=0.0.22",
 ]
 
