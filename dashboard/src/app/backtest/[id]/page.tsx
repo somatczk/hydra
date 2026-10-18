@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import {
   ArrowLeft,
@@ -21,6 +21,7 @@ import {
   CartesianGrid,
   Legend,
 } from 'recharts';
+import type { TooltipContentProps, TooltipValueType } from 'recharts';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
@@ -221,20 +222,19 @@ export default function BacktestDetailPage() {
     }));
   }, [detail, resolution, hasBenchmark]);
 
-  const CustomTooltip = useMemo(() => {
-    return function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number; dataKey: string }>; label?: string }) {
-      if (!active || !payload?.length) return null;
-      return (
-        <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
-          <p className="text-xs text-text-muted">{label ? formatXTick(label, resolution) : ''}</p>
-          {payload.map((entry) => (
-            <p key={entry.dataKey} className="text-sm font-medium text-text-primary">
-              {entry.dataKey === 'benchmark' ? 'Benchmark' : 'Strategy'}: ${entry.value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-            </p>
-          ))}
-        </div>
-      );
-    };
+  // a render function, not a component: recharts calls it with the hover state
+  const renderTooltip = useCallback(({ active, payload, label }: TooltipContentProps<TooltipValueType, string | number>) => {
+    if (!active || !payload?.length) return null;
+    return (
+      <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
+        <p className="text-xs text-text-muted">{label != null ? formatXTick(String(label), resolution) : ''}</p>
+        {payload.map((entry) => (
+          <p key={String(entry.dataKey)} className="text-sm font-medium text-text-primary">
+            {entry.dataKey === 'benchmark' ? 'Benchmark' : 'Strategy'}: ${Number(entry.value).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+          </p>
+        ))}
+      </div>
+    );
   }, [resolution]);
 
   const txnRows: TxnRow[] = useMemo(() => {
@@ -496,7 +496,7 @@ export default function BacktestDetailPage() {
                 tickLine={false}
                 width={44}
               />
-              <Tooltip content={<CustomTooltip />} />
+              <Tooltip content={renderTooltip} />
               {hasBenchmark && <Legend />}
               <Area
                 type="monotone"

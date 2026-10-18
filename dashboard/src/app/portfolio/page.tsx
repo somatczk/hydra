@@ -720,8 +720,8 @@ export default function PortfolioPage() {
                       borderRadius: '8px',
                       fontSize: '12px',
                     }}
-                    formatter={(v: number) => [`$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 'Value']}
-                    labelFormatter={formatXTick}
+                    formatter={(raw) => { const v = Number(raw); return [`$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 'Value']; }}
+                    labelFormatter={(l) => formatXTick(String(l))}
                   />
                   <Area
                     type="monotone"
@@ -782,8 +782,8 @@ export default function PortfolioPage() {
                       borderRadius: '8px',
                       fontSize: '12px',
                     }}
-                    formatter={(v: number) => [`${v.toFixed(2)}%`, 'Drawdown']}
-                    labelFormatter={formatXTick}
+                    formatter={(raw) => { const v = Number(raw); return [`${v.toFixed(2)}%`, 'Drawdown']; }}
+                    labelFormatter={(l) => formatXTick(String(l))}
                   />
                   <Area
                     type="monotone"
@@ -892,7 +892,7 @@ export default function PortfolioPage() {
                     borderRadius: '8px',
                     fontSize: '12px',
                   }}
-                  formatter={(v: number) => [`$${v.toFixed(2)}`, 'PnL']}
+                  formatter={(raw) => { const v = Number(raw); return [`$${v.toFixed(2)}`, 'PnL']; }}
                 />
                 <Bar dataKey="pnl" radius={[0, 3, 3, 0]}>
                   {attribution.map((entry, index) => (
