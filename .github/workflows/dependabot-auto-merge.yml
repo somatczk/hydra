@@ -1,0 +1,44 @@
+name: Dependabot Auto-Merge
+
+on:
+  # runs in base context and never checks out PR code; inputs go through env
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    name: Auto-Merge Dependabot PRs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]'
+    steps:
+      # Grouped minor/patch bumps merge on green CI. Majors, 0.x minors and base images
+      # (python 3.13 -> 3.14 is a "minor" tag bump) wait for a human.
+      - name: Merge safe update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          read -r PR TITLE < <(gh pr list --head "$HEAD_BRANCH" --author 'app/dependabot' \
+            --json number,title --jq '.[0] | "\(.number) \(.title)"')
+          [ -n "${PR:-}" ] || { echo "no open Dependabot PR for $HEAD_BRANCH"; exit 0; }
+          hold() { echo "leaving #$PR for review ($1): $TITLE"; exit 0; }
+          [[ "$TITLE" == *" in /docker/"* ]] && hold "base image"
+          # groups only carry minor/patch updates (see dependabot.yml)
+          if [[ "$TITLE" != *" group "* ]]; then
+            [[ "$TITLE" =~ from\ v?([0-9]+)\.([0-9]+)[^\ ]*\ to\ v?([0-9]+)\.([0-9]+) ]] || hold "unparsed version"
+            [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[3]}" ] || hold "major"
+            if [ "${BASH_REMATCH[1]}" -eq 0 ]; then
+              [ "${BASH_REMATCH[2]}" = "${BASH_REMATCH[4]}" ] || hold "0.x minor"
+            fi
+          fi
+          gh pr merge "$PR" --merge --delete-branch
