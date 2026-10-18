@@ -5,7 +5,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
-from hydra.strategy.condition_schema import Comparator, Condition, ConditionGroup
 from hydra.strategy.config import StrategyConfig
 
 

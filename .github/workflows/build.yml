@@ -18,7 +18,7 @@ permissions:
 jobs:
   version:
     name: Determine Version
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -34,7 +34,7 @@ jobs:
   build:
     name: Build ${{ matrix.image }}
     needs: version
-    runs-on: [self-hosted, hydra]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
@@ -55,21 +55,16 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build image
-        env:
-          TAG: ${{ needs.version.outputs.tag }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-        run: |
-          docker build --load \
-            -f ${{ matrix.dockerfile }} \
-            -t "${IMAGE}:${TAG}" \
-            -t "${IMAGE}:main" \
-            ${{ matrix.context }}
+      - uses: docker/setup-buildx-action@v4
 
-      - name: Push image
-        env:
-          TAG: ${{ needs.version.outputs.tag }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-        run: |
-          docker push "${IMAGE}:${TAG}"
-          docker push "${IMAGE}:main"
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.version.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:main
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
