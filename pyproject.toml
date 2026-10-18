@@ -19,10 +19,10 @@ dependencies = [
     "ccxt>=4.4,<5",
     "asyncpg>=0.30,<1",
     "alembic>=1.14,<2",
-    "sqlalchemy[asyncio]>=2.0,<3",
+    "sqlalchemy[asyncio]>=2.1.4,<3",
     # Indicators
     "numpy>=2.1,<3",
-    "pandas>=2.2,<4",
+    "pandas>=3.0.6,<4",
     "ta-lib>=0.5,<1; sys_platform != 'win32'",
     # ML
     "onnxruntime>=1.20,<2",
@@ -33,7 +33,7 @@ dependencies = [
     # Dashboard backend
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
-    "websockets>=16.0,<17",
+    "websockets>=17.2,<18",
     # Telegram
     "python-telegram-bot>=22.8,<23",
     # Observability
@@ -59,7 +59,7 @@ ml-training = [
 dev = [
     "pytest>=9.0.3,<10",
     "pytest-asyncio>=1.4.0,<2",
-    "pytest-cov>=6.0,<7",
+    "pytest-cov>=7.1.0,<8",
     "pytest-mock>=3.14,<4",
     "pytest-benchmark>=5.1,<6",
     "pytest-timeout>=2.3,<3",
