@@ -58,8 +58,9 @@ Each module only imports from `hydra.core` + its declared dependencies. Enforced
 
 ## CI/CD
 - PRs trigger lint, type-check, security scan, unit/integration/e2e tests
-- Merge to `main` builds Docker images, pushes to GHCR with auto-incrementing semver tags
-- Dependabot in the romulus repo picks up new image versions weekly and opens PRs
+- Merge to `main` builds Docker images and pushes `main` and `sha-<commit>` tags to GHCR. The version tag from `pyproject.toml` is pushed only if it doesn't exist yet: version tags never move, releasing means bumping the version.
+- Dependabot PRs auto-merge on green CI for minor/patch; majors, pre-releases and base images wait for review.
+- Dependabot in the romulus repo picks up new image versions weekly (7 day cooldown) and opens PRs
 
 ## Deployment
-Deployed via romulus (homelab infra repo) as a Docker Compose stack on ZimaOS. Images are pulled from `ghcr.io/somatczk/hydra-*`.
+Deployed via romulus (homelab infra repo) as a Docker Compose stack on Ubuntu, pulled by doco-cd. Images are pulled from `ghcr.io/somatczk/hydra-*`.

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -30,7 +32,23 @@ from hydra.dashboard.routes import (
 # Application factory
 # ---------------------------------------------------------------------------
 
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Startup and shutdown steps, in the order the old on_event handlers ran."""
+    await _init_logging()
+    await _init_db_pool()
+    await _load_exchange_credentials()
+    await _init_session_manager()
+    await _run_migrations()
+    await _populate_backtest_cache()
+    yield
+    await _shutdown_session_manager()
+    await _close_db_pool()
+
+
 app = FastAPI(
+    lifespan=_lifespan,
     title="Hydra Trading API",
     version="0.1.0",
     description="REST and WebSocket API for the Hydra Bitcoin auto-trading platform.",
@@ -201,7 +219,6 @@ async def ws_orderbook(websocket: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.on_event("startup")
 async def _init_logging() -> None:
     """Configure structured logging."""
     import os
@@ -213,7 +230,6 @@ async def _init_logging() -> None:
     setup_logging(level=level, log_format=fmt)
 
 
-@app.on_event("startup")
 async def _init_db_pool() -> None:
     """Create shared asyncpg connection pool."""
     import os
@@ -233,7 +249,6 @@ async def _init_db_pool() -> None:
         app.state.db_pool = None
 
 
-@app.on_event("startup")
 async def _load_exchange_credentials() -> None:
     """Load encrypted exchange credentials from DB into app state on startup."""
     pool = getattr(app.state, "db_pool", None)
@@ -264,7 +279,6 @@ async def _load_exchange_credentials() -> None:
         app.state.exchange_credentials = {}
 
 
-@app.on_event("startup")
 async def _init_session_manager() -> None:
     """Initialize the trading SessionManager."""
     from hydra.execution.session_manager import SessionManager
@@ -277,7 +291,6 @@ async def _init_session_manager() -> None:
     app.state.session_manager = mgr
 
 
-@app.on_event("shutdown")
 async def _shutdown_session_manager() -> None:
     """Stop all trading sessions on shutdown."""
     mgr = getattr(app.state, "session_manager", None)
@@ -285,7 +298,6 @@ async def _shutdown_session_manager() -> None:
         await mgr.graceful_shutdown()
 
 
-@app.on_event("shutdown")
 async def _close_db_pool() -> None:
     """Close the DB pool on shutdown."""
     pool = getattr(app.state, "db_pool", None)
@@ -293,7 +305,6 @@ async def _close_db_pool() -> None:
         await pool.close()
 
 
-@app.on_event("startup")
 async def _run_migrations() -> None:
     """Apply database migrations on startup if DATABASE_URL is set."""
     import os
@@ -553,7 +564,6 @@ async def _run_migrations() -> None:
         logging.getLogger(__name__).warning("Migration skipped: %s", exc)
 
 
-@app.on_event("startup")
 async def _populate_backtest_cache() -> None:
     """Warm the in-memory backtest cache from DB."""
     pool = getattr(app.state, "db_pool", None)
