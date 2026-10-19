@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
-from pathlib import Path
+import importlib
+import os
+import pkgutil
+import sys
+import types
+from pathlib import Path, PurePath
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+import hydra
+import hydra.core.config as config_module
 from hydra.dashboard.api import app
 from hydra.dashboard.routes.models import _models_dir
 
 REPO = Path(__file__).resolve().parents[3]
 REPO_STRATEGIES = REPO / "config" / "strategies"
-SRC = REPO / "src"
 
 _RULES = {
     "entry_long": {
@@ -84,27 +90,50 @@ def test_no_committed_test_strategy_yaml() -> None:
     assert sorted(REPO_STRATEGIES.glob("test_strategy_*.yaml")) == []
 
 
-def _file_derived_constants() -> set[str]:
-    found: set[str] = set()
-    for path in sorted((SRC / "hydra").rglob("*.py")):
-        module = ".".join(path.relative_to(SRC).with_suffix("").parts)
-        for node in ast.parse(path.read_text()).body:
-            if isinstance(node, ast.Assign):
-                targets, value = node.targets, node.value
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                targets, value = [node.target], node.value
-            else:
+_READ_ONLY_REPO_PATHS = {
+    ("hydra.core.config", "_DEFAULT_CONFIG_DIR"),
+    ("hydra.dashboard.routes.templates", "_TEMPLATES_DIR"),
+    ("hydra.execution.session_manager", "_CONFIG_DIR"),
+}
+
+
+def _import_all_hydra_modules() -> None:
+    for info in pkgutil.walk_packages(hydra.__path__, "hydra."):
+        if not info.name.startswith("hydra.data.migrations"):
+            importlib.import_module(info.name)
+
+
+# At collection, before the autouse fixture, so by-value aliases capture the real paths.
+_import_all_hydra_modules()
+
+
+def _repo_paths_in_hydra_modules() -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("hydra."):
+            continue
+        for attr, value in vars(module).items():
+            if attr.startswith("__"):
                 continue
-            if any(isinstance(n, ast.Name) and n.id == "__file__" for n in ast.walk(value)):
-                found.update(f"{module}.{t.id}" for t in targets if isinstance(t, ast.Name))
+            if isinstance(value, str) and not os.path.isabs(value):
+                continue
+            if isinstance(value, (str, PurePath)) and Path(value).resolve().is_relative_to(REPO):
+                found.add((name, attr))
     return found
 
 
-def test_repo_relative_dir_constants_are_known() -> None:
-    assert _file_derived_constants() == {
-        "hydra.core.config._DEFAULT_CONFIG_DIR",
-        "hydra.dashboard.routes.strategies._CONFIG_DIR",
-        "hydra.dashboard.routes.templates._TEMPLATES_DIR",
-        "hydra.dashboard.routes.templates._STRATEGIES_DIR",
-        "hydra.execution.session_manager._CONFIG_DIR",
+def test_only_read_only_repo_paths_survive_fixture(strategies_dir: Path) -> None:
+    assert _repo_paths_in_hydra_modules() == _READ_ONLY_REPO_PATHS
+
+
+def test_repo_path_scan_sees_aliases_and_derived_constants(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = types.ModuleType("hydra._isolation_probe")
+    probe.__dict__["_ALIAS"] = REPO_STRATEGIES
+    probe.__dict__["_DERIVED"] = config_module._DEFAULT_CONFIG_DIR / "strategies"
+    probe.__dict__["_AS_STR"] = str(REPO / "models")
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+    assert _repo_paths_in_hydra_modules() - _READ_ONLY_REPO_PATHS == {
+        (probe.__name__, "_ALIAS"),
+        (probe.__name__, "_DERIVED"),
+        (probe.__name__, "_AS_STR"),
     }
