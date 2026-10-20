@@ -237,7 +237,7 @@ def log_auth_posture(cfg: HydraConfig | None) -> None:
             "set" if cfg.api_token is not None else "unset",
         )
     if cfg is not None and cfg.api.auth_mode == "proxy":
-        for network in wide_trusted_networks(cfg):
+        for network in wide_trusted_networks(cfg.api):
             logger.warning(
                 "api.trusted_proxy_cidrs entry %s spans more than one host: every peer in it "
                 "(including the Docker bridge gateway, i.e. host processes) can assert "
@@ -246,9 +246,9 @@ def log_auth_posture(cfg: HydraConfig | None) -> None:
             )
 
 
-def wide_trusted_networks(cfg: HydraConfig) -> list[str]:
+def wide_trusted_networks(api: ApiConfig) -> list[str]:
     """Trusted proxy entries wider than a single address."""
-    return [str(n) for n in cfg.api.trusted_proxy_cidrs if n.prefixlen < n.max_prefixlen]
+    return [str(n) for n in api.trusted_proxy_cidrs if n.prefixlen < n.max_prefixlen]
 
 
 class ConfigCORSMiddleware:
