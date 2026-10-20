@@ -379,7 +379,7 @@ class TestKillSwitch:
         audit = [(e.kind, e.actor) for e in acct.store.events if e.kind.startswith("kill")]
         assert audit == [
             ("kill_switch_on", "alice"),
-            ("kill_switch_off", "alice"),
+            ("kill_switch_release_failed", "alice"),
             ("kill_switch_off", "alice"),
         ]
 

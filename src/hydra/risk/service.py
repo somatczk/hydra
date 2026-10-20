@@ -546,11 +546,21 @@ class RiskService:
         return KillSwitchResult(active=True, persisted=persisted)
 
     async def release_kill_switch(self, actor: str, reason: str) -> None:
-        """Audit, persist, then unlatch; any failure raises and the switch stays latched."""
-        await self._audit("kill_switch_off", actor, reason, self._cb.state.tier, required=True)
-        await self._store.set_kill_switch(False)
+        """Persist the release, then audit and unlatch; a failed write raises and stays latched."""
+        try:
+            await self._store.set_kill_switch(False)
+        except Exception as exc:
+            await self._audit(
+                "kill_switch_release_failed",
+                actor,
+                reason,
+                self._cb.state.tier,
+                {"error": str(exc)},
+            )
+            raise
         self._kill_switch = False
         metrics.set_kill_switch_active(False)
+        await self._audit("kill_switch_off", actor, reason, self._cb.state.tier)
 
     # ------------------------------------------------------------------
     # Manual actions
