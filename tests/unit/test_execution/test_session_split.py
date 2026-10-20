@@ -136,10 +136,10 @@ def test_wiring_classes_are_not_runtime_attributes_of_session_manager(name: str)
         pass
 
 
-def test_class_map_moved_to_client_factory() -> None:
-    assert exchange_client.EXCHANGE_CLASS_MAP is client_factory.EXCHANGE_CLASS_MAP
-    assert client_factory.EXCHANGE_CLASS_MAP["binance"] == "binanceusdm"
-    assert client_factory.SPOT_EXCHANGE_CLASS_MAP["binance"] == "binance"
+def test_class_selection_lives_in_client_factory() -> None:
+    assert not hasattr(exchange_client, "EXCHANGE_CLASS_MAP")
+    assert not hasattr(client_factory, "EXCHANGE_CLASS_MAP")
+    assert client_factory.SPOT_EXCHANGE_CLASS_MAP == {"binance": "binance"}
     assert not hasattr(exchange_client, "_EXCHANGE_CLASS_MAP")
     assert not hasattr(exchange_client, "_SPOT_EXCHANGE_CLASS_MAP")
 

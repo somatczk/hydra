@@ -190,7 +190,11 @@ async def test_outcomes_accumulate_per_endpoint(clock: _Clock) -> None:
 
 
 CLIENT_METHOD = {"fetch_ticker": "get_last_price"}
-DELEGATES = {"get_balance": "fetch_balance", "get_positions": "fetch_positions"}
+DELEGATES = {
+    "get_balance": "fetch_balance",
+    "get_equity": "fetch_balance",
+    "get_positions": "fetch_positions",
+}
 NOT_REST_CALLS = {"get_filled_orders", "start_user_data_stream", "close"}
 
 

@@ -13,8 +13,8 @@ from decimal import Decimal
 from typing import Any
 
 from hydra.core.metrics import observe_exchange_call, record_ws_reconnect
-from hydra.core.types import Direction, ExchangeId, Position, Symbol
-from hydra.execution.client_factory import EXCHANGE_CLASS_MAP
+from hydra.core.types import Direction, ExchangeId, MarketType, Position, Symbol
+from hydra.execution.client_factory import ccxt_class_for
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,8 @@ class ExchangeClient:
         CCXT-compatible configuration dict (apiKey, secret, etc.).
     testnet:
         Whether to connect to the testnet/sandbox endpoint.
+    market_type:
+        Selects the ccxt class through ``client_factory.ccxt_class_for`` (Binance SPOT only).
     """
 
     def __init__(
@@ -41,8 +43,10 @@ class ExchangeClient:
         exchange_id: ExchangeId,
         config: dict[str, Any],
         testnet: bool = True,
+        market_type: MarketType = MarketType.SPOT,
     ) -> None:
         self._exchange_id: ExchangeId = exchange_id
+        self._market_type = market_type
         self._config = dict(config)
         self._testnet = testnet
         self._exchange: Any | None = None
@@ -65,7 +69,7 @@ class ExchangeClient:
                 "Install with: pip install 'ccxt[async]'"
             ) from exc
 
-        class_name = EXCHANGE_CLASS_MAP.get(self._exchange_id, self._exchange_id)
+        class_name = ccxt_class_for(self._exchange_id, self._market_type)
         exchange_cls = getattr(ccxt_async, class_name, None)
         if exchange_cls is None:
             raise ValueError(f"Unknown exchange class: {class_name}")
@@ -184,6 +188,20 @@ class ExchangeClient:
                 )
             )
         return results
+
+    async def get_equity(self, quote: str = "USDT") -> Decimal:
+        """Quote total plus every other asset's total at its last ``<asset>/<quote>`` price."""
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "fetch_balance"):
+            raw: dict[str, Any] = await exchange.fetch_balance()
+        totals: dict[str, Any] = raw.get("total") or {}
+        equity = Decimal("0")
+        for asset, amount in totals.items():
+            if amount is None or Decimal(str(amount)) == 0:
+                continue
+            qty = Decimal(str(amount))
+            equity += qty if asset == quote else qty * await self.get_last_price(f"{asset}/{quote}")
+        return equity
 
     async def get_filled_orders(self) -> list[dict[str, Any]]:
         """Return filled orders. Live fills are persisted to DB, not held in-memory."""
