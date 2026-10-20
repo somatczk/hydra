@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import numpy as np
@@ -37,7 +37,7 @@ def _make_context_with_data(
             low=Decimal(str(round(low, 2))),
             close=Decimal(str(price)),
             volume=Decimal("1000"),
-            timestamp=datetime(2024, 1, 1, i % 24, 0, 0, tzinfo=UTC),
+            timestamp=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(hours=i),
         )
         ctx.add_bar(symbol, timeframe, ohlcv)
     return ctx

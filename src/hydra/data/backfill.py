@@ -7,27 +7,152 @@ to download missing bars and fill detected gaps in stored data.
 from __future__ import annotations
 
 import asyncio
+import secrets
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
+from hydra.data.bars import ceil_to_tf, floor_to_tf, last_closed_open, timeframe_seconds
 from hydra.data.normalizer import DataNormalizer
 from hydra.data.storage import MarketDataRepository
 
 logger = get_logger(__name__)
 
-# Timeframe durations used for gap detection
-_TIMEFRAME_SECONDS: dict[str, int] = {
-    "1m": 60,
-    "5m": 300,
-    "15m": 900,
-    "1h": 3600,
-    "4h": 14400,
-    "1d": 86400,
-    "1w": 604800,
-}
+type Sleep = Callable[[float], Awaitable[None]]
+
+MAX_PAGE_SIZE = 1000
+_RETRY_BASE_S = 1.0
+_RETRY_MAX_S = 60.0
+_DDOS_MIN_WAIT_S = 60.0
+
+
+def error_is(exc: BaseException, *names: str) -> bool:
+    """True when ``exc`` is (a subclass of) a class with one of ``names`` (ccxt stays lazy)."""
+    return any(cls.__name__ in names for cls in type(exc).__mro__)
+
+
+async def fetch_ohlcv_page(
+    exchange: Any,
+    symbol: str,
+    timeframe: Timeframe,
+    since_ms: int,
+    limit: int,
+    *,
+    max_retries: int = 5,
+    sleep: Sleep = asyncio.sleep,
+) -> list[list[Any]]:
+    """One ``fetch_ohlcv`` call, retrying ccxt network and rate-limit errors with backoff.
+
+    Raises the last error once ``max_retries`` retries are spent; never returns a partial
+    result silently.
+    """
+    attempt = 0
+    while True:
+        try:
+            rows: list[list[Any]] = await exchange.fetch_ohlcv(
+                symbol, str(timeframe), since=since_ms, limit=limit
+            )
+            return rows
+        except Exception as exc:
+            if not error_is(exc, "NetworkError") or attempt >= max_retries:
+                raise
+            attempt += 1
+            wait = min(_RETRY_BASE_S * 2 ** (attempt - 1), _RETRY_MAX_S)
+            wait += wait * secrets.randbelow(250) / 1000
+            if error_is(exc, "DDoSProtection"):
+                wait = max(wait, _DDOS_MIN_WAIT_S)
+            logger.warning(
+                "fetch_ohlcv failed, retrying",
+                symbol=symbol,
+                timeframe=str(timeframe),
+                attempt=attempt,
+                wait_s=round(wait, 2),
+                error=type(exc).__name__,
+            )
+            await sleep(wait)
+
+
+async def iter_closed_bar_pages(
+    exchange: Any,
+    symbol: str,
+    timeframe: Timeframe,
+    start: datetime,
+    end: datetime,
+    *,
+    exchange_id: ExchangeId = "binance",
+    now: datetime | None = None,
+    page_size: int = MAX_PAGE_SIZE,
+    max_retries: int = 5,
+    sleep: Sleep = asyncio.sleep,
+    normalizer: DataNormalizer | None = None,
+) -> AsyncIterator[list[OHLCV]]:
+    """Yield pages of closed bars with open time in ``[start, end]``, oldest first.
+
+    ``start`` is rounded up and ``end`` down to the bar grid. Rows outside the range and the
+    forming candle (close time after ``now``) are dropped, and a page that does not advance
+    the cursor ends the download.
+    """
+    norm = normalizer or DataNormalizer()
+    tf_ms = timeframe_seconds(timeframe) * 1000
+    now = now or datetime.now(UTC)
+    first = ceil_to_tf(start, timeframe)
+    last = min(floor_to_tf(end, timeframe), last_closed_open(now, timeframe))
+    start_ms = int(first.timestamp() * 1000)
+    end_ms = int(last.timestamp() * 1000)
+    limit = min(page_size, MAX_PAGE_SIZE)
+    since_ms = start_ms
+    while since_ms <= end_ms:
+        raw = await fetch_ohlcv_page(
+            exchange, symbol, timeframe, since_ms, limit, max_retries=max_retries, sleep=sleep
+        )
+        if not raw:
+            break
+        page = [
+            norm.normalize_ohlcv(row, exchange_id)
+            for row in raw
+            if since_ms <= int(row[0]) <= end_ms
+        ]
+        if page:
+            yield page
+        newest_ms = int(raw[-1][0])
+        if newest_ms < since_ms:
+            break
+        since_ms = newest_ms + tf_ms
+
+
+async def fetch_closed_bars(
+    exchange: Any,
+    symbol: str,
+    timeframe: Timeframe,
+    start: datetime,
+    end: datetime,
+    *,
+    exchange_id: ExchangeId = "binance",
+    now: datetime | None = None,
+    page_size: int = MAX_PAGE_SIZE,
+    max_retries: int = 5,
+    sleep: Sleep = asyncio.sleep,
+) -> list[OHLCV]:
+    """All closed bars in ``[start, end]`` (see ``iter_closed_bar_pages``), deduplicated."""
+    by_ts: dict[datetime, OHLCV] = {}
+    async for page in iter_closed_bar_pages(
+        exchange,
+        symbol,
+        timeframe,
+        start,
+        end,
+        exchange_id=exchange_id,
+        now=now,
+        page_size=page_size,
+        max_retries=max_retries,
+        sleep=sleep,
+    ):
+        for bar in page:
+            by_ts[bar.timestamp] = bar
+    return [by_ts[ts] for ts in sorted(by_ts)]
 
 
 @dataclass
@@ -112,19 +237,20 @@ class ExchangeBackfillService:
         timeframe:
             Bar timeframe.
         start:
-            Inclusive start of the range (UTC).
+            Inclusive start of the range (UTC), rounded up to the bar grid.
         end:
-            Inclusive end of the range (UTC).
+            Inclusive end of the range (UTC), rounded down to the bar grid.
 
         Returns
         -------
         list[GapRange]
             Sorted list of gap ranges (ascending by start time).
         """
-        tf_seconds = _TIMEFRAME_SECONDS.get(str(timeframe))
-        if tf_seconds is None:
-            msg = f"Unknown timeframe: {timeframe}"
-            raise ValueError(msg)
+        tf_seconds = timeframe_seconds(timeframe)
+        start = ceil_to_tf(start, timeframe)
+        end = floor_to_tf(end, timeframe)
+        if start > end:
+            return []
 
         bars = await self._repo.get_bars(
             exchange_id=exchange_id,
@@ -183,7 +309,7 @@ class ExchangeBackfillService:
         start:
             Start of range to check.  Defaults to 30 days ago.
         end:
-            End of range to check.  Defaults to now.
+            End of range to check.  Defaults to the newest closed bar.
 
         Returns
         -------
@@ -194,7 +320,7 @@ class ExchangeBackfillService:
         if start is None:
             start = now - timedelta(days=30)
         if end is None:
-            end = now
+            end = last_closed_open(now, timeframe)
 
         gaps = await self.detect_gaps(exchange_id, symbol, timeframe, start, end)
 
@@ -236,8 +362,15 @@ class ExchangeBackfillService:
         start: datetime,
         end: datetime,
         page_size: int = 500,
+        *,
+        now: datetime | None = None,
+        max_retries: int = 5,
+        sleep: Sleep = asyncio.sleep,
     ) -> int:
-        """Fetch historical OHLCV data via paginated CCXT REST calls.
+        """Download closed bars via paginated CCXT REST calls and upsert them.
+
+        The forming candle is never stored, and a stored bar whose values changed (for
+        example one frozen while it was still forming) is corrected.
 
         Parameters
         ----------
@@ -252,18 +385,21 @@ class ExchangeBackfillService:
         end:
             Inclusive end timestamp (UTC).
         page_size:
-            Number of bars per REST request (exchange-dependent max).
+            Number of bars per REST request (capped at 1000).
+        now:
+            Current time; bars that close after it are dropped. Defaults to the wall clock.
+        max_retries:
+            Retries per page for ccxt network and rate-limit errors before raising.
+        sleep:
+            Backoff sleep (injectable for tests).
 
         Returns
         -------
         int
-            Number of bars downloaded and stored.
+            Number of closed bars downloaded and passed to the repository.
         """
         exchange = await self._get_exchange(exchange_id)
-        since_ms = int(start.timestamp() * 1000)
-        end_ms = int(end.timestamp() * 1000)
-        total_stored = 0
-
+        total = 0
         logger.info(
             "Bulk download started",
             exchange=exchange_id,
@@ -272,51 +408,32 @@ class ExchangeBackfillService:
             start=start.isoformat(),
             end=end.isoformat(),
         )
-
-        while since_ms <= end_ms:
-            raw_bars = await exchange.fetch_ohlcv(
-                symbol,
-                str(timeframe),
-                since=since_ms,
-                limit=page_size,
-            )
-
-            if not raw_bars:
-                break
-
-            bars_to_store: list[tuple[str, str, Timeframe, OHLCV]] = []
-            for raw in raw_bars:
-                bar_ts_ms = raw[0]
-                if bar_ts_ms > end_ms:
-                    break
-
-                ohlcv = self._normalizer.normalize_ohlcv(raw, exchange_id)
-                bars_to_store.append((exchange_id, symbol, timeframe, ohlcv))
-
-            if bars_to_store:
-                await self._repo.store_bars(bars_to_store)
-                total_stored += len(bars_to_store)
-
-            # Advance past the last bar we received
-            last_ts_ms = raw_bars[-1][0]
-            tf_seconds = _TIMEFRAME_SECONDS.get(str(timeframe), 60)
-            since_ms = last_ts_ms + tf_seconds * 1000
-
-            # Rate limit compliance — brief pause between pages
-            await asyncio.sleep(0.1)
-
+        async for page in iter_closed_bar_pages(
+            exchange,
+            symbol,
+            timeframe,
+            start,
+            end,
+            exchange_id=exchange_id,
+            now=now,
+            page_size=page_size,
+            max_retries=max_retries,
+            sleep=sleep,
+            normalizer=self._normalizer,
+        ):
+            await self._repo.upsert_closed_bars([(exchange_id, symbol, timeframe, b) for b in page])
+            total += len(page)
             logger.debug(
                 "Bulk download page",
                 exchange=exchange_id,
                 symbol=symbol,
-                page_bars=len(raw_bars),
-                total_so_far=total_stored,
+                page_bars=len(page),
+                total_so_far=total,
             )
-
         logger.info(
             "Bulk download complete",
             exchange=exchange_id,
             symbol=symbol,
-            total_bars=total_stored,
+            total_bars=total,
         )
-        return total_stored
+        return total

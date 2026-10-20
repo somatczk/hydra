@@ -15,6 +15,74 @@ from hydra.core.types import OHLCV, Timeframe
 
 logger = get_logger(__name__)
 
+_STORE_BARS_SQL = """
+    INSERT INTO ts.ohlcv_1m (
+        exchange, symbol, timeframe, timestamp, open, high, low, close, volume
+    )
+    SELECT * FROM unnest(
+        $1::text[], $2::text[], $3::text[], $4::timestamptz[],
+        $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[]
+    )
+    ON CONFLICT (exchange, symbol, timeframe, timestamp) DO NOTHING
+    RETURNING 1
+"""
+
+_UPSERT_CLOSED_BARS_SQL = """
+    INSERT INTO ts.ohlcv_1m (
+        exchange, symbol, timeframe, timestamp, open, high, low, close, volume
+    )
+    SELECT * FROM unnest(
+        $1::text[], $2::text[], $3::text[], $4::timestamptz[],
+        $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[]
+    )
+    ON CONFLICT (exchange, symbol, timeframe, timestamp) DO UPDATE SET
+        open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+        close = EXCLUDED.close, volume = EXCLUDED.volume
+    WHERE (ohlcv_1m.open, ohlcv_1m.high, ohlcv_1m.low, ohlcv_1m.close, ohlcv_1m.volume)
+        IS DISTINCT FROM
+        (EXCLUDED.open, EXCLUDED.high, EXCLUDED.low, EXCLUDED.close, EXCLUDED.volume)
+    RETURNING exchange, symbol, timeframe, timestamp
+"""
+
+_EXISTING_KEYS_SQL = """
+    SELECT o.exchange, o.symbol, o.timeframe, o.timestamp
+    FROM ts.ohlcv_1m AS o
+    JOIN unnest($1::text[], $2::text[], $3::text[], $4::timestamptz[])
+        AS k(exchange, symbol, timeframe, timestamp)
+      ON o.exchange = k.exchange AND o.symbol = k.symbol
+     AND o.timeframe = k.timeframe AND o.timestamp = k.timestamp
+"""
+
+
+def _key(record: Any) -> tuple[str, str, str, datetime]:
+    ts = record["timestamp"]
+    return (
+        record["exchange"],
+        record["symbol"],
+        record["timeframe"],
+        ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts,
+    )
+
+
+def _columns(bars: list[tuple[str, str, Timeframe, OHLCV]]) -> list[list[Any]]:
+    """One array per ``ts.ohlcv_1m`` column, in insert order, for the unnest queries."""
+    cols: list[list[Any]] = [[] for _ in range(9)]
+    for exchange_id, symbol, timeframe, ohlcv in bars:
+        row = (
+            exchange_id,
+            symbol,
+            str(timeframe),
+            ohlcv.timestamp,
+            ohlcv.open,
+            ohlcv.high,
+            ohlcv.low,
+            ohlcv.close,
+            ohlcv.volume,
+        )
+        for col, value in zip(cols, row, strict=True):
+            col.append(value)
+    return cols
+
 
 class MarketDataRepository:
     """Async repository for OHLCV bars and funding-rate data.
@@ -89,7 +157,7 @@ class MarketDataRepository:
         self,
         bars: list[tuple[str, str, Timeframe, OHLCV]],
     ) -> int:
-        """Bulk insert OHLCV bars with ON CONFLICT DO NOTHING.
+        """Bulk insert OHLCV bars, keeping any existing row (ON CONFLICT DO NOTHING).
 
         Parameters
         ----------
@@ -103,40 +171,46 @@ class MarketDataRepository:
         """
         if not bars:
             return 0
+        async with self._ensure_pool().acquire() as conn:
+            records = await conn.fetch(_STORE_BARS_SQL, *_columns(bars))
+        inserted = len(records)
+        logger.info("store_bars", attempted=len(bars), inserted=inserted)
+        return inserted
 
-        pool = self._ensure_pool()
+    async def upsert_closed_bars(
+        self,
+        bars: list[tuple[str, str, Timeframe, OHLCV]],
+    ) -> tuple[int, int]:
+        """Insert closed bars, correcting stored rows whose values differ.
 
-        rows = [
-            (
+        Only closed bars may be passed: a forming candle written here would be overwritten
+        later, but anything that read it in between saw a partial bar.
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(inserted, updated)``; identical existing rows count as neither.
+        """
+        if not bars:
+            return (0, 0)
+        latest: dict[tuple[str, str, str, datetime], tuple[str, str, Timeframe, OHLCV]] = {}
+        for exchange_id, symbol, timeframe, ohlcv in bars:
+            latest[(exchange_id, symbol, str(timeframe), ohlcv.timestamp)] = (
                 exchange_id,
                 symbol,
-                str(timeframe),
-                ohlcv.timestamp,
-                ohlcv.open,
-                ohlcv.high,
-                ohlcv.low,
-                ohlcv.close,
-                ohlcv.volume,
+                timeframe,
+                ohlcv,
             )
-            for exchange_id, symbol, timeframe, ohlcv in bars
-        ]
-
-        query = """
-            INSERT INTO ts.ohlcv_1m (
-                exchange, symbol, timeframe, timestamp,
-                open, high, low, close, volume
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (exchange, symbol, timeframe, timestamp) DO NOTHING
-        """
-
-        async with pool.acquire() as conn:
-            result = await conn.executemany(query, rows)
-
-        # executemany does not return a row count; we log the attempt count
-        inserted = len(rows)
-        logger.info("store_bars", attempted=inserted, result=result)
-        return inserted
+        unique = list(latest.values())
+        cols = _columns(unique)
+        async with self._ensure_pool().acquire() as conn, conn.transaction():
+            existing = await conn.fetch(_EXISTING_KEYS_SQL, *cols[:4])
+            records = await conn.fetch(_UPSERT_CLOSED_BARS_SQL, *cols)
+        existing_keys = {_key(r) for r in existing}
+        updated = sum(1 for r in records if _key(r) in existing_keys)
+        inserted = len(records) - updated
+        logger.info("upsert_closed_bars", attempted=len(unique), inserted=inserted, updated=updated)
+        return (inserted, updated)
 
     async def get_bars(
         self,

@@ -93,6 +93,7 @@ async def _download(args: argparse.Namespace) -> None:
     import ccxt.async_support as ccxt_async
 
     from hydra.core.types import OHLCV, Timeframe
+    from hydra.data.bars import timeframe_seconds
     from hydra.data.storage import MarketDataRepository
 
     exchange_cls = getattr(ccxt_async, args.exchange, None)
@@ -107,6 +108,7 @@ async def _download(args: argparse.Namespace) -> None:
     since_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(end_dt.timestamp() * 1000)
     timeframe = Timeframe(args.timeframe)
+    tf_ms = timeframe_seconds(timeframe) * 1000
 
     # Connect to repository
     repo = MarketDataRepository(dsn=args.dsn)
@@ -177,8 +179,11 @@ async def _download(args: argparse.Namespace) -> None:
                 break
 
             bars: list[tuple[str, str, Timeframe, OHLCV]] = []
+            now_ms = int(time.time() * 1000)
             for candle in ohlcv_raw:
                 ts_ms, o, h, low, c, v = candle[:6]
+                if int(ts_ms) + tf_ms > now_ms:
+                    continue
                 bars.append(
                     (
                         args.exchange,

@@ -15,6 +15,7 @@ from typing import Any
 
 import msgpack
 
+from hydra.core import metrics
 from hydra.core.events import Event, event_from_dict, event_to_dict
 
 logger = logging.getLogger(__name__)
@@ -38,12 +39,15 @@ class InMemoryEventBus:
         self._queue: asyncio.PriorityQueue[tuple[float, str, Event]] = asyncio.PriorityQueue()
         self._running: bool = False
         self._counter: int = 0  # tiebreaker for same-timestamp events
+        self.handler_errors: int = 0
 
     async def publish(self, event: Event) -> None:
         """Publish an event to all subscribers matching its event_type.
 
-        In backtest mode events are dispatched immediately (synchronously from
-        the caller's perspective) so that the backtest loop stays deterministic.
+        Events are dispatched immediately (synchronously from the caller's perspective) so
+        that the backtest loop stays deterministic. Each callback is isolated: an exception is
+        logged and counted, and later subscribers still receive the event. Cancellation
+        propagates.
         """
         event_type = event.event_type
         callbacks = list(self._subscribers.get(event_type, []))
@@ -51,13 +55,17 @@ class InMemoryEventBus:
         callbacks.extend(self._subscribers.get("*", []))
         t0 = time.monotonic()
         for callback in callbacks:
-            await callback(event)
-        try:
-            from hydra.core.metrics import observe_event_bus_latency
-
-            observe_event_bus_latency(time.monotonic() - t0)
-        except Exception:
-            pass
+            try:
+                await callback(event)
+            except Exception:
+                self.handler_errors += 1
+                logger.exception(
+                    "Event handler %s failed for %s",
+                    getattr(callback, "__qualname__", repr(callback)),
+                    event_type,
+                )
+                metrics.record_event_handler_error(event_type)
+        metrics.observe_event_bus_latency(time.monotonic() - t0)
 
     async def publish_queued(self, event: Event) -> None:
         """Enqueue an event for later ordered processing via ``drain``."""

@@ -93,12 +93,12 @@ def repo(mock_pool: MagicMock) -> MarketDataRepository:
 class TestStoreBars:
     """Tests for MarketDataRepository.store_bars()."""
 
-    async def test_store_bars_calls_executemany(
+    async def test_store_bars_returns_rows_actually_inserted(
         self, repo: MarketDataRepository, mock_pool: MagicMock
     ) -> None:
-        """store_bars builds correct rows and calls executemany."""
+        """One unnest INSERT; the count is the RETURNING rows, not the attempt count."""
         conn = mock_pool._conn
-        conn.executemany = AsyncMock(return_value="INSERT 0 2")
+        conn.fetch = AsyncMock(return_value=[_fake_record({"?column?": 1})])
 
         bars = [
             ("binance", "BTCUSDT", Timeframe.M1, _make_bar(0)),
@@ -107,39 +107,103 @@ class TestStoreBars:
 
         result = await repo.store_bars(bars)
 
-        assert result == 2
-        conn.executemany.assert_called_once()
-
-        # Verify the query contains ON CONFLICT
-        call_args = conn.executemany.call_args
-        query = call_args[0][0]
-        assert "ON CONFLICT" in query
-        assert "DO NOTHING" in query
+        assert result == 1
+        conn.fetch.assert_called_once()
+        query = conn.fetch.call_args[0][0]
+        assert "unnest(" in query
+        assert "ON CONFLICT (exchange, symbol, timeframe, timestamp) DO NOTHING" in query
+        assert "RETURNING 1" in query
 
     async def test_store_bars_empty_list(self, repo: MarketDataRepository) -> None:
         """Empty bar list returns 0 without hitting the database."""
         result = await repo.store_bars([])
         assert result == 0
 
-    async def test_store_bars_row_data(
+    async def test_store_bars_column_arrays(
         self, repo: MarketDataRepository, mock_pool: MagicMock
     ) -> None:
-        """Verify the row tuples sent to executemany."""
+        """Each query parameter is one column array, in table order."""
         conn = mock_pool._conn
-        conn.executemany = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
 
-        bar = _make_bar(0)
-        await repo.store_bars([("binance", "BTCUSDT", Timeframe.M1, bar)])
+        bar0, bar1 = _make_bar(0), _make_bar(1, close="42200.50")
+        await repo.store_bars(
+            [
+                ("binance", "BTCUSDT", Timeframe.M1, bar0),
+                ("binance", "BTCUSDT", Timeframe.M1, bar1),
+            ]
+        )
 
-        rows = conn.executemany.call_args[0][1]
-        assert len(rows) == 1
-        row = rows[0]
-        assert row[0] == "binance"
-        assert row[1] == "BTCUSDT"
-        assert row[2] == "1m"
-        assert row[3] == bar.timestamp
-        assert row[4] == bar.open
-        assert row[5] == bar.high
+        cols = conn.fetch.call_args[0][1:]
+        assert len(cols) == 9
+        assert cols[0] == ["binance", "binance"]
+        assert cols[1] == ["BTCUSDT", "BTCUSDT"]
+        assert cols[2] == ["1m", "1m"]
+        assert cols[3] == [bar0.timestamp, bar1.timestamp]
+        assert cols[7] == [Decimal("42100.00"), Decimal("42200.50")]
+
+
+def _transactional(mock_pool: MagicMock) -> AsyncMock:
+    conn = mock_pool._conn
+    tx = AsyncMock()
+    tx.__aenter__ = AsyncMock(return_value=None)
+    tx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx)
+    return conn
+
+
+def _key(minute: int) -> _FakeRecord:
+    return _fake_record(
+        {
+            "exchange": "binance",
+            "symbol": "BTCUSDT",
+            "timeframe": "1m",
+            "timestamp": datetime(2024, 1, 1, 0, minute, tzinfo=UTC),
+        }
+    )
+
+
+class TestUpsertClosedBars:
+    """Tests for MarketDataRepository.upsert_closed_bars()."""
+
+    async def test_counts_inserted_and_updated_from_returned_keys(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        # minute 0 existed and changed, minute 1 is new, minute 2 existed unchanged
+        conn.fetch = AsyncMock(side_effect=[[_key(0), _key(2)], [_key(0), _key(1)]])
+
+        result = await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(m)) for m in range(3)]
+        )
+
+        assert result == (1, 1)
+        existing_sql, upsert_sql = (c[0][0] for c in conn.fetch.call_args_list)
+        assert "JOIN unnest(" in existing_sql
+        assert "DO UPDATE SET" in upsert_sql
+        assert "IS DISTINCT FROM" in upsert_sql
+        conn.transaction.assert_called_once()
+
+    async def test_duplicate_keys_in_one_batch_keep_the_last(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        """ON CONFLICT DO UPDATE cannot touch a row twice, so the batch is deduplicated."""
+        conn = _transactional(mock_pool)
+        conn.fetch = AsyncMock(side_effect=[[], [_key(0)]])
+
+        result = await repo.upsert_closed_bars(
+            [
+                ("binance", "BTCUSDT", Timeframe.M1, _make_bar(0, close="1")),
+                ("binance", "BTCUSDT", Timeframe.M1, _make_bar(0, close="2")),
+            ]
+        )
+
+        assert result == (1, 0)
+        cols = conn.fetch.call_args_list[1][0][1:]
+        assert cols[7] == [Decimal("2")]
+
+    async def test_empty_batch(self, repo: MarketDataRepository) -> None:
+        assert await repo.upsert_closed_bars([]) == (0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -302,24 +366,24 @@ class TestGetBarCount:
 
 
 class TestDeduplication:
-    """Test that duplicate bars are handled via ON CONFLICT DO NOTHING."""
+    """Duplicate bars are handled in SQL, never by the caller."""
 
     async def test_duplicate_insert_uses_on_conflict(
         self, repo: MarketDataRepository, mock_pool: MagicMock
     ) -> None:
-        """The INSERT query includes ON CONFLICT DO NOTHING."""
         conn = mock_pool._conn
-        conn.executemany = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[_fake_record({"?column?": 1})])
 
         bar = _make_bar(0)
-        await repo.store_bars(
+        inserted = await repo.store_bars(
             [
                 ("binance", "BTCUSDT", Timeframe.M1, bar),
                 ("binance", "BTCUSDT", Timeframe.M1, bar),  # duplicate
             ]
         )
 
-        query = conn.executemany.call_args[0][0]
+        assert inserted == 1
+        query = conn.fetch.call_args[0][0]
         assert "ON CONFLICT" in query
         assert "DO NOTHING" in query
 

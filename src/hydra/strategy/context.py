@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from bisect import bisect_left
 from decimal import Decimal
 from typing import Any
 
@@ -28,8 +29,12 @@ class StrategyContext:
     For testing it can be constructed with in-memory bar data.
     """
 
-    def __init__(self) -> None:
-        # symbol -> timeframe -> list of OHLCV bars (newest last)
+    def __init__(self, max_bars: int | None = None) -> None:
+        if max_bars is not None and max_bars < 1:
+            msg = f"max_bars must be >= 1, got {max_bars}"
+            raise ValueError(msg)
+        self._max_bars = max_bars
+        # symbol -> timeframe -> list of OHLCV bars (newest last, one per timestamp)
         self._bars: dict[str, dict[str, list[OHLCV]]] = {}
         # Indicator cache: key -> ndarray
         self._indicator_cache: dict[str, ndarray] = {}
@@ -42,17 +47,38 @@ class StrategyContext:
 
     # -- Bar data access -----------------------------------------------------
 
+    @property
+    def max_bars(self) -> int | None:
+        """Bars kept per symbol/timeframe; ``None`` keeps every bar."""
+        return self._max_bars
+
     def add_bar(self, symbol: str, timeframe: Timeframe, bar: OHLCV) -> None:
-        """Append a bar to the internal store (used by the engine)."""
-        self._bars.setdefault(symbol, {}).setdefault(str(timeframe), []).append(bar)
-        # Invalidate indicator cache for this symbol/timeframe
+        """Store a bar, upserting by timestamp (used by the engine).
+
+        A bar with a stored timestamp replaces it; any other is inserted in time order (a
+        late gap fill lands where it belongs) and the series is trimmed to ``max_bars``.
+        """
+        series = self._bars.setdefault(symbol, {}).setdefault(str(timeframe), [])
+        ts = bar.timestamp
+        if not series or ts > series[-1].timestamp:
+            series.append(bar)
+        else:
+            i = bisect_left(series, ts, key=lambda b: b.timestamp)
+            if series[i].timestamp == ts:
+                series[i] = bar
+            elif self._max_bars is not None and i == 0 and len(series) >= self._max_bars:
+                return
+            else:
+                series.insert(i, bar)
+        if self._max_bars is not None and len(series) > self._max_bars:
+            del series[: len(series) - self._max_bars]
         prefix = f"{symbol}:{timeframe}:"
         keys_to_drop = [k for k in self._indicator_cache if k.startswith(prefix)]
         for k in keys_to_drop:
             del self._indicator_cache[k]
 
     def bars(self, symbol: str, timeframe: Timeframe, count: int) -> list[OHLCV]:
-        """Return the last *count* bars for *symbol* / *timeframe*."""
+        """Return the last *count* bars for *symbol* / *timeframe* (oldest first)."""
         all_bars = self._bars.get(symbol, {}).get(str(timeframe), [])
         return all_bars[-count:]
 

@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 import yaml
 
 from hydra.core.config import HydraConfig
 from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import BarEvent, Event
-from hydra.core.types import OHLCV, Timeframe
+from hydra.core.events import BarEvent, EntrySignal, Event, ExitSignal
+from hydra.core.types import OHLCV, Symbol, Timeframe
+from hydra.data.bars import timeframe_seconds
+from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
@@ -25,8 +29,6 @@ def _make_bar(
     low: float = 95.0,
     volume: float = 1000.0,
 ) -> BarEvent:
-    from datetime import UTC, datetime
-
     ohlcv = OHLCV(
         open=Decimal(str(close)),
         high=Decimal(str(high)),
@@ -113,8 +115,6 @@ class TestStrategyEngine:
         await engine.load_strategy_from_config(cfg)
 
         # Pre-populate context with enough bars
-        from datetime import UTC, datetime
-
         for i in range(10):
             ohlcv = OHLCV(
                 open=Decimal("100"),
@@ -187,3 +187,136 @@ class TestStrategyEngine:
         assert new_strategy is not None
         # Should be a different instance
         assert old_strategy is not new_strategy
+
+
+# ---------------------------------------------------------------------------
+# Closed-bar routing (SM-19, EX-14, replay) and warm-up
+# ---------------------------------------------------------------------------
+
+_T0 = datetime(2026, 3, 2, tzinfo=UTC)
+_CALLS: dict[str, list[tuple[Timeframe, datetime, int]]] = {}
+
+
+class RecordingStrategy(BaseStrategy):
+    """Records every on_bar call with the context length it saw."""
+
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        assert bar.ohlcv is not None
+        seen = len(self.context.bars(str(bar.symbol), bar.timeframe, 10_000))
+        _CALLS.setdefault(self.strategy_id, []).append((bar.timeframe, bar.ohlcv.timestamp, seen))
+        return []
+
+
+def _recording_cfg(sid: str, **timeframes: Timeframe) -> StrategyConfig:
+    return StrategyConfig(
+        id=sid,
+        name=sid,
+        strategy_class=f"{__name__}.RecordingStrategy",
+        symbols=["BTCUSDT"],
+        timeframes={"primary": Timeframe.H1, **timeframes},
+    )
+
+
+def _closed(tf: Timeframe, i: int, *, replay: bool = False) -> BarEvent:
+    step = timedelta(seconds=timeframe_seconds(tf))
+    c = Decimal(100 + i)
+    ohlcv = OHLCV(open=c, high=c, low=c, close=c, volume=Decimal(1), timestamp=_T0 + i * step)
+    return BarEvent(symbol=Symbol("BTCUSDT"), timeframe=tf, ohlcv=ohlcv, replay=replay)
+
+
+async def _engine(
+    *cfgs: StrategyConfig, max_bars: int | None = None
+) -> tuple[InMemoryEventBus, StrategyContext, StrategyEngine]:
+    _CALLS.clear()
+    bus = InMemoryEventBus()
+    ctx = StrategyContext(max_bars=max_bars)
+    engine = StrategyEngine(config=HydraConfig(), event_bus=bus, context=ctx)
+    for cfg in cfgs:
+        await engine.load_strategy_from_config(cfg)
+    await engine.start()
+    return bus, ctx, engine
+
+
+class TestClosedBarRouting:
+    async def test_bar_added_once_for_two_strategies(self) -> None:
+        bus, ctx, _ = await _engine(_recording_cfg("a"), _recording_cfg("b"))
+        for i in range(10):
+            await bus.publish(_closed(Timeframe.H1, i))
+
+        assert len(ctx.bars("BTCUSDT", Timeframe.H1, 100)) == 10
+        assert [seen for _, _, seen in _CALLS["a"]] == list(range(1, 11))
+        assert [seen for _, _, seen in _CALLS["b"]] == list(range(1, 11))
+
+    async def test_confirmation_timeframe_reaches_context(self) -> None:
+        bus, ctx, _ = await _engine(_recording_cfg("mtf", confirmation=Timeframe.H4))
+        for i in range(3):
+            await bus.publish(_closed(Timeframe.H4, i))
+        for i in range(8):
+            await bus.publish(_closed(Timeframe.H1, i))
+
+        h4 = ctx.bars("BTCUSDT", Timeframe.H4, 100)
+        assert [b.timestamp for b in h4] == [_T0 + timedelta(hours=4 * i) for i in range(3)]
+        assert [tf for tf, _, _ in _CALLS["mtf"]] == [Timeframe.H1] * 8
+
+    async def test_undeclared_timeframe_is_ignored(self) -> None:
+        bus, ctx, _ = await _engine(_recording_cfg("h1"))
+        await bus.publish(_closed(Timeframe.D1, 0))
+        assert ctx.bars("BTCUSDT", Timeframe.D1, 10) == []
+        assert "h1" not in _CALLS
+
+    async def test_replay_bar_not_dispatched(self) -> None:
+        bus, ctx, _ = await _engine(_recording_cfg("r"))
+        await bus.publish(_closed(Timeframe.H1, 0, replay=True))
+        await bus.publish(_closed(Timeframe.H1, 1, replay=True))
+        await bus.publish(_closed(Timeframe.H1, 2))
+
+        assert len(ctx.bars("BTCUSDT", Timeframe.H1, 100)) == 3
+        assert _CALLS["r"] == [(Timeframe.H1, _T0 + timedelta(hours=2), 3)]
+
+    async def test_forming_update_replaces_instead_of_appending(self) -> None:
+        bus, ctx, _ = await _engine(_recording_cfg("dup"))
+        await bus.publish(_closed(Timeframe.H1, 0))
+        await bus.publish(_closed(Timeframe.H1, 0))
+        assert len(ctx.bars("BTCUSDT", Timeframe.H1, 100)) == 1
+
+    async def test_warm_up_adds_without_on_bar(self) -> None:
+        bus, ctx, engine = await _engine(_recording_cfg("w", confirmation=Timeframe.H4))
+        h1 = [_closed(Timeframe.H1, i).ohlcv for i in range(500)]
+        h4 = [_closed(Timeframe.H4, i).ohlcv for i in range(125)]
+        await engine.warm_up(
+            {
+                ("BTCUSDT", Timeframe.H1): [b for b in reversed(h1) if b is not None],
+                ("BTCUSDT", Timeframe.H4): [b for b in h4 if b is not None],
+            }
+        )
+
+        bars = ctx.bars("BTCUSDT", Timeframe.H1, 10_000)
+        assert len(bars) == 500
+        assert bars[0].timestamp == _T0 and bars[-1].timestamp == _T0 + timedelta(hours=499)
+        assert len(ctx.bars("BTCUSDT", Timeframe.H4, 10_000)) == 125
+        assert "w" not in _CALLS
+
+        await bus.publish(_closed(Timeframe.H1, 500))
+        assert _CALLS["w"] == [(Timeframe.H1, _T0 + timedelta(hours=500), 501)]
+
+    async def test_warm_up_refuses_more_bars_than_the_context_keeps(self) -> None:
+        _, ctx, engine = await _engine(_recording_cfg("cap"), max_bars=1000)
+        bars = [_closed(Timeframe.H1, i).ohlcv for i in range(1200)]
+        with pytest.raises(
+            ValueError, match="1200 warm-up bars exceed the context's max_bars=1000"
+        ):
+            await engine.warm_up({("BTCUSDT", Timeframe.H1): [b for b in bars if b is not None]})
+        assert ctx.bars("BTCUSDT", Timeframe.H1, 10_000) == []
+
+    async def test_late_replay_bar_lands_in_order(self) -> None:
+        bus, ctx, _ = await _engine(_recording_cfg("late"))
+        for i in (0, 1, 3):
+            await bus.publish(_closed(Timeframe.H1, i))
+        await bus.publish(_closed(Timeframe.H1, 2, replay=True))
+        stamps = [b.timestamp for b in ctx.bars("BTCUSDT", Timeframe.H1, 100)]
+        assert stamps == [_T0 + timedelta(hours=h) for h in range(4)]
+        assert [c[1] for c in _CALLS["late"]] == [_T0 + timedelta(hours=h) for h in (0, 1, 3)]

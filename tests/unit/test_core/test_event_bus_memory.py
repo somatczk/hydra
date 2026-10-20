@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from prometheus_client import REGISTRY
 
+from hydra.core import metrics
 from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.events import (
     BarEvent,
@@ -256,3 +259,74 @@ class TestAsyncBehaviour:
         await asyncio.gather(*(bus.publish(e) for e in events))
 
         assert len(received) == 10
+
+
+# ---------------------------------------------------------------------------
+# Subscriber isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_metrics() -> Iterator[None]:
+    metrics._reset_metrics()
+    yield
+    metrics._reset_metrics()
+
+
+@pytest.mark.usefixtures("fresh_metrics")
+class TestSubscriberIsolation:
+    async def test_publish_isolates_failing_callback(self, bus: InMemoryEventBus) -> None:
+        received: list[Event] = []
+
+        async def failing(event: Event) -> None:
+            raise ValueError("strategy bug")
+
+        async def recording(event: Event) -> None:
+            received.append(event)
+
+        await bus.subscribe("heartbeat", failing)
+        await bus.subscribe("heartbeat", recording)
+        event = HeartbeatEvent(component="x")
+        await bus.publish(event)
+
+        assert received == [event]
+        assert bus.handler_errors == 1
+        errors = REGISTRY.get_sample_value(
+            "hydra_event_handler_errors_total", {"event_type": "heartbeat"}
+        )
+        assert errors == 1.0
+
+    async def test_failing_wildcard_does_not_stop_later_wildcards(
+        self, bus: InMemoryEventBus
+    ) -> None:
+        received: list[str] = []
+
+        async def failing(event: Event) -> None:
+            raise RuntimeError("boom")
+
+        async def recording(event: Event) -> None:
+            received.append(event.event_type)
+
+        await bus.subscribe("*", failing)
+        await bus.subscribe("*", recording)
+        for _ in range(3):
+            await bus.publish(HeartbeatEvent(component="x"))
+
+        assert received == ["heartbeat"] * 3
+        assert bus.handler_errors == 3
+
+    async def test_publish_propagates_cancelled(self, bus: InMemoryEventBus) -> None:
+        received: list[Event] = []
+
+        async def cancelled(event: Event) -> None:
+            raise asyncio.CancelledError
+
+        async def recording(event: Event) -> None:
+            received.append(event)
+
+        await bus.subscribe("heartbeat", cancelled)
+        await bus.subscribe("heartbeat", recording)
+        with pytest.raises(asyncio.CancelledError):
+            await bus.publish(HeartbeatEvent(component="x"))
+        assert received == []
+        assert bus.handler_errors == 0
