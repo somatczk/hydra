@@ -283,26 +283,25 @@ class TestPreviewSignals:
             "bars_count": 100,
         }
 
-    def test_preview_returns_200(self, client: TestClient) -> None:
-        """POST /api/strategies/preview returns 200 with valid data."""
+    def test_preview_without_database_is_503_not_sample_data(self, client: TestClient) -> None:
+        """Preview needs stored bars; with no DB it says so instead of using a random walk."""
         response = client.post("/api/strategies/preview", json=self._valid_preview_request())
-        assert response.status_code == 200
+        assert response.status_code == 503
+        assert response.json()["detail"]["state"] == "unavailable"
 
-    def test_preview_response_structure(self, client: TestClient) -> None:
-        """Response has signals and metrics fields."""
-        response = client.post("/api/strategies/preview", json=self._valid_preview_request())
-        data = response.json()
-        assert "signals" in data
-        assert "metrics" in data
-        assert isinstance(data["signals"], list)
-        assert "trades" in data["metrics"]
-        assert "win_rate" in data["metrics"]
-        assert "pnl" in data["metrics"]
-
-    def test_preview_invalid_timeframe_returns_422(self, client: TestClient) -> None:
+    @pytest.mark.parametrize("timeframe", ["2h", "30m"])
+    def test_preview_invalid_timeframe_returns_422(
+        self, client: TestClient, timeframe: str
+    ) -> None:
         """Invalid timeframe in preview returns 422."""
         request = self._valid_preview_request()
-        request["timeframe"] = "2h"
+        request["timeframe"] = timeframe
+        response = client.post("/api/strategies/preview", json=request)
+        assert response.status_code == 422
+
+    def test_preview_unknown_exchange_returns_422(self, client: TestClient) -> None:
+        request = self._valid_preview_request()
+        request["exchange_id"] = "mtgox"
         response = client.post("/api/strategies/preview", json=request)
         assert response.status_code == 422
 

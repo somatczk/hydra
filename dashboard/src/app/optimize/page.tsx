@@ -10,6 +10,10 @@ import { Select } from '@/components/ui/Select';
 import { Table } from '@/components/ui/Table';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
+import { ErrorCard } from '@/components/ui/ErrorCard';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { ProvenancePanel, type DataProvenance } from '@/components/backtest/DataProvenance';
+import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -55,6 +59,7 @@ interface HyperoptHistoryEntry {
   total_trials: number;
   best_so_far: number | null;
   created_at: string;
+  error?: string | null;
 }
 
 
@@ -73,6 +78,10 @@ export default function OptimizePage() {
   const [strategies, setStrategies] = useState<StrategyOption[]>([]);
   const [strategyId, setStrategyId] = useState('');
   const [loading, setLoading] = useState(true);
+  const [strategiesError, setStrategiesError] = useState<unknown>(null);
+  const [paramsError, setParamsError] = useState<string | null>(null);
+  const [runError, setRunError] = useState<unknown>(null);
+  const [runFailure, setRunFailure] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(() => {
@@ -90,6 +99,7 @@ export default function OptimizePage() {
     currentParams: Record<string, number> | null;
     startDate: string;
     endDate: string;
+    provenance: DataProvenance | null;
   } | null>(null);
   const [params, setParams] = useState<ParamRange[]>([]);
   const [paramsLoading, setParamsLoading] = useState(false);
@@ -115,7 +125,7 @@ export default function OptimizePage() {
   }, [pollingTaskId]);
 
   useEffect(() => {
-    fetchApi<StrategyOption[]>('/api/strategies')
+    fetchApi<StrategyOption[]>('/api/backtest/strategies')
       .then((data) => {
         const mapped = data.map((s: { id: string; name: string }) => ({ id: s.id, name: s.name }));
         setStrategies(mapped);
@@ -123,6 +133,7 @@ export default function OptimizePage() {
       })
       .catch((err) => {
         logger.warn('Optimize', 'Failed to fetch strategies', err);
+        setStrategiesError(err);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -134,6 +145,7 @@ export default function OptimizePage() {
       return;
     }
     setParamsLoading(true);
+    setParamsError(null);
     fetchApi<StrategyParamDef[]>(`/api/backtest/strategies/${strategyId}/params`)
       .then((defs) => {
         setParams(
@@ -150,6 +162,11 @@ export default function OptimizePage() {
       .catch((err) => {
         logger.warn('Optimize', 'Failed to fetch strategy params', err);
         setParams([]);
+        setParamsError(
+          parseErrorDetail(err)?.state === 'not_found'
+            ? 'Strategy not found'
+            : describeApiError(err, 'Failed to load strategy parameters'),
+        );
       })
       .finally(() => setParamsLoading(false));
   }, [strategyId]);
@@ -176,6 +193,8 @@ export default function OptimizePage() {
           last_trial_sharpe: number | null;
           start_date: string;
           end_date: string;
+          error?: string | null;
+          provenance?: DataProvenance | null;
         }>(`/api/backtest/hyperopt/${pollingTaskId}`);
         setProgress(
           status.total_trials > 0
@@ -190,6 +209,7 @@ export default function OptimizePage() {
           currentParams: status.current_trial_params,
           startDate: status.start_date,
           endDate: status.end_date,
+          provenance: status.provenance ?? null,
         });
         if (status.status === 'completed' || status.status === 'failed') {
           clearInterval(interval);
@@ -204,10 +224,17 @@ export default function OptimizePage() {
           if (status.status === 'completed') {
             toast('success', 'Optimization completed');
           } else {
-            toast('error', 'Optimization failed');
+            const reason = status.error || 'no reason reported';
+            setRunFailure(`Optimization failed: ${reason}`);
+            toast('error', `Optimization failed: ${reason}`);
           }
         }
-      } catch {
+      } catch (err) {
+        setRunFailure(
+          parseErrorDetail(err)?.state === 'not_found'
+            ? 'The optimization task is no longer known to the server (it may have restarted).'
+            : describeApiError(err, 'Lost contact with the optimization task'),
+        );
         clearInterval(interval);
         setPollingTaskId(null);
         setRunning(false);
@@ -219,8 +246,10 @@ export default function OptimizePage() {
   }, [pollingTaskId, toast]);
 
   const handleRun = async () => {
-    if (!strategyId) return;
+    if (!strategyId || !startDate || !endDate) return;
     setRunning(true);
+    setRunError(null);
+    setRunFailure(null);
     setResults([]);
     try {
       const paramSpace = params.map((p) => ({
@@ -254,7 +283,8 @@ export default function OptimizePage() {
       }
     } catch (err) {
       logger.error('Optimize', 'Failed to start optimization', err);
-      toast('error', 'Failed to start optimization');
+      setRunError(err);
+      toast('error', describeApiError(err, 'Failed to start optimization'));
       setRunning(false);
     }
   };
@@ -350,6 +380,10 @@ export default function OptimizePage() {
         </p>
       </div>
 
+      {strategiesError !== null && (
+        <DataStateErrorCard error={strategiesError} fallback="Failed to load strategies" />
+      )}
+
       {/* Configuration */}
       <DataCard title="Configuration" description="Select strategy and define parameter search space">
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4 mb-6">
@@ -386,7 +420,8 @@ export default function OptimizePage() {
           {paramsLoading && (
             <p className="text-xs text-text-muted">Loading parameters...</p>
           )}
-          {!paramsLoading && params.length === 0 && strategyId && (
+          {paramsError && <p className="text-xs text-status-error">{paramsError}</p>}
+          {!paramsLoading && !paramsError && params.length === 0 && strategyId && (
             <p className="text-xs text-text-muted">No optimizable parameters found for this strategy.</p>
           )}
           {params.map((param, i) => (
@@ -417,7 +452,21 @@ export default function OptimizePage() {
         </div>
 
         <div className="mt-4 flex flex-col gap-3">
-          <Button variant="primary" onClick={handleRun} disabled={running || !strategyId || params.length === 0}>
+          {runError !== null && (
+            <div data-testid="run-error">
+              <DataStateErrorCard error={runError} fallback="Failed to start optimization" />
+            </div>
+          )}
+          {runFailure && (
+            <div data-testid="run-failure">
+              <ErrorCard message={runFailure} />
+            </div>
+          )}
+          <Button
+            variant="primary"
+            onClick={handleRun}
+            disabled={running || !strategyId || params.length === 0 || !startDate || !endDate}
+          >
             <Play className="h-4 w-4" />
             {running ? `Running${progress > 0 ? ` (${progress}%)` : '...'}` : 'Run Optimization'}
           </Button>
@@ -458,6 +507,7 @@ export default function OptimizePage() {
                       </div>
                     )}
                   </div>
+                  {trialStatus.provenance && <ProvenancePanel provenance={trialStatus.provenance} />}
                   {trialStatus.currentParams && (
                     <div className="pt-1 border-t border-border-default">
                       <p className="text-[10px] text-text-muted mb-1">Last Trial Parameters</p>

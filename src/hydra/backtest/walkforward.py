@@ -55,6 +55,17 @@ class CPCVResult:
     path_sharpes: list[float] = field(default_factory=list)
 
 
+def window_bar_counts(
+    bar_count: int, total_days: int, in_sample_months: int, out_of_sample_months: int
+) -> tuple[int, int]:
+    """In-sample / out-of-sample bar counts for 30-day months at the bars' real density."""
+    bars_per_day = bar_count / total_days
+    return (
+        int(in_sample_months * 30 * bars_per_day),
+        int(out_of_sample_months * 30 * bars_per_day),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Walk-forward Analyzer
 # ---------------------------------------------------------------------------
@@ -98,13 +109,13 @@ class WalkForwardAnalyzer:
         if total_days <= 0:
             return WalkForwardResult()
 
-        bars_per_day = max(len(bars) / total_days, 1)
-        is_bars = int(in_sample_months * 30 * bars_per_day)
-        oos_bars = int(out_of_sample_months * 30 * bars_per_day)
+        is_bars, oos_bars = window_bar_counts(
+            len(bars), total_days, in_sample_months, out_of_sample_months
+        )
         step_bars = oos_bars
         window_bars = is_bars + oos_bars
 
-        if window_bars > len(bars):
+        if is_bars <= 0 or oos_bars <= 0 or window_bars > len(bars):
             return WalkForwardResult()
 
         folds: list[FoldResult] = []

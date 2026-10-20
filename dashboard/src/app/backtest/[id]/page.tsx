@@ -29,6 +29,9 @@ import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { ProvenanceBadge, ProvenancePanel, type DataProvenance } from '@/components/backtest/DataProvenance';
+import { describeApiError, stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 import {
   type TimeResolution,
@@ -46,6 +49,9 @@ interface ApiBacktestDetail {
   period: string;
   status: string;
   name: string;
+  strategy_id?: string | null;
+  initial_capital?: number | null;
+  provenance?: DataProvenance | null;
   stopped_reason: string | null;
   metrics: {
     total_trades: number;
@@ -53,11 +59,11 @@ interface ApiBacktestDetail {
     total_pnl: number;
     max_drawdown: number;
     sharpe_ratio: number;
-    alpha?: number;
-    beta?: number;
-    max_consecutive_wins?: number;
-    max_consecutive_losses?: number;
-    expectancy?: number;
+    alpha?: number | null;
+    beta?: number | null;
+    max_consecutive_wins?: number | null;
+    max_consecutive_losses?: number | null;
+    expectancy?: number | null;
   };
   equity_curve: EquityPoint[];
   benchmark_equity?: EquityPoint[];
@@ -125,6 +131,7 @@ export default function BacktestDetailPage() {
   const [detail, setDetail] = useState<ApiBacktestDetail | null>(null);
   const [verification, setVerification] = useState<Verification | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [resolution, setResolution] = useState<TimeResolution>('days');
   const [isDark, setIsDark] = useState(false);
 
@@ -154,6 +161,7 @@ export default function BacktestDetailPage() {
         setVerification(v);
       } catch (err) {
         logger.warn('BacktestDetail', 'Failed to load backtest', err);
+        setLoadError(err);
       } finally {
         setLoading(false);
       }
@@ -171,8 +179,8 @@ export default function BacktestDetailPage() {
       setDetail({ ...detail, name: editName });
       setEditing(false);
       toast('success', 'Backtest renamed');
-    } catch {
-      toast('error', 'Failed to rename backtest');
+    } catch (err) {
+      toast('error', describeApiError(err, 'Failed to rename backtest'));
     }
   };
 
@@ -181,8 +189,8 @@ export default function BacktestDetailPage() {
       await fetchApi<undefined>(`/api/backtest/results/${resultId}`, { method: 'DELETE' });
       toast('success', 'Backtest deleted');
       router.push('/backtest');
-    } catch {
-      toast('error', 'Failed to delete backtest');
+    } catch (err) {
+      toast('error', describeApiError(err, 'Failed to delete backtest'));
     }
   };
 
@@ -311,9 +319,14 @@ export default function BacktestDetailPage() {
   }
 
   if (!detail) {
+    const missing = loadError === null || stateFromError(loadError) === 'not_found';
     return (
       <div className="flex flex-col items-center justify-center gap-4 py-20">
-        <p className="text-sm text-text-muted">Backtest not found</p>
+        {missing ? (
+          <p className="text-sm text-text-muted">Backtest not found</p>
+        ) : (
+          <DataStateErrorCard error={loadError} fallback="Failed to load backtest" />
+        )}
         <Button variant="outline" onClick={() => router.push('/backtest')}>
           <ArrowLeft className="h-4 w-4" /> Back to Backtests
         </Button>
@@ -373,6 +386,7 @@ export default function BacktestDetailPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <ProvenanceBadge provenance={detail.provenance} />
           <StatusBadge status={detail.status === 'completed' ? 'Completed' : detail.status} variant={detail.status === 'completed' ? 'success' : 'info'} />
           <Button variant="outline" size="sm" onClick={handleShare} loading={sharing}>
             <Share2 className="h-4 w-4" /> Share
@@ -390,6 +404,8 @@ export default function BacktestDetailPage() {
           )}
         </div>
       </div>
+
+      <ProvenancePanel provenance={detail.provenance} />
 
       {/* Metrics row */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
@@ -418,9 +434,9 @@ export default function BacktestDetailPage() {
       </div>
 
       {/* Extended metrics row */}
-      {(metrics.alpha !== undefined || metrics.beta !== undefined || metrics.max_consecutive_wins !== undefined || metrics.max_consecutive_losses !== undefined || metrics.expectancy !== undefined) && (
+      {(metrics.alpha != null || metrics.beta != null || metrics.max_consecutive_wins != null || metrics.max_consecutive_losses != null || metrics.expectancy != null) && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-          {metrics.alpha !== undefined && (
+          {metrics.alpha != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Alpha</p>
               <p className={`text-lg font-bold ${metrics.alpha >= 0 ? 'text-status-success' : 'text-status-error'}`}>
@@ -428,25 +444,25 @@ export default function BacktestDetailPage() {
               </p>
             </DataCard>
           )}
-          {metrics.beta !== undefined && (
+          {metrics.beta != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Beta</p>
               <p className="text-lg font-bold text-text-primary">{metrics.beta.toFixed(2)}</p>
             </DataCard>
           )}
-          {metrics.max_consecutive_wins !== undefined && (
+          {metrics.max_consecutive_wins != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Max Consec. Wins</p>
               <p className="text-lg font-bold text-status-success">{metrics.max_consecutive_wins}</p>
             </DataCard>
           )}
-          {metrics.max_consecutive_losses !== undefined && (
+          {metrics.max_consecutive_losses != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Max Consec. Losses</p>
               <p className="text-lg font-bold text-status-error">{metrics.max_consecutive_losses}</p>
             </DataCard>
           )}
-          {metrics.expectancy !== undefined && (
+          {metrics.expectancy != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Expectancy</p>
               <p className={`text-lg font-bold ${metrics.expectancy >= 0 ? 'text-status-success' : 'text-status-error'}`}>

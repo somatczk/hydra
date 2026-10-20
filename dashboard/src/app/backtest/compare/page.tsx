@@ -23,6 +23,12 @@ import {
   formatYTick,
 } from '../chart-utils';
 import { Button } from '@/components/ui/Button';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import {
+  ProvenanceBadge,
+  provenanceMismatch,
+  type DataProvenance,
+} from '@/components/backtest/DataProvenance';
 
 /* ---------- Types ---------- */
 
@@ -32,6 +38,7 @@ interface BacktestListItem {
   name: string;
   period: string;
   status: string;
+  provenance?: DataProvenance | null;
 }
 
 interface BacktestDetail {
@@ -39,6 +46,7 @@ interface BacktestDetail {
   strategy: string;
   period: string;
   name: string;
+  provenance?: DataProvenance | null;
   metrics: {
     total_trades: number;
     win_rate: number;
@@ -94,6 +102,8 @@ function fmtPnl(v: number): string {
 export default function BacktestComparePage() {
   const [results, setResults] = useState<BacktestListItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState<unknown>(null);
+  const [detailError, setDetailError] = useState<unknown>(null);
   const [selectedA, setSelectedA] = useState('');
   const [selectedB, setSelectedB] = useState('');
   const [detailA, setDetailA] = useState<BacktestDetail | null>(null);
@@ -106,7 +116,8 @@ export default function BacktestComparePage() {
     setIsDark(document.documentElement.classList.contains('dark'));
   }, []);
 
-  useEffect(() => {
+  const loadResults = () => {
+    setListError(null);
     fetchApi<BacktestListItem[]>('/api/backtest/results')
       .then((data) => {
         const completed = data.filter((r) => r.status === 'completed');
@@ -114,9 +125,12 @@ export default function BacktestComparePage() {
       })
       .catch((err) => {
         logger.warn('BacktestCompare', 'Failed to fetch results list', err);
+        setListError(err);
       })
       .finally(() => setLoading(false));
-  }, []);
+  };
+
+  useEffect(() => { loadResults(); }, []);
 
   useEffect(() => {
     if (!selectedA || !selectedB) {
@@ -125,6 +139,7 @@ export default function BacktestComparePage() {
       return;
     }
     setLoadingDetails(true);
+    setDetailError(null);
     Promise.all([
       fetchApi<BacktestDetail>(`/api/backtest/results/${selectedA}`),
       fetchApi<BacktestDetail>(`/api/backtest/results/${selectedB}`),
@@ -135,6 +150,7 @@ export default function BacktestComparePage() {
       })
       .catch((err) => {
         logger.error('BacktestCompare', 'Failed to fetch backtest details', err);
+        setDetailError(err);
       })
       .finally(() => setLoadingDetails(false));
   }, [selectedA, selectedB]);
@@ -148,6 +164,9 @@ export default function BacktestComparePage() {
     if (!detailA || !detailB) return [];
     return mergeEquityCurves(detailA.equity_curve, detailB.equity_curve, resolution);
   }, [detailA, detailB, resolution]);
+
+  const mismatch = detailA && detailB ? provenanceMismatch(detailA.provenance, detailB.provenance) : [];
+  const selectedProvenance = (id: string) => results.find((r) => r.id === id)?.provenance;
 
   const resultOptions = results.map((r) => ({
     value: r.id,
@@ -203,7 +222,32 @@ export default function BacktestComparePage() {
             placeholder="Select backtest..."
           />
         </div>
+        {(selectedA || selectedB) && (
+          <div className="mt-3 grid grid-cols-1 gap-4 text-xs text-text-muted md:grid-cols-2">
+            <div className="flex items-center gap-2" data-testid="data-a">
+              {selectedA && <>Data: <ProvenanceBadge provenance={selectedProvenance(selectedA)} /></>}
+            </div>
+            <div className="flex items-center gap-2" data-testid="data-b">
+              {selectedB && <>Data: <ProvenanceBadge provenance={selectedProvenance(selectedB)} /></>}
+            </div>
+          </div>
+        )}
       </DataCard>
+
+      {listError !== null && (
+        <DataStateErrorCard error={listError} fallback="Failed to load backtest results" onRetry={loadResults} />
+      )}
+
+      {detailError !== null && (
+        <DataStateErrorCard error={detailError} fallback="Failed to load the selected backtests" />
+      )}
+
+      {mismatch.length > 0 && (
+        <div className="rounded-xl border border-status-warning/30 bg-status-warning/10 px-4 py-3" data-testid="provenance-mismatch">
+          <p className="text-sm font-medium text-text-primary">These runs used different data</p>
+          <p className="text-xs text-text-muted">{mismatch.join('; ')}</p>
+        </div>
+      )}
 
       {loadingDetails && (
         <div className="flex h-32 items-center justify-center">
@@ -341,7 +385,7 @@ export default function BacktestComparePage() {
         </div>
       )}
 
-      {results.length < 2 && (
+      {listError === null && results.length < 2 && (
         <div className="flex flex-col items-center justify-center py-12">
           <p className="text-sm text-text-muted">At least two completed backtests are needed for comparison</p>
         </div>

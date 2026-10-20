@@ -290,6 +290,74 @@ class MarketDataRepository:
 
         return int(count) if count else 0
 
+    async def get_latest_bars(
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+        limit: int,
+        end: datetime | None = None,
+    ) -> list[OHLCV]:
+        """Return the ``limit`` most recent bars at or before ``end``, in ascending order."""
+        pool = self._ensure_pool()
+
+        query = """
+            SELECT open, high, low, close, volume, timestamp
+            FROM ts.ohlcv_1m
+            WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
+              AND ($4::timestamptz IS NULL OR timestamp <= $4::timestamptz)
+            ORDER BY timestamp DESC
+            LIMIT $5
+        """
+
+        async with pool.acquire() as conn:
+            records = await conn.fetch(query, exchange_id, symbol, str(timeframe), end, limit)
+
+        return [
+            OHLCV(
+                open=Decimal(str(r["open"])),
+                high=Decimal(str(r["high"])),
+                low=Decimal(str(r["low"])),
+                close=Decimal(str(r["close"])),
+                volume=Decimal(str(r["volume"])),
+                timestamp=r["timestamp"].replace(tzinfo=UTC)
+                if r["timestamp"].tzinfo is None
+                else r["timestamp"],
+            )
+            for r in reversed(records)
+        ]
+
+    async def get_bar_range(
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> tuple[datetime, datetime, int] | None:
+        """Return ``(first_ts, last_ts, count)`` of stored bars in range, or None if empty."""
+        pool = self._ensure_pool()
+
+        query = """
+            SELECT MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts, COUNT(*) AS n
+            FROM ts.ohlcv_1m
+            WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
+              AND ($4::timestamptz IS NULL OR timestamp >= $4::timestamptz)
+              AND ($5::timestamptz IS NULL OR timestamp <= $5::timestamptz)
+        """
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query, exchange_id, symbol, str(timeframe), start, end)
+
+        if row is None or not row["n"]:
+            return None
+        first, last = row["first_ts"], row["last_ts"]
+        return (
+            first.replace(tzinfo=UTC) if first.tzinfo is None else first,
+            last.replace(tzinfo=UTC) if last.tzinfo is None else last,
+            int(row["n"]),
+        )
+
     # ------------------------------------------------------------------
     # Funding rates
     # ------------------------------------------------------------------

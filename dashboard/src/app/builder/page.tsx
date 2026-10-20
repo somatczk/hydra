@@ -15,6 +15,8 @@ import { StrategyNameDialog } from '@/components/builder/StrategyNameDialog';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useToast } from '@/components/ui/Toast';
 import { fetchApi } from '@/lib/api';
+import { describeApiError } from '@/lib/apiState';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
 import type {
   BuilderState,
@@ -331,6 +333,7 @@ function BuilderPageContent() {
   const [comparators, setComparators] = useState<ComparatorSchema[]>(DEFAULT_COMPARATORS);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [availableModels, setAvailableModels] = useState<{ id: string; name: string }[]>([]);
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [mlOverlayOpen, setMlOverlayOpen] = useState(false);
   const [strategyType, setStrategyType] = useState<'rule' | 'dca' | 'grid'>('rule');
   const [dcaConfig, setDcaConfig] = useState({
@@ -357,27 +360,42 @@ function BuilderPageContent() {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [indData, compData, modelsData] = await Promise.all([
-          fetchApi<IndicatorSchema[]>('/api/strategies/indicators').catch(() => null),
-          fetchApi<ComparatorSchema[]>('/api/strategies/comparators').catch(() => null),
-          fetchApi<{ id: string; name: string; stage?: string }[]>('/api/models')
-            .then((models) => models?.filter((m) => !m.stage || (m.stage !== 'Archived' && m.stage !== 'Training')) ?? null)
-            .catch(() => null),
+        const [indResult, compResult, modelsResult] = await Promise.allSettled([
+          fetchApi<IndicatorSchema[]>('/api/strategies/indicators'),
+          fetchApi<ComparatorSchema[]>('/api/strategies/comparators'),
+          fetchApi<{ id: string; name: string; stage?: string }[]>('/api/models'),
         ]);
-        if (indData && indData.length > 0) setIndicators(indData);
-        if (compData && compData.length > 0) setComparators(compData);
-        if (modelsData) setAvailableModels(modelsData);
+        if (indResult.status === 'fulfilled' && indResult.value.length > 0) setIndicators(indResult.value);
+        if (compResult.status === 'fulfilled' && compResult.value.length > 0) setComparators(compResult.value);
+        if (modelsResult.status === 'fulfilled') {
+          setAvailableModels(
+            modelsResult.value.filter((m) => !m.stage || (m.stage !== 'Archived' && m.stage !== 'Training')),
+          );
+        }
+        const failed = [
+          indResult.status === 'rejected' ? ['indicators', indResult.reason] : null,
+          compResult.status === 'rejected' ? ['comparators', compResult.reason] : null,
+        ].filter((f): f is [string, unknown] => f !== null);
+        if (failed.length > 0) {
+          const detail = failed.map(([what, err]) => `${what}: ${describeApiError(err, 'unavailable')}`).join('; ');
+          logger.warn('Builder', 'Builder catalogue unavailable', detail);
+          toast('warning', `Using built-in indicator list; server catalogue unavailable (${detail})`);
+        }
+        if (modelsResult.status === 'rejected') {
+          toast('warning', `ML models unavailable: ${describeApiError(modelsResult.reason, 'request failed')}`);
+        }
       } catch (err) {
         logger.warn('Builder', 'Failed to fetch indicators/comparators', err);
       }
     };
     fetchData();
-  }, []);
+  }, [toast]);
 
   /* Load strategy from URL param ?strategy={id} */
   useEffect(() => {
     const strategyId = searchParams.get('strategy');
     if (!strategyId) return;
+    setLoadError(null);
     fetchApi<StrategyDetail>(`/api/strategies/${strategyId}`)
       .then((detail) => {
         dispatch({ type: 'LOAD_STRATEGY', payload: detail });
@@ -386,7 +404,8 @@ function BuilderPageContent() {
       })
       .catch((err) => {
         logger.error('Builder', 'Failed to load strategy', err);
-        toast('error', `Failed to load strategy: ${err instanceof Error ? err.message : 'not found'}`);
+        setLoadError(err);
+        toast('error', `Failed to load strategy: ${describeApiError(err, 'not found')}`);
       });
   }, [searchParams, toast]);
 
@@ -416,6 +435,12 @@ function BuilderPageContent() {
           Build trading strategies visually using indicators and conditions
         </p>
       </div>
+
+      {loadError !== null && (
+        <div data-testid="load-error">
+          <DataStateErrorCard error={loadError} fallback="Failed to load strategy" />
+        </div>
+      )}
 
       {/* Strategy type tabs */}
       <div className="flex gap-1 rounded-lg border border-border-default bg-bg-secondary p-1">

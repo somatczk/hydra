@@ -22,7 +22,6 @@ def strategies_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "config" / "strategies"
     path.mkdir(parents=True)
     monkeypatch.setattr("hydra.dashboard.routes.strategies._CONFIG_DIR", path)
-    monkeypatch.setattr("hydra.dashboard.routes.backtest._STRATEGY_CONFIG_DIR", path)
     monkeypatch.setattr("hydra.dashboard.routes.templates._STRATEGIES_DIR", path)
     monkeypatch.setattr("hydra.execution.session_manager._STRATEGY_DIR", path)
     monkeypatch.setenv("HYDRA_ML__MODELS_DIR", str(tmp_path / "models"))

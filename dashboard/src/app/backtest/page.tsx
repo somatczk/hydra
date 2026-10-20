@@ -12,6 +12,9 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import { ErrorCard } from '@/components/ui/ErrorCard';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { ProvenanceBadge, type DataProvenance } from '@/components/backtest/DataProvenance';
+import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -27,7 +30,8 @@ interface BacktestRun {
   maxDrawdown: string;
   sharpe: string;
   status: string;
-  statusVariant: 'success' | 'warning' | 'info' | 'neutral';
+  statusVariant: 'success' | 'warning' | 'info' | 'neutral' | 'error';
+  provenance: DataProvenance | null;
 }
 
 interface ApiBacktestResult {
@@ -36,6 +40,8 @@ interface ApiBacktestResult {
   period: string;
   status: string;
   name: string;
+  strategy_id?: string | null;
+  provenance?: DataProvenance | null;
   metrics: {
     total_trades: number;
     win_rate: number;
@@ -48,6 +54,30 @@ interface ApiBacktestResult {
 interface StrategyOption {
   id: string;
   name: string;
+  primary_timeframe?: string | null;
+}
+
+interface TaskStatus {
+  status: string;
+  progress: number;
+  error?: string | null;
+  fetch_error?: string | null;
+}
+
+const TIMEFRAME_OPTIONS = [
+  { value: '1m', label: '1 Minute' },
+  { value: '5m', label: '5 Minutes' },
+  { value: '15m', label: '15 Minutes' },
+  { value: '1h', label: '1 Hour' },
+  { value: '4h', label: '4 Hours' },
+  { value: '1d', label: '1 Day' },
+  { value: '1w', label: '1 Week' },
+];
+
+function statusDisplay(status: string): Pick<BacktestRun, 'status' | 'statusVariant'> {
+  if (status === 'completed') return { status: 'Completed', statusVariant: 'success' };
+  if (status === 'failed') return { status: 'Failed', statusVariant: 'error' };
+  return { status: 'Running', statusVariant: 'info' };
 }
 
 /* ---------- Helpers ---------- */
@@ -68,8 +98,8 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
       pnl: pnlStr,
       maxDrawdown: m.max_drawdown > 0 ? `${m.max_drawdown}%` : 'N/A',
       sharpe: m.sharpe_ratio > 0 ? m.sharpe_ratio.toFixed(2) : 'N/A',
-      status: r.status === 'completed' ? 'Completed' : 'Running',
-      statusVariant: r.status === 'completed' ? 'success' : 'info',
+      ...statusDisplay(r.status),
+      provenance: r.provenance ?? null,
     };
   });
 }
@@ -81,6 +111,9 @@ function BacktestPageContent() {
   const searchParams = useSearchParams();
   const { toast } = useToast();
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([]);
+  const [resultsError, setResultsError] = useState<unknown>(null);
+  const [runError, setRunError] = useState<unknown>(null);
+  const [runFailure, setRunFailure] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [strategies, setStrategies] = useState<StrategyOption[]>([]);
@@ -113,8 +146,10 @@ function BacktestPageContent() {
     try {
       const data = await fetchApi<ApiBacktestResult[]>('/api/backtest/results');
       setBacktestRuns(mapApiResults(data));
-    } catch {
-      /* API unavailable */
+      setResultsError(null);
+    } catch (err) {
+      logger.warn('Backtest', 'Failed to load backtest results', err);
+      setResultsError(err);
     } finally {
       setLoading(false);
     }
@@ -130,11 +165,12 @@ function BacktestPageContent() {
         if (data.length > 0) {
           setStrategies(data);
           const param = searchParams.get('strategy');
-          if (param && data.some((s) => s.id === param)) {
-            setStrategyId(param);
-          } else if (!data.some((s) => s.id === strategyId)) {
-            setStrategyId(data[0].id);
-          }
+          const chosen = param && data.some((s) => s.id === param)
+            ? param
+            : data.some((s) => s.id === strategyId) ? strategyId : data[0].id;
+          setStrategyId(chosen);
+          const primary = data.find((s) => s.id === chosen)?.primary_timeframe;
+          if (primary) setTimeframe(primary);
         }
       })
       .catch((err) => {
@@ -148,7 +184,7 @@ function BacktestPageContent() {
     if (!pollingTaskId) return;
     const interval = setInterval(async () => {
       try {
-        const status = await fetchApi<{ status: string; progress: number }>(`/api/backtest/status/${pollingTaskId}`);
+        const status = await fetchApi<TaskStatus>(`/api/backtest/status/${pollingTaskId}`);
         setProgress(Math.round(status.progress));
         if (status.status === 'completed' || status.status === 'failed') {
           clearInterval(interval);
@@ -158,17 +194,26 @@ function BacktestPageContent() {
           fetchResults();
           if (status.status === 'completed') {
             toast('success', 'Backtest completed');
+            if (status.fetch_error) toast('warning', `Fresh data fetch failed: ${status.fetch_error}`);
           } else {
-            toast('error', 'Backtest failed');
-            logger.error('Backtest', 'Backtest failed');
+            const reason = status.error || 'no reason reported';
+            setRunFailure(`Backtest failed: ${reason}`);
+            toast('error', `Backtest failed: ${reason}`);
+            logger.error('Backtest', 'Backtest failed', reason);
           }
         }
-      } catch {
-        logger.warn('Backtest', 'Polling failed, stopping');
+      } catch (err) {
+        logger.warn('Backtest', 'Polling failed, stopping', err);
         clearInterval(interval);
         setPollingTaskId(null);
         setRunning(false);
         setProgress(0);
+        const lost = parseErrorDetail(err)?.state === 'not_found';
+        setRunFailure(
+          lost
+            ? 'The backtest task is no longer known to the server (it may have restarted).'
+            : describeApiError(err, 'Lost contact with the backtest task'),
+        );
       }
     }, 1500);
     return () => clearInterval(interval);
@@ -176,6 +221,8 @@ function BacktestPageContent() {
 
   const handleRunBacktest = async () => {
     setRunning(true);
+    setRunError(null);
+    setRunFailure(null);
     try {
       const result = await fetchApi<{ task_id: string }>('/api/backtest/run', {
         method: 'POST',
@@ -197,19 +244,28 @@ function BacktestPageContent() {
       }
     } catch (err) {
       logger.error('Backtest', 'Failed to start backtest', err);
-      toast('error', 'Failed to start backtest');
+      setRunError(err);
+      toast('error', describeApiError(err, 'Failed to start backtest'));
       setRunning(false);
     }
   };
 
-  // Auto-run backtest when navigating from Save & Backtest
+  const handleStrategyChange = (id: string) => {
+    setStrategyId(id);
+    const primary = strategies.find((s) => s.id === id)?.primary_timeframe;
+    if (primary) setTimeframe(primary);
+  };
+
+  // Auto-run from Save & Backtest only once the strategy list has applied its primary timeframe
   useEffect(() => {
     if (autorunTriggered.current) return;
     if (searchParams.get('autorun') !== 'true') return;
-    if (!strategyId || running) return;
+    const requested = searchParams.get('strategy');
+    if (!requested || strategyId !== requested || running) return;
+    if (!strategies.some((s) => s.id === requested)) return;
     autorunTriggered.current = true;
     handleRunBacktest();
-  }, [strategyId]);
+  }, [strategyId, strategies]);
 
   const handleDelete = async (id: string) => {
     try {
@@ -247,6 +303,11 @@ function BacktestPageContent() {
     },
     { key: 'maxDrawdown', header: 'Max DD', hideOnMobile: true },
     { key: 'sharpe', header: 'Sharpe', hideOnMobile: true },
+    {
+      key: 'data',
+      header: 'Data',
+      render: (row: BacktestRun) => <ProvenanceBadge provenance={row.provenance} />,
+    },
     {
       key: 'status',
       header: 'Status',
@@ -299,28 +360,30 @@ function BacktestPageContent() {
             label="Strategy"
             options={strategies.map((s) => ({ value: s.id, label: s.name }))}
             value={strategyId}
-            onChange={(e) => setStrategyId(e.target.value)}
+            onChange={(e) => handleStrategyChange(e.target.value)}
             placeholder="Select strategy..."
           />
           <Select
             label="Timeframe"
-            options={[
-              { value: '1m', label: '1 Minute' },
-              { value: '5m', label: '5 Minutes' },
-              { value: '15m', label: '15 Minutes' },
-              { value: '30m', label: '30 Minutes' },
-              { value: '1h', label: '1 Hour' },
-              { value: '4h', label: '4 Hours' },
-              { value: '1d', label: '1 Day' },
-            ]}
+            options={TIMEFRAME_OPTIONS}
             value={timeframe}
             onChange={(e) => setTimeframe(e.target.value)}
           />
           <Input label="Start Date" type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
           <Input label="End Date" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
           <Input label="Initial Capital ($)" type="number" value={initialCapital} onChange={(e) => setInitialCapital(e.target.value)} />
-          <Input label="Name (optional)" type="text" value={backtestName} onChange={(e) => setBacktestName(e.target.value)} placeholder="e.g. LSTM Q1 run" />
+          <Input label="Name (optional)" type="text" value={backtestName} onChange={(e) => setBacktestName(e.target.value)} placeholder="e.g. Q1 BTC 1h" />
         </div>
+        {runError !== null && (
+          <div className="mt-4" data-testid="run-error">
+            <DataStateErrorCard error={runError} fallback="Failed to start backtest" />
+          </div>
+        )}
+        {runFailure && (
+          <div className="mt-4" data-testid="run-failure">
+            <ErrorCard message={runFailure} />
+          </div>
+        )}
         <div className="mt-4 flex flex-col gap-3">
           <div className="flex gap-3 sm:flex-row">
             <Button variant="primary" onClick={handleRunBacktest} disabled={running}>
@@ -360,12 +423,16 @@ function BacktestPageContent() {
 
       {/* Results table */}
       <DataCard title="Backtest History" description="Previous backtest runs">
+        {resultsError !== null ? (
+          <DataStateErrorCard error={resultsError} fallback="Failed to load backtest results" onRetry={fetchResults} />
+        ) : (
         <Table
           columns={columns}
           data={backtestRuns}
           keyExtractor={(row) => row.id}
           loading={loading}
         />
+        )}
       </DataCard>
     </div>
   );

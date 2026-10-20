@@ -9,6 +9,8 @@ import { Input } from '@/components/ui/Input';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
+import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { describeApiError, stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -26,8 +28,8 @@ interface StrategyPerformance {
   total_pnl: number;
   win_rate: number;
   total_trades: number;
-  sharpe_ratio: number;
-  max_drawdown: number;
+  sharpe_ratio: number | null;
+  max_drawdown: number | null;
 }
 
 interface Strategy {
@@ -40,6 +42,7 @@ interface Strategy {
   editable: boolean;
   session: TradingSession | null;
   performance: StrategyPerformance | null;
+  performanceError: unknown;
 }
 
 interface BuilderStrategy {
@@ -66,6 +69,7 @@ function mapBuilderStrategies(
   data: BuilderStrategy[],
   sessions: TradingSession[],
   perfMap: Record<string, StrategyPerformance>,
+  perfErrors: Record<string, unknown>,
 ): Strategy[] {
   return data.map((s) => {
     const session = sessions.find(
@@ -82,6 +86,7 @@ function mapBuilderStrategies(
       editable: s.editable,
       session,
       performance: perfMap[s.id] ?? null,
+      performanceError: perfErrors[s.id] ?? null,
     };
   });
 }
@@ -106,6 +111,12 @@ function fmtPnl(v: number): string {
   return `${sign}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
 }
 
+function sharpeClass(v: number | null): string {
+  if (v === null) return 'text-text-muted';
+  if (v >= 1) return 'text-status-success';
+  return v >= 0 ? 'text-text-primary' : 'text-status-error';
+}
+
 /* ---------- Page ---------- */
 
 export default function StrategiesPage() {
@@ -116,8 +127,11 @@ export default function StrategiesPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [startingId, setStartingId] = useState<string | null>(null);
   const [stoppingId, setStoppingId] = useState<string | null>(null);
-  const [tradingMode, setTradingMode] = useState<string>('paper');
-  const [paperCapital, setPaperCapital] = useState<number>(10000);
+  const [tradingMode, setTradingMode] = useState<string | null>(null);
+  const [paperCapital, setPaperCapital] = useState<number | null>(null);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [sessionsError, setSessionsError] = useState<unknown>(null);
+  const [configError, setConfigError] = useState<unknown>(null);
   const [capitalMap, setCapitalMap] = useState<Record<string, string>>({});
   const [riskOverridesOpen, setRiskOverridesOpen] = useState<string | null>(null);
   const [riskOverrides, setRiskOverrides] = useState<Record<string, RiskOverrides>>({});
@@ -127,43 +141,52 @@ export default function StrategiesPage() {
   const fetchData = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [stratData, sessData, cfg] = await Promise.all([
-        fetchApi<BuilderStrategy[]>('/api/strategies').catch(() => [] as BuilderStrategy[]),
-        fetchApi<TradingSession[]>('/api/trading/sessions').catch(() => [] as TradingSession[]),
-        fetchApi<{ trading_mode: string; paper_capital?: number }>('/api/system/config').catch(() => null),
+      const [stratResult, sessResult, cfgResult] = await Promise.allSettled([
+        fetchApi<BuilderStrategy[]>('/api/strategies'),
+        fetchApi<TradingSession[]>('/api/trading/sessions'),
+        fetchApi<{ trading_mode: string; paper_capital?: number }>('/api/system/config'),
       ]);
+      if (stratResult.status === 'rejected') {
+        logger.warn('Strategies', 'Failed to fetch strategies', stratResult.reason);
+        setLoadError(stratResult.reason);
+        setStrategies([]);
+        return;
+      }
+      setLoadError(null);
+      const stratData = stratResult.value;
+      const sessData = sessResult.status === 'fulfilled' ? sessResult.value : [];
+      setSessionsError(sessResult.status === 'rejected' ? sessResult.reason : null);
+      const cfg = cfgResult.status === 'fulfilled' ? cfgResult.value : null;
+      setConfigError(cfgResult.status === 'rejected' ? cfgResult.reason : null);
 
       // Fetch performance for each strategy in parallel
-      const perfEntries = await Promise.all(
-        stratData.map((s) =>
-          fetchApi<StrategyPerformance>(`/api/strategies/${s.id}/performance`)
-            .then((perf) => [s.id, perf] as const)
-            .catch(() => [s.id, null] as const)
-        ),
+      const perfEntries = await Promise.allSettled(
+        stratData.map((s) => fetchApi<StrategyPerformance>(`/api/strategies/${s.id}/performance`)),
       );
       const perfMap: Record<string, StrategyPerformance> = {};
-      for (const [id, perf] of perfEntries) {
-        if (perf) perfMap[id] = perf;
-      }
-
-      setStrategies(mapBuilderStrategies(stratData, sessData, perfMap));
-      const effectiveCapital = cfg?.paper_capital ?? 10000;
-      if (cfg) {
-        setTradingMode(cfg.trading_mode);
-        if (cfg.paper_capital) setPaperCapital(cfg.paper_capital);
-      }
-      // Initialize capital for new strategies (don't overwrite user edits)
-      setCapitalMap((prev) => {
-        const next = { ...prev };
-        for (const s of stratData) {
-          if (!(s.id in next)) {
-            next[s.id] = String(effectiveCapital);
-          }
-        }
-        return next;
+      const perfErrors: Record<string, unknown> = {};
+      perfEntries.forEach((entry, i) => {
+        const id = stratData[i].id;
+        if (entry.status === 'fulfilled') perfMap[id] = entry.value;
+        else perfErrors[id] = entry.reason;
       });
-    } catch (err) {
-      logger.warn('Strategies', 'Failed to fetch strategies', err);
+
+      setStrategies(mapBuilderStrategies(stratData, sessData, perfMap, perfErrors));
+      setTradingMode(cfg ? cfg.trading_mode : null);
+      setPaperCapital(cfg?.paper_capital ?? null);
+      const configuredCapital = cfg?.paper_capital;
+      // Initialize capital for new strategies (don't overwrite user edits)
+      if (configuredCapital) {
+        setCapitalMap((prev) => {
+          const next = { ...prev };
+          for (const s of stratData) {
+            if (!(s.id in next)) {
+              next[s.id] = String(configuredCapital);
+            }
+          }
+          return next;
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -182,7 +205,7 @@ export default function StrategiesPage() {
       fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to toggle strategy', err);
-      toast('error', 'Failed to toggle strategy');
+      toast('error', describeApiError(err, 'Failed to toggle strategy'));
     }
   };
 
@@ -195,15 +218,19 @@ export default function StrategiesPage() {
       fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to delete strategy', err);
-      toast('error', `Failed to delete: ${err instanceof Error ? err.message : 'unknown error'}`);
+      toast('error', `Failed to delete: ${describeApiError(err, 'unknown error')}`);
     } finally {
       setDeletingId(null);
     }
   };
 
   const handleStartPaper = async (strategyId: string) => {
+    const capital = parseFloat(capitalMap[strategyId] ?? '') || paperCapital;
+    if (!capital || capital <= 0) {
+      toast('error', 'Enter the paper capital to start a session');
+      return;
+    }
     setStartingId(strategyId);
-    const capital = parseFloat(capitalMap[strategyId]) || paperCapital;
     try {
       await fetchApi('/api/trading/sessions', {
         method: 'POST',
@@ -217,7 +244,7 @@ export default function StrategiesPage() {
       fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to start paper session', err);
-      toast('error', `Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
+      toast('error', `Failed to start: ${describeApiError(err, 'unknown error')}`);
     } finally {
       setStartingId(null);
     }
@@ -238,7 +265,7 @@ export default function StrategiesPage() {
       fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to start live session', err);
-      toast('error', `Failed to start: ${err instanceof Error ? err.message : 'unknown error'}`);
+      toast('error', `Failed to start: ${describeApiError(err, 'unknown error')}`);
     } finally {
       setStartingId(null);
     }
@@ -252,7 +279,7 @@ export default function StrategiesPage() {
       fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to stop session', err);
-      toast('error', `Failed to stop: ${err instanceof Error ? err.message : 'unknown error'}`);
+      toast('error', `Failed to stop: ${describeApiError(err, 'unknown error')}`);
     } finally {
       setStoppingId(null);
     }
@@ -269,19 +296,10 @@ export default function StrategiesPage() {
       try {
         const cfg = await fetchApi<RiskOverrides>(`/api/risk/config/${strategyId}`);
         setRiskOverrides((prev) => ({ ...prev, [strategyId]: cfg }));
-      } catch {
-        // No overrides yet — use defaults
-        setRiskOverrides((prev) => ({
-          ...prev,
-          [strategyId]: {
-            max_position_pct: 0.10,
-            max_risk_per_trade: 0.02,
-            max_portfolio_heat: 0.06,
-            max_daily_loss_pct: 0.03,
-            max_drawdown_pct: 0.15,
-            max_concurrent_positions: 10,
-          },
-        }));
+      } catch (err) {
+        logger.warn('Strategies', 'Failed to load risk overrides', err);
+        toast('error', describeApiError(err, 'Failed to load risk overrides'));
+        setRiskOverridesOpen(null);
       }
     }
   };
@@ -307,7 +325,7 @@ export default function StrategiesPage() {
       toast('success', 'Risk overrides saved');
     } catch (err) {
       logger.error('Strategies', 'Failed to save risk overrides', err);
-      toast('error', 'Failed to save risk overrides');
+      toast('error', describeApiError(err, 'Failed to save risk overrides'));
     } finally {
       setSavingRisk(null);
     }
@@ -343,7 +361,7 @@ export default function StrategiesPage() {
       fetchData(true);
     } catch (err) {
       logger.error('Strategies', 'Failed to import strategy', err);
-      toast('error', `Import failed: ${err instanceof Error ? err.message : 'invalid file'}`);
+      toast('error', `Import failed: ${describeApiError(err, 'invalid file')}`);
     }
   };
 
@@ -353,7 +371,11 @@ export default function StrategiesPage() {
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm text-text-muted">
-            {loading ? 'Loading...' : `${strategies.filter((s) => s.status === 'Active').length} active strategies`}
+            {loading
+              ? 'Loading...'
+              : loadError !== null
+                ? 'Strategies unavailable'
+                : `${strategies.filter((s) => s.status === 'Active').length} active strategies`}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -385,6 +407,20 @@ export default function StrategiesPage() {
           </Button>
         </div>
       </div>
+
+      {loadError !== null && (
+        <DataStateErrorCard error={loadError} fallback="Failed to load strategies" onRetry={() => fetchData()} />
+      )}
+      {sessionsError !== null && (
+        <div data-testid="sessions-error">
+          <DataStateErrorCard error={sessionsError} fallback="Trading sessions unavailable; session controls are hidden" />
+        </div>
+      )}
+      {configError !== null && (
+        <div data-testid="config-error">
+          <DataStateErrorCard error={configError} fallback="System config unavailable; trading mode and capital are unknown" />
+        </div>
+      )}
 
       {/* Strategy cards grid */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -430,6 +466,15 @@ export default function StrategiesPage() {
             </div>
 
             {/* Performance metrics */}
+            {strategy.performanceError !== null && (
+              <div className="mt-3 flex items-center gap-2 text-xs text-text-muted" data-testid="performance-error">
+                <DataStateBadge
+                  state={stateFromError(strategy.performanceError)}
+                  reason={describeApiError(strategy.performanceError, 'Performance unavailable')}
+                />
+                Performance: {describeApiError(strategy.performanceError, 'unavailable')}
+              </div>
+            )}
             {strategy.performance && (
               <div className="mt-3 grid grid-cols-5 gap-2 rounded-lg border border-border-default bg-bg-secondary p-2.5">
                 <div className="text-center">
@@ -456,15 +501,18 @@ export default function StrategiesPage() {
                 <div className="text-center">
                   <p className={cn(
                     'text-sm font-bold',
-                    strategy.performance.sharpe_ratio >= 1 ? 'text-status-success' : strategy.performance.sharpe_ratio >= 0 ? 'text-text-primary' : 'text-status-error',
+                    sharpeClass(strategy.performance.sharpe_ratio),
                   )}>
-                    {strategy.performance.sharpe_ratio.toFixed(2)}
+                    {strategy.performance.sharpe_ratio === null ? '—' : strategy.performance.sharpe_ratio.toFixed(2)}
                   </p>
                   <p className="text-[10px] text-text-muted">Sharpe</p>
                 </div>
                 <div className="text-center">
-                  <p className="text-sm font-bold text-status-error">
-                    {strategy.performance.max_drawdown.toFixed(1)}%
+                  <p className={cn(
+                    'text-sm font-bold',
+                    strategy.performance.max_drawdown === null ? 'text-text-muted' : 'text-status-error',
+                  )}>
+                    {strategy.performance.max_drawdown === null ? '—' : `${strategy.performance.max_drawdown.toFixed(1)}%`}
                   </p>
                   <p className="text-[10px] text-text-muted">Max DD</p>
                 </div>
@@ -477,7 +525,7 @@ export default function StrategiesPage() {
                 <label className="text-xs text-text-muted whitespace-nowrap">Capital:</label>
                 <Input
                   type="number"
-                  value={capitalMap[strategy.id] ?? String(paperCapital)}
+                  value={capitalMap[strategy.id] ?? (paperCapital !== null ? String(paperCapital) : '')}
                   onChange={(e) =>
                     setCapitalMap((prev) => ({ ...prev, [strategy.id]: e.target.value }))
                   }
@@ -487,7 +535,7 @@ export default function StrategiesPage() {
             )}
 
             {/* Trading controls -- only show on Active strategies or when a session is running */}
-            {(strategy.status === 'Active' || strategy.session) && (
+            {sessionsError === null && (strategy.status === 'Active' || strategy.session) && (
               <div className="mt-3 flex items-center gap-2">
                 {strategy.session ? (
                   <>
