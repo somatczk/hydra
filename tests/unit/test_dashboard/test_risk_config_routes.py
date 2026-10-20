@@ -171,6 +171,7 @@ async def test_put_reload_propagates_to_risk_service() -> None:
     clock = Clock()
     svc = RiskService(_RowStore(row), clock=clock, market_rules=rules_cache(clock))
     await svc.load()
+    await svc.recovery_complete()
     ex = PaperTradingExecutor(initial_balances={"USDT": Decimal("10000")})
     await svc.register_session(
         "s1", ex, allocated=Decimal("10000"), symbols=["BTCUSDT"], exchange_id="binance"

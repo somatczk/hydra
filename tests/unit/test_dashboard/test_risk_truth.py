@@ -18,6 +18,7 @@ from hydra.dashboard.routes import risk
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.risk import router
 from hydra.risk.pretrade import RiskConfig
+from hydra.risk.state import RiskStateUnavailableError
 from tests.unit.test_risk.harness import Account, make_account
 
 _GLOBAL_ROW: dict[str, Any] = {
@@ -177,6 +178,64 @@ class TestReset:
             "anonymous",
         )
         assert tier2.store.state.peak_equity == Decimal("9480.0")
+
+    async def test_reset_not_persisted_is_503_and_rolled_back(
+        self, client: httpx.AsyncClient, tier2: Account
+    ) -> None:
+        tier2.store.save_state = AsyncMock(side_effect=OSError("db down"))
+        resp = await client.post(
+            "/api/risk/circuit-breakers/2/reset", json={"reason": "reviewed", "confirm_tier": 2}
+        )
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "reset_not_persisted"
+        assert (tier2.svc.account().tier, tier2.store.state.cb.tier) == (2, 2)
+        assert [e.kind for e in tier2.store.events[-2:]] == ["cb_reset", "cb_reset_failed"]
+
+
+class TestPaperAccountReset:
+    async def test_reset_rebases_ledger_and_keeps_tier(
+        self, client: httpx.AsyncClient, tier2: Account
+    ) -> None:
+        resp = await client.post(
+            "/api/risk/paper-account/reset", json={"reason": "fresh start", "confirm": "RESET"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert (body["equity"], body["peak_equity"], body["current_drawdown"]) == (
+            9480.0,
+            9480.0,
+            0.0,
+        )
+        assert body["restrictions"]["active_tier"] == 2
+        event = tier2.store.events[-1]
+        assert (event.kind, event.actor, event.reason) == (
+            "paper_reset",
+            "anonymous",
+            "fresh start",
+        )
+        assert event.details["old_peak"] == Decimal("10000")
+
+    @pytest.mark.parametrize(
+        "body",
+        [{"reason": "fresh start", "confirm": "reset"}, {"reason": "fresh start"}],
+    )
+    async def test_needs_typed_confirmation(
+        self, client: httpx.AsyncClient, tier2: Account, body: dict[str, Any]
+    ) -> None:
+        resp = await client.post("/api/risk/paper-account/reset", json=body)
+        assert resp.status_code == 422
+        assert "paper_reset" not in [e.kind for e in tier2.store.events]
+
+    async def test_audit_failure_is_503_and_changes_nothing(
+        self, client: httpx.AsyncClient, tier2: Account
+    ) -> None:
+        tier2.store.append_event = AsyncMock(side_effect=RiskStateUnavailableError("down"))
+        resp = await client.post(
+            "/api/risk/paper-account/reset", json={"reason": "fresh start", "confirm": "RESET"}
+        )
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "paper_reset_unavailable"
+        assert tier2.store.state.peak_equity == Decimal("10000")
 
 
 class TestRiskStatus:

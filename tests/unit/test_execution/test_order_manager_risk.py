@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import timedelta
 from decimal import Decimal
@@ -41,8 +42,22 @@ async def _holding_long(acct: Account) -> PaperTradingExecutor:
 Setup = Callable[[], Awaitable[Account]]
 
 
+def _trade_pnl(le: str | None = None) -> float | None:
+    """OrderManager's hydra_trade_pnl samples (strategy 's'); count, or the bucket <= le."""
+    labels = {"symbol": BTC, "strategy_id": "s"}
+    if le is None:
+        return REGISTRY.get_sample_value("hydra_trade_pnl_count", labels)
+    return REGISTRY.get_sample_value("hydra_trade_pnl_bucket", {**labels, "le": le})
+
+
 async def _heat() -> Account:
     return await make_account(permissive(max_portfolio_heat=Decimal("0.04")))
+
+
+async def _tier2() -> Account:
+    return await make_account(
+        permissive(), state=RiskState(cb=CircuitBreakerState(tier=2, tier_since=T0))
+    )
 
 
 async def _tier3() -> Account:
@@ -75,6 +90,7 @@ async def _rate_limited() -> Account:
 
 CONDITIONS: dict[str, tuple[Setup, str]] = {
     "gross_exposure": (_heat, "portfolio_heat"),
+    "cb_tier_2": (_tier2, "circuit_breaker"),
     "cb_tier_3": (_tier3, "circuit_breaker"),
     "cb_tier_4": (_tier4, "circuit_breaker"),
     "daily_halt": (_daily_halt, "daily_loss_halt"),
@@ -104,6 +120,7 @@ class TestExitNeverBlocked:
             "s1",
             Decimal("-100.00"),
         )
+        assert (_trade_pnl(), _trade_pnl("-100.0"), _trade_pnl("-200.0")) == (1.0, 1.0, 0.0)
 
     async def test_duplicate_reductions_both_fill(self) -> None:
         acct = await make_account(permissive())
@@ -118,6 +135,52 @@ class TestExitNeverBlocked:
         ex = await _holding_long(acct)
         assert await acct.submit("s1", SELL, "0.01")
         assert await ex.get_positions(BTC) == []
+
+
+class TestConcurrentExits:
+    async def test_two_reduce_only_exits_fill_once(self) -> None:
+        acct = await make_account(permissive())
+        ex = await _holding_long(acct)
+        results = await asyncio.gather(
+            acct.submit("s1", SELL, "0.01", reduce_only=True),
+            acct.submit("s1", SELL, "0.01", reduce_only=True),
+        )
+        assert sorted(r is None for r in results) == [False, True]
+        assert await ex.get_positions(BTC) == []
+        assert (await ex.get_balance())["USDT"] == Decimal("9900.00")
+        assert [f.quantity for f in acct.buses["s1"].fills] == [Decimal("0.01")]
+
+    async def test_second_unflagged_exit_is_an_opening_and_refused(self) -> None:
+        acct = await make_account(permissive())
+        ex = await _holding_long(acct)
+        results = await asyncio.gather(
+            acct.submit("s1", SELL, "0.01"),
+            acct.submit("s1", SELL, "0.01"),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(r, str) for r in results) == 1
+        errors = [(r.check, r.intent) for r in results if isinstance(r, RiskRejectedError)]
+        assert errors == [("spot_short", "open")]
+        assert await ex.get_positions(BTC) == []
+        assert (await ex.get_balance())["USDT"] == Decimal("9900.00")
+
+
+class TestRealizedPnl:
+    async def test_net_of_exit_and_pro_rata_entry_fee(self) -> None:
+        acct = await make_account(permissive())
+        await acct.add_session("s1", "10000", fee="0.001")
+        await acct.mark("50000")
+        assert await acct.submit("s1", BUY, "0.01")
+        await acct.mark("50100")
+        assert await acct.submit("s1", SELL, "0.01", reduce_only=True)
+        fill = acct.buses["s1"].fills[-1]
+        assert (fill.gross_pnl, fill.fee, fill.realized_pnl) == (
+            Decimal("1.0"),
+            Decimal("0.501"),
+            Decimal("-0.001"),
+        )
+        assert acct.store.state.consecutive_losses == 1
+        assert (_trade_pnl(), _trade_pnl("0.0"), _trade_pnl("-10.0")) == (1.0, 1.0, 0.0)
 
 
 class TestReduceOnlyClamp:

@@ -19,6 +19,10 @@ class RiskStateUnavailableError(RuntimeError):
     """Risk state, config or paper capital could not be read or written."""
 
 
+class RiskStateNotPersistedError(RiskStateUnavailableError):
+    """A manual change was audited but could not be saved, so it was rolled back."""
+
+
 @dataclass(slots=True)
 class RiskState:
     """Account-level state; None means 'not established yet' (never a fabricated number)."""
@@ -32,6 +36,7 @@ class RiskState:
     consecutive_losses: int = 0
     last_loss_at: datetime | None = None
     carried_pnl: Decimal = Decimal("0")
+    paper_capital: Decimal | None = None
     cb: CircuitBreakerState = field(default_factory=CircuitBreakerState)
 
 
@@ -137,8 +142,8 @@ class PgRiskStateStore:
                 row = await conn.fetchrow(
                     "SELECT equity, equity_at, peak_portfolio_value, current_drawdown, "
                     "daily_pnl_date, day_start_equity, consecutive_losses, last_loss_at, "
-                    "carried_pnl, cb_tier, cb_tier_since, cb_requires_review, daily_halt_until, "
-                    "consecutive_pause_until FROM risk_state WHERE scope = $1",
+                    "carried_pnl, paper_capital, cb_tier, cb_tier_since, cb_requires_review, "
+                    "daily_halt_until, consecutive_pause_until FROM risk_state WHERE scope = $1",
                     self._scope,
                 )
         except Exception as exc:
@@ -157,6 +162,7 @@ class PgRiskStateStore:
             consecutive_losses=int(row["consecutive_losses"] or 0),
             last_loss_at=row["last_loss_at"],
             carried_pnl=_dec(row["carried_pnl"], Decimal("0")) or Decimal("0"),
+            paper_capital=_dec(row["paper_capital"]),
             cb=CircuitBreakerState.from_row(row),
         )
 
@@ -175,7 +181,8 @@ class PgRiskStateStore:
                     "day_start_equity = $7, daily_pnl = $8, consecutive_losses = $9, "
                     "last_loss_at = $10, carried_pnl = $11, cb_tier = $12, cb_tier_since = $13, "
                     "cb_requires_review = $14, daily_halt_until = $15, "
-                    "consecutive_pause_until = $16, updated_at = now() WHERE scope = $1",
+                    "consecutive_pause_until = $16, paper_capital = $17, updated_at = now() "
+                    "WHERE scope = $1",
                     self._scope,
                     state.equity,
                     state.equity_at,
@@ -192,6 +199,7 @@ class PgRiskStateStore:
                     cb["cb_requires_review"],
                     cb["daily_halt_until"],
                     cb["consecutive_pause_until"],
+                    state.paper_capital,
                 )
         except Exception as exc:
             raise RiskStateUnavailableError(f"writing risk_state failed: {exc}") from exc
@@ -304,6 +312,7 @@ def _copy_state(state: RiskState) -> RiskState:
         consecutive_losses=state.consecutive_losses,
         last_loss_at=state.last_loss_at,
         carried_pnl=state.carried_pnl,
+        paper_capital=state.paper_capital,
         cb=CircuitBreakerState(
             tier=state.cb.tier,
             tier_since=state.cb.tier_since,

@@ -5,6 +5,11 @@ Account equity (the persistent paper ledger) = paper_capital + carried PnL of st
 Marks come from closed bars. Every breaker transition, reset and kill-switch change is written to
 risk_events and logged on 'hydra.audit'. If the state cannot be loaded or the last save failed,
 opening orders are refused ('risk state unavailable'); reducing orders still pass.
+
+After load() the service is recovering: breakers are not evaluated and openings are refused until
+the owner has re-registered every running session and called recovery_complete(). Breakers are
+also not evaluated while a held position has no mark, so a restart never values a position at
+its entry price against a peak that was built from marks.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from hydra.risk.sizing import size_entry
 from hydra.risk.state import (
     RiskEventRecord,
     RiskState,
+    RiskStateNotPersistedError,
     RiskStateStore,
     RiskStateUnavailableError,
 )
@@ -56,7 +62,9 @@ audit_logger = logging.getLogger("hydra.audit")
 
 QUOTE = "USDT"
 ENGINE_ACTOR = "risk_engine"
+SYSTEM_ACTOR = "system"
 RATE_WINDOW = timedelta(minutes=1)
+FLATTEN_RETRY = timedelta(minutes=1)
 
 
 class RiskExecutor(Protocol):
@@ -129,6 +137,22 @@ class _Session:
     openings: deque[datetime] = field(default_factory=deque)
 
 
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    equity: Decimal
+    gross: Decimal
+    per: dict[str, tuple[Decimal, list[Position], dict[str, Decimal]]]
+    unmarked: tuple[str, ...]
+
+    @property
+    def holding(self) -> bool:
+        return any(_is_held(p) for _, positions, _ in self.per.values() for p in positions)
+
+
+def _is_held(pos: Position) -> bool:
+    return pos.direction != Direction.FLAT and pos.quantity > 0
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -148,8 +172,8 @@ class RiskService:
         store: RiskStateStore,
         *,
         scope: str = "paper",
+        market_rules: MarketRulesCache,
         clock: Callable[[], datetime] = _utcnow,
-        market_rules: MarketRulesCache | None = None,
         lock_timeout: float = 5.0,
         on_must_flatten: FlattenCallback | None = None,
         on_kill_switch: KillSwitchCallback | None = None,
@@ -157,7 +181,7 @@ class RiskService:
         self._store = store
         self._scope = scope
         self._clock = clock
-        self._rules = market_rules or MarketRulesCache()
+        self._rules = market_rules
         self._lock_timeout = lock_timeout
         self.on_must_flatten = on_must_flatten
         self.on_kill_switch = on_kill_switch
@@ -169,9 +193,14 @@ class RiskService:
         self._cb = CircuitBreakerManager(_cb_config(self._config))
         self._state = RiskState()
         self._paper_capital: Decimal | None = None
+        self._pending_capital: Decimal | None = None
+        self._pending_actor = SYSTEM_ACTOR
         self._kill_switch = False
         self._loaded = False
+        self._recovered = False
         self._persist_ok = True
+        self._flattening = False
+        self._last_flatten: datetime | None = None
         self._sessions: dict[str, _Session] = {}
         self._marks: dict[tuple[str, str], Decimal] = {}
         self._mark_ts: dict[tuple[str, str], datetime] = {}
@@ -193,8 +222,20 @@ class RiskService:
     def paper_capital(self) -> Decimal | None:
         return self._paper_capital
 
+    @property
+    def recovering(self) -> bool:
+        return not self._recovered
+
+    @property
+    def pending_paper_capital(self) -> Decimal | None:
+        return self._pending_capital
+
     async def load(self) -> None:
-        """Read config, paper capital and persisted state; raises RiskStateUnavailableError."""
+        """Read config, paper capital and persisted state; raises RiskStateUnavailableError.
+
+        A paper_capital that differs from the one the persisted ledger was built on is held as
+        pending and applied through the audited paper reset once recovery is complete.
+        """
         try:
             loaded = await self._store.load_config()
             state = await self._store.load_state()
@@ -205,7 +246,12 @@ class RiskService:
                 raise
             raise RiskStateUnavailableError(str(exc)) from exc
         self._apply_config(loaded.config)
-        self._paper_capital = loaded.paper_capital
+        if state.paper_capital is None:
+            state.paper_capital = loaded.paper_capital
+        self._paper_capital = state.paper_capital
+        if loaded.paper_capital != state.paper_capital:
+            self._pending_capital = loaded.paper_capital
+            self._pending_actor = SYSTEM_ACTOR
         self._state = state
         self._cb = CircuitBreakerManager(_cb_config(loaded.config), state.cb)
         self._kill_switch = self._kill_switch or loaded.kill_switch
@@ -219,8 +265,12 @@ class RiskService:
         self._pretrade = PreTradeRiskManager(cfg)
         self._cb.reconfigure(_cb_config(cfg))
 
-    async def reload_config(self, actor: str = "system") -> None:
-        """Re-read risk_config and paper_capital; a paper_capital change rebases the ledger."""
+    async def reload_config(self, actor: str = SYSTEM_ACTOR) -> None:
+        """Re-read risk_config and paper_capital; a paper_capital change rebases the ledger.
+
+        The rebase is the audited paper reset; it waits while recovering or while a held
+        position has no mark (openings are refused meanwhile). Store errors propagate.
+        """
         if not self._loaded:
             await self.load()
             await self.evaluate()
@@ -230,15 +280,33 @@ class RiskService:
         if loaded.kill_switch and not self._kill_switch:
             self._kill_switch = True
             metrics.set_kill_switch_active(True)
-        if self._paper_capital is not None and loaded.paper_capital != self._paper_capital:
-            await self.reset_paper_account(
-                actor=actor,
-                reason=f"paper_capital changed {self._paper_capital} -> {loaded.paper_capital}",
-                paper_capital=loaded.paper_capital,
-            )
+        if loaded.paper_capital == self._paper_capital:
+            self._pending_capital = None
         else:
-            self._paper_capital = loaded.paper_capital
-            await self.evaluate()
+            self._pending_capital = loaded.paper_capital
+            self._pending_actor = actor
+            if await self._apply_pending_capital():
+                return
+        await self.evaluate()
+
+    async def recovery_complete(self) -> list[Transition]:
+        """Every running session is re-registered: start evaluating (idempotent)."""
+        self._recovered = True
+        return await self.evaluate()
+
+    async def _apply_pending_capital(self) -> bool:
+        """Run the pending paper_capital rebase once equity can be trusted; True when done."""
+        pending = self._pending_capital
+        if pending is None or not self._recovered or not self._loaded:
+            return False
+        if (await self._account()).unmarked:
+            return False
+        await self.reset_paper_account(
+            actor=self._pending_actor,
+            reason=f"paper_capital changed {self._paper_capital} -> {pending}",
+            paper_capital=pending,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Sessions
@@ -259,15 +327,16 @@ class RiskService:
             raise ValueError(f"allocated capital must be > 0, got {allocated}")
         syms = [str(s) for s in symbols]
         rules = await self._rules.get(exchange_id, syms)
-        self._sessions[session_id] = _Session(
-            session_id=session_id,
-            executor=executor,
-            allocated=allocated,
-            symbols=syms,
-            exchange_id=exchange_id,
-            strategy_id=strategy_id,
-            rules=rules,
-        )
+        async with self._state_lock:
+            self._sessions[session_id] = _Session(
+                session_id=session_id,
+                executor=executor,
+                allocated=allocated,
+                symbols=syms,
+                exchange_id=exchange_id,
+                strategy_id=strategy_id,
+                rules=rules,
+            )
 
     async def unregister_session(self, session_id: str, actor: str = ENGINE_ACTOR) -> Decimal:
         """Remove a session and carry its PnL (equity - allocated) into the account."""
@@ -308,17 +377,22 @@ class RiskService:
             equity += signed * price
         return equity, positions, balances
 
-    async def _account(
-        self,
-    ) -> tuple[Decimal, Decimal, dict[str, tuple[Decimal, list[Position], dict[str, Decimal]]]]:
+    async def _account(self) -> _Snapshot:
         per: dict[str, tuple[Decimal, list[Position], dict[str, Decimal]]] = {}
         equity = (self._paper_capital or Decimal("0")) + self._state.carried_pnl
         gross = Decimal("0")
-        for sid, session in self._sessions.items():
+        unmarked: list[str] = []
+        for sid, session in list(self._sessions.items()):
             per[sid] = await self._session_equity(session)
+            marks = self._marks_for(session.exchange_id)
             equity += per[sid][0] - session.allocated
-            gross += gross_exposure(per[sid][1], self._marks_for(session.exchange_id))
-        return equity, gross, per
+            gross += gross_exposure(per[sid][1], marks)
+            unmarked += [
+                f"{sid}:{p.symbol}"
+                for p in per[sid][1]
+                if _is_held(p) and str(p.symbol) not in marks
+            ]
+        return _Snapshot(equity, gross, per, tuple(unmarked))
 
     # ------------------------------------------------------------------
     # Marks, fills and breaker evaluation
@@ -357,12 +431,26 @@ class RiskService:
             self._state.consecutive_losses = 0
 
     async def evaluate(self) -> list[Transition]:
-        """Recompute equity, drawdown and daily loss; update breakers; persist; act."""
+        """Recompute equity, drawdown and daily loss; update breakers; persist; act.
+
+        Skipped while recovering, while a paper_capital change is pending and while a held
+        position has no mark.
+        """
+        if not self._loaded or not self._recovered:
+            return []
+        if self._pending_capital is not None:
+            try:
+                await self._apply_pending_capital()
+            except Exception:
+                logger.exception("Pending paper_capital rebase failed; openings stay refused")
+            return []
         async with self._state_lock:
-            if not self._loaded:
-                return []
             now = self._clock()
-            equity, gross, _ = await self._account()
+            snap = await self._account()
+            if snap.unmarked:
+                logger.info("Breakers not evaluated: no mark yet for %s", ", ".join(snap.unmarked))
+                return []
+            equity, gross = snap.equity, snap.gross
             st = self._state
             st.equity = equity
             st.equity_at = now
@@ -390,38 +478,55 @@ class RiskService:
             await self._save()
             self._publish_metrics(equity, gross, start)
         await self._audit_transitions(transitions)
-        await self._act(transitions)
+        await self._act(transitions, snap.holding)
         return transitions
 
-    async def _act(self, transitions: list[Transition]) -> None:
+    async def _act(self, transitions: list[Transition], holding: bool) -> None:
+        """Tier 4 latches the kill switch; tier >= 3 flattens on escalation and, while
+        positions are still held, again every FLATTEN_RETRY (failed flatten, restart)."""
         escalations = [t for t in transitions if t.kind == "cb_escalate"]
-        if not escalations:
-            return
-        top = max(t.tier for t in escalations)
+        top = max((t.tier for t in escalations), default=0)
         if top >= 4:
             await self.activate_kill_switch(
                 ENGINE_ACTOR, f"circuit breaker tier 4: drawdown {self._state.current_drawdown:.4f}"
             )
-        if top >= 3 and self.on_must_flatten is not None:
-            failures = await self.on_must_flatten(f"circuit breaker tier {top}")
+        tier = self._cb.state.tier
+        now = self._clock()
+        retry_due = holding and (
+            self._last_flatten is None or now - self._last_flatten >= FLATTEN_RETRY
+        )
+        if (
+            tier >= 3
+            and self.on_must_flatten is not None
+            and not self._flattening
+            and (top >= 3 or retry_due)
+        ):
+            self._flattening = True
+            self._last_flatten = now
+            try:
+                failures = await self.on_must_flatten(f"circuit breaker tier {tier}")
+            finally:
+                self._flattening = False
             if failures:
                 await self._audit(
                     "flatten_failed",
                     ENGINE_ACTOR,
                     "tier flatten left positions",
-                    top,
+                    tier,
                     {"failures": list(failures)},
                 )
         if top >= 4 and self.on_kill_switch is not None:
             await self.on_kill_switch(f"circuit breaker tier {top}")
 
-    async def _save(self) -> None:
+    async def _save(self, *, required: bool = False) -> None:
         try:
             await self._store.save_state(self._state)
         except Exception:
             self._persist_ok = False
             metrics.record_risk_state_persist_failure()
             logger.exception("Risk state not persisted; opening orders are refused until it is")
+            if required:
+                raise
             return
         self._persist_ok = True
 
@@ -459,11 +564,11 @@ class RiskService:
     async def snapshot(self, session_id: str) -> PortfolioState:
         session = self._sessions[session_id]
         now = self._clock()
-        equity, _, per = await self._account()
-        sleeve, positions, balances = per[session_id]
-        account_positions = [p for value in per.values() for p in value[1]]
+        snap = await self._account()
+        sleeve, positions, balances = snap.per[session_id]
+        account_positions = [p for value in snap.per.values() for p in value[1]]
         return PortfolioState(
-            portfolio_value=equity,
+            portfolio_value=snap.equity,
             positions=positions,
             balances=balances,
             marks=self._marks_for(session.exchange_id),
@@ -495,6 +600,15 @@ class RiskService:
         if session_id not in self._sessions:
             return RiskDecision(
                 False, "unknown_session", f"session {session_id!r} not registered", OPEN
+            )
+        if not self._recovered:
+            return RiskDecision(False, "risk_state", "risk state recovering", OPEN)
+        if self._pending_capital is not None:
+            return RiskDecision(
+                False,
+                "risk_state",
+                f"paper_capital change to {self._pending_capital} pending",
+                OPEN,
             )
         state = await self.snapshot(session_id)
         return self._pretrade.evaluate(order, state, OPEN)
@@ -569,65 +683,82 @@ class RiskService:
     async def reset_breaker(self, tier: int, *, actor: str, reason: str, confirm_tier: int) -> None:
         """Clear the active tier and rebase the high-water mark to current equity.
 
-        Raises ValueError (bad tier or confirmation), TierNotActiveError, or the store's error
-        when the audit row cannot be written; in every failure the breaker state is unchanged.
+        Raises ValueError (bad tier or confirmation), TierNotActiveError, the store's error when
+        the audit row cannot be written, or RiskStateNotPersistedError when the reset cannot be
+        saved (then rolled back and recorded as cb_reset_failed). On every failure the
+        breaker state is unchanged.
         """
         if tier not in range(1, 5):
             raise ValueError(f"tier must be 1-4, got {tier}")
         if confirm_tier != tier:
             raise ValueError(f"confirm_tier {confirm_tier} does not match tier {tier}")
-        self._cb.reset_check(tier)
-        st = self._state
-        await self._audit(
-            "cb_reset",
-            actor,
-            reason,
-            tier,
-            {"old_peak": st.peak_equity, "new_peak": st.equity, "drawdown": st.current_drawdown},
-            required=True,
-        )
         async with self._state_lock:
+            self._cb.reset_check(tier)
+            st = self._state
+            old_cb = self._cb.snapshot_state()
+            old_peak, old_dd = st.peak_equity, st.current_drawdown
+            await self._audit(
+                "cb_reset",
+                actor,
+                reason,
+                tier,
+                {"old_peak": old_peak, "new_peak": st.equity, "drawdown": old_dd},
+                required=True,
+            )
             self._cb.reset(tier)
             st.peak_equity = st.equity
             st.current_drawdown = Decimal("0")
             st.cb = self._cb.state
-            await self._save()
+            try:
+                await self._save(required=True)
+            except Exception as exc:
+                self._cb.restore(old_cb)
+                st.cb = self._cb.state
+                st.peak_equity, st.current_drawdown = old_peak, old_dd
+                await self._audit("cb_reset_failed", actor, reason, tier, {"error": str(exc)})
+                raise RiskStateNotPersistedError(f"breaker reset not persisted: {exc}") from exc
             metrics.set_circuit_breaker_tier(self._scope, self._cb.state.tier)
 
     async def reset_paper_account(
         self, *, actor: str, reason: str, paper_capital: Decimal | None = None
     ) -> None:
-        """Rebase the ledger: carried PnL 0, peak and day start at current equity, breakers cleared.
+        """Rebase the ledger only: carried PnL 0, peak and day start at current equity.
 
-        The audit row is written first; if it fails nothing changes.
+        Applies a pending paper_capital change. Breakers (tier, manual review, daily halt, loss
+        pause) and the loss streak are untouched; tiers are cleared only by reset_breaker. The
+        audit row is written first; if it fails nothing changes. Raises RiskStateUnavailableError
+        while recovering or while a held position has no mark.
         """
-        st = self._state
-        new_capital = paper_capital if paper_capital is not None else self._paper_capital
-        await self._audit(
-            "paper_reset",
-            actor,
-            reason,
-            self._cb.state.tier,
-            {
-                "old_capital": self._paper_capital,
-                "new_capital": new_capital,
-                "old_equity": st.equity,
-                "old_peak": st.peak_equity,
-                "old_carried": st.carried_pnl,
-            },
-            required=True,
-        )
+        if not self._recovered:
+            raise RiskStateUnavailableError("risk state recovering; paper reset refused")
         async with self._state_lock:
+            if (await self._account()).unmarked:
+                raise RiskStateUnavailableError("a held position has no mark; paper reset refused")
+            st = self._state
+            new_capital = paper_capital or self._pending_capital or self._paper_capital
+            await self._audit(
+                "paper_reset",
+                actor,
+                reason,
+                self._cb.state.tier,
+                {
+                    "old_capital": self._paper_capital,
+                    "new_capital": new_capital,
+                    "old_equity": st.equity,
+                    "old_peak": st.peak_equity,
+                    "old_carried": st.carried_pnl,
+                },
+                required=True,
+            )
             self._paper_capital = new_capital
+            self._pending_capital = None
+            st.paper_capital = new_capital
             st.carried_pnl = Decimal("0")
-            equity, _, _ = await self._account()
+            equity = (await self._account()).equity
             st.peak_equity = equity
             st.day_start_equity = equity
             st.day = self._clock().astimezone(UTC).date()
             st.current_drawdown = Decimal("0")
-            st.consecutive_losses = 0
-            self._cb.clear()
-            st.cb = self._cb.state
         await self.evaluate()
 
     # ------------------------------------------------------------------

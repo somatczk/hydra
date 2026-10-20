@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
@@ -204,6 +204,30 @@ class TestTiers:
         assert svc.account().tier == 0
         assert svc.account().drawdown == Decimal("0")
 
+    async def test_reset_that_cannot_be_persisted_is_rolled_back(self) -> None:
+        acct, _ = await _tiered_account()
+        await acct.mark("49500")
+        svc = acct.svc
+        acct.store.save_state = AsyncMock(side_effect=ConnectionError("db down"))
+
+        with pytest.raises(RiskStateUnavailableError, match="not persisted"):
+            await svc.reset_breaker(3, actor="alice", reason="reviewed", confirm_tier=3)
+        view = svc.account()
+        assert (view.tier, view.peak_equity, view.drawdown) == (
+            3,
+            Decimal("10000"),
+            Decimal("0.105"),
+        )
+        assert svc.breakers()[2].requires_manual_review is True
+        assert acct.store.state.cb.tier == 3
+        assert svc.available is False
+        assert _kinds(acct)[-2:] == ["cb_reset", "cb_reset_failed"]
+        assert acct.store.events[-1].details == {"error": "db down"}
+
+        restarted = RiskService(acct.store, clock=acct.clock, market_rules=rules_cache(acct.clock))
+        await restarted.load()
+        assert restarted.account().tier == 3
+
 
 class TestAggregateExposure:
     async def test_gross_exposure_across_sessions(self) -> None:
@@ -268,6 +292,7 @@ class TestFailClosed:
         svc = RiskService(acct.store, clock=acct.clock, market_rules=rules_cache(acct.clock))
         with pytest.raises(RiskStateUnavailableError, match="db down"):
             await svc.load()
+        await svc.recovery_complete()
         acct.svc = svc
         await acct.add_session("s1", "10000")
         await acct.mark("60000")
@@ -318,7 +343,7 @@ class TestLedger:
 
         restarted = RiskService(acct.store, clock=acct.clock, market_rules=rules_cache(acct.clock))
         await restarted.load()
-        await restarted.evaluate()
+        await restarted.recovery_complete()
         assert restarted.account().carried_pnl == Decimal("-300.0")
         assert restarted.account().equity == Decimal("9700.0")
         assert restarted.account().peak_equity == Decimal("10000")
@@ -341,6 +366,9 @@ class TestLedger:
         await acct.mark("60000")
         await _buy_direct(acct, "s1", "0.1")
         await acct.mark("57000")
+        assert acct.svc.account().tier == 1
+        halt = acct.svc.restrictions().daily_halt_until
+        assert halt is not None
 
         acct.store.paper_capital = Decimal("20000")
         acct.store.config = permissive(max_position_pct=Decimal("0.01"))
@@ -350,7 +378,227 @@ class TestLedger:
         view = acct.svc.account()
         assert view.equity == view.peak_equity == view.day_start_equity == Decimal("19700.0")
         assert view.carried_pnl == Decimal("0")
-        assert (await _rejected(acct, "s1", BUY, "0.01")).check == "position_size"
+        assert acct.store.state.paper_capital == Decimal("20000")
+        assert (view.tier, view.restrictions.daily_halt_until) == (1, halt)
+        assert (await _rejected(acct, "s1", BUY, "0.01")).check == "daily_loss_halt"
+
+
+def _latched(tier: int) -> RiskState:
+    return RiskState(
+        peak_equity=Decimal("10000"),
+        paper_capital=Decimal("10000"),
+        cb=CircuitBreakerState(
+            tier=tier,
+            tier_since=T0,
+            requires_manual_review=True,
+            daily_halt_until=T0 + timedelta(hours=10),
+            consecutive_pause_until=T0 + timedelta(hours=2),
+        ),
+    )
+
+
+class TestPaperReset:
+    @pytest.mark.parametrize("tier", [3, 4])
+    async def test_capital_change_rebases_ledger_but_keeps_breakers(self, tier: int) -> None:
+        acct = await make_account(permissive(), state=_latched(tier))
+        before = acct.svc.restrictions()
+        acct.store.paper_capital = Decimal("10001")
+        await acct.svc.reload_config(actor="anonymous")
+
+        assert _kinds(acct) == ["paper_reset"]
+        assert acct.svc.account().peak_equity == Decimal("10001")
+        assert acct.svc.restrictions() == before
+        assert acct.store.state.cb == _latched(tier).cb
+        assert acct.store.state.cb.requires_manual_review is True
+        await acct.add_session("s1", "10000")
+        await acct.mark("60000")
+        assert (await _rejected(acct, "s1", BUY, "0.001")).check == "circuit_breaker"
+
+    async def test_explicit_reset_needs_recovery(self) -> None:
+        acct = await make_account(permissive(), recover=False)
+        with pytest.raises(RiskStateUnavailableError, match="recovering"):
+            await acct.svc.reset_paper_account(actor="ops", reason="fresh start")
+        assert acct.store.events == []
+
+
+class TestRestart:
+    async def _marked_up_account(self) -> tuple[Account, list[str]]:
+        """A and B 5000 each; B long 0.08 BTC from 50000, marked at 80000: equity 12400."""
+        flattens: list[str] = []
+
+        async def flatten(reason: str) -> list[str]:
+            flattens.append(reason)
+            return []
+
+        acct = await make_account(permissive(), on_must_flatten=flatten)
+        await acct.add_session("A", "5000")
+        await acct.add_session("B", "5000")
+        await acct.mark("50000")
+        await _buy_direct(acct, "B", "0.08")
+        await acct.mark("80000")
+        assert acct.store.state.peak_equity == Decimal("12400.00")
+        return acct, flattens
+
+    async def _restart(self, acct: Account, flattens: list[str], *sids: str) -> RiskService:
+        async def flatten(reason: str) -> list[str]:
+            flattens.append(reason)
+            return []
+
+        svc = RiskService(
+            acct.store,
+            clock=acct.clock,
+            market_rules=rules_cache(acct.clock),
+            on_must_flatten=flatten,
+        )
+        await svc.load()
+        for sid in sids:
+            await svc.register_session(
+                sid,
+                acct.executors[sid],
+                allocated=Decimal("5000"),
+                symbols=[BTC],
+                exchange_id="binance",
+            )
+        return svc
+
+    async def test_no_phantom_drawdown_before_recovery_and_marks(self) -> None:
+        acct, flattens = await self._marked_up_account()
+        svc = await self._restart(acct, flattens, "A", "B")
+
+        await svc.reload_config()
+        decision = await svc.check(order(BUY, "0.001"), "A", OPEN)
+        assert (decision.approved, decision.reason) == (False, "risk state recovering")
+
+        await svc.recovery_complete()
+        assert (svc.account().tier, svc.account().equity) == (0, Decimal("12400.00"))
+        await svc.on_mark("binance", BTC, Decimal("80000"), T0)
+        view = svc.account()
+        assert (view.equity, view.peak_equity, view.tier) == (
+            Decimal("12400.00"),
+            Decimal("12400.00"),
+            0,
+        )
+        assert (svc.kill_switch_active(), flattens) == (False, [])
+        assert "cb_escalate" not in _kinds(acct)
+
+    async def test_marks_before_recovery_do_not_evaluate(self) -> None:
+        acct, flattens = await self._marked_up_account()
+        svc = await self._restart(acct, flattens, "A")
+        await svc.on_mark("binance", BTC, Decimal("80000"), T0)
+        assert (svc.account().tier, svc.kill_switch_active(), flattens) == (0, False, [])
+        assert acct.store.state.peak_equity == Decimal("12400.00")
+
+    async def test_capital_cut_while_down_is_an_audited_reset_not_a_drawdown(self) -> None:
+        acct = await make_account(permissive())
+        assert acct.store.state.paper_capital == Decimal("10000")
+        acct.store.paper_capital = Decimal("5000")
+
+        svc = RiskService(acct.store, clock=acct.clock, market_rules=rules_cache(acct.clock))
+        await svc.load()
+        assert (svc.paper_capital, svc.pending_paper_capital) == (Decimal("10000"), Decimal("5000"))
+        await svc.recovery_complete()
+
+        assert _kinds(acct) == ["paper_reset"]
+        reset = acct.store.events[-1]
+        assert (reset.actor, reset.details["old_capital"], reset.details["new_capital"]) == (
+            "system",
+            Decimal("10000"),
+            Decimal("5000"),
+        )
+        view = svc.account()
+        assert (view.tier, view.peak_equity, view.equity) == (0, Decimal("5000"), Decimal("5000"))
+        assert svc.kill_switch_active() is False
+
+    async def test_capital_raise_while_down_is_audited_and_keeps_tier(self) -> None:
+        state = RiskState(
+            equity=Decimal("8800"),
+            peak_equity=Decimal("10000"),
+            current_drawdown=Decimal("0.12"),
+            carried_pnl=Decimal("-1200"),
+            paper_capital=Decimal("10000"),
+            cb=CircuitBreakerState(tier=3, tier_since=T0, requires_manual_review=True),
+        )
+        acct = await make_account(permissive(), state=state, recover=False)
+        acct.store.paper_capital = Decimal("20000")
+        svc = RiskService(acct.store, clock=acct.clock, market_rules=rules_cache(acct.clock))
+        await svc.load()
+        await svc.recovery_complete()
+
+        assert _kinds(acct) == ["paper_reset"]
+        assert acct.store.events[-1].details["old_peak"] == Decimal("10000")
+        view = svc.account()
+        assert (view.peak_equity, view.carried_pnl, view.tier) == (Decimal("20000"), 0, 3)
+        assert acct.store.state.cb.requires_manual_review is True
+
+    async def test_capital_change_waits_for_marks(self) -> None:
+        acct, flattens = await self._marked_up_account()
+        acct.store.paper_capital = Decimal("6000")
+        svc = await self._restart(acct, flattens, "A", "B")
+        await svc.recovery_complete()
+        assert "paper_reset" not in _kinds(acct)
+        decision = await svc.check(order(BUY, "0.001"), "A", OPEN)
+        assert (decision.approved, decision.check) == (False, "risk_state")
+
+        await svc.on_mark("binance", BTC, Decimal("80000"), T0)
+        assert _kinds(acct)[-1] == "paper_reset"
+        assert svc.account().peak_equity == Decimal("8400.00")
+        assert svc.pending_paper_capital is None
+
+    async def test_register_during_evaluate(self) -> None:
+        acct = await make_account(permissive())
+        await acct.add_session("A", "5000")
+        await acct.add_session("B", "5000")
+        await acct.mark("60000")
+        task = asyncio.create_task(acct.svc.evaluate())
+        await asyncio.sleep(0)
+        await acct.add_session("C", "5000")
+        await task
+        assert acct.svc.registered_sessions() == ["A", "B", "C"]
+        assert (await acct.svc.evaluate()) == []
+        assert acct.svc.account().equity == Decimal("10000")
+
+
+class TestTier3Flatten:
+    async def test_failed_flatten_is_retried_while_positions_remain(self) -> None:
+        acct, calls = await _tiered_account()
+        await acct.mark("49500")
+        assert acct.svc.account().tier == 3
+        assert len(calls) == 1
+
+        await acct.mark("49400")
+        assert len(calls) == 1
+        acct.clock.advance(minutes=1)
+        await acct.mark("49300")
+        assert [reason for reason, _ in calls] == ["circuit breaker tier 3"] * 2
+
+    async def test_restart_at_tier3_flattens_after_recovery(self) -> None:
+        acct, calls = await _tiered_account()
+        await acct.mark("49500")
+        calls.clear()
+
+        async def flatten(reason: str) -> list[str]:
+            calls.append((reason, []))
+            return []
+
+        svc = RiskService(
+            acct.store,
+            clock=acct.clock,
+            market_rules=rules_cache(acct.clock),
+            on_must_flatten=flatten,
+        )
+        await svc.load()
+        for sid, capital in (("s1", "10000"), ("s2", "1000")):
+            await svc.register_session(
+                sid,
+                acct.executors[sid],
+                allocated=Decimal(capital),
+                symbols=[BTC],
+                exchange_id="binance",
+            )
+        await svc.on_mark("binance", BTC, Decimal("49500"), T0)
+        assert calls == []
+        await svc.recovery_complete()
+        assert calls == [("circuit breaker tier 3", [])]
 
 
 class TestKillSwitch:

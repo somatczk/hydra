@@ -211,7 +211,7 @@ describe('RiskPage live risk engine state', () => {
 });
 
 describe('RiskPage kill switch release', () => {
-  it('needs RELEASE typed before it sends the release', async () => {
+  it('needs RELEASE typed and a reason before it sends the release', async () => {
     const routes = baseRoutes();
     routes['/api/risk/config'] = { ...RISK_CONFIG, kill_switch_active: true };
     routes['/api/risk/live-status'] = {
@@ -228,11 +228,15 @@ describe('RiskPage kill switch release', () => {
     await click(buttonByText(page.container, 'Release Kill Switch'));
     expect(calls.filter((c) => c.init?.method === 'DELETE')).toEqual([]);
 
-    prompt.mockReturnValue('RELEASE');
+    prompt.mockReturnValueOnce('RELEASE').mockReturnValueOnce('  ');
+    await click(buttonByText(page.container, 'Release Kill Switch'));
+    expect(calls.filter((c) => c.init?.method === 'DELETE')).toEqual([]);
+
+    prompt.mockReturnValueOnce('RELEASE').mockReturnValueOnce(' post-mortem done ');
     await click(buttonByText(page.container, 'Release Kill Switch'));
     const deletes = calls.filter((c) => c.init?.method === 'DELETE');
     expect(deletes.map((c) => [c.path, JSON.parse(String(c.init?.body))])).toEqual([
-      ['/api/trading/kill-switch', { confirm: 'RELEASE' }],
+      ['/api/trading/kill-switch', { confirm: 'RELEASE', reason: 'post-mortem done' }],
     ]);
     prompt.mockRestore();
   });

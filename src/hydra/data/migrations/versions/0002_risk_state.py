@@ -4,7 +4,9 @@ Revision ID: 0002
 Revises: 0001
 Create Date: 2026-10-20
 
-Additive and idempotent. Seeds the 'paper' risk_state row the RiskService uses. The heat limit
+Additive and idempotent. Seeds the 'paper' risk_state row the RiskService uses; its
+paper_capital is the capital the ledger was built on, so a change made while the engine is down
+goes through the audited paper reset on the next start. The heat limit
 becomes a cross-session gross-exposure cap, so the untouched 0.06 default moves to 0.30; a value
 someone changed is kept.
 """
@@ -27,6 +29,7 @@ _STATEMENTS: tuple[str, ...] = (
         ADD COLUMN IF NOT EXISTS equity_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS day_start_equity NUMERIC(24,8),
         ADD COLUMN IF NOT EXISTS carried_pnl NUMERIC(24,8) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS paper_capital NUMERIC(24,8),
         ADD COLUMN IF NOT EXISTS cb_tier SMALLINT NOT NULL DEFAULT 0,
         ADD COLUMN IF NOT EXISTS cb_tier_since TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS cb_requires_review BOOLEAN NOT NULL DEFAULT FALSE,

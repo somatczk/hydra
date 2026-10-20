@@ -2,8 +2,8 @@
 
 The ``OrderManager`` sits between strategy signals and the exchange executor. Orders are
 classified as opening or reducing; reduce_only orders are clamped to the held position. With a
-RiskService, the account lock is held from the risk check through ``create_order``, and fill
-events are published after it is released.
+RiskService, the account lock is held from the position read (clamp and classification) through
+the risk check and ``create_order``, and fill events are published after it is released.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import replace
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol, runtime_checkable
 
 from hydra.core.events import (
     OrderCancelEvent,
@@ -25,6 +25,7 @@ from hydra.core.types import (
     OrderRequest,
     OrderStatus,
     Position,
+    Side,
 )
 from hydra.risk.pretrade import (
     OPEN,
@@ -104,14 +105,27 @@ def _dec(value: Any) -> Decimal | None:
     return Decimal(str(value))
 
 
-def _realized_pnl(resp: dict[str, Any], fee: Decimal) -> tuple[Decimal | None, Decimal | None]:
-    """(net, gross) PnL of a closing fill from the executor response."""
+def _realized_pnl(
+    resp: dict[str, Any], fee: Decimal, side: Side
+) -> tuple[Decimal | None, Decimal | None]:
+    """(net, gross) PnL of a closing fill from the executor response.
+
+    Without net_pnl, the pro-rata entry fee is taken at this fill's fee rate (exact for the
+    fixed-rate paper executor): entry notional = cost - gross on a sell, cost + gross on a buy.
+    """
     gross = _dec(resp.get("pnl"))
     for key in ("net_pnl", "realized_pnl"):
         net = _dec(resp.get(key))
         if net is not None:
             return net, gross
-    return (None, None) if gross is None else (gross - fee, gross)
+    if gross is None:
+        return None, None
+    cost = _dec(resp.get("cost"))
+    entry_fee = Decimal("0")
+    if cost is not None and cost > 0 and fee > 0:
+        entry_notional = cost - gross if side == Side.SELL else cost + gross
+        entry_fee = fee * entry_notional / cost
+    return gross - fee - entry_fee, gross
 
 
 # ---------------------------------------------------------------------------
@@ -193,14 +207,55 @@ class OrderManager:
                 )
             )
 
+        if self._risk is not None:
+            return await self._submit_with_risk(self._risk, order, now)
+
         positions: list[Position] | None = None
-        if order.reduce_only or self._risk is not None:
+        if order.reduce_only:
             positions = list(await self._executor.get_positions(str(order.symbol)))
         elif self._risk_checker is not None:
             if self._portfolio_state_builder is not None:
                 self._portfolio_state = await self._portfolio_state_builder()
             if isinstance(self._portfolio_state, PortfolioState):
                 positions = self._portfolio_state.positions
+        resolved = self._resolve(order, positions)
+        if resolved is None:
+            return None
+        order, intent = resolved
+        if intent == OPEN:
+            self._dedup(order, now)
+        await self._legacy_check(order, intent)
+        resp = await self._create(order)
+        return await self._track_and_publish(order, intent, resp, now)
+
+    async def _submit_with_risk(
+        self, risk: RiskService, order: OrderRequest, now: float
+    ) -> str | None:
+        """Positions are read, and the order clamped and classified, under the account lock."""
+        slot: Intent = REDUCE if order.reduce_only else OPEN
+        try:
+            async with risk.order_slot(slot):
+                positions = list(await self._executor.get_positions(str(order.symbol)))
+                resolved = self._resolve(order, positions)
+                if resolved is None:
+                    return None
+                order, intent = resolved
+                if intent == OPEN:
+                    self._dedup(order, now)
+                decision = await risk.check(order, self._session_id, intent)
+                if not decision.approved:
+                    self._reject(decision)
+                resp = await self._create(order)
+                if intent == OPEN:
+                    risk.record_opening(self._session_id)
+        except RiskLockTimeoutError as exc:
+            self._reject(RiskDecision(False, "lock_timeout", str(exc), slot))
+        return await self._track_and_publish(order, intent, resp, now)
+
+    def _resolve(
+        self, order: OrderRequest, positions: list[Position] | None
+    ) -> tuple[OrderRequest, Intent] | None:
+        """Clamp a reduce_only order to the held position (None: nothing to reduce); classify."""
         if order.reduce_only:
             held = next(
                 (
@@ -218,39 +273,23 @@ class OrderManager:
             if order.quantity > held.quantity:
                 order = replace(order, quantity=held.quantity)
         intent: Intent = classify_intent(order, positions) if positions is not None else OPEN
+        return order, intent
 
-        if intent == OPEN:
-            key = _dedup_key(order)
-            if key in self._dedup_cache and now - self._dedup_cache[key] < self._dedup_window:
-                self._reject(
-                    RiskDecision(
-                        False,
-                        "duplicate",
-                        f"Duplicate order rejected (same symbol+side+quantity within "
-                        f"{self._dedup_window}s window)",
-                        OPEN,
-                    )
+    def _dedup(self, order: OrderRequest, now: float) -> None:
+        key = _dedup_key(order)
+        if key in self._dedup_cache and now - self._dedup_cache[key] < self._dedup_window:
+            self._reject(
+                RiskDecision(
+                    False,
+                    "duplicate",
+                    f"Duplicate order rejected (same symbol+side+quantity within "
+                    f"{self._dedup_window}s window)",
+                    OPEN,
                 )
-            self._dedup_cache[key] = now
+            )
+        self._dedup_cache[key] = now
 
-        if self._risk is not None:
-            try:
-                async with self._risk.order_slot(intent):
-                    decision = await self._risk.check(order, self._session_id, intent)
-                    if not decision.approved:
-                        self._reject(decision)
-                    resp = await self._create(order)
-                    if intent == OPEN:
-                        self._risk.record_opening(self._session_id)
-            except RiskLockTimeoutError as exc:
-                self._reject(RiskDecision(False, "lock_timeout", str(exc), intent))
-        else:
-            await self._legacy_check(order, intent)
-            resp = await self._create(order)
-
-        return await self._track_and_publish(order, intent, resp, now)
-
-    def _reject(self, decision: RiskDecision) -> None:
+    def _reject(self, decision: RiskDecision) -> NoReturn:
         record_risk_rejection(decision.check, decision.intent)
         logger.warning(
             "Order rejected (%s, %s): %s", decision.check, decision.intent, decision.reason
@@ -299,7 +338,9 @@ class OrderManager:
             else:
                 fee = Decimal("0")
                 fee_currency = ""
-            realized, gross = _realized_pnl(resp, fee) if intent == REDUCE else (None, None)
+            realized, gross = (
+                _realized_pnl(resp, fee, order.side) if intent == REDUCE else (None, None)
+            )
             await self._event_bus.publish(
                 OrderFillEvent(
                     order_id=order_id,
@@ -328,6 +369,7 @@ class OrderManager:
                     str(order.side),
                     order.strategy_id,
                     order.exchange_id,
+                    pnl=None if realized is None else float(realized),
                 )
                 observe_order_fill_latency(time.monotonic() - started)
             except Exception:

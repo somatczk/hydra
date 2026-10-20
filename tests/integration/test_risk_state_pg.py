@@ -50,6 +50,7 @@ async def pool(fresh_database: str) -> AsyncIterator[asyncpg.Pool]:
 async def _service(pool: asyncpg.Pool, clock: Clock) -> RiskService:
     svc = RiskService(PgRiskStateStore(pool), clock=clock, market_rules=rules_cache(clock))
     await svc.load()
+    await svc.recovery_complete()
     return svc
 
 
@@ -114,7 +115,11 @@ async def test_state_survives_restart_without_resetting_peak(pool: asyncpg.Pool)
         legacy = await conn.fetchrow(
             "SELECT peak_portfolio_value, consecutive_losses FROM risk_state WHERE scope = 'global'"
         )
+        basis = await conn.fetchval("SELECT paper_capital FROM risk_state WHERE scope = 'paper'")
     assert tuple(legacy) == (Decimal("0"), 0)
+    assert basis is not None
+    assert basis == restarted.paper_capital
+    assert restarted.pending_paper_capital is None
 
 
 async def test_kill_switch_and_audit_trail_persist(pool: asyncpg.Pool) -> None:

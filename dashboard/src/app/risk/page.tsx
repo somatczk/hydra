@@ -353,17 +353,23 @@ export default function RiskPage() {
 
   // Unknown state only offers activation: it is the fail-safe direction.
   const handleKillSwitch = async () => {
+    let releaseReason = '';
     if (killSwitchActive !== true) {
       if (!confirm('ACTIVATE KILL SWITCH?\n\nThis will immediately stop ALL trading sessions. Are you sure?')) return;
-    } else if (window.prompt('Type RELEASE to allow trading to resume') !== 'RELEASE') {
-      return;
+    } else {
+      if (window.prompt('Type RELEASE to allow trading to resume') !== 'RELEASE') return;
+      releaseReason = (window.prompt('Reason for releasing the kill switch (audited)') ?? '').trim();
+      if (releaseReason.length < 3) {
+        toast('error', 'A reason of at least 3 characters is required to release the kill switch');
+        return;
+      }
     }
     setKillSwitchLoading(true);
     try {
       if (killSwitchActive === true) {
         await fetchApi('/api/trading/kill-switch', {
           method: 'DELETE',
-          body: JSON.stringify({ confirm: 'RELEASE' }),
+          body: JSON.stringify({ confirm: 'RELEASE', reason: releaseReason }),
         });
         setKillSwitchActive(false);
         toast('success', 'Kill switch deactivated');

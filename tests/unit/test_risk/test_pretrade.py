@@ -159,6 +159,16 @@ class TestOpeningChecks:
         assert (ok, check) == (False, "position_size")
         assert _check(_order("0.003"), state)[0] is True
 
+    def test_tier1_halves_the_position_cap(self) -> None:
+        tier1 = _state(
+            restrictions=CircuitBreakerRestrictions(tier=1, position_size_multiplier=Decimal("0.5"))
+        )
+        assert _check(_order("0.015"), _state())[0] is True
+        ok, check, reason = _check(_order("0.015"), tier1)
+        assert (ok, check) == (False, "position_size")
+        assert "(500.00" in reason
+        assert _check(_order("0.008"), tier1)[0] is True
+
     def test_risk_per_trade_only_with_stop(self) -> None:
         cfg = {"max_risk_per_trade": Decimal("0.02")}
         assert _check(_order("0.01"), _state(), **cfg)[0] is True

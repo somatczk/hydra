@@ -111,12 +111,12 @@ class Account:
     buses: dict[str, FillBus] = field(default_factory=dict)
     bar: int = 0
 
-    async def add_session(self, sid: str, capital: str) -> PaperTradingExecutor:
+    async def add_session(self, sid: str, capital: str, *, fee: str = "0") -> PaperTradingExecutor:
         ex = YieldingPaperExecutor(
             exchange_id="binance",
             initial_balances={"USDT": Decimal(capital)},
             slippage_pct=Decimal("0"),
-            fee_pct=Decimal("0"),
+            fee_pct=Decimal(fee),
             session_id=sid,
         )
         for sym in (BTC, "ETHUSDT"):
@@ -166,6 +166,7 @@ async def make_account(
     state: RiskState | None = None,
     kill_switch: bool = False,
     clock: Clock | None = None,
+    recover: bool = True,
     **kw: Any,
 ) -> Account:
     clock = clock or Clock()
@@ -177,4 +178,6 @@ async def make_account(
     )
     svc = RiskService(store, clock=clock, market_rules=rules_cache(clock), **kw)
     await svc.load()
+    if recover:
+        await svc.recovery_complete()
     return Account(svc=svc, store=store, clock=clock)

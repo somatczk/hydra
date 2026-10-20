@@ -16,7 +16,11 @@ from hydra.dashboard.routes._db import (
 )
 from hydra.risk.circuit_breakers import CircuitBreakerRestrictions, TierNotActiveError
 from hydra.risk.service import RiskService
-from hydra.risk.state import RiskStateUnavailableError, fetch_risk_events
+from hydra.risk.state import (
+    RiskStateNotPersistedError,
+    RiskStateUnavailableError,
+    fetch_risk_events,
+)
 
 router = APIRouter(prefix="/api/risk", tags=["risk"])
 logger = logging.getLogger(__name__)
@@ -103,6 +107,13 @@ class BreakerResetRequest(BaseModel):
 
     reason: str = Field(min_length=3, max_length=500)
     confirm_tier: int
+
+
+class PaperResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=3, max_length=500)
+    confirm: Literal["RESET"]
 
 
 class RiskEventModel(BaseModel):
@@ -345,6 +356,14 @@ async def reset_circuit_breaker(
         ) from exc
     except ValueError as exc:
         raise api_error(422, "invalid_reset", str(exc), "invalid") from exc
+    except RiskStateNotPersistedError as exc:
+        logger.exception("Circuit breaker reset not persisted; rolled back")
+        raise api_error(
+            503,
+            "reset_not_persisted",
+            "The reset could not be saved and was rolled back; the breaker is unchanged",
+            "unavailable",
+        ) from exc
     except _STORE_ERRORS as exc:
         logger.exception("Circuit breaker reset not audited; state unchanged")
         raise api_error(
@@ -354,6 +373,27 @@ async def reset_circuit_breaker(
             "unavailable",
         ) from exc
     return _breakers(svc)
+
+
+@router.post("/paper-account/reset", response_model=RiskStatus)
+async def reset_paper_account(body: PaperResetRequest, request: Request) -> RiskStatus:
+    """Rebase the paper ledger (peak, day start, carried PnL) to current equity; audited first.
+
+    Breaker tiers, halts and pauses are untouched (reset those through the breaker reset).
+    """
+    svc = _require_risk(request)
+    try:
+        await svc.reset_paper_account(actor=_actor(request), reason=body.reason)
+    except _STORE_ERRORS as exc:
+        logger.exception("Paper account reset refused or not audited")
+        raise api_error(
+            503,
+            "paper_reset_unavailable",
+            "The paper account was not reset: risk state is recovering, a held position has no "
+            "mark yet, or the audit log could not be written",
+            "unavailable",
+        ) from exc
+    return await get_risk_status(request)
 
 
 @router.get("/events", response_model=list[RiskEventModel])

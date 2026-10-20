@@ -365,11 +365,17 @@ class PreTradeRiskManager:
     ) -> tuple[str, str] | None:
         notional = order.quantity * self._ref(order, state)
         sleeve = self._sleeve(state)
-        cap = self._config.max_position_pct * sleeve
+        multiplier = (
+            state.restrictions.position_size_multiplier
+            if state.restrictions is not None
+            else Decimal("1")
+        )
+        cap = self._config.max_position_pct * multiplier * sleeve
         if sleeve <= 0 or notional > cap:
             return "position_size", (
                 f"position notional {notional:f} exceeds max_position_pct "
-                f"{self._config.max_position_pct} of sleeve equity {sleeve} ({cap:f})"
+                f"{self._config.max_position_pct} x size multiplier {multiplier} "
+                f"of sleeve equity {sleeve} ({cap:f})"
             )
         return None
 

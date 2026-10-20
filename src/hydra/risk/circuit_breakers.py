@@ -319,9 +319,9 @@ class CircuitBreakerManager:
         self._state.tier_since = None
         self._state.requires_manual_review = False
 
-    def clear(self) -> None:
-        """Paper-account reset: every breaker back to its initial state."""
-        self._state = CircuitBreakerState()
+    def restore(self, state: CircuitBreakerState) -> None:
+        """Put back a state taken with snapshot_state (a reset that could not be persisted)."""
+        self._state = replace(state)
 
     def snapshot_state(self) -> CircuitBreakerState:
         return replace(self._state)
