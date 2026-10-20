@@ -32,7 +32,8 @@ not duplicate it here; update that table in the PR that changes a row.
 
 ## Tech stack
 - **Python**: CI (`.python-version`) and images run 3.14; `requires-python = ">=3.12"` and ruff/mypy target 3.12; the
-  ML image uses 3.12. uv is pinned to 0.13.3 (`[tool.uv] required-version`, setup-uv, Dockerfiles);
+  ML image uses 3.12. uv is pinned to 0.13.3 (setup-uv, Dockerfiles); `[tool.uv] required-version >=0.12.18` refuses
+  older uvs that rewrite `uv.lock` while still admitting Dependabot's bundled uv;
   `tests/unit/test_repo/test_toolchain_pins.py` keeps the pins in agreement.
 - **Backend**: FastAPI + uvicorn, raw asyncpg with inline DDL in `src/hydra/dashboard/api.py`, pydantic. SQLAlchemy
   and alembic are declared but not used at runtime.
