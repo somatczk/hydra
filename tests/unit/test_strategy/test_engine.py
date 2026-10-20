@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 import yaml
 
 from hydra.core.config import HydraConfig
@@ -228,11 +229,11 @@ def _closed(tf: Timeframe, i: int, *, replay: bool = False) -> BarEvent:
 
 
 async def _engine(
-    *cfgs: StrategyConfig,
+    *cfgs: StrategyConfig, max_bars: int | None = None
 ) -> tuple[InMemoryEventBus, StrategyContext, StrategyEngine]:
     _CALLS.clear()
     bus = InMemoryEventBus()
-    ctx = StrategyContext()
+    ctx = StrategyContext(max_bars=max_bars)
     engine = StrategyEngine(config=HydraConfig(), event_bus=bus, context=ctx)
     for cfg in cfgs:
         await engine.load_strategy_from_config(cfg)
@@ -301,3 +302,21 @@ class TestClosedBarRouting:
 
         await bus.publish(_closed(Timeframe.H1, 500))
         assert _CALLS["w"] == [(Timeframe.H1, _T0 + timedelta(hours=500), 501)]
+
+    async def test_warm_up_refuses_more_bars_than_the_context_keeps(self) -> None:
+        _, ctx, engine = await _engine(_recording_cfg("cap"), max_bars=1000)
+        bars = [_closed(Timeframe.H1, i).ohlcv for i in range(1200)]
+        with pytest.raises(
+            ValueError, match="1200 warm-up bars exceed the context's max_bars=1000"
+        ):
+            await engine.warm_up({("BTCUSDT", Timeframe.H1): [b for b in bars if b is not None]})
+        assert ctx.bars("BTCUSDT", Timeframe.H1, 10_000) == []
+
+    async def test_late_replay_bar_lands_in_order(self) -> None:
+        bus, ctx, _ = await _engine(_recording_cfg("late"))
+        for i in (0, 1, 3):
+            await bus.publish(_closed(Timeframe.H1, i))
+        await bus.publish(_closed(Timeframe.H1, 2, replay=True))
+        stamps = [b.timestamp for b in ctx.bars("BTCUSDT", Timeframe.H1, 100)]
+        assert stamps == [_T0 + timedelta(hours=h) for h in range(4)]
+        assert [c[1] for c in _CALLS["late"]] == [_T0 + timedelta(hours=h) for h in (0, 1, 3)]

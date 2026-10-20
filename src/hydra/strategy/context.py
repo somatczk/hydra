@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from bisect import bisect_left
 from decimal import Decimal
 from typing import Any
 
@@ -54,25 +55,23 @@ class StrategyContext:
     def add_bar(self, symbol: str, timeframe: Timeframe, bar: OHLCV) -> None:
         """Store a bar, upserting by timestamp (used by the engine).
 
-        A bar with the newest stored timestamp replaces it, an older one is ignored, a newer
-        one is appended and the series is trimmed to ``max_bars``.
+        A bar with a stored timestamp replaces it; any other is inserted in time order (a
+        late gap fill lands where it belongs) and the series is trimmed to ``max_bars``.
         """
         series = self._bars.setdefault(symbol, {}).setdefault(str(timeframe), [])
-        if series and bar.timestamp == series[-1].timestamp:
-            series[-1] = bar
-        elif series and bar.timestamp < series[-1].timestamp:
-            logger.debug(
-                "Ignoring out-of-order bar %s %s at %s (newest %s)",
-                symbol,
-                timeframe,
-                bar.timestamp.isoformat(),
-                series[-1].timestamp.isoformat(),
-            )
-            return
-        else:
+        ts = bar.timestamp
+        if not series or ts > series[-1].timestamp:
             series.append(bar)
-            if self._max_bars is not None and len(series) > self._max_bars:
-                del series[: len(series) - self._max_bars]
+        else:
+            i = bisect_left(series, ts, key=lambda b: b.timestamp)
+            if series[i].timestamp == ts:
+                series[i] = bar
+            elif self._max_bars is not None and i == 0 and len(series) >= self._max_bars:
+                return
+            else:
+                series.insert(i, bar)
+        if self._max_bars is not None and len(series) > self._max_bars:
+            del series[: len(series) - self._max_bars]
         prefix = f"{symbol}:{timeframe}:"
         keys_to_drop = [k for k in self._indicator_cache if k.startswith(prefix)]
         for k in keys_to_drop:

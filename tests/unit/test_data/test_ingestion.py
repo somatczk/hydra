@@ -7,11 +7,13 @@ so the feed consumes exactly the shape ``watch_ohlcv_for_symbols`` returns.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+import ccxt
 import pytest
 from prometheus_client import REGISTRY
 
@@ -19,6 +21,7 @@ from hydra.core import metrics
 from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.events import BarEvent, Event, FeedStatusEvent, PriceEvent
 from hydra.core.types import OHLCV, Timeframe
+from hydra.data import ingestion
 from hydra.data.bars import last_closed_open
 from hydra.data.ingestion import ExchangeFeedManager, InsufficientHistoryError
 from tests.fixtures.binance_kline import (
@@ -45,8 +48,10 @@ def _row(ts: datetime, close: float, *, high: float | None = None, low: float | 
 @pytest.fixture(autouse=True)
 def _fresh_metrics() -> Iterator[None]:
     metrics._reset_metrics()
+    ingestion._STREAM_OWNERS.clear()
     yield
     metrics._reset_metrics()
+    ingestion._STREAM_OWNERS.clear()
 
 
 class Clock:
@@ -62,6 +67,10 @@ class Clock:
 
 async def _fast_sleep(seconds: float) -> None:
     await asyncio.sleep(0)
+
+
+async def _throttled_sleep(seconds: float) -> None:
+    await asyncio.sleep(0.005)
 
 
 async def until(cond: Callable[[], bool], timeout: float = 3.0) -> None:
@@ -138,6 +147,7 @@ class Harness:
         *,
         repo: MemoryRepo | None = None,
         rest: FakeRestExchange | None = None,
+        sleep: Callable[[float], Any] = _fast_sleep,
         **kwargs: Any,
     ) -> None:
         self.bus = InMemoryEventBus()
@@ -151,6 +161,7 @@ class Harness:
             "stale_after_bars": 10_000,
             "watchdog_interval_s": 0.005,
             "mtf_barrier_s": 5.0,
+            "publish_replay": True,
         }
         options.update(kwargs)
         self.feed = ExchangeFeedManager(
@@ -159,7 +170,7 @@ class Harness:
             repository=repo,
             rest_factory=lambda _eid: self.rest,
             clock=clock,
-            sleep=_fast_sleep,
+            sleep=sleep,
             **options,
         )
 
@@ -464,7 +475,12 @@ async def test_bar_overdue_stale_and_recovery() -> None:
 async def test_recreate_once_per_threshold() -> None:
     h = Harness(Clock(DAY))
     await h.start(symbols=["BTCUSDT", "ETHUSDT"], timeframes=[Timeframe.H1, Timeframe.H4])
-    assert len(h.feed._tasks["binance"]) == 3
+    assert [t.get_name() for t in h.feed._tasks["binance"]] == [
+        "ohlcv-binance",
+        "dispatch-binance",
+        "watchdog-binance",
+        "gaps-binance",
+    ]
     h.ws[0].feed(*[ConnectionError(f"drop {i}") for i in range(5)])
     await until(lambda: len(h.ws) == 2)
     h.ws[1].feed(*[ConnectionError(f"drop {i}") for i in range(5)])
@@ -496,7 +512,7 @@ async def test_hole_in_ws_stream_is_filled_over_rest() -> None:
     await until(lambda: len(h.recorder.bars) == 4)
 
     got = [(b.ohlcv.timestamp, b.replay) for b in h.recorder.bars if b.ohlcv]
-    assert got == [(DAY, False), (DAY + H, False), (DAY + 2 * H, True), (DAY + 3 * H, True)]
+    assert got == [(DAY, False), (DAY + H, False), (DAY + 2 * H, True), (DAY + 3 * H, False)]
     assert h.recorder.bars[2].ohlcv is not None
     assert h.recorder.bars[2].ohlcv.close == Decimal("302.0")
     assert rest.calls[0][0] == "BTC/USDT"
@@ -687,4 +703,338 @@ async def test_consumer_lag_marks_stale_then_live() -> None:
     gate.set()
     await until(lambda: [s.status for s in h.recorder.statuses] == ["stale", "live"])
     assert h.recorder.statuses[0].reason == "consumer_lag"
+    await h.stop()
+
+
+# ---------------------------------------------------------------------------
+# Gap replay, REST outages and deferred gaps
+# ---------------------------------------------------------------------------
+
+
+def _gated_sleep(gate: asyncio.Event) -> Callable[[float], Any]:
+    async def sleep(seconds: float) -> None:
+        if seconds >= ingestion._GAP_RETRY_INITIAL_S:
+            await gate.wait()
+        await asyncio.sleep(0)
+
+    return sleep
+
+
+class BlockingRest(FakeRestExchange):
+    def __init__(self, rows: list[list[Any]]) -> None:
+        super().__init__(rows)
+        self.gate = asyncio.Event()
+        self.blocked = asyncio.Event()
+
+    async def fetch_ohlcv(
+        self, symbol: str, timeframe: str, since: int | None = None, limit: int | None = None
+    ) -> list[list[Any]]:
+        self.blocked.set()
+        await self.gate.wait()
+        return await super().fetch_ohlcv(symbol, timeframe, since, limit)
+
+
+async def test_newest_bar_filled_at_a_boundary_is_evaluated() -> None:
+    now = DAY + 10 * H + 59 * M + timedelta(seconds=59)
+    clock = Clock(now)
+    end = last_closed_open(now, Timeframe.H1)
+    repo = MemoryRepo()
+    repo.seed("BTCUSDT", Timeframe.H1, _hourly(end - 99 * H, 100))
+    rest = FakeRestExchange([_row(DAY + i * H, 500.0 + i) for i in range(12)])
+    h = Harness(clock, repo=repo, rest=rest, history_window=100)
+    await h.feed.warm_up(["BTCUSDT"], [Timeframe.H1], min_bars=50)
+    await h.start()
+    await until(lambda: h.ws[0].watch_calls >= 1)
+
+    clock.set(DAY + 11 * H + timedelta(seconds=2))
+    h.kline(DAY + 11 * H, 600.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    bar = h.recorder.bars[0]
+    assert bar.ohlcv is not None
+    assert (bar.ohlcv.timestamp, bar.replay, bar.ohlcv.close) == (
+        DAY + 10 * H,
+        False,
+        Decimal("510.0"),
+    )
+    await h.stop()
+
+
+async def test_rest_outage_keeps_ws_bars_flowing_and_fills_the_gap_later() -> None:
+    clock = Clock(DAY + H + M)
+    rest = FakeRestExchange([_row(DAY + i * H, 300.0 + i) for i in range(10)])
+    h = Harness(clock, rest=rest, sleep=_throttled_sleep)
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    rest.errors = [ccxt.PermissionDenied("418 banned")] * 10_000
+    clock.set(DAY + 3 * H + M)
+    h.ws[0].feed(ConnectionError("blip"))
+    await until(lambda: h.feed.stale_reasons("binance") == {"BTCUSDT/1h": ["gap_unfilled"]})
+    for i in (3, 4, 5):
+        clock.set(DAY + i * H + M)
+        h.kline(DAY + i * H, 100.0 + i)
+    await until(lambda: len(h.recorder.bars) == 3)
+
+    got = [(b.ohlcv.timestamp, b.replay) for b in h.recorder.bars if b.ohlcv]
+    assert got == [(DAY, False), (DAY + 3 * H, False), (DAY + 4 * H, False)]
+    assert len(h.ws) == 1
+    assert h.ws[0].watch_calls >= 5
+    assert (
+        REGISTRY.get_sample_value("hydra_ws_reconnects_total", {"exchange_id": "binance"}) is None
+    )
+    assert not h.feed.is_live("binance")
+
+    rest.errors.clear()
+    await until(lambda: len(h.recorder.bars) == 5)
+    late = [(b.ohlcv.timestamp, b.replay, b.ohlcv.close) for b in h.recorder.bars[3:] if b.ohlcv]
+    assert late == [(DAY + H, True, Decimal("301.0")), (DAY + 2 * H, True, Decimal("302.0"))]
+    await until(lambda: h.feed.is_live("binance"))
+    assert [(s.status, s.reason, s.symbol) for s in h.recorder.statuses] == [
+        ("stale", "gap_unfilled", "BTCUSDT"),
+        ("live", "gap_unfilled", "BTCUSDT"),
+    ]
+    await h.stop()
+
+
+async def test_hole_fill_failure_is_retried_not_skipped() -> None:
+    clock = Clock(DAY + 4 * H + M)
+    repo = MemoryRepo()
+    rest = FakeRestExchange([_row(DAY + i * H, 300.0 + i) for i in range(4)])
+    h = Harness(clock, repo=repo, rest=rest)
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    rest.errors = [ccxt.PermissionDenied("418 banned")]
+    h.kline(DAY + 4 * H, 104.0)
+    await until(lambda: len(h.recorder.bars) == 4)
+
+    got = [(b.ohlcv.timestamp, b.replay) for b in h.recorder.bars if b.ohlcv]
+    assert got == [(DAY, False), (DAY + H, False), (DAY + 2 * H, True), (DAY + 3 * H, False)]
+    assert len(rest.calls) == 2
+    await until(lambda: len(repo.persisted) == 4)
+    assert sorted(b.timestamp for *_, b in repo.persisted) == [DAY + i * H for i in range(4)]
+    await until(lambda: len(h.recorder.statuses) == 2)
+    assert [(s.status, s.reason) for s in h.recorder.statuses] == [
+        ("stale", "gap_unfilled"),
+        ("live", "gap_unfilled"),
+    ]
+    await h.stop()
+
+
+async def test_short_rest_answer_is_deferred_until_the_exchange_has_the_bar() -> None:
+    clock = Clock(DAY + H + M)
+    rest = FakeRestExchange([_row(DAY + i * H, 300.0 + i) for i in range(2)])
+    gate = asyncio.Event()
+    h = Harness(clock, rest=rest, sleep=_gated_sleep(gate))
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    clock.set(DAY + 3 * H + M)
+    h.ws[0].feed(ConnectionError("blip"))
+    await until(lambda: len(h.recorder.bars) == 2)
+    assert (h.recorder.bars[1].ohlcv.timestamp, h.recorder.bars[1].replay) == (DAY + H, True)
+    assert h.feed.stale_reasons("binance") == {"BTCUSDT/1h": ["gap_unfilled"]}
+
+    rest.rows.append(_row(DAY + 2 * H, 302.0))
+    gate.set()
+    await until(lambda: len(h.recorder.bars) == 3)
+    newest = h.recorder.bars[2]
+    assert newest.ohlcv is not None
+    assert (newest.ohlcv.timestamp, newest.replay, newest.ohlcv.close) == (
+        DAY + 2 * H,
+        False,
+        Decimal("302.0"),
+    )
+    await until(lambda: h.feed.is_live("binance"))
+    await h.stop()
+
+
+async def test_gap_the_exchange_never_fills_is_given_up_after_the_budget() -> None:
+    clock = Clock(DAY + H + M)
+    rest = FakeRestExchange([_row(DAY + i * H, 300.0 + i) for i in range(2)])
+    gate = asyncio.Event()
+    gate.set()
+    h = Harness(clock, rest=rest, sleep=_gated_sleep(gate))
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    clock.set(DAY + 3 * H + M)
+    h.ws[0].feed(ConnectionError("blip"))
+    await until(lambda: len(h.recorder.statuses) == 2)
+
+    assert [(s.status, s.reason) for s in h.recorder.statuses] == [
+        ("stale", "gap_unfilled"),
+        ("live", "gap_unfilled"),
+    ]
+    assert [c[2] for c in rest.calls] == [_ms(DAY + H)] + [_ms(DAY + 2 * H)] * (
+        1 + ingestion._GAP_EMPTY_ATTEMPTS
+    )
+    assert h.feed.is_live("binance")
+    await h.stop()
+
+
+async def test_watch_skips_an_instance_closed_during_resync() -> None:
+    clock = Clock(DAY + H + M)
+    rest = BlockingRest([_row(DAY + i * H, 300.0 + i) for i in range(5)])
+    h = Harness(clock, rest=rest, ws_silence_s=10_000.0)
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    clock.set(DAY + 2 * H + 2 * M)
+    h.ws[0].feed(ConnectionError("blip"))
+    await until(rest.blocked.is_set)
+    calls = h.ws[0].watch_calls
+    clock.t += 10_001
+    await until(lambda: h.ws[0].close_calls == 1)
+    rest.gate.set()
+    await until(lambda: len(h.ws) == 2 and h.ws[1].watch_calls >= 1)
+
+    assert h.ws[0].watch_calls == calls
+    await h.stop()
+
+
+# ---------------------------------------------------------------------------
+# Shared gauges, warm-up holes, persistence, replay gating, full queue
+# ---------------------------------------------------------------------------
+
+
+async def test_interval_gauge_survives_while_another_feed_owns_the_stream() -> None:
+    clock = Clock(DAY + H + M)
+    a = Harness(clock)
+    b = Harness(clock)
+    await a.start()
+    await b.start()
+    await a.stop()
+
+    b.kline(DAY, 100.0)
+    b.kline(DAY + H, 101.0)
+    await until(lambda: len(b.recorder.bars) == 1)
+    assert _gauge("hydra_feed_bar_interval_seconds") == 3600
+    assert _gauge("hydra_feed_last_closed_bar_timestamp_seconds") == DAY.timestamp()
+
+    await b.stop()
+    assert _gauge("hydra_feed_bar_interval_seconds") is None
+    assert _gauge("hydra_feed_last_closed_bar_timestamp_seconds") is None
+
+
+async def test_warm_up_repairs_an_interior_hole() -> None:
+    now = DAY + 60 * 24 * H + 25 * M
+    end = last_closed_open(now, Timeframe.H1)
+    stored = _hourly(end - 1099 * H, 1100)
+    first_hole = stored[1050].timestamp
+    del stored[1050:1053]
+    repo = MemoryRepo()
+    repo.seed("BTCUSDT", Timeframe.H1, stored)
+    rest = FakeRestExchange([_row(end - i * H, 7.0) for i in range(60)])
+    h = Harness(Clock(now), repo=repo, rest=rest, history_window=1000)
+
+    warm = await h.feed.warm_up(["BTCUSDT"], [Timeframe.H1], min_bars=50)
+
+    bars = warm[("BTCUSDT", Timeframe.H1)]
+    assert [b.timestamp for b in bars] == [end - (999 - i) * H for i in range(1000)]
+    assert first_hole == end - 49 * H
+    assert rest.calls[0][2] == _ms(first_hole)
+    assert [b.timestamp for *_, b in repo.persisted] == [first_hole + i * H for i in range(50)]
+
+
+async def test_warm_up_never_fetches_more_than_the_window() -> None:
+    now = DAY + 400 * 24 * H + 25 * M
+    end = last_closed_open(now, Timeframe.H1)
+    repo = MemoryRepo()
+    repo.seed("BTCUSDT", Timeframe.H1, _hourly(end - 365 * 24 * H - 99 * H, 100))
+    rest = FakeRestExchange([_row(end - i * H, 50.0) for i in range(24 * 400)])
+    h = Harness(Clock(now), repo=repo, rest=rest, history_window=100)
+
+    warm = await h.feed.warm_up(["BTCUSDT"], [Timeframe.H1], min_bars=50)
+
+    bars = warm[("BTCUSDT", Timeframe.H1)]
+    assert [b.timestamp for b in bars] == [end - (99 - i) * H for i in range(100)]
+    assert [c[2] for c in rest.calls] == [_ms(end - 99 * H)]
+    assert len(repo.persisted) == 100
+
+
+async def test_persist_retries_through_an_outage_longer_than_seven_seconds() -> None:
+    clock = Clock(DAY + 3 * H + M)
+    repo = MemoryRepo()
+    repo.fail_next = 8
+    h = Harness(clock, repo=repo)
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    h.kline(DAY + 2 * H, 102.0)
+    await until(lambda: len(h.recorder.bars) == 2)
+    await until(lambda: len(repo.persisted) == 2)
+
+    assert [b.timestamp for *_, b in repo.persisted] == [DAY, DAY + H]
+    errors = REGISTRY.get_sample_value(
+        "hydra_feed_persist_errors_total", {"exchange_id": "binance"}
+    )
+    assert errors == 8.0
+
+    repo.fail_next = 10**9
+    h.kline(DAY + 3 * H, 103.0)
+    await until(lambda: h.feed.persist_backlog("binance") == 1)
+    repo.fail_next = 0
+    await until(lambda: len(repo.persisted) == 3)
+    assert h.feed.persist_backlog("binance") == 0
+    await h.stop()
+
+
+async def test_replay_bars_are_persisted_but_not_published_by_default() -> None:
+    assert inspect.signature(ExchangeFeedManager).parameters["publish_replay"].default is False
+    clock = Clock(DAY + H + 10 * M)
+    repo = MemoryRepo()
+    rest = FakeRestExchange([_row(DAY + i * H, 200.0 + i) for i in range(5)])
+    h = Harness(clock, repo=repo, rest=rest, publish_replay=False)
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    clock.set(DAY + 3 * H + 10 * M)
+    h.ws[0].feed(ConnectionError("blip"))
+    await until(lambda: len(repo.persisted) == 3)
+    await until(lambda: len(h.recorder.bars) == 2)
+
+    got = [(b.ohlcv.timestamp, b.replay) for b in h.recorder.bars if b.ohlcv]
+    assert got == [(DAY, False), (DAY + 2 * H, False)]
+    assert [b.timestamp for *_, b in repo.persisted] == [DAY, DAY + H, DAY + 2 * H]
+    await h.stop()
+
+
+async def test_consumer_lag_survives_a_full_queue_and_recovers() -> None:
+    clock = Clock(DAY + 10 * H + M)
+    h = Harness(clock, queue_maxsize=2)
+    gate = asyncio.Event()
+
+    async def stuck(event: Event) -> None:
+        await gate.wait()
+
+    await h.bus.subscribe("bar", stuck)
+    await h.start()
+    for i in range(8):
+        h.kline(DAY + i * H, 100.0 + i)
+    await until(lambda: h.feed.stale_reasons("binance") == {"*": ["consumer_lag"]})
+    assert h.recorder.statuses == []
+
+    gate.set()
+    await until(lambda: len(h.recorder.statuses) == 2)
+    assert [(s.status, s.reason) for s in h.recorder.statuses] == [
+        ("stale", "consumer_lag"),
+        ("live", "consumer_lag"),
+    ]
+    assert [b.ohlcv.timestamp for b in h.recorder.bars if b.ohlcv] == [
+        DAY + i * H for i in range(7)
+    ]
     await h.stop()

@@ -118,7 +118,19 @@ class StrategyEngine:
     async def warm_up(
         self, bars_by_stream: Mapping[tuple[str, Timeframe], Sequence[OHLCV]]
     ) -> None:
-        """Seed the context with history, oldest first, without calling ``on_bar``."""
+        """Seed the context with history, oldest first, without calling ``on_bar``.
+
+        Raises ``ValueError`` when a stream has more bars than the context keeps, which would
+        silently leave strategies short of ``required_history``.
+        """
+        limit = self._context.max_bars
+        for (symbol, timeframe), bars in bars_by_stream.items():
+            if limit is not None and len(bars) > limit:
+                msg = (
+                    f"{symbol} {timeframe}: {len(bars)} warm-up bars exceed the context's "
+                    f"max_bars={limit}; size it with feed.window_for(required_history)"
+                )
+                raise ValueError(msg)
         for (symbol, timeframe), bars in bars_by_stream.items():
             for bar in sorted(bars, key=lambda b: b.timestamp):
                 self._context.add_bar(symbol, timeframe, bar)

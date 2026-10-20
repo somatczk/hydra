@@ -36,12 +36,32 @@ def test_same_timestamp_replaces_and_recomputes_indicator() -> None:
     assert ctx.indicator("sma", "BTCUSDT", _TF, period=3)[-1] == pytest.approx(30.0)
 
 
-def test_older_timestamp_is_ignored() -> None:
+def test_older_timestamp_replaces_or_inserts_in_order() -> None:
     ctx = StrategyContext()
-    ctx.add_bar("BTCUSDT", _TF, _bar(0, "10"))
-    ctx.add_bar("BTCUSDT", _TF, _bar(1, "11"))
+    for i, close in ((0, "10"), (1, "11"), (3, "13")):
+        ctx.add_bar("BTCUSDT", _TF, _bar(i, close))
+    assert ctx.indicator("sma", "BTCUSDT", _TF, period=3)[-1] == pytest.approx(34 / 3)
+
     ctx.add_bar("BTCUSDT", _TF, _bar(0, "99"))
-    assert [b.close for b in ctx.bars("BTCUSDT", _TF, 10)] == [Decimal("10"), Decimal("11")]
+    ctx.add_bar("BTCUSDT", _TF, _bar(2, "12"))
+
+    bars = ctx.bars("BTCUSDT", _TF, 10)
+    assert [b.timestamp for b in bars] == [_T0 + timedelta(hours=h) for h in range(4)]
+    assert [b.close for b in bars] == [Decimal(c) for c in ("99", "11", "12", "13")]
+    assert ctx.indicator("sma", "BTCUSDT", _TF, period=3)[-1] == pytest.approx(12.0)
+
+
+def test_bar_older_than_a_full_window_is_ignored() -> None:
+    ctx = StrategyContext(max_bars=3)
+    for i in range(2, 5):
+        ctx.add_bar("BTCUSDT", _TF, _bar(i, str(100 + i)))
+    ctx.add_bar("BTCUSDT", _TF, _bar(0, "1"))
+    ctx.add_bar("BTCUSDT", _TF, _bar(3, "7"))
+    assert [b.close for b in ctx.bars("BTCUSDT", _TF, 10)] == [
+        Decimal("102"),
+        Decimal("7"),
+        Decimal("104"),
+    ]
 
 
 def test_max_bars_keeps_the_newest() -> None:
