@@ -4,8 +4,10 @@ Every metric the engine exports is declared once, in ``CONTRACT``. Producers onl
 call the setter helpers below; they never create collectors. A metric listed here
 with a later workstream as producer is defined now so that rules, Grafana panels
 and producers agree on one name, type, label set and unit. No label set is
-pre-initialised and a family registers on its first write, so an unlabelled gauge
-never reports a made-up 0 before its producer has set it.
+pre-initialised. Unlabelled counters and histograms register at init, because 0 is
+their true value at startup and rate() then sees the first increment. Every other
+family registers on its first write, so a gauge never reports a made-up 0 before
+its producer has set it.
 
 Units are in the name (``_seconds``, ``_ratio``, ``_timestamp_seconds``) except
 USDT amounts and base-asset quantities, which are noted below. Timestamps are
@@ -19,12 +21,12 @@ Contract (name: type, unit / labels / producer):
   producer: core.metrics at init
 - hydra_trades_total: counter, fills
   labels: symbol, side, strategy_id, exchange_id
-  producer: OrderManager
+  producer: OrderManager and paper executor (paper market fills counted twice until P1-D)
 - hydra_trade_pnl: histogram, USDT
   labels: symbol, strategy_id
   producer: paper executor; P1-C/P1-E from realized_pnl
 - hydra_position_size: gauge, base asset
-  labels: symbol, exchange_id
+  labels: session_id, strategy_id, exchange_id, symbol
   producer: P1-E session_wiring on fill
 - hydra_portfolio_value: gauge, USDT
   labels: -
@@ -98,6 +100,12 @@ Contract (name: type, unit / labels / producer):
 - hydra_risk_state_persist_failures_total: counter, errors
   labels: -
   producer: P1-C RiskService
+- hydra_risk_lock_wait_seconds: histogram, seconds
+  labels: -
+  producer: P1-C RiskService
+- hydra_risk_lock_timeouts_total: counter, orders
+  labels: -
+  producer: P1-C RiskService
 - hydra_session_desired: gauge, 1
   labels: session_id, strategy_id, mode
   producer: P1-G1 HealthMonitor
@@ -116,9 +124,6 @@ Contract (name: type, unit / labels / producer):
 - hydra_health_monitor_last_run_timestamp_seconds: gauge, unix seconds
   labels: -
   producer: P1-G1 HealthMonitor
-- hydra_reconciliation_mismatch: gauge, 1
-  labels: exchange_id, symbol
-  producer: none (deprecated, P3)
 """
 
 from __future__ import annotations
@@ -184,15 +189,17 @@ CONTRACT: tuple[MetricSpec, ...] = (
     MetricSpec(
         "hydra_trades_total",
         "counter",
-        "Executed fills by symbol, side, strategy and exchange",
+        "Executed fills by symbol, side, strategy and exchange; "
+        "paper market fills are counted twice until P1-D",
         "fills",
-        "OrderManager",
+        "OrderManager and paper executor (paper market fills counted twice until P1-D)",
         ("symbol", "side", "strategy_id", "exchange_id"),
     ),
     MetricSpec(
         "hydra_trade_pnl",
         "histogram",
-        "Realized PnL per fill in USDT (no _sum series: the buckets are negative)",
+        "PnL per paper fill in USDT; opening fills observe 0 until P1-D "
+        "(no _sum series: the buckets are negative)",
         "USDT",
         "paper executor; P1-C/P1-E from realized_pnl",
         ("symbol", "strategy_id"),
@@ -201,10 +208,10 @@ CONTRACT: tuple[MetricSpec, ...] = (
     MetricSpec(
         "hydra_position_size",
         "gauge",
-        "Open position size in base-asset units by symbol and exchange",
+        "Open position size in base-asset units per session, strategy, exchange and symbol",
         "base asset",
         "P1-E session_wiring on fill",
-        ("symbol", "exchange_id"),
+        ("session_id", "strategy_id", "exchange_id", "symbol"),
     ),
     MetricSpec(
         "hydra_portfolio_value",
@@ -397,6 +404,22 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "P1-C RiskService",
     ),
     MetricSpec(
+        "hydra_risk_lock_wait_seconds",
+        "histogram",
+        "Time an order waited for the RiskService lock, which is held across create_order",
+        "seconds",
+        "P1-C RiskService",
+        (),
+        (0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+    ),
+    MetricSpec(
+        "hydra_risk_lock_timeouts_total",
+        "counter",
+        "Orders refused because the RiskService lock was not acquired in time",
+        "orders",
+        "P1-C RiskService",
+    ),
+    MetricSpec(
         "hydra_session_desired",
         "gauge",
         "1 when the database marks a trading session as running",
@@ -443,18 +466,11 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "unix seconds",
         "P1-G1 HealthMonitor",
     ),
-    MetricSpec(
-        "hydra_reconciliation_mismatch",
-        "gauge",
-        "Deprecated: no exchange reconciliation exists until P3; not alerted",
-        "1",
-        "none (deprecated, P3)",
-        ("exchange_id", "symbol"),
-    ),
 )
 
 _SPECS: dict[str, MetricSpec] = {spec.name: spec for spec in CONTRACT}
 _collectors: dict[str, Counter | Gauge | Histogram] = {}
+_session_positions: dict[str, set[tuple[str, str, str]]] = {}
 _initialized: bool = False
 
 _wall_clock: Callable[[], float] = time.time
@@ -470,7 +486,7 @@ def _build(spec: MetricSpec) -> Counter | Gauge | Histogram:
 
 
 def _ensure_initialized() -> None:
-    """Export ``hydra_build_info`` once; every other family registers on first write."""
+    """Export ``hydra_build_info`` and the unlabelled counters and histograms at 0."""
     global _initialized
     if _initialized:
         return
@@ -479,6 +495,9 @@ def _ensure_initialized() -> None:
     from hydra import __version__
 
     _gauge("hydra_build_info").labels(version=__version__).set(1)
+    for spec in CONTRACT:
+        if not spec.labels and spec.kind != "gauge":
+            _collector(spec.name)
 
 
 def _collector(name: str) -> Counter | Gauge | Histogram:
@@ -543,17 +562,32 @@ def record_trade(
 
 
 def update_position(symbol: str, exchange_id: str, size: float) -> None:
-    """Set the open position size in base-asset units."""
-    _gauge("hydra_position_size").labels(symbol=symbol, exchange_id=exchange_id).set(size)
+    """Deprecated no-op: a value without a session label is last-writer-wins across sessions.
+
+    Kept so the legacy call sites still import; P1-E calls ``set_session_position``.
+    """
+
+
+def set_session_position(
+    session_id: str, strategy_id: str, exchange_id: str, symbol: str, size: float
+) -> None:
+    """Set one session's open position size in base-asset units."""
+    _gauge("hydra_position_size").labels(
+        session_id=session_id, strategy_id=strategy_id, exchange_id=exchange_id, symbol=symbol
+    ).set(size)
+    _session_positions.setdefault(session_id, set()).add((strategy_id, exchange_id, symbol))
 
 
 def update_portfolio(value: float, drawdown_ratio: float, daily_pnl: float) -> None:
-    """Set account equity (USDT), drawdown (fraction) and daily PnL (USDT)."""
+    """Set account equity (USDT), drawdown (fraction) and daily PnL (USDT).
+
+    Equity and daily PnL are set even when the drawdown is rejected as out of range.
+    """
+    _gauge("hydra_portfolio_value").set(value)
+    _gauge("hydra_daily_pnl").set(daily_pnl)
     if not 0 <= drawdown_ratio <= 1:
         raise ValueError(f"drawdown_ratio must be a fraction in [0, 1], got {drawdown_ratio}")
-    _gauge("hydra_portfolio_value").set(value)
     _gauge("hydra_drawdown_ratio").set(drawdown_ratio)
-    _gauge("hydra_daily_pnl").set(daily_pnl)
 
 
 def set_portfolio_heat(ratio: float) -> None:
@@ -738,6 +772,16 @@ def record_risk_state_persist_failure() -> None:
     _counter("hydra_risk_state_persist_failures_total").inc()
 
 
+def observe_risk_lock_wait(seconds: float) -> None:
+    """Record how long an order waited for the RiskService lock."""
+    _histogram("hydra_risk_lock_wait_seconds").observe(seconds)
+
+
+def record_risk_lock_timeout() -> None:
+    """Count one order refused because the RiskService lock timed out."""
+    _counter("hydra_risk_lock_timeouts_total").inc()
+
+
 # ---------------------------------------------------------------------------
 # Sessions and health
 # ---------------------------------------------------------------------------
@@ -757,6 +801,9 @@ def forget_session(session_id: str, strategy_id: str, mode: str) -> None:
     _gauge("hydra_session_desired").remove(session_id, strategy_id, mode)
     _gauge("hydra_session_supervised").remove(session_id, strategy_id, mode)
     _gauge("hydra_paper_persist_dirty").remove(session_id)
+    positions = _gauge("hydra_position_size")
+    for position_strategy, exchange_id, symbol in _session_positions.pop(session_id, set()):
+        positions.remove(session_id, position_strategy, exchange_id, symbol)
 
 
 def record_session_errored(strategy_id: str) -> None:
@@ -782,10 +829,11 @@ def mark_health_monitor_run(*, at: float | None = None) -> None:
 
 
 def update_reconciliation(exchange_id: str, symbol: str, mismatch: bool) -> None:
-    """Deprecated: set reconciliation mismatch (1) or match (0); no rule reads it."""
-    _gauge("hydra_reconciliation_mismatch").labels(exchange_id=exchange_id, symbol=symbol).set(
-        1.0 if mismatch else 0.0
-    )
+    """Deprecated no-op: nothing reconciles against the exchange until P3.
+
+    Kept so the legacy call site still imports; exporting its hard-coded 0 would
+    claim a reconciliation that never ran.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -800,4 +848,5 @@ def _reset_metrics() -> None:
         with contextlib.suppress(KeyError):
             REGISTRY.unregister(collector)
     _collectors.clear()
+    _session_positions.clear()
     _initialized = False

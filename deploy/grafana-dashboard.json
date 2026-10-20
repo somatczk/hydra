@@ -147,7 +147,7 @@
       "type": "timeseries",
       "title": "Drawdown %",
       "description": "Current drawdown from peak equity (metric is a fraction, 0.05 = 5%)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -183,48 +183,6 @@
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
         "tooltip": { "mode": "single" }
-      }
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "Win Rate",
-      "description": "Percentage of profitable trades",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum(hydra_trade_pnl_bucket{le=\"0.0\"}) / sum(hydra_trade_pnl_count) * 100",
-          "legendFormat": "Loss Rate %"
-        },
-        {
-          "refId": "B",
-          "expr": "100 - (sum(hydra_trade_pnl_bucket{le=\"0.0\"}) / sum(hydra_trade_pnl_count) * 100)",
-          "legendFormat": "Win Rate %"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 40 },
-              { "color": "green", "value": 55 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "/^Win Rate/" },
-        "graphMode": "area",
-        "colorMode": "value",
-        "justifyMode": "auto",
-        "textMode": "auto"
       }
     },
     {
@@ -270,48 +228,11 @@
       }
     },
     {
-      "id": 7,
-      "type": "stat",
-      "title": "Fill Rate",
-      "description": "Ratio of trades executed to signals generated",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 18 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum(rate(hydra_trades_total[$__rate_interval])) / sum(rate(hydra_signal_count_total[$__rate_interval])) * 100",
-          "legendFormat": "Fill Rate %"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 50 },
-              { "color": "green", "value": 80 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "graphMode": "area",
-        "colorMode": "value",
-        "justifyMode": "auto",
-        "textMode": "auto"
-      }
-    },
-    {
       "id": 8,
       "type": "heatmap",
       "title": "Strategy Latency",
       "description": "Distribution of signal-to-order latency per strategy",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 18 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -438,13 +359,13 @@
       "id": 11,
       "type": "piechart",
       "title": "Position Exposure by Symbol",
-      "description": "Relative size of open positions across symbols",
+      "description": "Gross open position size per symbol, summed over sessions",
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "abs(hydra_position_size)",
+          "expr": "sum by (symbol) (abs(hydra_position_size))",
           "legendFormat": "{{ symbol }}"
         }
       ],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Iterator
 from decimal import Decimal
 from typing import Any
@@ -186,3 +187,28 @@ async def test_outcomes_accumulate_per_endpoint(clock: _Clock) -> None:
     assert _latency("fetch_ticker", "ok", "count") == 3.0
     assert _latency("fetch_ticker", "error", "count") == 1.0
     assert _errors("fetch_ticker", "ExchangeNotAvailable") == 1.0
+
+
+CLIENT_METHOD = {"fetch_ticker": "get_last_price"}
+DELEGATES = {"get_balance": "fetch_balance", "get_positions": "fetch_positions"}
+NOT_REST_CALLS = {"get_filled_orders", "start_user_data_stream", "close"}
+
+
+def test_calls_cover_every_public_async_method() -> None:
+    public = {
+        name
+        for name, _ in inspect.getmembers(ExchangeClient, inspect.iscoroutinefunction)
+        if not name.startswith("_")
+    }
+    covered = {CLIENT_METHOD.get(endpoint, endpoint) for endpoint, _ in CALLS}
+    assert public - set(DELEGATES) - NOT_REST_CALLS == covered
+
+
+@pytest.mark.parametrize(("method", "endpoint"), sorted(DELEGATES.items()))
+async def test_delegating_wrappers_are_observed_through_their_call(
+    clock: _Clock, method: str, endpoint: str
+) -> None:
+    fake = _FakeCcxt(clock)
+    await getattr(_client(fake), method)()
+    assert fake.calls == [endpoint]
+    assert _latency(endpoint, "ok", "count") == 1.0

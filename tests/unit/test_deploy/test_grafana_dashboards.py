@@ -137,6 +137,21 @@ def test_no_panel_without_an_honest_source(path: Path) -> None:
         assert not [t for t in titles if word in t], (path.name, word)
 
 
+@pytest.mark.parametrize("path", DASHBOARDS, ids=lambda p: p.name)
+def test_no_panel_reads_trade_series_until_the_paper_double_count_is_fixed(path: Path) -> None:
+    skewed = {"hydra_trades_total", "hydra_trade_pnl"}
+    for title, target in _targets(path):
+        families = {SAMPLE_TO_SPEC[n].name for n in HYDRA_NAME.findall(target.get("expr", ""))}
+        assert not families & skewed, title
+    titles = {p["title"] for p in _panels(path)}
+    assert not titles & {"Win Rate", "Fill Rate", "Trades by Strategy", "Total Trades (24h)"}
+
+
+def test_position_panel_sums_sessions_per_symbol() -> None:
+    (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["title"] == "Position Exposure by Symbol"]
+    assert [t["expr"] for t in panel["targets"]] == ["sum by (symbol) (abs(hydra_position_size))"]
+
+
 def test_heat_panel_reads_heat_ratio_not_drawdown() -> None:
     (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["title"] == "Portfolio Heat"]
     assert [t["expr"] for t in panel["targets"]] == ["hydra_portfolio_heat_ratio"]

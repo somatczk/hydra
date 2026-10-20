@@ -67,6 +67,33 @@ tests:
         alertname: HydraExchangeWSDisconnected
         exp_alerts: []
 
+  - name: ws reconnect series first exported at 1, as in production, reports 4 of 5 reconnects and still fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_ws_reconnects_total{exchange_id="binance"}'
+        values: "_ 1 2 3 4 5 5 5 5 5 5"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraExchangeWSDisconnected
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Exchange WebSocket reconnecting too frequently"
+              description: "Exchange binance has reconnected 4 times in the last 5 minutes."
+
+  - name: ws reconnect series first exported at 1 with 3 reconnects does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_ws_reconnects_total{exchange_id="binance"}'
+        values: "_ 1 2 3 3 3 3 3 3 3 3"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraExchangeWSDisconnected
+        exp_alerts: []
+
   - name: order fill p99 9.5s fires
     interval: 1m
     input_series:
@@ -139,6 +166,35 @@ tests:
         values: "0x10"
     alert_rule_test:
       - eval_time: 3m
+        alertname: HydraFeedStale
+        exp_alerts: []
+
+  - name: feed message 121s old at the start of the for window fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_message_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "119x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraFeedStale
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              symbol: BTCUSDT
+              timeframe: 1m
+              severity: critical
+              team: infra
+            exp_annotations:
+              summary: "Market data feed stale"
+              description: "No market data message for binance/BTCUSDT 1m in 181 seconds."
+
+  - name: feed message 119s old at the start of the for window does not fire yet
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_message_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "121x10"
+    alert_rule_test:
+      - eval_time: 5m
         alertname: HydraFeedStale
         exp_alerts: []
 
@@ -388,6 +444,40 @@ tests:
         values: "0 0 0 1 1 1 1 1 1 1 1"
       - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="create_order",error_type="InsufficientFunds"}'
         values: "0 0 0 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPIErrorRate
+        exp_alerts: []
+
+  - name: exchange API error series first exported at 1 (first increments unscraped) fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="ok"}'
+        values: "_ 1 4 7 10 13 16 19 22 25 28"
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="error"}'
+        values: "_ 1 3 5 7 9 11 13 15 17 19"
+      - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="fetch_balance",error_type="ExchangeNotAvailable"}'
+        values: "_ 1 3 5 7 9 11 13 15 17 19"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraExchangeAPIErrorRate
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              endpoint: fetch_balance
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Exchange API error rate above 20%"
+              description: "Exchange binance fetch_balance: 40% of calls failed or timed out over 5 minutes."
+
+  - name: exchange API one failed call as the series' first sample is invisible to rate() and does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="create_order",outcome="error"}'
+        values: "_ _ _ 1 1 1 1 1 1 1 1"
+      - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="create_order",error_type="InsufficientFunds"}'
+        values: "_ _ _ 1 1 1 1 1 1 1 1"
     alert_rule_test:
       - eval_time: 5m
         alertname: HydraExchangeAPIErrorRate

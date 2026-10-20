@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 import tomllib
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -94,15 +96,47 @@ class TestContract:
         families = _families()
         assert "hydra_drawdown_pct" not in families
         assert "hydra_data_gap_seconds" not in families
+        assert "hydra_reconciliation_mismatch" not in families
         assert "hydra_drawdown_ratio" in families
 
-    def test_no_series_exists_before_any_event_except_build_info(self) -> None:
+    def test_before_any_event_only_build_info_and_unlabelled_zero_counts_exist(self) -> None:
         metrics._ensure_initialized()
-        samples = _hydra_samples()
-        assert [(n, labels) for n, labels, _ in samples] == [
-            ("hydra_build_info", {"version": _pyproject_version()})
-        ]
+        samples = [s for s in _hydra_samples() if not s[0].endswith("_created")]
+        build_info = ("hydra_build_info", {"version": _pyproject_version()}, 1.0)
+        assert samples[0] == build_info
+        rest = samples[1:]
+        assert {name for name, _, _ in rest} == {
+            "hydra_event_bus_latency_seconds_bucket",
+            "hydra_event_bus_latency_seconds_count",
+            "hydra_event_bus_latency_seconds_sum",
+            "hydra_order_fill_latency_seconds_bucket",
+            "hydra_order_fill_latency_seconds_count",
+            "hydra_order_fill_latency_seconds_sum",
+            "hydra_risk_lock_wait_seconds_bucket",
+            "hydra_risk_lock_wait_seconds_count",
+            "hydra_risk_lock_wait_seconds_sum",
+            "hydra_risk_state_persist_failures_total",
+            "hydra_risk_lock_timeouts_total",
+        }
+        assert all(value == 0.0 for _, _, value in rest)
+        assert all(set(labels) <= {"le"} for _, labels, _ in rest)
         assert not any(v in ("init", "none") for _, labels, _ in samples for v in labels.values())
+
+    def test_first_increment_of_an_unlabelled_counter_is_a_step_from_zero(self) -> None:
+        metrics._ensure_initialized()
+        assert _value("hydra_risk_state_persist_failures_total") == 0.0
+        metrics.record_risk_state_persist_failure()
+        assert _value("hydra_risk_state_persist_failures_total") == 1.0
+
+    def test_no_gauge_reports_a_value_before_its_producer_sets_it(self) -> None:
+        metrics._ensure_initialized()
+        for name in (
+            "hydra_kill_switch_active",
+            "hydra_drawdown_ratio",
+            "hydra_portfolio_value",
+            "hydra_portfolio_heat_ratio",
+        ):
+            assert _value(name) is None, name
 
     def test_build_info_reports_pyproject_version(self) -> None:
         metrics._ensure_initialized()
@@ -141,16 +175,23 @@ class TestTradingSetters:
         with pytest.raises(ValueError, match="fraction"):
             metrics.update_portfolio(8800.0, 12.0, 0.0)
         assert _value("hydra_drawdown_ratio") is None
-        assert _value("hydra_portfolio_value") is None
 
-    def test_position_heat_signal_and_spot_short(self) -> None:
-        metrics.update_position("BTCUSDT", "binance", 0.25)
+    def test_out_of_range_drawdown_still_updates_equity_and_daily_pnl(self) -> None:
+        metrics.update_portfolio(5000.0, 0.1, 10.0)
+        with pytest.raises(ValueError, match="fraction"):
+            metrics.update_portfolio(10_000.0, 1.2, -25.0)
+        assert _value("hydra_portfolio_value") == 10_000.0
+        assert _value("hydra_daily_pnl") == -25.0
+        assert _value("hydra_drawdown_ratio") == 0.1
+        with pytest.raises(ValueError, match="fraction"):
+            metrics.update_portfolio(9000.0, -0.01, 3.0)
+        assert _value("hydra_portfolio_value") == 9000.0
+        assert _value("hydra_daily_pnl") == 3.0
+
+    def test_heat_signal_and_spot_short(self) -> None:
         metrics.set_portfolio_heat(0.18)
         metrics.record_signal("s1", "entry_long")
         metrics.record_spot_short_ignored("s1", "entry_short")
-        assert (
-            _value("hydra_position_size", {"symbol": "BTCUSDT", "exchange_id": "binance"}) == 0.25
-        )
         assert _value("hydra_portfolio_heat_ratio") == 0.18
         signal = {"strategy_id": "s1", "signal_type": "entry_long"}
         assert _value("hydra_signal_count_total", signal) == 1.0
@@ -160,6 +201,40 @@ class TestTradingSetters:
             metrics.record_spot_short_ignored("s1", "entry_long")
         with pytest.raises(ValueError):
             metrics.set_portfolio_heat(-0.1)
+
+
+class TestPositions:
+    def test_two_sessions_on_one_symbol_keep_their_own_series(self) -> None:
+        metrics.set_session_position("sa", "trend", "binance", "BTCUSDT", 0.5)
+        metrics.set_session_position("sb", "meanrev", "binance", "BTCUSDT", 0.0)
+        a = {"session_id": "sa", "strategy_id": "trend", "exchange_id": "binance"}
+        b = {"session_id": "sb", "strategy_id": "meanrev", "exchange_id": "binance"}
+        assert _value("hydra_position_size", {**a, "symbol": "BTCUSDT"}) == 0.5
+        assert _value("hydra_position_size", {**b, "symbol": "BTCUSDT"}) == 0.0
+
+    def test_forget_session_removes_only_that_sessions_positions(self) -> None:
+        metrics.set_session_position("sa", "trend", "binance", "BTCUSDT", 0.5)
+        metrics.set_session_position("sa", "trend", "binance", "ETHUSDT", 2.0)
+        metrics.set_session_position("sb", "meanrev", "binance", "BTCUSDT", 0.1)
+        metrics.forget_session("sa", "trend", "paper")
+        positions = [s for s in _hydra_samples() if s[0] == "hydra_position_size"]
+        assert positions == [
+            (
+                "hydra_position_size",
+                {
+                    "session_id": "sb",
+                    "strategy_id": "meanrev",
+                    "exchange_id": "binance",
+                    "symbol": "BTCUSDT",
+                },
+                0.1,
+            )
+        ]
+
+    def test_legacy_update_position_exports_nothing(self) -> None:
+        metrics.update_position("BTCUSDT", "binance", 0.25)
+        metrics.update_position("BTCUSDT", "binance", 0.0)
+        assert [s for s in _hydra_samples() if s[0] == "hydra_position_size"] == []
 
 
 class TestFeedFreshness:
@@ -222,11 +297,16 @@ class TestRiskAndHealthSetters:
         metrics.set_kill_switch_active(True)
         metrics.record_risk_rejection("max_position_pct", "open")
         metrics.record_risk_state_persist_failure()
+        metrics.observe_risk_lock_wait(0.3)
+        metrics.record_risk_lock_timeout()
         assert _value("hydra_circuit_breaker_active_tier", {"scope": "paper"}) == 3.0
         assert _value("hydra_kill_switch_active") == 1.0
         rejection = {"check": "max_position_pct", "intent": "open"}
         assert _value("hydra_risk_rejections_total", rejection) == 1.0
         assert _value("hydra_risk_state_persist_failures_total") == 1.0
+        assert _value("hydra_risk_lock_wait_seconds_bucket", {"le": "0.25"}) == 0.0
+        assert _value("hydra_risk_lock_wait_seconds_bucket", {"le": "0.5"}) == 1.0
+        assert _value("hydra_risk_lock_timeouts_total") == 1.0
         with pytest.raises(ValueError):
             metrics.set_circuit_breaker_tier("paper", 5)
         with pytest.raises(ValueError):
@@ -265,6 +345,49 @@ class TestRiskAndHealthSetters:
         assert _value("hydra_order_fill_latency_seconds_bucket", {"le": "0.5"}) == 1.0
         assert _value("hydra_ml_inference_latency_seconds_count", {"model_name": "xgb"}) == 1.0
         assert _value("hydra_ws_reconnects_total", {"exchange_id": "binance"}) == 1.0
+
+
+class TestReconciliation:
+    def test_hard_coded_no_mismatch_exports_no_sample(self) -> None:
+        metrics.update_reconciliation("binance", "BTC/USDT", mismatch=False)
+        metrics.update_reconciliation("binance", "BTC/USDT", mismatch=True)
+        assert not [s for s in _hydra_samples() if "reconciliation" in s[0]]
+        assert "hydra_reconciliation_mismatch" not in {s.name for s in metrics.CONTRACT}
+
+    async def test_live_reconciliation_pass_exports_no_reconciliation_or_position(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hydra.execution import session_manager as sm
+
+        class _Executor:
+            calls = 0
+
+            async def get_balance(self) -> dict[str, Decimal]:
+                return {"USDT": Decimal("1000")}
+
+            async def get_positions(self, symbol: str) -> list[SimpleNamespace]:
+                _Executor.calls += 1
+                return [SimpleNamespace(symbol=symbol, quantity=Decimal("0.5"))]
+
+        session = sm.TradingSession(
+            session_id="s1", strategy_id="sma", trading_mode="live", status="running"
+        )
+        session._executor = _Executor()
+        sleeps: list[float] = []
+
+        async def _sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) > 1:
+                session.status = "stopped"
+
+        monkeypatch.setattr(sm.asyncio, "sleep", _sleep)
+        await sm.SessionManager(db_pool=None)._reconciliation_loop(session)
+
+        assert sleeps == [300, 300]
+        assert _Executor.calls == 1
+        exported = {name for name, _, _ in _hydra_samples()}
+        assert "hydra_reconciliation_mismatch" not in exported
+        assert "hydra_position_size" not in exported
 
 
 class TestReset:

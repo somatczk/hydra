@@ -8,28 +8,21 @@
       {
         "title": "Portfolio Value",
         "type": "stat",
-        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+        "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
         "targets": [{ "expr": "hydra_portfolio_value", "legendFormat": "Portfolio" }]
       },
       {
         "title": "Daily PnL",
         "type": "stat",
-        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+        "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
         "targets": [{ "expr": "hydra_daily_pnl", "legendFormat": "Daily PnL" }]
       },
       {
-        "title": "Total Trades (24h)",
-        "type": "stat",
-        "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "targets": [{ "expr": "increase(hydra_trades_total[24h])", "legendFormat": "Trades" }]
-      },
-      {
         "title": "Current Drawdown",
         "type": "gauge",
-        "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+        "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
         "targets": [{ "expr": "hydra_drawdown_ratio", "legendFormat": "Drawdown" }],
         "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 0.20, "thresholds": { "steps": [
@@ -46,20 +39,6 @@
         "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
         "targets": [{ "expr": "hydra_portfolio_value", "legendFormat": "Value" }]
-      },
-      {
-        "title": "Trade PnL Distribution",
-        "type": "histogram",
-        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "targets": [{ "expr": "hydra_trade_pnl_bucket", "legendFormat": "{{le}}" }]
-      },
-      {
-        "title": "Trades by Strategy",
-        "type": "piechart",
-        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "targets": [{ "expr": "sum by (strategy_id) (hydra_trades_total)", "legendFormat": "{{strategy_id}}" }]
       }
     ]
   }
