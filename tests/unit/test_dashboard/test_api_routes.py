@@ -174,7 +174,7 @@ class TestBacktest:
         resp = client.get("/api/backtest/results")
         assert resp.status_code == 503
 
-    def test_seeded_result_is_gone(self, client: TestClient) -> None:
+    def test_uncached_detail_without_database_is_503(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/results/bt-1")
         assert resp.status_code == 503
 
