@@ -171,8 +171,10 @@
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.05 },
-              { "color": "red", "value": 0.10 }
+              { "color": "yellow", "value": 0.03 },
+              { "color": "orange", "value": 0.05 },
+              { "color": "red", "value": 0.10 },
+              { "color": "dark-red", "value": 0.15 }
             ]
           }
         },
@@ -386,7 +388,7 @@
     {
       "id": 9,
       "type": "state-timeline",
-      "title": "Circuit Breaker Status",
+      "title": "Drawdown vs Breaker Tiers",
       "description": "Drawdown against each circuit breaker tier threshold (not live breaker state)",
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -423,8 +425,8 @@
             ]
           },
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "Normal", "color": "green" } } },
-            { "type": "value", "options": { "1": { "text": "Triggered", "color": "red" } } }
+            { "type": "value", "options": { "0": { "text": "Below", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "At/above threshold", "color": "red" } } }
           ]
         },
         "overrides": []
@@ -454,15 +456,16 @@
         "defaults": {
           "unit": "percentunit",
           "min": 0,
-          "max": 0.25,
+          "max": 0.20,
           "color": { "mode": "thresholds" },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "#EAB839", "value": 0.05 },
-              { "color": "orange", "value": 0.10 },
-              { "color": "red", "value": 0.15 }
+              { "color": "#EAB839", "value": 0.03 },
+              { "color": "orange", "value": 0.05 },
+              { "color": "red", "value": 0.10 },
+              { "color": "dark-red", "value": 0.15 }
             ]
           }
         },

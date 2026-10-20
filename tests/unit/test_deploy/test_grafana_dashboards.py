@@ -17,6 +17,7 @@ DASHBOARDS = [
     REPO_ROOT / "config" / "grafana" / "hydra-overview.json",
 ]
 TIER_EXPR = re.compile(r"hydra_drawdown_pct\s*>=\s*bool\s*([\d.]+)")
+TIER_VALUES = [float(spec.drawdown_threshold) for spec in _TIERS]
 
 
 def _panels(path: Path) -> list[dict[str, Any]]:
@@ -46,19 +47,22 @@ def test_drawdown_value_panels_use_fraction_unit(path: Path) -> None:
         defaults = panel["fieldConfig"]["defaults"]
         assert defaults.get("unit") == "percentunit", panel["title"]
         thresholds = _threshold_values(panel)
-        assert thresholds, panel["title"]
-        assert all(0 <= v < 1 for v in thresholds), (panel["title"], thresholds)
+        assert sorted(thresholds) == TIER_VALUES, (panel["title"], thresholds)
         if "max" in defaults:
             assert 0 < defaults["max"] < 1, (panel["title"], defaults["max"])
             assert max(thresholds) < defaults["max"], panel["title"]
 
 
-def test_circuit_breaker_panel_matches_risk_tiers() -> None:
-    (panel,) = [
-        p
-        for p in _panels(DASHBOARDS[0])
-        if p["type"] == "state-timeline" and p["title"] == "Circuit Breaker Status"
-    ]
+def test_tier_timeline_matches_risk_tiers() -> None:
+    (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["type"] == "state-timeline"]
+    assert panel["title"] == "Drawdown vs Breaker Tiers"
+    texts = {
+        value: option["text"]
+        for mapping in panel["fieldConfig"]["defaults"]["mappings"]
+        for value, option in mapping["options"].items()
+    }
+    assert texts == {"0": "Below", "1": "At/above threshold"}
+
     targets = sorted(panel["targets"], key=lambda t: t["refId"])
 
     parsed = []
@@ -67,8 +71,7 @@ def test_circuit_breaker_panel_matches_risk_tiers() -> None:
         assert match, target["expr"]
         parsed.append(float(match.group(1)))
 
-    tiers = [float(spec.drawdown_threshold) for spec in _TIERS]
-    assert parsed == tiers
+    assert parsed == TIER_VALUES
     for spec, target in zip(_TIERS, targets, strict=True):
         pct = f"{float(spec.drawdown_threshold) * 100:g}%"
         assert target["legendFormat"] == f"Tier {spec.tier} ({pct})"
