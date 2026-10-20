@@ -37,26 +37,58 @@ interface CircuitBreaker {
   label: string;
   threshold: string;
   currentValue: string;
-  status: 'Normal' | 'Warning' | 'Alert' | 'Tripped';
+  status: 'Normal' | 'Warning' | 'Tripped';
+  activeSince: string | null;
+  requiresManualReview: boolean;
   color: string;
   bgColor: string;
   borderColor: string;
   icon: typeof ShieldCheck;
 }
 
+interface ApiCircuitBreaker {
+  tier: number;
+  label: string;
+  threshold: string;
+  threshold_pct: number;
+  current_value: number;
+  status: 'Normal' | 'Warning' | 'Tripped';
+  active_since: string | null;
+  requires_manual_review: boolean;
+}
+
+interface Restrictions {
+  active_tier: number;
+  can_open_new_trades: boolean;
+  size_multiplier: number;
+  must_flatten: boolean;
+  is_shutdown: boolean;
+  daily_halt_until: string | null;
+  consecutive_pause_until: string | null;
+}
+
 interface ApiRiskStatus {
   current_drawdown: number;
   max_drawdown_limit: number;
-  daily_loss: number;
-  daily_loss_limit: number;
-  circuit_breakers: Array<{
-    tier: number;
-    label: string;
-    threshold: string;
-    current_value: number;
-    status: string;
-  }> | null;
-  circuit_breakers_state?: 'unavailable';
+  daily_loss: number | null;
+  daily_loss_limit: number | null;
+  equity: number | null;
+  peak_equity: number | null;
+  day_start_equity: number | null;
+  consecutive_losses: number;
+  max_consecutive_losses: number;
+  circuit_breakers: ApiCircuitBreaker[] | null;
+  circuit_breakers_state: 'live' | 'unavailable';
+  restrictions: Restrictions | null;
+}
+
+interface RiskEvent {
+  id: number | null;
+  ts: string | null;
+  kind: string;
+  tier: number | null;
+  actor: string;
+  reason: string;
 }
 
 interface RiskConfig {
@@ -83,11 +115,12 @@ interface LiveStatus {
   kill_switch_active: boolean | null;
   kill_switch_state: 'active' | 'inactive' | 'unknown';
   running_sessions: number | null;
-  circuit_breaker_restrictions: null;
-  circuit_breakers_state: 'unavailable';
+  circuit_breaker_restrictions: Restrictions | null;
+  circuit_breakers_state: 'live' | 'unavailable';
 }
 
 const MIN_VAR_SAMPLE_DAYS = 5;
+const EVENTS_PATH = '/api/risk/events?limit=20';
 
 /* ---------- Helpers ---------- */
 
@@ -95,7 +128,6 @@ function statusToColors(s: string) {
   switch (s) {
     case 'Warning':
       return { color: 'text-status-warning', bgColor: 'bg-status-warning/10', borderColor: 'border-status-warning/30', icon: AlertTriangle };
-    case 'Alert':
     case 'Tripped':
       return { color: 'text-status-error', bgColor: 'bg-status-error/10', borderColor: 'border-status-error/30', icon: Ban };
     default:
@@ -104,11 +136,14 @@ function statusToColors(s: string) {
 }
 
 interface RiskState {
-  /** null while circuit breakers are not wired to the engine */
+  /** null while the engine's risk service is not available */
   circuitBreakers: CircuitBreaker[] | null;
   drawdown: number;
   maxDrawdown: number;
-  dailyLoss: number;
+  dailyLoss: number | null;
+  consecutiveLosses: number;
+  maxConsecutiveLosses: number;
+  restrictions: Restrictions | null;
 }
 
 function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
@@ -123,7 +158,9 @@ function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
       label: cb.label,
       threshold: cb.threshold,
       currentValue: `${cb.current_value}%`,
-      status: cb.status as CircuitBreaker['status'],
+      status: cb.status,
+      activeSince: cb.active_since,
+      requiresManualReview: cb.requires_manual_review,
       ...finalColors,
     };
   }) ?? null;
@@ -132,7 +169,14 @@ function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
     drawdown: data.current_drawdown,
     maxDrawdown: data.max_drawdown_limit,
     dailyLoss: data.daily_loss,
+    consecutiveLosses: data.consecutive_losses,
+    maxConsecutiveLosses: data.max_consecutive_losses,
+    restrictions: data.restrictions,
   };
+}
+
+function fmtTime(iso: string | null): string {
+  return iso ? new Date(iso).toLocaleString('en-GB', { timeZone: 'UTC' }) + ' UTC' : '';
 }
 
 interface DailyPnl { date: string; pnl: number; }
@@ -168,6 +212,10 @@ export default function RiskPage() {
   const [varEstimate, setVarEstimate] = useState<VarEstimate | null>(null);
   const [varState, setVarState] = useState<DataState>('ok');
 
+  // Risk audit trail (breaker transitions, resets, kill switch)
+  const [events, setEvents] = useState<RiskEvent[]>([]);
+  const [eventsError, setEventsError] = useState<unknown>(null);
+
   // Live status (polled); null kill switch means the state is unknown
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
 
@@ -180,7 +228,8 @@ export default function RiskPage() {
   const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
 
-  const sourceRef = useRef<string>('paper');
+  // null until /api/system/config says which account the page reports on
+  const sourceRef = useRef<string | null>(null);
 
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
@@ -188,13 +237,19 @@ export default function RiskPage() {
 
   // Consolidated data loader
   const loadRiskData = useCallback(async () => {
-    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
-      .catch(() => ({ trading_mode: 'paper' }));
-    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    let source: string | null = null;
+    try {
+      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config');
+      source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    } catch (err) {
+      logger.warn('Risk', 'Failed to fetch trading mode', err);
+      setStateError(err);
+      setDailyPnlError(err);
+      setVarState(stateFromError(err));
+    }
     sourceRef.current = source;
     const qs = `?source=${source}`;
-
-    await Promise.all([
+    const sourced = source === null ? [] : [
       fetchApi<ApiRiskStatus>(`/api/risk/status${qs}`)
         .then((data) => { setState(mapApiRiskStatus(data)); setStateError(null); })
         .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); setStateError(err); }),
@@ -204,6 +259,13 @@ export default function RiskPage() {
       fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
         .then((data) => { setDailyPnl(data); setDailyPnlError(null); })
         .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); setDailyPnlError(err); }),
+    ];
+
+    await Promise.all([
+      ...sourced,
+      fetchApi<RiskEvent[]>(EVENTS_PATH)
+        .then((data) => { setEvents(data); setEventsError(null); })
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch risk events', err); setEventsError(err); }),
       fetchApi<RiskConfig>('/api/risk/config')
         .then((riskCfg) => {
           setRiskConfig(riskCfg);
@@ -236,7 +298,7 @@ export default function RiskPage() {
   // Poll live status + risk status every 10s for responsive kill switch & drawdown
   useEffect(() => {
     const fetchLiveStatus = () => {
-      const qs = `?source=${sourceRef.current}`;
+      const source = sourceRef.current;
       fetchApi<LiveStatus>('/api/risk/live-status')
         .then((data) => {
           setLiveStatus(data);
@@ -247,7 +309,8 @@ export default function RiskPage() {
           setLiveStatus(null);
           setKillSwitchActive(null);
         });
-      fetchApi<ApiRiskStatus>(`/api/risk/status${qs}`)
+      if (source === null) return;
+      fetchApi<ApiRiskStatus>(`/api/risk/status?source=${source}`)
         .then((data) => { setState(mapApiRiskStatus(data)); setStateError(null); })
         .catch((err) => { logger.warn('Risk', 'Failed to refresh risk status', err); setStateError(err); });
     };
@@ -290,13 +353,24 @@ export default function RiskPage() {
 
   // Unknown state only offers activation: it is the fail-safe direction.
   const handleKillSwitch = async () => {
+    let releaseReason = '';
     if (killSwitchActive !== true) {
       if (!confirm('ACTIVATE KILL SWITCH?\n\nThis will immediately stop ALL trading sessions. Are you sure?')) return;
+    } else {
+      if (window.prompt('Type RELEASE to allow trading to resume') !== 'RELEASE') return;
+      releaseReason = (window.prompt('Reason for releasing the kill switch (audited)') ?? '').trim();
+      if (releaseReason.length < 3) {
+        toast('error', 'A reason of at least 3 characters is required to release the kill switch');
+        return;
+      }
     }
     setKillSwitchLoading(true);
     try {
       if (killSwitchActive === true) {
-        await fetchApi('/api/trading/kill-switch', { method: 'DELETE' });
+        await fetchApi('/api/trading/kill-switch', {
+          method: 'DELETE',
+          body: JSON.stringify({ confirm: 'RELEASE', reason: releaseReason }),
+        });
         setKillSwitchActive(false);
         toast('success', 'Kill switch deactivated');
         logger.warn('Risk', 'Kill switch deactivated');
@@ -370,10 +444,7 @@ export default function RiskPage() {
           onRetry={() => {
             setLoading(true);
             setStateError(null);
-            fetchApi<ApiRiskStatus>(`/api/risk/status?source=${sourceRef.current}`)
-              .then((data) => { setState(mapApiRiskStatus(data)); setStateError(null); })
-              .catch((err) => setStateError(err))
-              .finally(() => setLoading(false));
+            void loadRiskData();
           }}
         />
       ) : (
@@ -382,10 +453,10 @@ export default function RiskPage() {
             <div className="rounded-xl border border-border-default bg-bg-secondary p-4 md:p-5">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-text-primary">Circuit breakers</h3>
-                <DataStateBadge state="unavailable" reason="not wired to engine yet" />
+                <DataStateBadge state="unavailable" reason="risk service not running" />
               </div>
               <p className="mt-2 text-xs text-text-muted">
-                Circuit breaker state is not wired to the trading engine yet, so no tier status is shown.
+                The engine&apos;s risk service is not available, so no tier status is shown.
               </p>
             </div>
           ) : (
@@ -426,9 +497,36 @@ export default function RiskPage() {
                     {cb.status}
                   </span>
                 </div>
+                {cb.activeSince && (
+                  <p className="mt-2 text-xs text-text-muted">Since {fmtTime(cb.activeSince)}</p>
+                )}
+                {cb.requiresManualReview && (
+                  <p className="mt-1 text-xs font-medium text-status-error">Manual review required</p>
+                )}
               </div>
             ))}
           </div>
+          )}
+
+          {state.restrictions && (
+            <div
+              data-testid="risk-restrictions"
+              className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border border-border-default bg-bg-secondary px-4 py-3 text-xs"
+            >
+              <span className={cn('font-medium', state.restrictions.can_open_new_trades ? 'text-status-success' : 'text-status-error')}>
+                {state.restrictions.can_open_new_trades ? 'New entries allowed' : 'New entries blocked'}
+              </span>
+              <span className="text-text-muted">Size multiplier x{state.restrictions.size_multiplier}</span>
+              <span className="text-text-muted">
+                Losing streak {state.consecutiveLosses} / {state.maxConsecutiveLosses}
+              </span>
+              {state.restrictions.daily_halt_until && (
+                <span className="text-status-error">Daily halt until {fmtTime(state.restrictions.daily_halt_until)}</span>
+              )}
+              {state.restrictions.consecutive_pause_until && (
+                <span className="text-status-error">Loss pause until {fmtTime(state.restrictions.consecutive_pause_until)}</span>
+              )}
+            </div>
           )}
 
           {/* Gauges row */}
@@ -545,7 +643,11 @@ export default function RiskPage() {
               )}
               <div className="mt-4 space-y-2">
                 {[
-                  { label: 'Current daily loss', value: `-${fmtUsd(state.dailyLoss)}`, color: 'text-status-error' },
+                  {
+                    label: 'Current daily loss',
+                    value: state.dailyLoss === null ? 'unknown' : `-${fmtUsd(state.dailyLoss)}`,
+                    color: 'text-status-error',
+                  },
                 ].map((row) => (
                   <div key={row.label} className="flex justify-between text-xs">
                     <span className="text-text-muted">{row.label}</span>
@@ -594,6 +696,30 @@ export default function RiskPage() {
           )}
         </>
       )}
+
+      {/* Risk audit trail */}
+      <DataCard title="Risk Events" description="Breaker transitions, resets and kill-switch changes">
+        {eventsError !== null ? (
+          <div className="flex items-center gap-3">
+            <DataStateBadge state={stateFromError(eventsError)} />
+            <p className="text-sm text-text-muted">{describeApiError(eventsError, 'Risk events could not be loaded')}</p>
+          </div>
+        ) : events.length === 0 ? (
+          <p className="text-sm text-text-muted">No risk events recorded</p>
+        ) : (
+          <ul className="divide-y divide-border-default text-xs">
+            {events.map((e, i) => (
+              <li key={e.id ?? i} className="flex flex-wrap gap-x-3 py-2">
+                <span className="text-text-muted">{fmtTime(e.ts)}</span>
+                <span className="font-medium text-text-primary">{e.kind}</span>
+                {e.tier !== null && <span className="text-text-muted">tier {e.tier}</span>}
+                <span className="text-text-muted">{e.actor}</span>
+                <span className="text-text-primary">{e.reason}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </DataCard>
 
       {/* Editable risk limits */}
       <DataCard title="Risk Limits" description="Configure global risk management parameters">

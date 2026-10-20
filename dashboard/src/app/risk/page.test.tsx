@@ -24,6 +24,13 @@ vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast }) }));
 
 const { default: RiskPage } = await import('./page');
 
+const LIVE_BREAKERS = [
+  { tier: 1, label: 'Reduce size 50%', threshold: '3.00% drawdown', threshold_pct: 3, current_value: 10.5, status: 'Tripped', active_since: '2026-10-20T09:00:00Z', requires_manual_review: false },
+  { tier: 2, label: 'Halt new entries', threshold: '5.00% drawdown', threshold_pct: 5, current_value: 10.5, status: 'Tripped', active_since: '2026-10-20T09:00:00Z', requires_manual_review: false },
+  { tier: 3, label: 'Flatten all sessions', threshold: '10.00% drawdown', threshold_pct: 10, current_value: 10.5, status: 'Tripped', active_since: '2026-10-20T09:00:00Z', requires_manual_review: true },
+  { tier: 4, label: 'Emergency shutdown', threshold: '15.00% drawdown', threshold_pct: 15, current_value: 10.5, status: 'Warning', active_since: null, requires_manual_review: false },
+];
+
 const RISK_CONFIG = {
   scope: 'global',
   max_position_pct: 0.1,
@@ -32,6 +39,7 @@ const RISK_CONFIG = {
   max_daily_loss_pct: 0.03,
   max_drawdown_pct: 0.15,
   max_concurrent_positions: 3,
+  max_consecutive_losses: 5,
   kill_switch_active: false,
 };
 
@@ -43,9 +51,16 @@ function baseRoutes(): Routes {
       max_drawdown_limit: 15,
       daily_loss: 120,
       daily_loss_limit: 300,
+      equity: 9880,
+      peak_equity: 10000,
+      day_start_equity: 10000,
+      consecutive_losses: 0,
+      max_consecutive_losses: 5,
       circuit_breakers: null,
       circuit_breakers_state: 'unavailable',
+      restrictions: null,
     },
+    '/api/risk/events?limit=20': [],
     '/api/risk/var?source=paper': unavailable(),
     '/api/portfolio/daily-pnl?source=paper': [{ date: '2026-10-19', pnl: -50 }],
     '/api/risk/config': RISK_CONFIG,
@@ -142,5 +157,87 @@ describe('RiskPage risk limits form', () => {
 
     expect(calls.filter((c) => c.path === '/api/risk/config').length).toBeGreaterThan(1);
     expect(input.value).toBe('4');
+  });
+});
+
+describe('RiskPage live risk engine state', () => {
+  it('renders live breakers, restrictions and the risk event trail', async () => {
+    const routes = baseRoutes();
+    routes['/api/risk/status?source=paper'] = {
+      ...(routes['/api/risk/status?source=paper'] as object),
+      current_drawdown: 10.5,
+      consecutive_losses: 2,
+      circuit_breakers: LIVE_BREAKERS,
+      circuit_breakers_state: 'live',
+      restrictions: {
+        active_tier: 3,
+        can_open_new_trades: false,
+        size_multiplier: 0.5,
+        must_flatten: true,
+        is_shutdown: false,
+        daily_halt_until: '2026-10-21T00:00:00Z',
+        consecutive_pause_until: null,
+      },
+    };
+    routes['/api/risk/events?limit=20'] = [
+      { id: 1, ts: '2026-10-20T09:00:00Z', scope: 'paper', kind: 'cb_escalate', tier: 3, actor: 'risk_engine', reason: 'drawdown 0.1050 >= 0.10', details: {} },
+    ];
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<RiskPage />);
+
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('Flatten all sessions');
+    expect(text).toContain('Manual review required');
+    expect(text).not.toContain('risk service not running');
+    const strip = page.container.querySelector('[data-testid="risk-restrictions"]')?.textContent ?? '';
+    expect(strip).toContain('New entries blocked');
+    expect(strip).toContain('x0.5');
+    expect(strip).toContain('Losing streak 2 / 5');
+    expect(strip).toContain('Daily halt until');
+    const events = sectionText(page.container, 'Risk Events');
+    expect(events).toContain('cb_escalate');
+    expect(events).toContain('risk_engine');
+  });
+
+  it('does not guess a source when the trading mode cannot be read', async () => {
+    const routes = baseRoutes();
+    routes['/api/system/config'] = unavailable();
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<RiskPage />);
+
+    expect(calls.some((c) => c.path.includes('source='))).toBe(false);
+    expect(page.container.textContent).toContain('Database is not available');
+  });
+});
+
+describe('RiskPage kill switch release', () => {
+  it('needs RELEASE typed and a reason before it sends the release', async () => {
+    const routes = baseRoutes();
+    routes['/api/risk/config'] = { ...RISK_CONFIG, kill_switch_active: true };
+    routes['/api/risk/live-status'] = {
+      kill_switch_active: true,
+      kill_switch_state: 'active',
+      running_sessions: 0,
+      circuit_breaker_restrictions: null,
+      circuit_breakers_state: 'unavailable',
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    const prompt = vi.spyOn(window, 'prompt').mockReturnValue('release');
+    page = await mount(<RiskPage />);
+
+    await click(buttonByText(page.container, 'Release Kill Switch'));
+    expect(calls.filter((c) => c.init?.method === 'DELETE')).toEqual([]);
+
+    prompt.mockReturnValueOnce('RELEASE').mockReturnValueOnce('  ');
+    await click(buttonByText(page.container, 'Release Kill Switch'));
+    expect(calls.filter((c) => c.init?.method === 'DELETE')).toEqual([]);
+
+    prompt.mockReturnValueOnce('RELEASE').mockReturnValueOnce(' post-mortem done ');
+    await click(buttonByText(page.container, 'Release Kill Switch'));
+    const deletes = calls.filter((c) => c.init?.method === 'DELETE');
+    expect(deletes.map((c) => [c.path, JSON.parse(String(c.init?.body))])).toEqual([
+      ['/api/trading/kill-switch', { confirm: 'RELEASE', reason: 'post-mortem done' }],
+    ]);
+    prompt.mockRestore();
   });
 });

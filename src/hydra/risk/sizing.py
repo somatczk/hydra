@@ -6,6 +6,34 @@ All methods return position size in **base currency units** as ``Decimal``.
 from __future__ import annotations
 
 from decimal import ROUND_DOWN, Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hydra.risk.market_rules import MarketRules
+
+
+def size_entry(
+    *,
+    sleeve_equity: Decimal,
+    fraction: Decimal,
+    mark: Decimal,
+    size_multiplier: Decimal,
+    rules: MarketRules,
+    quote_balance: Decimal,
+    fee_buffer: Decimal,
+) -> Decimal | None:
+    """Entry quantity in base units: notional sizing floored to the lot step.
+
+    notional = min(sleeve_equity x fraction x size_multiplier, quote_balance / (1 + fee_buffer));
+    returns None when the floored quantity is below the market minimum quantity or notional.
+    """
+    if min(sleeve_equity, fraction, mark, size_multiplier, quote_balance) <= 0 or fee_buffer < 0:
+        return None
+    budget = min(sleeve_equity * fraction * size_multiplier, quote_balance / (1 + fee_buffer))
+    qty = rules.floor_qty(budget / mark)
+    if qty <= 0 or qty < rules.min_qty or qty * mark < rules.min_notional:
+        return None
+    return qty
 
 
 class PositionSizer:

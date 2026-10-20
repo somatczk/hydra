@@ -1,4 +1,4 @@
-"""Parameterized tests for the 10-point PreTradeRiskManager check sequence."""
+"""PreTradeRiskManager: mark pricing, open vs reduce, quote-only balance, account limits."""
 
 from __future__ import annotations
 
@@ -7,214 +7,214 @@ from typing import Any
 
 import pytest
 
-from hydra.core.types import (
-    Direction,
-    MarketType,
-    OrderRequest,
-    OrderType,
-    Position,
-    Side,
-    Symbol,
+from hydra.core.types import Direction, MarketType, OrderRequest, OrderType, Position, Side, Symbol
+from hydra.risk.circuit_breakers import CircuitBreakerRestrictions
+from hydra.risk.market_rules import MarketRules
+from hydra.risk.pretrade import (
+    OPEN,
+    REDUCE,
+    PortfolioState,
+    PreTradeRiskManager,
+    RiskConfig,
+    classify_intent,
 )
-from hydra.risk.pretrade import PortfolioState, PreTradeRiskManager, RiskConfig
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+BTC = Symbol("BTCUSDT")
 
 
-def _make_order(**overrides: Any) -> OrderRequest:
-    defaults: dict[str, Any] = {
-        "symbol": Symbol("BTCUSDT"),
-        "side": Side.BUY,
-        "order_type": OrderType.MARKET,
-        "quantity": Decimal("0.01"),
-        "price": Decimal("42000"),
-        "strategy_id": "test",
-        "exchange_id": "binance",
-        "market_type": MarketType.SPOT,
-    }
-    defaults.update(overrides)
-    return OrderRequest(**defaults)
+def _order(qty: str, side: Side = Side.BUY, **kw: Any) -> OrderRequest:
+    return OrderRequest(
+        symbol=BTC,
+        side=side,
+        order_type=OrderType.MARKET,
+        quantity=Decimal(qty),
+        strategy_id="s",
+        exchange_id="binance",
+        market_type=MarketType.SPOT,
+        **kw,
+    )
 
 
-def _make_portfolio(**overrides: Any) -> PortfolioState:
-    defaults: dict[str, Any] = {
-        "positions": [],
-        "balances": {"USDT": Decimal("10000")},
-        "daily_pnl": Decimal("0"),
-        "consecutive_losses": 0,
-        "current_drawdown": Decimal("0"),
-        "portfolio_value": Decimal("10000"),
-        "average_volume": Decimal("1000000"),
-        "correlation_map": {},
-    }
-    defaults.update(overrides)
-    return PortfolioState(**defaults)
-
-
-def _make_position(
-    symbol: str = "BTCUSDT",
-    quantity: str = "0.01",
-    entry: str = "42000",
-) -> Position:
+def _long(qty: str, entry: str = "60000", symbol: str = "BTCUSDT") -> Position:
     return Position(
         symbol=Symbol(symbol),
         direction=Direction.LONG,
-        quantity=Decimal(quantity),
+        quantity=Decimal(qty),
         avg_entry_price=Decimal(entry),
         unrealized_pnl=Decimal("0"),
         realized_pnl=Decimal("0"),
-        strategy_id="test",
+        strategy_id="s",
         exchange_id="binance",
     )
 
 
-# ---------------------------------------------------------------------------
-# Parameterized test: each check individually
-# ---------------------------------------------------------------------------
+def _state(**kw: Any) -> PortfolioState:
+    base: dict[str, Any] = {
+        "portfolio_value": Decimal("10000"),
+        "balances": {"USDT": Decimal("10000")},
+        "marks": {"BTCUSDT": Decimal("60000")},
+        "restrictions": CircuitBreakerRestrictions(),
+    }
+    base.update(kw)
+    return PortfolioState(**base)
 
 
-class TestPreTradeRiskChecks:
+def _check(order: OrderRequest, state: PortfolioState, **cfg: Any) -> tuple[bool, str, str]:
+    d = PreTradeRiskManager(RiskConfig(**cfg)).evaluate(order, state)
+    return d.approved, d.check, d.reason
+
+
+class TestMarkPricing:
+    def test_market_order_priced_at_mark(self) -> None:
+        ok, check, reason = _check(_order("50"), _state())
+        assert (ok, check) == (False, "position_size")
+        assert "3000000" in reason
+
+    def test_negative_quantity_rejected(self) -> None:
+        ok, check, reason = _check(_order("-5"), _state())
+        assert (ok, check) == (False, "sanity")
+        assert "non-positive quantity" in reason
+
+    def test_opening_without_mark_or_price_rejected(self) -> None:
+        ok, check, reason = _check(_order("0.001"), _state(marks={}))
+        assert (ok, check) == (False, "no_mark")
+        assert "no mark price" in reason
+
+    def test_mark_wins_over_stale_order_price(self) -> None:
+        ok, check, _ = _check(_order("0.02", price=Decimal("1")), _state())
+        assert (ok, check) == (False, "position_size")
+
+    def test_small_order_at_mark_approved(self) -> None:
+        assert _check(_order("0.01"), _state())[0] is True
+
+
+class TestQuoteOnlyBalance:
+    def test_quote_only_balance(self) -> None:
+        state = _state(balances={"USDT": Decimal("100"), "BTC": Decimal("1")})
+        ok, check, reason = _check(_order("0.01"), state)
+        assert (ok, check) == (False, "balance")
+        assert "insufficient USDT" in reason
+
+
+class TestIntent:
+    def test_reduce_only_is_reduce(self) -> None:
+        assert classify_intent(_order("1", Side.SELL, reduce_only=True), []) == REDUCE
+
+    def test_unflagged_sell_within_long_is_reduce(self) -> None:
+        assert classify_intent(_order("0.01", Side.SELL), [_long("0.01")]) == REDUCE
+
+    def test_sell_beyond_long_is_open(self) -> None:
+        assert classify_intent(_order("0.02", Side.SELL), [_long("0.01")]) == OPEN
+
+    def test_buy_with_long_is_open(self) -> None:
+        assert classify_intent(_order("0.01"), [_long("0.01")]) == OPEN
+
     @pytest.mark.parametrize(
-        ("scenario", "expected_approved", "reason_substring"),
+        "blocker",
         [
-            ("position_too_large", False, "position size"),
-            ("risk_exceeded", False, "risk per trade"),
-            ("heat_exceeded", False, "portfolio heat"),
-            ("circuit_breaker", False, "circuit breaker"),
-            ("daily_loss", False, "daily loss"),
-            ("consecutive_losses", False, "consecutive"),
-            ("insufficient_balance", False, "balance"),
-            ("low_liquidity", False, "liquidity"),
-            ("valid_order", True, "approved"),
-        ],
-        ids=[
-            "position_too_large",
-            "risk_exceeded",
-            "heat_exceeded",
-            "circuit_breaker",
-            "daily_loss",
-            "consecutive_losses",
-            "insufficient_balance",
-            "low_liquidity",
-            "valid_order",
+            {"kill_switch": True},
+            {"state_available": False},
+            {"restrictions": CircuitBreakerRestrictions(tier=3, must_flatten=True)},
+            {"restrictions": CircuitBreakerRestrictions(tier=4, is_shutdown=True)},
+            {"restrictions": CircuitBreakerRestrictions(daily_halt=True)},
+            {"restrictions": CircuitBreakerRestrictions(consecutive_loss_pause=True)},
+            {"opening_orders_last_minute": 99},
+            {"marks": {}},
+            {"balances": {"USDT": Decimal("0")}},
+            {"account_positions": [_long("0.5", symbol=f"X{i}USDT") for i in range(20)]},
         ],
     )
-    async def test_risk_check(
-        self,
-        scenario: str,
-        expected_approved: bool,
-        reason_substring: str,
-    ) -> None:
-        order, portfolio, config_kwargs, cb_tier = self._build_scenario(scenario)
-        config = RiskConfig(**config_kwargs) if config_kwargs else RiskConfig()
-        mgr = PreTradeRiskManager(config=config, circuit_breaker_tier=cb_tier)
-
-        result = await mgr.check_order(order, portfolio)
-        assert result.approved is expected_approved
-        assert reason_substring.lower() in result.reason.lower()
-
-    @staticmethod
-    def _build_scenario(
-        name: str,
-    ) -> tuple[OrderRequest, PortfolioState, dict[str, Any], int]:
-        """Build order + portfolio + config for each scenario."""
-        config_kwargs: dict[str, Any] = {}
-        cb_tier = 0
-
-        if name == "position_too_large":
-            # Order value = 0.5 * 42000 = 21000 > 10% of 10000 = 1000
-            order = _make_order(quantity=Decimal("0.5"), price=Decimal("42000"))
-            portfolio = _make_portfolio(portfolio_value=Decimal("10000"))
-
-        elif name == "risk_exceeded":
-            # Order value / portfolio = 5000/10000 = 50% > 2%
-            order = _make_order(quantity=Decimal("0.5"), price=Decimal("10000"))
-            portfolio = _make_portfolio(portfolio_value=Decimal("10000"))
-            config_kwargs = {"max_position_pct": Decimal("1.0")}  # pass position check
-
-        elif name == "heat_exceeded":
-            # Existing position risk = 420/10000 = 4.2%
-            # New order risk = 420/10000 = 4.2%
-            # Total = 8.4% > 6%
-            pos = _make_position(quantity="0.01", entry="42000")
-            order = _make_order(quantity=Decimal("0.01"), price=Decimal("42000"))
-            portfolio = _make_portfolio(
-                positions=[pos],
-                portfolio_value=Decimal("10000"),
-            )
-            config_kwargs = {
-                "max_position_pct": Decimal("1.0"),
-                "max_risk_per_trade": Decimal("1.0"),
-            }
-
-        elif name == "circuit_breaker":
-            order = _make_order(quantity=Decimal("0.001"), price=Decimal("42000"))
-            portfolio = _make_portfolio()
-            cb_tier = 2
-
-        elif name == "daily_loss":
-            order = _make_order(quantity=Decimal("0.001"), price=Decimal("42000"))
-            portfolio = _make_portfolio(daily_pnl=Decimal("-500"))  # 5% of 10000
-
-        elif name == "consecutive_losses":
-            order = _make_order(quantity=Decimal("0.001"), price=Decimal("42000"))
-            portfolio = _make_portfolio(consecutive_losses=5)
-
-        elif name == "insufficient_balance":
-            order = _make_order(quantity=Decimal("1"), price=Decimal("50000"))
-            portfolio = _make_portfolio(
-                balances={"USDT": Decimal("100")},
-                portfolio_value=Decimal("1000000"),
-                average_volume=Decimal("999999999"),
-            )
-            config_kwargs = {
-                "max_position_pct": Decimal("1.0"),
-                "max_risk_per_trade": Decimal("1.0"),
-                "max_portfolio_heat": Decimal("1.0"),
-            }
-
-        elif name == "low_liquidity":
-            order = _make_order(quantity=Decimal("200"), price=Decimal("1"))
-            portfolio = _make_portfolio(
-                average_volume=Decimal("10000"),
-                balances={"USDT": Decimal("999999")},
-                portfolio_value=Decimal("999999"),
-            )
-            config_kwargs = {
-                "max_position_pct": Decimal("1.0"),
-                "max_risk_per_trade": Decimal("1.0"),
-                "max_portfolio_heat": Decimal("1.0"),
-            }
-
-        elif name == "valid_order":
-            # Small order that passes everything
-            order = _make_order(quantity=Decimal("0.001"), price=Decimal("42000"))
-            portfolio = _make_portfolio(
-                balances={"USDT": Decimal("10000")},
-                portfolio_value=Decimal("10000"),
-                average_volume=Decimal("1000000"),
-            )
-
-        else:
-            raise ValueError(f"Unknown scenario: {name}")
-
-        return order, portfolio, config_kwargs, cb_tier
+    def test_exit_never_blocked(self, blocker: dict[str, Any]) -> None:
+        state = _state(positions=[_long("0.01")], **blocker)
+        exit_order = _order("0.01", Side.SELL)
+        assert _check(exit_order, state) == (True, "reduce", "reducing order: entry checks exempt")
+        assert _check(_order("0.01"), state)[0] is False
 
 
-class TestPreTradeEdgeCases:
-    async def test_zero_portfolio_value_fails(self) -> None:
-        mgr = PreTradeRiskManager()
-        order = _make_order()
-        portfolio = _make_portfolio(portfolio_value=Decimal("0"))
-        result = await mgr.check_order(order, portfolio)
+class TestOpeningChecks:
+    def test_kill_switch(self) -> None:
+        assert _check(_order("0.01"), _state(kill_switch=True))[1] == "kill_switch"
+
+    def test_state_unavailable(self) -> None:
+        _, check, reason = _check(_order("0.01"), _state(state_available=False))
+        assert (check, reason) == ("risk_state", "risk state unavailable")
+
+    @pytest.mark.parametrize(
+        ("restr", "check"),
+        [
+            (CircuitBreakerRestrictions(tier=2), "circuit_breaker"),
+            (CircuitBreakerRestrictions(daily_halt=True), "daily_loss_halt"),
+            (CircuitBreakerRestrictions(consecutive_loss_pause=True), "consecutive_loss_pause"),
+        ],
+    )
+    def test_breaker_restrictions(self, restr: CircuitBreakerRestrictions, check: str) -> None:
+        assert _check(_order("0.01"), _state(restrictions=restr))[1] == check
+
+    def test_spot_short_open_rejected(self) -> None:
+        assert _check(_order("0.01", Side.SELL), _state())[1] == "spot_short"
+
+    def test_position_size_uses_sleeve(self) -> None:
+        state = _state(sleeve_equity=Decimal("2000"))
+        ok, check, _ = _check(_order("0.004"), state)
+        assert (ok, check) == (False, "position_size")
+        assert _check(_order("0.003"), state)[0] is True
+
+    def test_tier1_halves_the_position_cap(self) -> None:
+        tier1 = _state(
+            restrictions=CircuitBreakerRestrictions(tier=1, position_size_multiplier=Decimal("0.5"))
+        )
+        assert _check(_order("0.015"), _state())[0] is True
+        ok, check, reason = _check(_order("0.015"), tier1)
+        assert (ok, check) == (False, "position_size")
+        assert "(500.00" in reason
+        assert _check(_order("0.008"), tier1)[0] is True
+
+    def test_risk_per_trade_only_with_stop(self) -> None:
+        cfg = {"max_risk_per_trade": Decimal("0.02")}
+        assert _check(_order("0.01"), _state(), **cfg)[0] is True
+        stop = _order("0.01", stop_price=Decimal("30000"))
+        ok, check, reason = _check(stop, _state(), **cfg)
+        assert (ok, check) == (False, "risk_per_trade")
+        assert "300" in reason
+
+    def test_gross_exposure_across_sessions(self) -> None:
+        others = [_long("0.01"), _long("0.01"), _long("0.01")]
+        state = _state(account_positions=others)
+        ok, check, _ = _check(_order("0.01"), state, max_portfolio_heat=Decimal("0.20"))
+        assert (ok, check) == (False, "portfolio_heat")
+        assert _check(_order("0.01"), state, max_portfolio_heat=Decimal("0.30"))[0] is True
+
+    def test_concurrent_positions_counted_across_sessions(self) -> None:
+        others = [_long("0.001", symbol=s) for s in ("ETHUSDT", "SOLUSDT")]
+        state = _state(account_positions=others)
+        assert _check(_order("0.01"), state, max_concurrent_positions=2)[1] == (
+            "concurrent_positions"
+        )
+
+    def test_market_rules_min_notional(self) -> None:
+        rules = MarketRules(
+            symbol="BTCUSDT",
+            amount_step=Decimal("0.00001"),
+            min_qty=Decimal("0.00001"),
+            min_notional=Decimal("5"),
+        )
+        ok, check, reason = _check(_order("0.00005"), _state(market_rules={"BTCUSDT": rules}))
+        assert (ok, check) == (False, "market_rules")
+        assert "min notional" in reason
+
+    def test_liquidity_skipped_without_volume(self) -> None:
+        assert _check(_order("0.01"), _state(average_volume=None))[0] is True
+        assert _check(_order("0.01"), _state(average_volume=Decimal("0.5")))[1] == "liquidity"
+
+    def test_rate_limit(self) -> None:
+        state = _state(opening_orders_last_minute=6)
+        assert _check(_order("0.01"), state, max_orders_per_minute=6)[1] == "rate_limit"
+
+
+class TestLegacyPath:
+    async def test_constructor_tier_blocks_when_no_restrictions(self) -> None:
+        mgr = PreTradeRiskManager(circuit_breaker_tier=2)
+        state = _state(restrictions=None)
+        result = await mgr.check_order(_order("0.001"), state)
         assert result.approved is False
-
-    async def test_no_price_uses_fallback(self) -> None:
-        mgr = PreTradeRiskManager()
-        order = _make_order(price=None, quantity=Decimal("0.001"))
-        portfolio = _make_portfolio()
-        result = await mgr.check_order(order, portfolio)
-        # Should still run checks without crashing
-        assert isinstance(result.approved, bool)
+        assert "circuit breaker" in result.reason

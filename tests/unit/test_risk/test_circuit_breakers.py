@@ -1,310 +1,206 @@
-"""Tests for CircuitBreakerManager: 4 tiers, auto-reset, additional breakers."""
+"""CircuitBreakerManager: tiers from max_drawdown_pct, wall-clock latching, strict reset."""
 
 from __future__ import annotations
 
-import time
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from unittest.mock import AsyncMock
 
-from hydra.core.events import CircuitBreakerEvent
-from hydra.risk.circuit_breakers import CircuitBreakerManager
+import pytest
 
-# ---------------------------------------------------------------------------
-# Tier activation tests
-# ---------------------------------------------------------------------------
+from hydra.risk.circuit_breakers import (
+    CircuitBreakerConfig,
+    CircuitBreakerManager,
+    CircuitBreakerState,
+    TierNotActiveError,
+    next_utc_midnight,
+)
+
+T0 = datetime(2026, 10, 20, 9, 30, tzinfo=UTC)
 
 
-class TestTierActivation:
-    async def test_tier_0_no_breaker(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
+def _update(
+    mgr: CircuitBreakerManager,
+    dd: str = "0",
+    *,
+    daily: str = "0",
+    losses: int = 0,
+    now: datetime = T0,
+) -> list[str]:
+    return [
+        t.kind
+        for t in mgr.update(
+            drawdown=Decimal(dd), daily_loss=Decimal(daily), consecutive_losses=losses, now=now
         )
-        assert mgr.get_active_tier() == 0
+    ]
 
-    async def test_tier_1_at_3pct_drawdown(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.03"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        assert mgr.get_active_tier() == 1
 
-    async def test_tier_2_at_5pct_drawdown(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.05"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
+class TestThresholds:
+    def test_tiers_derive_from_max_drawdown(self) -> None:
+        cfg = CircuitBreakerConfig(max_drawdown_pct=Decimal("0.15"))
+        assert cfg.thresholds() == (
+            Decimal("0.03"),
+            Decimal("0.05"),
+            Decimal("0.10"),
+            Decimal("0.15"),
         )
+        assert CircuitBreakerConfig(max_drawdown_pct=Decimal("0.30")).thresholds() == (
+            Decimal("0.06"),
+            Decimal("0.10"),
+            Decimal("0.20"),
+            Decimal("0.30"),
+        )
+
+    def test_zero_max_drawdown_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_drawdown_pct"):
+            CircuitBreakerConfig(max_drawdown_pct=Decimal("0"))
+
+    @pytest.mark.parametrize(
+        ("dd", "tier"),
+        [("0.0299", 0), ("0.03", 1), ("0.0499", 1), ("0.05", 2), ("0.10", 3), ("0.15", 4)],
+    )
+    def test_tier_for(self, dd: str, tier: int) -> None:
+        assert CircuitBreakerManager().tier_for(Decimal(dd)) == tier
+
+
+class TestEscalation:
+    def test_escalates_one_transition_per_update(self) -> None:
+        mgr = CircuitBreakerManager()
+        assert _update(mgr, "0.052") == ["cb_escalate"]
         assert mgr.get_active_tier() == 2
-
-    async def test_tier_3_at_10pct_drawdown(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.10"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        assert mgr.get_active_tier() == 3
-
-    async def test_tier_4_at_15pct_drawdown(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.15"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
+        assert _update(mgr, "0.105") == ["cb_escalate"]
+        assert mgr.state.requires_manual_review is True
+        assert _update(mgr, "0.151") == ["cb_escalate"]
         assert mgr.get_active_tier() == 4
 
-    async def test_tier_escalation_publishes_event(self) -> None:
-        bus = AsyncMock()
-        mgr = CircuitBreakerManager(event_bus=bus)
-        await mgr.update(
-            current_drawdown=Decimal("0.05"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        bus.publish.assert_awaited()
-        event = bus.publish.call_args[0][0]
-        assert isinstance(event, CircuitBreakerEvent)
-        assert event.tier == 2
-        assert event.action == "halt_new_trades"
-
-
-# ---------------------------------------------------------------------------
-# Restrictions tests
-# ---------------------------------------------------------------------------
-
-
-class TestRestrictions:
-    async def test_tier_0_no_restrictions(self) -> None:
+    def test_recovery_does_not_lower_tier_before_auto_reset(self) -> None:
         mgr = CircuitBreakerManager()
-        r = mgr.get_restrictions()
-        assert r.can_open_new_trades is True
-        assert r.position_size_multiplier == Decimal("1.0")
-        assert r.must_flatten is False
-        assert r.is_shutdown is False
+        _update(mgr, "0.04")
+        assert _update(mgr, "0.0", now=T0 + timedelta(hours=23)) == []
+        assert mgr.get_active_tier() == 1
 
-    async def test_tier_1_reduces_size(self) -> None:
+    @pytest.mark.parametrize(
+        ("tier_dd", "expected"),
+        [
+            ("0.0", (True, Decimal("1"), False, False)),
+            ("0.03", (True, Decimal("0.5"), False, False)),
+            ("0.05", (False, Decimal("0.5"), False, False)),
+            ("0.10", (False, Decimal("0.5"), True, False)),
+            ("0.15", (False, Decimal("0.5"), True, True)),
+        ],
+    )
+    def test_restrictions_per_tier(
+        self, tier_dd: str, expected: tuple[bool, Decimal, bool, bool]
+    ) -> None:
         mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.03"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.can_open_new_trades is True
-        assert r.position_size_multiplier == Decimal("0.5")
-
-    async def test_tier_2_halts_new_trades(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.05"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.can_open_new_trades is False
-
-    async def test_tier_3_must_flatten(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.10"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.must_flatten is True
-
-    async def test_tier_4_shutdown(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.15"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.is_shutdown is True
-
-
-# ---------------------------------------------------------------------------
-# Auto-reset tests
-# ---------------------------------------------------------------------------
+        _update(mgr, tier_dd)
+        r = mgr.restrictions(T0)
+        assert (
+            r.can_open_new_trades,
+            r.position_size_multiplier,
+            r.must_flatten,
+            r.is_shutdown,
+        ) == expected
 
 
 class TestAutoReset:
-    async def test_tier_1_auto_resets_after_24h(self) -> None:
+    def test_tier1_resets_only_after_24h_and_below_threshold(self) -> None:
         mgr = CircuitBreakerManager()
-        # Activate tier 1
-        await mgr.update(
-            current_drawdown=Decimal("0.03"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
+        _update(mgr, "0.035")
+        assert _update(mgr, "0.031", now=T0 + timedelta(hours=25)) == []
+        assert mgr.get_active_tier() == 1
+        assert _update(mgr, "0.029", now=T0 + timedelta(hours=23, minutes=59)) == []
+        assert mgr.get_active_tier() == 1
+        assert _update(mgr, "0.029", now=T0 + timedelta(hours=24)) == ["cb_auto_reset"]
+        assert mgr.get_active_tier() == 0
+        assert mgr.state.tier_since is None
+
+    def test_tier2_auto_reset_lands_on_current_tier(self) -> None:
+        mgr = CircuitBreakerManager()
+        _update(mgr, "0.06")
+        assert _update(mgr, "0.04", now=T0 + timedelta(hours=48)) == ["cb_auto_reset"]
         assert mgr.get_active_tier() == 1
 
-        # Simulate time passing by patching the activation timestamp
-        # Move activation time 25 hours into the past
-        mgr._tier_activated_at = time.monotonic() - (25 * 3600)
-
-        # Update with low drawdown (no longer breaching)
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        assert mgr.get_active_tier() == 0
-
-    async def test_tier_4_no_auto_reset(self) -> None:
+    @pytest.mark.parametrize("dd", ["0.10", "0.15"])
+    def test_tier3_and_4_never_auto_reset(self, dd: str) -> None:
         mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.15"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
+        tier = mgr.tier_for(Decimal(dd))
+        _update(mgr, dd)
+        assert _update(mgr, "0", now=T0 + timedelta(days=30)) == []
+        assert mgr.get_active_tier() == tier
+
+
+class TestDailyHalt:
+    def test_latched_until_utc_midnight(self) -> None:
+        mgr = CircuitBreakerManager()
+        assert _update(mgr, daily="0.036") == ["daily_halt"]
+        assert mgr.state.daily_halt_until == datetime(2026, 10, 21, tzinfo=UTC)
+        assert _update(mgr, daily="0.001", now=T0 + timedelta(hours=10)) == []
+        assert mgr.restrictions(T0 + timedelta(hours=10)).daily_halt is True
+        rollover = datetime(2026, 10, 21, 0, 0, 1, tzinfo=UTC)
+        assert mgr.restrictions(rollover).can_open_new_trades is True
+        assert _update(mgr, daily="0", now=rollover) == ["daily_halt_lifted"]
+        assert mgr.state.daily_halt_until is None
+
+    def test_next_midnight_is_utc_for_aware_non_utc_input(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        la = datetime(2026, 10, 20, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+        assert next_utc_midnight(la) == datetime(2026, 10, 22, tzinfo=UTC)
+
+
+class TestConsecutivePause:
+    def test_pause_then_counter_reset_on_expiry(self) -> None:
+        mgr = CircuitBreakerManager()
+        assert _update(mgr, losses=5) == ["consecutive_pause"]
+        assert mgr.restrictions(T0 + timedelta(hours=3)).consecutive_loss_pause is True
+        later = T0 + timedelta(hours=4)
+        assert mgr.restrictions(later).consecutive_loss_pause is False
+        assert _update(mgr, losses=5, now=later) == ["consecutive_reset"]
+        assert mgr.state.consecutive_pause_until is None
+
+
+class TestReset:
+    def test_reset_rejects_out_of_range_tier(self) -> None:
+        mgr = CircuitBreakerManager()
+        _update(mgr, "0.16")
+        with pytest.raises(ValueError, match="1-4"):
+            mgr.reset(9)
         assert mgr.get_active_tier() == 4
 
-        # Simulate time passing (even 1000 hours)
-        mgr._tier_activated_at = time.monotonic() - (1000 * 3600)
-
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        # Tier 4 has no auto-reset
-        assert mgr.get_active_tier() == 4
-
-
-# ---------------------------------------------------------------------------
-# Manual reset
-# ---------------------------------------------------------------------------
-
-
-class TestManualReset:
-    async def test_manual_reset(self) -> None:
+    def test_reset_rejects_non_active_tier(self) -> None:
         mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.10"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
+        _update(mgr, "0.11")
+        with pytest.raises(TierNotActiveError):
+            mgr.reset(2)
         assert mgr.get_active_tier() == 3
 
-        mgr.reset(tier=3)
+    def test_reset_active_tier(self) -> None:
+        mgr = CircuitBreakerManager()
+        _update(mgr, "0.11")
+        mgr.reset(3)
         assert mgr.get_active_tier() == 0
+        assert mgr.state.requires_manual_review is False
 
 
-# ---------------------------------------------------------------------------
-# Additional breakers
-# ---------------------------------------------------------------------------
-
-
-class TestAdditionalBreakers:
-    async def test_daily_loss_halt(self) -> None:
+class TestPersistence:
+    def test_row_round_trip_preserves_deadlines(self) -> None:
         mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0.04"),  # exceeds 3%
-            consecutive_losses=0,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.daily_halt is True
-        assert r.can_open_new_trades is False
+        _update(mgr, "0.11", daily="0.04", losses=5)
+        row = mgr.state.to_row()
+        restored = CircuitBreakerState.from_row(row)
+        assert restored == mgr.state
+        assert restored.tier_since == T0
+        assert restored.daily_halt_until == datetime(2026, 10, 21, tzinfo=UTC)
+        assert restored.consecutive_pause_until == T0 + timedelta(hours=4)
 
-    async def test_consecutive_loss_pause(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=5,  # reaches threshold
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.consecutive_loss_pause is True
-        assert r.can_open_new_trades is False
+    def test_new_manager_from_persisted_state_keeps_tier(self) -> None:
+        first = CircuitBreakerManager()
+        _update(first, "0.11")
+        second = CircuitBreakerManager(state=CircuitBreakerState.from_row(first.state.to_row()))
+        assert second.get_active_tier() == 3
+        assert second.restrictions(T0).must_flatten is True
 
-    async def test_consecutive_loss_pause_auto_resets(self) -> None:
-        mgr = CircuitBreakerManager(consecutive_pause_hours=0.001)  # very short
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=5,
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        assert mgr.get_restrictions().consecutive_loss_pause is True
-
-        # Simulate the pause expiring
-        mgr._consecutive_pause_until = time.monotonic() - 1
-
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=2,  # losses recovered
-            current_vol=Decimal("0.2"),
-            normal_vol=Decimal("0.2"),
-        )
-        assert mgr.get_restrictions().consecutive_loss_pause is False
-
-    async def test_volatility_spike_reduces_size(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.9"),  # 4.5x normal
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.volatility_reduction is True
-        assert r.position_size_multiplier == Decimal("0.5")
-
-    async def test_no_volatility_spike(self) -> None:
-        mgr = CircuitBreakerManager()
-        await mgr.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.3"),  # 1.5x normal (below 3x)
-            normal_vol=Decimal("0.2"),
-        )
-        r = mgr.get_restrictions()
-        assert r.volatility_reduction is False
+    def test_out_of_range_persisted_tier_raises(self) -> None:
+        row = CircuitBreakerState().to_row() | {"cb_tier": 7}
+        with pytest.raises(ValueError, match="out of range"):
+            CircuitBreakerState.from_row(row)

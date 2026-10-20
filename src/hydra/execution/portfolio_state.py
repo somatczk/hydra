@@ -1,4 +1,5 @@
-"""Portfolio state for pre-trade risk checks, aggregated from a session executor."""
+"""Per-session PortfolioState for the pre-RiskService order path (P1-E replaces it with
+RiskService.snapshot)."""
 
 from __future__ import annotations
 
@@ -19,13 +20,17 @@ async def build_portfolio_state(executor: Any, symbols: list[str], db_pool: Any)
     daily_pnl = Decimal("0")
     consecutive_losses = 0
     current_drawdown = Decimal("0")
-    portfolio_value = Decimal("10000")
+    marks: dict[str, Decimal] = {}
 
     if executor is not None:
         balances = await executor.get_balance()
         for sym in symbols:
             pos_list = await executor.get_positions(sym)
             positions.extend(pos_list)
+            try:
+                marks[sym] = await executor.get_last_price(sym)
+            except ValueError:
+                logger.debug("No mark for %s; opening orders on it are refused", sym)
 
     # Sum portfolio value from balances + position notional values
     balance_total = sum(balances.values(), Decimal("0"))
@@ -73,4 +78,5 @@ async def build_portfolio_state(executor: Any, symbols: list[str], db_pool: Any)
         consecutive_losses=consecutive_losses,
         current_drawdown=current_drawdown,
         portfolio_value=portfolio_value,
+        marks=marks,
     )

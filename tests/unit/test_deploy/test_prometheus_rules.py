@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -16,8 +15,7 @@ from prometheus_client import generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from hydra.core import metrics
-from hydra.execution.session_manager import SessionManager, TradingSession
-from hydra.risk.pretrade import PreTradeRiskManager
+from tests.unit.test_risk.harness import make_account, permissive
 
 DEPLOY = Path(__file__).resolve().parents[3] / "deploy"
 RULES_PATH = DEPLOY / "prometheus-rules.yml"
@@ -27,28 +25,6 @@ EXTERNAL_SERIES = re.compile(r"^(up|process_\w+)\{")
 HISTOGRAM_RULE = re.compile(
     r"histogram_quantile\(\s*[\d.]+\s*,.*?(\w+)_bucket\b.*\)\s*>\s*([\d.]+)\s*$", re.S
 )
-
-
-class _RiskStateConn:
-    def __init__(self, row: dict[str, Any]) -> None:
-        self._row = row
-
-    async def execute(self, query: str, *args: Any) -> None:
-        assert query.startswith("UPDATE risk_state"), query
-        self._row.update(daily_pnl=args[0], consecutive_losses=args[2], current_drawdown=args[4])
-
-    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
-        assert "FROM risk_state" in query, query
-        return dict(self._row) if self._row else None
-
-
-class _RiskStatePool:
-    def __init__(self) -> None:
-        self.row: dict[str, Any] = {}
-
-    @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[_RiskStateConn]:
-        yield _RiskStateConn(self.row)
 
 
 @pytest.fixture(autouse=True)
@@ -79,21 +55,18 @@ def _exported_sample(name: str) -> float:
 
 
 async def test_drawdown_emitted_as_fraction() -> None:
-    pool = _RiskStatePool()
-    risk = PreTradeRiskManager(db_pool=pool)
-    await risk.record_fill(Decimal("0"), Decimal("10000"))
-    await risk.record_fill(Decimal("-1200"), Decimal("8800"))
-    assert pool.row["current_drawdown"] == Decimal("0.12")
+    acct = await make_account(permissive())
+    ex = await acct.add_session("s1", "10000")
+    await acct.mark("60000")
+    await ex.create_order("BTCUSDT", "BUY", "MARKET", Decimal("0.1"))
+    await acct.mark("48000")
 
-    sessions = SessionManager(db_pool=None)
-    sessions._db_pool = pool
-    session = TradingSession(session_id="s1", strategy_id="any", trading_mode="paper")
-    state = await sessions._build_portfolio_state(session)
-
-    assert state.current_drawdown == Decimal("0.12")
+    assert acct.svc.account().peak_equity == Decimal("10000")
+    assert acct.svc.account().equity == Decimal("8800.0")
     exported = _exported_sample("hydra_drawdown_ratio")
     assert exported == pytest.approx(0.12)
     assert exported > _drawdown_threshold()
+    assert _exported_sample("hydra_circuit_breaker_active_tier") == 3.0
 
 
 def test_drawdown_rule_threshold_matches_fraction_unit() -> None:

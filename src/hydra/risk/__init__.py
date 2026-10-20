@@ -1,21 +1,33 @@
-"""M08: Pre-trade risk checks, position sizing, circuit breakers."""
+"""M08: Pre-trade risk checks, position sizing, circuit breakers, account RiskService."""
 
 from __future__ import annotations
 
 __all__ = [
     "CircuitBreakerManager",
     "ExchangeSafetyManager",
+    "InMemoryRiskStateStore",
+    "MarketRules",
+    "MarketRulesCache",
+    "PgRiskStateStore",
     "PortfolioState",
     "PositionSizer",
     "PreTradeRiskManager",
+    "RiskService",
+    "size_entry",
 ]
 
 _IMPORT_MAP: dict[str, tuple[str, str]] = {
     "CircuitBreakerManager": ("hydra.risk.circuit_breakers", "CircuitBreakerManager"),
     "ExchangeSafetyManager": ("hydra.risk.exchange_safety", "ExchangeSafetyManager"),
+    "InMemoryRiskStateStore": ("hydra.risk.state", "InMemoryRiskStateStore"),
+    "MarketRules": ("hydra.risk.market_rules", "MarketRules"),
+    "MarketRulesCache": ("hydra.risk.market_rules", "MarketRulesCache"),
+    "PgRiskStateStore": ("hydra.risk.state", "PgRiskStateStore"),
     "PortfolioState": ("hydra.risk.pretrade", "PortfolioState"),
     "PreTradeRiskManager": ("hydra.risk.pretrade", "PreTradeRiskManager"),
     "PositionSizer": ("hydra.risk.sizing", "PositionSizer"),
+    "RiskService": ("hydra.risk.service", "RiskService"),
+    "size_entry": ("hydra.risk.sizing", "size_entry"),
 }
 
 

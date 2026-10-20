@@ -111,9 +111,9 @@ def risk_manager() -> PreTradeRiskManager:
 
 
 @pytest.fixture()
-def circuit_breakers(event_bus: InMemoryEventBus) -> CircuitBreakerManager:
-    """CircuitBreakerManager wired to the test event bus."""
-    return CircuitBreakerManager(event_bus=event_bus)
+def circuit_breakers() -> CircuitBreakerManager:
+    """CircuitBreakerManager with the default 15% max-drawdown tiers."""
+    return CircuitBreakerManager()
 
 
 @pytest.fixture()
@@ -130,15 +130,12 @@ def pnl_calculator() -> PnLCalculator:
 
 @pytest.fixture()
 def portfolio_state() -> PortfolioState:
-    """Default PortfolioState with $10,000 value and USDT balance."""
+    """$10,000 account, all in USDT, BTCUSDT marked at 42,000, no volume data."""
     return PortfolioState(
+        portfolio_value=Decimal("10000"),
         positions=[],
         balances={"USDT": Decimal("10000")},
-        daily_pnl=Decimal("0"),
-        consecutive_losses=0,
-        current_drawdown=Decimal("0"),
-        portfolio_value=Decimal("10000"),
-        average_volume=Decimal("1000000"),
+        marks={"BTCUSDT": Decimal("42000")},
     )
 
 
