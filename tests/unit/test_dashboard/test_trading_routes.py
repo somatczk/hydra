@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from hydra.dashboard.api import app
+from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
 from hydra.risk.state import RiskStateUnavailableError
 from tests.unit.test_execution.session_harness import (
     Harness,
@@ -296,6 +297,29 @@ class TestQuickTrade:
             for o in await executor(session).fetch_open_orders()
         )
         assert legs == [("LIMIT", 0.2, None, 110.0), ("STOP_MARKET", 0.2, 90.0, None)]
+
+    @pytest.mark.parametrize(
+        ("error", "code"),
+        [
+            (PersistenceUnavailableError("2 unpersisted fills"), "paper_state_unpersisted"),
+            (PaperSessionHaltedError("ledger invariant broken"), "paper_session_halted"),
+        ],
+    )
+    async def test_unavailable_paper_account_is_503(
+        self,
+        session: Any,
+        api: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+        error: Exception,
+        code: str,
+    ) -> None:
+        async def refuse(*_a: Any, **_k: Any) -> Any:
+            raise error
+
+        monkeypatch.setattr(executor(session), "create_order", refuse)
+        resp = await api.post("/api/trading/quick-trade", json={"side": "buy", "quantity": "0.1"})
+        assert (resp.status_code, _detail(resp)["code"]) == (503, code)
+        assert _detail(resp)["state"] == "unavailable"
 
     async def test_no_running_session_is_404(self, h: Harness, api: httpx.AsyncClient) -> None:
         resp = await api.post(

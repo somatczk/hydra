@@ -45,7 +45,7 @@ from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import SessionNotRunningError, SpotShortError
 from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
-from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.execution.paper_trading import PaperTradingExecutor, PersistenceUnavailableError
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.risk.service import RiskService
 from hydra.strategy.base import BaseStrategy
@@ -272,6 +272,10 @@ class SessionRuntime:
                     await self.om.submit_order(order)
         except (RiskRejectedError, ValueError) as exc:
             logger.warning("Skipped order from signal in %s: %s", self.session.session_id, exc)
+        except PersistenceUnavailableError as exc:
+            logger.warning(
+                "Entry refused in %s until fills persist: %s", self.session.session_id, exc
+            )
         except Exception:
             logger.exception("Failed to submit order from signal in %s", self.session.session_id)
 

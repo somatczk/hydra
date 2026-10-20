@@ -29,6 +29,7 @@ from hydra.execution.errors import (
     UnsupportedVenueError,
 )
 from hydra.execution.order_manager import RiskRejectedError
+from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.risk.market_rules import MarketRulesUnavailableError
 
@@ -464,6 +465,10 @@ async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, An
         ) from exc
     except ValueError as exc:
         raise api_error(422, "order_rejected", str(exc), "invalid") from exc
+    except PersistenceUnavailableError as exc:
+        raise api_error(503, "paper_state_unpersisted", str(exc), "unavailable") from exc
+    except PaperSessionHaltedError as exc:
+        raise api_error(503, "paper_session_halted", str(exc), "unavailable") from exc
     audit(
         getattr(request.state, "principal", None),
         "manual_order",
