@@ -1,0 +1,83 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError, apiHeaders, fetchApi } from './api';
+
+const fetchMock = vi.fn();
+
+beforeEach(() => {
+  fetchMock.mockResolvedValue(new Response('{"ok":true}', { status: 200 }));
+  vi.stubGlobal('fetch', fetchMock);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  fetchMock.mockReset();
+});
+
+function sentHeaders(): Headers {
+  const init = fetchMock.mock.calls[0][1] as RequestInit;
+  return new Headers(init.headers);
+}
+
+describe('fetchApi headers', () => {
+  it('sends the CSRF header and JSON content type on a POST', async () => {
+    await fetchApi('/api/trading/kill-switch', { method: 'POST', body: '{}' });
+    const headers = sentHeaders();
+    expect(headers.get('x-hydra-request')).toBe('1');
+    expect(headers.get('content-type')).toBe('application/json');
+  });
+
+  it.each(['PUT', 'PATCH', 'DELETE', 'post'])('sends the CSRF header on %s', async (method) => {
+    await fetchApi('/api/x', { method });
+    expect(sentHeaders().get('x-hydra-request')).toBe('1');
+  });
+
+  it('keeps the CSRF header when the caller passes its own headers', async () => {
+    await fetchApi('/api/x', {
+      method: 'POST',
+      body: 'a,b',
+      headers: { 'Content-Type': 'text/csv', 'X-Trace': 'abc' },
+    });
+    const headers = sentHeaders();
+    expect(headers.get('x-hydra-request')).toBe('1');
+    expect(headers.get('content-type')).toBe('text/csv');
+    expect(headers.get('x-trace')).toBe('abc');
+  });
+
+  it('accepts a Headers instance from the caller', async () => {
+    await fetchApi('/api/x', { method: 'DELETE', headers: new Headers({ 'X-Trace': 't' }) });
+    const headers = sentHeaders();
+    expect(headers.get('x-hydra-request')).toBe('1');
+    expect(headers.get('x-trace')).toBe('t');
+  });
+
+  it('adds no CSRF header or content type to a plain GET', async () => {
+    await fetchApi('/api/x');
+    const headers = sentHeaders();
+    expect(headers.get('x-hydra-request')).toBeNull();
+    expect(headers.get('content-type')).toBeNull();
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe('GET');
+  });
+
+  it('lets the browser set the multipart boundary for FormData bodies', async () => {
+    await fetchApi('/api/models/upload', { method: 'POST', body: new FormData() });
+    const headers = sentHeaders();
+    expect(headers.get('content-type')).toBeNull();
+    expect(headers.get('x-hydra-request')).toBe('1');
+  });
+
+  it('surfaces a 403 envelope as ApiError with the raw body', async () => {
+    const body = JSON.stringify({
+      detail: { code: 'csrf_rejected', message: 'Origin is not allowed', state: 'forbidden' },
+    });
+    fetchMock.mockResolvedValueOnce(new Response(body, { status: 403 }));
+    await expect(fetchApi('/api/x', { method: 'POST' })).rejects.toEqual(new ApiError(403, body));
+  });
+});
+
+describe('apiHeaders', () => {
+  it('gives raw fetch callers the CSRF header for unsafe methods only', () => {
+    expect(apiHeaders()).toEqual({ 'x-hydra-request': '1' });
+    expect(apiHeaders('PUT')).toEqual({ 'x-hydra-request': '1' });
+    expect(apiHeaders('GET')).toEqual({});
+  });
+});

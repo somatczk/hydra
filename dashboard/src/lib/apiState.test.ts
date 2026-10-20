@@ -32,6 +32,34 @@ describe('stateFromError', () => {
     expect(stateFromError(new ApiError(503, '<html>bad gateway</html>'))).toBe('unavailable');
   });
 
+  it('maps auth refusals to their own states', () => {
+    const unauth = envelope(401, {
+      code: 'unauthenticated',
+      message: 'Authentication required',
+      state: 'unauthenticated',
+    });
+    expect(stateFromError(unauth)).toBe('unauthenticated');
+    expect(describeApiError(unauth)).toBe('Authentication required');
+
+    const csrf = envelope(403, {
+      code: 'csrf_rejected',
+      message: 'Missing X-Hydra-Request header',
+      state: 'forbidden',
+    });
+    expect(parseErrorDetail(csrf)).toEqual({
+      code: 'csrf_rejected',
+      message: 'Missing X-Hydra-Request header',
+      state: 'forbidden',
+    });
+    expect(stateFromError(csrf)).toBe('forbidden');
+  });
+
+  it('maps bare 401 and 403 responses by status', () => {
+    expect(stateFromError(new ApiError(401, ''))).toBe('unauthenticated');
+    expect(stateFromError(new ApiError(403, '<html>Forbidden</html>'))).toBe('forbidden');
+    expect(parseErrorDetail(envelope(403, 'Not allowed'))?.state).toBe('forbidden');
+  });
+
   it('treats network failures and plain errors as unknown', () => {
     expect(stateFromError(new TypeError('Failed to fetch'))).toBe('unknown');
     expect(stateFromError(null)).toBe('unknown');

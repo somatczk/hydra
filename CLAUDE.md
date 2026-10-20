@@ -98,6 +98,13 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   `PUT /api/system/config` still changes memory only). In memory only: background task state (backtest, hyperopt,
   walk-forward). Circuit breakers are not instantiated. Paper state is not reloaded on restart.
 - No exchange-side stops yet (P3). Only Binance is supported in practice; the explicit gate is P1.
+- API auth lives in one pure-ASGI middleware, `src/hydra/dashboard/security.py`: every route and WebSocket except
+  `PUBLIC_PATHS` (`/health`, `/metrics`) needs a principal (Authelia `Remote-User` from a peer in
+  `api.trusted_proxy_cidrs`, bearer `HYDRA_API_TOKEN`, or anyone in `api.auth_mode: dev`), and browser principals
+  must send `X-Hydra-Request: 1` on non-GET requests. Routes need no auth code; read the caller with
+  `current_principal` and log security actions with `audit()`. A new public path needs a reviewed edit to
+  `PUBLIC_PATHS` and `tests/unit/test_dashboard/test_auth_coverage.py`. Dashboard unit tests call the real app as
+  the bearer-token service (`default_api_auth` in their conftest); auth tests override that fixture.
 - Errors from dashboard routes use one envelope, `{"detail": {"code", "message", "state", ...}}`, built by
   `src/hydra/dashboard/routes/_db.py`; the frontend reads it with `dashboard/src/lib/apiState.ts`. Reuse both.
 - Backtests run only on stored bars (`hydra.backtest.data`); no data means 422, never a synthetic fallback.

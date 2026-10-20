@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import hydra
@@ -30,9 +29,7 @@ def test_package_version_matches_pyproject() -> None:
 def test_api_version_matches_pyproject() -> None:
     expected = _pyproject_version()
     assert app.version == expected
-    resp = TestClient(app).get("/openapi.json")
-    assert resp.status_code == 200
-    assert resp.json()["info"]["version"] == expected
+    assert app.openapi()["info"]["version"] == expected
 
 
 def test_platform_config_version_matches_pyproject() -> None:
