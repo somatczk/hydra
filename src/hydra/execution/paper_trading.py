@@ -426,7 +426,7 @@ class PaperTradingExecutor:
         self._filled_orders.append(fill_dict)
 
         try:
-            from hydra.dashboard.metrics import record_trade
+            from hydra.core.metrics import record_trade
 
             record_trade(symbol, side, self._strategy_id, self._exchange_id, pnl=float(pnl))
         except Exception:
@@ -570,7 +570,7 @@ class PaperTradingExecutor:
                 avg_entry_price=price,
             )
             try:
-                from hydra.dashboard.metrics import update_position
+                from hydra.core.metrics import update_position
 
                 update_position(str(symbol), self._exchange_id, float(quantity))
             except Exception:
@@ -606,7 +606,7 @@ class PaperTradingExecutor:
                 pos.quantity -= quantity
 
         try:
-            from hydra.dashboard.metrics import update_position
+            from hydra.core.metrics import update_position
 
             pos_now = self._positions.get(symbol)
             is_open = pos_now is not None and pos_now.direction != Direction.FLAT

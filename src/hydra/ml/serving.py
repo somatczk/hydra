@@ -117,7 +117,7 @@ class ModelInference:
             t0 = time.monotonic()
             results = session.run(None, {loaded.input_name: input_data})  # type: ignore[union-attr]
             try:
-                from hydra.dashboard.metrics import observe_ml_inference_latency
+                from hydra.core.metrics import observe_ml_inference_latency
 
                 observe_ml_inference_latency(model_name, time.monotonic() - t0)
             except Exception:

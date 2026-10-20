@@ -218,7 +218,7 @@ class SessionManager:
                 logger.debug("Could not load risk_state for session %s", session.session_id)
 
         try:
-            from hydra.dashboard.metrics import update_portfolio
+            from hydra.core.metrics import update_portfolio
 
             update_portfolio(float(portfolio_value), float(current_drawdown), float(daily_pnl))
         except Exception:
@@ -920,7 +920,7 @@ class SessionManager:
                     all_positions.extend(pos_list)
 
                 try:
-                    from hydra.dashboard.metrics import update_position, update_reconciliation
+                    from hydra.core.metrics import update_position, update_reconciliation
 
                     for pos in all_positions:
                         update_position(str(pos.symbol), session.exchange_id, float(pos.quantity))

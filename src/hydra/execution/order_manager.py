@@ -188,7 +188,7 @@ class OrderManager:
                 )
             )
             try:
-                from hydra.dashboard.metrics import observe_order_fill_latency, record_trade
+                from hydra.core.metrics import observe_order_fill_latency, record_trade
 
                 record_trade(
                     str(order.symbol),

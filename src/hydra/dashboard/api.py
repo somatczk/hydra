@@ -109,7 +109,7 @@ async def metrics() -> Any:
         from starlette.responses import Response
 
         # Ensure metric collectors are registered before generating output
-        from hydra.dashboard.metrics import _ensure_initialized
+        from hydra.core.metrics import _ensure_initialized
 
         _ensure_initialized()
 
