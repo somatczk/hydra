@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from hydra.core.types import (
     OHLCV,
@@ -67,13 +67,27 @@ class MarketDataEvent(Event):
 
 @dataclass(frozen=True, slots=True)
 class BarEvent(MarketDataEvent):
-    """A completed OHLCV bar."""
+    """A closed OHLCV bar.
+
+    ``replay`` is True for catch-up bars back-filled after a reconnect.
+    """
 
     symbol: Symbol = field(default=Symbol(""))
     timeframe: Timeframe = Timeframe.M1
     ohlcv: OHLCV | None = None
     exchange_id: ExchangeId = "binance"
+    replay: bool = False
     event_type: str = field(default="bar", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PriceEvent(MarketDataEvent):
+    """Latest price of a still-forming candle (throttled by the feed)."""
+
+    symbol: Symbol = field(default=Symbol(""))
+    price: Decimal = Decimal("0")
+    exchange_id: ExchangeId = "binance"
+    event_type: str = field(default="price", init=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +189,11 @@ class OrderRequestEvent(OrderEvent):
 
 @dataclass(frozen=True, slots=True)
 class OrderFillEvent(OrderEvent):
-    """An order has been filled (fully or partially)."""
+    """An order has been filled (fully or partially).
+
+    ``realized_pnl`` is net of this fill's fee and the pro-rata entry fee;
+    ``realized_pnl`` and ``gross_pnl`` are None on opening fills.
+    """
 
     order_id: str = ""
     symbol: Symbol = field(default=Symbol(""))
@@ -187,6 +205,12 @@ class OrderFillEvent(OrderEvent):
     fee_currency: str = ""
     exchange_id: ExchangeId = "binance"
     status: OrderStatus = OrderStatus.FILLED
+    session_id: str = ""
+    strategy_id: str = ""
+    tag: str = ""
+    reduce_only: bool = False
+    realized_pnl: Decimal | None = None
+    gross_pnl: Decimal | None = None
     event_type: str = field(default="order_fill", init=False)
 
 
@@ -294,6 +318,19 @@ class ErrorEvent(SystemEvent):
     event_type: str = field(default="error", init=False)
 
 
+@dataclass(frozen=True, slots=True)
+class FeedStatusEvent(SystemEvent):
+    """Market-data feed health transition (empty symbol/None timeframe = whole exchange)."""
+
+    exchange_id: ExchangeId = "binance"
+    symbol: Symbol = field(default=Symbol(""))
+    timeframe: Timeframe | None = None
+    status: Literal["live", "stale"] = "live"
+    reason: str = ""
+    age_seconds: float = 0.0
+    event_type: str = field(default="feed_status", init=False)
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers (msgpack)
 # ---------------------------------------------------------------------------
@@ -346,6 +383,7 @@ _EVENT_CLASSES: dict[str, type[Event]] = {
     "Event": Event,
     "MarketDataEvent": MarketDataEvent,
     "BarEvent": BarEvent,
+    "PriceEvent": PriceEvent,
     "TradeEvent": TradeEvent,
     "OrderBookEvent": OrderBookEvent,
     "FundingRateEvent": FundingRateEvent,
@@ -365,6 +403,7 @@ _EVENT_CLASSES: dict[str, type[Event]] = {
     "HeartbeatEvent": HeartbeatEvent,
     "ConfigChangeEvent": ConfigChangeEvent,
     "ErrorEvent": ErrorEvent,
+    "FeedStatusEvent": FeedStatusEvent,
 }
 
 

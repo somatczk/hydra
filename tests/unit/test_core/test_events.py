@@ -18,6 +18,7 @@ from hydra.core.events import (
     ErrorEvent,
     Event,
     ExitSignal,
+    FeedStatusEvent,
     FundingRateEvent,
     HeartbeatEvent,
     MarketDataEvent,
@@ -27,6 +28,7 @@ from hydra.core.events import (
     OrderFillEvent,
     OrderRejectEvent,
     OrderRequestEvent,
+    PriceEvent,
     RiskCheckResult,
     RiskEvent,
     SignalEvent,
@@ -378,3 +380,245 @@ class TestEventSerialization:
         e = BarEvent()
         d = event_to_dict(e)
         assert d["__event_class__"] == "BarEvent"
+
+
+# ---------------------------------------------------------------------------
+# P1 additive contracts
+# ---------------------------------------------------------------------------
+
+
+def _msgpack_roundtrip(event: Event) -> Event:
+    packed = msgpack.packb(event_to_dict(event), use_bin_type=True)
+    return event_from_dict(msgpack.unpackb(packed, raw=False))
+
+
+def _ohlcv() -> OHLCV:
+    return OHLCV(
+        open=Decimal("65000.50"),
+        high=Decimal("65500.00"),
+        low=Decimal("64800.00"),
+        close=Decimal("65200.00"),
+        volume=Decimal("12.5"),
+        timestamp=datetime(2024, 3, 15, 10, 0, tzinfo=UTC),
+    )
+
+
+class TestBarEventReplay:
+    def test_replay_defaults_false(self) -> None:
+        bar = BarEvent(symbol=Symbol("BTCUSDT"), timeframe=Timeframe.H1, ohlcv=_ohlcv())
+        assert bar.replay is False
+        assert BarEvent().replay is False
+
+    def test_replay_roundtrip(self) -> None:
+        bar = BarEvent(
+            symbol=Symbol("BTCUSDT"), timeframe=Timeframe.H1, ohlcv=_ohlcv(), replay=True
+        )
+        restored = _msgpack_roundtrip(bar)
+        assert type(restored) is BarEvent
+        assert restored.replay is True
+        assert restored.timeframe == Timeframe.H1
+        assert restored.ohlcv == _ohlcv()
+
+    def test_replay_frozen(self) -> None:
+        bar = BarEvent(replay=True)
+        name = "replay"
+        with pytest.raises(FrozenInstanceError):
+            setattr(bar, name, False)
+
+
+class TestPriceEvent:
+    def test_defaults(self) -> None:
+        pe = PriceEvent()
+        assert isinstance(pe, MarketDataEvent)
+        assert pe.event_type == "price"
+        assert pe.symbol == ""
+        assert pe.price == Decimal("0")
+        assert pe.exchange_id == "binance"
+
+    def test_msgpack_roundtrip(self) -> None:
+        pe = PriceEvent(symbol=Symbol("BTCUSDT"), price=Decimal("65123.45"), exchange_id="binance")
+        restored = _msgpack_roundtrip(pe)
+        assert type(restored) is PriceEvent
+        assert restored.event_id == pe.event_id
+        assert restored.timestamp == pe.timestamp
+        assert restored.symbol == "BTCUSDT"
+        assert restored.price == Decimal("65123.45")
+        assert isinstance(restored.price, Decimal)
+        assert restored.event_type == "price"
+
+    def test_frozen(self) -> None:
+        pe = PriceEvent(price=Decimal("1"))
+        name = "price"
+        with pytest.raises(FrozenInstanceError):
+            setattr(pe, name, Decimal("2"))
+
+
+class TestFeedStatusEvent:
+    def test_defaults(self) -> None:
+        fs = FeedStatusEvent()
+        assert isinstance(fs, SystemEvent)
+        assert fs.event_type == "feed_status"
+        assert fs.exchange_id == "binance"
+        assert fs.symbol == ""
+        assert fs.timeframe is None
+        assert fs.status == "live"
+        assert fs.reason == ""
+        assert fs.age_seconds == 0.0
+
+    def test_stream_stale_roundtrip(self) -> None:
+        fs = FeedStatusEvent(
+            exchange_id="binance",
+            symbol=Symbol("BTCUSDT"),
+            timeframe=Timeframe.H1,
+            status="stale",
+            reason="bar_overdue",
+            age_seconds=7325.5,
+        )
+        restored = _msgpack_roundtrip(fs)
+        assert type(restored) is FeedStatusEvent
+        assert restored.event_id == fs.event_id
+        assert restored.symbol == "BTCUSDT"
+        assert restored.timeframe == Timeframe.H1
+        assert restored.status == "stale"
+        assert restored.reason == "bar_overdue"
+        assert restored.age_seconds == 7325.5
+
+    def test_exchange_wide_roundtrip_keeps_none_timeframe(self) -> None:
+        fs = FeedStatusEvent(status="stale", reason="ws_silence", age_seconds=61.0)
+        restored = _msgpack_roundtrip(fs)
+        assert type(restored) is FeedStatusEvent
+        assert restored.timeframe is None
+        assert restored.symbol == ""
+        assert restored.reason == "ws_silence"
+
+    def test_frozen(self) -> None:
+        fs = FeedStatusEvent(status="stale")
+        name = "status"
+        with pytest.raises(FrozenInstanceError):
+            setattr(fs, name, "live")
+
+
+class TestOrderFillEventP1Fields:
+    def test_existing_runner_constructor_defaults(self) -> None:
+        fill = OrderFillEvent(
+            order_id="ord-1",
+            symbol=Symbol("BTCUSDT"),
+            side=Side.BUY,
+            quantity=Decimal("0.5"),
+            price=Decimal("65000"),
+            fee=Decimal("32.5"),
+            fee_currency="USDT",
+            exchange_id="binance",
+        )
+        assert fill.session_id == ""
+        assert fill.strategy_id == ""
+        assert fill.tag == ""
+        assert fill.reduce_only is False
+        assert fill.realized_pnl is None
+        assert fill.gross_pnl is None
+        assert fill.status == OrderStatus.FILLED
+
+    def test_existing_order_manager_constructor(self) -> None:
+        fill = OrderFillEvent(
+            order_id="ord-2",
+            symbol=Symbol("BTCUSDT"),
+            side=Side.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=Decimal("0.5"),
+            price=Decimal("66000"),
+            fee=Decimal("0"),
+            fee_currency="",
+            exchange_id="binance",
+            status=OrderStatus.FILLED,
+        )
+        assert fill.order_type == OrderType.LIMIT
+        assert fill.realized_pnl is None
+
+    def test_closing_fill_roundtrip_keeps_decimals(self) -> None:
+        # entry 0.5 @ 65000, entry fee 32.5; exit 0.5 @ 66000, exit fee 33
+        gross = (Decimal("66000") - Decimal("65000")) * Decimal("0.5")
+        net = gross - Decimal("33") - Decimal("32.5")
+        fill = OrderFillEvent(
+            order_id="ord-3",
+            symbol=Symbol("BTCUSDT"),
+            side=Side.SELL,
+            quantity=Decimal("0.5"),
+            price=Decimal("66000"),
+            fee=Decimal("33"),
+            fee_currency="USDT",
+            session_id="sess-1",
+            strategy_id="momentum",
+            tag="stop_loss",
+            reduce_only=True,
+            realized_pnl=net,
+            gross_pnl=gross,
+        )
+        restored = _msgpack_roundtrip(fill)
+        assert isinstance(restored, OrderFillEvent)
+        assert restored.session_id == "sess-1"
+        assert restored.strategy_id == "momentum"
+        assert restored.tag == "stop_loss"
+        assert restored.reduce_only is True
+        assert restored.gross_pnl == Decimal("500.0")
+        assert restored.realized_pnl == Decimal("434.5")
+        assert isinstance(restored.realized_pnl, Decimal)
+        assert isinstance(restored.gross_pnl, Decimal)
+
+    def test_negative_pnl_roundtrip(self) -> None:
+        fill = OrderFillEvent(realized_pnl=Decimal("-1.25"), gross_pnl=Decimal("-0.75"))
+        restored = _msgpack_roundtrip(fill)
+        assert isinstance(restored, OrderFillEvent)
+        assert restored.realized_pnl == Decimal("-1.25")
+        assert restored.gross_pnl == Decimal("-0.75")
+
+    def test_opening_fill_roundtrip_keeps_none(self) -> None:
+        fill = OrderFillEvent(order_id="ord-4", session_id="sess-1", side=Side.BUY)
+        restored = _msgpack_roundtrip(fill)
+        assert isinstance(restored, OrderFillEvent)
+        assert restored.realized_pnl is None
+        assert restored.gross_pnl is None
+        assert restored.session_id == "sess-1"
+
+    def test_frozen(self) -> None:
+        fill = OrderFillEvent(realized_pnl=Decimal("1"))
+        name = "realized_pnl"
+        with pytest.raises(FrozenInstanceError):
+            setattr(fill, name, Decimal("2"))
+
+
+class TestOrderRequestEventP1Fields:
+    def test_reduce_only_and_tag_roundtrip(self) -> None:
+        req = OrderRequest(
+            symbol=Symbol("BTCUSDT"),
+            side=Side.SELL,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("0.5"),
+            strategy_id="momentum",
+            exchange_id="binance",
+            market_type=MarketType.SPOT,
+            reduce_only=True,
+            tag="flatten",
+        )
+        restored = _msgpack_roundtrip(OrderRequestEvent(order_request=req))
+        assert isinstance(restored, OrderRequestEvent)
+        assert restored.order_request is not None
+        assert restored.order_request.reduce_only is True
+        assert restored.order_request.tag == "flatten"
+        assert restored.order_request.quantity == Decimal("0.5")
+        assert restored.order_request.request_id == req.request_id
+
+    def test_default_request_roundtrip(self) -> None:
+        req = OrderRequest(
+            symbol=Symbol("BTCUSDT"),
+            side=Side.BUY,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("0.01"),
+            strategy_id="momentum",
+            exchange_id="binance",
+            market_type=MarketType.SPOT,
+        )
+        restored = _msgpack_roundtrip(OrderRequestEvent(order_request=req))
+        assert isinstance(restored, OrderRequestEvent)
+        assert restored.order_request is not None
+        assert restored.order_request.reduce_only is False
+        assert restored.order_request.tag == ""

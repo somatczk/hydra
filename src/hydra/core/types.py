@@ -117,6 +117,10 @@ class ExecutorState(Protocol):
 
     async def get_last_price(self, symbol: str) -> Decimal: ...
 
+    async def get_equity(self) -> Decimal:
+        """Total account equity in quote currency, positions marked to the last price."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Frozen dataclasses (immutable value objects)
@@ -158,6 +162,8 @@ class OrderRequest:
     price: Decimal | None = None
     stop_price: Decimal | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    reduce_only: bool = False
+    tag: str = ""
 
 
 @dataclass(slots=True)
