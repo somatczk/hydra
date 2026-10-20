@@ -1,9 +1,12 @@
-# Desktop ML training stack (requires NVIDIA GPU + CUDA)
+# Desktop ML training stack (requires NVIDIA GPU + CUDA). NON-FUNCTIONAL UNTIL P5:
+# hydra.ml.training has no __main__ entrypoint, jupyter is not a declared dependency,
+# the ubuntu22.04 base has no python3.12 apt package, and MLflow listens unauthenticated
+# on 0.0.0.0:5000. Only the Dockerfile paths are known to be correct.
 services:
   ml-training:
     build:
       context: .
-      dockerfile: docker/Dockerfile.ml
+      dockerfile: docker/ml/Dockerfile
     container_name: hydra-ml-training
     restart: unless-stopped
     runtime: nvidia
@@ -44,7 +47,7 @@ services:
   jupyter:
     build:
       context: .
-      dockerfile: docker/Dockerfile.ml
+      dockerfile: docker/ml/Dockerfile
     container_name: hydra-jupyter
     restart: unless-stopped
     runtime: nvidia

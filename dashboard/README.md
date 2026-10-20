@@ -1,36 +1,55 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Hydra dashboard
 
-## Getting Started
+Next.js 16.4 (App Router) frontend for the Hydra engine. Routes and their current state are listed in the root
+`README.md` under "Dashboard routes".
 
-First, run the development server:
+## Scripts
+
+Run from `dashboard/` with Node 26 (the CI and Docker image version):
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm ci             # install from package-lock.json
+npm run dev        # dev server on http://localhost:3000
+npm run lint       # eslint
+npm run typecheck  # tsc --noEmit (TypeScript 7)
+npm test           # vitest run (jsdom)
+npm run build      # next build, standalone output
+npm run start      # next start
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`npm run lint` and `next build` use the TypeScript 6 API package (`typescript` is aliased to
+`@typescript/typescript6`); `typecheck` uses TypeScript 7 (`@typescript/native`).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Talking to the engine
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- `src/lib/api.ts` calls `NEXT_PUBLIC_API_URL`, or the page's own origin when it is unset. Next inlines
+  `NEXT_PUBLIC_*` at build time, so only the value present during `next build` counts.
+- `next.config.ts` rewrites `/api/*` to `API_URL` (default `http://localhost:8000`). This is also fixed when
+  `next build` runs.
+- `docker/dashboard/Dockerfile` sets neither variable, so the image calls its own origin. In production, romulus
+  Traefik routes `/api` and `/ws` on the same host to the engine, which is why that works. The runtime
+  `NEXT_PUBLIC_API_URL` set in romulus and in `deploy/compose.yml` does not change the bundle.
+- For local development, run the engine on `localhost:8000` and use `npm run dev`; the rewrite forwards `/api`.
+  WebSockets go to the page origin (`ws://localhost:3000`), so set `NEXT_PUBLIC_API_URL=http://localhost:8000` when
+  you need live WebSocket updates.
 
-## Learn More
+## Errors and data state
 
-To learn more about Next.js, take a look at the following resources:
+API errors use the engine's envelope `{"detail": {"code", "message", "state"}}`. Read it with
+`src/lib/apiState.ts` (`stateFromError`, `describeApiError`) and show it with `src/components/ui/DataStateBadge.tsx`
+(`DataStateBadge`, `DataStateErrorCard`). Do not show defaults or empty lists in place of an error.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Build output
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+`next.config.ts` sets `output: "standalone"`. The Docker image copies `.next/standalone`, `.next/static` and `public/`
+and runs `node server.js` on port 3000.
 
-## Deploy on Vercel
+## Version
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+The sidebar shows `package.json`'s `version` (via `APP_VERSION`). It is not the Hydra release version, which lives in
+the root `pyproject.toml`.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Tests
+
+Tests sit next to the code as `*.test.ts` / `*.test.tsx` and run with vitest + jsdom (`vitest.config.mts`). CI runs
+lint, typecheck, test and build in the "Dashboard Build" job.

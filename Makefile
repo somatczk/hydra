@@ -1,5 +1,5 @@
 .PHONY: install dev test lint type-check security check unit integration e2e perf \
-	dev-up dev-down format clean docker-build
+	dev-up dev-down format clean docker-build imports
 
 # Development setup
 install:
@@ -54,9 +54,9 @@ dev-down:
 
 # Docker
 docker-build:
-	docker build -f docker/Dockerfile.engine -t hydra-engine .
-	docker build -f docker/Dockerfile.dashboard -t hydra-dashboard .
-	docker build -f docker/Dockerfile.backtest -t hydra-backtest .
+	docker build -f docker/engine/Dockerfile -t hydra-engine .
+	docker build -f docker/dashboard/Dockerfile -t hydra-dashboard .
+	docker build -f docker/backtest/Dockerfile -t hydra-backtest .
 
 # Cleanup
 clean:

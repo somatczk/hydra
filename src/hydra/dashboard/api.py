@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+import hydra
 from hydra.core.websocket import manager
 from hydra.dashboard.routes import (
     backtest,
@@ -51,7 +52,7 @@ async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     lifespan=_lifespan,
     title="Hydra Trading API",
-    version="0.1.0",
+    version=hydra.__version__,
     description="REST and WebSocket API for the Hydra Bitcoin auto-trading platform.",
 )
 

@@ -1,252 +1,247 @@
 # Hydra
 
-Bitcoin auto-trading platform with ML-assisted signals, multi-exchange support, backtesting with walk-forward/CPCV, and production monitoring.
+Bitcoin trading platform under active rebuild. What runs today: a FastAPI engine and a Next.js dashboard that run
+paper-trading sessions with rule-based strategies on Binance market data, and backtests on bars already stored in
+TimescaleDB. Most risk, ML and multi-exchange features are not wired yet; the status table below says which.
+**Live trading is not supported until P3.**
 
-## Features
+## Status
 
-- **Multi-exchange**: Binance, Bybit, Kraken, OKX (Spot + Futures) via CCXT
-- **Strategy framework**: Visual no-code builder + Python strategies, hot-reload, 7 built-in strategies, 19 configs
-- **Backtesting**: Walk-forward analysis, CPCV, VectorBT parameter sweeps, realistic fill simulation
-- **ML pipeline**: XGBoost/LSTM training, ONNX inference with upload/promote/rollback, drift detection, ML overlay per strategy
-- **Risk management**: 4-tier circuit breakers, pre-trade checks, per-strategy risk overrides, exchange-side safety orders, kill switch
-- **Paper trading**: Per-strategy capital allocation, real PnL tracking (unrealized + realized), session detail with PnL %
-- **Dashboard**: Next.js frontend with real-time WebSocket updates, TradingView charts, 10 pages
-- **Monitoring**: Prometheus metrics, Grafana dashboards (Sharpe, drawdown, PnL), Telegram alerts
+The table describes `main` as it is. Statuses:
 
-## Architecture
+- **Working**: proven by the named test or command.
+- **Partial**: some of it works; the caveat says what does not.
+- **Planned Px**: scheduled for that phase (see [Roadmap](#roadmap)).
+- **Known gap: unscheduled**: not true today and not yet assigned to a phase.
 
-```mermaid
-graph TB
-    subgraph Frontend
-        Dashboard[Next.js Dashboard<br/>10 pages]
-    end
+Each PR that changes one of these rows updates the row.
 
-    subgraph Backend["FastAPI Backend"]
-        API[REST API + WebSocket]
-        Routes[Routes: strategies, models,<br/>trading, portfolio, risk, backtest]
-    end
+| Area | Capability | Status |
+|------|------------|--------|
+| Exchanges | Binance, Bybit, Kraken, OKX, spot + futures | **Planned P1/P4.** `ExchangeClient` builds any ccxt class by name. Orders always use the futures class while prices come from the spot feed, and symbols carry no market type. P1 adds a Binance-only gate at session start (other exchanges rejected); other exchanges and perps come in P4. |
+| Strategies | Visual rule builder + Python strategies | **Partial.** Rules are saved as YAML and evaluated. Stop-loss and take-profit from the builder are dropped (P1 stops). The builder preview runs on the latest stored bars (`test_preview_uses_the_latest_stored_bars`). |
+| Strategies | Hot-reload | **Planned P2.** `StrategyEngine.reload_strategy` exists, but nothing in the app calls it; a session reads its YAML once. |
+| Strategies | Built-in strategy classes and shipped configs | **Partial.** Modules in `strategy/builtin/`: breakout, composite, dca, grid, mean_reversion, ml_ensemble, momentum, rule_based, trend_following. DCA and Grid never run in a live or paper session (their order management needs the P1 OMS wiring). No test-generated configs are committed (`test_no_committed_test_strategy_yaml`). |
+| Backtest | Runs only on stored bars, records provenance, 422 when there is no data | **Working.** `tests/integration/test_backtest_real_data.py::test_backtest_runs_on_stored_bars_with_exact_provenance`, `::test_no_stored_bars_is_422_with_available_range`, `tests/unit/test_dashboard/test_backtest_routes.py`. |
+| Backtest | Results and trades persisted, identical after a restart | **Working.** `tests/integration/test_backtest_real_data.py::test_results_survive_a_restart`. Needs TimescaleDB (see [Testing](#testing)). |
+| Backtest | Walk-forward / CPCV, PBO, DSR | **Planned P2.** Walk-forward does not re-optimise per fold, CPCV is not reachable from the API, PBO is not CSCV, and DSR is the mean Sharpe. |
+| Backtest | VectorBT parameter sweeps | **Planned P2.** `vectorbt` is a dependency but is never imported; the sweep is a numpy SMA cross that ignores fees. |
+| Backtest | Realistic fill simulation | **Planned P2.** No partial fills, funding or liquidation; slippage is uncapped. |
+| Backtest | Durable job queue | **Planned P2.** Backtests, hyperopt and walk-forward run as in-process tasks in the engine; task state is lost on restart. The `backtest-worker` image runs an idle placeholder loop. |
+| ML | XGBoost training | **Planned P5.** Training code has no data loader or entrypoint. There is no LSTM code; the "LSTM Momentum" placeholder was removed in P0-B. |
+| ML | ONNX inference, model upload / promote / rollback | **Planned P5.** Inference works in isolation, but no strategy calls it, nothing reads the model stage, and rollback leaves no model in Production. |
+| ML | Drift detection | **Planned P5.** A PSI function exists and nothing runs it. The API and UI report drift as `unknown` and retrain returns 501 (P0-C). |
+| ML | ML overlay per strategy | **Planned P5.** `MLOverlayConfig` is parsed and never read. |
+| Risk | 4-tier circuit breakers | **Planned P1.** `CircuitBreakerManager` is never instantiated. The API returns `circuit_breakers: null` / 503 and the UI shows UNAVAILABLE instead of a hardcoded list (`tests/unit/test_dashboard/test_risk_truth.py`). |
+| Risk | Pre-trade checks | **Partial → P1.** The checks exist, but market orders bypass the size checks and some order paths skip them. |
+| Risk | Per-strategy risk overrides | **Planned P1.** Override rows are written, but only `scope = 'global'` is read. |
+| Risk | Exchange-side stop-losses | **Planned P3.** `ExchangeSafetyManager` has no caller, and paper stops never trigger. |
+| Risk | Quick-trade TP / SL / trailing stop | **Planned P1 (stops).** If attaching a protective order fails, `POST /api/trading/quick-trade` logs a warning and still returns 200, so the position looks protected when it is not. |
+| Risk | Kill switch | **Partial → P1.** It stops engines and persists the flag, and the UI shows active / inactive / unknown. The flatten step fails and positions stay open. |
+| Paper trading | Per-strategy capital, P&L | **Partial → P1.** Per-strategy paper capital slices work. Unrealized P&L is never updated, P&L is gross of fees, and live P&L is 0. |
+| Paper trading | Testnet + paper by default | **Partial → P1.** The trading mode defaults to `paper`, and session `ExchangeClient`s default to `testnet=True`. `HYDRA_TESTNET`, `trading.testnet` and `config/live.yaml` are never read. The settings page's balance / orders / positions endpoints use stored keys against mainnet (`testnet=False`), read-only. |
+| Data | Redis Streams event bus | **Planned P1** (event-bus isolation decides the transport). Sessions use an in-process `InMemoryEventBus`; `RedisEventBus` is used only in tests. Redis is only health-pinged by `/api/system/health`. |
+| Data | PostgreSQL as source of truth | **Partial → P1.** Backtest results and trades are persisted (P0-B). Live fills are not stored, paper state is not reloaded, and system config lives in memory. |
+| Data | Decimal for financial values | **Known gap: unscheduled.** Decimal in domain types and fills; floats at the exchange boundary, in routes, VaR and the flatten path. |
+| Dashboard | Next.js app, routes listed under [Dashboard routes](#dashboard-routes) | **Working.** `cd dashboard && npm run build` (CI job "Dashboard Build") prints the route list. |
+| Dashboard | Reports unavailable / unknown instead of made-up data | **Working.** `tests/unit/test_dashboard/test_risk_truth.py`, `tests/unit/test_dashboard/test_portfolio_routes.py`, `cd dashboard && npm test`. |
+| Dashboard | Real-time WebSocket updates | **Known gap: unscheduled.** The engine serves `/ws/market`, `/ws/trades`, `/ws/portfolio`, `/ws/signals` and `/ws/risk`; only per-session trade fills are ever broadcast. The session page re-fetches its detail on a fill (P0-C), which fixed the NaN P&L. |
+| Dashboard | TradingView charts | **Known gap: unscheduled.** A third-party TradingView embed on `/trading` only; every other chart is Recharts. |
+| Monitoring | Prometheus alert rules | **Working (rule logic).** `promtool test rules deploy/prometheus-rules.test.yml` (workflow "Prometheus Rules"), `tests/unit/test_deploy/test_prometheus_rules.py`. The drawdown gauge only moves on fills inside a running session, so in production it reads about 0 until P1 risk wiring. |
+| Monitoring | Grafana dashboards (Sharpe, drawdown, P&L) | **Partial.** Drawdown panels read the fraction unit (`tests/unit/test_deploy/test_grafana_dashboards.py`). The "Rolling Sharpe" panel is not a Sharpe ratio, and several panels plot a different metric than their title (Known gap: unscheduled). |
+| Monitoring | Telegram alerts | **Partial.** Paging goes through romulus Alertmanager to Telegram. The in-app bot was deleted in P0-D. |
+| Engineering | mypy strict | **Partial → P1 ops.** CI runs `mypy --strict` over eight packages, and `pyproject.toml` relaxes strict mode for most packages through overrides. |
+| Engineering | import-linter module boundaries | **Planned P1 ops.** `make imports` fails today (the layers contract is broken) and it is not in CI. |
+| Engineering | CI runs unit / integration / e2e | **Partial → P1 ops.** Unit, lint, type, security and dashboard jobs are real. Integration runs against TimescaleDB and Redis containers: the backtest DB tests run there, but the Redis tests always skip because they probe `localhost:6379`. E2E uses no infrastructure. The image build is not gated on CI. |
+| Engineering | Every module has tests | **Known gap: unscheduled.** No tests for hyperopt, vectorbt research, ingestion or `ops/notifications.py`. |
+| Engineering | Dockerfile references in Makefile, compose files and build workflow | **Working.** `tests/unit/test_repo/test_build_references.py`. |
+| Engineering | One version (pyproject) reported everywhere | **Working** for the engine: `tests/unit/test_repo/test_version_single_source.py` (package, OpenAPI, config). The dashboard sidebar shows `dashboard/package.json`'s own version, which is separate. |
 
-    subgraph Engine["Trading Engine"]
-        Strategy[Strategy Engine<br/>7 built-in + rule-based builder]
-        Risk[Risk Manager<br/>4-tier circuit breakers]
-        Execution[Order Execution<br/>Paper + Live]
-        ML[ML Pipeline<br/>ONNX inference + drift]
-    end
-
-    subgraph Data["Data Layer"]
-        TimescaleDB[(TimescaleDB<br/>OHLCV + State)]
-        Redis[(Redis Streams<br/>Event Bus + Cache)]
-    end
-
-    subgraph Exchanges
-        CCXT[CCXT Pro] --> Binance & Bybit & Kraken & OKX
-    end
-
-    Dashboard <-->|HTTP + WS| API
-    API --> Routes
-    Routes --> Strategy & Risk & Execution & ML
-    Strategy --> Redis
-    Risk --> Redis
-    Execution --> CCXT
-    Strategy --> TimescaleDB
-    Execution --> TimescaleDB
-    ML -->|ONNX models| Strategy
-
-    style Frontend fill:#1a1a2e,stroke:#8AB8FF,color:#fff
-    style Backend fill:#1a1a2e,stroke:#22c55e,color:#fff
-    style Engine fill:#1a1a2e,stroke:#f59e0b,color:#fff
-    style Data fill:#1a1a2e,stroke:#a78bfa,color:#fff
-    style Exchanges fill:#1a1a2e,stroke:#ef4444,color:#fff
-```
-
-### Data Flow
-
-```mermaid
-sequenceDiagram
-    participant D as Dashboard
-    participant A as FastAPI
-    participant S as Strategy Engine
-    participant R as Risk Manager
-    participant E as Executor
-    participant X as Exchange (CCXT)
-    participant DB as TimescaleDB
-    participant RD as Redis
-
-    D->>A: Start paper/live session
-    A->>S: Initialize strategy
-    S->>RD: Subscribe to market data
-    RD-->>S: OHLCV bar event
-    S->>S: Evaluate conditions
-    S->>R: Pre-trade risk check
-    R-->>S: Approved / Rejected
-    S->>E: Create order
-    E->>X: Submit to exchange
-    X-->>E: Fill confirmation
-    E->>DB: Persist trade + balance snapshot
-    E->>RD: Publish trade event
-    RD-->>A: Trade notification
-    A-->>D: WebSocket push
-```
-
-## Dashboard Pages
+## Architecture (as is)
 
 ```mermaid
 graph LR
-    subgraph Pages
-        Home["/  Dashboard"]
-        Strategies["/strategies"]
-        Builder["/builder"]
-        Trading["/trading"]
-        Session["/trading/[id]"]
-        Backtest["/backtest"]
-        Models["/models"]
-        Portfolio["/portfolio"]
-        Risk["/risk"]
-        Settings["/settings"]
+    UI[Next.js dashboard] -->|HTTP /api, WS /ws| API
+
+    subgraph Engine["hydra-engine (one process)"]
+        API[FastAPI routes] --> SM[SessionManager]
+        API --> BT[In-process backtests<br/>hyperopt, walk-forward]
+        SM --> Bus[InMemoryEventBus<br/>one per session]
+        Bus --> SE[StrategyEngine]
+        SE --> OM[OrderManager]
+        OM -->|pre-trade check| PT[PreTradeRiskManager]
+        OM --> PE[PaperTradingExecutor]
+        OM --> EC[ExchangeClient<br/>ccxt async, testnet default]
     end
 
-    Strategies -->|"New Strategy"| Builder
-    Strategies -->|"Start Session"| Trading
-    Trading -->|"View Session"| Session
-    Strategies -->|"Backtest"| Backtest
-    Builder -->|"Attach Model"| Models
-
-    style Pages fill:#1a1a2e,stroke:#8AB8FF,color:#fff
+    SM -->|ccxt.pro watch_ohlcv| Binance[(Exchange)]
+    EC --> Binance
+    API -->|asyncpg| DB[(TimescaleDB)]
+    BT -->|stored bars| DB
+    API -.->|health ping only| Redis[(Redis)]
+    Worker[backtest-worker container<br/>idle placeholder loop]
 ```
 
-| Page | Description |
-|------|-------------|
-| `/` | Portfolio value, daily PnL chart, balance history, active positions |
-| `/strategies` | Strategy cards with performance, per-strategy capital, start/stop sessions, risk overrides |
-| `/builder` | Visual rule builder with indicators, conditions, timeframes, risk config, ML overlay |
-| `/trading` | Live TradingView chart, open positions, recent trades, risk controls, kill switch |
-| `/trading/[id]` | Session detail with starting capital, PnL %, positions, trade history, WebSocket live updates |
-| `/backtest` | Run backtests with walk-forward/CPCV, equity curves, trade analysis |
-| `/models` | ML model registry with ONNX upload, promote/rollback, accuracy chart, drift monitoring |
-| `/portfolio` | Detailed position breakdown, allocation chart, balance snapshots |
-| `/risk` | Circuit breaker status, risk limits, daily PnL vs limits |
-| `/settings` | System config, exchange credentials, trading mode |
+- The engine is one process: FastAPI, the session manager and every session's event bus. Redis is not on the trading path.
+- The schema is created by inline DDL in `src/hydra/dashboard/api.py` at startup. The alembic files under
+  `data/migrations` and `portfolio/migrations` and the SQLAlchemy models in `portfolio/models.py` are not used at runtime.
+- Backtests load bars through `hydra.backtest.data` from `ts.ohlcv_1m`; nothing is fetched or synthesised on the fly.
 
-## Project Structure
+## Planned architecture
+
+- **P3** splits the engine into `hydra-trader` (sessions) and `hydra-api` (REST, WebSocket, MCP).
+- **MCP v1** (after P2) is served by hydra over streamable HTTP with a bearer token, on its own romulus Traefik router.
+  Research and paper tools are fully available; live start, kill-switch release and live orders need a one-time code
+  the user types.
+
+## Dashboard routes
+
+| Route | What it does today |
+|-------|--------------------|
+| `/` | Portfolio summary, equity and daily P&L, open positions. Shows UNAVAILABLE when the DB is down. |
+| `/trading` | TradingView embed, Binance order book (REST polling, marked STALE when old), running sessions, quick trade, tri-state kill switch. |
+| `/trading/[sessionId]` | Session detail: capital, P&L, positions, trades. Re-fetches on a WebSocket fill. |
+| `/strategies` | Strategy list from YAML, start/stop sessions, per-strategy capital and risk overrides (overrides are not enforced yet). |
+| `/builder` | Visual rule builder; preview on stored bars. Stop-loss / take-profit are not enforced. |
+| `/templates` | Import a strategy from `config/templates/`. |
+| `/backtest` | Run a backtest on stored bars, with a provenance panel. |
+| `/backtest/[id]` | Result detail: metrics, equity curve, trades. |
+| `/backtest/compare` | Compare two results, with a warning when their data differs. |
+| `/optimize` | Launch hyperopt / walk-forward as an in-process task. |
+| `/optimize/[taskId]` | Task progress and result. |
+| `/portfolio` | Positions, allocation, balance snapshots. |
+| `/risk` | Risk limits form, drawdown and daily-loss gauges, VaR; circuit breakers show UNAVAILABLE. |
+| `/models` | ONNX model registry: upload, promote, rollback. Drift shows Unknown. |
+| `/settings` | System config, exchange credentials and webhook secrets (write-only), notifications. |
+
+## Project structure
 
 ```
 src/hydra/
-├── core/           # Config, models, event bus, shared types
-├── data/           # Market data ingestion (CCXT, WebSocket)
-├── indicators/     # Technical indicators (TA-Lib + custom)
-├── strategy/       # Strategy framework, rule-based builder, 7 built-in strategies
-│   └── builtin/    # breakout, composite, mean_reversion, ml_ensemble,
-│                   # momentum, rule_based, trend_following
-├── ml/             # Training, ONNX serving, drift detection, feature engineering
-├── backtest/       # Backtesting engine (walk-forward, CPCV)
-├── execution/      # Paper trading, live execution, session manager
-├── risk/           # Circuit breakers, pre-trade checks, position sizing, exchange safety
-├── portfolio/      # Position tracking + PnL calculation
-├── dashboard/      # FastAPI routes + WebSocket handlers
-│   └── routes/     # strategies, models, trading, portfolio, risk, backtest, system
-└── ops/            # Health checks, Prometheus metrics, Telegram alerts
-dashboard/          # Next.js 15 frontend (React 19, Tailwind CSS 4, Recharts)
-docker/             # Dockerfiles (engine, dashboard, backtest, ml)
-config/             # YAML configs (base, live, backtest, 19 strategy configs)
-tests/              # Unit (849+), integration, e2e, performance
+├── core/         # Config (pydantic + layered YAML), domain types, events, InMemory/Redis event bus, WS manager
+├── data/         # Ingestion (ccxt.pro), bar storage, backfill, news/sentiment; migrations/ is unused alembic
+├── indicators/   # TA-Lib wrappers + custom indicators
+├── strategy/     # Strategy base, engine, rule engine, YAML config; builtin/ holds the built-in classes
+├── backtest/     # Runner, bar loader, fills, metrics, hyperopt, walk-forward, vectorbt_research
+├── execution/    # SessionManager, OrderManager, paper executor, ccxt ExchangeClient
+├── risk/         # Pre-trade checks, sizing, circuit breakers and exchange safety (not wired)
+├── portfolio/    # P&L, positions, reconciliation; models.py + migrations/ are unused SQLAlchemy/alembic
+├── ml/           # Features, ONNX serving/export, registry, drift, training (not wired, P5)
+├── dashboard/    # FastAPI app (api.py), routes/, Prometheus metrics (metrics.py)
+└── ops/          # Discord / Slack webhook notifier
+dashboard/        # Next.js app (see dashboard/README.md)
+docker/           # engine/, dashboard/, backtest/, ml/ — one Dockerfile each
+deploy/           # Local full-stack compose, Prometheus rules + promtool tests, Grafana dashboard
+config/           # base/live/backtest YAML, strategies/, templates/, grafana/
+scripts/          # download_history.py, seed_db.py, sync_models.py
+tests/            # unit/, integration/, e2e/, performance/
 ```
 
-## Tech Stack
+## Tech stack
 
-```mermaid
-graph LR
-    subgraph Backend
-        Python[Python 3.12+]
-        FastAPI[FastAPI]
-        SQLAlchemy[SQLAlchemy 2.0]
-        CCXT[CCXT Pro]
-    end
+- Python: images run 3.14 (`python:3.14-slim`); `requires-python = ">=3.12"`, ruff and mypy target 3.12; the ML image
+  uses 3.12. CI does not pin an interpreter. A single pin is a P1 ops item.
+- FastAPI + uvicorn, raw asyncpg (no ORM at runtime), pydantic / pydantic-settings, structlog.
+- ccxt async for REST and ccxt.pro for the session market-data feed.
+- TimescaleDB on PostgreSQL 16, Redis.
+- Next.js 16.4, React 19, TypeScript 7 (`tsc --noEmit`; lint and `next build` use the TypeScript 6 API package),
+  Tailwind CSS 4, Recharts, vitest + jsdom.
+- ML libraries (onnxruntime; xgboost, torch, mlflow etc. in the `ml-training` extra) are installed in the images but
+  not wired into trading (P5).
+- Prometheus rules and Grafana dashboards live here; the running Prometheus, Alertmanager and Grafana are in romulus.
 
-    subgraph Frontend
-        Next[Next.js 15]
-        React[React 19]
-        Tailwind[Tailwind CSS 4]
-        TV[TradingView Charts]
-    end
+## Quick start
 
-    subgraph ML
-        XGBoost
-        PyTorch[PyTorch LSTM]
-        ONNX[ONNX Runtime]
-    end
-
-    subgraph Infra
-        TimescaleDB
-        Redis
-        Docker
-        Prometheus
-        Grafana
-    end
-
-    style Backend fill:#1a1a2e,stroke:#22c55e,color:#fff
-    style Frontend fill:#1a1a2e,stroke:#8AB8FF,color:#fff
-    style ML fill:#1a1a2e,stroke:#f59e0b,color:#fff
-    style Infra fill:#1a1a2e,stroke:#a78bfa,color:#fff
-```
-
-## Quick Start
+Requires [uv](https://docs.astral.sh/uv/). CI installs with:
 
 ```bash
-# Install dependencies (requires Python 3.12+ and uv)
-make dev
-
-# Start local TimescaleDB + Redis
-make dev-up
-
-# Run all checks (lint + type-check + security + tests)
-make check
+uv sync --locked --extra dev
+uv run pytest tests/unit -m "not slow"
 ```
+
+`make dev` installs every extra, including `ml-training` (torch, xgboost, mlflow), which is large. `make install`
+installs runtime dependencies only, without the test tools.
+
+To run the engine against a local database, start TimescaleDB and Redis with `make dev-up` (needs Docker), then set
+`DATABASE_URL` (and `REDIS_URL`) and run `uv run python -m hydra.dashboard.api`. `.env.example` predates the current
+config: several of its keys (`HYDRA_DB_*` for the API, `HYDRA_PAPER_TRADING`, `HYDRA_CORS_ORIGINS`) are not read the
+way it implies; P1 config rewrites it.
 
 ## Development
 
 ```bash
-make install       # Install dependencies
-make dev           # Install with all extras (dev + ml-training)
-make test          # Run unit tests with coverage
-make unit          # Unit tests only
-make integration   # Integration tests only
-make e2e           # End-to-end tests
-make perf          # Performance benchmarks
-make lint          # Ruff check + format check
-make format        # Auto-format code
-make type-check    # mypy strict mode
-make security      # bandit security scan
-make imports       # Import boundary checks
-make check         # All: lint + type-check + security + test
-make dev-up        # Start local TimescaleDB + Redis
-make dev-down      # Stop local infrastructure
-make docker-build  # Build all Docker images
-make clean         # Remove build artifacts
+make lint          # ruff check + ruff format --check on src/ and tests/
+make format        # ruff --fix + ruff format
+make type-check    # mypy src/ (pyproject config; CI also runs the --strict command in ci.yml)
+make security      # bandit
+make test          # unit tests, not slow, with coverage
+make unit          # all unit tests, verbose
+make integration   # integration tests; DB tests skip unless HYDRA_DB_HOST is set
+make e2e           # e2e tests (no infrastructure needed)
+make perf          # benchmarks, writes benchmark.json
+make imports       # import-linter: FAILS until P1 (layers contract broken)
+make check         # lint + type-check + security + test
+make dev-up        # TimescaleDB + Redis via docker-compose.dev.yml (needs Docker)
+make dev-down      # stop them
+make docker-build  # build hydra-engine, hydra-dashboard, hydra-backtest (needs Docker)
+make clean         # remove caches and build output
 ```
 
-## CI/CD
+Other compose files:
 
-```mermaid
-graph LR
-    PR[Pull Request] --> CI[CI Pipeline]
-    CI --> Lint[Ruff lint + format]
-    CI --> Types[mypy strict]
-    CI --> Security[bandit scan]
-    CI --> Tests[Unit + Integration + E2E]
+- `deploy/compose.yml` is a local full-stack approximation, not the deployment. Its env names do not match what the
+  engine reads, so the engine starts without a DB pool, and the dashboard's `/api` rewrite does not reach the engine.
+  Both wait for P1 config.
+- `docker-compose.ml.yml` is non-functional until P5 (see its header).
 
-    Merge[Merge to main] --> Build[Build Docker Images]
-    Build --> GHCR[Push to GHCR<br/>hydra-engine, hydra-dashboard,<br/>hydra-backtest]
-    GHCR --> Dependabot[Dependabot PR<br/>in romulus]
-    Dependabot --> Deploy[Docker Compose<br/>on ZimaOS]
+## Testing
 
-    style CI fill:#1a1a2e,stroke:#22c55e,color:#fff
-    style Build fill:#1a1a2e,stroke:#8AB8FF,color:#fff
-```
+| Suite | Needs | Command |
+|-------|-------|---------|
+| Unit | nothing | `uv run pytest tests/unit -m "not slow"` |
+| Integration | TimescaleDB (`HYDRA_DB_HOST`, `HYDRA_DB_PORT`, `HYDRA_DB_NAME`, `HYDRA_DB_USER`, `HYDRA_DB_PASSWORD`); Redis on `localhost:6379` | `uv run pytest tests/integration -m integration` |
+| E2E | nothing (in-memory) | `uv run pytest tests/e2e -m e2e` |
+| Performance | nothing | `uv run pytest tests/performance -m performance` |
+| Dashboard | Node 26 | `cd dashboard && npm ci && npm test` |
 
-- PRs trigger lint, type-check, security scan, unit/integration/e2e tests
-- Merge to `main` builds Docker images, pushes to GHCR with auto-incrementing semver tags
-- Deployed via [romulus](https://github.com/somatczk/romulus) as a Docker Compose stack on ZimaOS
+The DB integration tests create and drop their own database. They skip when `HYDRA_DB_HOST` is unset and fail when it
+is set but the server is unreachable. For the current number of tests, run `uv run pytest --collect-only -q`.
+
+What CI runs (`.github/workflows/ci.yml`): lint, `mypy --strict` over core, data, indicators, strategy, backtest,
+execution, risk and portfolio, bandit, unit tests with a clean-tree check, the dashboard (lint, typecheck, test,
+build), integration and e2e. `rules.yml` runs promtool on the Prometheus rules. Performance tests are not run in CI.
+
+## CI/CD and releases
+
+- Every PR to `main` runs CI and the promtool workflow.
+- A push to `main` that touches `src/`, `docker/`, `dashboard/`, `pyproject.toml` or `uv.lock` runs `build.yml`. It
+  builds `hydra-engine`, `hydra-dashboard` and `hydra-backtest` and pushes `main` and `sha-<7>` tags to GHCR. The
+  version tag from `pyproject.toml` is pushed only if it does not exist yet, so version tags never move: releasing
+  means bumping the version. The build does not wait for CI (P1 ops gates it).
+- Releases happen at the end of a phase: `pyproject.toml` version, `uv lock`, and the romulus image tags move together.
+- Dependabot PRs in this repo auto-merge on green CI for minor/patch updates (`dependabot-auto-merge.yml`); majors,
+  0.x minors, pre-releases and base images wait for review.
+
+## Deployment
+
+Production is the `hydra` stack in [romulus](https://github.com/somatczk/romulus) (`stacks/hydra/`), a Docker Compose
+stack on a ZimaCube running Ubuntu 26.04, applied by doco-cd. Each service there is a one-line Dockerfile
+(`FROM ghcr.io/somatczk/hydra-<image>:<version>`); Dependabot in romulus opens the bump PRs. Romulus P0-E2 (in
+progress) holds hydra bumps back from auto-merge, removes the public `/health` + `/metrics` router and drops the
+remaining Telegram env.
+
+## Roadmap
+
+- **P0 Truth**: docs, UI and API stop claiming what is not true; backtests use real stored bars. (This phase.)
+- **P1 Safe paper trading**: config/creds/lifespan, feed, event-bus isolation, risk and circuit-breaker wiring, paper
+  executor, stops and OMS, Binance gate, API security, ops (CI on real PG/Redis, import-linter, python pin).
+- **P2 Trustworthy backtester**: shared execution core, realistic fills, real WFO / CSCV PBO / DSR, durable job queue,
+  real vectorbt, hot-reload.
+- **MCP v1** (after P2): service layer exposed as MCP tools; live tools gated by a one-time code.
+- **P3 Live spot (Binance)**: order state machine, reconciliation, exchange stops, live gating, trader/api split.
+- **P4 Perps.**
+- **P5 ML.**
 
 ## License
 
-MIT
+Proprietary. See [LICENSE](LICENSE).
