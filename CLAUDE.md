@@ -90,14 +90,17 @@ those packages, because `mypy src/` alone does not catch everything it catches.
 ## Architecture (as is)
 - One engine process holds FastAPI, the SessionManager and an `InMemoryEventBus` per session. Redis is only
   health-pinged; it is not on the trading path.
-- Signal path: ccxt.pro bar → StrategyEngine → OrderManager (pre-trade check by PreTradeRiskManager) →
-  PaperTradingExecutor or ExchangeClient. ExchangeClient defaults to `testnet=True`.
+- Signal path: ccxt.pro closed bar → the session's bar handler (paper executor fills resting orders and marks) →
+  StrategyEngine → OrderManager (check by the process-wide RiskService) → PaperTradingExecutor. Every exchange client is
+  built by `hydra.execution.client_factory` (Binance spot only); live sessions are refused until P3.
 - Persisted (the engine has a DB pool whenever `DATABASE_URL` is set; startup fails without one): risk config and
   kill-switch flag, trading sessions, paper trades, positions and balance snapshots, backtest results and trades with
   data provenance, exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`), and `system_config` rows (read at startup;
   `PUT /api/system/config` still changes memory only). In memory only: background task state (backtest, hyperopt,
-  walk-forward). Circuit breakers are not instantiated. Paper state is not reloaded on restart.
-- No exchange-side stops yet (P3). Only Binance is supported in practice; the explicit gate is P1.
+  walk-forward). Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`; paper
+  sessions are restored from `paper_accounts` by `SessionManager.startup()`.
+- Every paper entry gets a protective stop (strategy `risk:` block, 5 % default); no exchange-side stops yet (P3).
+  Only Binance SPOT is accepted (`client_factory.validate_venue`).
 - API auth lives in one pure-ASGI middleware, `src/hydra/dashboard/security.py`: every route and WebSocket except
   `PUBLIC_PATHS` (`/health`, `/metrics`) needs a principal (Authelia `Remote-User` from a peer in
   `api.trusted_proxy_cidrs`, bearer `HYDRA_API_TOKEN`, or anyone in `api.auth_mode: dev`), and browser principals

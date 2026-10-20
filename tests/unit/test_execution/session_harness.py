@@ -108,6 +108,7 @@ class Harness:
     capital: Decimal = field(default_factory=lambda: Decimal("1000"))
     risk_config: RiskConfig | None = None
     history_close: float = 100.0
+    history_bars: int = 20
     end: datetime = field(default_factory=lambda: last_closed_open(datetime.now(UTC), Timeframe.H1))
     ws: list[FakeWsExchange] = field(default_factory=list)
     mgr: SessionManager | None = None
@@ -115,7 +116,7 @@ class Harness:
     _next: dict[str, datetime] = field(default_factory=dict)
 
     def clients(self) -> ClientFactory:
-        rows = history_rows(self.end, 20, self.history_close)
+        rows = history_rows(self.end, self.history_bars, self.history_close)
 
         def ws_factory(exchange_id: str) -> Any:
             def make() -> FakeWsExchange:
