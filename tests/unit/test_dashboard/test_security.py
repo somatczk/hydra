@@ -14,6 +14,8 @@ from structlog.testing import capture_logs
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from hydra.core.config import HydraConfig, load_config
+from hydra.core.logging import get_logger
+from hydra.dashboard import security
 from hydra.dashboard.api import app, build_uvicorn_config
 from hydra.dashboard.security import (
     Principal,
@@ -253,7 +255,9 @@ class TestStartup:
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
 
 
-def test_audit_line_carries_principal_and_fields() -> None:
+def test_audit_line_carries_principal_and_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    # an earlier route's audit() call may have cached the shared logger's configuration
+    monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
     with capture_logs() as logs:
         audit(Principal("user", "soma"), "kill_switch.activate", sessions_stopped=2)
     assert logs == [

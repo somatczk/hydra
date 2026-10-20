@@ -6,10 +6,10 @@ Supports loading from YAML files in ``config/strategies/``.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hydra.core.types import ExchangeId, MarketType, Timeframe
 
@@ -40,6 +40,41 @@ class PositionSizingConfig(BaseModel):
     risk_per_trade_pct: float = 1.0
     max_position_pct: float = 10.0
     fixed_quantity: float | None = None
+
+
+StopLossMethod = Literal["fixed_pct", "atr", "trailing_stop"]
+TakeProfitMethod = Literal["none", "fixed_pct", "atr"]
+
+DEFAULT_STOP_LOSS_PCT = 5.0
+
+
+class StrategyRiskConfig(BaseModel):
+    """Protective exits placed on every entry fill (decision 17).
+
+    ``fixed_pct`` and ``trailing_stop`` values are percentages (5.0 = 5 %), ``atr`` values are
+    multiples of ATR(``atr_period``) on the primary timeframe. A take-profit turns the stop into
+    an OCO. A trailing stop cannot be combined with a take-profit (both would sell the full
+    position).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    stop_loss_method: StopLossMethod = "fixed_pct"
+    stop_loss_value: float = Field(DEFAULT_STOP_LOSS_PCT, gt=0)
+    take_profit_method: TakeProfitMethod = "none"
+    take_profit_value: float = Field(0.0, ge=0)
+    atr_period: int = Field(14, ge=2)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> StrategyRiskConfig:
+        pct_methods = {"fixed_pct", "trailing_stop"}
+        if self.stop_loss_method in pct_methods and self.stop_loss_value >= 100:
+            raise ValueError("stop_loss_value is a percentage and must be below 100")
+        if self.take_profit_method != "none" and self.take_profit_value <= 0:
+            raise ValueError("take_profit_value must be > 0 when a take-profit method is set")
+        if self.stop_loss_method == "trailing_stop" and self.take_profit_method != "none":
+            raise ValueError("a trailing stop cannot be combined with a take-profit")
+        return self
 
 
 class ScheduleConfig(BaseModel):
@@ -75,6 +110,7 @@ class StrategyConfig(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     filters: dict[str, Any] = Field(default_factory=dict)
     position_sizing: PositionSizingConfig = Field(default_factory=PositionSizingConfig)
+    risk: StrategyRiskConfig = Field(default_factory=StrategyRiskConfig)
     schedule: ScheduleConfig | None = None
     ml_overlay: MLOverlayConfig | None = None
 

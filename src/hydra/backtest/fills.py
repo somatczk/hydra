@@ -18,7 +18,7 @@ from hydra.core.types import (
     OrderType,
     Side,
 )
-from hydra.execution.fill_rules import oco_stop_first
+from hydra.execution.fill_rules import oco_stop_first, stop_trigger_price
 
 # ---------------------------------------------------------------------------
 # Configuration dataclasses
@@ -215,18 +215,17 @@ class FillSimulator:
         commission: CommissionConfig,
         avg_volume: Decimal | None,
     ) -> OrderFill | None:
-        """Stop-market: trigger if price crosses stop, fill at stop + slippage."""
+        """Stop-market: fill at the worse of stop and open (gap rule), plus slippage."""
         if order.stop_price is None:
             return None
-        stop = order.stop_price
-        triggered = current_bar.high >= stop if order.side == Side.BUY else current_bar.low <= stop
-        if not triggered:
+        trigger = stop_trigger_price(order.side.value, order.stop_price, current_bar)
+        if trigger is None:
             return None
-        slippage = self._compute_slippage(stop, order.quantity, avg_volume)
+        slippage = self._compute_slippage(trigger, order.quantity, avg_volume)
         if order.side == Side.BUY:
-            fill_price = stop + slippage
+            fill_price = trigger + slippage
         else:
-            fill_price = stop - slippage
+            fill_price = trigger - slippage
             fill_price = max(fill_price, Decimal("0"))
         fee_rate = commission.fee_rate(order.market_type, is_maker=False)
         fee = self.calculate_fee(order.quantity, fill_price, fee_rate)
@@ -355,7 +354,8 @@ class FillSimulator:
         commission: CommissionConfig,
         avg_volume: Decimal | None,
     ) -> OrderFill:
-        """Fill the stop-loss leg of an OCO with slippage."""
+        """Fill the stop-loss leg of an OCO at the worse of stop and open, with slippage."""
+        stop_price = stop_trigger_price(order.side.value, stop_price, bar) or stop_price
         slippage = self._compute_slippage(stop_price, order.quantity, avg_volume)
         if order.side == Side.SELL:
             fill_price = stop_price - slippage

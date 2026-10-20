@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import replace
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, NoReturn, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol, cast, runtime_checkable
 
 from hydra.core.events import (
     OrderCancelEvent,
@@ -22,10 +22,13 @@ from hydra.core.events import (
 )
 from hydra.core.metrics import record_risk_rejection
 from hydra.core.types import (
+    ExchangeId,
     OrderRequest,
     OrderStatus,
+    OrderType,
     Position,
     Side,
+    Symbol,
 )
 from hydra.risk.pretrade import (
     OPEN,
@@ -40,9 +43,12 @@ from hydra.risk.pretrade import (
 from hydra.risk.service import RiskLockTimeoutError
 
 if TYPE_CHECKING:
+    from hydra.execution.paper_trading import PaperFill
     from hydra.risk.service import RiskService
 
 logger = logging.getLogger(__name__)
+
+PROTECTIVE_TAG = "protective"
 
 # ---------------------------------------------------------------------------
 # Lightweight protocol so we don't depend on concrete ExchangeClient/Paper
@@ -427,12 +433,75 @@ class OrderManager:
             raise KeyError(f"Unknown order_id: {order_id}")
         return tracked.status
 
+    def mark_cancelled(self, order_id: str) -> bool:
+        """Record that the executor dropped a tracked order (e.g. a gap-cancelled BUY)."""
+        tracked = self._orders.get(order_id)
+        if tracked is None or tracked.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+            return False
+        tracked.status = OrderStatus.CANCELLED
+        return True
+
+    async def on_external_fill(self, fill: PaperFill) -> OrderFillEvent | None:
+        """Publish a fill the executor made later (resting order, OCO leg, flatten).
+
+        A ``CANCELLED`` record traded nothing: the tracked order is marked cancelled and no
+        event is published. The OCO parent id is the tracked id.
+        """
+        order_id = fill.parent_order_id or fill.order_id
+        if fill.status != "FILLED":
+            self.mark_cancelled(order_id)
+            return None
+        tracked = self._orders.get(order_id)
+        request = tracked.request if tracked is not None else None
+        if tracked is not None:
+            tracked.status = OrderStatus.FILLED
+        event = OrderFillEvent(
+            order_id=order_id,
+            symbol=Symbol(fill.symbol),
+            side=Side(fill.side),
+            order_type=OrderType(fill.order_type),
+            quantity=fill.quantity,
+            price=fill.price,
+            fee=fill.fee,
+            fee_currency=fill.fee_currency,
+            exchange_id=request.exchange_id if request is not None else self._exchange_id(),
+            status=OrderStatus.FILLED,
+            session_id=self._session_id,
+            strategy_id=request.strategy_id if request is not None else "",
+            tag=request.tag if request is not None else fill.reason,
+            reduce_only=request.reduce_only if request is not None else fill.side == "SELL",
+            realized_pnl=fill.net_pnl,
+            gross_pnl=fill.gross_pnl,
+        )
+        await self._event_bus.publish(event)
+        try:
+            from hydra.core.metrics import record_trade
+
+            record_trade(
+                fill.symbol,
+                fill.side,
+                event.strategy_id,
+                event.exchange_id,
+                pnl=None if fill.net_pnl is None else float(fill.net_pnl),
+            )
+        except Exception:
+            logger.debug("trade metrics not recorded", exc_info=True)
+        return event
+
+    def _exchange_id(self) -> ExchangeId:
+        return cast(ExchangeId, getattr(self._executor, "_exchange_id", "binance"))
+
     async def cleanup_stale_orders(self) -> list[str]:
-        """Cancel orders that exceed the configured stale timeout.  Returns cancelled ids."""
+        """Cancel orders that exceed the configured stale timeout.  Returns cancelled ids.
+
+        Protective orders (stops, OCOs) rest until the position closes and are never stale.
+        """
         now = time.monotonic()
         cancelled: list[str] = []
         for order_id, tracked in list(self._orders.items()):
             if tracked.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED):
+                continue
+            if tracked.request.tag == PROTECTIVE_TAG:
                 continue
             age = now - tracked.submitted_at
             if age > self._stale_order_timeout:

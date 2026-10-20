@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from hydra.backtest.data import (
     DataProvenance,
@@ -28,6 +28,7 @@ from hydra.backtest.data import (
 from hydra.core.types import ExchangeId, Timeframe
 from hydra.dashboard.routes._db import DB_ERRORS, api_error, db_errors_to_503, require_pool
 from hydra.data.storage import MarketDataRepository
+from hydra.strategy.config import StrategyRiskConfig
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 logger = logging.getLogger(__name__)
@@ -209,6 +210,22 @@ class RiskInput(BaseModel):
     sizing_params: dict[str, float] = Field(default_factory=dict)
 
 
+def _risk_block(risk: RiskInput) -> dict[str, Any]:
+    """The YAML ``risk:`` block for builder SL/TP; a trailing stop drops the take-profit."""
+    trailing = risk.stop_loss_method == "trailing_stop"
+    block = {
+        "stop_loss_method": risk.stop_loss_method,
+        "stop_loss_value": risk.stop_loss_value,
+        "take_profit_method": "none" if trailing else risk.take_profit_method,
+        "take_profit_value": 0.0 if trailing else risk.take_profit_value,
+    }
+    try:
+        return StrategyRiskConfig(**block).model_dump(mode="json")
+    except ValidationError as exc:
+        msgs = "; ".join(str(e.get("msg", "")) for e in exc.errors())
+        raise HTTPException(status_code=422, detail=f"Invalid risk settings: {msgs}") from exc
+
+
 class PreviewRequest(BaseModel):
     rules: RuleSetInput
     timeframe: Timeframe = Timeframe.H1
@@ -377,6 +394,20 @@ def _to_condition_group_input(group_data: dict[str, Any] | None) -> ConditionGro
     )
 
 
+def _stored_risk(raw: Any) -> dict[str, Any]:
+    """SL/TP as enforced: the YAML ``risk:`` block, or the 5 % default stop when absent."""
+    try:
+        cfg = StrategyRiskConfig(**raw) if isinstance(raw, dict) else StrategyRiskConfig()
+    except ValidationError:
+        cfg = StrategyRiskConfig()
+    return {
+        "stop_loss_method": cfg.stop_loss_method,
+        "stop_loss_value": cfg.stop_loss_value,
+        "take_profit_method": cfg.take_profit_method,
+        "take_profit_value": cfg.take_profit_value,
+    }
+
+
 def _extract_strategy_detail(data: dict[str, Any]) -> dict[str, Any]:
     """Extract structured builder fields from parsed YAML config."""
     params = data.get("parameters", {})
@@ -401,10 +432,7 @@ def _extract_strategy_detail(data: dict[str, Any]) -> dict[str, Any]:
             "entry": tf_data.get("entry"),
         },
         "risk": {
-            "stop_loss_method": "atr",
-            "stop_loss_value": 2.0,
-            "take_profit_method": "atr",
-            "take_profit_value": 3.0,
+            **_stored_risk(data.get("risk")),
             "sizing_method": sizing.get("method", "fixed_fractional"),
             "sizing_params": {
                 "risk_per_trade_pct": sizing.get("risk_per_trade_pct", 1.0),
@@ -659,6 +687,7 @@ async def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
             "risk_per_trade_pct": body.risk.sizing_params.get("risk_per_trade_pct", 1.0),
             "max_position_pct": body.risk.sizing_params.get("max_position_pct", 10.0),
         },
+        "risk": _risk_block(body.risk),
     }
 
     if body.ml_overlay:
@@ -863,6 +892,7 @@ async def save_strategy(request: SaveRequest) -> SaveResponse:
             "risk_per_trade_pct": request.risk.sizing_params.get("risk_per_trade_pct", 1.0),
             "max_position_pct": request.risk.sizing_params.get("max_position_pct", 10.0),
         },
+        "risk": _risk_block(request.risk),
     }
 
     if request.ml_overlay:

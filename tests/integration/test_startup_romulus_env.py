@@ -59,8 +59,8 @@ async def test_fresh_database_boots_from_seeded_rows(
     async with lifespan.run(app):
         mgr = app.state.session_manager
         assert app.state.db_pool is not None
-        assert mgr._global_paper_capital == Decimal("10000")
-        assert mgr._risk_manager._config.max_position_pct == Decimal("0.1000")
+        assert mgr.risk.paper_capital == Decimal("10000")
+        assert mgr.risk.config.max_position_pct == Decimal("0.1000")
         assert app.state.system_config["paper_capital"] == 10000
         assert app.state.config.api.cors_origins == ["https://trading.example.com"]
 
@@ -72,8 +72,10 @@ async def test_fresh_database_boots_from_seeded_rows(
     migrated = events.index(
         ("hydra.dashboard.lifespan", f"Database schema at revision {head_revision()}")
     )
-    risk_loaded = events.index(
-        ("hydra.execution.session_manager", "PreTradeRiskManager initialised (from DB: True)")
+    risk_loaded = next(
+        i
+        for i, (name, event) in enumerate(events)
+        if name == "hydra.execution.session_manager" and event.startswith("Risk service loaded")
     )
     assert migrated < risk_loaded
 
@@ -102,8 +104,8 @@ async def test_db_values_win_over_defaults_and_survive_restart(
         app = FastAPI()
         async with lifespan.run(app):
             mgr = app.state.session_manager
-            assert mgr._global_paper_capital == Decimal("2500")
-            assert mgr._risk_manager._config.max_position_pct == Decimal("0.0700")
+            assert mgr.risk.paper_capital == Decimal("2500")
+            assert mgr.risk.config.max_position_pct == Decimal("0.0700")
             assert app.state.system_config["paper_capital"] == 2500
             assert app.state.exchange_credentials == {
                 "binance": {"api_key": "live-key", "api_secret": "live-secret", "passphrase": None}

@@ -494,9 +494,6 @@ async def update_risk_config(body: RiskConfigUpdate, request: Request) -> dict[s
     async with db_errors_to_503("updating risk config"):
         await _apply_risk_config_update(pool, "global", updates)
 
-    mgr = getattr(request.app.state, "session_manager", None)
-    if mgr is not None:
-        await mgr.reload_risk_config()
     svc = _risk_service(request)
     if svc is not None:
         try:

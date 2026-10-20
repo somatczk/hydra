@@ -10,7 +10,15 @@ from decimal import Decimal
 from typing import Any
 
 from hydra.core.events import Event, OrderFillEvent
-from hydra.core.types import MarketType, OrderRequest, OrderType, Position, Side, Symbol
+from hydra.core.types import (
+    OHLCV,
+    MarketType,
+    OrderRequest,
+    OrderType,
+    Position,
+    Side,
+    Symbol,
+)
 from hydra.execution.order_manager import OrderManager
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.risk.market_rules import MarketRulesCache
@@ -20,6 +28,12 @@ from hydra.risk.state import InMemoryRiskStateStore, RiskState
 
 BTC = "BTCUSDT"
 T0 = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+
+
+def flat_bar(price: Decimal, ts: datetime) -> OHLCV:
+    """A closed bar that trades only at *price* (marks a paper executor without fills)."""
+    return OHLCV(open=price, high=price, low=price, close=price, volume=Decimal("1"), timestamp=ts)
+
 
 BINANCE_MARKETS: list[dict[str, Any]] = [
     {
@@ -122,7 +136,7 @@ class Account:
         for sym in (BTC, "ETHUSDT"):
             price = self.svc.mark("binance", sym)
             if price is not None:
-                ex.set_market_price(sym, price)
+                await ex.on_closed_bar(sym, flat_bar(price, T0 + timedelta(hours=self.bar)))
         await self.svc.register_session(
             sid, ex, allocated=Decimal(capital), symbols=[BTC], exchange_id="binance"
         )
@@ -137,7 +151,7 @@ class Account:
     async def mark(self, price: str, symbol: str = BTC) -> None:
         self.bar += 1
         for ex in self.executors.values():
-            ex.set_market_price(symbol, Decimal(price))
+            await ex.on_closed_bar(symbol, flat_bar(Decimal(price), T0 + timedelta(hours=self.bar)))
         await self.svc.on_mark("binance", symbol, Decimal(price), T0 + timedelta(hours=self.bar))
 
     async def submit(
