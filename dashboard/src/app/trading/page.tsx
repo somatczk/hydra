@@ -447,10 +447,17 @@ export default function TradingPage() {
       if (qtTakeProfit) payload.take_profit = Number(qtTakeProfit);
       if (qtStopLoss) payload.stop_loss = Number(qtStopLoss);
 
-      await fetchApi('/api/trading/quick-trade', {
+      const placed = await fetchApi<{ session_id?: string }>('/api/trading/quick-trade', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
+      if (placed?.session_id !== session.session_id) {
+        toast(
+          'error',
+          `The order was placed on session ${placed?.session_id ?? 'unknown'}, not ${session.session_id}; check both sessions now`,
+        );
+        return;
+      }
       toast('success', `PAPER ${qtSide.toUpperCase()} order placed for ${quantity} ${symbol}`);
       setQtQuantity('');
       setQtPrice('');

@@ -3,10 +3,14 @@ are capped, validated by onnxruntime and never silently replace a model."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -229,3 +233,103 @@ class TestUpload:
     def test_bad_names_are_rejected(self, models_dir: Path, client: TestClient, name: str) -> None:
         assert _upload(client, ONNX, name=name).status_code in (400, 422)
         assert _files(models_dir) == []
+
+
+_BOUNDARY = "hydra-test-boundary"
+
+
+def _multipart(content: bytes, name: str = "alpha.onnx") -> bytes:
+    head = (
+        f'--{_BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    return head + content + f"\r\n--{_BOUNDARY}--\r\n".encode()
+
+
+class TestUploadBodyBound:
+    """The cap holds at the transport: the multipart parser never spools an oversized body."""
+
+    @pytest.fixture(autouse=True)
+    def small_cap(self, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        monkeypatch.setattr(models, "MAX_MODEL_BYTES", 1024)
+        monkeypatch.setattr(models, "MULTIPART_OVERHEAD_BYTES", 512)
+        spooled: list[int] = []
+
+        async def spy(file: Any, dest: Path) -> int:
+            spooled.append(1)
+            raise AssertionError("the handler ran on an oversized body")
+
+        monkeypatch.setattr(models, "_spool", spy)
+        return spooled
+
+    def test_declared_length_over_the_bound_is_413_before_parsing(
+        self, models_dir: Path, client: TestClient, small_cap: list[int]
+    ) -> None:
+        body = _multipart(b"\0" * 4096)
+        resp = client.post(
+            "/api/models/upload",
+            content=body,
+            headers={"content-type": f"multipart/form-data; boundary={_BOUNDARY}"},
+        )
+        assert resp.status_code == 413
+        assert resp.json()["detail"]["code"] == "model_too_large"
+        assert small_cap == []
+        assert _files(models_dir) == []
+
+    def test_chunked_body_is_counted_and_cut_off(
+        self, models_dir: Path, client: TestClient, small_cap: list[int]
+    ) -> None:
+        body = _multipart(b"\0" * 4096)
+        sent: list[int] = []
+
+        def chunks() -> Iterator[bytes]:
+            for i in range(0, len(body), 256):
+                sent.append(i)
+                yield body[i : i + 256]
+
+        resp = client.post(
+            "/api/models/upload",
+            content=chunks(),
+            headers={"content-type": f"multipart/form-data; boundary={_BOUNDARY}"},
+        )
+        assert resp.status_code == 413
+        assert resp.json()["detail"]["code"] == "model_too_large"
+        assert small_cap == []
+        assert _files(models_dir) == []
+
+
+async def test_promote_during_an_upload_is_not_overwritten(
+    models_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _add_model(models_dir, "alpha", {"stage": "Staging", "version": "v3"})
+    entered, release = threading.Event(), threading.Event()
+    check = models._check_onnx
+
+    def slow_check(path: Path) -> None:
+        entered.set()
+        release.wait(5)
+        check(path)
+
+    monkeypatch.setattr(models, "_check_onnx", slow_check)
+    app = FastAPI()
+    install_error_handlers(app)
+    app.include_router(router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as http:
+        upload = asyncio.create_task(
+            http.post(
+                "/api/models/upload",
+                params={"replace": "true"},
+                files={"file": ("alpha.onnx", ONNX, "application/octet-stream")},
+            )
+        )
+        await asyncio.to_thread(entered.wait, 5)
+        assert (await http.post("/api/models/alpha/promote")).status_code == 200
+        release.set()
+        resp = await upload
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "model_in_production"
+    assert (models_dir / "alpha.onnx").read_bytes() == b"onnx"
+    assert json.loads((models_dir / "alpha.meta.json").read_text())["stage"] == "Production"
+    assert _files(models_dir) == ["alpha.meta.json", "alpha.onnx"]

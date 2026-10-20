@@ -19,7 +19,10 @@ vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
   fetchApi: (...args: unknown[]) => fetchApi(...args),
 }));
-vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
+const toast = vi.fn();
+vi.mock('@/components/ui/Toast', () => ({
+  useToast: () => ({ toast: (...args: unknown[]) => toast(...args) }),
+}));
 vi.mock('@/components/layout/ThemeProvider', () => ({ useTheme: () => ({ resolved: 'light' }) }));
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn() }) }));
 
@@ -283,6 +286,34 @@ describe('TradingPage quick trade', () => {
         stop_loss: 60000,
       },
     ]);
+  });
+
+  it.each([
+    ['sess-paper', 'success', 'PAPER BUY order placed for 0.01 BTCUSDT'],
+    ['sess-other', 'error', 'placed on session sess-other, not sess-paper'],
+  ])('checks the session the server used (%s)', async (used, level, text) => {
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    toast.mockReset();
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = SESSIONS;
+    const base = routeFetch(routes, calls);
+    fetchApi.mockImplementation(async (path: string, init?: RequestInit) =>
+      path === '/api/trading/quick-trade'
+        ? { order_id: 'o1', session_id: used, status: 'filled' }
+        : base(path, init),
+    );
+    page = await mount(<TradingPage />);
+
+    await choose(selectByLabel(page.container, 'Session'), 'sess-paper');
+    await typeInto(inputByLabel(page.container, 'Quantity'), '0.01');
+    const review = Array.from(page.container.querySelectorAll('button')).find((b) =>
+      b.textContent?.includes('Review Buy'),
+    );
+    await click(review as HTMLButtonElement);
+
+    const [lastLevel, lastText] = toast.mock.calls.at(-1) as [string, string];
+    expect(lastLevel).toBe(level);
+    expect(lastText).toContain(text);
   });
 
   it('sends nothing when the confirmation is declined', async () => {

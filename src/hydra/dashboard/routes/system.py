@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, cast
 from urllib.parse import unquote, urlsplit
 
@@ -15,9 +16,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from hydra.dashboard.deps import current_config
-from hydra.dashboard.routes._db import DB_ERRORS, api_error, db_errors_to_503, require_pool
+from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
 from hydra.dashboard.security import Principal, audit
-from hydra.risk.state import RiskStateUnavailableError
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 logger = logging.getLogger(__name__)
@@ -36,10 +36,10 @@ _EXCHANGE_DEFS: dict[str, str] = {
 }
 _SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance"})
 CONNECT_TIMEOUT_S = 10.0
-_RELOAD_ERRORS: tuple[type[BaseException], ...] = (RiskStateUnavailableError, *DB_ERRORS)
 
 TradingMode = Literal["paper", "live"]
 CredentialState = Literal["ok", "undecryptable", "missing"]
+Environment = Literal["testnet", "mainnet"]
 _SETTING_FIELDS: tuple[str, ...] = (
     "trading_mode",
     "default_pair",
@@ -222,7 +222,8 @@ async def _save_system_config(pool: Any, updates: dict[str, Any], actor: str) ->
                 await conn.execute(_UPSERT_SETTING, key, json.dumps(value), actor)
 
 
-def _risk_service(request: Request) -> Any:
+def risk_service(request: Request) -> Any:
+    """The process-wide RiskService on the session manager, or ``None``."""
     from hydra.risk.service import RiskService
 
     mgr = getattr(request.app.state, "session_manager", None)
@@ -231,25 +232,23 @@ def _risk_service(request: Request) -> Any:
 
 
 async def _reload_paper_capital(request: Request) -> None:
-    """Hand a paper_capital change to the engine; RiskService rebases via its audited reset."""
-    mgr = getattr(request.app.state, "session_manager", None)
-    svc = _risk_service(request)
+    """Hand paper_capital to the RiskService, which rebases via its audited paper reset."""
+    svc = risk_service(request)
+    if svc is None:
+        return
     try:
-        if mgr is not None:
-            await mgr.reload_risk_config()
-        if svc is not None:
-            await svc.reload_config(actor=_actor(request))
-    except _RELOAD_ERRORS as exc:
+        await svc.reload_config(actor=_actor(request))
+    except Exception as exc:
         logger.exception("paper_capital saved but the running engine did not reload it")
         raise api_error(
             503,
             "risk_reload_failed",
-            "paper_capital was saved but the running engine could not apply it",
+            "paper_capital was saved but the running engine could not apply it; save it again",
             "unavailable",
         ) from exc
 
 
-def _to_public(stored: StoredConfig, pending: Any = None) -> dict[str, Any]:
+def _to_public(stored: StoredConfig, pending: Decimal | None = None) -> dict[str, Any]:
     data = stored.model_dump()
     public = {k: v for k, v in data.items() if k not in _SECRET_FIELDS}
     for field in _SECRET_FIELDS:
@@ -258,9 +257,25 @@ def _to_public(stored: StoredConfig, pending: Any = None) -> dict[str, Any]:
     return public
 
 
-def _pending_capital(request: Request) -> Any:
-    svc = _risk_service(request)
-    return svc.pending_paper_capital if svc is not None else None
+def _as_decimal(value: Any) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def pending_capital(request: Request, stored: Any) -> Decimal | None:
+    """The saved paper_capital the risk ledger does not run on yet, or ``None`` when in sync."""
+    svc = risk_service(request)
+    if svc is None:
+        return None
+    if svc.pending_paper_capital is not None:
+        return cast(Decimal, svc.pending_paper_capital)
+    wanted = _as_decimal(stored)
+    applied = svc.paper_capital
+    if wanted is not None and (applied is None or applied != wanted):
+        return wanted
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +291,8 @@ class ExchangeStatus(BaseModel):
     api_key_set: bool
     credential_state: CredentialState
     last_sync: str | None
+    environment: Environment
+    validated_environment: Environment | None = None
 
 
 class PlatformConfig(BaseModel):
@@ -338,6 +355,7 @@ class ExchangeConnectResponse(BaseModel):
     connected: bool
     message: str
     validated_at: str | None = None
+    environment: Environment
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +395,8 @@ async def get_paper_capital(pool: Any) -> float:
 async def get_config(request: Request) -> dict[str, Any]:
     """Return the persisted platform configuration; secrets are never returned."""
     pool = require_pool(request)
-    return _to_public(await read_system_config(pool), _pending_capital(request))
+    stored = await read_system_config(pool)
+    return _to_public(stored, pending_capital(request, stored.paper_capital))
 
 
 @router.put("/config", response_model=PlatformConfig)
@@ -386,8 +405,6 @@ async def update_config(body: PlatformConfigUpdate, request: Request) -> dict[st
     pool = require_pool(request)
     updates = body.model_dump(exclude_none=True)
     if updates:
-        async with db_errors_to_503("reading system config"):
-            before = await load_system_config(pool)
         await _save_system_config(pool, updates, _actor(request))
         async with db_errors_to_503("reading system config"):
             request.app.state.system_config = await load_system_config(pool)
@@ -398,9 +415,10 @@ async def update_config(body: PlatformConfigUpdate, request: Request) -> dict[st
             secrets_set=sorted(k for k in updates if k in _SECRET_FIELDS and updates[k]),
             secrets_cleared=sorted(k for k in updates if k in _SECRET_FIELDS and not updates[k]),
         )
-        if "paper_capital" in updates and before.get("paper_capital") != updates["paper_capital"]:
+        if "paper_capital" in updates:
             await _reload_paper_capital(request)
-    return _to_public(await read_system_config(pool), _pending_capital(request))
+    stored = await read_system_config(pool)
+    return _to_public(stored, pending_capital(request, stored.paper_capital))
 
 
 def _unknown_exchange(exchange_id: str) -> HTTPException:
@@ -424,14 +442,26 @@ def _iso(ts: datetime | None) -> str | None:
     return ts.isoformat() if ts is not None else None
 
 
+def current_environment() -> Environment:
+    """Where keyed calls go: the Binance sandbox while ``trading.testnet`` is true."""
+    return "testnet" if current_config().trading.testnet else "mainnet"
+
+
+def _venue(exchange_id: str, environment: Environment) -> str:
+    return f"{_EXCHANGE_DEFS[exchange_id]} {environment}"
+
+
 @router.get("/exchanges", response_model=list[ExchangeStatus])
 async def get_exchanges(request: Request) -> list[dict[str, Any]]:
     """Stored-credential state per exchange; connected means the keys passed a read-only check."""
     pool = require_pool(request)
     async with db_errors_to_503("reading exchange credentials"), pool.acquire() as conn:
-        rows = await conn.fetch("SELECT exchange_id, validated_at FROM exchange_credentials")
-    stored = {row["exchange_id"]: row["validated_at"] for row in rows}
+        rows = await conn.fetch(
+            "SELECT exchange_id, validated_at, validated_environment FROM exchange_credentials"
+        )
+    stored = {row["exchange_id"]: row for row in rows}
     errors = _get_credential_errors(request)
+    environment = current_environment()
 
     results: list[dict[str, Any]] = []
     for exchange_id, display_name in _EXCHANGE_DEFS.items():
@@ -442,16 +472,22 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
             state = "undecryptable"
         else:
             state = "ok"
-        validated_at = stored.get(exchange_id)
+        row = stored.get(exchange_id)
+        validated_at = row["validated_at"] if row is not None else None
+        validated_env = row["validated_environment"] if row is not None else None
         results.append(
             {
                 "id": exchange_id,
                 "name": display_name,
                 "supported": exchange_id in _SUPPORTED_EXCHANGES,
-                "connected": state == "ok" and validated_at is not None,
+                "connected": state == "ok"
+                and validated_at is not None
+                and validated_env == environment,
                 "api_key_set": exchange_id in stored,
                 "credential_state": state,
                 "last_sync": _iso(validated_at),
+                "environment": environment,
+                "validated_environment": validated_env,
             }
         )
     return results
@@ -479,7 +515,8 @@ async def connect_exchange(
         "api_secret": body.api_secret,
         "passphrase": body.passphrase or None,
     }
-    await _check_credentials(exchange, creds)
+    environment = current_environment()
+    await _check_credentials(exchange, creds, environment)
 
     from hydra.core.encryption import encrypt
 
@@ -487,31 +524,34 @@ async def connect_exchange(
         validated_at = await conn.fetchval(
             "INSERT INTO exchange_credentials "
             "(exchange_id, encrypted_key, encrypted_secret, encrypted_passphrase, updated_at, "
-            "validated_at) "
-            "VALUES ($1, $2, $3, $4, now(), now()) "
+            "validated_at, validated_environment) "
+            "VALUES ($1, $2, $3, $4, now(), now(), $5) "
             "ON CONFLICT (exchange_id) DO UPDATE SET "
             "encrypted_key = EXCLUDED.encrypted_key, "
             "encrypted_secret = EXCLUDED.encrypted_secret, "
             "encrypted_passphrase = EXCLUDED.encrypted_passphrase, "
-            "updated_at = now(), validated_at = now() "
+            "updated_at = now(), validated_at = now(), "
+            "validated_environment = EXCLUDED.validated_environment "
             "RETURNING validated_at",
             exchange,
             encrypt(body.api_key),
             encrypt(body.api_secret),
             encrypt(body.passphrase) if body.passphrase else None,
+            environment,
         )
 
     _get_exchange_credentials(request)[exchange] = creds
     _get_credential_errors(request).pop(exchange, None)
     await _evict_client(request, exchange)
-    audit(_principal(request), "exchange_connected", exchange_id=exchange)
+    audit(_principal(request), "exchange_connected", exchange_id=exchange, environment=environment)
 
     return {
         "id": exchange,
         "name": display_name,
         "connected": True,
-        "message": f"{display_name} keys verified and stored",
+        "message": f"{_venue(exchange, environment)} accepted these keys; they are stored",
         "validated_at": _iso(validated_at),
+        "environment": environment,
     }
 
 
@@ -539,6 +579,7 @@ async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, A
         "name": display_name,
         "connected": False,
         "message": f"Disconnected from {display_name}",
+        "environment": current_environment(),
     }
 
 
@@ -732,19 +773,21 @@ def _get_exchange_clients(request: Request) -> dict[str, Any]:
     return cast(dict[str, Any], request.app.state._exchange_clients)
 
 
-def _readonly_client(exchange_id: str, creds: dict[str, Any]) -> Any:
-    """E's read-only Binance SPOT client; sandbox follows ``trading.testnet``."""
+def _readonly_client(exchange_id: str, creds: dict[str, Any], environment: Environment) -> Any:
+    """E's read-only Binance SPOT client; the sandbox on ``testnet``."""
     from hydra.execution.client_factory import build_readonly_client
 
-    return build_readonly_client(exchange_id, creds, testnet=current_config().trading.testnet)
+    return build_readonly_client(exchange_id, creds, testnet=environment == "testnet")
 
 
-async def _check_credentials(exchange_id: str, creds: dict[str, Any]) -> None:
+async def _check_credentials(
+    exchange_id: str, creds: dict[str, Any], environment: Environment
+) -> None:
     """One read-only balance call; 422 when the exchange rejects the keys, 502 when unreachable."""
     import ccxt
 
-    name = _EXCHANGE_DEFS[exchange_id]
-    client = _readonly_client(exchange_id, creds)
+    name = _venue(exchange_id, environment)
+    client = _readonly_client(exchange_id, creds, environment)
     try:
         await asyncio.wait_for(client.fetch_balance(), CONNECT_TIMEOUT_S)
     except ccxt.AuthenticationError as exc:
@@ -790,14 +833,32 @@ async def _get_exchange_client(exchange_id: str, request: Request) -> Any:
         raise api_error(
             404, "credentials_not_found", f"No credentials stored for {exchange}", "not_found"
         )
-    client = _readonly_client(exchange, creds[exchange])
+    client = _readonly_client(exchange, creds[exchange], current_environment())
     clients[exchange] = client
     return client
 
 
-def _exchange_error(exchange_id: str) -> HTTPException:
+async def _exchange_error(request: Request, exchange_id: str) -> HTTPException:
     logger.warning("Exchange request to %s failed", exchange_id, exc_info=True)
-    return api_error(502, "exchange_error", f"Request to {exchange_id} failed", "unavailable")
+    await _evict_client(request, exchange_id)
+    venue = _venue(exchange_id, current_environment())
+    return api_error(502, "exchange_error", f"Request to {venue} failed", "unavailable")
+
+
+async def _order_symbols(request: Request) -> list[str]:
+    """default_pair plus the symbols of running sessions (Binance wants a symbol per call)."""
+    pool = require_pool(request)
+    stored = await read_system_config(pool)
+    symbols = [stored.default_pair]
+    mgr = getattr(request.app.state, "session_manager", None)
+    if mgr is not None:
+        for session in mgr.list_sessions():
+            if session.status == "running":
+                symbols += [str(s) for s in session.symbols]
+    unique: dict[str, str] = {}
+    for symbol in symbols:
+        unique.setdefault(symbol.replace("/", "").upper(), symbol)
+    return list(unique.values())
 
 
 @router.get("/exchanges/{exchange_id}/balance")
@@ -808,30 +869,31 @@ async def get_exchange_balance(exchange_id: str, request: Request) -> dict[str, 
         balances = await client.fetch_balance()
         return {"exchange_id": exchange_id, "balances": {k: float(v) for k, v in balances.items()}}
     except Exception as exc:
-        # Evict cached client on error so next request creates a fresh one
-        _get_exchange_clients(request).pop(exchange_id, None)
-        raise _exchange_error(exchange_id) from exc
+        raise await _exchange_error(request, exchange_id) from exc
 
 
 @router.get("/exchanges/{exchange_id}/orders")
 async def get_exchange_orders(exchange_id: str, request: Request) -> dict[str, Any]:
-    """Fetch open orders from a configured exchange."""
+    """Open orders for default_pair and every running session's symbols."""
     client = await _get_exchange_client(exchange_id, request)
+    symbols = await _order_symbols(request)
     try:
-        orders = await client.fetch_open_orders()
-        return {"exchange_id": exchange_id, "orders": orders}
+        orders: list[dict[str, Any]] = []
+        for symbol in symbols:
+            orders += await client.fetch_open_orders(symbol)
+        return {"exchange_id": exchange_id, "symbols": symbols, "orders": orders}
     except Exception as exc:
-        _get_exchange_clients(request).pop(exchange_id, None)
-        raise _exchange_error(exchange_id) from exc
+        raise await _exchange_error(request, exchange_id) from exc
 
 
 @router.get("/exchanges/{exchange_id}/positions")
-async def get_exchange_positions(exchange_id: str, request: Request) -> dict[str, Any]:
-    """Fetch open positions from a configured exchange."""
-    client = await _get_exchange_client(exchange_id, request)
-    try:
-        positions = await client.fetch_positions()
-        return {"exchange_id": exchange_id, "positions": positions}
-    except Exception as exc:
-        _get_exchange_clients(request).pop(exchange_id, None)
-        raise _exchange_error(exchange_id) from exc
+async def get_exchange_positions(exchange_id: str) -> dict[str, Any]:
+    """A spot account has no positions (holdings are the balance); 501 without a call."""
+    _require_supported(exchange_id)
+    raise api_error(
+        501,
+        "spot_no_positions",
+        f"{_EXCHANGE_DEFS[exchange_id]} is connected as a spot account: it has no positions, "
+        "holdings are listed under Balance",
+        "not_implemented",
+    )

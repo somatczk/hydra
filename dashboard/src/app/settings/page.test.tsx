@@ -103,6 +103,8 @@ const EXCHANGES = [
     api_key_set: true,
     credential_state: 'ok',
     last_sync: '2026-10-20T12:00:00+00:00',
+    environment: 'testnet',
+    validated_environment: 'testnet',
   },
   {
     id: 'bybit',
@@ -112,6 +114,8 @@ const EXCHANGES = [
     api_key_set: true,
     credential_state: 'undecryptable',
     last_sync: null,
+    environment: 'testnet',
+    validated_environment: null,
   },
   {
     id: 'kraken',
@@ -121,6 +125,8 @@ const EXCHANGES = [
     api_key_set: false,
     credential_state: 'missing',
     last_sync: null,
+    environment: 'testnet',
+    validated_environment: null,
   },
 ];
 
@@ -132,7 +138,7 @@ describe('SettingsPage exchange credential state', () => {
     page = await mount(<SettingsPage />);
 
     const binance = page.container.querySelector('[data-testid="validation-binance"]');
-    expect(binance?.textContent).toContain('Validated');
+    expect(binance?.textContent).toContain('Validated on testnet');
     expect(binance?.textContent).not.toContain('Active');
     expect(page.container.textContent).toContain('Undecryptable, enter the keys again');
     expect(page.container.textContent).toContain('Not supported yet (Binance only)');
@@ -140,6 +146,37 @@ describe('SettingsPage exchange credential state', () => {
       (b) => b.textContent?.trim() === 'Connect',
     );
     expect(connect.every((b) => b.disabled)).toBe(true);
+  });
+
+  it('does not count keys checked on testnet as validated on mainnet', async () => {
+    const r = routes();
+    r['/api/system/exchanges'] = [
+      { ...EXCHANGES[0], connected: false, environment: 'mainnet', validated_environment: 'testnet' },
+    ];
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page = await mount(<SettingsPage />);
+
+    const binance = page.container.querySelector('[data-testid="validation-binance"]');
+    expect(binance?.textContent).toBe('Checked on testnet only; connect again for mainnet');
+  });
+
+  it('shows the balance when open orders fail and never asks a spot account for positions', async () => {
+    const r = routes();
+    r['/api/system/exchanges'] = EXCHANGES;
+    r['/api/system/exchanges/binance/balance'] = { exchange_id: 'binance', balances: { USDT: 12.5 } };
+    r['/api/system/exchanges/binance/orders'] = unavailable('Request to Binance testnet failed');
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page = await mount(<SettingsPage />);
+    await click(buttonByText(page.container, 'Details'));
+
+    const balances = page.container.textContent ?? '';
+    expect(balances).toContain('USDT');
+    expect(balances).toContain('12.50');
+    expect(page.container.querySelector('[data-testid="orders-error-binance"]')?.textContent).toBe(
+      'Request to Binance testnet failed',
+    );
+    expect(balances).toContain('Spot account: there are no positions');
+    expect(calls.some((c) => c.path.endsWith('/positions'))).toBe(false);
   });
 
   it('shows the server message when exchanges cannot be read', async () => {

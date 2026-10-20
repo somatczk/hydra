@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import secrets
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -246,22 +247,18 @@ class _SystemConfigStore(InMemoryRiskStateStore):
     def __init__(self, db: FakeSystemDb) -> None:
         super().__init__(paper_capital=Decimal("10000"))
         self.db = db
-        self.fail = False
+        self.fail: BaseException | None = None
 
     async def load_config(self) -> LoadedConfig:
-        if self.fail:
-            raise RiskStateUnavailableError("store down")
+        if self.fail is not None:
+            raise self.fail
         self.paper_capital = Decimal(str(self.db.value("paper_capital")))
         return await super().load_config()
 
 
-class _Manager:
-    def __init__(self, risk: RiskService) -> None:
-        self.risk = risk
-        self.reloads = 0
-
-    async def reload_risk_config(self) -> None:
-        self.reloads += 1
+def _manager(risk: RiskService) -> SimpleNamespace:
+    """P1-E's SessionManager as the route sees it: only ``.risk`` (no reload hook)."""
+    return SimpleNamespace(risk=risk)
 
 
 async def _risk(db: FakeSystemDb, *, recovered: bool) -> tuple[RiskService, _SystemConfigStore]:
@@ -279,7 +276,7 @@ class TestPaperCapitalChange:
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _Manager(svc)
+        app.state.session_manager = _manager(svc)
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
         assert resp.status_code == 200
         assert resp.json()["paper_capital"] == 25000.0
@@ -287,13 +284,12 @@ class TestPaperCapitalChange:
         assert svc.paper_capital == Decimal("25000")
         assert [(e.kind, e.actor) for e in store.events] == [("paper_reset", "anonymous")]
         assert store.events[0].details["old_capital"] == Decimal("10000")
-        assert app.state.session_manager.reloads == 1
 
     async def test_change_while_recovering_is_reported_pending(
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=False)
-        app.state.session_manager = _Manager(svc)
+        app.state.session_manager = _manager(svc)
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
         assert resp.status_code == 200
         assert resp.json()["paper_capital"] == 25000.0
@@ -303,22 +299,51 @@ class TestPaperCapitalChange:
 
     async def test_same_capital_does_not_reset(self, db: FakeSystemDb, app: FastAPI) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _Manager(svc)
-        TestClient(app).put("/api/system/config", json={"paper_capital": 10000})
+        app.state.session_manager = _manager(svc)
+        resp = TestClient(app).put("/api/system/config", json={"paper_capital": 10000})
+        assert resp.json()["paper_capital_pending"] is None
         assert store.events == []
-        assert app.state.session_manager.reloads == 0
 
     async def test_reload_failure_is_503_after_the_save(
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _Manager(svc)
-        store.fail = True
+        app.state.session_manager = _manager(svc)
+        store.fail = RiskStateUnavailableError("store down")
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
         assert resp.status_code == 503
         assert _detail(resp)["code"] == "risk_reload_failed"
         assert db.value("paper_capital") == 25000
         assert svc.paper_capital == Decimal("10000")
+
+    async def test_unexpected_reload_error_is_the_503_envelope(
+        self, db: FakeSystemDb, app: FastAPI
+    ) -> None:
+        svc, store = await _risk(db, recovered=True)
+        app.state.session_manager = _manager(svc)
+        store.fail = AttributeError("contract drift")
+        resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "risk_reload_failed"
+
+    async def test_retry_after_a_failed_reload_applies_the_reset(
+        self, db: FakeSystemDb, app: FastAPI
+    ) -> None:
+        svc, store = await _risk(db, recovered=True)
+        app.state.session_manager = _manager(svc)
+        client = TestClient(app)
+        store.fail = RiskStateUnavailableError("store down")
+        assert client.put("/api/system/config", json={"paper_capital": 25000}).status_code == 503
+        between = client.get("/api/system/config").json()
+        assert between["paper_capital"] == 25000.0
+        assert between["paper_capital_pending"] == 25000.0
+        store.fail = None
+        resp = client.put("/api/system/config", json={"paper_capital": 25000})
+        assert resp.status_code == 200
+        assert resp.json()["paper_capital_pending"] is None
+        assert svc.paper_capital == Decimal("25000")
+        assert [e.kind for e in store.events] == ["paper_reset"]
+        assert store.events[0].details["new_capital"] == Decimal("25000")
 
 
 async def test_get_paper_capital_has_no_fallback(db: FakeSystemDb) -> None:
@@ -465,7 +490,16 @@ class FakeBinance:
         self.opts = opts
         self.closed = False
         self.balance_calls = 0
+        self.order_symbols: list[str] = []
         FakeBinance.instances.append(self)
+
+    async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if symbol is None:
+            raise ccxt.ExchangeError("binance fetchOpenOrders() WARNING: no symbol")
+        if FakeBinance.error is not None:
+            raise FakeBinance.error
+        self.order_symbols.append(symbol)
+        return [{"id": f"o-{symbol}", "symbol": symbol}]
 
     async def fetch_balance(self) -> dict[str, Any]:
         self.balance_calls += 1
@@ -502,6 +536,7 @@ class TestExchanges:
             assert entry["api_key_set"] is False
             assert entry["connected"] is False
             assert entry["last_sync"] is None
+            assert entry["environment"] == "testnet"
 
     def test_env_keys_are_not_a_badge(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -514,11 +549,24 @@ class TestExchanges:
     def test_validated_keys_are_connected_with_their_check_time(
         self, db: FakeSystemDb, client: TestClient
     ) -> None:
-        db.credentials["binance"] = {"validated_at": NOW}
+        db.credentials["binance"] = {"validated_at": NOW, "validated_environment": "testnet"}
         binance = client.get("/api/system/exchanges").json()[0]
         assert binance["credential_state"] == "ok"
         assert binance["connected"] is True
         assert binance["last_sync"] == "2026-10-20T12:00:00+00:00"
+        assert binance["validated_environment"] == "testnet"
+
+    def test_keys_checked_on_testnet_are_not_connected_on_mainnet(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db.credentials["binance"] = {"validated_at": NOW, "validated_environment": "testnet"}
+        cfg = system.current_config().model_copy(deep=True)
+        cfg.trading.testnet = False
+        monkeypatch.setattr(system, "current_config", lambda: cfg)
+        binance = client.get("/api/system/exchanges").json()[0]
+        assert binance["environment"] == "mainnet"
+        assert binance["validated_environment"] == "testnet"
+        assert binance["connected"] is False
 
     def test_never_validated_keys_are_not_connected(
         self, db: FakeSystemDb, client: TestClient
@@ -533,7 +581,7 @@ class TestExchanges:
     def test_undecryptable_keys_are_reported(
         self, db: FakeSystemDb, app: FastAPI, client: TestClient
     ) -> None:
-        db.credentials["bybit"] = {"validated_at": NOW}
+        db.credentials["bybit"] = {"validated_at": NOW, "validated_environment": "testnet"}
         app.state.exchange_credential_errors = {"bybit": "undecryptable"}
         bybit = client.get("/api/system/exchanges").json()[1]
         assert bybit["credential_state"] == "undecryptable"
@@ -559,8 +607,9 @@ class TestExchangeConnect:
             "id": "binance",
             "name": "Binance",
             "connected": True,
-            "message": "Binance keys verified and stored",
+            "message": "Binance testnet accepted these keys; they are stored",
             "validated_at": "2026-10-20T12:00:00+00:00",
+            "environment": "testnet",
         }
         [probe] = FakeBinance.instances
         assert probe.balance_calls == 1
@@ -572,6 +621,7 @@ class TestExchangeConnect:
         assert stored["encrypted_key"] != API_KEY
         assert decrypt(stored["encrypted_key"]) == API_KEY
         assert stored["validated_at"] == NOW
+        assert stored["validated_environment"] == "testnet"
         assert app.state.exchange_credentials["binance"]["api_key"] == API_KEY
 
     def test_mainnet_when_testnet_is_off(
@@ -580,7 +630,10 @@ class TestExchangeConnect:
         cfg = system.current_config().model_copy(deep=True)
         cfg.trading.testnet = False
         monkeypatch.setattr(system, "current_config", lambda: cfg)
-        assert _connect(client).status_code == 200
+        resp = _connect(client)
+        assert resp.status_code == 200
+        assert resp.json()["environment"] == "mainnet"
+        assert resp.json()["message"].startswith("Binance mainnet accepted")
         assert "sandbox" not in FakeBinance.instances[0].opts
 
     @pytest.mark.parametrize(
@@ -594,6 +647,7 @@ class TestExchangeConnect:
         assert resp.status_code == 422
         assert _detail(resp)["code"] == "credentials_rejected"
         assert _detail(resp)["state"] == "invalid"
+        assert _detail(resp)["message"].startswith("Binance testnet rejected these API keys")
         assert str(error) not in resp.text
         assert db.credentials == {}
         assert not any(sql.startswith("INSERT") for sql in db.statements)
@@ -714,3 +768,45 @@ class TestExchangeConnect:
         resp = client.get("/api/system/exchanges/binance/balance")
         assert resp.status_code == 404
         assert _detail(resp)["code"] == "credentials_not_found"
+
+
+def _session(status: str, symbols: list[str]) -> SimpleNamespace:
+    return SimpleNamespace(status=status, symbols=symbols)
+
+
+@pytest.mark.usefixtures("binance")
+class TestExchangeReads:
+    def test_orders_are_fetched_per_symbol(self, app: FastAPI, client: TestClient) -> None:
+        assert _connect(client).status_code == 200
+        app.state.session_manager = SimpleNamespace(
+            list_sessions=lambda: [
+                _session("running", ["BTCUSDT", "ETHUSDT"]),
+                _session("stopped", ["SOLUSDT"]),
+            ]
+        )
+        resp = client.get("/api/system/exchanges/binance/orders")
+        assert resp.status_code == 200
+        assert resp.json()["symbols"] == ["BTC/USDT", "ETHUSDT"]
+        assert [o["id"] for o in resp.json()["orders"]] == ["o-BTC/USDT", "o-ETHUSDT"]
+        assert FakeBinance.instances[-1].order_symbols == ["BTC/USDT", "ETHUSDT"]
+
+    def test_failed_read_is_502_and_closes_the_cached_client(
+        self, app: FastAPI, client: TestClient
+    ) -> None:
+        assert _connect(client).status_code == 200
+        assert client.get("/api/system/exchanges/binance/balance").status_code == 200
+        cached = FakeBinance.instances[-1]
+        FakeBinance.error = ccxt.NetworkError("dns")
+        resp = client.get("/api/system/exchanges/binance/orders")
+        assert resp.status_code == 502
+        assert _detail(resp)["message"] == "Request to Binance testnet failed"
+        assert cached.closed is True
+        assert "binance" not in app.state._exchange_clients
+
+    def test_positions_on_a_spot_account_are_501_without_a_call(self, client: TestClient) -> None:
+        assert _connect(client).status_code == 200
+        calls = len(FakeBinance.instances)
+        resp = client.get("/api/system/exchanges/binance/positions")
+        assert resp.status_code == 501
+        assert _detail(resp)["code"] == "spot_no_positions"
+        assert len(FakeBinance.instances) == calls

@@ -14,6 +14,11 @@ interface Exchange {
   name: string;
   connected: boolean;
   credentialState?: 'ok' | 'undecryptable' | 'missing';
+  environment: 'testnet' | 'mainnet';
+}
+
+interface ConnectResponse {
+  message: string;
 }
 
 interface ExchangeConnectDialogProps {
@@ -50,7 +55,7 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
     setSaving(true);
     setError(null);
     try {
-      await fetchApi(`/api/system/exchanges/${exchange.id}/connect`, {
+      const res = await fetchApi<ConnectResponse>(`/api/system/exchanges/${exchange.id}/connect`, {
         method: 'POST',
         body: JSON.stringify({
           api_key: apiKey.trim(),
@@ -59,7 +64,7 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
         }),
       });
       logger.info('Settings', `Exchange ${exchange.name} connected`);
-      toast('success', `${exchange.name} connected`);
+      toast('success', res.message);
       onUpdated();
       onClose();
     } catch (err) {
@@ -125,9 +130,12 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
         ) : (
           /* Connect mode */
           <div className="flex flex-col gap-4">
-            <p className="text-xs text-text-muted">
-              The keys are checked with a read-only balance call before anything is stored. Use
-              read-only keys.
+            <p className="text-xs text-text-muted" data-testid="connect-target">
+              The keys are checked against {exchange.name} {exchange.environment} with a read-only
+              balance call before anything is stored. Use read-only keys
+              {exchange.environment === 'testnet'
+                ? ' from testnet.binance.vision; mainnet keys are rejected there.'
+                : ' from your mainnet account.'}
             </p>
             {exchange.credentialState === 'undecryptable' && (
               <p className="text-xs text-status-warning">

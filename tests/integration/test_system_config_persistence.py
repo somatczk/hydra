@@ -159,13 +159,16 @@ async def test_connect_stores_validated_at(
         exchanges = (await client.get("/api/system/exchanges")).json()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT encrypted_key, validated_at FROM exchange_credentials WHERE exchange_id = $1",
+            "SELECT encrypted_key, validated_at, validated_environment FROM exchange_credentials "
+            "WHERE exchange_id = $1",
             "binance",
         )
     assert row is not None
     assert decrypt(row["encrypted_key"]) == "k-" + HOOK
     assert row["validated_at"] is not None
+    assert row["validated_environment"] == "testnet"
     assert exchanges[0]["connected"] is True
+    assert exchanges[0]["environment"] == "testnet"
     assert exchanges[0]["last_sync"] == row["validated_at"].isoformat()
 
 
@@ -174,18 +177,28 @@ async def test_portfolio_reads_on_the_real_schema(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.executemany(
             "INSERT INTO trading_sessions (id, strategy_id, trading_mode, status, timeframe, "
-            "paper_capital) VALUES ($1, $2, 'paper', $3, '1h', $4)",
-            [("big", "s1", "running", 9000), ("small", "s2", "stopped", 1000)],
+            "paper_capital, stopped_at) VALUES ($1, $2, 'paper', $3, '1h', $4, $5)",
+            [
+                ("big", "s1", "running", 9000, None),
+                ("small", "s2", "stopped", 1000, T0 + timedelta(minutes=90)),
+            ],
         )
         await conn.executemany(
             "INSERT INTO balance_snapshots (timestamp, total_value, source, session_id) "
             "VALUES ($1, $2, 'paper', $3)",
             [
                 (T0, 9100, "big"),
-                (T0 + timedelta(minutes=1), 1050, "small"),
-                (T0 + timedelta(minutes=2), 8600, "big"),
-                (T0 + timedelta(minutes=3), 123, None),
+                (T0 + timedelta(hours=1), 1050, "small"),
+                (T0 + timedelta(hours=2), 8600, "big"),
+                (T0 + timedelta(hours=2, minutes=30), 8650, "big"),
+                (T0 + timedelta(hours=2, minutes=40), 123, None),
             ],
+        )
+        await conn.execute(
+            "INSERT INTO risk_events (ts, scope, kind, actor, details) "
+            "VALUES ($1, 'paper', 'paper_reset', 'user:soma', $2::jsonb)",
+            T0 + timedelta(hours=3),
+            '{"old_capital": "10000", "new_capital": "20000", "old_carried": "50"}',
         )
         await conn.executemany(
             "INSERT INTO trades (symbol, side, quantity, price, fee, pnl, timestamp, strategy_id, "
@@ -218,13 +231,23 @@ async def test_portfolio_reads_on_the_real_schema(pool: asyncpg.Pool) -> None:
         positions = (await client.get("/api/portfolio/positions?source=paper")).json()
         trades = await client.get("/api/portfolio/trades?from_date=2026-01-01&to_date=2099-01-01")
         bad = await client.get("/api/portfolio/trades?from_date=notadate")
+        daily = (await client.get("/api/portfolio/daily-pnl?source=paper")).json()
+        attribution = (await client.get("/api/portfolio/attribution?source=paper")).json()
+        live = await client.get("/api/portfolio/live-metrics?source=paper")
 
-    assert [p["value"] for p in curve] == [10100.0, 10150.0, 9650.0]
-    assert summary["max_drawdown_pct"] == round(500 / 10150 * 100, 1)
+    # hourly last values; the reset at T0+3h moves capital to 20000 and drops the stopped sleeve
+    assert [p["value"] for p in curve] == [10100.0, 10150.0, 9700.0, 19650.0]
+    assert summary["max_drawdown_pct"] == round(450 / 10150 * 100, 1)
+    assert summary["total_value"] == 19650.0
     assert summary["daily_pnl"] == -70.0
     assert summary["realized_pnl"] == 450.0
     assert summary["unrealized_pnl"] == 5.0
-    assert summary["total_value"] == 10000.0 + 450.0 + 5.0 - 20.0
+    assert daily == [
+        {"date": (today - timedelta(days=2)).strftime("%Y-%m-%d"), "pnl": 500.0},
+        {"date": today.strftime("%Y-%m-%d"), "pnl": -70.0},
+    ]
+    assert [a["pnl"] for a in attribution] == [430.0]
+    assert live.status_code == 200, live.text
     assert positions[0]["current_price"] == 61000.0
     assert positions[0]["unrealized_pnl"] == 100.0
     assert trades.status_code == 200

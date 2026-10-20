@@ -1,11 +1,12 @@
-"""When stored exchange credentials last passed the read-only key check.
+"""When, and on which environment (testnet or mainnet), stored exchange keys last passed the check.
 
 Revision ID: 0004_credentials_validated_at
 Revises: 0003_risk_state
 Create Date: 2026-10-20
 
 Additive and idempotent. Rows stored before this revision were never checked, so they stay NULL
-("never validated") until the keys are connected again.
+("never validated") until the keys are connected again. Keys checked on one environment do not count
+as validated on the other.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ depends_on: str | Sequence[str] | None = None
 
 _STATEMENTS: tuple[str, ...] = (
     "ALTER TABLE exchange_credentials ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ",
+    "ALTER TABLE exchange_credentials ADD COLUMN IF NOT EXISTS validated_environment TEXT",
 )
 
 

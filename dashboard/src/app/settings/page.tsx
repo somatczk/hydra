@@ -19,6 +19,7 @@ import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDial
 /* ---------- Types ---------- */
 
 type CredentialState = 'ok' | 'undecryptable' | 'missing';
+type Environment = 'testnet' | 'mainnet';
 
 interface Exchange {
   id: string;
@@ -29,6 +30,8 @@ interface Exchange {
   apiKeySet: boolean;
   credentialState: CredentialState;
   validatedAt: string | null;
+  environment: Environment;
+  validatedEnvironment: Environment | null;
 }
 
 interface ApiExchange {
@@ -39,6 +42,8 @@ interface ApiExchange {
   api_key_set: boolean;
   credential_state: CredentialState;
   last_sync: string | null;
+  environment: Environment;
+  validated_environment: Environment | null;
 }
 
 interface PlatformConfig {
@@ -68,29 +73,34 @@ interface ExchangeBalance {
   total: number;
 }
 
+interface ApiOrder {
+  symbol: string;
+  side: string;
+  type: string | null;
+  amount: number | null;
+  price: number | null;
+  status: string | null;
+}
+
 interface ExchangeOrder {
   symbol: string;
   side: string;
   type: string;
-  quantity: number;
-  price: number;
+  quantity: number | null;
+  price: number | null;
   status: string;
-}
-
-interface ExchangePosition {
-  symbol: string;
-  direction: string;
-  quantity: number;
-  entry: number;
-  unrealized_pnl: number;
 }
 
 type ConnectionStatus = 'live' | 'error' | 'retrying';
 
+interface Panel<T> {
+  data: T | null;
+  error: string | null;
+}
+
 interface ExchangeDetail {
-  balances: ExchangeBalance[] | null;
-  orders: ExchangeOrder[] | null;
-  positions: ExchangePosition[] | null;
+  balances: Panel<ExchangeBalance[]>;
+  orders: Panel<ExchangeOrder[]>;
   status: ConnectionStatus;
   error: string | null;
 }
@@ -119,6 +129,8 @@ function mapApiExchanges(data: ApiExchange[]): Exchange[] {
     apiKeySet: e.api_key_set,
     credentialState: e.credential_state,
     validatedAt: e.last_sync,
+    environment: e.environment,
+    validatedEnvironment: e.validated_environment,
   }));
 }
 
@@ -126,7 +138,21 @@ function validationText(exchange: Exchange): string {
   if (!exchange.supported) return 'Not supported yet (Binance only)';
   if (exchange.credentialState === 'undecryptable') return 'Stored keys cannot be decrypted';
   if (!exchange.validatedAt) return exchange.apiKeySet ? 'Never validated' : 'Not connected';
-  return `Validated ${new Date(exchange.validatedAt).toLocaleString()}`;
+  if (exchange.validatedEnvironment !== exchange.environment) {
+    return `Checked on ${exchange.validatedEnvironment ?? 'an unknown environment'} only; connect again for ${exchange.environment}`;
+  }
+  return `Validated on ${exchange.environment} ${new Date(exchange.validatedAt).toLocaleString()}`;
+}
+
+function toOrder(o: ApiOrder): ExchangeOrder {
+  return {
+    symbol: o.symbol,
+    side: o.side,
+    type: o.type ?? '',
+    quantity: o.amount,
+    price: o.price,
+    status: o.status ?? '',
+  };
 }
 
 const CREDENTIAL_LABELS: Record<CredentialState, string> = {
@@ -242,49 +268,46 @@ export default function SettingsPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch exchange detail data with polling
-  const fetchExchangeDetail = useCallback(async (exchangeId: string) => {
-    try {
-      const [balancesRaw, ordersRaw, positionsRaw] = await Promise.all([
+  // Each panel loads on its own: one failing read never hides the other
+  const fetchExchangeDetail = useCallback((exchangeId: string) => {
+    async function load(): Promise<void> {
+      const [balancesRes, ordersRes] = await Promise.allSettled([
         fetchApi<{ exchange_id: string; balances: Record<string, number> }>(`/api/system/exchanges/${exchangeId}/balance`),
-        fetchApi<{ exchange_id: string; orders: ExchangeOrder[] }>(`/api/system/exchanges/${exchangeId}/orders`),
-        fetchApi<{ exchange_id: string; positions: ExchangePosition[] }>(`/api/system/exchanges/${exchangeId}/positions`),
+        fetchApi<{ exchange_id: string; orders: ApiOrder[] }>(`/api/system/exchanges/${exchangeId}/orders`),
       ]);
-      const balances: ExchangeBalance[] = Object.entries(balancesRaw.balances || {}).map(
-        ([currency, amount]) => ({ currency, available: amount, total: amount })
-      );
-      const orders = ordersRaw.orders || [];
-      const positions = positionsRaw.positions || [];
-      setExchangeDetails((prev) => ({
-        ...prev,
-        [exchangeId]: { balances, orders, positions, status: 'live', error: null },
-      }));
-      failCounts.current[exchangeId] = 0;
-      // Success: poll again in 30s
-      pollTimers.current[exchangeId] = setTimeout(() => fetchExchangeDetail(exchangeId), 30000);
-    } catch (err) {
-      const count = (failCounts.current[exchangeId] || 0) + 1;
-      failCounts.current[exchangeId] = count;
-      const backoffIdx = Math.min(count - 1, BACKOFF_STEPS.length - 1);
-      const backoff = BACKOFF_STEPS[backoffIdx];
+      const balances: Panel<ExchangeBalance[]> = balancesRes.status === 'fulfilled'
+        ? {
+            data: Object.entries(balancesRes.value.balances || {}).map(
+              ([currency, amount]) => ({ currency, available: amount, total: amount }),
+            ),
+            error: null,
+          }
+        : { data: null, error: describeApiError(balancesRes.reason, 'Balance unavailable') };
+      const orders: Panel<ExchangeOrder[]> = ordersRes.status === 'fulfilled'
+        ? { data: (ordersRes.value.orders || []).map(toOrder), error: null }
+        : { data: null, error: describeApiError(ordersRes.reason, 'Open orders unavailable') };
+      const failed = [balances.error, orders.error].filter((e): e is string => e !== null);
 
       setExchangeDetails((prev) => ({
         ...prev,
         [exchangeId]: {
-          ...(prev[exchangeId] || { balances: null, orders: null, positions: null }),
-          status: 'retrying',
-          error: describeApiError(err, 'Connection failed'),
+          balances,
+          orders,
+          status: failed.length === 0 ? 'live' : 'retrying',
+          error: failed[0] ?? null,
         },
       }));
-
-      pollTimers.current[exchangeId] = setTimeout(() => {
-        setExchangeDetails((prev) => ({
-          ...prev,
-          [exchangeId]: { ...(prev[exchangeId] || { balances: null, orders: null, positions: null }), status: 'retrying', error: prev[exchangeId]?.error || null },
-        }));
-        fetchExchangeDetail(exchangeId);
-      }, backoff);
+      if (failed.length === 0) {
+        failCounts.current[exchangeId] = 0;
+        pollTimers.current[exchangeId] = setTimeout(load, 30000);
+        return;
+      }
+      const count = (failCounts.current[exchangeId] || 0) + 1;
+      failCounts.current[exchangeId] = count;
+      const backoff = BACKOFF_STEPS[Math.min(count - 1, BACKOFF_STEPS.length - 1)];
+      pollTimers.current[exchangeId] = setTimeout(load, backoff);
     }
+    void load();
   }, []);
 
   const toggleExchangePanel = useCallback((exchangeId: string) => {
@@ -498,7 +521,9 @@ export default function SettingsPage() {
                       {/* Balances */}
                       <div>
                         <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Balances</h5>
-                        {detail?.balances && detail.balances.length > 0 ? (
+                        {detail?.balances.error ? (
+                          <p className="text-xs text-status-error" data-testid={`balances-error-${exchange.id}`}>{detail.balances.error}</p>
+                        ) : detail?.balances.data && detail.balances.data.length > 0 ? (
                           <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                               <thead>
@@ -509,7 +534,7 @@ export default function SettingsPage() {
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-border-default">
-                                {detail.balances.map((b) => (
+                                {detail.balances.data.map((b) => (
                                   <tr key={b.currency}>
                                     <td className="px-2 py-1.5 text-text-primary font-medium">{b.currency}</td>
                                     <td className="px-2 py-1.5 text-right text-text-primary">{b.available.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
@@ -527,7 +552,9 @@ export default function SettingsPage() {
                       {/* Open Orders */}
                       <div>
                         <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Open Orders</h5>
-                        {detail?.orders && detail.orders.length > 0 ? (
+                        {detail?.orders.error ? (
+                          <p className="text-xs text-status-error" data-testid={`orders-error-${exchange.id}`}>{detail.orders.error}</p>
+                        ) : detail?.orders.data && detail.orders.data.length > 0 ? (
                           <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                               <thead>
@@ -541,15 +568,15 @@ export default function SettingsPage() {
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-border-default">
-                                {detail.orders.map((o, i) => (
+                                {detail.orders.data.map((o, i) => (
                                   <tr key={i}>
                                     <td className="px-2 py-1.5 text-text-primary">{o.symbol}</td>
                                     <td className="px-2 py-1.5">
                                       <StatusBadge status={o.side} variant={o.side.toLowerCase() === 'buy' ? 'success' : 'error'} size="sm" />
                                     </td>
                                     <td className="px-2 py-1.5 text-text-primary">{o.type}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.quantity}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">${o.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.quantity ?? '-'}</td>
+                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.price === null ? 'Market' : `$${o.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}</td>
                                     <td className="px-2 py-1.5">
                                       <StatusBadge status={o.status} variant="neutral" size="sm" />
                                     </td>
@@ -563,41 +590,12 @@ export default function SettingsPage() {
                         )}
                       </div>
 
-                      {/* Positions */}
+                      {/* Positions: a spot account has none */}
                       <div>
                         <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Positions</h5>
-                        {detail?.positions && detail.positions.length > 0 ? (
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-xs">
-                              <thead>
-                                <tr className="border-b border-border-default">
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Symbol</th>
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Direction</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Qty</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Entry</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Unrealized PnL</th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-border-default">
-                                {detail.positions.map((p, i) => (
-                                  <tr key={i}>
-                                    <td className="px-2 py-1.5 text-text-primary">{p.symbol}</td>
-                                    <td className="px-2 py-1.5">
-                                      <StatusBadge status={p.direction} variant={p.direction.toLowerCase() === 'long' ? 'success' : 'error'} size="sm" />
-                                    </td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{p.quantity}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">${p.entry.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                    <td className={cn('px-2 py-1.5 text-right font-medium', p.unrealized_pnl >= 0 ? 'text-status-success' : 'text-status-error')}>
-                                      {p.unrealized_pnl >= 0 ? '+' : ''}${p.unrealized_pnl.toFixed(2)}
-                                    </td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        ) : (
-                          <p className="text-xs text-text-muted">No open positions</p>
-                        )}
+                        <p className="text-xs text-text-muted">
+                          Spot account: there are no positions; holdings are listed under Balances.
+                        </p>
                       </div>
                     </div>
                   )}

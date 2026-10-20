@@ -66,9 +66,15 @@ class FakeSystemDb:
         self._check(sql)
         if sql == "SELECT key, value FROM system_config":
             return [{"key": k, "value": row["value"]} for k, row in self.config.items()]
-        if sql == "SELECT exchange_id, validated_at FROM exchange_credentials":
+        if sql == (
+            "SELECT exchange_id, validated_at, validated_environment FROM exchange_credentials"
+        ):
             return [
-                {"exchange_id": eid, "validated_at": row["validated_at"]}
+                {
+                    "exchange_id": eid,
+                    "validated_at": row["validated_at"],
+                    "validated_environment": row.get("validated_environment"),
+                }
                 for eid, row in self.credentials.items()
             ]
         raise AssertionError(f"unexpected fetch: {sql}")
@@ -81,12 +87,13 @@ class FakeSystemDb:
         if sql == "SELECT 1":
             return 1
         if sql.startswith("INSERT INTO exchange_credentials"):
-            exchange_id, key, secret, passphrase = args
+            exchange_id, key, secret, passphrase, environment = args
             self.credentials[exchange_id] = {
                 "encrypted_key": key,
                 "encrypted_secret": secret,
                 "encrypted_passphrase": passphrase,
                 "validated_at": NOW,
+                "validated_environment": environment,
             }
             return NOW
         raise AssertionError(f"unexpected fetchval: {sql}")

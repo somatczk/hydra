@@ -47,6 +47,7 @@ interface PortfolioSummary {
   max_drawdown_pct: number;
   total_fees: number;
   change_pct: number;
+  paper_capital_pending?: number | null;
 }
 
 interface ApiRecentTrade {
@@ -271,6 +272,12 @@ export default function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      {summary?.paper_capital_pending != null && (
+        <p className="rounded-lg border border-status-warning/30 bg-status-warning/5 p-3 text-xs text-text-primary" data-testid="capital-pending">
+          Paper capital change to ${summary.paper_capital_pending.toLocaleString('en-US')} is pending: the
+          ledger rebases once every held position has a mark. Values below use the capital in force.
+        </p>
+      )}
       {/* Stat cards */}
       {fetchErrors.summary ? (
         <DataStateErrorCard error={fetchErrors.summary} fallback="Failed to load portfolio summary" onRetry={loadData} />

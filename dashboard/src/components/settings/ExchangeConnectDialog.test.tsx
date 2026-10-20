@@ -33,7 +33,7 @@ async function submit(connected = false): Promise<Mounted> {
       open
       onClose={vi.fn()}
       onUpdated={vi.fn()}
-      exchange={{ id: 'binance', name: 'Binance', connected }}
+      exchange={{ id: 'binance', name: 'Binance', connected, environment: 'testnet' }}
     />,
   );
   if (!connected) {
@@ -48,8 +48,8 @@ async function submit(connected = false): Promise<Mounted> {
 
 describe('ExchangeConnectDialog errors', () => {
   it.each([
-    [422, 'credentials_rejected', 'Binance rejected these API keys (key, secret or permissions); nothing was stored', 'invalid'],
-    [502, 'exchange_unreachable', 'Binance could not be reached to check the keys; nothing was stored', 'unavailable'],
+    [422, 'credentials_rejected', 'Binance testnet rejected these API keys (key, secret or permissions); nothing was stored', 'invalid'],
+    [502, 'exchange_unreachable', 'Binance testnet could not be reached to check the keys; nothing was stored', 'unavailable'],
     [503, 'database_unavailable', 'Database error while storing exchange credentials', 'unavailable'],
   ])('shows the %s %s message, never the raw JSON body', async (status, code, message, state) => {
     fetchApi.mockRejectedValue(envelope(status, code, message, state));
@@ -69,11 +69,25 @@ describe('ExchangeConnectDialog errors', () => {
   });
 
   it('posts the keys to the connect endpoint', async () => {
-    fetchApi.mockResolvedValue({ id: 'binance', connected: true });
+    fetchApi.mockResolvedValue({ id: 'binance', connected: true, message: 'stored' });
     page = await submit();
 
     const [path, init] = fetchApi.mock.calls[0] as [string, RequestInit];
     expect(path).toBe('/api/system/exchanges/binance/connect');
     expect(JSON.parse(String(init.body))).toEqual({ api_key: 'key', api_secret: 'secret' });
+  });
+
+  it('names the environment the keys are checked against', async () => {
+    page = await mount(
+      <ExchangeConnectDialog
+        open
+        onClose={vi.fn()}
+        onUpdated={vi.fn()}
+        exchange={{ id: 'binance', name: 'Binance', connected: false, environment: 'testnet' }}
+      />,
+    );
+    const target = page.container.querySelector('[data-testid="connect-target"]')?.textContent ?? '';
+    expect(target).toContain('Binance testnet');
+    expect(target).toContain('mainnet keys are rejected there');
   });
 });
