@@ -237,7 +237,7 @@ def log_auth_posture(cfg: HydraConfig | None) -> None:
             "set" if cfg.api_token is not None else "unset",
         )
     if cfg is not None and cfg.api.auth_mode == "proxy":
-        wide = count_wide_trusted_networks(cfg.api)
+        wide = count_wide_proxy_networks(cfg.api)
         if wide:
             logger.warning(
                 "%d api.trusted_proxy_cidrs entries span more than one host: every peer in them "
@@ -247,7 +247,7 @@ def log_auth_posture(cfg: HydraConfig | None) -> None:
             )
 
 
-def count_wide_trusted_networks(api: ApiConfig) -> int:
+def count_wide_proxy_networks(api: ApiConfig) -> int:
     """Number of trusted proxy entries wider than a single address."""
     return sum(1 for n in api.trusted_proxy_cidrs if n.prefixlen < n.max_prefixlen)
 
