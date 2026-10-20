@@ -1,9 +1,6 @@
-# Local full-stack approximation. It is not the deployment: romulus/stacks/hydra/compose.yml is.
-# Known gap until P1 config: the HYDRA_DB_* / HYDRA_REDIS_URL / HYDRA_LOG_* names below are not
-# what the engine reads (DATABASE_URL, REDIS_URL, LOG_LEVEL, LOG_FORMAT), so it starts without a
-# DB pool and DB-backed routes return 503. The dashboard image is built without NEXT_PUBLIC_API_URL
-# or API_URL, so the runtime value below changes nothing and its /api rewrite targets the
-# dashboard container's own localhost:8000, not the engine.
+# Local approximation only; romulus/stacks/hydra/compose.yml is the deployment. Until P1 config the engine
+# ignores the HYDRA_DB_*/HYDRA_REDIS_URL/HYDRA_LOG_* names below (it reads DATABASE_URL etc.), so it has no DB pool,
+# and the dashboard image's /api rewrite targets its own localhost:8000 whatever NEXT_PUBLIC_API_URL says.
 # Usage: docker compose -f deploy/compose.yml up --build
 
 services:

@@ -21,7 +21,7 @@ Each PR that changes one of these rows updates the row.
 | Exchanges | Binance, Bybit, Kraken, OKX, spot + futures | **Planned P1/P4.** `ExchangeClient` builds any ccxt class by name. Orders always use the futures class while prices come from the spot feed, and symbols carry no market type. P1 adds a Binance-only gate at session start (other exchanges rejected); other exchanges and perps come in P4. |
 | Strategies | Visual rule builder + Python strategies | **Partial.** Rules are saved as YAML and evaluated. Stop-loss and take-profit from the builder are dropped (P1 stops). The builder preview runs on the latest stored bars (`test_preview_uses_the_latest_stored_bars`). |
 | Strategies | Hot-reload | **Planned P2.** `StrategyEngine.reload_strategy` exists, but nothing in the app calls it; a session reads its YAML once. |
-| Strategies | Built-in strategy classes and shipped configs | **Partial.** Modules in `strategy/builtin/`: breakout, composite, dca, grid, mean_reversion, ml_ensemble, momentum, rule_based, trend_following. DCA and Grid never run in a live or paper session (their order management needs the P1 OMS wiring). No test-generated configs are committed (`test_no_committed_test_strategy_yaml`). |
+| Strategies | Built-in strategy classes and shipped configs | **Partial.** Modules in `strategy/builtin/`: breakout, composite, dca, grid, mean_reversion, ml_ensemble, momentum, rule_based, trend_following. DCA and Grid do not work in a session: a DCA deal stalls after its base order and a grid places a one-shot ladder (their order tracking needs the P1 OMS wiring). Shipped strategy configs all use the rule-based class; only templates use DCA and Grid. No test-generated configs are committed (`test_no_committed_test_strategy_yaml`). |
 | Backtest | Runs only on stored bars, records provenance, 422 when there is no data | **Working.** `tests/integration/test_backtest_real_data.py::test_backtest_runs_on_stored_bars_with_exact_provenance`, `::test_no_stored_bars_is_422_with_available_range`, `tests/unit/test_dashboard/test_backtest_routes.py`. |
 | Backtest | Results and trades persisted, identical after a restart | **Working.** `tests/integration/test_backtest_real_data.py::test_results_survive_a_restart`. Needs TimescaleDB (see [Testing](#testing)). |
 | Backtest | Walk-forward / CPCV, PBO, DSR | **Planned P2.** Walk-forward does not re-optimise per fold, CPCV is not reachable from the API, PBO is not CSCV, and DSR is the mean Sharpe. |
@@ -61,7 +61,7 @@ Each PR that changes one of these rows updates the row.
 
 ```mermaid
 graph LR
-    UI[Next.js dashboard] -->|HTTP /api, WS /ws| API
+    UI[Next.js dashboard]
 
     subgraph Engine["hydra-engine (one process)"]
         API[FastAPI routes] --> SM[SessionManager]
@@ -74,6 +74,7 @@ graph LR
         OM --> EC[ExchangeClient<br/>ccxt async, testnet default]
     end
 
+    UI -->|HTTP /api, WS /ws| API
     SM -->|ccxt.pro watch_ohlcv| Binance[(Exchange)]
     EC --> Binance
     API -->|asyncpg| DB[(TimescaleDB)]
