@@ -1,0 +1,31 @@
+name: Prometheus Rules
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  promtool:
+    name: promtool check + test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # same image romulus pins in stacks/monitoring/prometheus/Dockerfile
+      PROMETHEUS_IMAGE: prom/prometheus:v3.15.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check rules
+        run: docker run --rm -v "$PWD/deploy:/rules:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check rules /rules/prometheus-rules.yml
+      - name: Test rules
+        run: docker run --rm -v "$PWD/deploy:/rules:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" test rules /rules/prometheus-rules.test.yml

@@ -1,0 +1,184 @@
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  - name: drawdown 0.12 (fraction) fires
+    interval: 1m
+    input_series:
+      - series: hydra_drawdown_pct
+        values: "0.12x10"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HydraDrawdownExceedsThreshold
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Hydra drawdown exceeds 10%"
+              description: "Current drawdown is 12%. Circuit breakers should have been triggered."
+
+  - name: drawdown 0.08 does not fire
+    interval: 1m
+    input_series:
+      - series: hydra_drawdown_pct
+        values: "0.08x10"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HydraDrawdownExceedsThreshold
+        exp_alerts: []
+
+  - name: drawdown exactly at 0.10 does not fire
+    interval: 1m
+    input_series:
+      - series: hydra_drawdown_pct
+        values: "0.10x10"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HydraDrawdownExceedsThreshold
+        exp_alerts: []
+
+  - name: exchange API p99 in +Inf bucket caps at 10s and fires against 5s
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="1.0"}'
+        values: "0+50x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPILatencyHigh
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              endpoint: fetch_ticker
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Exchange API latency p99 exceeds 5 seconds"
+              description: "Exchange binance fetch_ticker p99 is 10.00s (successful calls only; timeouts and errors are not observed)."
+
+  - name: exchange API p99 interpolated inside (5s, 10s] fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
+        values: "0+90x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
+        values: "0+100x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPILatencyHigh
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              endpoint: fetch_ticker
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Exchange API latency p99 exceeds 5 seconds"
+              description: "Exchange binance fetch_ticker p99 is 7.50s (successful calls only; timeouts and errors are not observed)."
+
+  - name: exchange API all calls under 1s does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="1.0"}'
+        values: "0+100x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
+        values: "0+100x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
+        values: "0+100x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
+        values: "0+100x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPILatencyHigh
+        exp_alerts: []
+
+  - name: slow create_order fires despite high-volume fast fetch_ticker
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.05"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.1"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.25"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.5"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="1.0"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+        values: "0+200x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.05"}'
+        values: "0+0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.1"}'
+        values: "0+0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.25"}'
+        values: "0+0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.5"}'
+        values: "0+0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="1.0"}'
+        values: "0+0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="2.5"}'
+        values: "0+0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="5.0"}'
+        values: "0+0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="10.0"}'
+        values: "0+1x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="+Inf"}'
+        values: "0+1x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPILatencyHigh
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              endpoint: create_order
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Exchange API latency p99 exceeds 5 seconds"
+              description: "Exchange binance create_order p99 is 9.95s (successful calls only; timeouts and errors are not observed)."
+
+  - name: ML inference p99 above 100ms fires with the 100ms budget text
+    interval: 1m
+    input_series:
+      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.1"}'
+        values: "0+90x10"
+      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.25"}'
+        values: "0+100x10"
+      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.5"}'
+        values: "0+100x10"
+      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraMLInferenceLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              model_name: xgb
+              severity: warning
+              team: ml
+            exp_annotations:
+              summary: "ML inference latency p99 exceeds 100ms"
+              description: "Model xgb inference p99 is 0.235s, exceeding the 100ms budget."

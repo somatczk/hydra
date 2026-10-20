@@ -3,15 +3,14 @@ groups:
     interval: 30s
     rules:
       - alert: HydraDrawdownExceedsThreshold
-        expr: hydra_drawdown_pct > 10
+        expr: hydra_drawdown_pct > 0.10
         for: 1m
         labels:
           severity: critical
           team: trading
         annotations:
           summary: "Hydra drawdown exceeds 10%"
-          description: "Current drawdown is {{ $value | printf \"%.2f\" }}%. Circuit breakers should have been triggered."
-          runbook_url: "https://docs.hydra.internal/runbooks/drawdown"
+          description: "Current drawdown is {{ $value | humanizePercentage }}. Circuit breakers should have been triggered."
 
       - alert: HydraExchangeWSDisconnected
         expr: increase(hydra_ws_reconnects_total[5m]) > 3
@@ -62,7 +61,6 @@ groups:
         annotations:
           summary: "Hydra engine is down"
           description: "The Hydra trading engine has been unreachable for over 2 minutes. All trading activity is halted."
-          runbook_url: "https://docs.hydra.internal/runbooks/engine-down"
 
   - name: hydra-system
     interval: 30s
@@ -75,17 +73,17 @@ groups:
           team: infra
         annotations:
           summary: "Event bus latency p99 exceeds 500ms"
-          description: "Redis Streams event bus is slow — p99 latency is {{ $value | printf \"%.3f\" }}s. Check Redis health."
+          description: "In-process event dispatch p99 is {{ $value | printf \"%.3f\" }}s; a subscriber callback is slow."
 
       - alert: HydraExchangeAPILatencyHigh
-        expr: histogram_quantile(0.99, sum by (le, exchange_id) (rate(hydra_exchange_api_latency_seconds_bucket[5m]))) > 10
+        expr: histogram_quantile(0.99, sum by (le, exchange_id, endpoint) (rate(hydra_exchange_api_latency_seconds_bucket[5m]))) > 5
         for: 2m
         labels:
           severity: warning
           team: infra
         annotations:
-          summary: "Exchange API latency p99 exceeds 10 seconds"
-          description: "Exchange {{ $labels.exchange_id }} REST API p99 is {{ $value | printf \"%.2f\" }}s."
+          summary: "Exchange API latency p99 exceeds 5 seconds"
+          description: "Exchange {{ $labels.exchange_id }} {{ $labels.endpoint }} p99 is {{ $value | printf \"%.2f\" }}s (successful calls only; timeouts and errors are not observed)."
 
       - alert: HydraMLInferenceLatencyHigh
         expr: histogram_quantile(0.99, sum by (le, model_name) (rate(hydra_ml_inference_latency_seconds_bucket[5m]))) > 0.1
@@ -95,7 +93,7 @@ groups:
           team: ml
         annotations:
           summary: "ML inference latency p99 exceeds 100ms"
-          description: "Model {{ $labels.model_name }} inference p99 is {{ $value | printf \"%.3f\" }}s, exceeding the 5ms budget."
+          description: "Model {{ $labels.model_name }} inference p99 is {{ $value | printf \"%.3f\" }}s, exceeding the 100ms budget."
 
       - alert: HydraHighMemoryUsage
         expr: process_resident_memory_bytes{job="hydra"} > 2147483648

@@ -56,7 +56,7 @@ def _ensure_initialized() -> None:
 
     _metrics["drawdown_pct"] = Gauge(
         "hydra_drawdown_pct",
-        "Current drawdown as a percentage from peak equity",
+        "Current drawdown from peak equity as a fraction (0.05 = 5%)",
     )
 
     _metrics["daily_pnl"] = Gauge(
