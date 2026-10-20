@@ -2,6 +2,7 @@
 
 The route sits behind the API auth middleware, and the body must also carry the configured
 ``webhook_secret``: with no secret configured the webhook is disabled (503), a wrong one is 401.
+Entries need an explicit ``quantity``; exits default to closing the open position.
 """
 
 from __future__ import annotations
@@ -10,10 +11,10 @@ import hmac
 import logging
 import uuid
 from decimal import Decimal
-from typing import Any
+from typing import Any, Self
 
-from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, Field, model_validator
 
 from hydra.dashboard.routes._db import api_error, unauthenticated
 
@@ -34,7 +35,13 @@ class WebhookSignal(BaseModel):
     action: str = Field("entry", pattern="^(entry|exit)$")
     strategy_id: str = Field(..., min_length=1)
     secret: str = ""
-    quantity: Decimal | None = Field(None, gt=0)
+    quantity: Decimal | None = Field(None, gt=0, max_digits=18, decimal_places=8)
+
+    @model_validator(mode="after")
+    def _entry_needs_quantity(self) -> Self:
+        if self.action == "entry" and self.quantity is None:
+            raise ValueError("quantity is required for entry signals")
+        return self
 
 
 class WebhookResponse(BaseModel):
@@ -104,18 +111,15 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
             "not_found",
         )
 
-    # Execute signal on each matching session
     executed = 0
+    failed = 0
     for session in targets:
         executor = session._executor
         if executor is None:
             continue
 
         try:
-            side = "BUY" if body.side == "buy" else "SELL"
-
             if body.action == "exit":
-                # Exit: close the position for this symbol
                 positions = await executor.fetch_positions(body.symbol)
                 if not positions:
                     logger.info(
@@ -130,35 +134,14 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
                     if body.quantity is not None
                     else Decimal(str(pos.get("contracts", pos.get("quantity", 0))))
                 )
-                # Flip the side for closing
                 close_side = "SELL" if pos.get("side", "").lower() in ("long", "buy") else "BUY"
                 await executor.create_order(
-                    symbol=body.symbol,
-                    side=close_side,
-                    order_type="MARKET",
-                    quantity=qty,
+                    symbol=body.symbol, side=close_side, order_type="MARKET", quantity=qty
                 )
             else:
-                # Entry: auto-compute quantity from session balance if missing
-                if body.quantity is None:
-                    try:
-                        balance = await executor.get_balance()
-                        bal_usdt = balance.get("USDT", Decimal("0"))
-                        price = await executor.get_last_price(body.symbol)
-                        if bal_usdt > 0 and price > 0:
-                            body.quantity = (
-                                Decimal(str(bal_usdt)) * Decimal("0.01") / Decimal(str(price))
-                            )
-                    except Exception:
-                        logger.debug("Could not auto-compute quantity for %s", body.symbol)
-                if body.quantity is None:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="quantity is required for entry signals",
-                    )
                 await executor.create_order(
                     symbol=body.symbol,
-                    side=side,
+                    side="BUY" if body.side == "buy" else "SELL",
                     order_type="MARKET",
                     quantity=body.quantity,
                 )
@@ -172,9 +155,8 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
                 body.symbol,
                 session.session_id,
             )
-        except HTTPException:
-            raise
         except Exception:
+            failed += 1
             logger.exception(
                 "Failed to execute webhook signal %s on session %s",
                 signal_id,
@@ -182,9 +164,19 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
             )
 
     if executed == 0:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Signal received but could not be executed on any session",
+        if failed:
+            raise api_error(
+                502,
+                "execution_failed",
+                f"Signal {signal_id} failed on every session of '{body.strategy_id}'",
+                "unavailable",
+            )
+        if body.action == "exit":
+            raise api_error(
+                409, "no_position", f"No open {body.symbol} position to exit", "no_data"
+            )
+        raise api_error(
+            503, "executor_not_ready", "No session executor is ready for this signal", "unavailable"
         )
 
     return {

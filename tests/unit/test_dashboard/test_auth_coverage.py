@@ -6,13 +6,19 @@ wrappers, so iterating it would check almost nothing.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 from starlette.routing import WebSocketRoute
-from starlette.websockets import WebSocketDisconnect
+from starlette.testclient import WebSocketDenialResponse
+from websockets.asyncio.client import connect
+from websockets.exceptions import InvalidStatus
+from websockets.typing import Origin
 
 from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
@@ -85,13 +91,67 @@ def test_websocket_routes_are_the_known_five() -> None:
 
 
 @pytest.mark.parametrize("path", sorted(EXPECTED_WS))
-def test_every_websocket_closes_4401_without_credentials(path: str) -> None:
+def test_every_websocket_upgrade_is_denied_401_without_credentials(path: str) -> None:
     with (
-        pytest.raises(WebSocketDisconnect) as exc,
+        pytest.raises(WebSocketDenialResponse) as exc,
         TestClient(app).websocket_connect(path, headers={"Origin": "http://localhost:3000"}),
     ):
         pass
-    assert exc.value.code == 4401
+    assert exc.value.status_code == 401
+    assert exc.value.headers["www-authenticate"] == "Bearer"
+    assert exc.value.json()["detail"]["code"] == "unauthenticated"
+
+
+@pytest.fixture()
+async def live_server() -> AsyncIterator[str]:
+    """The real app under real uvicorn, with the image's proxy_headers=False."""
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=0, log_config=None, proxy_headers=False, lifespan="off"
+    )
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    try:
+        yield f"ws://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        await task
+
+
+@pytest.mark.parametrize(
+    ("env", "origin", "status", "code"),
+    [
+        pytest.param({}, "http://localhost:3000", 401, "unauthenticated", id="anonymous"),
+        pytest.param(
+            {"HYDRA_API__AUTH_MODE": "dev"},
+            "http://evil.example",
+            403,
+            "ws_origin_rejected",
+            id="foreign-origin",
+        ),
+        pytest.param(
+            {"HYDRA_API__AUTH_MODE": "dev"}, None, 403, "ws_origin_rejected", id="no-origin"
+        ),
+    ],
+)
+async def test_real_server_denies_the_upgrade_with_the_envelope(
+    bind_api_config: Bind,
+    live_server: str,
+    env: dict[str, str],
+    origin: str | None,
+    status: int,
+    code: str,
+) -> None:
+    if env:
+        bind_api_config(**env)
+    with pytest.raises(InvalidStatus) as exc:
+        async with connect(f"{live_server}/ws/market", origin=Origin(origin) if origin else None):
+            pass
+    response = exc.value.response
+    assert response.status_code == status
+    assert json.loads(response.body)["detail"]["code"] == code
 
 
 def test_validation_errors_use_the_envelope_through_the_full_stack() -> None:

@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.testclient import WebSocketDenialResponse
 
 from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
@@ -79,6 +79,10 @@ REFUSED_HEADERS = [
     pytest.param({**CSRF_OK, "Origin": EVIL}, id="foreign-origin"),
     pytest.param({**CSRF_OK, "Origin": "null"}, id="null-origin"),
     pytest.param({**CSRF_OK, "Sec-Fetch-Site": "same-site"}, id="same-site"),
+    pytest.param(
+        {**CSRF_OK, "Origin": DASHBOARD, "Sec-Fetch-Site": "same-site"},
+        id="same-site-allowed-origin",
+    ),
     pytest.param({**CSRF_OK, "Sec-Fetch-Site": "cross-site"}, id="cross-site"),
 ]
 
@@ -185,11 +189,13 @@ class TestWebSocketOrigin:
     def test_browser_upgrade_needs_an_allowed_origin(self, origin: str | None) -> None:
         headers = {**USER, "Origin": origin} if origin else USER
         with (
-            pytest.raises(WebSocketDisconnect) as exc,
+            pytest.raises(WebSocketDenialResponse) as exc,
             TestClient(app, client=TRAEFIK).websocket_connect("/ws/market", headers=headers),
         ):
             pass
-        assert exc.value.code == 4403
+        assert exc.value.status_code == 403
+        detail = exc.value.json()["detail"]
+        assert (detail["code"], detail["state"]) == ("ws_origin_rejected", "forbidden")
 
     def test_dashboard_origin_connects(self) -> None:
         headers = {**USER, "Origin": DASHBOARD}

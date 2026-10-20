@@ -10,7 +10,7 @@ services:
     container_name: hydra-engine
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: postgresql://hydra:${HYDRA_DB_PASSWORD:-hydra_dev}@timescaledb:5432/hydra
       REDIS_URL: redis://redis:6379

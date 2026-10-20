@@ -30,8 +30,9 @@ npm run start      # next start
   Traefik routes `/api` and `/ws` on the same host to the engine, which is why that works. The runtime
   `NEXT_PUBLIC_API_URL` set in romulus and in `deploy/compose.yml` does not change the bundle.
 - For local development, run the engine on `localhost:8000` and use `npm run dev`; the rewrite forwards `/api`.
-  WebSockets go to the page origin (`ws://localhost:3000`), so set `NEXT_PUBLIC_API_URL=http://localhost:8000` when
-  you need live WebSocket updates.
+  WebSockets go to the page origin (`ws://localhost:3000`), so set `NEXT_PUBLIC_WS_URL=http://localhost:8000` when
+  you need live WebSocket updates. Do not point `NEXT_PUBLIC_API_URL` at another port: the engine's CSRF check
+  refuses `Sec-Fetch-Site: same-site` mutations, so every POST from `:3000` to `:8000` gets 403 `csrf_rejected`.
 
 ## Errors and data state
 

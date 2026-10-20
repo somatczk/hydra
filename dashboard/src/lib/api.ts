@@ -11,7 +11,9 @@ const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000');
 
+/** NEXT_PUBLIC_WS_URL lets local dev reach the engine's WebSockets while REST stays same-origin. */
 const WS_BASE = (
+  process.env.NEXT_PUBLIC_WS_URL ||
   process.env.NEXT_PUBLIC_API_URL ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
 ).replace(/^http/, 'ws');

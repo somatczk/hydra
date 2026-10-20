@@ -81,3 +81,41 @@ describe('apiHeaders', () => {
     expect(apiHeaders('GET')).toEqual({});
   });
 });
+
+describe('connectWebSocket base URL', () => {
+  const opened: string[] = [];
+
+  class FakeWebSocket {
+    constructor(url: string) {
+      opened.push(url);
+    }
+  }
+
+  async function connectWith(env: Record<string, string>): Promise<string> {
+    opened.length = 0;
+    for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    vi.resetModules();
+    const { connectWebSocket } = await import('./api');
+    connectWebSocket('/ws/market', () => {});
+    return opened[0];
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('uses NEXT_PUBLIC_WS_URL so REST can stay on the same origin', async () => {
+    const url = await connectWith({ NEXT_PUBLIC_WS_URL: 'http://localhost:8000', NEXT_PUBLIC_API_URL: '' });
+    expect(url).toBe('ws://localhost:8000/ws/market');
+  });
+
+  it('falls back to NEXT_PUBLIC_API_URL, then the page origin', async () => {
+    expect(await connectWith({ NEXT_PUBLIC_WS_URL: '', NEXT_PUBLIC_API_URL: 'https://api.example' })).toBe(
+      'wss://api.example/ws/market',
+    );
+    expect(await connectWith({ NEXT_PUBLIC_WS_URL: '', NEXT_PUBLIC_API_URL: '' })).toBe(
+      `${window.location.origin.replace(/^http/, 'ws')}/ws/market`,
+    );
+  });
+});

@@ -219,6 +219,26 @@ class TestStartup:
         assert [r.levelno for r in caplog.records] == [logging.ERROR]
         assert "auth_not_configured" in caplog.records[0].getMessage()
 
+    @pytest.mark.parametrize(
+        ("cidrs", "warned"),
+        [
+            ("10.10.16.0/24", ["10.10.16.0/24"]),
+            ("10.10.16.2/32,fd00::/64", ["fd00::/64"]),
+            ("10.10.16.2/32,fd00::2/128", []),
+        ],
+    )
+    def test_trusting_more_than_one_host_is_warned(
+        self, bind_api_config: Bind, caplog: pytest.LogCaptureFixture, cidrs: str, warned: list[str]
+    ) -> None:
+        cfg = bind_api_config(HYDRA_API__AUTH_MODE="proxy", HYDRA_API__TRUSTED_PROXY_CIDRS=cidrs)
+        with caplog.at_level(logging.INFO, logger="hydra.dashboard.security"):
+            log_auth_posture(cfg)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == len(warned)
+        for network, message in zip(warned, warnings, strict=True):
+            assert network in message
+            assert "/32" in message
+
     def test_posture_is_logged_when_the_lifespan_finishes(
         self, bind_api_config: Bind, caplog: pytest.LogCaptureFixture
     ) -> None:

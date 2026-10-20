@@ -140,6 +140,9 @@ class TestValidation:
             pytest.param({"quantity": "0"}, id="zero-qty"),
             pytest.param({"quantity": "-1"}, id="negative-qty"),
             pytest.param({"side": "banana"}, id="bad-side"),
+            pytest.param({"quantity": MISSING}, id="entry-without-qty"),
+            pytest.param({"quantity": "1e400"}, id="huge-qty"),
+            pytest.param({"quantity": "0.0000000000000000000001"}, id="dust-qty"),
         ],
     )
     async def test_bad_payload_is_a_422_envelope_and_reaches_no_executor(
@@ -151,6 +154,41 @@ class TestValidation:
         assert resp.json()["detail"]["state"] == "invalid"
         assert await _untouched(sessions["momentum"])
         assert await _untouched(sessions["breakout"])
+
+
+class TestExecutionOutcome:
+    async def test_exit_closes_the_open_position(
+        self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        assert _post(secret=SECRET, quantity="0.01").status_code == 200
+        resp = _post(secret=SECRET, side="sell", action="exit")
+        assert resp.status_code == 200, resp.text
+        assert await sessions["momentum"].fetch_positions("BTCUSDT") == []
+
+    async def test_exit_without_a_position_is_409_no_position(
+        self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        resp = _post(secret=SECRET, side="sell", action="exit")
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert (detail["code"], detail["state"]) == ("no_position", "no_data")
+        assert await _untouched(sessions["momentum"])
+
+    async def test_executor_failure_is_502_not_a_validation_error(
+        self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def exchange_down(**_: Any) -> None:
+            raise RuntimeError("exchange down")
+
+        _secret(monkeypatch, SECRET)
+        monkeypatch.setattr(sessions["momentum"], "create_order", exchange_down)
+        resp = _post(secret=SECRET, quantity="0.01")
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert (detail["code"], detail["state"]) == ("execution_failed", "unavailable")
+        assert await _untouched(sessions["momentum"])
 
 
 def test_telegram_endpoint_is_gone() -> None:

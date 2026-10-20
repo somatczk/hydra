@@ -9,7 +9,8 @@ Every HTTP and WebSocket request needs a principal, except the paths in ``PUBLIC
 
 Browser principals (``user``, ``dev``) must also pass the CSRF checks on non-safe methods
 (``X-Hydra-Request: 1``, an allowed ``Origin`` if sent, ``Sec-Fetch-Site`` same-origin or none)
-and must send an allowed ``Origin`` on WebSocket upgrades. Settings come from
+and must send an allowed ``Origin`` on WebSocket upgrades. A refused upgrade gets an HTTP 401/403
+with the error envelope (WebSocket denial response). Settings come from
 ``app.state.config`` at request time; without a loaded config every protected request is refused.
 """
 
@@ -25,7 +26,7 @@ from fastapi import FastAPI, Request
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
-from starlette.websockets import WebSocketClose
+from starlette.websockets import WebSocket, WebSocketClose
 
 from hydra.core.config import ApiConfig, HydraConfig
 from hydra.core.logging import get_logger
@@ -41,6 +42,7 @@ ALLOWED_FETCH_SITES: frozenset[str] = frozenset({"same-origin", "none"})
 CORS_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 CORS_HEADERS = ("Content-Type", "X-Hydra-Request", "Authorization")
 
+WS_DENIAL_EXTENSION = "websocket.http.response"
 WS_CLOSE_UNAUTHENTICATED = 4401
 WS_CLOSE_FORBIDDEN = 4403
 
@@ -190,17 +192,19 @@ class SecurityMiddleware:
 
     @staticmethod
     async def _refuse(scope: Scope, receive: Receive, send: Send, denied: _DeniedError) -> None:
-        if scope["type"] == "websocket":
-            code = WS_CLOSE_UNAUTHENTICATED if denied.status == 401 else WS_CLOSE_FORBIDDEN
-            await WebSocketClose(code=code, reason=denied.code)(scope, receive, send)
-            return
         headers = {"WWW-Authenticate": "Bearer"} if denied.status == 401 else None
         response = JSONResponse(
             {"detail": error_detail(denied.code, denied.message, denied.state)},
             status_code=denied.status,
             headers=headers,
         )
-        await response(scope, receive, send)
+        if scope["type"] == "http":
+            await response(scope, receive, send)
+        elif WS_DENIAL_EXTENSION in scope.get("extensions", {}):
+            await WebSocket(scope, receive, send).send_denial_response(response)
+        else:
+            code = WS_CLOSE_UNAUTHENTICATED if denied.status == 401 else WS_CLOSE_FORBIDDEN
+            await WebSocketClose(code=code, reason=denied.code)(scope, receive, send)
 
     @staticmethod
     def _lifespan_send(scope: Scope, send: Send) -> Send:
@@ -232,6 +236,19 @@ def log_auth_posture(cfg: HydraConfig | None) -> None:
             len(cfg.api.trusted_proxy_cidrs),
             "set" if cfg.api_token is not None else "unset",
         )
+    if cfg is not None and cfg.api.auth_mode == "proxy":
+        for network in wide_trusted_networks(cfg):
+            logger.warning(
+                "api.trusted_proxy_cidrs entry %s spans more than one host: every peer in it "
+                "(including the Docker bridge gateway, i.e. host processes) can assert "
+                "Remote-User. Pin Traefik to a static address and trust only that /32 or /128",
+                network,
+            )
+
+
+def wide_trusted_networks(cfg: HydraConfig) -> list[str]:
+    """Trusted proxy entries wider than a single address."""
+    return [str(n) for n in cfg.api.trusted_proxy_cidrs if n.prefixlen < n.max_prefixlen]
 
 
 class ConfigCORSMiddleware:

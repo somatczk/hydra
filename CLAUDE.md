@@ -101,7 +101,8 @@ those packages, because `mypy src/` alone does not catch everything it catches.
 - API auth lives in one pure-ASGI middleware, `src/hydra/dashboard/security.py`: every route and WebSocket except
   `PUBLIC_PATHS` (`/health`, `/metrics`) needs a principal (Authelia `Remote-User` from a peer in
   `api.trusted_proxy_cidrs`, bearer `HYDRA_API_TOKEN`, or anyone in `api.auth_mode: dev`), and browser principals
-  must send `X-Hydra-Request: 1` on non-GET requests. Routes need no auth code; read the caller with
+  must send `X-Hydra-Request: 1` on non-GET requests. `api.trusted_proxy_cidrs` lists Traefik's static /32, never
+  the hydra-edge subnet (its bridge gateway is the host). Routes need no auth code; read the caller with
   `current_principal` and log security actions with `audit()`. A new public path needs a reviewed edit to
   `PUBLIC_PATHS` and `tests/unit/test_dashboard/test_auth_coverage.py`. Dashboard unit tests call the real app as
   the bearer-token service (`default_api_auth` in their conftest); auth tests override that fixture.
