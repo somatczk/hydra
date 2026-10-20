@@ -21,8 +21,8 @@ not duplicate it here; update that table in the PR that changes a row.
 - **Comments**: at most one short comment line where it is truly needed. Reasoning goes in the PR body.
 - **Tests** assert real behaviour and real numbers at the seam being fixed; do not mock the seam away.
 - **Integration tests** must `pytest.fail`, not skip, when their DB env (`HYDRA_DB_*`) is set but the server is
-  unreachable, and they build their own DSN. `tests/integration/test_event_bus_redis.py` predates this rule and
-  still skips.
+  unreachable, and they build their own DSN. Use the `tests/infra.py` fixtures (`fresh_database`, `database_dsn`,
+  `redis_url`); under `HYDRA_REQUIRE_INFRA=1` (CI) a skipped integration or e2e test fails.
 - **Releases** only at the end of a phase: the `pyproject.toml` version, `uv lock` and the romulus image tags move
   together. Never bump the version inside a feature PR.
 - **Worktrees**: work in `~/Documents/GitHub/.wt/<repo>-<ws-id>` on branch `ws/<ws-id>`, never in the main checkout.
@@ -31,8 +31,9 @@ not duplicate it here; update that table in the PR that changes a row.
 - **Secrets**: never print `.env` contents or keys. Never call exchange APIs with real keys.
 
 ## Tech stack
-- **Python**: images run 3.14; `requires-python = ">=3.12"` and ruff/mypy target 3.12; the ML image uses 3.12. The
-  pin is a P1 ops item.
+- **Python**: CI (`.python-version`) and images run 3.14; `requires-python = ">=3.12"` and ruff/mypy target 3.12; the
+  ML image uses 3.12. uv is pinned to 0.13.3 (`[tool.uv] required-version`, setup-uv, Dockerfiles);
+  `tests/unit/test_repo/test_toolchain_pins.py` keeps the pins in agreement.
 - **Backend**: FastAPI + uvicorn, raw asyncpg with inline DDL in `src/hydra/dashboard/api.py`, pydantic. SQLAlchemy
   and alembic are declared but not used at runtime.
 - **Exchange**: ccxt async (REST) and ccxt.pro (session market-data feed).
@@ -64,13 +65,13 @@ not duplicate it here; update that table in the PR that changes a row.
 
 ## Commands
 ```bash
-uv sync --locked --extra dev   # what CI installs
+uv sync --locked --extra dev   # what CI installs (uv 0.13.3; an older uv refuses to run)
 make lint                      # ruff check + format check (src/ tests/)
 make type-check                # mypy src/
 make security                  # bandit
 make test                      # unit tests, not slow, with coverage
 make e2e                       # e2e tests, no infrastructure
-make integration               # integration tests; DB tests need HYDRA_DB_*
+make integration               # integration tests; need HYDRA_DB_* and HYDRA_REDIS_URL
 make check                     # lint + type-check + security + imports + test
 make imports                   # import-linter layers contract (also in CI lint)
 make docker-build              # needs Docker
@@ -110,13 +111,14 @@ those packages, because `mypy src/` alone does not catch everything it catches.
 - `dashboard/package.json` has its own version, shown in the sidebar; it is not the release version.
 
 ## CI/CD
-- `ci.yml` on PRs and pushes to `main`: ruff, strict mypy over eight packages, bandit, unit tests with a clean-tree
-  check, dashboard (lint, typecheck, test, build), integration (TimescaleDB + Redis containers; the Redis tests skip
-  because they probe `localhost:6379`), e2e (no infrastructure used).
-- `rules.yml`: `promtool check rules` and `promtool test rules` for `deploy/prometheus-rules.yml`.
-- `build.yml` on pushes to `main` touching `src/`, `docker/`, `dashboard/`, `pyproject.toml` or `uv.lock`: builds
-  `hydra-engine`, `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag only if
-  it does not exist yet. Version tags never move. The build is not gated on CI (P1 ops).
+- `ci.yml` on PRs, pushes to `main` and manual dispatch, on Python 3.14 and uv 0.13.3: ruff and `lint-imports`, strict
+  mypy over eight packages, bandit, unit tests with a clean-tree check, dashboard (lint, typecheck, test, build),
+  promtool check + test for `deploy/prometheus-rules.yml`, integration and e2e on TimescaleDB + Redis service
+  containers with `HYDRA_REQUIRE_INFRA=1`, and `image-smoke`, which builds each image without pushing and starts it
+  (engine against the services with only `DATABASE_URL` and `REDIS_URL`).
+- `publish` (in `ci.yml`) needs every other job and runs only on pushes to `main`: it builds `hydra-engine`,
+  `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag only if it does not
+  exist yet. Version tags never move. `tests/unit/test_repo/test_ci_gating.py` enforces the gating.
 - `dependabot-auto-merge.yml`: Dependabot minor/patch PRs merge on green CI; majors, 0.x minors, pre-releases and base
   images wait for review.
 

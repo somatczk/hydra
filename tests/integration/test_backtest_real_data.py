@@ -1,21 +1,17 @@
 """Backtests, hyperopt, walk-forward and preview against a real TimescaleDB.
 
-Needs HYDRA_DB_HOST/PORT/NAME/USER/PASSWORD (as exported by CI). Each module run creates
-and drops its own database, so the target server's data is never touched.
+Needs HYDRA_DB_HOST/PORT/NAME/USER/PASSWORD (as exported by CI). The tests/infra.py fixtures
+create and drop their own databases, so the target server's data is never touched.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
-import uuid
 from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import asyncpg
 import httpx
@@ -86,58 +82,8 @@ _NEW_COLUMNS = {
 
 
 # ---------------------------------------------------------------------------
-# Database lifecycle
+# Database lifecycle (database_dsn and fresh_database come from tests/infra.py)
 # ---------------------------------------------------------------------------
-
-
-def _dsn(database: str) -> str:
-    user = quote(os.environ.get("HYDRA_DB_USER", "hydra"), safe="")
-    password = quote(os.environ.get("HYDRA_DB_PASSWORD", ""), safe="")
-    host = os.environ["HYDRA_DB_HOST"]
-    port = os.environ.get("HYDRA_DB_PORT", "5432")
-    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
-
-
-async def _admin(sql: str) -> None:
-    conn = await asyncpg.connect(_dsn(os.environ.get("HYDRA_DB_NAME", "postgres")), timeout=10)
-    try:
-        await conn.execute(sql)
-    finally:
-        await conn.close()
-
-
-async def _create_database() -> str:
-    """Create an empty database on the configured server; fail (not skip) if unreachable."""
-    if not os.environ.get("HYDRA_DB_HOST"):
-        pytest.skip("HYDRA_DB_HOST not set; integration database not configured")
-    name = f"hydra_bt_it_{uuid.uuid4().hex[:10]}"
-    try:
-        await _admin(f'CREATE DATABASE "{name}"')
-    except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
-        pytest.fail(f"HYDRA_DB_* is set but the database server is unreachable: {exc!r}")
-    return name
-
-
-async def _drop_database(name: str) -> None:
-    await _admin(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-
-
-@asynccontextmanager
-async def _fresh_database() -> AsyncIterator[str]:
-    name = await _create_database()
-    try:
-        yield _dsn(name)
-    finally:
-        await _drop_database(name)
-
-
-@pytest.fixture(scope="module")
-def database_dsn() -> Iterator[str]:
-    name = asyncio.run(_create_database())
-    try:
-        yield _dsn(name)
-    finally:
-        asyncio.run(_drop_database(name))
 
 
 async def _migrate(monkeypatch: pytest.MonkeyPatch, dsn: str) -> None:
@@ -616,40 +562,40 @@ _LEGACY_SCHEMA = [
 
 
 async def test_migration_adds_provenance_and_purges_legacy_rows(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, fresh_database: str
 ) -> None:
-    async with _fresh_database() as dsn:
-        conn = await asyncpg.connect(dsn)
-        try:
-            for ddl in _LEGACY_SCHEMA:
-                await conn.execute(ddl)
-            for rid, strategy in (("bt-1", "LSTM Momentum"), ("bt-task-0legacy", "Old run")):
-                await conn.execute(
-                    "INSERT INTO backtest_results (id, strategy, period) VALUES ($1, $2, 'x')",
-                    rid,
-                    strategy,
-                )
+    dsn = fresh_database
+    conn = await asyncpg.connect(dsn)
+    try:
+        for ddl in _LEGACY_SCHEMA:
+            await conn.execute(ddl)
+        for rid, strategy in (("bt-1", "LSTM Momentum"), ("bt-task-0legacy", "Old run")):
             await conn.execute(
-                "INSERT INTO backtest_result_trades "
-                "(backtest_id, entry_time, exit_time, side, entry_price, exit_price, pnl) "
-                "VALUES ('bt-task-0legacy', now(), now(), 'LONG', 42000, 42100, 1)"
+                "INSERT INTO backtest_results (id, strategy, period) VALUES ($1, $2, 'x')",
+                rid,
+                strategy,
             )
+        await conn.execute(
+            "INSERT INTO backtest_result_trades "
+            "(backtest_id, entry_time, exit_time, side, entry_price, exit_price, pnl) "
+            "VALUES ('bt-task-0legacy', now(), now(), 'LONG', 42000, 42100, 1)"
+        )
 
-            await _migrate(monkeypatch, dsn)
+        await _migrate(monkeypatch, dsn)
 
-            columns = await _columns(conn)
-            assert set(columns) >= _NEW_COLUMNS
-            assert columns["data_source"] == "NO"
-            assert await conn.fetchval("SELECT count(*) FROM backtest_results") == 0
-            assert await conn.fetchval("SELECT count(*) FROM backtest_result_trades") == 0
+        columns = await _columns(conn)
+        assert set(columns) >= _NEW_COLUMNS
+        assert columns["data_source"] == "NO"
+        assert await conn.fetchval("SELECT count(*) FROM backtest_results") == 0
+        assert await conn.fetchval("SELECT count(*) FROM backtest_result_trades") == 0
 
-            await conn.execute(
-                "INSERT INTO backtest_results (id, strategy, period, data_source) "
-                "VALUES ('bt-task-real', 'Saw', 'x', 'db')"
-            )
-            await _migrate(monkeypatch, dsn)
+        await conn.execute(
+            "INSERT INTO backtest_results (id, strategy, period, data_source) "
+            "VALUES ('bt-task-real', 'Saw', 'x', 'db')"
+        )
+        await _migrate(monkeypatch, dsn)
 
-            ids = [r["id"] for r in await conn.fetch("SELECT id FROM backtest_results")]
-            assert ids == ["bt-task-real"]
-        finally:
-            await conn.close()
+        ids = [r["id"] for r in await conn.fetch("SELECT id FROM backtest_results")]
+        assert ids == ["bt-task-real"]
+    finally:
+        await conn.close()

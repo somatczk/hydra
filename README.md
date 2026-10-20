@@ -48,14 +48,17 @@ Each PR that changes one of these rows updates the row.
 | Dashboard | Every page shows an error instead of defaults | **Known gap: unscheduled.** `/templates` swallows a failed fetch and shows "No templates available yet". `/` and `/portfolio` fall back to `trading_mode: 'paper'` when `/api/system/config` fails and show paper numbers with no error. `/portfolio` drops a failed strategy-list fetch silently. `/api/models` serves `version: v1.0.0` and `stage: Staging` for an `.onnx` without sidecar metadata. |
 | Dashboard | Real-time WebSocket updates | **Known gap: unscheduled.** The engine serves `/ws/market`, `/ws/trades`, `/ws/portfolio`, `/ws/signals` and `/ws/risk`; only per-session trade fills are ever broadcast. The session page re-fetches its detail on a fill (P0-C), which fixed the NaN P&L. |
 | Dashboard | TradingView charts | **Known gap: unscheduled.** A third-party TradingView embed on `/trading` only; every other chart is Recharts. |
-| Monitoring | Prometheus alert rules | **Working (rule logic) → P1 producers.** `promtool test rules deploy/prometheus-rules.test.yml` (workflow "Prometheus Rules") has a firing and a non-firing case for every alert, and `tests/unit/test_deploy/test_prometheus_rules.py` checks that every rule reads a series defined in the metric contract (`src/hydra/core/metrics.py`). Exchange API latency and errors are recorded for every call and outcome (`tests/unit/test_execution/test_exchange_client_metrics.py`). Feed staleness compares timestamp gauges against Prometheus `time()`, but nothing sets those gauges until the P1 feed work, so a sustained market-data WebSocket outage is not alerted until then. Drawdown (`hydra_drawdown_ratio`) only moves on fills inside a running session until P1 risk wiring. The reconciliation alert was removed: there is no reconciliation until P3. |
+| Monitoring | Prometheus alert rules | **Working (rule logic) → P1 producers.** `promtool test rules deploy/prometheus-rules.test.yml` (CI job "promtool check + test") has a firing and a non-firing case for every alert, and `tests/unit/test_deploy/test_prometheus_rules.py` checks that every rule reads a series defined in the metric contract (`src/hydra/core/metrics.py`). Exchange API latency and errors are recorded for every call and outcome (`tests/unit/test_execution/test_exchange_client_metrics.py`). Feed staleness compares timestamp gauges against Prometheus `time()`, but nothing sets those gauges until the P1 feed work, so a sustained market-data WebSocket outage is not alerted until then. Drawdown (`hydra_drawdown_ratio`) only moves on fills inside a running session until P1 risk wiring. The reconciliation alert was removed: there is no reconciliation until P3. |
 | Monitoring | Grafana dashboards (drawdown, P&L, heat, exchange errors) | **Partial → P1 ops.** Every panel in `deploy/grafana-dashboard.json` and `config/grafana/hydra-overview.json` reads only exported series with their real labels (`tests/unit/test_deploy/test_grafana_dashboards.py`). Rolling Sharpe, Model Accuracy and Drift PSI were removed because nothing produces them (Sharpe needs a daily-return series; ML is P5). Win Rate, Fill Rate and the overview's trade-count and trade-PnL panels were removed until P1 paper execution: the paper executor counts market fills twice and observes PnL 0 for opening fills. Portfolio Heat, drawdown and P&L stay empty or flat until P1 risk wiring sets them, and Position Exposure stays empty until P1 session wiring sets per-session positions. Left for P1 ops: `config/grafana/hydra-system.json` still queries `hydra_signal_count` with a `strategy` legend (always empty), `HydraHighMemoryUsage` is kept, the `$exchange_id` variable is sourced from `hydra_trades_total`, and "Strategy Latency" plots order fill latency. |
 | Monitoring | Telegram alerts | **Partial.** Paging goes through romulus Alertmanager to Telegram. The in-app bot was deleted in P0-D. |
 | Engineering | mypy strict | **Partial → P1 ops.** CI runs `mypy --strict` over eight packages, and `pyproject.toml` relaxes strict mode for most packages through overrides. |
 | Engineering | import-linter module boundaries | **Working.** `make imports` (`uv run lint-imports`) prints `Contracts: 1 kept, 0 broken.`; it runs in `make check` and in the CI "Lint & Format" job. Layers: dashboard > portfolio, backtest > execution > risk, ml > strategy > data > indicators > core, ops. |
-| Engineering | CI runs unit / integration / e2e | **Partial → P1 ops.** Unit, lint, type, security and dashboard jobs are real. Integration runs against TimescaleDB and Redis containers: the backtest DB tests run there, but the Redis tests always skip because they probe `localhost:6379`. E2E uses no infrastructure. The image build is not gated on CI. |
+| Engineering | CI runs unit / integration / e2e | **Working.** Integration and e2e run against TimescaleDB 2.30.2 and Redis 8 service containers with `HYDRA_REQUIRE_INFRA=1`, which turns any skipped integration or e2e test into a failure; there is no exit-code-5 escape (`tests/unit/test_repo/test_ci_gating.py::test_infra_tiers_run_on_service_containers_with_skips_as_failures`, `::test_require_infra_turns_tier_skips_into_failures`). |
+| Engineering | Images publish only after CI passes | **Working.** The publish jobs in `ci.yml` need every other job and run only on pushes to `main`; PRs build every image and start it in the "Image Smoke" job (`tests/unit/test_repo/test_ci_gating.py::test_publish_needs_every_other_job_and_runs_only_on_main_pushes`). |
+| Engineering | Python and uv pinned in one place | **Working.** CI runs Python 3.14 from `.python-version` and uv 0.13.3 (`[tool.uv] required-version`, setup-uv, the `ghcr.io/astral-sh/uv` image in each Dockerfile); every `uv sync` is `--locked` (`tests/unit/test_repo/test_toolchain_pins.py`). |
+| Engineering | JSON logs carry level, logger, timestamp and tracebacks | **Working.** Stdlib, structlog and uvicorn records render as one JSON line each, with the traceback text (`tests/unit/test_core/test_logging.py`). |
 | Engineering | Every module has tests | **Known gap: unscheduled.** No tests for `backtest/vectorbt_research.py`, `data/ingestion.py` or `ops/notifications.py`. `backtest/hyperopt.py` has no unit tests of its own; it is covered through the route tests and `tests/integration/test_backtest_real_data.py::test_hyperopt_grid_runs_on_stored_bars_reproducibly`. |
-| Engineering | Dockerfile references in Makefile, compose files and build workflow | **Working.** `tests/unit/test_repo/test_build_references.py`. |
+| Engineering | Dockerfile references in Makefile, compose files and CI publish job | **Working.** `tests/unit/test_repo/test_build_references.py`. |
 | Engineering | One version (pyproject) reported everywhere | **Partial.** The engine package, OpenAPI and `PlatformConfig` report the pyproject version (`tests/unit/test_repo/test_version_single_source.py`). The dashboard sidebar still shows `dashboard/package.json`'s version (1.2.0); fixing it needs a build arg in `docker/dashboard/Dockerfile` (Known gap: unscheduled). |
 
 ## Architecture (as is)
@@ -141,8 +144,9 @@ tests/            # unit/, integration/, e2e/, performance/
 
 ## Tech stack
 
-- Python: images run 3.14 (`python:3.14-slim`); `requires-python = ">=3.12"`, ruff and mypy target 3.12; the ML image
-  uses 3.12. CI does not pin an interpreter. A single pin is a P1 ops item.
+- Python: CI and images run 3.14 (`.python-version`, `python:3.14-slim`); `requires-python = ">=3.12"`, ruff and mypy
+  target 3.12; the ML image uses 3.12. uv is pinned to 0.13.3 (`[tool.uv] required-version`); an older uv refuses to
+  run, so it cannot rewrite `uv.lock`.
 - FastAPI + uvicorn, raw asyncpg (no ORM at runtime), pydantic / pydantic-settings, structlog.
 - ccxt async for REST and ccxt.pro for the session market-data feed.
 - TimescaleDB on PostgreSQL 16, Redis.
@@ -178,7 +182,7 @@ make type-check    # mypy src/ (pyproject config; CI also runs the --strict comm
 make security      # bandit
 make test          # unit tests, not slow, with coverage
 make unit          # all unit tests, verbose
-make integration   # integration tests; DB tests skip unless HYDRA_DB_HOST is set
+make integration   # integration tests; they skip unless HYDRA_DB_* / HYDRA_REDIS_URL are set
 make e2e           # e2e tests (no infrastructure needed)
 make perf          # benchmarks, writes benchmark.json
 make imports       # import-linter layers contract
@@ -201,25 +205,29 @@ Other compose files:
 | Suite | Needs | Command |
 |-------|-------|---------|
 | Unit | nothing | `uv run pytest tests/unit -m "not slow"` |
-| Integration | TimescaleDB (`HYDRA_DB_HOST`, `HYDRA_DB_PORT`, `HYDRA_DB_NAME`, `HYDRA_DB_USER`, `HYDRA_DB_PASSWORD`); Redis on `localhost:6379` | `uv run pytest tests/integration -m integration` |
-| E2E | nothing (in-memory) | `uv run pytest tests/e2e -m e2e` |
+| Integration | TimescaleDB (`HYDRA_DB_HOST`, `HYDRA_DB_PORT`, `HYDRA_DB_NAME`, `HYDRA_DB_USER`, `HYDRA_DB_PASSWORD`); Redis (`HYDRA_REDIS_URL`) | `uv run pytest tests/integration -m integration` |
+| E2E | nothing yet (in-memory); CI provides TimescaleDB and Redis for the P1 paper smoke test | `uv run pytest tests/e2e -m e2e` |
 | Performance | nothing | `uv run pytest tests/performance -m performance` |
 | Dashboard | Node 26 | `cd dashboard && npm ci && npm test` |
 
-The DB integration tests create and drop their own database. They skip when `HYDRA_DB_HOST` is unset and fail when it
-is set but the server is unreachable. For the current number of tests, run `uv run pytest --collect-only -q`.
+The shared fixtures live in `tests/infra.py` (`fresh_database`, `database_dsn`, `redis_url`). DB tests create and drop
+their own database. Tests skip when their env is unset and fail when it is set but the server is unreachable; with
+`HYDRA_REQUIRE_INFRA=1` (as in CI) a skipped integration or e2e test fails. For the current number of tests, run
+`uv run pytest --collect-only -q`.
 
-What CI runs (`.github/workflows/ci.yml`): lint, `mypy --strict` over core, data, indicators, strategy, backtest,
-execution, risk and portfolio, bandit, unit tests with a clean-tree check, the dashboard (lint, typecheck, test,
-build), integration and e2e. `rules.yml` runs promtool on the Prometheus rules. Performance tests are not run in CI.
+What CI runs (`.github/workflows/ci.yml`, Python 3.14, uv 0.13.3): lint and `lint-imports`, `mypy --strict` over core,
+data, indicators, strategy, backtest, execution, risk and portfolio, bandit, unit tests with a clean-tree check, the
+dashboard (lint, typecheck, test, build), promtool on the Prometheus rules, integration and e2e on TimescaleDB and
+Redis service containers, and an image smoke job that builds each image and starts it (the engine against the service
+containers with only `DATABASE_URL` and `REDIS_URL`). Performance tests are not run in CI.
 
 ## CI/CD and releases
 
-- Every PR to `main` runs CI and the promtool workflow.
-- A push to `main` that touches `src/`, `docker/`, `dashboard/`, `pyproject.toml` or `uv.lock` runs `build.yml`. It
-  builds `hydra-engine`, `hydra-dashboard` and `hydra-backtest` and pushes `main` and `sha-<7>` tags to GHCR. The
-  version tag from `pyproject.toml` is pushed only if it does not exist yet, so version tags never move: releasing
-  means bumping the version. The build does not wait for CI (P1 ops gates it).
+- Every PR to `main` runs CI, including the image smoke build (nothing is pushed).
+- A push to `main` runs the same jobs; only when all of them pass do the publish jobs build `hydra-engine`,
+  `hydra-dashboard` and `hydra-backtest` and push `main` and `sha-<7>` tags to GHCR. The version tag from
+  `pyproject.toml` is pushed only if it does not exist yet, so version tags never move: releasing means bumping the
+  version.
 - Releases happen at the end of a phase: `pyproject.toml` version, `uv lock`, and the romulus image tags move together.
 - Dependabot PRs in this repo auto-merge on green CI for minor/patch updates (`dependabot-auto-merge.yml`); majors,
   0.x minors, pre-releases and base images wait for review.
