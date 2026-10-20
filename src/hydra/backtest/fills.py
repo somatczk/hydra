@@ -18,6 +18,7 @@ from hydra.core.types import (
     OrderType,
     Side,
 )
+from hydra.execution.fill_rules import oco_stop_first
 
 # ---------------------------------------------------------------------------
 # Configuration dataclasses
@@ -327,15 +328,11 @@ class FillSimulator:
         commission: CommissionConfig,
         avg_volume: Decimal | None,
     ) -> OrderFill | None:
-        """OCO: check both stop-loss and take-profit, fill whichever triggers first.
+        """OCO: fill whichever leg the bar reaches first, chosen by ``fill_rules.oco_stop_first``.
 
-        Uses open->high->low->close price sequence heuristic:
-        - If close > open (bullish bar): assume open -> low -> high -> close
-          (dip first, then rally)
-        - If close <= open (bearish bar): assume open -> high -> low -> close
-          (rally first, then drop)
-
-        ``stop_price`` = stop-loss level, ``price`` = take-profit level.
+        That is the paper executor's rule: a bullish bar goes open -> low -> high -> close, any
+        other bar open -> high -> low -> close, and a level the open has gapped through is reached
+        first. ``stop_price`` = stop-loss level, ``price`` = take-profit level.
         """
         if order.stop_price is None or order.price is None:
             return None
@@ -343,48 +340,11 @@ class FillSimulator:
         stop_price = order.stop_price
         tp_price = order.price
 
-        # Determine which triggers: stop-loss or take-profit
-        stop_triggered = False
-        tp_triggered = False
-
-        if order.side == Side.SELL:
-            # Closing a long: stop below, TP above
-            stop_triggered = current_bar.low <= stop_price
-            tp_triggered = current_bar.high >= tp_price
-        else:
-            # Closing a short: stop above, TP below
-            stop_triggered = current_bar.high >= stop_price
-            tp_triggered = current_bar.low <= tp_price
-
-        if not stop_triggered and not tp_triggered:
+        stop_first = oco_stop_first(order.side.value, stop_price, tp_price, current_bar)
+        if stop_first is None:
             return None
-
-        # Both triggered — use bar direction to decide priority
-        if stop_triggered and tp_triggered:
-            if order.side == Side.SELL:
-                # Long position: stop is low, TP is high
-                if current_bar.close > current_bar.open:
-                    # Bullish: went low first (stop hit first)
-                    return self._make_oco_stop_fill(
-                        order, stop_price, current_bar, commission, avg_volume
-                    )
-                else:
-                    # Bearish/flat: went high first (TP hit first)
-                    return self._make_oco_tp_fill(order, tp_price, current_bar, commission)
-            else:
-                # Short position: stop is high, TP is low
-                if current_bar.close <= current_bar.open:
-                    # Bearish: went high first (stop hit first)
-                    return self._make_oco_stop_fill(
-                        order, stop_price, current_bar, commission, avg_volume
-                    )
-                else:
-                    # Bullish: went low first (TP hit first)
-                    return self._make_oco_tp_fill(order, tp_price, current_bar, commission)
-
-        if stop_triggered:
+        if stop_first:
             return self._make_oco_stop_fill(order, stop_price, current_bar, commission, avg_volume)
-        # tp_triggered
         return self._make_oco_tp_fill(order, tp_price, current_bar, commission)
 
     def _make_oco_stop_fill(

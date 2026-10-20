@@ -326,8 +326,7 @@ class TestSignalToOrderPipeline:
                     )
                     await position_tracker.update_on_fill(fill_event, strategy_id="close_test")
 
-                elif isinstance(sig, ExitSignal):
-                    # Close position via paper executor
+                elif isinstance(sig, ExitSignal) and await paper_executor.get_positions(symbol):
                     fill = await paper_executor.create_order(
                         symbol=symbol,
                         side="SELL",
@@ -346,7 +345,8 @@ class TestSignalToOrderPipeline:
                     )
                     await position_tracker.update_on_fill(fill_event, strategy_id="close_test")
 
-        # Verify the position is closed (flat or zero quantity)
+        assert await paper_executor.get_positions(symbol) == []
+        assert (await paper_executor.get_balance()).keys() == {"USDT"}
         pos = await position_tracker.get_position(symbol)
         if pos is not None:
             assert pos.quantity == Decimal("0") or pos.direction == Direction.FLAT
