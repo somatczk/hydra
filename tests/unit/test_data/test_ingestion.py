@@ -799,6 +799,40 @@ async def test_rest_outage_keeps_ws_bars_flowing_and_fills_the_gap_later() -> No
     await h.stop()
 
 
+async def test_rate_limited_rest_never_stalls_the_watch_loop() -> None:
+    clock = Clock(DAY + H + M)
+    rest = FakeRestExchange([_row(DAY + i * H, 300.0 + i) for i in range(10)])
+    gate = asyncio.Event()
+    h = Harness(clock, rest=rest, sleep=_gated_sleep(gate))
+    await h.start()
+    h.kline(DAY, 100.0)
+    h.kline(DAY + H, 101.0)
+    await until(lambda: len(h.recorder.bars) == 1)
+
+    rest.errors = [ccxt.DDoSProtection("418 I'm a teapot")] * 3
+    clock.set(DAY + 3 * H + M)
+    h.ws[0].feed(ConnectionError("blip"))
+    await until(lambda: h.feed.stale_reasons("binance") == {"BTCUSDT/1h": ["gap_unfilled"]})
+    for i in (3, 4):
+        clock.set(DAY + i * H + M)
+        h.kline(DAY + i * H, 100.0 + i)
+    await until(lambda: len(h.recorder.bars) == 2)
+    assert (h.recorder.bars[1].ohlcv.timestamp, h.recorder.bars[1].replay) == (DAY + 3 * H, False)
+    assert len(rest.calls) == 1
+    assert (len(h.ws), h.ws[0].close_calls) == (1, 0)
+    assert (
+        REGISTRY.get_sample_value("hydra_ws_reconnects_total", {"exchange_id": "binance"}) is None
+    )
+
+    rest.errors.clear()
+    gate.set()
+    await until(lambda: len(h.recorder.bars) == 4)
+    late = [(b.ohlcv.timestamp, b.replay) for b in h.recorder.bars[2:] if b.ohlcv]
+    assert late == [(DAY + H, True), (DAY + 2 * H, True)]
+    await until(lambda: h.feed.is_live("binance"))
+    await h.stop()
+
+
 async def test_hole_fill_failure_is_retried_not_skipped() -> None:
     clock = Clock(DAY + 4 * H + M)
     repo = MemoryRepo()
