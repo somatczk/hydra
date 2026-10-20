@@ -441,6 +441,8 @@ async def test_risk_rejection_then_the_kill_switch_flattens_and_latches(
         assert await trades(eng, sid) == []
         rejected = {"check": "portfolio_heat", "intent": "open"}
         assert await eng.metric("hydra_risk_rejections_total", **rejected) == 1
+        # live bars are a minute apart; OrderManager refuses an identical entry within 1 s
+        await asyncio.sleep(1.1)
 
         put = await eng.client.put("/api/risk/config", json={"max_portfolio_heat": 0.30})
         assert put.status_code == 200, put.json()
@@ -448,6 +450,7 @@ async def test_risk_rejection_then_the_kill_switch_flattens_and_latches(
         entry = entry_fill(market.live[accepted].close)
         assert await trades(eng, sid) == [as_row(entry)]
         assert await eng.metric("hydra_risk_rejections_total", **rejected) == 1
+        assert await eng.metric("hydra_risk_rejections_total", check="duplicate") is None
 
         kill = await eng.client.post("/api/trading/kill-switch")
         assert kill.status_code == 200, kill.json()
