@@ -40,7 +40,7 @@
         "name": "exchange_id",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "query": "label_values(hydra_trades_total, exchange_id)",
+        "query": "label_values(hydra_feed_bars_total, exchange_id)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -230,8 +230,8 @@
     {
       "id": 8,
       "type": "heatmap",
-      "title": "Strategy Latency",
-      "description": "Distribution of signal-to-order latency per strategy",
+      "title": "Order Fill Latency",
+      "description": "Distribution of OrderManager submit-to-fill latency (all sessions)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
@@ -595,6 +595,321 @@
         "color": { "scheme": "Purples", "fill": "dark-purple", "exponent": 0.5 },
         "cellGap": 1,
         "tooltip": { "show": true }
+      }
+    },
+    {
+      "id": 600,
+      "type": "row",
+      "title": "Trades",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "Win Rate",
+      "description": "Share of closing paper fills in the selected range with net PnL above 0 USDT (fees included); break-even counts as a loss. Opening fills are not counted.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - sum(increase(hydra_trade_pnl_bucket{le=\"0.0\"}[$__range])) / sum(increase(hydra_trade_pnl_count[$__range]))",
+          "legendFormat": "Win rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.4 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 20,
+      "type": "heatmap",
+      "title": "Net PnL per Closing Fill",
+      "description": "Distribution of net PnL (USDT, fees included) of closing paper fills",
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (increase(hydra_trade_pnl_bucket[$__rate_interval]))",
+          "legendFormat": "{{ le }}",
+          "format": "heatmap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "scheme", "schemeId": "RdYlGn" },
+          "custom": { "hideFrom": { "legend": false, "tooltip": false, "viz": false } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": { "unit": "currencyUSD" },
+        "color": { "scheme": "RdYlGn", "fill": "dark-green", "exponent": 0.5 },
+        "cellGap": 1,
+        "tooltip": { "show": true }
+      }
+    },
+    {
+      "id": 700,
+      "type": "row",
+      "title": "Sessions & Readiness",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "state-timeline",
+      "title": "Readiness by Check",
+      "description": "hydra_ready per check, set by the engine health monitor (GET /readyz names the cause)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 63 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "hydra_ready", "legendFormat": "{{ check }}" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "Not ready", "color": "red" },
+                "1": { "text": "Ready", "color": "green" }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": { "showValue": "never", "rowHeight": 0.8 }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Sessions: Desired vs Supervised",
+      "description": "Running in the database vs a live task in the engine; a zombie is desired without supervision",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 63 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(hydra_session_desired)", "legendFormat": "Desired (DB running)" },
+        { "refId": "B", "expr": "sum(hydra_session_supervised)", "legendFormat": "Supervised (task alive)" },
+        {
+          "refId": "C",
+          "expr": "count(hydra_session_desired == 1 unless on (session_id) hydra_session_supervised == 1) or vector(0)",
+          "legendFormat": "Zombies"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0, "min": 0 },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Feed Message Age",
+      "description": "Seconds since the last market-data message per stream (HydraFeedStale above 120s)",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 71 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - hydra_feed_last_message_timestamp_seconds{exchange_id=~\"$exchange_id\"}",
+          "legendFormat": "{{ exchange_id }} {{ symbol }} {{ timeframe }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 120 }]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Closed Bar Age vs Limit",
+      "description": "Seconds since the open of the last closed bar, and the HydraClosedBarOverdue limit (2 bars + 60s)",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 71 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - hydra_feed_last_closed_bar_timestamp_seconds{exchange_id=~\"$exchange_id\"}",
+          "legendFormat": "{{ symbol }} {{ timeframe }} age"
+        },
+        {
+          "refId": "B",
+          "expr": "2 * hydra_feed_bar_interval_seconds{exchange_id=~\"$exchange_id\"} + 60",
+          "legendFormat": "{{ symbol }} {{ timeframe }} limit"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Risk Rejections",
+      "description": "Orders refused by the RiskService, by check and intent",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 71 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (check, intent) (increase(hydra_risk_rejections_total[$__rate_interval]))",
+          "legendFormat": "{{ check }} ({{ intent }})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 60 } },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Kill Switch",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 79 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "hydra_kill_switch_active", "legendFormat": "Kill switch" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "Released", "color": "green" },
+                "1": { "text": "LATCHED", "color": "red" }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 27,
+      "type": "stat",
+      "title": "Engine Version",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 79 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "hydra_build_info", "legendFormat": "{{ version }}" }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name"
+      }
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "Health Monitor Last Run",
+      "description": "HydraHealthMonitorStalled fires above 60s",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 79 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - hydra_health_monitor_last_run_timestamp_seconds",
+          "legendFormat": "Seconds ago"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 60 }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "Sessions Errored (24h)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 79 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(hydra_sessions_errored_total[24h])) or vector(0)",
+          "legendFormat": "Errored"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
       }
     }
   ],

@@ -1,7 +1,7 @@
 """Tests for the main dashboard FastAPI application module.
 
 Tests cover:
-- Health endpoint reflects pool status
+- /health is the /livez alias (behaviour: test_health_routes.py)
 - strategy_builder router is included (not legacy builder)
 - Lifespan without DATABASE_URL runs with no pool (startup failures: test_lifespan.py)
 - All expected route prefixes are registered
@@ -9,7 +9,7 @@ Tests cover:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -35,53 +35,11 @@ def client() -> TestClient:
 
 
 class TestHealthEndpoint:
-    def test_health_returns_200(self, client: TestClient) -> None:
+    def test_health_is_the_livez_alias_and_503_without_a_lifespan(self, client: TestClient) -> None:
         resp = client.get("/health")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "status" in data
-        assert "db" in data
-
-    def test_health_degraded_without_pool(self, client: TestClient) -> None:
-        """Without a DB pool the health endpoint should report degraded."""
-        # Ensure no pool is set
-        original = getattr(app.state, "db_pool", None)
-        app.state.db_pool = None
-        try:
-            resp = client.get("/health")
-            data = resp.json()
-            assert data["status"] == "degraded"
-            assert data["db"] == "disconnected"
-        finally:
-            app.state.db_pool = original
-
-    def test_health_ok_with_open_pool(self, client: TestClient) -> None:
-        """With an open pool, the health endpoint should report ok."""
-        mock_pool = MagicMock()
-        mock_pool._closed = False
-        original = getattr(app.state, "db_pool", None)
-        app.state.db_pool = mock_pool
-        try:
-            resp = client.get("/health")
-            data = resp.json()
-            assert data["status"] == "ok"
-            assert data["db"] == "connected"
-        finally:
-            app.state.db_pool = original
-
-    def test_health_degraded_with_closed_pool(self, client: TestClient) -> None:
-        """With a closed pool, the health endpoint should report degraded."""
-        mock_pool = MagicMock()
-        mock_pool._closed = True
-        original = getattr(app.state, "db_pool", None)
-        app.state.db_pool = mock_pool
-        try:
-            resp = client.get("/health")
-            data = resp.json()
-            assert data["status"] == "degraded"
-            assert data["db"] == "disconnected"
-        finally:
-            app.state.db_pool = original
+        assert resp.status_code == 503
+        assert resp.json() == client.get("/livez").json()
+        assert resp.json()["status"] == "down"
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +85,7 @@ class TestRouterRegistration:
 
     def test_health_route_present(self) -> None:
         paths = self._route_paths()
-        assert "/health" in paths
+        assert {"/health", "/livez", "/readyz"} <= paths
 
     def test_metrics_route_present(self) -> None:
         paths = self._route_paths()

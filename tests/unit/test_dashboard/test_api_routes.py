@@ -22,14 +22,10 @@ def client() -> TestClient:
 
 
 class TestHealth:
-    def test_health_returns_200(self, client: TestClient) -> None:
+    def test_health_reports_liveness_with_the_version(self, client: TestClient) -> None:
         resp = client.get("/health")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "status" in data
-        # Without a DB pool the health endpoint reports degraded status
-        assert data["status"] in ("ok", "degraded")
-        assert "db" in data
+        assert resp.status_code == 503
+        assert set(resp.json()) == {"status", "version"}
 
 
 # ---------------------------------------------------------------------------

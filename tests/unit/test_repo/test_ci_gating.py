@@ -17,7 +17,7 @@ _PUBLISH_IF = (
 )
 _BUILD_IF = "steps.changes.outputs.build == 'true'"
 _ALL_JSON = """jq -s -e 'all(has("level") and has("timestamp"))'"""
-_INFRA_JOBS = ["integration-tests", "e2e-tests"]
+_INFRA_JOBS = ["integration-tests", "e2e-tests", "paper-smoke"]
 
 
 def _ci() -> dict[str, Any]:
@@ -35,7 +35,7 @@ def _runs(job: dict[str, Any]) -> list[str]:
 
 
 def _pytest_step(job: dict[str, Any]) -> dict[str, Any]:
-    [step] = [s for s in job["steps"] if "pytest" in str(s.get("run", ""))]
+    [step] = [s for s in job["steps"] if re.search(r"pytest|make smoke", str(s.get("run", "")))]
     return step
 
 
@@ -73,7 +73,8 @@ def test_image_smoke_builds_every_published_image_on_prs_and_pushes() -> None:
     )
     start = "\n".join(_runs(smoke))
     assert "DATABASE_URL=" in start and "REDIS_URL=" in start
-    assert '.db == "connected"' in start
+    assert "http://localhost:8000/livez" in start
+    assert ".checks.db.ok == true" in start
     for image in ("hydra-engine", "hydra-backtest"):
         [branch] = re.findall(rf"^ *{image}\)\n(.*?);;", start, re.M | re.S)
         assert f"docker logs smoke 2>&1 | {_ALL_JSON} >/dev/null" in branch, image
@@ -135,6 +136,16 @@ def test_infra_tiers_run_on_service_containers_with_skips_as_failures(job_name: 
     assert env["HYDRA_DB_PORT"] == "${{ job.services.timescaledb.ports['5432'] }}"
     assert env["HYDRA_REDIS_URL"] == "redis://localhost:${{ job.services.redis.ports['6379'] }}/0"
     assert not any("docker run" in run for run in _runs(job))
+
+
+def test_paper_smoke_is_its_own_required_job() -> None:
+    job = _jobs()["paper-smoke"]
+    assert job["name"] == "Paper Smoke"
+    assert _pytest_step(job)["run"] == "make smoke"
+    makefile = (_ROOT / "Makefile").read_text()
+    [recipe] = re.findall(r"^smoke:\n\t(.+)$", makefile, re.M)
+    assert recipe == "uv run pytest tests/e2e/test_paper_smoke.py -v -m e2e"
+    assert (_ROOT / "tests" / "e2e" / "test_paper_smoke.py").is_file()
 
 
 def test_import_contract_runs_in_ci_and_make_check() -> None:

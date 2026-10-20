@@ -582,30 +582,214 @@ tests:
         alertname: HydraMLInferenceLatencyHigh
         exp_alerts: []
 
-  - name: RSS above 2 GiB for 5m fires
+  - name: readiness check failing for 3m fires
     interval: 1m
     input_series:
-      - series: 'process_resident_memory_bytes{job="hydra",instance="hydra-engine:8000"}'
-        values: "3221225472x10"
+      - series: 'hydra_ready{check="feeds"}'
+        values: "0x10"
+      - series: 'hydra_ready{check="db"}'
+        values: "1x10"
     alert_rule_test:
-      - eval_time: 6m
-        alertname: HydraHighMemoryUsage
+      - eval_time: 4m
+        alertname: HydraNotReady
         exp_alerts:
           - exp_labels:
-              job: hydra
-              instance: "hydra-engine:8000"
-              severity: warning
-              team: infra
+              check: feeds
+              severity: critical
+              team: trading
             exp_annotations:
-              summary: "Hydra process using over 2 GiB of memory"
-              description: "RSS is 3GiB. Investigate for memory leaks."
+              summary: "Hydra readiness check failing"
+              description: "Readiness check feeds has failed for 3 minutes; GET /readyz names the cause."
 
-  - name: RSS 1 GiB does not fire
+  - name: readiness check failing for 2m does not fire yet
     interval: 1m
     input_series:
-      - series: 'process_resident_memory_bytes{job="hydra",instance="hydra-engine:8000"}'
-        values: "1073741824x10"
+      - series: 'hydra_ready{check="feeds"}'
+        values: "1 1 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HydraNotReady
+        exp_alerts: []
+
+  - name: zombie session (desired, not supervised) for 2m fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_session_desired{session_id="s1",strategy_id="sma",mode="paper"}'
+        values: "1x10"
+      - series: 'hydra_session_supervised{session_id="s1",strategy_id="sma",mode="paper"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraSessionNotSupervised
+        exp_alerts:
+          - exp_labels:
+              session_id: s1
+              strategy_id: sma
+              mode: paper
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Trading session running in the database but not in the engine"
+              description: "Session s1 is marked running but has no live task (zombie); it is not trading and will be resumed on restart."
+
+  - name: zombie row with no supervised series and empty labels fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_session_desired{session_id="s2"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraSessionNotSupervised
+        exp_alerts:
+          - exp_labels:
+              session_id: s2
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Trading session running in the database but not in the engine"
+              description: "Session s2 is marked running but has no live task (zombie); it is not trading and will be resumed on restart."
+
+  - name: supervised session does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_session_desired{session_id="s1",strategy_id="sma",mode="paper"}'
+        values: "1x10"
+      - series: 'hydra_session_supervised{session_id="s1",strategy_id="sma",mode="paper"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraSessionNotSupervised
+        exp_alerts: []
+
+  - name: health monitor heartbeat frozen fires
+    interval: 1m
+    input_series:
+      - series: hydra_health_monitor_last_run_timestamp_seconds
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraHealthMonitorStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              team: infra
+            exp_annotations:
+              summary: "Hydra health monitor stalled"
+              description: "The health monitor last ran 180 seconds ago; readiness gauges are stale."
+
+  - name: health monitor heartbeat advancing does not fire
+    interval: 1m
+    input_series:
+      - series: hydra_health_monitor_last_run_timestamp_seconds
+        values: "0+60x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraHealthMonitorStalled
+        exp_alerts: []
+
+  - name: a session errored in the last 15m fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_sessions_errored_total{strategy_id="sma"}'
+        values: "0 0 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraSessionErrored
+        exp_alerts:
+          - exp_labels:
+              strategy_id: sma
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Trading session moved to error"
+              description: "1 session(s) of strategy sma errored in the last 15 minutes."
+
+  - name: no session error does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_sessions_errored_total{strategy_id="sma"}'
+        values: "2x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraSessionErrored
+        exp_alerts: []
+
+  - name: kill switch latched fires
+    interval: 1m
+    input_series:
+      - series: hydra_kill_switch_active
+        values: "1x5"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HydraKillSwitchActive
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: trading
+            exp_annotations:
+              summary: "Hydra kill switch is latched"
+              description: "New entries are refused until the kill switch is released."
+
+  - name: kill switch released does not fire
+    interval: 1m
+    input_series:
+      - series: hydra_kill_switch_active
+        values: "0x5"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HydraKillSwitchActive
+        exp_alerts: []
+
+  - name: breaker tier 2 fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_circuit_breaker_active_tier{scope="paper"}'
+        values: "2x5"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HydraCircuitBreakerTripped
+        exp_alerts:
+          - exp_labels:
+              scope: paper
+              severity: warning
+              team: trading
+            exp_annotations:
+              summary: "Drawdown circuit breaker active"
+              description: "Circuit breaker tier 2 is active (paper)."
+
+  - name: breaker tier 0 does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_circuit_breaker_active_tier{scope="paper"}'
+        values: "0x5"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HydraCircuitBreakerTripped
+        exp_alerts: []
+
+  - name: paper fills unpersisted for 5m fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_paper_persist_dirty{session_id="s1"}'
+        values: "1x10"
     alert_rule_test:
       - eval_time: 6m
-        alertname: HydraHighMemoryUsage
+        alertname: HydraPaperPersistDirty
+        exp_alerts:
+          - exp_labels:
+              session_id: s1
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Paper fills not persisted"
+              description: "Session s1 has held unpersisted fills for 5 minutes; new entries are refused."
+
+  - name: paper fills persisted within the window do not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_paper_persist_dirty{session_id="s1"}'
+        values: "1 1 1 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraPaperPersistDirty
         exp_alerts: []

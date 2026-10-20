@@ -5,20 +5,27 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
+from prometheus_client import REGISTRY
 from prometheus_client.utils import floatToGoString
 
+from hydra.core import metrics
 from hydra.core.metrics import CONTRACT
 from hydra.risk.circuit_breakers import _TIERS
+from tests.unit.test_execution.session_harness import Harness, held, rule, write_strategy
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DASHBOARDS = [
+DRAWDOWN_DASHBOARDS = [
     REPO_ROOT / "deploy" / "grafana-dashboard.json",
     REPO_ROOT / "config" / "grafana" / "hydra-overview.json",
 ]
+DASHBOARDS = [*DRAWDOWN_DASHBOARDS, REPO_ROOT / "config" / "grafana" / "hydra-system.json"]
+RULES_PATH = REPO_ROOT / "deploy" / "prometheus-rules.yml"
 TIER_EXPR = re.compile(r"hydra_drawdown_ratio\s*>=\s*bool\s*([\d.]+)")
 TIER_VALUES = [float(spec.drawdown_threshold) for spec in _TIERS]
 HYDRA_NAME = re.compile(r"\bhydra_\w+")
@@ -57,7 +64,7 @@ def _threshold_values(panel: dict[str, Any]) -> list[float]:
     return [float(s["value"]) for s in steps if s["value"] is not None]
 
 
-@pytest.mark.parametrize("path", DASHBOARDS, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", DRAWDOWN_DASHBOARDS, ids=lambda p: p.name)
 def test_drawdown_value_panels_use_fraction_unit(path: Path) -> None:
     value_panels = [p for p in _drawdown_panels(path) if p["type"] != "state-timeline"]
     assert value_panels, f"{path.name}: no panel reads hydra_drawdown_ratio"
@@ -73,8 +80,8 @@ def test_drawdown_value_panels_use_fraction_unit(path: Path) -> None:
 
 
 def test_tier_timeline_matches_risk_tiers() -> None:
-    (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["type"] == "state-timeline"]
-    assert panel["title"] == "Drawdown vs Breaker Tiers"
+    (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["title"] == "Drawdown vs Breaker Tiers"]
+    assert panel["type"] == "state-timeline"
     texts = {
         value: option["text"]
         for mapping in panel["fieldConfig"]["defaults"]["mappings"]
@@ -137,14 +144,88 @@ def test_no_panel_without_an_honest_source(path: Path) -> None:
         assert not [t for t in titles if word in t], (path.name, word)
 
 
-@pytest.mark.parametrize("path", DASHBOARDS, ids=lambda p: p.name)
-def test_no_panel_reads_trade_series_until_the_paper_double_count_is_fixed(path: Path) -> None:
-    skewed = {"hydra_trades_total", "hydra_trade_pnl"}
-    for title, target in _targets(path):
-        families = {SAMPLE_TO_SPEC[n].name for n in HYDRA_NAME.findall(target.get("expr", ""))}
-        assert not families & skewed, title
-    titles = {p["title"] for p in _panels(path)}
-    assert not titles & {"Win Rate", "Fill Rate", "Trades by Strategy", "Total Trades (24h)"}
+@pytest.fixture()
+def _fresh_registry() -> Iterator[None]:
+    metrics._reset_metrics()
+    yield
+    metrics._reset_metrics()
+
+
+def _sample(name: str, **labels: str) -> float:
+    total = 0.0
+    for family in REGISTRY.collect():
+        for sample in family.samples:
+            if sample.name == name and all(sample.labels.get(k) == v for k, v in labels.items()):
+                total += sample.value
+    return total
+
+
+@pytest.mark.usefixtures("_fresh_registry")
+async def test_trade_series_count_each_paper_fill_once(strategies_dir: Path) -> None:
+    h = Harness(strategies_dir)
+    await h.start()
+    try:
+        sid = write_strategy(
+            strategies_dir,
+            "pnl-once",
+            entry_long=rule(("less_than", 100.5), ("greater_than", 99.5)),
+            exit_long=rule(("greater_than", 104.0)),
+        )
+        session = await h.session(sid)
+        await h.bar(session, "100")
+        assert await held(session) == Decimal("1.00000")
+        await h.bar(session, "105")
+        assert await held(session) == Decimal("0")
+    finally:
+        await h.close()
+
+    assert _sample("hydra_trades_total", side="BUY", strategy_id="pnl-once") == 1.0
+    assert _sample("hydra_trades_total", side="SELL", strategy_id="pnl-once") == 1.0
+    # net = 1 x 104.895 - 1 x 100.1 - 0.104895 - 0.1001 = 4.590005 USDT
+    assert _sample("hydra_trade_pnl_count", strategy_id="pnl-once") == 1.0
+    assert _sample("hydra_trade_pnl_bucket", strategy_id="pnl-once", le="0.0") == 0.0
+    assert _sample("hydra_trade_pnl_bucket", strategy_id="pnl-once", le="10.0") == 1.0
+
+
+def test_win_rate_counts_break_even_as_a_loss() -> None:
+    (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["title"] == "Win Rate"]
+    assert [t["expr"] for t in panel["targets"]] == [
+        '1 - sum(increase(hydra_trade_pnl_bucket{le="0.0"}[$__range]))'
+        " / sum(increase(hydra_trade_pnl_count[$__range]))"
+    ]
+    assert panel["fieldConfig"]["defaults"]["unit"] == "percentunit"
+    assert "break-even counts as a loss" in panel["description"]
+
+
+def test_exchange_variable_reads_a_series_every_session_produces() -> None:
+    (variable,) = [
+        v for v in _doc(DASHBOARDS[0])["templating"]["list"] if v["name"] == "exchange_id"
+    ]
+    assert variable["query"] == "label_values(hydra_feed_bars_total, exchange_id)"
+
+
+def test_fill_latency_panel_is_titled_for_what_it_measures() -> None:
+    titles = {p["title"]: p for p in _panels(DASHBOARDS[0])}
+    assert "Strategy Latency" not in titles
+    exprs = [t["expr"] for t in titles["Order Fill Latency"]["targets"]]
+    assert exprs == [
+        "sum by (le) (rate(hydra_order_fill_latency_seconds_bucket[$__rate_interval]))"
+    ]
+
+
+def test_session_panels_match_the_alert_rules() -> None:
+    rules = {
+        r["alert"]: r["expr"]
+        for g in yaml.safe_load(RULES_PATH.read_text())["groups"]
+        for r in g["rules"]
+    }
+    titles = {p["title"]: p for p in _panels(DASHBOARDS[0])}
+    zombies = titles["Sessions: Desired vs Supervised"]["targets"][2]["expr"]
+    assert rules["HydraSessionNotSupervised"] in zombies
+    assert [t["expr"] for t in titles["Readiness by Check"]["targets"]] == ["hydra_ready"]
+    limit = titles["Closed Bar Age vs Limit"]["targets"][1]["expr"]
+    assert limit.startswith("2 * hydra_feed_bar_interval_seconds") and limit.endswith(" + 60")
+    assert "2 * hydra_feed_bar_interval_seconds + 60" in rules["HydraClosedBarOverdue"]
 
 
 def test_position_panel_sums_sessions_per_symbol() -> None:
