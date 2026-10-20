@@ -98,16 +98,16 @@ class TestQuoteOnlyBalance:
 
 class TestIntent:
     def test_reduce_only_is_reduce(self) -> None:
-        assert classify_intent(_order("1", Side.SELL, reduce_only=True), []) == REDUCE
+        assert classify_intent(_order("1", Side.SELL, reduce_only=True)) == REDUCE
 
-    def test_unflagged_sell_within_long_is_reduce(self) -> None:
-        assert classify_intent(_order("0.01", Side.SELL), [_long("0.01")]) == REDUCE
-
-    def test_sell_beyond_long_is_open(self) -> None:
-        assert classify_intent(_order("0.02", Side.SELL), [_long("0.01")]) == OPEN
+    def test_unflagged_sell_within_long_is_an_opening_spot_short(self) -> None:
+        assert classify_intent(_order("0.01", Side.SELL)) == OPEN
+        state = _state(positions=[_long("0.01")])
+        ok, check, _ = _check(_order("0.01", Side.SELL), state)
+        assert (ok, check) == (False, "spot_short")
 
     def test_buy_with_long_is_open(self) -> None:
-        assert classify_intent(_order("0.01"), [_long("0.01")]) == OPEN
+        assert classify_intent(_order("0.01")) == OPEN
 
     @pytest.mark.parametrize(
         "blocker",
@@ -126,7 +126,7 @@ class TestIntent:
     )
     def test_exit_never_blocked(self, blocker: dict[str, Any]) -> None:
         state = _state(positions=[_long("0.01")], **blocker)
-        exit_order = _order("0.01", Side.SELL)
+        exit_order = _order("0.01", Side.SELL, reduce_only=True)
         assert _check(exit_order, state) == (True, "reduce", "reducing order: entry checks exempt")
         assert _check(_order("0.01"), state)[0] is False
 

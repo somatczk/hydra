@@ -46,6 +46,18 @@ def test_session_path_has_no_legacy_risk_or_fake_reconcile(module: ModuleType) -
         assert marker not in source
 
 
+def test_legacy_risk_path_is_deleted() -> None:
+    from hydra.execution.order_manager import OrderManager
+    from hydra.risk.pretrade import classify_intent
+
+    params = inspect.signature(OrderManager.__init__).parameters
+    assert {"risk_checker", "portfolio_state", "portfolio_state_builder"}.isdisjoint(params)
+    assert list(inspect.signature(classify_intent).parameters) == ["order"]
+    assert not (EXECUTION / "portfolio_state.py").exists()
+    with pytest.raises(ModuleNotFoundError):
+        __import__("hydra.execution.portfolio_state")
+
+
 def test_paper_executor_shims_are_gone() -> None:
     from hydra.execution.paper_trading import PaperTradingExecutor
 

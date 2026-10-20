@@ -7,9 +7,7 @@ from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
 
-import pytest
-
-from hydra.core.events import OrderCancelEvent, OrderFillEvent, RiskCheckResult
+from hydra.core.events import OrderCancelEvent, OrderFillEvent
 from hydra.core.types import (
     OHLCV,
     MarketType,
@@ -111,38 +109,6 @@ class TestSubmitOrder:
 
         await mgr.submit_order(_make_order())
         assert mgr.get_order_status("ord-4") == OrderStatus.FILLED
-
-    async def test_submit_with_risk_check_pass(self) -> None:
-        executor = _mock_executor(fill_immediately=False)
-        bus = _mock_event_bus()
-        risk_checker = AsyncMock()
-        risk_checker.check_order.return_value = RiskCheckResult(approved=True, reason="ok")
-
-        mgr = OrderManager(
-            executor=executor,
-            event_bus=bus,
-            risk_checker=risk_checker,
-        )
-        order_id = await mgr.submit_order(_make_order())
-        assert order_id
-        risk_checker.check_order.assert_awaited_once()
-
-    async def test_submit_with_risk_check_fail(self) -> None:
-        executor = _mock_executor(fill_immediately=False)
-        bus = _mock_event_bus()
-        risk_checker = AsyncMock()
-        risk_checker.check_order.return_value = RiskCheckResult(
-            approved=False, reason="position too large"
-        )
-
-        mgr = OrderManager(
-            executor=executor,
-            event_bus=bus,
-            risk_checker=risk_checker,
-        )
-        with pytest.raises(ValueError, match="Risk check failed"):
-            await mgr.submit_order(_make_order())
-        executor.create_order.assert_not_awaited()
 
 
 class TestCancelOrder:

@@ -27,10 +27,11 @@ from hydra.execution.order_manager import OrderManager
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.portfolio.pnl import PnLCalculator
 from hydra.portfolio.positions import PositionTracker
-from hydra.risk.pretrade import PortfolioState, PreTradeRiskManager
+from hydra.risk.pretrade import PortfolioState, PreTradeRiskManager, RiskConfig
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
+from tests.unit.test_risk.harness import make_account
 
 from .conftest import make_bar
 
@@ -361,26 +362,26 @@ class TestSignalToOrderPipeline:
         self,
         event_bus: InMemoryEventBus,
         paper_executor: PaperTradingExecutor,
-        risk_manager: PreTradeRiskManager,
     ) -> None:
-        """OrderManager wires risk check + executor + event bus together."""
-        await paper_executor.on_closed_bar(
-            "BTCUSDT", make_bar(42000.0, datetime(2024, 1, 1, tzinfo=UTC))
+        """OrderManager wires the RiskService check + executor + event bus together."""
+        bar_ts = datetime(2024, 1, 1, tzinfo=UTC)
+        await paper_executor.on_closed_bar("BTCUSDT", make_bar(42000.0, bar_ts))
+        acct = await make_account(RiskConfig())
+        await acct.svc.register_session(
+            "e2e",
+            paper_executor,
+            allocated=Decimal("10000"),
+            symbols=["BTCUSDT"],
+            exchange_id="binance",
         )
-
-        portfolio_state = PortfolioState(
-            positions=[],
-            balances={"USDT": Decimal("10000")},
-            portfolio_value=Decimal("10000"),
-            average_volume=Decimal("1000000"),
-        )
+        await acct.svc.on_mark("binance", "BTCUSDT", Decimal("42000"), bar_ts)
 
         order_mgr = OrderManager(
             executor=paper_executor,
             event_bus=event_bus,
-            risk_checker=risk_manager,
-            portfolio_state=portfolio_state,
             dedup_window=0.0,
+            risk=acct.svc,
+            session_id="e2e",
         )
 
         # Collect fill events published onto the event bus
