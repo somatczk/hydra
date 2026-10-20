@@ -26,7 +26,7 @@ from hydra.backtest.data import (
     load_latest_bars,
 )
 from hydra.core.types import ExchangeId, Timeframe
-from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
+from hydra.dashboard.routes._db import DB_ERRORS, api_error, db_errors_to_503, require_pool
 from hydra.data.storage import MarketDataRepository
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
@@ -127,8 +127,8 @@ class StrategyPerformance(BaseModel):
     total_pnl: float = 0.0
     win_rate: float = 0.0
     total_trades: int = 0
-    sharpe_ratio: float = 0.0
-    max_drawdown: float = 0.0
+    sharpe_ratio: float | None = None
+    max_drawdown: float | None = None
 
 
 class StrategyResponse(BaseModel):
@@ -139,7 +139,8 @@ class StrategyResponse(BaseModel):
     enabled: bool = True
     editable: bool = False
     config_yaml: str = ""
-    performance: StrategyPerformance = Field(default_factory=StrategyPerformance)
+    performance: StrategyPerformance | None = None
+    performance_error: str | None = None
 
 
 class ToggleResponse(BaseModel):
@@ -285,7 +286,8 @@ class StrategyDetailResponse(BaseModel):
     rules: RuleSetInput | None = None
     timeframes: TimeframeInput = Field(default_factory=TimeframeInput)
     risk: RiskInput = Field(default_factory=RiskInput)
-    performance: StrategyPerformance = Field(default_factory=StrategyPerformance)
+    performance: StrategyPerformance | None = None
+    performance_error: str | None = None
     ml_overlay: dict[str, Any] | None = None
 
 
@@ -303,8 +305,6 @@ def _row_to_strategy(row: Any) -> dict[str, Any]:
             "total_pnl": round(float(row["total_pnl"]), 2),
             "win_rate": round(float(row["win_rate"]), 1),
             "total_trades": row["total_trades"],
-            "sharpe_ratio": 0.0,
-            "max_drawdown": 0.0,
         },
     }
 
@@ -444,41 +444,55 @@ async def list_strategies(request: Request) -> list[dict[str, Any]]:
             "enabled": enabled,
             "editable": strategy_class == _RULE_BASED_CLASS,
             "config_yaml": "",
-            "performance": {
-                "total_pnl": 0.0,
-                "win_rate": 0.0,
-                "total_trades": 0,
-                "sharpe_ratio": 0.0,
-                "max_drawdown": 0.0,
-            },
         }
 
-    # 2. Overlay DB performance stats
-    pool = _pool_from_request(request)
-    if pool is not None and strategies:
-        async with db_errors_to_503("loading strategy performance"):
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT strategy_id, "
-                    "COALESCE(SUM(pnl), 0) AS total_pnl, "
-                    "COUNT(id) AS total_trades, "
-                    "COALESCE("
-                    "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
-                    "  / NULLIF(COUNT(id), 0) * 100, 0"
-                    ") AS win_rate "
-                    "FROM trades GROUP BY strategy_id"
-                )
-            for row in rows:
-                sid = row["strategy_id"]
-                if sid in strategies:
-                    strategies[sid]["performance"] = {
-                        **strategies[sid]["performance"],
-                        "total_pnl": round(float(row["total_pnl"]), 2),
-                        "win_rate": round(float(row["win_rate"]), 1),
-                        "total_trades": row["total_trades"],
-                    }
+    if strategies:
+        rows, perf_error = await _overlay_performance(request, _PERFORMANCE_SQL)
+        perf_by_id = {row["strategy_id"]: _performance_from_row(row) for row in rows}
+        for sid, entry in strategies.items():
+            entry["performance_error"] = perf_error
+            if perf_error is None:
+                entry["performance"] = perf_by_id.get(sid, _performance_from_row(None))
 
     return list(strategies.values())
+
+
+_PERFORMANCE_SQL = (
+    "SELECT strategy_id, "
+    "COALESCE(SUM(pnl), 0) AS total_pnl, "
+    "COUNT(id) AS total_trades, "
+    "COALESCE("
+    "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
+    "  / NULLIF(COUNT(id), 0) * 100, 0"
+    ") AS win_rate "
+    "FROM trades GROUP BY strategy_id"
+)
+_PERFORMANCE_UNAVAILABLE = "Performance unavailable: database is not available"
+
+
+def _performance_from_row(row: Any) -> dict[str, Any]:
+    if row is None:
+        return {"total_pnl": 0.0, "win_rate": 0.0, "total_trades": 0}
+    return {
+        "total_pnl": round(float(row["total_pnl"]), 2),
+        "win_rate": round(float(row["win_rate"]), 1),
+        "total_trades": row["total_trades"],
+    }
+
+
+async def _overlay_performance(
+    request: Request, query: str, *args: Any
+) -> tuple[list[Any], str | None]:
+    """Trade-stat rows for the performance overlay, or why the database could not answer."""
+    pool = _pool_from_request(request)
+    if pool is None:
+        return [], _PERFORMANCE_UNAVAILABLE
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetch(query, *args), None
+    except DB_ERRORS:
+        logger.exception("Database error while loading strategy performance")
+        return [], "Performance unavailable: database error"
 
 
 @router.get("/indicators")
@@ -541,18 +555,15 @@ async def list_comparators() -> list[dict[str, str]]:
     ]
 
 
-async def _fetch_trade_performance(pool: Any, strategy_id: str) -> Any:
-    async with db_errors_to_503("loading strategy performance"), pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
-            "COUNT(id) AS total_trades, "
-            "COALESCE("
-            "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
-            "  / NULLIF(COUNT(id), 0) * 100, 0"
-            ") AS win_rate "
-            "FROM trades WHERE strategy_id = $1",
-            strategy_id,
-        )
+_ONE_PERFORMANCE_SQL = (
+    "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
+    "COUNT(id) AS total_trades, "
+    "COALESCE("
+    "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
+    "  / NULLIF(COUNT(id), 0) * 100, 0"
+    ") AS win_rate "
+    "FROM trades WHERE strategy_id = $1"
+)
 
 
 @router.get("/{strategy_id}", response_model=StrategyDetailResponse)
@@ -577,27 +588,15 @@ async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
                 "status": _status_from_enabled(enabled),
                 "enabled": enabled,
                 "editable": is_rule_based,
-                "performance": {
-                    "total_pnl": 0.0,
-                    "win_rate": 0.0,
-                    "total_trades": 0,
-                    "sharpe_ratio": 0.0,
-                    "max_drawdown": 0.0,
-                },
             }
             if is_rule_based:
                 result.update(_extract_strategy_detail(data))
-            # Overlay DB performance
-            pool = _pool_from_request(request)
-            if pool is not None:
-                row = await _fetch_trade_performance(pool, strategy_id)
-                if row:
-                    result["performance"] = {
-                        **result["performance"],
-                        "total_pnl": round(float(row["total_pnl"]), 2),
-                        "win_rate": round(float(row["win_rate"]), 1),
-                        "total_trades": row["total_trades"],
-                    }
+            rows, perf_error = await _overlay_performance(
+                request, _ONE_PERFORMANCE_SQL, strategy_id
+            )
+            result["performance_error"] = perf_error
+            if perf_error is None:
+                result["performance"] = _performance_from_row(rows[0] if rows else None)
             return result
 
     # No YAML: the strategy may only exist in trading-session history
@@ -687,29 +686,12 @@ async def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
 @router.get("/{strategy_id}/performance", response_model=StrategyPerformance)
 async def get_strategy_performance(strategy_id: str, request: Request) -> dict[str, Any]:
     """Get performance metrics for a strategy."""
-    default_perf = {
-        "total_pnl": 0.0,
-        "win_rate": 0.0,
-        "total_trades": 0,
-        "sharpe_ratio": 0.0,
-        "max_drawdown": 0.0,
-    }
-
     if find_strategy_file(strategy_id) is None:
         raise _strategy_not_found(strategy_id)
-
-    pool = _pool_from_request(request)
-    if pool is not None:
-        row = await _fetch_trade_performance(pool, strategy_id)
-        if row and row["total_trades"] > 0:
-            return {
-                **default_perf,
-                "total_pnl": round(float(row["total_pnl"]), 2),
-                "win_rate": round(float(row["win_rate"]), 1),
-                "total_trades": row["total_trades"],
-            }
-
-    return default_perf
+    pool = require_pool(request)
+    async with db_errors_to_503("loading strategy performance"), pool.acquire() as conn:
+        row = await conn.fetchrow(_ONE_PERFORMANCE_SQL, strategy_id)
+    return _performance_from_row(row)
 
 
 @router.delete("/{strategy_id}")

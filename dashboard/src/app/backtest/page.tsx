@@ -256,14 +256,16 @@ function BacktestPageContent() {
     if (primary) setTimeframe(primary);
   };
 
-  // Auto-run backtest when navigating from Save & Backtest
+  // Auto-run from Save & Backtest only once the strategy list has applied its primary timeframe
   useEffect(() => {
     if (autorunTriggered.current) return;
     if (searchParams.get('autorun') !== 'true') return;
-    if (!strategyId || running) return;
+    const requested = searchParams.get('strategy');
+    if (!requested || strategyId !== requested || running) return;
+    if (!strategies.some((s) => s.id === requested)) return;
     autorunTriggered.current = true;
     handleRunBacktest();
-  }, [strategyId]);
+  }, [strategyId, strategies]);
 
   const handleDelete = async (id: string) => {
     try {

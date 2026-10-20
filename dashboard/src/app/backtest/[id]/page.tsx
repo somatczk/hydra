@@ -59,11 +59,11 @@ interface ApiBacktestDetail {
     total_pnl: number;
     max_drawdown: number;
     sharpe_ratio: number;
-    alpha?: number;
-    beta?: number;
-    max_consecutive_wins?: number;
-    max_consecutive_losses?: number;
-    expectancy?: number;
+    alpha?: number | null;
+    beta?: number | null;
+    max_consecutive_wins?: number | null;
+    max_consecutive_losses?: number | null;
+    expectancy?: number | null;
   };
   equity_curve: EquityPoint[];
   benchmark_equity?: EquityPoint[];
@@ -434,9 +434,9 @@ export default function BacktestDetailPage() {
       </div>
 
       {/* Extended metrics row */}
-      {(metrics.alpha !== undefined || metrics.beta !== undefined || metrics.max_consecutive_wins !== undefined || metrics.max_consecutive_losses !== undefined || metrics.expectancy !== undefined) && (
+      {(metrics.alpha != null || metrics.beta != null || metrics.max_consecutive_wins != null || metrics.max_consecutive_losses != null || metrics.expectancy != null) && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-          {metrics.alpha !== undefined && (
+          {metrics.alpha != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Alpha</p>
               <p className={`text-lg font-bold ${metrics.alpha >= 0 ? 'text-status-success' : 'text-status-error'}`}>
@@ -444,25 +444,25 @@ export default function BacktestDetailPage() {
               </p>
             </DataCard>
           )}
-          {metrics.beta !== undefined && (
+          {metrics.beta != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Beta</p>
               <p className="text-lg font-bold text-text-primary">{metrics.beta.toFixed(2)}</p>
             </DataCard>
           )}
-          {metrics.max_consecutive_wins !== undefined && (
+          {metrics.max_consecutive_wins != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Max Consec. Wins</p>
               <p className="text-lg font-bold text-status-success">{metrics.max_consecutive_wins}</p>
             </DataCard>
           )}
-          {metrics.max_consecutive_losses !== undefined && (
+          {metrics.max_consecutive_losses != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Max Consec. Losses</p>
               <p className="text-lg font-bold text-status-error">{metrics.max_consecutive_losses}</p>
             </DataCard>
           )}
-          {metrics.expectancy !== undefined && (
+          {metrics.expectancy != null && (
             <DataCard padding="sm">
               <p className="text-xs text-text-muted">Expectancy</p>
               <p className={`text-lg font-bold ${metrics.expectancy >= 0 ? 'text-status-success' : 'text-status-error'}`}>

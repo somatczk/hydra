@@ -28,8 +28,8 @@ interface StrategyPerformance {
   total_pnl: number;
   win_rate: number;
   total_trades: number;
-  sharpe_ratio: number;
-  max_drawdown: number;
+  sharpe_ratio: number | null;
+  max_drawdown: number | null;
 }
 
 interface Strategy {
@@ -109,6 +109,12 @@ function sessionStatusVariant(session: TradingSession | null): 'success' | 'warn
 function fmtPnl(v: number): string {
   const sign = v >= 0 ? '+' : '-';
   return `${sign}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+}
+
+function sharpeClass(v: number | null): string {
+  if (v === null) return 'text-text-muted';
+  if (v >= 1) return 'text-status-success';
+  return v >= 0 ? 'text-text-primary' : 'text-status-error';
 }
 
 /* ---------- Page ---------- */
@@ -495,15 +501,18 @@ export default function StrategiesPage() {
                 <div className="text-center">
                   <p className={cn(
                     'text-sm font-bold',
-                    strategy.performance.sharpe_ratio >= 1 ? 'text-status-success' : strategy.performance.sharpe_ratio >= 0 ? 'text-text-primary' : 'text-status-error',
+                    sharpeClass(strategy.performance.sharpe_ratio),
                   )}>
-                    {strategy.performance.sharpe_ratio.toFixed(2)}
+                    {strategy.performance.sharpe_ratio === null ? '—' : strategy.performance.sharpe_ratio.toFixed(2)}
                   </p>
                   <p className="text-[10px] text-text-muted">Sharpe</p>
                 </div>
                 <div className="text-center">
-                  <p className="text-sm font-bold text-status-error">
-                    {strategy.performance.max_drawdown.toFixed(1)}%
+                  <p className={cn(
+                    'text-sm font-bold',
+                    strategy.performance.max_drawdown === null ? 'text-text-muted' : 'text-status-error',
+                  )}>
+                    {strategy.performance.max_drawdown === null ? '—' : `${strategy.performance.max_drawdown.toFixed(1)}%`}
                   </p>
                   <p className="text-[10px] text-text-muted">Max DD</p>
                 </div>

@@ -25,7 +25,11 @@ from hydra.backtest.data import (
 from hydra.backtest.hyperopt import HyperoptResult, HyperoptRunner, ParamDef, ParameterSpace
 from hydra.backtest.metrics import Trade
 from hydra.backtest.runner import BacktestRunner
-from hydra.backtest.walkforward import WalkForwardAnalyzer, WalkForwardResult
+from hydra.backtest.walkforward import (
+    WalkForwardAnalyzer,
+    WalkForwardResult,
+    window_bar_counts,
+)
 from hydra.core.types import ExchangeId, MarketType, Timeframe
 from hydra.dashboard.routes import strategies as strategy_files
 from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
@@ -151,12 +155,12 @@ class BacktestMetrics(BaseModel):
     total_pnl: float = 0.0
     max_drawdown: float = 0.0
     sharpe_ratio: float = 0.0
-    benchmark_return: float = 0.0
-    alpha: float = 0.0
-    beta: float = 0.0
-    max_consecutive_wins: int = 0
-    max_consecutive_losses: int = 0
-    expectancy: float = 0.0
+    benchmark_return: float | None = None
+    alpha: float | None = None
+    beta: float | None = None
+    max_consecutive_wins: int | None = None
+    max_consecutive_losses: int | None = None
+    expectancy: float | None = None
 
 
 class BacktestResultSummary(BaseModel):
@@ -236,19 +240,50 @@ def _fail(task: dict[str, Any], error: str) -> None:
 # DB persistence helpers
 # ---------------------------------------------------------------------------
 
-_LIST_RESULTS_SQL = (
-    "SELECT id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
-    "sharpe_ratio, equity_curve, name, transactions, strategy_id, initial_capital, "
+_EXTENDED_METRICS = (
+    "benchmark_return",
+    "alpha",
+    "beta",
+    "max_consecutive_wins",
+    "max_consecutive_losses",
+    "expectancy",
+)
+_LIST_SUMMARIES_SQL = (
+    "SELECT "
+    "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
+    "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
+    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
     "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
     "last_ts, gap_count, requested_start, requested_end "
     "FROM backtest_results ORDER BY created_at DESC"
 )
-_ONE_RESULT_SQL = (
-    "SELECT id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
-    "sharpe_ratio, equity_curve, name, transactions, strategy_id, initial_capital, "
+_LIST_DETAILS_SQL = (
+    "SELECT "
+    "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
+    "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
+    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
     "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
-    "last_ts, gap_count, requested_start, requested_end "
+    "last_ts, gap_count, requested_start, requested_end, "
+    "stopped_reason, equity_curve, benchmark_equity, transactions "
+    "FROM backtest_results ORDER BY created_at DESC"
+)
+_ONE_RESULT_SQL = (
+    "SELECT "
+    "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
+    "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
+    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
+    "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
+    "last_ts, gap_count, requested_start, requested_end, "
+    "stopped_reason, equity_curve, benchmark_equity, transactions "
     "FROM backtest_results WHERE id = $1"
+)
+_RENAME_SQL = (
+    "UPDATE backtest_results SET name = $1 WHERE id = $2 RETURNING "
+    "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
+    "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
+    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
+    "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
+    "last_ts, gap_count, requested_start, requested_end"
 )
 
 
@@ -267,10 +302,12 @@ async def _persist_result_to_db(
                     total_pnl, max_drawdown, sharpe_ratio, equity_curve, name,
                     transactions, strategy_id, initial_capital, data_source,
                     data_exchange, data_symbol, data_timeframe, bar_count,
-                    first_ts, last_ts, gap_count, requested_start, requested_end)
+                    first_ts, last_ts, gap_count, requested_start, requested_end,
+                    stopped_reason, benchmark_equity, benchmark_return, alpha, beta,
+                    max_consecutive_wins, max_consecutive_losses, expectancy)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11,
                        $12::jsonb, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                       $22, $23, $24)
+                       $22, $23, $24, $25, $26::jsonb, $27, $28, $29, $30, $31, $32)
                ON CONFLICT (id) DO UPDATE SET
                    status = EXCLUDED.status,
                    total_trades = EXCLUDED.total_trades,
@@ -292,7 +329,15 @@ async def _persist_result_to_db(
                    last_ts = EXCLUDED.last_ts,
                    gap_count = EXCLUDED.gap_count,
                    requested_start = EXCLUDED.requested_start,
-                   requested_end = EXCLUDED.requested_end""",
+                   requested_end = EXCLUDED.requested_end,
+                   stopped_reason = EXCLUDED.stopped_reason,
+                   benchmark_equity = EXCLUDED.benchmark_equity,
+                   benchmark_return = EXCLUDED.benchmark_return,
+                   alpha = EXCLUDED.alpha,
+                   beta = EXCLUDED.beta,
+                   max_consecutive_wins = EXCLUDED.max_consecutive_wins,
+                   max_consecutive_losses = EXCLUDED.max_consecutive_losses,
+                   expectancy = EXCLUDED.expectancy""",
             result["id"],
             result["strategy"],
             result["period"],
@@ -317,6 +362,9 @@ async def _persist_result_to_db(
             provenance.gap_count,
             provenance.requested_start,
             provenance.requested_end,
+            result["stopped_reason"],
+            json.dumps(result["benchmark_equity"]),
+            *(metrics[name] for name in _EXTENDED_METRICS),
         )
         await conn.execute(
             "DELETE FROM backtest_result_trades WHERE backtest_id = $1", result["id"]
@@ -383,6 +431,7 @@ def _summary_from_row(row: Any) -> dict[str, Any]:
             "total_pnl": row["total_pnl"],
             "max_drawdown": row["max_drawdown"],
             "sharpe_ratio": row["sharpe_ratio"],
+            **{name: row[name] for name in _EXTENDED_METRICS},
         },
     }
 
@@ -401,8 +450,9 @@ def _trade_from_row(t: Any) -> dict[str, Any]:
 def _detail_from_row(row: Any, trade_rows: list[Any]) -> dict[str, Any]:
     return {
         **_summary_from_row(row),
+        "stopped_reason": row["stopped_reason"],
         "equity_curve": _json_column(row["equity_curve"]),
-        "benchmark_equity": [],
+        "benchmark_equity": _json_column(row["benchmark_equity"]),
         "trades": [_trade_from_row(t) for t in trade_rows],
         "transactions": _json_column(row["transactions"]),
     }
@@ -412,7 +462,7 @@ async def populate_cache_from_db(pool: Any) -> None:
     """Load backtest results from DB into the in-memory cache on startup."""
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(_LIST_RESULTS_SQL)
+            rows = await conn.fetch(_LIST_DETAILS_SQL)
             trade_rows = await conn.fetch(
                 "SELECT backtest_id, entry_time, exit_time, side, entry_price, exit_price, pnl "
                 "FROM backtest_result_trades ORDER BY backtest_id, entry_time, id"
@@ -730,7 +780,7 @@ async def list_results(request: Request) -> list[dict[str, Any]]:
     """List all persisted backtest result summaries."""
     pool = require_pool(request)
     async with db_errors_to_503("listing backtest results"), pool.acquire() as conn:
-        rows = await conn.fetch(_LIST_RESULTS_SQL)
+        rows = await conn.fetch(_LIST_SUMMARIES_SQL)
     return [_summary_from_row(row) for row in rows]
 
 
@@ -761,46 +811,28 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
 async def rename_result(
     result_id: str, body: BacktestRenameRequest, request: Request
 ) -> dict[str, Any]:
-    """Rename a backtest result."""
-    if result_id not in _RESULTS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Result {result_id} not found",
-        )
-    _RESULTS[result_id]["name"] = body.name
-
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is not None:
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE backtest_results SET name = $1 WHERE id = $2",
-                    body.name,
-                    result_id,
-                )
-        except Exception:
-            logger.debug("Failed to update name in DB for %s", result_id, exc_info=True)
-
-    return _RESULTS[result_id]
+    """Rename a backtest result in the database, then in the cache."""
+    pool = require_pool(request)
+    async with db_errors_to_503("renaming a backtest result"), pool.acquire() as conn:
+        row = await conn.fetchrow(_RENAME_SQL, body.name, result_id)
+    if row is None:
+        raise api_error(404, "result_not_found", f"Result {result_id} not found", "not_found")
+    if result_id in _RESULTS:
+        _RESULTS[result_id]["name"] = body.name
+    return _summary_from_row(row)
 
 
 @router.delete("/results/{result_id}", status_code=204)
 async def delete_result(result_id: str, request: Request) -> None:
-    """Delete a backtest result."""
-    if result_id not in _RESULTS:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Result {result_id} not found",
+    """Delete a backtest result from the database, then evict it from the cache."""
+    pool = require_pool(request)
+    async with db_errors_to_503("deleting a backtest result"), pool.acquire() as conn:
+        deleted = await conn.fetchval(
+            "DELETE FROM backtest_results WHERE id = $1 RETURNING id", result_id
         )
+    if deleted is None:
+        raise api_error(404, "result_not_found", f"Result {result_id} not found", "not_found")
     _RESULTS.pop(result_id, None)
-
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is not None:
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute("DELETE FROM backtest_results WHERE id = $1", result_id)
-        except Exception:
-            logger.debug("Failed to delete backtest %s from DB", result_id, exc_info=True)
 
 
 @router.get("/results/{result_id}/verify", response_model=BacktestVerification)
@@ -1357,7 +1389,6 @@ _WALKFORWARD_TASKS: dict[str, dict[str, Any]] = {}
 _WALKFORWARD_RESULTS: dict[str, WalkForwardResult] = {}
 
 _DAYS_PER_MONTH = 30.44
-_ANALYZER_DAYS_PER_MONTH = 30
 
 
 # ---------------------------------------------------------------------------
@@ -1411,8 +1442,14 @@ def _walkforward_months(
     return in_sample, out_of_sample
 
 
-def _window_fits(first: datetime, last: datetime, in_sample: int, out_of_sample: int) -> bool:
-    return (in_sample + out_of_sample) * _ANALYZER_DAYS_PER_MONTH <= (last - first).days
+def _window_fits(
+    first: datetime, last: datetime, bar_count: int, in_sample: int, out_of_sample: int
+) -> bool:
+    days = (last - first).days
+    if days <= 0:
+        return False
+    is_bars, oos_bars = window_bar_counts(bar_count, days, in_sample, out_of_sample)
+    return is_bars > 0 and oos_bars > 0 and is_bars + oos_bars <= bar_count
 
 
 # ---------------------------------------------------------------------------
@@ -1487,9 +1524,9 @@ async def start_walkforward(body: WalkForwardRunRequest, request: Request) -> di
     """
     pf = await _preflight(request, body.strategy_id, body.timeframe, body.start_date, body.end_date)
     if pf.stored is not None:
-        first, last, _ = pf.stored
+        first, last, bar_count = pf.stored
         in_sample, out_of_sample = _walkforward_months(first, last, body.fold_count, body.train_pct)
-        if not _window_fits(first, last, in_sample, out_of_sample):
+        if not _window_fits(first, last, bar_count, in_sample, out_of_sample):
             raise api_error(
                 422,
                 "range_too_short",

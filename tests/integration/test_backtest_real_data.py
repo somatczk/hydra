@@ -74,6 +74,14 @@ _NEW_COLUMNS = {
     "gap_count",
     "requested_start",
     "requested_end",
+    "stopped_reason",
+    "benchmark_equity",
+    "benchmark_return",
+    "alpha",
+    "beta",
+    "max_consecutive_wins",
+    "max_consecutive_losses",
+    "expectancy",
 }
 
 
@@ -331,16 +339,32 @@ async def test_results_survive_a_restart(
         await _run(client, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-31")
     )["result_id"]
     before = (await client.get(f"/api/backtest/results/{result_id}")).json()
+    assert before["trades"]
+    assert before["benchmark_equity"]
+    assert before["metrics"]["max_consecutive_wins"] is not None
+    assert before["metrics"]["expectancy"] is not None
 
     backtest._RESULTS.clear()
-    await backtest.populate_cache_from_db(pool)
+    uncached = (await client.get(f"/api/backtest/results/{result_id}")).json()
+    assert uncached == before
 
-    after = (await client.get(f"/api/backtest/results/{result_id}")).json()
-    assert len(after["trades"]) == len(before["trades"]) == before["metrics"]["total_trades"]
-    assert [t["entry_time"] for t in after["trades"]] == [t["entry_time"] for t in before["trades"]]
-    assert [t["pnl"] for t in after["trades"]] == [t["pnl"] for t in before["trades"]]
-    assert after["provenance"] == before["provenance"]
+    await backtest.populate_cache_from_db(pool)
     assert set(backtest._RESULTS) == {result_id}
+    after = (await client.get(f"/api/backtest/results/{result_id}")).json()
+    assert after == before
+
+    listed = (await client.get("/api/backtest/results")).json()
+    assert listed[0]["metrics"] == before["metrics"]
+
+    backtest._RESULTS.clear()
+    renamed = await client.patch(f"/api/backtest/results/{result_id}", json={"name": "kept"})
+    assert renamed.status_code == 200
+    assert renamed.json()["provenance"] == before["provenance"]
+    assert (await client.delete(f"/api/backtest/results/{result_id}")).status_code == 204
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM backtest_results") == 0
+        assert await conn.fetchval("SELECT count(*) FROM backtest_result_trades") == 0
+    assert (await client.delete(f"/api/backtest/results/{result_id}")).status_code == 404
 
 
 async def test_no_stored_bars_is_422_with_available_range(
@@ -497,6 +521,15 @@ async def test_walkforward_uses_the_real_span(
     assert result["provenance"]["last_ts"] == _iso(daily[-1].timestamp)
     task = backtest._WALKFORWARD_TASKS[task_id]
     assert (task["in_sample_months"], task["out_of_sample_months"]) == (5, 2)
+    # 400 daily bars over 399 days: 150 IS + 60 OOS bars per window, stepping 60 bars.
+    folds = backtest._WALKFORWARD_RESULTS[task_id].folds
+    assert len(result["folds"]) == len(folds) == 4
+    for k, fold in enumerate(folds):
+        window = daily[150 + 60 * k : 210 + 60 * k]
+        assert fold.out_of_sample_metrics.trades
+        for trade in fold.out_of_sample_metrics.trades:
+            assert window[0].timestamp <= trade.entry_time <= trade.exit_time
+            assert trade.exit_time <= window[-1].timestamp
 
     short = await client.post(
         "/api/backtest/walkforward",

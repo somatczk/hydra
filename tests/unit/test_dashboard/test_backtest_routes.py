@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -19,14 +20,18 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from hydra.core.types import Timeframe
+from hydra.backtest.walkforward import WalkForwardAnalyzer
+from hydra.core.events import BarEvent, EntrySignal, ExitSignal
+from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.backtest import (
     _HYPEROPT_TASKS,
     _RESULTS,
     _TASKS,
     _WALKFORWARD_TASKS,
+    BacktestResultDetail,
     BacktestRunRequest,
+    _detail_from_row,
     _load_backtest_strategy,
     _preflight,
     _run_backtest_task,
@@ -34,6 +39,8 @@ from hydra.dashboard.routes.backtest import (
     _window_fits,
     router,
 )
+from hydra.strategy.base import BaseStrategy
+from hydra.strategy.config import StrategyConfig
 
 SRC = Path(__file__).resolve().parents[3] / "src" / "hydra"
 
@@ -457,17 +464,14 @@ class TestStatusAndResults:
         assert body["computed_win_rate"] == 50.0
         assert body["all_passed"] is True
 
-    def test_rename_returns_provenance(self, client: TestClient) -> None:
+    def test_rename_and_delete_without_database_are_503(self, client: TestClient) -> None:
         _RESULTS["bt-task-cached"] = dict(_CACHED)
-        resp = client.patch("/api/backtest/results/bt-task-cached", json={"name": "Renamed"})
-        assert resp.status_code == 200
-        assert resp.json()["name"] == "Renamed"
-        assert resp.json()["provenance"]["bar_count"] == 25
-
-    def test_delete_removes_cached_result(self, client: TestClient) -> None:
-        _RESULTS["bt-task-cached"] = dict(_CACHED)
-        assert client.delete("/api/backtest/results/bt-task-cached").status_code == 204
-        assert "bt-task-cached" not in _RESULTS
+        assert (
+            client.patch("/api/backtest/results/bt-task-cached", json={"name": "x"}).status_code
+            == 503
+        )
+        assert client.delete("/api/backtest/results/bt-task-cached").status_code == 503
+        assert _RESULTS["bt-task-cached"] == _CACHED
 
 
 # ---------------------------------------------------------------------------
@@ -507,19 +511,63 @@ class TestStrategyOptions:
 # ---------------------------------------------------------------------------
 
 
+class _IdleStrategy(BaseStrategy):
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        return []
+
+
 class TestWalkForwardMonths:
     def test_months_from_span(self) -> None:
         first = datetime(2025, 1, 1, tzinfo=UTC)
         last = first + timedelta(days=399)
         assert _walkforward_months(first, last, fold_count=2, train_pct=0.75) == (5, 2)
-        assert _window_fits(first, last, 5, 2)
+        assert _window_fits(first, last, 400, 5, 2)
 
     def test_thirty_days_cannot_fit_a_window(self) -> None:
         first = datetime(2025, 1, 1, tzinfo=UTC)
         last = first + timedelta(days=30)
         in_sample, out_of_sample = _walkforward_months(first, last, fold_count=2, train_pct=0.75)
         assert (in_sample, out_of_sample) == (1, 1)
-        assert not _window_fits(first, last, in_sample, out_of_sample)
+        assert not _window_fits(first, last, 31, in_sample, out_of_sample)
+
+    def test_weekly_bars_are_sized_at_their_real_density(self) -> None:
+        first = datetime(2025, 1, 1, tzinfo=UTC)
+        last = first + timedelta(weeks=56)
+        assert _walkforward_months(first, last, fold_count=2, train_pct=0.75) == (4, 2)
+        assert _window_fits(first, last, 57, 4, 2)
+        assert not _window_fits(first, first + timedelta(weeks=4), 5, 1, 1)
+
+    async def test_weekly_walkforward_windows_match_the_reported_months(self) -> None:
+        start = datetime(2025, 1, 1, tzinfo=UTC)
+        bars = [
+            OHLCV(
+                open=Decimal(1000 + (i % 4) * 50),
+                high=Decimal(1000 + (i % 4) * 50),
+                low=Decimal(1000 + (i % 4) * 50),
+                close=Decimal(1000 + (i % 4) * 50),
+                volume=Decimal(10),
+                timestamp=start + timedelta(weeks=i),
+            )
+            for i in range(57)
+        ]
+        config = StrategyConfig(id="wf-1w", name="WF 1w", strategy_class="x.Y", symbols=["BTCUSDT"])
+        result = await WalkForwardAnalyzer().run_walkforward(
+            bars=bars,
+            strategy_class=_IdleStrategy,
+            strategy_config=config,
+            in_sample_months=4,
+            out_of_sample_months=2,
+            timeframe=Timeframe.W1,
+        )
+        # 57 bars over 392 days: 4 months = 17 weekly bars, 2 months = 8, stepping 8.
+        assert len(result.folds) == 5
+        for fold in result.folds:
+            assert len(fold.in_sample_metrics.equity_curve) == 17 + 1
+            assert len(fold.out_of_sample_metrics.equity_curve) == 8 + 1
 
 
 # ---------------------------------------------------------------------------
@@ -599,3 +647,173 @@ async def test_persistence_failure_fails_the_task(strategies_dir: Path) -> None:
     assert _TASKS["task-p"]["error"].startswith("result not persisted")
     assert "result_id" not in _TASKS["task-p"]
     assert _RESULTS == {}
+
+
+# ---------------------------------------------------------------------------
+# Persisted detail: every field round-trips, nothing missing is shown as zero
+# ---------------------------------------------------------------------------
+
+
+def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": result_id,
+        "strategy": "Saw",
+        "period": "p",
+        "status": "completed",
+        "name": "",
+        "total_trades": 3,
+        "win_rate": 33.33,
+        "total_pnl": -950.0,
+        "max_drawdown": 95.0,
+        "sharpe_ratio": -2.1,
+        "benchmark_return": 4.2,
+        "alpha": -0.31,
+        "beta": 1.7,
+        "max_consecutive_wins": 1,
+        "max_consecutive_losses": 2,
+        "expectancy": -316.67,
+        "stopped_reason": "margin_call",
+        "strategy_id": "saw",
+        "initial_capital": 1000.0,
+        "data_source": "db",
+        "data_exchange": "binance",
+        "data_symbol": "BTCUSDT",
+        "data_timeframe": "1h",
+        "bar_count": 25,
+        "first_ts": datetime(2026, 1, 1, tzinfo=UTC),
+        "last_ts": datetime(2026, 1, 2, tzinfo=UTC),
+        "gap_count": 0,
+        "requested_start": datetime(2026, 1, 1, tzinfo=UTC),
+        "requested_end": datetime(2026, 1, 2, tzinfo=UTC),
+        "equity_curve": '[{"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}]',
+        "benchmark_equity": '[{"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}]',
+        "transactions": "[]",
+    }
+    row.update(overrides)
+    return row
+
+
+class TestPersistedDetail:
+    def test_stopped_reason_benchmark_and_extended_metrics_round_trip(self) -> None:
+        detail = BacktestResultDetail(**_detail_from_row(_db_row(), []))
+        assert detail.stopped_reason == "margin_call"
+        assert detail.benchmark_equity == [
+            {"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}
+        ]
+        m = detail.metrics
+        assert (m.benchmark_return, m.alpha, m.beta) == (4.2, -0.31, 1.7)
+        assert (m.max_consecutive_wins, m.max_consecutive_losses) == (1, 2)
+        assert m.expectancy == -316.67
+
+    def test_unrecorded_extended_metrics_are_null_not_zero(self) -> None:
+        row = _db_row(
+            benchmark_return=None,
+            alpha=None,
+            beta=None,
+            max_consecutive_wins=None,
+            max_consecutive_losses=None,
+            expectancy=None,
+            stopped_reason=None,
+        )
+        metrics = BacktestResultDetail(**_detail_from_row(row, [])).model_dump()["metrics"]
+        for name in ("benchmark_return", "alpha", "beta", "expectancy"):
+            assert metrics[name] is None
+        assert metrics["max_consecutive_losses"] is None
+
+
+# ---------------------------------------------------------------------------
+# List / rename / delete go to the database first
+# ---------------------------------------------------------------------------
+
+
+class _ResultsConn:
+    def __init__(self, rows: dict[str, dict[str, Any]], *, down: bool = False) -> None:
+        self.rows = rows
+        self.down = down
+        self.queries: list[str] = []
+
+    def _check(self, query: str) -> None:
+        self.queries.append(query)
+        if self.down:
+            raise OSError("database unreachable")
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self._check(query)
+        return list(self.rows.values())
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        self._check(query)
+        name, result_id = args
+        row = self.rows.get(result_id)
+        if row is not None:
+            row["name"] = name
+        return row
+
+    async def fetchval(self, query: str, *args: Any) -> str | None:
+        self._check(query)
+        removed = self.rows.pop(args[0], None)
+        return None if removed is None else str(removed["id"])
+
+
+def _results_client(conn: _ResultsConn) -> TestClient:
+    return TestClient(_make_app(pool=_Pool(conn)))
+
+
+class TestResultMutations:
+    def test_delete_during_outage_is_503_and_keeps_row_and_cache(self) -> None:
+        conn = _ResultsConn({"bt-task-db": _db_row()}, down=True)
+        _RESULTS["bt-task-db"] = dict(_CACHED, id="bt-task-db")
+        client = _results_client(conn)
+
+        resp = client.delete("/api/backtest/results/bt-task-db")
+
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
+        assert "bt-task-db" in conn.rows
+        assert "bt-task-db" in _RESULTS
+
+        conn.down = False
+        assert client.delete("/api/backtest/results/bt-task-db").status_code == 204
+        assert conn.rows == {}
+        assert "bt-task-db" not in _RESULTS
+
+    def test_uncached_row_can_be_renamed_and_deleted(self) -> None:
+        conn = _ResultsConn({"bt-task-db": _db_row()})
+        client = _results_client(conn)
+
+        renamed = client.patch("/api/backtest/results/bt-task-db", json={"name": "Renamed"})
+        assert renamed.status_code == 200
+        assert renamed.json()["name"] == "Renamed"
+        assert renamed.json()["provenance"]["bar_count"] == 25
+        assert conn.rows["bt-task-db"]["name"] == "Renamed"
+
+        assert client.delete("/api/backtest/results/bt-task-db").status_code == 204
+        assert conn.rows == {}
+
+    def test_rename_updates_the_cached_copy(self) -> None:
+        conn = _ResultsConn({"bt-task-db": _db_row()})
+        _RESULTS["bt-task-db"] = dict(_CACHED, id="bt-task-db")
+        resp = _results_client(conn).patch(
+            "/api/backtest/results/bt-task-db", json={"name": "Renamed"}
+        )
+        assert resp.status_code == 200
+        assert _RESULTS["bt-task-db"]["name"] == "Renamed"
+
+    def test_missing_row_is_404_envelope(self) -> None:
+        client = _results_client(_ResultsConn({}))
+        for resp in (
+            client.delete("/api/backtest/results/bt-gone"),
+            client.patch("/api/backtest/results/bt-gone", json={"name": "x"}),
+        ):
+            assert resp.status_code == 404
+            assert resp.json()["detail"]["code"] == "result_not_found"
+
+    def test_list_reads_summaries_without_curves(self) -> None:
+        conn = _ResultsConn({"bt-task-db": _db_row()})
+        resp = _results_client(conn).get("/api/backtest/results")
+        assert resp.status_code == 200
+        assert resp.json()[0]["metrics"]["max_consecutive_losses"] == 2
+        (query,) = conn.queries
+        select_list = query.split(" FROM ")[0]
+        for column in ("equity_curve", "benchmark_equity", "transactions"):
+            assert column not in select_list

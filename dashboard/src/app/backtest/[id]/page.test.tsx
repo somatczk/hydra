@@ -81,6 +81,50 @@ describe('BacktestDetailPage', () => {
     expect(page.container.querySelector('[data-state="unknown"]')).not.toBeNull();
   });
 
+  it('shows a persisted margin call and its extended metrics', async () => {
+    const stopped = {
+      ...DETAIL,
+      stopped_reason: 'margin_call',
+      metrics: {
+        ...DETAIL.metrics,
+        alpha: -0.31,
+        beta: 1.7,
+        max_consecutive_wins: 1,
+        max_consecutive_losses: 2,
+        expectancy: -316.67,
+      },
+    };
+    fetchApi.mockImplementation(routeFetch(routes(stopped), calls));
+    page = await mount(<BacktestDetailPage />);
+
+    const text = page.container.textContent ?? '';
+    expect(text).toMatch(/margin call/i);
+    expect(text).toContain('-0.31');
+    expect(text).toContain('1.70');
+    expect(text).toContain('-316.67');
+  });
+
+  it('hides extended metrics that were not recorded instead of showing zeros', async () => {
+    const unrecorded = {
+      ...DETAIL,
+      metrics: {
+        ...DETAIL.metrics,
+        alpha: null,
+        beta: null,
+        max_consecutive_wins: null,
+        max_consecutive_losses: null,
+        expectancy: null,
+      },
+    };
+    fetchApi.mockImplementation(routeFetch(routes(unrecorded), calls));
+    page = await mount(<BacktestDetailPage />);
+
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('Alpha');
+    expect(text).not.toContain('Expectancy');
+    expect(text).not.toContain('Max Consec. Losses');
+  });
+
   it('distinguishes a missing result from an outage', async () => {
     const notFound = new ApiError(
       404,

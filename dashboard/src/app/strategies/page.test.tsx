@@ -74,6 +74,25 @@ describe('StrategiesPage error states', () => {
     expect(row?.querySelector('[data-state="unavailable"]')).not.toBeNull();
   });
 
+  it('shows uncomputed Sharpe and drawdown as unknown, not zero', async () => {
+    const routes = baseRoutes();
+    routes['/api/strategies/saw/performance'] = {
+      total_pnl: 0,
+      win_rate: 0,
+      total_trades: 0,
+      sharpe_ratio: null,
+      max_drawdown: null,
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('0.00Sharpe');
+    expect(text).not.toContain('0.0%Max DD');
+    expect(text).toContain('—Sharpe');
+    expect(text).toContain('—Max DD');
+  });
+
   it('uses the configured paper capital', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
     page = await mount(<StrategiesPage />);

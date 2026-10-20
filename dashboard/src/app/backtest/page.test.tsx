@@ -5,6 +5,7 @@ import { buttonByText, click, flush, mount, unavailable, type Mounted } from '@/
 
 const fetchApi = vi.fn();
 const toast = vi.fn();
+const nav = vi.hoisted(() => ({ search: new URLSearchParams() }));
 
 vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
@@ -13,7 +14,7 @@ vi.mock('@/lib/api', async (orig) => ({
 vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast }) }));
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: vi.fn() }),
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => nav.search,
 }));
 
 const { default: BacktestPage } = await import('./page');
@@ -75,6 +76,7 @@ function serve(overrides: Record<string, Handler> = {}) {
 }
 
 beforeEach(() => {
+  nav.search = new URLSearchParams();
   posts = [];
   fetchApi.mockReset();
   toast.mockReset();
@@ -98,6 +100,25 @@ describe('BacktestPage', () => {
 
     await click(buttonByText(page.container, 'Run Backtest'));
     expect(posts[0]).toMatchObject({ strategy_id: 'saw', timeframe: '4h', start_date: '2026-01-01' });
+  });
+
+  it('Save & Backtest autorun waits for the strategy primary timeframe', async () => {
+    nav.search = new URLSearchParams('strategy=saw&autorun=true');
+    serve({ 'POST /api/backtest/run': () => NO_DATA });
+    page = await mount(<BacktestPage />);
+    await flush();
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ strategy_id: 'saw', timeframe: '4h' });
+  });
+
+  it('autorun does not run a different strategy when the requested one is unknown', async () => {
+    nav.search = new URLSearchParams('strategy=gone&autorun=true');
+    serve({ 'POST /api/backtest/run': () => NO_DATA });
+    page = await mount(<BacktestPage />);
+    await flush();
+
+    expect(posts).toHaveLength(0);
   });
 
   it('shows the 422 no-data message with the stored range, persistently', async () => {
