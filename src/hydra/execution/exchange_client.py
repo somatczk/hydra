@@ -14,40 +14,9 @@ from typing import Any
 
 from hydra.core.metrics import observe_exchange_call, record_ws_reconnect
 from hydra.core.types import Direction, ExchangeId, Position, Symbol
+from hydra.execution.client_factory import EXCHANGE_CLASS_MAP
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Exchange configuration defaults
-# ---------------------------------------------------------------------------
-
-_EXCHANGE_CLASS_MAP: dict[str, str] = {
-    # Futures / derivatives class (used for live trading)
-    "binance": "binanceusdm",
-    "bybit": "bybit",
-    "kraken": "krakenfutures",
-    "okx": "okx",
-    # coinbase and mexc do not offer a separate futures class via CCXT; fall
-    # back to the spot class so the client can still be instantiated.
-    "coinbase": "coinbase",
-    "kucoin": "kucoinfutures",
-    "gateio": "gateio",
-    "mexc": "mexc",
-    "bitget": "bitget",
-}
-
-_SPOT_EXCHANGE_CLASS_MAP: dict[str, str] = {
-    "binance": "binance",
-    "bybit": "bybit",
-    "kraken": "kraken",
-    "okx": "okx",
-    "coinbase": "coinbase",
-    "kucoin": "kucoin",
-    "gateio": "gateio",
-    "mexc": "mexc",
-    "bitget": "bitget",
-}
-
 
 # ---------------------------------------------------------------------------
 # ExchangeClient
@@ -96,7 +65,7 @@ class ExchangeClient:
                 "Install with: pip install 'ccxt[async]'"
             ) from exc
 
-        class_name = _EXCHANGE_CLASS_MAP.get(self._exchange_id, self._exchange_id)
+        class_name = EXCHANGE_CLASS_MAP.get(self._exchange_id, self._exchange_id)
         exchange_cls = getattr(ccxt_async, class_name, None)
         if exchange_cls is None:
             raise ValueError(f"Unknown exchange class: {class_name}")

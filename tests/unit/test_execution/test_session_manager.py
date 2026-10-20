@@ -77,7 +77,7 @@ def _mock_hydra_config() -> MagicMock:
 class TestStartSession:
     @patch("hydra.execution.session_manager.load_config", return_value=_mock_hydra_config())
     @patch.object(SessionManager, "_find_strategy_config", return_value=_mock_strategy_config())
-    @patch("hydra.execution.session_manager.StrategyEngine")
+    @patch("hydra.execution.session_wiring.StrategyEngine")
     async def test_start_session_creates_running_session(
         self,
         mock_engine_cls: MagicMock,
@@ -99,7 +99,7 @@ class TestStartSession:
 
     @patch("hydra.execution.session_manager.load_config", return_value=_mock_hydra_config())
     @patch.object(SessionManager, "_find_strategy_config", return_value=_mock_strategy_config())
-    @patch("hydra.execution.session_manager.StrategyEngine")
+    @patch("hydra.execution.session_wiring.StrategyEngine")
     async def test_start_session_returns_session_id(
         self,
         mock_engine_cls: MagicMock,
@@ -116,7 +116,7 @@ class TestStartSession:
 
     @patch("hydra.execution.session_manager.load_config", return_value=_mock_hydra_config())
     @patch.object(SessionManager, "_find_strategy_config", return_value=_mock_strategy_config())
-    @patch("hydra.execution.session_manager.StrategyEngine")
+    @patch("hydra.execution.session_wiring.StrategyEngine")
     async def test_start_paper_session_uses_paper_executor(
         self,
         mock_engine_cls: MagicMock,
@@ -142,7 +142,7 @@ class TestStartSession:
 class TestStopSession:
     @patch("hydra.execution.session_manager.load_config", return_value=_mock_hydra_config())
     @patch.object(SessionManager, "_find_strategy_config", return_value=_mock_strategy_config())
-    @patch("hydra.execution.session_manager.StrategyEngine")
+    @patch("hydra.execution.session_wiring.StrategyEngine")
     async def test_stop_session_sets_status_stopped(
         self,
         mock_engine_cls: MagicMock,
@@ -169,7 +169,7 @@ class TestStopSession:
 class TestStopAll:
     @patch("hydra.execution.session_manager.load_config", return_value=_mock_hydra_config())
     @patch.object(SessionManager, "_find_strategy_config", return_value=_mock_strategy_config())
-    @patch("hydra.execution.session_manager.StrategyEngine")
+    @patch("hydra.execution.session_wiring.StrategyEngine")
     async def test_stop_all_stops_all_running(
         self,
         mock_engine_cls: MagicMock,
@@ -194,7 +194,7 @@ class TestStopAll:
 class TestDuplicateSession:
     @patch("hydra.execution.session_manager.load_config", return_value=_mock_hydra_config())
     @patch.object(SessionManager, "_find_strategy_config", return_value=_mock_strategy_config())
-    @patch("hydra.execution.session_manager.StrategyEngine")
+    @patch("hydra.execution.session_wiring.StrategyEngine")
     async def test_duplicate_session_raises(
         self,
         mock_engine_cls: MagicMock,
