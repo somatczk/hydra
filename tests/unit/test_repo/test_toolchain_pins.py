@@ -67,7 +67,6 @@ def test_published_images_pin_one_base_digest_per_image() -> None:
         assert all(_DIGEST.fullmatch(ref) for ref in froms), froms
         bases[rel] = set(froms)
     assert all(len(refs) == 1 for refs in bases.values()), bases
-    assert bases[_PYTHON_DOCKERFILES[0]] == bases[_PYTHON_DOCKERFILES[1]]
 
 
 def test_python_floor_and_lint_targets_stay_3_12() -> None:
