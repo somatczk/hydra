@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from hydra.core import metrics
 from hydra.core.events import OrderFillEvent
@@ -83,13 +83,16 @@ class KillSwitchResult:
     flatten_failures: tuple[str, ...] = ()
 
 
+BreakerStatus = Literal["Normal", "Warning", "Tripped"]
+
+
 @dataclass(frozen=True, slots=True)
 class BreakerView:
     tier: int
     label: str
     action: str
     threshold: Decimal
-    status: str
+    status: BreakerStatus
     active_since: datetime | None
     requires_manual_review: bool
 
@@ -629,6 +632,7 @@ class RiskService:
         dd = self._state.current_drawdown
         views: list[BreakerView] = []
         for i, threshold in enumerate(self._cb.thresholds(), start=1):
+            status: BreakerStatus
             if st.tier >= i:
                 status = "Tripped"
             elif dd >= threshold * Decimal("0.8"):
