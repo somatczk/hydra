@@ -100,7 +100,8 @@ interface OrderBook {
   bids: [number, number][];
   asks: [number, number][];
   spread: number;
-  timestamp: string;
+  timestamp: string | null;
+  fetched_at: string;
 }
 
 const ORDER_BOOK_MAX_AGE_MS = 15_000;
@@ -264,7 +265,7 @@ export default function TradingPage() {
         .then((ob) => {
           setOrderBook(ob);
           setBookError(null);
-          setBookTimestampStale(isStale(ob.timestamp, ORDER_BOOK_MAX_AGE_MS));
+          setBookTimestampStale(ob.timestamp !== null && isStale(ob.timestamp, ORDER_BOOK_MAX_AGE_MS));
           setBookReceivedAt(new Date());
         })
         .catch((err) => {
@@ -457,7 +458,15 @@ export default function TradingPage() {
           </div>
 
           {/* Daily PnL vs limit */}
-          {riskStatus && (
+          {fetchErrors.riskStatus ? (
+            <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
+              <div>
+                <p className="text-sm font-medium text-text-primary">Daily PnL vs Limit</p>
+                <p className="text-xs text-text-muted">{describeApiError(fetchErrors.riskStatus, 'Risk status could not be loaded')}</p>
+              </div>
+              <DataStateBadge state={stateFromError(fetchErrors.riskStatus)} />
+            </div>
+          ) : riskStatus && (
             <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
               <div>
                 <p className="text-sm font-medium text-text-primary">Daily PnL vs Limit</p>
@@ -537,7 +546,11 @@ export default function TradingPage() {
       </DataCard>
 
       {/* Active sessions */}
-      {runningSessions.length > 0 && (
+      {fetchErrors.sessions ? (
+        <DataCard title="Running Sessions" description="Currently active trading sessions">
+          <DataStateErrorCard error={fetchErrors.sessions} fallback="Failed to load trading sessions" onRetry={loadData} />
+        </DataCard>
+      ) : runningSessions.length > 0 && (
         <DataCard title="Running Sessions" description="Currently active trading sessions">
           <div className="space-y-2">
             {runningSessions.map((session) => (
@@ -665,7 +678,9 @@ export default function TradingPage() {
                 reason={bookError !== null ? describeApiError(bookError, 'Order book refresh failed') : 'Exchange timestamp is older than 15s'}
               />
               <span className="text-xs text-text-muted">
-                Exchange time {fmtTime(new Date(orderBook.timestamp))}
+                {orderBook.timestamp !== null
+                  ? `Exchange time ${fmtTime(new Date(orderBook.timestamp))}`
+                  : `Fetched ${fmtTime(new Date(orderBook.fetched_at))}`}
               </span>
             </div>
           )}

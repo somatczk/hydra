@@ -43,7 +43,8 @@ class OrderBookSnapshot(BaseModel):
     bids: list[list[float]]  # [[price, qty], ...]
     asks: list[list[float]]  # [[price, qty], ...]
     spread: float
-    timestamp: str
+    timestamp: str | None  # exchange time; None when the exchange does not report one
+    fetched_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -148,15 +149,16 @@ async def _get_market_client(app: FastAPI, exchange_id: str) -> Any:
         return client
 
 
-async def _evict_market_client(app: FastAPI, exchange_id: str) -> None:
+async def _evict_market_client(app: FastAPI, exchange_id: str, client: Any) -> None:
+    """Drop and close the client that failed; a newer cached replacement is left alone."""
     clients, lock = _client_state(app)
     async with lock:
-        client = clients.pop(exchange_id, None)
-    if client is not None:
-        try:
-            await client.close()
-        except Exception:
-            logger.debug("Failed to close market data client for %s", exchange_id, exc_info=True)
+        if clients.get(exchange_id) is client:
+            clients.pop(exchange_id)
+    try:
+        await client.close()
+    except Exception:
+        logger.debug("Failed to close market data client for %s", exchange_id, exc_info=True)
 
 
 async def close_market_clients(app: FastAPI) -> None:
@@ -209,7 +211,7 @@ async def get_order_book(
         ) from exc
     except (BaseError, OSError, TimeoutError) as exc:
         logger.warning("Order book fetch failed for %s/%s", exchange, symbol, exc_info=True)
-        await _evict_market_client(app, exchange)
+        await _evict_market_client(app, exchange, client)
         raise _exchange_unavailable(exchange) from exc
 
     bids = [[float(p), float(q)] for p, q, *_ in ob.get("bids", [])[:depth]]
@@ -217,10 +219,10 @@ async def get_order_book(
     best_bid = bids[0][0] if bids else 0.0
     best_ask = asks[0][0] if asks else 0.0
     ts_ms = ob.get("timestamp")
-    ts = (
-        datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
+    exchange_ts = (
+        datetime.fromtimestamp(ts_ms / 1000, tz=UTC).isoformat()
         if isinstance(ts_ms, int | float)
-        else datetime.now(UTC)
+        else None
     )
     return {
         "symbol": symbol,
@@ -228,7 +230,8 @@ async def get_order_book(
         "bids": bids,
         "asks": asks,
         "spread": round(best_ask - best_bid, 8),
-        "timestamp": ts.isoformat(),
+        "timestamp": exchange_ts,
+        "fetched_at": datetime.now(UTC).isoformat(),
     }
 
 

@@ -10,6 +10,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.signals import _get_webhook_secret
 from hydra.dashboard.routes.system import router
 
@@ -21,6 +22,7 @@ def _make_app(pool: Any = None) -> FastAPI:
     app = FastAPI()
     app.state.db_pool = pool
     app.state.system_config = None
+    install_error_handlers(app)
     app.include_router(router)
     return app
 
@@ -83,6 +85,12 @@ class TestValidation:
 
         resp = client.put("/api/system/config", json=payload)
         assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "validation_error"
+        assert detail["state"] == "invalid"
+        field = next(iter(payload))
+        assert detail["message"].startswith(f"{field}: ")
+        assert detail["errors"][0]["loc"] == ["body", field]
         assert app.state.system_config == before
 
     def test_valid_values_accepted(self) -> None:
@@ -127,6 +135,10 @@ class TestWebhookAllowlist:
             ("discord_webhook_url", "https://discord.com:8443/api/webhooks/x"),
             ("discord_webhook_url", "https://user:pw@discord.com/api/webhooks/x"),
             ("discord_webhook_url", "https://discord.com/not-a-webhook"),
+            ("discord_webhook_url", "https://discord.com/api/webhooks/../../users/@me"),
+            ("discord_webhook_url", "https://discord.com/api/webhooks/./x"),
+            ("discord_webhook_url", "https://discord.com/api/webhooks/%2e%2e/%2E%2E/users/@me"),
+            ("slack_webhook_url", "https://hooks.slack.com/services/../../x"),
             ("slack_webhook_url", _DISCORD),
             ("discord_webhook_url", _SLACK),
         ],
@@ -135,11 +147,32 @@ class TestWebhookAllowlist:
         app = _make_app()
         resp = TestClient(app).put("/api/system/config", json={field: url})
         assert resp.status_code == 422
+        assert url not in resp.text
         assert app.state.system_config is None
+
+    def test_dot_segment_blocked_on_send(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sent: list[str] = []
+
+        async def _post(self: httpx.AsyncClient, url: str, **_: Any) -> httpx.Response:
+            sent.append(url)
+            return httpx.Response(204, request=httpx.Request("POST", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+        app = _make_app()
+        app.state.system_config = {
+            "discord_webhook_url": "https://discord.com/api/webhooks/../../users/@me"
+        }
+        resp = TestClient(app).post("/api/system/notifications/test")
+        assert resp.status_code == 422
+        assert sent == []
 
     @pytest.mark.parametrize(
         ("field", "url"),
-        [("discord_webhook_url", _DISCORD), ("slack_webhook_url", _SLACK)],
+        [
+            ("discord_webhook_url", _DISCORD),
+            ("slack_webhook_url", _SLACK),
+            ("discord_webhook_url", "https://discord.com/api/webhooks/1/a.b..c"),
+        ],
     )
     def test_accepted(self, field: str, url: str) -> None:
         app = _make_app()

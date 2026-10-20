@@ -75,6 +75,19 @@ describe('parseErrorDetail', () => {
     });
   });
 
+  it('reads the server validation envelope', () => {
+    const errors = [{ loc: ['body', 'trading_mode'], msg: "Input should be 'paper' or 'live'", type: 'literal_error' }];
+    const err = envelope(422, {
+      code: 'validation_error',
+      message: "trading_mode: Input should be 'paper' or 'live'",
+      state: 'invalid',
+      errors,
+    });
+    expect(stateFromError(err)).toBe('invalid');
+    expect(describeApiError(err)).toBe("trading_mode: Input should be 'paper' or 'live'");
+    expect(parseErrorDetail(err)?.errors).toEqual(errors);
+  });
+
   it('maps legacy string details by status', () => {
     expect(parseErrorDetail(envelope(404, 'Session abc not found'))).toEqual({
       code: 'http_404',

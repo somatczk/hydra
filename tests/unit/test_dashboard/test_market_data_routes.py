@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import ccxt
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from hydra.dashboard import api
 from hydra.dashboard.routes import market_data
+from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.market_data import close_market_clients, router
 
 _BOOK: dict[str, Any] = {
@@ -24,6 +28,7 @@ _BOOK: dict[str, Any] = {
 class _FakeExchange:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
+        self.book: dict[str, Any] = _BOOK
         self.calls: list[tuple[str, int]] = []
         self.closed = 0
 
@@ -31,7 +36,7 @@ class _FakeExchange:
         self.calls.append((symbol, limit))
         if self.error is not None:
             raise self.error
-        return _BOOK
+        return self.book
 
     async def close(self) -> None:
         self.closed += 1
@@ -58,6 +63,7 @@ def factory(monkeypatch: pytest.MonkeyPatch) -> _Factory:
 def _make_app(pool: Any = None) -> FastAPI:
     app = FastAPI()
     app.state.db_pool = pool
+    install_error_handlers(app)
     app.include_router(router)
     return app
 
@@ -75,7 +81,18 @@ class TestOrderBook:
         assert data["spread"] == 0.5
         assert data["exchange"] == "binance"
         assert data["timestamp"].startswith("2025-10-09T08:53:20")
+        assert data["fetched_at"] > data["timestamp"]
         assert "mock" not in data
+
+    def test_missing_exchange_timestamp_is_null_not_server_time(self, factory: _Factory) -> None:
+        book = {**_BOOK, "timestamp": None}
+        app = _make_app()
+        client = TestClient(app)
+        client.get("/api/market/orderbook")
+        factory.created[0].book = book
+        data = client.get("/api/market/orderbook").json()
+        assert data["timestamp"] is None
+        assert data["fetched_at"].startswith("20")
 
     def test_ccxt_failure_is_503_no_mock(self, factory: _Factory) -> None:
         factory.error = ccxt.NetworkError("binance GET https://api.binance.com 418 I'm a teapot")
@@ -107,7 +124,13 @@ class TestOrderBook:
 
     def test_depth_cap(self, factory: _Factory) -> None:
         client = TestClient(_make_app())
-        assert client.get("/api/market/orderbook?depth=0").status_code == 422
+        resp = client.get("/api/market/orderbook?depth=0")
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "validation_error"
+        assert detail["state"] == "invalid"
+        assert detail["message"].startswith("query.depth: ")
+        assert detail["errors"][0]["loc"] == ["query", "depth"]
         assert client.get("/api/market/orderbook?depth=101").status_code == 422
         assert factory.created == []
         assert client.get("/api/market/orderbook?depth=100").status_code == 200
@@ -127,6 +150,89 @@ class TestOrderBook:
 
     def test_close_market_clients_without_clients_is_noop(self) -> None:
         asyncio.run(close_market_clients(_make_app()))
+
+
+class _ScriptedExchange:
+    """Each fetch_order_book call runs the next scripted step; fails if closed while in flight."""
+
+    def __init__(self, steps: list[Callable[[], Awaitable[None]]]) -> None:
+        self.steps = steps
+        self.closed = 0
+
+    async def fetch_order_book(self, symbol: str, limit: int) -> dict[str, Any]:
+        await self.steps.pop(0)()
+        if self.closed:
+            raise ccxt.NetworkError("session closed")
+        return _BOOK
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class TestConcurrentEviction:
+    async def test_late_failure_does_not_evict_replacement_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        b_started, b_fail, c_started, c_go = (asyncio.Event() for _ in range(4))
+
+        async def b_step() -> None:
+            b_started.set()
+            await b_fail.wait()
+            raise ccxt.NetworkError("late failure")
+
+        async def a_step() -> None:
+            raise ccxt.NetworkError("fast failure")
+
+        async def c_step() -> None:
+            c_started.set()
+            await c_go.wait()
+
+        client0 = _ScriptedExchange([b_step, a_step])
+        client1 = _ScriptedExchange([c_step])
+        made = iter([client0, client1])
+        monkeypatch.setattr(market_data, "_exchange_factory", lambda _id: next(made))
+
+        app = _make_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
+            url = "/api/market/orderbook"
+            b = asyncio.create_task(http.get(url))
+            await b_started.wait()
+            a = await http.get(url)
+            c = asyncio.create_task(http.get(url))
+            await c_started.wait()
+            b_fail.set()
+            b_resp = await b
+            c_go.set()
+            c_resp = await c
+
+        assert a.status_code == 503
+        assert b_resp.status_code == 503
+        assert c_resp.status_code == 200
+        assert client0.closed >= 1
+        assert client1.closed == 0
+        assert app.state.market_data_clients["binance"] is client1
+
+
+class TestLifespanClosesClients:
+    async def test_app_shutdown_closes_cached_clients(self) -> None:
+        names = [
+            "_init_logging",
+            "_init_db_pool",
+            "_load_exchange_credentials",
+            "_init_session_manager",
+            "_run_migrations",
+            "_populate_backtest_cache",
+            "_shutdown_session_manager",
+            "_close_db_pool",
+        ]
+        fake = _FakeExchange()
+        app = FastAPI()
+        with patch.multiple(api, **{n: AsyncMock() for n in names}):
+            async with api._lifespan(app):
+                app.state.market_data_clients = {"binance": fake}
+        assert fake.closed == 1
+        assert app.state.market_data_clients == {}
 
 
 class TestFundingRates:

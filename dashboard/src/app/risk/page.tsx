@@ -23,6 +23,12 @@ import { useToast } from '@/components/ui/Toast';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
 import { describeApiError, stateFromError, type DataState } from '@/lib/apiState';
+import {
+  buildRiskLimitsUpdate,
+  riskLimitsToForm,
+  type RiskLimitField,
+  type RiskLimitsForm,
+} from '@/lib/riskLimits';
 
 /* ---------- Types ---------- */
 
@@ -155,6 +161,7 @@ export default function RiskPage() {
   const [stateError, setStateError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl[]>([]);
+  const [dailyPnlError, setDailyPnlError] = useState<unknown>(null);
   const [isDark, setIsDark] = useState(false);
 
   // VaR estimate
@@ -167,12 +174,9 @@ export default function RiskPage() {
   // Risk config form state: empty until loaded, never pre-filled with defaults
   const [riskConfig, setRiskConfig] = useState<RiskConfig | null>(null);
   const [riskConfigError, setRiskConfigError] = useState<unknown>(null);
-  const [maxPositionPct, setMaxPositionPct] = useState('');
-  const [maxRiskPerTrade, setMaxRiskPerTrade] = useState('');
-  const [maxPortfolioHeat, setMaxPortfolioHeat] = useState('');
-  const [maxDailyLossPct, setMaxDailyLossPct] = useState('');
-  const [maxDrawdownPct, setMaxDrawdownPct] = useState('');
-  const [maxConcurrentPositions, setMaxConcurrentPositions] = useState('');
+  const [limitsForm, setLimitsForm] = useState<RiskLimitsForm | null>(null);
+  const limitsBaselineRef = useRef<RiskLimitsForm | null>(null);
+  const limitsDirtyRef = useRef(false);
   const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
 
@@ -198,17 +202,16 @@ export default function RiskPage() {
         .then((data) => { setVarEstimate(data); setVarState('ok'); })
         .catch((err) => { logger.warn('Risk', 'Failed to fetch VaR', err); setVarState(stateFromError(err)); }),
       fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
-        .then((data) => setDailyPnl(data))
-        .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); }),
+        .then((data) => { setDailyPnl(data); setDailyPnlError(null); })
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); setDailyPnlError(err); }),
       fetchApi<RiskConfig>('/api/risk/config')
         .then((riskCfg) => {
           setRiskConfig(riskCfg);
-          setMaxPositionPct((riskCfg.max_position_pct * 100).toFixed(0));
-          setMaxRiskPerTrade((riskCfg.max_risk_per_trade * 100).toFixed(0));
-          setMaxPortfolioHeat((riskCfg.max_portfolio_heat * 100).toFixed(0));
-          setMaxDailyLossPct((riskCfg.max_daily_loss_pct * 100).toFixed(0));
-          setMaxDrawdownPct((riskCfg.max_drawdown_pct * 100).toFixed(0));
-          setMaxConcurrentPositions(riskCfg.max_concurrent_positions.toString());
+          if (!limitsDirtyRef.current) {
+            const form = riskLimitsToForm(riskCfg);
+            limitsBaselineRef.current = form;
+            setLimitsForm(form);
+          }
           setKillSwitchActive(riskCfg.kill_switch_active);
           setRiskConfigError(null);
         })
@@ -253,20 +256,32 @@ export default function RiskPage() {
     return () => clearInterval(interval);
   }, []);
 
+  const setLimit = (field: RiskLimitField, value: string) => {
+    limitsDirtyRef.current = true;
+    setLimitsForm((prev) => (prev ? { ...prev, [field]: value } : prev));
+  };
+
   const handleSaveRiskConfig = async () => {
+    const baseline = limitsBaselineRef.current;
+    if (!baseline || !limitsForm) return;
+    const result = buildRiskLimitsUpdate(baseline, limitsForm);
+    if (!result.ok) {
+      toast('error', `Invalid value for ${result.field.replace(/_/g, ' ')}`);
+      return;
+    }
+    if (Object.keys(result.update).length === 0) {
+      toast('info', 'No changes to save');
+      return;
+    }
     try {
       await fetchApi('/api/risk/config', {
         method: 'PUT',
-        body: JSON.stringify({
-          max_position_pct: parseFloat(maxPositionPct) / 100,
-          max_risk_per_trade: parseFloat(maxRiskPerTrade) / 100,
-          max_portfolio_heat: parseFloat(maxPortfolioHeat) / 100,
-          max_daily_loss_pct: parseFloat(maxDailyLossPct) / 100,
-          max_drawdown_pct: parseFloat(maxDrawdownPct) / 100,
-          max_concurrent_positions: parseInt(maxConcurrentPositions, 10),
-        }),
+        body: JSON.stringify(result.update),
       });
+      limitsDirtyRef.current = false;
+      limitsBaselineRef.current = limitsForm;
       toast('success', 'Risk configuration saved');
+      void loadRiskData();
     } catch (err) {
       logger.error('Risk', 'Failed to save risk config', err);
       toast('error', describeApiError(err, 'Failed to save risk configuration'));
@@ -476,7 +491,12 @@ export default function RiskPage() {
 
             {/* Daily loss tracker */}
             <DataCard title="Daily Loss Tracker" description="Cumulative losses today">
-              {dailyPnl.length === 0 ? (
+              {dailyPnlError !== null ? (
+                <div className="flex h-48 flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border-default bg-bg-secondary">
+                  <DataStateBadge state={stateFromError(dailyPnlError)} />
+                  <p className="text-sm text-text-muted">{describeApiError(dailyPnlError, 'Daily PnL could not be loaded')}</p>
+                </div>
+              ) : dailyPnl.length === 0 ? (
                 <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
                   <p className="text-sm text-text-muted">No data</p>
                 </div>
@@ -586,55 +606,55 @@ export default function RiskPage() {
             />
           </div>
         )}
-        {riskConfig !== null && (
+        {riskConfig !== null && limitsForm !== null && (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
           <Input
             label="Max Position Size (%)"
             type="number"
-            value={maxPositionPct}
-            onChange={(e) => setMaxPositionPct(e.target.value)}
+            value={limitsForm.max_position_pct}
+            onChange={(e) => setLimit('max_position_pct', e.target.value)}
             hint="Maximum % of portfolio per position"
           />
           <Input
             label="Max Risk Per Trade (%)"
             type="number"
-            value={maxRiskPerTrade}
-            onChange={(e) => setMaxRiskPerTrade(e.target.value)}
+            value={limitsForm.max_risk_per_trade}
+            onChange={(e) => setLimit('max_risk_per_trade', e.target.value)}
             hint="Maximum risk per individual trade"
           />
           <Input
             label="Max Portfolio Heat (%)"
             type="number"
-            value={maxPortfolioHeat}
-            onChange={(e) => setMaxPortfolioHeat(e.target.value)}
+            value={limitsForm.max_portfolio_heat}
+            onChange={(e) => setLimit('max_portfolio_heat', e.target.value)}
             hint="Sum of all position risks as % of portfolio"
           />
           <Input
             label="Max Daily Loss (%)"
             type="number"
-            value={maxDailyLossPct}
-            onChange={(e) => setMaxDailyLossPct(e.target.value)}
+            value={limitsForm.max_daily_loss_pct}
+            onChange={(e) => setLimit('max_daily_loss_pct', e.target.value)}
             hint="Daily loss limit before trading halt"
           />
           <Input
             label="Max Drawdown (%)"
             type="number"
-            value={maxDrawdownPct}
-            onChange={(e) => setMaxDrawdownPct(e.target.value)}
+            value={limitsForm.max_drawdown_pct}
+            onChange={(e) => setLimit('max_drawdown_pct', e.target.value)}
             hint="Maximum drawdown before kill switch"
           />
           <Input
             label="Max Concurrent Positions"
             type="number"
-            value={maxConcurrentPositions}
-            onChange={(e) => setMaxConcurrentPositions(e.target.value)}
+            value={limitsForm.max_concurrent_positions}
+            onChange={(e) => setLimit('max_concurrent_positions', e.target.value)}
             hint="Maximum number of open positions"
           />
         </div>
         )}
         <div className="mt-4 flex items-center justify-end">
           <div className="flex items-center gap-3">
-            <Button variant="primary" onClick={handleSaveRiskConfig} disabled={riskConfig === null}>
+            <Button variant="primary" onClick={handleSaveRiskConfig} disabled={riskConfig === null || limitsForm === null}>
               Save Risk Limits
             </Button>
             {killSwitchActive !== true && (

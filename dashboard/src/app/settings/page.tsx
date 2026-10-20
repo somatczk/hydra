@@ -12,6 +12,7 @@ import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBad
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
+import { CLEAR_WEBHOOK_SECRET_WARNING, TRADING_MODE_OPTIONS } from '@/lib/platformConfig';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDialog';
@@ -664,6 +665,7 @@ export default function SettingsPage() {
                 variant="outline"
                 size="sm"
                 onClick={async () => {
+                  if (!confirm(CLEAR_WEBHOOK_SECRET_WARNING)) return;
                   try {
                     await saveSecrets({ webhook_secret: '' }, 'Webhook secret cleared');
                   } catch (err) {
@@ -795,11 +797,7 @@ export default function SettingsPage() {
               />
               <Select
                 label="Trading Mode"
-                options={[
-                  { value: 'paper', label: 'Paper Trading' },
-                  { value: 'testnet', label: 'Testnet' },
-                  { value: 'live', label: 'Live Trading' },
-                ]}
+                options={[...TRADING_MODE_OPTIONS]}
                 value={tradingMode}
                 onChange={(e) => setTradingMode(e.target.value)}
                 hint="Paper trading mode is recommended for testing"

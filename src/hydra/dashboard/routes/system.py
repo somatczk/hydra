@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
@@ -78,6 +78,8 @@ def _validate_webhook_url(url: str, allowed_host: str) -> str:
         raise ValueError("webhook URL has an invalid port") from exc
     if port not in (None, 443):
         raise ValueError("webhook URL must use the default https port")
+    if {".", ".."} & set(unquote(parts.path).split("/")):
+        raise ValueError("webhook URL path must not contain dot segments")
     if not parts.path.startswith(_WEBHOOK_HOSTS[allowed_host]):
         raise ValueError(f"webhook URL path must start with {_WEBHOOK_HOSTS[allowed_host]}")
     return url

@@ -26,6 +26,7 @@ from hydra.dashboard.routes import (
     templates,
     trading,
 )
+from hydra.dashboard.routes._db import install_error_handlers
 
 # ---------------------------------------------------------------------------
 # Application factory
@@ -62,6 +63,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+install_error_handlers(app)
 
 app.state.system_config = None
 app.state.session_manager = None

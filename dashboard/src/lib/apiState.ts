@@ -1,11 +1,4 @@
-/**
- * Shared reading of API failures.
- *
- * Every non-2xx from the dashboard routes carries
- * `{"detail": {"code", "message", "state", ...extra}}`. FastAPI request
- * validation still returns `{"detail": [{loc, msg, type}]}`; both are handled.
- * No `@/` imports so the helpers stay pure and testable.
- */
+/** Shared reading of the dashboard API error envelope; no `@/` imports so it stays testable. */
 
 export type ServerErrorState =
   | 'unavailable'

@@ -1,8 +1,4 @@
-"""Shared error envelope and database helpers for dashboard routes.
-
-Every non-2xx response raised by a dashboard route carries
-``{"detail": {"code": str, "message": str, "state": ErrorState, ...extra}}``.
-"""
+"""Shared error envelope (``{"detail": {"code", "message", "state", ...}}``) and DB helpers."""
 
 from __future__ import annotations
 
@@ -12,7 +8,10 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import asyncpg
-from fastapi import HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -60,3 +59,38 @@ async def db_errors_to_503(what: str) -> AsyncIterator[None]:
     except DB_ERRORS as exc:
         logger.exception("Database error while %s", what)
         raise database_unavailable(f"Database error while {what}") from exc
+
+
+def _validation_message(errors: list[dict[str, Any]]) -> str:
+    parts = []
+    for err in errors:
+        field = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
+        msg = str(err.get("msg", "invalid value"))
+        parts.append(f"{field}: {msg}" if field else msg)
+    return "; ".join(parts)
+
+
+async def _validation_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+    raw = exc.errors() if isinstance(exc, RequestValidationError) else []
+    errors = [
+        {"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")}
+        for e in raw
+    ]
+    return JSONResponse(
+        status_code=422,
+        content=jsonable_encoder(
+            {
+                "detail": {
+                    "code": "validation_error",
+                    "message": _validation_message(errors),
+                    "state": "invalid",
+                    "errors": errors,
+                }
+            }
+        ),
+    )
+
+
+def install_error_handlers(app: FastAPI) -> None:
+    """Make request-validation 422s use the shared envelope (submitted values are not echoed)."""
+    app.add_exception_handler(RequestValidationError, _validation_error_handler)

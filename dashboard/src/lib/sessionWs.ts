@@ -1,7 +1,4 @@
-/**
- * Session-page WebSocket handling. The server's session detail endpoint is the
- * single source of PnL and win rate, so a fill only triggers a re-fetch.
- */
+/** The server is the single source of session PnL, so a fill only triggers a re-fetch. */
 
 export type SessionWsAction = 'refetch' | 'ignore';
 
