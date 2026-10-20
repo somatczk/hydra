@@ -15,41 +15,21 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
-from hydra.core.config import load_config
+from hydra.core.config import HydraConfig, load_config
 from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import BarEvent, EntrySignal, Event, ExitSignal, OrderFillEvent
-from hydra.core.types import (
-    Direction,
-    ExchangeId,
-    MarketType,
-    OrderRequest,
-    OrderType,
-    Position,
-    Side,
-    Symbol,
-    Timeframe,
-)
+from hydra.core.types import Position, Timeframe
 from hydra.data.ingestion import ExchangeFeedManager
+from hydra.execution import client_factory, session_store, session_wiring
+from hydra.execution.flatten import flatten_session
 from hydra.execution.order_manager import OrderManager
-from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.execution.portfolio_state import build_portfolio_state
 from hydra.risk.pretrade import PortfolioState, PreTradeRiskManager, RiskConfig
 from hydra.strategy.config import StrategyConfig, load_strategy_config
-from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
 
 logger = logging.getLogger(__name__)
-
-
-def _collect_timeframes(cfg: StrategyConfig) -> list[Timeframe]:
-    """Return all timeframes a strategy uses (primary + confirmation + entry)."""
-    tfs = [cfg.timeframes.primary]
-    if cfg.timeframes.confirmation is not None:
-        tfs.append(cfg.timeframes.confirmation)
-    if cfg.timeframes.entry is not None:
-        tfs.append(cfg.timeframes.entry)
-    return tfs
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +81,10 @@ class TradingSession:
 class SessionManager:
     """Registry of all active trading sessions."""
 
-    def __init__(self, db_pool: Any = None) -> None:
+    def __init__(self, db_pool: Any = None, config: HydraConfig | None = None) -> None:
         self._sessions: dict[str, TradingSession] = {}
         self._db_pool = db_pool
+        self._config = config
         self._risk_manager: PreTradeRiskManager | None = None
         self._risk_config: dict = {}
         self._stale_cleanup_task: asyncio.Task[None] | None = None
@@ -168,70 +149,15 @@ class SessionManager:
                 total += s.paper_capital
         return total
 
+    def _hydra_config(self) -> HydraConfig:
+        """Return the injected config, or load it from disk when none was given."""
+        return self._config if self._config is not None else load_config()
+
     # -- Portfolio state builder --------------------------------------------
 
     async def _build_portfolio_state(self, session: TradingSession) -> PortfolioState:
         """Aggregate current portfolio state from executor + DB risk_state."""
-        positions: list[Position] = []
-        balances: dict[str, Decimal] = {}
-        daily_pnl = Decimal("0")
-        consecutive_losses = 0
-        current_drawdown = Decimal("0")
-        portfolio_value = Decimal("10000")
-
-        if session._executor is not None:
-            balances = await session._executor.get_balance()
-            for sym in session.symbols:
-                pos_list = await session._executor.get_positions(sym)
-                positions.extend(pos_list)
-
-        # Sum portfolio value from balances + position notional values
-        balance_total = sum(balances.values(), Decimal("0"))
-        position_value = Decimal("0")
-        for pos in positions:
-            try:
-                price = await session._executor.get_last_price(str(pos.symbol))
-                position_value += pos.quantity * price
-            except Exception:  # nosec B110
-                pass  # price unavailable — skip position valuation
-        portfolio_value = balance_total + position_value
-
-        # Load risk state from DB if available
-        if self._db_pool is not None:
-            try:
-                async with self._db_pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        "SELECT daily_pnl, consecutive_losses, current_drawdown "
-                        "FROM risk_state WHERE scope = 'global'"
-                    )
-                if row:
-                    daily_pnl = Decimal(str(row["daily_pnl"])) if row["daily_pnl"] else Decimal("0")
-                    consecutive_losses = (
-                        int(row["consecutive_losses"]) if row["consecutive_losses"] else 0
-                    )
-                    current_drawdown = (
-                        Decimal(str(row["current_drawdown"]))
-                        if row["current_drawdown"]
-                        else Decimal("0")
-                    )
-            except Exception:
-                logger.debug("Could not load risk_state for session %s", session.session_id)
-
-        try:
-            from hydra.core.metrics import update_portfolio
-
-            update_portfolio(float(portfolio_value), float(current_drawdown), float(daily_pnl))
-        except Exception:
-            pass
-
-        return PortfolioState(
-            positions=positions,
-            balances=balances,
-            daily_pnl=daily_pnl,
-            consecutive_losses=consecutive_losses,
-            current_drawdown=current_drawdown,
-            portfolio_value=portfolio_value,
-        )
+        return await build_portfolio_state(session._executor, session.symbols, self._db_pool)
 
     # -- Public API ----------------------------------------------------------
 
@@ -252,12 +178,9 @@ class SessionManager:
 
         # Check kill switch
         if self._db_pool is not None:
-            async with self._db_pool.acquire() as conn:
-                active = await conn.fetchval(
-                    "SELECT kill_switch_active FROM risk_config WHERE scope = 'global'"
-                )
-                if active:
-                    raise RuntimeError("Kill switch is active — cannot start new sessions")
+            active = await session_store.read_kill_switch(self._db_pool)
+            if active:
+                raise RuntimeError("Kill switch is active — cannot start new sessions")
 
         # Prevent duplicate sessions for the same strategy
         for s in self._sessions.values():
@@ -279,12 +202,7 @@ class SessionManager:
         )
 
         # Wire components
-        event_bus = InMemoryEventBus()
-        context = StrategyContext()
-
-        hydra_config = load_config()
-        engine = StrategyEngine(config=hydra_config, event_bus=event_bus, context=context)
-        await engine.load_strategy_from_config(cfg)
+        event_bus, engine = await session_wiring.build_engine(cfg, self._hydra_config())
 
         executor: Any
         if trading_mode == "paper":
@@ -299,7 +217,7 @@ class SessionManager:
                 )
             paper_capital = effective
             initial_bal = {"USDT": effective}  # per-strategy allocation
-            executor = PaperTradingExecutor(
+            executor = client_factory.build_paper_executor(
                 exchange_id=cfg.exchange.exchange_id,
                 initial_balances=initial_bal,
                 db_pool=self._db_pool,
@@ -307,38 +225,23 @@ class SessionManager:
                 session_id=session_id,
             )
         else:
-            # Live mode: use ExchangeClient (lazy import to avoid CCXT at startup)
-            from hydra.execution.exchange_client import ExchangeClient
-
-            executor = ExchangeClient(
+            executor = client_factory.build_live_executor(
                 exchange_id=cfg.exchange.exchange_id,
                 config=credentials or {},
             )
 
         # Build portfolio state for risk checks
-        session._executor = executor
-        session._event_bus = event_bus
         session.symbols = cfg.symbols
         session.session_id = session_id
-
-        portfolio_state = await self._build_portfolio_state(session)
-
-        async def _state_builder() -> PortfolioState:
-            return await self._build_portfolio_state(session)
-
-        order_manager = OrderManager(
-            executor=executor,
-            event_bus=event_bus,
-            risk_checker=self._risk_manager,
-            portfolio_state=portfolio_state,
-            portfolio_state_builder=_state_builder,
+        await session_wiring.attach_order_path(
+            session,
+            cfg,
+            engine,
+            event_bus,
+            executor,
+            self._risk_manager,
+            self._build_portfolio_state,
         )
-        feed = ExchangeFeedManager(event_bus=event_bus)
-
-        session._engine = engine
-        session._order_manager = order_manager
-        session._feed = feed
-        session._all_timeframes = _collect_timeframes(cfg)
 
         # Start engine
         session.status = "running"
@@ -353,7 +256,7 @@ class SessionManager:
             self._stale_cleanup_task = asyncio.create_task(self._stale_order_cleanup_loop())
 
         # Persist to DB
-        await self._persist_session(session)
+        await session_store.persist_session(self._db_pool, session)
 
         logger.info(
             "Started %s session %s for strategy %s",
@@ -380,22 +283,14 @@ class SessionManager:
 
         # Set kill switch flag in DB
         if self._db_pool is not None:
-            async with self._db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE risk_config SET kill_switch_active = TRUE, "
-                    "updated_at = now() WHERE scope = 'global'"
-                )
+            await session_store.set_kill_switch(self._db_pool, True)
 
         logger.warning("Kill switch activated — stopped %d sessions", len(running))
 
     async def release_kill_switch(self) -> None:
         """Release the kill switch so new sessions can start."""
         if self._db_pool is not None:
-            async with self._db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE risk_config SET kill_switch_active = FALSE, "
-                    "updated_at = now() WHERE scope = 'global'"
-                )
+            await session_store.set_kill_switch(self._db_pool, False)
         logger.info("Kill switch released")
 
     def list_sessions(self) -> list[TradingSession]:
@@ -450,7 +345,7 @@ class SessionManager:
             trades = await session._executor.get_filled_orders()
         else:
             # Stopped/error: load trades from DB
-            trades = await self._load_session_trades(session)
+            trades = await session_store.load_session_trades(self._db_pool, session)
 
         # Compute metrics from trades
         total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
@@ -470,40 +365,6 @@ class SessionManager:
 
         return detail
 
-    async def _load_session_trades(self, session: TradingSession) -> list[dict[str, Any]]:
-        """Load trades from DB for a stopped session."""
-        if self._db_pool is None:
-            return []
-        try:
-            source = session.trading_mode  # 'paper' or 'live'
-            async with self._db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT id, symbol, side, quantity, price, fee, pnl, timestamp
-                    FROM trades
-                    WHERE session_id = $1 AND source = $2
-                    ORDER BY timestamp ASC
-                    """,
-                    session.session_id,
-                    source,
-                )
-                return [
-                    {
-                        "id": str(row["id"]),
-                        "symbol": row["symbol"],
-                        "side": row["side"],
-                        "quantity": float(row["quantity"]) if row["quantity"] else 0,
-                        "price": float(row["price"]) if row["price"] else 0,
-                        "fee": float(row["fee"]) if row["fee"] else 0,
-                        "pnl": float(row["pnl"]) if row["pnl"] else 0,
-                        "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
-                    }
-                    for row in rows
-                ]
-        except Exception:
-            logger.exception("Failed to load trades for session %s", session.session_id)
-            return []
-
     # -- Internal helpers ----------------------------------------------------
 
     def _find_strategy_config(self, strategy_id: str) -> StrategyConfig:
@@ -522,171 +383,15 @@ class SessionManager:
 
         raise KeyError(f"Strategy config not found: {strategy_id}")
 
-    async def _execute_order_actions(
-        self, actions: list, executor: Any, session: TradingSession
-    ) -> None:
-        """Dispatch OrderAction items (PlaceOrder/CancelOrder/ModifyOrder) to the executor."""
-        from hydra.strategy.base import CancelOrder, ModifyOrder, PlaceOrder
-
-        for action in actions:
-            try:
-                if isinstance(action, PlaceOrder):
-                    await executor.create_order(
-                        symbol=action.symbol,
-                        side=action.side,
-                        order_type=action.order_type,
-                        quantity=action.quantity,
-                        price=action.price,
-                        stop_price=action.stop_price,
-                        params=action.params or {},
-                    )
-                elif isinstance(action, CancelOrder):
-                    await executor.cancel_order(action.order_id, action.symbol)
-                elif isinstance(action, ModifyOrder):
-                    await executor.cancel_order(action.order_id, action.symbol)
-                    if action.new_price is not None or action.new_quantity is not None:
-                        await executor.create_order(
-                            symbol=action.symbol,
-                            side="BUY",
-                            order_type="LIMIT",
-                            quantity=action.new_quantity or Decimal("0"),
-                            price=action.new_price,
-                        )
-            except Exception:
-                logger.exception(
-                    "Failed to execute order action %s in session %s",
-                    type(action).__name__,
-                    session.session_id,
-                )
-
     async def _run_session(self, session: TradingSession) -> None:
         """Run the strategy engine in its own task."""
         try:
             if session._engine is not None:
-                await session._engine.start()
-
-                # Wire signal->order bridge
-                if session._event_bus and session._order_manager and session._executor:
-                    om = session._order_manager  # capture for closure
-
-                    async def on_bar_price(event: Event) -> None:
-                        if (
-                            isinstance(event, BarEvent)
-                            and event.ohlcv
-                            and hasattr(session._executor, "set_market_price")
-                        ):
-                            session._executor.set_market_price(
-                                str(event.symbol),
-                                event.ohlcv.close,
-                            )
-
-                    async def on_signal(event: Event) -> None:
-                        order = await self._signal_to_order(event, session)
-                        if order is not None:
-                            try:
-                                await om.submit_order(order)
-                            except ValueError as exc:
-                                logger.warning("Skipped order from signal: %s", exc)
-                            except Exception:
-                                logger.exception("Failed to submit order from signal")
-
-                    await session._event_bus.subscribe("bar", on_bar_price)
-                    await session._event_bus.subscribe("entry_signal", on_signal)
-                    await session._event_bus.subscribe("exit_signal", on_signal)
-
-                    # Forward fill events to risk manager
-                    async def on_fill(event: Event) -> None:
-                        if self._risk_manager and session.status == "running":
-                            pnl = Decimal(str(getattr(event, "pnl", 0) or 0))
-                            balance = await session._executor.get_balance()
-                            portfolio_val = sum(balance.values(), Decimal("0"))
-                            await self._risk_manager.record_fill(pnl, portfolio_val)
-
-                    await session._event_bus.subscribe("order_fill", on_fill)
-
-                    # Publish fills to WebSocket ConnectionManager
-                    async def on_fill_ws(event: Event) -> None:
-                        try:
-                            from hydra.core.websocket import manager
-
-                            fill_data = {
-                                "event": "order_fill",
-                                "session_id": session.session_id,
-                                "order_id": getattr(event, "order_id", ""),
-                                "symbol": str(getattr(event, "symbol", "")),
-                                "side": str(getattr(event, "side", "")),
-                                "quantity": str(getattr(event, "quantity", "0")),
-                                "price": str(getattr(event, "price", "0")),
-                                "fee": str(getattr(event, "fee", "0")),
-                                "timestamp": datetime.now(UTC).isoformat(),
-                            }
-                            await manager.broadcast(f"trades:{session.session_id}", fill_data)
-                        except Exception:
-                            logger.debug("Could not broadcast fill to WebSocket")
-
-                    await session._event_bus.subscribe("order_fill", on_fill_ws)
-
-                # Wire OrderManagementStrategy if applicable
-                if (
-                    session._engine is not None
-                    and session._engine.is_order_management
-                    and session._executor is not None
-                    and session._event_bus is not None
-                ):
-                    from hydra.strategy.base import OrderManagementStrategy
-
-                    for strategy in session._engine.get_all_strategies().values():
-                        if isinstance(strategy, OrderManagementStrategy):
-                            oms = strategy
-                            ex = session._executor
-
-                            # Execute on_start actions
-                            start_actions = await oms.on_start()
-                            if start_actions:
-                                await self._execute_order_actions(start_actions, ex, session)
-
-                            # On bar events: call strategy's on_bar -> execute actions
-                            async def on_bar_oms(
-                                event: Event,
-                                _oms: Any = oms,
-                                _ex: Any = ex,
-                            ) -> None:
-                                if isinstance(event, BarEvent):
-                                    actions = await _oms.on_bar(event)
-                                    if actions:
-                                        await self._execute_order_actions(actions, _ex, session)
-
-                            await session._event_bus.subscribe("bar", on_bar_oms)
-
-                            # On fill events: call strategy's on_fill -> execute follow-ups
-                            async def on_fill_oms(
-                                event: Event,
-                                _oms: Any = oms,
-                                _ex: Any = ex,
-                            ) -> None:
-                                if isinstance(event, OrderFillEvent):
-                                    actions = await _oms.on_fill(event)
-                                    if actions:
-                                        await self._execute_order_actions(actions, _ex, session)
-
-                            await session._event_bus.subscribe("order_fill", on_fill_oms)
-
-                # Start market data feed
-                if session._feed is not None:
-                    eid = cast(ExchangeId, session.exchange_id)
-
-                    def _ccxt_factory() -> Any:
-                        import ccxt.pro
-
-                        cls = getattr(ccxt.pro, session.exchange_id)
-                        return cls({"enableRateLimit": True})
-
-                    session._feed._exchange_factories[eid] = _ccxt_factory
-                    await session._feed.connect(
-                        exchange_id=eid,
-                        symbols=session.symbols,
-                        timeframes=session._all_timeframes or [Timeframe(session.timeframe)],
-                    )
+                await session_wiring.start_session_runtime(
+                    session,
+                    get_risk_manager=lambda: self._risk_manager,
+                    get_risk_config=lambda: self._risk_config,
+                )
 
                 # Start reconciliation loop for live sessions
                 if session.trading_mode == "live":
@@ -704,123 +409,11 @@ class SessionManager:
             session.status = "error"
             session.error_message = str(exc)
             session.stopped_at = datetime.now(UTC)
-            await self._persist_session(session)
-
-    async def _signal_to_order(self, event: Event, session: TradingSession) -> OrderRequest | None:
-        """Convert a signal event into an OrderRequest for the live context."""
-        if isinstance(event, EntrySignal):
-            balance = await session._executor.get_balance()
-            capital = balance.get("USDT", Decimal("0"))
-            if capital <= 0:
-                return None
-
-            # Load max_risk_per_trade from risk config
-            max_risk_per_trade = Decimal(str(self._risk_config.get("max_risk_per_trade", "0.02")))
-
-            price = await session._executor.get_last_price(str(event.symbol))
-            if price <= 0:
-                return None
-
-            # Compute portfolio value from balance for sizing
-            portfolio_value = capital
-            quantity = (portfolio_value * max_risk_per_trade) / price
-            quantity = quantity.quantize(Decimal("0.00000001"))
-            if quantity <= 0:
-                return None
-
-            side = Side.BUY if event.direction == Direction.LONG else Side.SELL
-            return OrderRequest(
-                symbol=Symbol(str(event.symbol)),
-                side=side,
-                order_type=OrderType.MARKET,
-                quantity=quantity,
-                strategy_id=event.strategy_id,
-                exchange_id=event.exchange_id,
-                market_type=event.market_type,
-            )
-
-        if isinstance(event, ExitSignal):
-            positions = await session._executor.get_positions(str(event.symbol))
-            if not positions:
-                return None
-            pos = positions[0]
-            side = Side.SELL if pos.direction == Direction.LONG else Side.BUY
-            close_pct = getattr(event, "close_pct", 1.0)
-            quantity = pos.quantity * Decimal(str(min(max(close_pct, 0.0), 1.0)))
-            return OrderRequest(
-                symbol=Symbol(str(event.symbol)),
-                side=side,
-                order_type=OrderType.MARKET,
-                quantity=quantity,
-                strategy_id=event.strategy_id,
-                exchange_id=event.exchange_id,
-                market_type=MarketType.SPOT,
-            )
-
-        return None
+            await session_store.persist_session(self._db_pool, session)
 
     async def _stop_session_internal(self, session: TradingSession) -> None:
         """Stop a session's engine/task, flatten positions, cancel orders, update state."""
-        # 1. Cancel all open orders
-        if session._order_manager is not None:
-            try:
-                open_ids = [
-                    oid
-                    for oid, t in session._order_manager._orders.items()
-                    if t.status.name in ("PENDING", "SUBMITTED", "PARTIALLY_FILLED")
-                ]
-                for oid in open_ids:
-                    await session._order_manager.cancel_order(oid)
-                if open_ids:
-                    logger.info(
-                        "Cancelled %d open orders in session %s",
-                        len(open_ids),
-                        session.session_id,
-                    )
-            except Exception:
-                logger.exception("Failed to cancel open orders in session %s", session.session_id)
-
-        # 2. Flatten all open positions (market close)
-        if session._executor is not None:
-            try:
-                positions = await session._executor.fetch_positions()
-                for pos in positions:
-                    symbol = pos["symbol"]
-                    side = pos.get("side", "")
-                    qty = abs(float(pos.get("contracts", 0)))
-                    if qty <= 0:
-                        continue
-                    # Close: sell longs, buy shorts
-                    close_side = "sell" if side == "long" else "buy"
-                    await session._executor.create_order(
-                        symbol=symbol,
-                        order_type="market",
-                        side=close_side,
-                        amount=qty,
-                    )
-                    logger.info(
-                        "Closed %s position %.8f %s in session %s",
-                        side,
-                        qty,
-                        symbol,
-                        session.session_id,
-                    )
-            except Exception:
-                logger.exception("Failed to flatten positions in session %s", session.session_id)
-
-            # Re-check: warn if any positions remain open after flatten
-            try:
-                remaining = await session._executor.fetch_positions()
-                remaining = [p for p in remaining if abs(float(p.get("contracts", 0))) > 0]
-                session.positions_at_stop = len(remaining)
-                if remaining:
-                    logger.warning(
-                        "Session %s stopped with %d positions still open",
-                        session.session_id,
-                        len(remaining),
-                    )
-            except Exception:
-                logger.exception("Failed to re-check positions in session %s", session.session_id)
+        await flatten_session(session)
 
         if session._feed is not None:
             await session._feed.disconnect_all()
@@ -840,43 +433,7 @@ class SessionManager:
 
         session.status = "stopped"
         session.stopped_at = datetime.now(UTC)
-        await self._persist_session(session)
-
-    async def _persist_session(self, session: TradingSession) -> None:
-        """Upsert session row to DB."""
-        if self._db_pool is None:
-            return
-        try:
-            async with self._db_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO trading_sessions
-                        (id, strategy_id, trading_mode, status, exchange_id,
-                         symbols, timeframe, paper_capital, started_at,
-                         stopped_at, error_message, positions_at_stop)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                    ON CONFLICT (id) DO UPDATE SET
-                        status = EXCLUDED.status,
-                        started_at = EXCLUDED.started_at,
-                        stopped_at = EXCLUDED.stopped_at,
-                        error_message = EXCLUDED.error_message,
-                        positions_at_stop = EXCLUDED.positions_at_stop
-                    """,
-                    session.session_id,
-                    session.strategy_id,
-                    session.trading_mode,
-                    session.status,
-                    session.exchange_id,
-                    session.symbols,
-                    session.timeframe,
-                    session.paper_capital,
-                    session.started_at,
-                    session.stopped_at,
-                    session.error_message,
-                    session.positions_at_stop,
-                )
-        except Exception:
-            logger.exception("Failed to persist session %s", session.session_id)
+        await session_store.persist_session(self._db_pool, session)
 
     # -- Background tasks ----------------------------------------------------
 
@@ -969,8 +526,7 @@ class SessionManager:
         if self._db_pool is None:
             return
         try:
-            async with self._db_pool.acquire() as conn:
-                rows = await conn.fetch("SELECT * FROM trading_sessions WHERE status = 'running'")
+            rows = await session_store.load_running(self._db_pool)
             for row in rows:
                 sid = row["id"]
 
@@ -996,22 +552,14 @@ class SessionManager:
                         started_at=row["started_at"],
                     )
 
-                    event_bus = InMemoryEventBus()
-                    context = StrategyContext()
-                    hydra_config = load_config()
-                    engine = StrategyEngine(
-                        config=hydra_config,
-                        event_bus=event_bus,
-                        context=context,
-                    )
-                    await engine.load_strategy_from_config(cfg)
+                    event_bus, engine = await session_wiring.build_engine(cfg, self._hydra_config())
 
                     executor: Any
                     if trading_mode == "paper":
                         initial_bal = {
                             "USDT": row["paper_capital"] or Decimal("10000"),
                         }
-                        executor = PaperTradingExecutor(
+                        executor = client_factory.build_paper_executor(
                             exchange_id=cfg.exchange.exchange_id,
                             initial_balances=initial_bal,
                             db_pool=self._db_pool,
@@ -1020,67 +568,24 @@ class SessionManager:
                         )
                     else:
                         # Live recovery: load credentials from DB
-                        from hydra.execution.exchange_client import ExchangeClient
-
-                        creds: dict[str, Any] = {}
-                        try:
-                            from hydra.core.encryption import decrypt
-
-                            async with self._db_pool.acquire() as conn:
-                                cred_row = await conn.fetchrow(
-                                    "SELECT encrypted_key, encrypted_secret, "
-                                    "encrypted_passphrase "
-                                    "FROM exchange_credentials "
-                                    "WHERE exchange_id = $1",
-                                    cfg.exchange.exchange_id,
-                                )
-                            if cred_row:
-                                creds = {
-                                    "apiKey": decrypt(cred_row["encrypted_key"]),
-                                    "secret": decrypt(cred_row["encrypted_secret"]),
-                                }
-                                if cred_row.get("encrypted_passphrase"):
-                                    creds["password"] = decrypt(cred_row["encrypted_passphrase"])
-                            else:
-                                raise ValueError(
-                                    f"No credentials found for exchange {cfg.exchange.exchange_id}"
-                                )
-                        except ValueError:
-                            raise
-                        except Exception as exc:
-                            raise ValueError(
-                                f"Failed to load credentials for exchange "
-                                f"{cfg.exchange.exchange_id}"
-                            ) from exc
-
-                        executor = ExchangeClient(
+                        creds = await client_factory.load_live_credentials(
+                            self._db_pool, cfg.exchange.exchange_id
+                        )
+                        executor = client_factory.build_live_executor(
                             exchange_id=cfg.exchange.exchange_id,
                             config=creds,
                         )
 
                     # Build portfolio state for risk checks
-                    session._executor = executor
-                    session._event_bus = event_bus
-                    portfolio_state = await self._build_portfolio_state(session)
-
-                    async def _recovery_state_builder(
-                        _s: TradingSession = session,
-                    ) -> PortfolioState:
-                        return await self._build_portfolio_state(_s)
-
-                    order_manager = OrderManager(
-                        executor=executor,
-                        event_bus=event_bus,
-                        risk_checker=self._risk_manager,
-                        portfolio_state=portfolio_state,
-                        portfolio_state_builder=_recovery_state_builder,
+                    await session_wiring.attach_order_path(
+                        session,
+                        cfg,
+                        engine,
+                        event_bus,
+                        executor,
+                        self._risk_manager,
+                        self._build_portfolio_state,
                     )
-                    feed = ExchangeFeedManager(event_bus=event_bus)
-
-                    session._engine = engine
-                    session._order_manager = order_manager
-                    session._feed = feed
-                    session._all_timeframes = _collect_timeframes(cfg)
                     task = asyncio.create_task(self._run_session(session))
                     session._task = task
 
@@ -1097,12 +602,7 @@ class SessionManager:
                     if sid in self._sessions:
                         self._sessions[sid].status = "error"
                         self._sessions[sid].error_message = "Recovery failed"
-                    async with self._db_pool.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE trading_sessions SET status = 'error', "
-                            "error_message = 'Recovery failed' WHERE id = $1",
-                            sid,
-                        )
+                    await session_store.mark_recovery_failed(self._db_pool, sid)
         except Exception:
             logger.exception("Failed to query running sessions for recovery")
 
@@ -1111,26 +611,23 @@ class SessionManager:
         if self._db_pool is None:
             return
         try:
-            async with self._db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT * FROM trading_sessions ORDER BY created_at DESC LIMIT 50"
-                )
-                for row in rows:
-                    sid = row["id"]
-                    if sid not in self._sessions:
-                        self._sessions[sid] = TradingSession(
-                            session_id=sid,
-                            strategy_id=row["strategy_id"],
-                            trading_mode=row["trading_mode"],
-                            status=row["status"],
-                            exchange_id=row["exchange_id"],
-                            symbols=row["symbols"],
-                            timeframe=row["timeframe"],
-                            paper_capital=row["paper_capital"],
-                            started_at=row["started_at"],
-                            stopped_at=row["stopped_at"],
-                            error_message=row["error_message"],
-                            positions_at_stop=row.get("positions_at_stop", 0),
-                        )
+            rows = await session_store.load_recent(self._db_pool)
+            for row in rows:
+                sid = row["id"]
+                if sid not in self._sessions:
+                    self._sessions[sid] = TradingSession(
+                        session_id=sid,
+                        strategy_id=row["strategy_id"],
+                        trading_mode=row["trading_mode"],
+                        status=row["status"],
+                        exchange_id=row["exchange_id"],
+                        symbols=row["symbols"],
+                        timeframe=row["timeframe"],
+                        paper_capital=row["paper_capital"],
+                        started_at=row["started_at"],
+                        stopped_at=row["stopped_at"],
+                        error_message=row["error_message"],
+                        positions_at_stop=row.get("positions_at_stop", 0),
+                    )
         except Exception:
             logger.exception("Failed to load recent sessions from DB")
