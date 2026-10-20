@@ -1,323 +1,379 @@
-"""Tests for hydra.core.config — YAML loading, env var substitution, layered config."""
+"""hydra.core.config: one model, env > overlay > base > defaults, fail-fast on bad files."""
 
 from __future__ import annotations
 
-import logging
+import os
 import textwrap
+from ipaddress import IPv4Network
 from pathlib import Path
 
 import pytest
 import yaml
+from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 from hydra.core.config import (
     _DEFAULT_CONFIG_DIR,
+    ConfigError,
     HydraConfig,
     _deep_merge,
-    _substitute_env_vars,
     load_config,
 )
 
-# ---------------------------------------------------------------------------
-# Env var substitution
-# ---------------------------------------------------------------------------
+ROMULUS_DSN = "postgresql://hydra:pw@hydra-timescaledb:5432/hydra"
 
 
-class TestEnvVarSubstitution:
-    def test_simple_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("MY_VAR", "hello")
-        assert _substitute_env_vars("${MY_VAR}") == "hello"
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in list(os.environ):
+        if name.startswith("HYDRA_") or name in {"DATABASE_URL", "REDIS_URL"}:
+            monkeypatch.delenv(name)
 
-    def test_var_with_default(self) -> None:
-        # Unset var should fall back to default
-        result = _substitute_env_vars("${NONEXISTENT_VAR_12345:fallback}")
-        assert result == "fallback"
 
-    def test_var_with_empty_default(self) -> None:
-        result = _substitute_env_vars("${NONEXISTENT_VAR_12345:}")
-        assert result == ""
+def _write(directory: Path, name: str, body: str) -> Path:
+    path = directory / name
+    path.write_text(textwrap.dedent(body))
+    return path
 
-    def test_no_default_no_env(self) -> None:
-        # Should leave placeholder unchanged
-        result = _substitute_env_vars("${NEVER_SET_VAR_XYZ}")
-        assert result == "${NEVER_SET_VAR_XYZ}"
 
-    def test_multiple_vars_in_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HOST", "localhost")
-        monkeypatch.setenv("PORT", "5432")
-        result = _substitute_env_vars("${HOST}:${PORT}")
-        assert result == "localhost:5432"
-
-    def test_env_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("MY_VAR", "from_env")
-        result = _substitute_env_vars("${MY_VAR:default}")
-        assert result == "from_env"
+def _loc_types(exc: ValidationError) -> set[tuple[tuple[str | int, ...], str]]:
+    return {(tuple(e["loc"]), e["type"]) for e in exc.errors()}
 
 
 # ---------------------------------------------------------------------------
-# Deep merge
+# The repo config and the romulus engine env
 # ---------------------------------------------------------------------------
 
 
-class TestDeepMerge:
-    def test_simple_merge(self) -> None:
-        base = {"a": 1, "b": 2}
-        override = {"b": 3, "c": 4}
-        result = _deep_merge(base, override)
-        assert result == {"a": 1, "b": 3, "c": 4}
+class TestRepoConfig:
+    def test_romulus_engine_env_loads_repo_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("DATABASE_URL", ROMULUS_DSN)
+        monkeypatch.setenv("REDIS_URL", "redis://hydra-redis:6379")
+        monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", key)
+        monkeypatch.setenv("HYDRA_API__CORS_ORIGINS", "https://trading.example.com")
+        monkeypatch.setenv("TZ", "Europe/London")
+        monkeypatch.setenv("BINANCE_API_KEY", "x")
 
-    def test_nested_merge(self) -> None:
-        base = {"a": {"x": 1, "y": 2}, "b": 10}
-        override = {"a": {"y": 99, "z": 3}}
-        result = _deep_merge(base, override)
-        assert result == {"a": {"x": 1, "y": 99, "z": 3}, "b": 10}
+        cfg = load_config()
 
-    def test_override_replaces_non_dict(self) -> None:
-        base = {"a": [1, 2]}
-        override = {"a": [3]}
-        result = _deep_merge(base, override)
-        assert result == {"a": [3]}
-
-
-# ---------------------------------------------------------------------------
-# YAML loading
-# ---------------------------------------------------------------------------
-
-
-class TestLoadConfig:
-    def test_load_base_config(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text(
-            textwrap.dedent("""\
-            database:
-              host: myhost
-              port: 5433
-            trading:
-              testnet: true
-        """)
-        )
-
-        cfg = load_config(env="base", config_dir=tmp_path)
-        assert isinstance(cfg, HydraConfig)
-        assert cfg.database.host == "myhost"
-        assert cfg.database.port == 5433
+        assert cfg.database_url is not None
+        assert cfg.database_url.get_secret_value() == ROMULUS_DSN
+        assert cfg.redis_url is not None
+        assert cfg.redis_url.get_secret_value() == "redis://hydra-redis:6379"
+        assert cfg.credential_key is not None
+        assert cfg.credential_key.get_secret_value() == key
+        assert cfg.api.cors_origins == ["https://trading.example.com"]
+        assert cfg.trading.paper_trading is True
         assert cfg.trading.testnet is True
+        assert cfg.logging.level == "INFO"
+        assert cfg.ml.inference_timeout_ms == 5
 
-    def test_layered_config(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text(
-            textwrap.dedent("""\
-            database:
-              host: basehost
-              port: 5432
-            trading:
-              testnet: true
-              paper_trading: true
-        """)
-        )
+    def test_secrets_do_not_leak_into_repr(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DATABASE_URL", ROMULUS_DSN)
+        monkeypatch.setenv("REDIS_URL", "redis://:R3disPw@hydra-redis:6379")
+        monkeypatch.setenv("HYDRA_API_TOKEN", "t" * 40)
+        cfg = load_config()
+        for text in (repr(cfg), str(cfg.model_dump())):
+            assert "pw@" not in text
+            assert "R3disPw" not in text
+            assert "t" * 40 not in text
 
-        live = tmp_path / "live.yaml"
-        live.write_text(
-            textwrap.dedent("""\
-            trading:
-              testnet: false
-              paper_trading: false
-        """)
-        )
+    @pytest.mark.parametrize(
+        "path", sorted(_DEFAULT_CONFIG_DIR.glob("*.yaml")), ids=lambda p: p.name
+    )
+    def test_every_repo_yaml_loads_as_overlay(self, path: Path) -> None:
+        assert isinstance(load_config(env=path.stem), HydraConfig)
 
-        cfg = load_config(env="live", config_dir=tmp_path)
-        assert cfg.database.host == "basehost"  # from base
-        assert cfg.trading.testnet is False  # overridden by live
-        assert cfg.trading.paper_trading is False
+    def test_repo_config_dir_holds_only_base_yaml(self) -> None:
+        assert sorted(p.name for p in _DEFAULT_CONFIG_DIR.glob("*.yaml")) == ["base.yaml"]
 
-    def test_env_var_substitution_in_yaml(
+    def test_repo_base_yaml_has_no_placeholders(self) -> None:
+        assert "${" not in (_DEFAULT_CONFIG_DIR / "base.yaml").read_text()
+
+    def test_hydra_config_dir_and_env_select_files(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("TEST_DB_HOST", "envhost")
-        monkeypatch.setenv("TEST_DB_PORT", "9999")
+        _write(tmp_path, "base.yaml", "trading:\n  testnet: true\n")
+        _write(tmp_path, "staging.yaml", "trading:\n  testnet: false\n")
+        monkeypatch.setenv("HYDRA_CONFIG_DIR", str(tmp_path))
+        monkeypatch.setenv("HYDRA_ENV", "staging")
+        assert load_config().trading.testnet is False
 
-        base = tmp_path / "base.yaml"
-        base.write_text(
-            textwrap.dedent("""\
-            database:
-              host: ${TEST_DB_HOST}
-              port: ${TEST_DB_PORT}
-        """)
-        )
 
-        cfg = load_config(env="base", config_dir=tmp_path)
-        assert cfg.database.host == "envhost"
-        assert cfg.database.port == 9999
+# ---------------------------------------------------------------------------
+# Precedence: env > overlay > base > defaults
+# ---------------------------------------------------------------------------
 
-    def test_env_var_with_default_in_yaml(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text(
-            textwrap.dedent("""\
-            logging:
-              level: ${LOG_LEVEL_NONEXISTENT:WARNING}
-              format: ${LOG_FORMAT_NONEXISTENT:colored}
-        """)
-        )
 
-        cfg = load_config(env="base", config_dir=tmp_path)
-        assert cfg.logging.level == "WARNING"
-        assert cfg.logging.format == "colored"
-
-    def test_missing_env_yaml_is_ok(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text(
-            textwrap.dedent("""\
+class TestPrecedence:
+    def test_env_beats_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _write(
+            tmp_path,
+            "base.yaml",
+            """\
             trading:
               testnet: true
-        """)
+              default_symbols: [ETHUSDT]
+            ml:
+              models_dir: /a
+            """,
         )
-        # "staging.yaml" doesn't exist — should not raise
-        cfg = load_config(env="staging", config_dir=tmp_path)
-        assert cfg.trading.testnet is True
-
-    def test_empty_base_yaml(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text("")
+        monkeypatch.setenv("HYDRA_TRADING__TESTNET", "false")
+        monkeypatch.setenv("HYDRA_ML__MODELS_DIR", "/b")
         cfg = load_config(env="base", config_dir=tmp_path)
-        # Defaults should apply
-        assert isinstance(cfg, HydraConfig)
-        assert cfg.trading.testnet is True
-
-    def test_no_base_yaml(self, tmp_path: Path) -> None:
-        # No files at all — defaults
-        cfg = load_config(env="base", config_dir=tmp_path)
-        assert isinstance(cfg, HydraConfig)
-
-
-# ---------------------------------------------------------------------------
-# Nested config sections
-# ---------------------------------------------------------------------------
-
-
-class TestNestedConfigs:
-    def test_database_dsn(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text(
-            textwrap.dedent("""\
-            database:
-              host: db.example.com
-              port: 5432
-              name: hydra
-              user: admin
-              password: secret
-        """)
-        )
-        cfg = load_config(env="base", config_dir=tmp_path)
-        assert cfg.database.dsn == "postgresql+asyncpg://admin:secret@db.example.com:5432/hydra"
-
-    def test_exchanges_config(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text(
-            textwrap.dedent("""\
-            exchanges:
-              binance:
-                api_key: mykey
-                api_secret: mysecret
-                market_types:
-                  - spot
-                  - futures
-        """)
-        )
-        cfg = load_config(env="base", config_dir=tmp_path)
-        assert "binance" in cfg.exchanges
-        assert cfg.exchanges["binance"].api_key == "mykey"
-        assert cfg.exchanges["binance"].market_types == ["spot", "futures"]
-
-    def test_all_sections_present(self, tmp_path: Path) -> None:
-        base = tmp_path / "base.yaml"
-        base.write_text("")
-        cfg = load_config(env="base", config_dir=tmp_path)
-        assert cfg.database is not None
-        assert cfg.redis is not None
-        assert cfg.trading is not None
-        assert cfg.logging is not None
-        assert cfg.api is not None
-        assert cfg.ml is not None
-
-    def test_real_base_config_loads(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Verify the actual repo base.yaml loads with env vars set."""
-        monkeypatch.setenv("HYDRA_DB_HOST", "localhost")
-        monkeypatch.setenv("HYDRA_DB_PORT", "5432")
-        monkeypatch.setenv("HYDRA_DB_NAME", "hydra")
-        monkeypatch.setenv("HYDRA_DB_USER", "hydra")
-        monkeypatch.setenv("HYDRA_DB_PASSWORD", "test")
-        monkeypatch.setenv("HYDRA_REDIS_URL", "redis://localhost:6379")
-        cfg = load_config(env="base")
-        assert cfg.trading.testnet is True
-        assert cfg.trading.default_symbols == ["BTCUSDT"]
-
-
-# ---------------------------------------------------------------------------
-# Retired telegram section (legacy-key shim)
-# ---------------------------------------------------------------------------
-
-
-def _config_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [
-        r for r in caplog.records if r.name == "hydra.core.config" and r.levelno == logging.WARNING
-    ]
-
-
-class TestRetiredTelegramKey:
-    def test_model_has_no_telegram_field(self) -> None:
-        assert "telegram" not in HydraConfig.model_fields
-
-    def test_real_base_config_has_no_telegram_section(self) -> None:
-        raw = yaml.safe_load((_DEFAULT_CONFIG_DIR / "base.yaml").read_text())
-        assert "telegram" not in raw
-
-    def test_legacy_telegram_key_is_dropped_with_one_warning(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        (tmp_path / "base.yaml").write_text(
-            textwrap.dedent("""\
-            telegram:
-              bot_token: x
-              chat_id: y
-            trading:
-              testnet: false
-        """)
-        )
-        with caplog.at_level(logging.WARNING, logger="hydra.core.config"):
-            cfg = load_config(env="base", config_dir=tmp_path)
-        assert not hasattr(cfg, "telegram")
         assert cfg.trading.testnet is False
-        warnings = _config_warnings(caplog)
-        assert len(warnings) == 1
-        assert "telegram" in warnings[0].getMessage()
+        assert cfg.ml.models_dir == "/b"
+        assert cfg.trading.default_symbols == ["ETHUSDT"]
 
-    def test_legacy_telegram_key_in_env_overlay_is_dropped(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        (tmp_path / "base.yaml").write_text("telegram:\n  bot_token: x\n")
-        (tmp_path / "live.yaml").write_text("telegram:\n  chat_id: y\n")
-        with caplog.at_level(logging.WARNING, logger="hydra.core.config"):
-            cfg = load_config(env="live", config_dir=tmp_path)
-        assert not hasattr(cfg, "telegram")
-        assert len(_config_warnings(caplog)) == 1
+    def test_overlay_beats_base_and_keeps_siblings(self, tmp_path: Path) -> None:
+        _write(tmp_path, "base.yaml", "trading:\n  testnet: true\n  paper_trading: true\n")
+        _write(tmp_path, "live.yaml", "trading:\n  testnet: false\n")
+        cfg = load_config(env="live", config_dir=tmp_path)
+        assert cfg.trading.testnet is False
+        assert cfg.trading.paper_trading is True
 
-    def test_empty_legacy_telegram_key_is_dropped(self, tmp_path: Path) -> None:
-        (tmp_path / "base.yaml").write_text("telegram:\n")
+    def test_env_beats_overlay(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _write(tmp_path, "base.yaml", "logging:\n  level: INFO\n")
+        _write(tmp_path, "dev.yaml", "logging:\n  level: DEBUG\n")
+        monkeypatch.setenv("HYDRA_LOGGING__LEVEL", "warning")
+        assert load_config(env="dev", config_dir=tmp_path).logging.level == "WARNING"
+
+    def test_defaults_fill_an_empty_base(self, tmp_path: Path) -> None:
+        _write(tmp_path, "base.yaml", "")
         cfg = load_config(env="base", config_dir=tmp_path)
-        assert not hasattr(cfg, "telegram")
+        assert cfg.trading.testnet is True
+        assert cfg.api.port == 8000
+        assert cfg.database_url is None
 
-    def test_no_warning_without_telegram_key(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        (tmp_path / "base.yaml").write_text("trading:\n  testnet: true\n")
-        with caplog.at_level(logging.WARNING, logger="hydra.core.config"):
-            load_config(env="base", config_dir=tmp_path)
-        assert _config_warnings(caplog) == []
+    def test_deep_merge(self) -> None:
+        merged = _deep_merge({"a": {"x": 1, "y": 2}, "b": [1, 2]}, {"a": {"y": 9}, "b": [3]})
+        assert merged == {"a": {"x": 1, "y": 9}, "b": [3]}
 
-    @pytest.mark.parametrize("key", ["telegrm", "Telegram", "slack"])
-    def test_other_unknown_top_level_keys_still_fail(self, tmp_path: Path, key: str) -> None:
-        (tmp_path / "base.yaml").write_text(f"{key}:\n  bot_token: x\n")
+
+# ---------------------------------------------------------------------------
+# Fail-fast: unknown keys, placeholders, retired and env-only keys
+# ---------------------------------------------------------------------------
+
+
+class TestFailFast:
+    def test_nested_unknown_key_fails(self, tmp_path: Path) -> None:
+        _write(tmp_path, "base.yaml", "trading:\n  tesnet: false\n")
         with pytest.raises(ValidationError) as exc_info:
             load_config(env="base", config_dir=tmp_path)
-        errors = exc_info.value.errors()
-        assert any(e["loc"] == (key,) and e["type"] == "extra_forbidden" for e in errors)
+        assert (("trading", "tesnet"), "extra_forbidden") in _loc_types(exc_info.value)
+
+    def test_platform_version_key_fails(self, tmp_path: Path) -> None:
+        _write(tmp_path, "base.yaml", "platform:\n  name: hydra\n  version: '0.1.0'\n")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config(env="base", config_dir=tmp_path)
+        assert (("platform", "version"), "extra_forbidden") in _loc_types(exc_info.value)
+
+    def test_telegram_key_now_fails(self, tmp_path: Path) -> None:
+        _write(tmp_path, "base.yaml", "telegram:\n  bot_token: x\n")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config(env="base", config_dir=tmp_path)
+        assert (("telegram",), "extra_forbidden") in _loc_types(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("body", "env_var"),
+        [
+            ("database:\n  host: x\n", "DATABASE_URL"),
+            ("redis:\n  url: redis://x\n", "REDIS_URL"),
+            ("database_url: postgresql://x/y\n", "DATABASE_URL"),
+            ("DATABASE_URL: postgresql://x/y\n", "DATABASE_URL"),
+            ("credential_key: abc\n", "HYDRA_CREDENTIAL_KEY"),
+            ("api_token: abc\n", "HYDRA_API_TOKEN"),
+            ("exchanges: {}\n", "Settings page"),
+        ],
+    )
+    def test_infra_keys_rejected_in_yaml(self, tmp_path: Path, body: str, env_var: str) -> None:
+        path = _write(tmp_path, "base.yaml", body)
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(env="base", config_dir=tmp_path)
+        assert env_var in str(exc_info.value)
+        assert str(path) in str(exc_info.value)
+
+    def test_unresolved_placeholder_is_an_error(self, tmp_path: Path) -> None:
+        path = _write(tmp_path, "base.yaml", "api:\n  host: ${NOPE_X}\n")
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(env="base", config_dir=tmp_path)
+        assert "NOPE_X" in str(exc_info.value)
+        assert str(path) in str(exc_info.value)
+
+    def test_placeholder_resolves_from_env_or_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write(tmp_path, "base.yaml", "api:\n  host: ${API_HOST_X}\n  port: ${API_PORT_X:8123}\n")
+        monkeypatch.setenv("API_HOST_X", "127.0.0.2")
+        cfg = load_config(env="base", config_dir=tmp_path)
+        assert cfg.api.host == "127.0.0.2"
+        assert cfg.api.port == 8123
+
+    def test_missing_named_overlay_is_an_error(self, tmp_path: Path) -> None:
+        _write(tmp_path, "base.yaml", "")
+        with pytest.raises(ConfigError, match=r"staging\.yaml"):
+            load_config(env="staging", config_dir=tmp_path)
+
+    def test_missing_base_is_an_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match=r"base\.yaml"):
+            load_config(env="base", config_dir=tmp_path)
+
+    def test_bad_env_value_fails(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _write(tmp_path, "base.yaml", "")
+        monkeypatch.setenv("HYDRA_API__PORT", "not-a-port")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config(env="base", config_dir=tmp_path)
+        assert ("api", "port") in {loc for loc, _ in _loc_types(exc_info.value)}
+
+    def test_database_url_must_be_postgres(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DATABASE_URL", "mysql://x/y")
+        with pytest.raises(ValidationError, match="postgresql"):
+            load_config()
+
+    def test_validation_errors_do_not_print_secrets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_API_TOKEN", "tok_SECRETabcdefghijklmnopqrstu")
+        monkeypatch.setenv("DATABASE_URL", "mysql://hydra:S3cretPassw0rd@db:5432/hydra")
+        monkeypatch.setenv("REDIS_URL", "http://:R3disPw@redis:6379")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config()
+        text = str(exc_info.value)
+        assert {loc for loc, _ in _loc_types(exc_info.value)} >= {
+            ("HYDRA_API_TOKEN",),
+            ("DATABASE_URL",),
+            ("REDIS_URL",),
+        }
+        for secret in ("SECRETabc", "tPassw0rd", "S3cret", "R3disPw"):
+            assert secret not in text
+
+    def test_model_level_error_does_not_print_the_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("DATABASE_URL", ROMULUS_DSN)
+        monkeypatch.setenv("REDIS_URL", "redis://hydra-redis:6379")
+        monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", key)
+        monkeypatch.setenv("HYDRA_API__AUTH_MODE", "token")
+        with pytest.raises(ValidationError, match="HYDRA_API_TOKEN") as exc_info:
+            load_config()
+        text = str(exc_info.value)
+        assert key[-12:] not in text
+        assert key[:12] not in text
+        assert "pw@" not in text
+
+
+# ---------------------------------------------------------------------------
+# HYDRA_* variables outside the model
+# ---------------------------------------------------------------------------
+
+
+class TestHydraEnvNames:
+    @pytest.mark.parametrize(
+        ("name", "replacement"),
+        [
+            ("HYDRA_TESTNET", "HYDRA_TRADING__TESTNET"),
+            ("HYDRA_CORS_ORIGINS", "HYDRA_API__CORS_ORIGINS"),
+            ("HYDRA_AUTH_MODE", "HYDRA_API__AUTH_MODE"),
+            ("HYDRA_TRUSTED_PROXY_CIDRS", "HYDRA_API__TRUSTED_PROXY_CIDRS"),
+            ("HYDRA_LOG_LEVEL", "HYDRA_LOGGING__LEVEL"),
+            ("HYDRA_DATABASE_DSN", "DATABASE_URL"),
+        ],
+    )
+    def test_retired_name_fails_with_its_replacement(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, replacement: str
+    ) -> None:
+        monkeypatch.setenv(name, "dev")
+        with pytest.raises(ConfigError, match=rf"^{name} is no longer read; set {replacement}"):
+            load_config()
+
+    @pytest.mark.parametrize("name", ["HYDRA_TRADING_TESTNET", "HYDRA_FOO__BAR", "hydra_typo"])
+    def test_unknown_name_fails(self, monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+        monkeypatch.setenv(name, "x")
+        with pytest.raises(ConfigError, match=rf"^{name} is not a Hydra setting"):
+            load_config()
+
+    def test_known_names_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name, value in {
+            "HYDRA_ENV": "base",
+            "HYDRA_CONFIG_DIR": str(_DEFAULT_CONFIG_DIR),
+            "HYDRA_REQUIRE_INFRA": "1",
+            "HYDRA_DB_HOST": "localhost",
+            "HYDRA_REDIS_URL": "redis://localhost:6379",
+            "HYDRA_TRADING_MODE": "paper",
+            "HYDRA_MAX_STRATEGIES": "5",
+            "HYDRA_DEFAULT_PAIR": "BTC/USDT",
+            "HYDRA_DEFAULT_TIMEFRAME": "1h",
+            "hydra_api__port": "9001",
+        }.items():
+            monkeypatch.setenv(name, value)
+        assert load_config().api.port == 9001
+
+
+# ---------------------------------------------------------------------------
+# API auth fields (validated now, enforced by the API security layer)
+# ---------------------------------------------------------------------------
+
+
+class TestApiAuthFields:
+    def test_defaults(self) -> None:
+        cfg = load_config()
+        assert cfg.api.auth_mode == "proxy"
+        assert cfg.api.trusted_proxy_cidrs == []
+        assert cfg.api.cors_origins == ["http://localhost:3000", "http://127.0.0.1:3000"]
+        assert cfg.api_token is None
+
+    def test_env_lists_are_comma_separated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_API__CORS_ORIGINS", "https://a.example, https://b.example")
+        monkeypatch.setenv("HYDRA_API__TRUSTED_PROXY_CIDRS", "10.10.16.0/24,fd00::/64")
+        monkeypatch.setenv("HYDRA_TRADING__DEFAULT_SYMBOLS", "BTCUSDT, ETHUSDT")
+        cfg = load_config()
+        assert cfg.trading.default_symbols == ["BTCUSDT", "ETHUSDT"]
+        assert cfg.api.cors_origins == ["https://a.example", "https://b.example"]
+        assert cfg.api.trusted_proxy_cidrs[0] == IPv4Network("10.10.16.0/24")
+        assert str(cfg.api.trusted_proxy_cidrs[1]) == "fd00::/64"
+
+    @pytest.mark.parametrize("origin", ["*", "https://*.example.com", "trading.example.com"])
+    def test_bad_cors_origin_fails(self, monkeypatch: pytest.MonkeyPatch, origin: str) -> None:
+        monkeypatch.setenv("HYDRA_API__CORS_ORIGINS", origin)
+        with pytest.raises(ValidationError) as exc_info:
+            load_config()
+        assert ("api", "cors_origins") in {loc for loc, _ in _loc_types(exc_info.value)}
+
+    def test_invalid_cidr_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_API__TRUSTED_PROXY_CIDRS", "10.0.0.1/33")
+        with pytest.raises(ValidationError):
+            load_config()
+
+    @pytest.mark.parametrize("cidrs", ["0.0.0.0/0", "10.10.16.0/24,::/0"])
+    def test_catch_all_cidr_fails(self, monkeypatch: pytest.MonkeyPatch, cidrs: str) -> None:
+        monkeypatch.setenv("HYDRA_API__TRUSTED_PROXY_CIDRS", cidrs)
+        with pytest.raises(ValidationError, match="trusts every peer") as exc_info:
+            load_config()
+        assert ("api", "trusted_proxy_cidrs") in {loc for loc, _ in _loc_types(exc_info.value)}
+
+    def test_unknown_auth_mode_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_API__AUTH_MODE", "none")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config()
+        assert (("api", "auth_mode"), "literal_error") in _loc_types(exc_info.value)
+
+    def test_short_api_token_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_API_TOKEN", "short")
+        with pytest.raises(ValidationError, match="32 characters"):
+            load_config()
+
+    def test_token_mode_needs_a_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_API__AUTH_MODE", "token")
+        with pytest.raises(ValidationError, match="HYDRA_API_TOKEN"):
+            load_config()
+        monkeypatch.setenv("HYDRA_API_TOKEN", "x" * 32)
+        cfg = load_config()
+        assert cfg.api.auth_mode == "token"
+        assert cfg.api_token is not None
+        assert cfg.api_token.get_secret_value() == "x" * 32
+
+
+def test_repo_base_yaml_sections_match_model() -> None:
+    raw = yaml.safe_load((_DEFAULT_CONFIG_DIR / "base.yaml").read_text())
+    assert set(raw) <= set(HydraConfig.model_fields)
+    assert "telegram" not in raw

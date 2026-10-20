@@ -1,7 +1,6 @@
-# Local approximation only; romulus/stacks/hydra/compose.yml is the deployment. Until P1 config the engine
-# ignores the HYDRA_DB_*/HYDRA_REDIS_URL/HYDRA_LOG_* names below (it reads DATABASE_URL etc.), so it has no DB pool,
-# and the dashboard image's /api rewrite targets its own localhost:8000 whatever NEXT_PUBLIC_API_URL says.
-# Usage: docker compose -f deploy/compose.yml up --build
+# Local approximation only; romulus/stacks/hydra/compose.yml is the deployment. The dashboard image's /api rewrite
+# targets its own localhost:8000 whatever NEXT_PUBLIC_API_URL says.
+# Usage: HYDRA_CREDENTIAL_KEY=<fernet key> docker compose -f deploy/compose.yml up --build
 
 services:
   engine:
@@ -13,14 +12,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      HYDRA_DB_HOST: timescaledb
-      HYDRA_DB_PORT: "5432"
-      HYDRA_DB_NAME: hydra
-      HYDRA_DB_USER: hydra
-      HYDRA_DB_PASSWORD: ${HYDRA_DB_PASSWORD:-hydra_dev}
-      HYDRA_REDIS_URL: redis://redis:6379
-      HYDRA_LOG_LEVEL: ${HYDRA_LOG_LEVEL:-INFO}
-      HYDRA_LOG_FORMAT: json
+      DATABASE_URL: postgresql://hydra:${HYDRA_DB_PASSWORD:-hydra_dev}@timescaledb:5432/hydra
+      REDIS_URL: redis://redis:6379
+      HYDRA_CREDENTIAL_KEY: ${HYDRA_CREDENTIAL_KEY:?HYDRA_CREDENTIAL_KEY missing (see .env.example)}
+      HYDRA_LOGGING__LEVEL: ${HYDRA_LOGGING__LEVEL:-INFO}
     volumes:
       - ml-models:/app/models:ro
     depends_on:
@@ -53,14 +48,8 @@ services:
     container_name: hydra-backtest-worker
     restart: unless-stopped
     environment:
-      HYDRA_DB_HOST: timescaledb
-      HYDRA_DB_PORT: "5432"
-      HYDRA_DB_NAME: hydra
-      HYDRA_DB_USER: hydra
-      HYDRA_DB_PASSWORD: ${HYDRA_DB_PASSWORD:-hydra_dev}
-      HYDRA_REDIS_URL: redis://redis:6379
-      HYDRA_LOG_LEVEL: ${HYDRA_LOG_LEVEL:-INFO}
-      HYDRA_LOG_FORMAT: json
+      DATABASE_URL: postgresql://hydra:${HYDRA_DB_PASSWORD:-hydra_dev}@timescaledb:5432/hydra
+      REDIS_URL: redis://redis:6379
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -70,7 +59,7 @@ services:
       - hydra
 
   timescaledb:
-    image: timescale/timescaledb:2.17.2-pg16
+    image: timescale/timescaledb:2.30.2-pg16
     container_name: hydra-timescaledb
     restart: unless-stopped
     ports:
@@ -90,7 +79,7 @@ services:
       - hydra
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     container_name: hydra-redis
     restart: unless-stopped
     ports:

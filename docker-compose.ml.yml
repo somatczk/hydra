@@ -11,11 +11,7 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      HYDRA_DB_HOST: timescaledb
-      HYDRA_DB_PORT: 5432
-      HYDRA_DB_NAME: hydra
-      HYDRA_DB_USER: hydra
-      HYDRA_DB_PASSWORD: ${HYDRA_DB_PASSWORD}
+      DATABASE_URL: postgresql://hydra:${HYDRA_DB_PASSWORD:?HYDRA_DB_PASSWORD missing}@timescaledb:5432/hydra
     volumes:
       - ./src:/app/src:ro
       - ./config:/app/config:ro

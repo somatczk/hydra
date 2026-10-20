@@ -1,17 +1,7 @@
+# Defaults for every environment; override any key from env as HYDRA_<SECTION>__<KEY>.
+# Infra is env-only: DATABASE_URL, REDIS_URL, HYDRA_CREDENTIAL_KEY, HYDRA_API_TOKEN.
 platform:
   name: hydra
-
-database:
-  host: ${HYDRA_DB_HOST}
-  port: ${HYDRA_DB_PORT}
-  name: ${HYDRA_DB_NAME}
-  user: ${HYDRA_DB_USER}
-  password: ${HYDRA_DB_PASSWORD}
-
-redis:
-  url: ${HYDRA_REDIS_URL}
-
-exchanges: {}
 
 trading:
   testnet: true
@@ -20,15 +10,18 @@ trading:
     - BTCUSDT
 
 logging:
-  level: ${HYDRA_LOG_LEVEL:INFO}
-  format: ${HYDRA_LOG_FORMAT:json}
+  level: INFO
+  format: json
 
 api:
-  host: ${HYDRA_API_HOST:0.0.0.0}
-  port: ${HYDRA_API_PORT:8000}
+  host: 0.0.0.0
+  port: 8000
   cors_origins:
-    - ${HYDRA_CORS_ORIGINS:http://localhost:3000}
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+  auth_mode: proxy
+  trusted_proxy_cidrs: []
 
 ml:
-  models_dir: ${HYDRA_MODELS_DIR:/app/models}
+  models_dir: /app/models
   inference_timeout_ms: 5

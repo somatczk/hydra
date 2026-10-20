@@ -3,18 +3,20 @@
 Tests cover:
 - Health endpoint reflects pool status
 - strategy_builder router is included (not legacy builder)
-- DB pool initialises when DATABASE_URL is set
-- DB pool is None when DATABASE_URL is not set
+- Lifespan without DATABASE_URL runs with no pool (startup failures: test_lifespan.py)
 - All expected route prefixes are registered
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from hydra.core.config import HydraConfig
+from hydra.dashboard import lifespan
 from hydra.dashboard.api import app
 
 # ---------------------------------------------------------------------------
@@ -144,73 +146,30 @@ class TestRouterRegistration:
 
 
 class TestDbPoolLifecycle:
-    @pytest.mark.asyncio
-    async def test_init_db_pool_without_database_url(self) -> None:
-        """When DATABASE_URL is not set, db_pool should be None."""
-        with patch.dict("os.environ", {}, clear=False):
-            # Remove DATABASE_URL if present
-            import os
+    async def test_lifespan_without_database_url_has_no_pool(self) -> None:
+        """Dev mode: no DATABASE_URL means no pool, no key check, config still loaded."""
+        test_app = FastAPI()
+        async with lifespan.run(test_app):
+            assert test_app.state.db_pool is None
+            assert isinstance(test_app.state.config, HydraConfig)
+            assert test_app.state.session_manager is not None
+            assert test_app.state.exchange_credentials == {}
 
-            os.environ.pop("DATABASE_URL", None)
+    async def test_app_starts_with_pool_unset(self) -> None:
+        assert app.state.db_pool is None
+        assert app.state.exchange_credential_errors == {}
 
-            from hydra.dashboard.api import _init_db_pool
-
-            await _init_db_pool()
-            assert app.state.db_pool is None
-
-    @pytest.mark.asyncio
-    async def test_init_db_pool_with_database_url(self) -> None:
-        """When DATABASE_URL is set, asyncpg.create_pool should be called."""
-        mock_pool = AsyncMock()
-        with (
-            patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
-            patch("asyncpg.create_pool", new_callable=AsyncMock, return_value=mock_pool),
-        ):
-            from hydra.dashboard.api import _init_db_pool
-
-            await _init_db_pool()
-            assert app.state.db_pool is mock_pool
-
-        # Clean up
-        app.state.db_pool = None
-
-    @pytest.mark.asyncio
-    async def test_init_db_pool_exception_sets_none(self) -> None:
-        """When asyncpg.create_pool fails, db_pool should be None."""
-        with (
-            patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
-            patch(
-                "asyncpg.create_pool",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("Connection refused"),
-            ),
-        ):
-            from hydra.dashboard.api import _init_db_pool
-
-            await _init_db_pool()
-            assert app.state.db_pool is None
-
-    @pytest.mark.asyncio
     async def test_close_db_pool_when_pool_exists(self) -> None:
-        """Shutdown should close the pool when it exists."""
         mock_pool = AsyncMock()
-        app.state.db_pool = mock_pool
-        try:
-            from hydra.dashboard.api import _close_db_pool
+        test_app = FastAPI()
+        test_app.state.db_pool = mock_pool
+        await lifespan._close_db_pool(test_app)
+        mock_pool.close.assert_awaited_once()
 
-            await _close_db_pool()
-            mock_pool.close.assert_called_once()
-        finally:
-            app.state.db_pool = None
-
-    @pytest.mark.asyncio
     async def test_close_db_pool_when_pool_is_none(self) -> None:
-        """Shutdown should be a no-op when pool is None."""
-        app.state.db_pool = None
-        from hydra.dashboard.api import _close_db_pool
-
-        # Should not raise
-        await _close_db_pool()
+        test_app = FastAPI()
+        test_app.state.db_pool = None
+        await lifespan._close_db_pool(test_app)
 
 
 # ---------------------------------------------------------------------------

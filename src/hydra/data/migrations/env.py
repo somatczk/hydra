@@ -1,70 +1,41 @@
-"""Alembic environment configuration for Hydra TimescaleDB migrations.
-
-Supports both online (live connection) and offline (SQL generation) modes.
-Database DSN is read from ``hydra.core.config``.
-"""
+"""Alembic environment: async engine on asyncpg, one transaction, serialised by an advisory lock."""
 
 from __future__ import annotations
 
-import os
+import asyncio
 
 from alembic import context
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
-# ---------------------------------------------------------------------------
-# Target metadata — we use raw SQL migrations so no SQLAlchemy metadata.
-# ---------------------------------------------------------------------------
-target_metadata = None
+from hydra.data.migrations.runner import MIGRATION_LOCK_ID, async_dsn, resolve_dsn
 
 
-def _get_dsn() -> str:
-    """Resolve the database DSN from environment or Hydra config."""
-    dsn = os.environ.get("HYDRA_DATABASE_DSN")
-    if dsn:
-        return dsn
+def _run(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=None)
+    with context.begin_transaction():
+        connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": MIGRATION_LOCK_ID})
+        context.run_migrations()
 
-    # Fall back to Hydra config
+
+async def _run_online(dsn: str) -> None:
+    engine = create_async_engine(async_dsn(dsn), poolclass=NullPool)
     try:
-        from hydra.core.config import load_config
-
-        cfg = load_config()
-        return (
-            f"postgresql://{cfg.database.user}:{cfg.database.password}"
-            f"@{cfg.database.host}:{cfg.database.port}/{cfg.database.name}"
-        )
-    except Exception:
-        return "postgresql://hydra:hydra@localhost:5432/hydra"
+        async with engine.connect() as connection:
+            await connection.run_sync(_run)
+    finally:
+        await engine.dispose()
 
 
-def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode — emit SQL to stdout."""
-    url = _get_dsn()
-    context.configure(
-        url=url,
-        target_metadata=target_metadata,
-        literal_binds=True,
-        dialect_opts={"paramstyle": "named"},
-    )
-
+def _run_offline(dsn: str) -> None:
+    context.configure(url=async_dsn(dsn), target_metadata=None, literal_binds=True)
     with context.begin_transaction():
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    """Run migrations against a live database."""
-    from sqlalchemy import create_engine
-
-    connectable = create_engine(_get_dsn())
-
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
-
-
 if context.is_offline_mode():
-    run_migrations_offline()
+    _run_offline(resolve_dsn(context.config))
 else:
-    run_migrations_online()
+    asyncio.run(_run_online(resolve_dsn(context.config)))

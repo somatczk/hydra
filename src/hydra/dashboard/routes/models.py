@@ -10,7 +10,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from hydra.core.config import HydraConfig
+from hydra.dashboard.deps import current_config
 from hydra.dashboard.routes._db import api_error
 
 router = APIRouter(prefix="/api/models", tags=["models"])
@@ -37,11 +37,7 @@ def _validate_model_id(model_id: str) -> str:
 
 
 def _models_dir() -> Path:
-    try:
-        cfg = HydraConfig()
-        return Path(cfg.ml.models_dir)
-    except Exception:
-        return Path("/app/models")
+    return Path(current_config().ml.models_dir)
 
 
 # ---------------------------------------------------------------------------

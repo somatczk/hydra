@@ -120,6 +120,8 @@ def test_ci_services_use_the_dev_compose_images() -> None:
     dev_images = {svc["image"] for svc in compose["services"].values()}
     assert dev_images == {"timescale/timescaledb:2.30.2-pg16", "redis:8-alpine"}
     assert _service_images() == dev_images
+    local = yaml.safe_load((_ROOT / "deploy" / "compose.yml").read_text())["services"]
+    assert {local["timescaledb"]["image"], local["redis"]["image"]} == dev_images
 
 
 def test_ci_node_matches_the_dashboard_image() -> None:
