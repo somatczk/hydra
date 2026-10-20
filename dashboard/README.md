@@ -47,8 +47,9 @@ and runs `node server.js` on port 3000.
 
 ## Version
 
-The sidebar shows `package.json`'s `version` (via `APP_VERSION`). It is not the Hydra release version, which lives in
-the root `pyproject.toml`.
+The sidebar shows the Hydra release version (`APP_VERSION`), which `next.config.ts` reads from the root
+`pyproject.toml` (`src/lib/releaseVersion.ts`); the image build copies that file to `/pyproject.toml`, next to `/app`.
+`package.json`'s own `version` is not shown.
 
 ## Tests
 
