@@ -6,8 +6,10 @@ Resting orders lock what they may spend (SELL locks base, BUY locks quote, an OC
 Fees are always charged in the quote asset (a documented deviation from Binance, where a BUY
 fee is taken in base unless paid with BNB).
 
-Market orders fill at the last closed-bar close with slippage. Resting orders are evaluated by
-``on_closed_bar`` with the rules in ``hydra.execution.fill_rules``. With a DB pool, every change
+Market orders fill with slippage at the latest traded price set by ``set_mark`` since the last
+closed bar, else at that bar's close. Resting orders are evaluated only by ``on_closed_bar``
+with the rules in ``hydra.execution.fill_rules``; an order placed at a live mark sees only the
+move from that mark to the close of the bar it was placed in. With a DB pool, every change
 is persisted (``hydra.execution.paper_store``) before the call returns; ``restore`` rebuilds the
 account after a restart.
 """
@@ -94,6 +96,7 @@ class SpotMarketRules(Protocol):
 
 
 PaperFillStatus = Literal["FILLED", "CANCELLED"]
+MarkSource = Literal["live", "stale_live", "last_close"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +107,9 @@ class PaperFill:
     fill's fee and the pro-rata entry fee. ``parent_order_id`` is the OCO id for an OCO leg.
     ``status="CANCELLED"`` reports a resting BUY dropped on a gap it could not pay for: nothing
     traded, ``price`` is where it would have filled, ``fee`` is 0 and ``fill_seq`` is 0.
+    ``mark_source`` is set on market fills: ``live`` (a ``set_mark`` price newer than the last
+    closed bar), ``stale_live`` (such a price, but the feed went stale after it) or
+    ``last_close`` (the fallback); None on bar-priced and restored fills.
     """
 
     order_id: str
@@ -122,6 +128,7 @@ class PaperFill:
     timestamp: datetime
     fill_seq: int
     status: PaperFillStatus = "FILLED"
+    mark_source: MarkSource | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +184,7 @@ class _PendingOrder:
     trail_pct: Decimal | None = None
     extreme: Decimal | None = None
     oco_id: str | None = None
+    placed_at: Decimal | None = None
 
 
 @dataclass(slots=True)
@@ -238,6 +246,18 @@ def _opt_d(value: object) -> Decimal | None:
 
 def _opt_s(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
+
+
+def _since_placement(mark: Decimal, bar: OHLCV) -> OHLCV:
+    """The part of ``bar`` known to follow an order placed at ``mark``: mark, then the close."""
+    return OHLCV(
+        open=mark,
+        high=max(mark, bar.close),
+        low=min(mark, bar.close),
+        close=bar.close,
+        volume=bar.volume,
+        timestamp=bar.timestamp,
+    )
 
 
 def _ts(value: datetime) -> str:
@@ -314,6 +334,8 @@ class PaperTradingExecutor:
         self._lots: dict[str, _Lot] = {}
         self._pending: list[_PendingOrder] = []
         self._marks: dict[str, Decimal] = {}
+        self._live_marks: dict[str, Decimal] = {}
+        self._stale_marks: set[str] = set()
         self._last_bar_ts: dict[str, datetime] = {}
         self._names: dict[str, str] = {}
         self._fill_seq = 0
@@ -371,6 +393,23 @@ class PaperTradingExecutor:
     def _bar_time(self, canon: str) -> datetime:
         return self._last_bar_ts.get(canon) or datetime.now(UTC)
 
+    def set_mark(self, symbol: str, price: Decimal) -> None:
+        """Latest traded price between closed bars; only market fills use it, until the next bar."""
+        if price > 0:
+            canon = self._symbol(symbol)
+            self._live_marks[canon] = price
+            self._stale_marks.discard(canon)
+
+    def mark_feed_stale(self) -> None:
+        """The feed went stale: the live marks held now are labelled until a fresh one arrives."""
+        self._stale_marks = set(self._live_marks)
+
+    def _market_mark(self, canon: str) -> tuple[Decimal | None, MarkSource]:
+        live = self._live_marks.get(canon)
+        if live is not None:
+            return live, "stale_live" if canon in self._stale_marks else "live"
+        return self._marks.get(canon), "last_close"
+
     # ------------------------------------------------------------------
     # Orders
     # ------------------------------------------------------------------
@@ -385,7 +424,7 @@ class PaperTradingExecutor:
         stop_price: Decimal | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Market orders fill at once at the last mark; other types rest and lock funds.
+        """Market orders fill at once at the latest mark; other types rest and lock funds.
 
         OCO: ``price`` is the take-profit limit, ``stop_price`` the stop-loss trigger.
         """
@@ -402,16 +441,16 @@ class PaperTradingExecutor:
             await self._require_persisted()
 
         if otype == OrderType.MARKET:
-            mark = self._marks.get(canon)
+            mark, source = self._market_mark(canon)
             if mark is None or mark <= 0:
                 raise ValueError(f"No market price available for {symbol}")
             fp = fill_rules.market_fill(s, mark, self._slippage_pct)
             self._check_rules(canon, quantity, fp.price)
             fill = self._fill_from_free(
-                canon, s, OrderType.MARKET, quantity, fp, "market", str(uuid.uuid4())
+                canon, s, OrderType.MARKET, quantity, fp, "market", str(uuid.uuid4()), source
             )
             await self._persist(snapshot_at=fill.timestamp)
-            return self._fill_response(fill)
+            return {**self._fill_response(fill), "mark_source": source}
 
         if otype == OrderType.OCO:
             return await self._create_oco(canon, s, quantity, price, stop_price)
@@ -462,7 +501,7 @@ class PaperTradingExecutor:
             trail_pct = _d(raw)
             if not _ZERO < trail_pct < _ONE:
                 raise OrderRejectedError(f"trail_pct must be in (0, 1), got {trail_pct}")
-            mark = self._marks.get(canon)
+            mark, _ = self._market_mark(canon)
             if mark is None:
                 raise ValueError(f"No market price available for {canon}")
             extreme = mark
@@ -492,6 +531,7 @@ class PaperTradingExecutor:
             created_after_ts=self._last_bar_ts.get(canon),
             trail_pct=trail_pct,
             extreme=extreme,
+            placed_at=self._live_marks.get(canon),
         )
 
     def _buy_lock(self, otype: str, quantity: Decimal, ref: Decimal) -> Decimal:
@@ -527,6 +567,7 @@ class PaperTradingExecutor:
                 oco_id, self._quote, self._buy_lock(OrderType.STOP_MARKET, quantity, sl)
             )
         created = self._last_bar_ts.get(canon)
+        placed_at = self._live_marks.get(canon)
         legs: list[_PendingOrder] = []
         for otype, leg_price, leg_stop, reason in (
             (OrderType.LIMIT, tp, None, "take_profit"),
@@ -547,6 +588,7 @@ class PaperTradingExecutor:
                     reason=reason,
                     created_after_ts=created,
                     oco_id=oco_id,
+                    placed_at=placed_at,
                 )
             )
         self._pending.extend(legs)
@@ -593,7 +635,9 @@ class PaperTradingExecutor:
         """Evaluate this symbol's resting orders on one closed bar, then mark to its close.
 
         A bar at or before the last processed timestamp is ignored. Orders placed after the
-        previous bar are eligible; at most one leg of an OCO fills. The result also carries
+        previous bar are eligible; one placed at a live mark sees this bar as the path from that
+        mark to the close (its earlier range came before the order). At most one leg of an OCO
+        fills. The result also carries
         ``status="CANCELLED"`` records for BUYs dropped on a gap. While halted, only SELLs run.
         """
         canon = self._symbol(symbol)
@@ -609,12 +653,20 @@ class PaperTradingExecutor:
                 seen_oco.add(order.oco_id)
             if order.created_after_ts is not None and ohlcv.timestamp <= order.created_after_ts:
                 continue
+            bar = ohlcv
+            if order.placed_at is not None:
+                bar = _since_placement(order.placed_at, ohlcv)
+                for leg in self._pending:
+                    if leg is order or (order.oco_id is not None and leg.oco_id == order.oco_id):
+                        leg.placed_at = None
             if self._halted is not None and order.side == "BUY":
                 continue
-            fill = self._evaluate(order, ohlcv)
+            fill = self._evaluate(order, bar)
             if fill is not None:
                 fills.append(fill)
         self._marks[canon] = ohlcv.close
+        self._live_marks.pop(canon, None)
+        self._stale_marks.discard(canon)
         self._last_bar_ts[canon] = ohlcv.timestamp
         self._update_peak()
         await self._persist(snapshot_at=ohlcv.timestamp)
@@ -719,6 +771,7 @@ class PaperTradingExecutor:
         fp: FillPrice,
         reason: str,
         order_id: str,
+        mark_source: MarkSource,
     ) -> PaperFill:
         if side == "BUY":
             need = quantity * fp.price * (_ONE + self._fee_rate(fp.liquidity))
@@ -735,7 +788,16 @@ class PaperTradingExecutor:
                     f"free {self._ledger.get_free(base)} (spot cannot sell short)"
                 )
         return self._apply_fill(
-            canon, side, order_type, quantity, fp, reason, order_id, None, self._bar_time(canon)
+            canon,
+            side,
+            order_type,
+            quantity,
+            fp,
+            reason,
+            order_id,
+            None,
+            self._bar_time(canon),
+            mark_source,
         )
 
     def _apply_fill(
@@ -749,6 +811,7 @@ class PaperTradingExecutor:
         order_id: str,
         parent_order_id: str | None,
         ts: datetime,
+        mark_source: MarkSource | None = None,
     ) -> PaperFill:
         base = self._base(canon)
         notional = quantity * fp.price
@@ -796,6 +859,7 @@ class PaperTradingExecutor:
             reason=reason,
             timestamp=ts,
             fill_seq=self._fill_seq,
+            mark_source=mark_source,
         )
         self._filled.append(fill)
         if self._db_pool is not None:
@@ -842,7 +906,7 @@ class PaperTradingExecutor:
     # ------------------------------------------------------------------
 
     async def flatten(self, symbol: str | None = None, reason: str = "flatten") -> list[PaperFill]:
-        """Cancel resting orders and market-sell all base at the last mark; never risk-gated."""
+        """Cancel resting orders and market-sell all base at the latest mark; never risk-gated."""
         if symbol is not None:
             targets = {self._symbol(symbol)}
         else:
@@ -855,7 +919,7 @@ class PaperTradingExecutor:
             qty = self._ledger.get_free(self._base(canon))
             if qty <= 0:
                 continue
-            mark = self._marks.get(canon)
+            mark, source = self._market_mark(canon)
             if mark is None or mark <= 0:
                 raise ValueError(f"cannot flatten {canon}: no market price for {qty} held")
             fp = fill_rules.market_fill("SELL", mark, self._slippage_pct)
@@ -870,6 +934,7 @@ class PaperTradingExecutor:
                     str(uuid.uuid4()),
                     None,
                     self._bar_time(canon),
+                    source,
                 )
             )
         await self._persist(snapshot_at=fills[-1].timestamp if fills else None)
@@ -1126,6 +1191,7 @@ class PaperTradingExecutor:
                     "trail_pct": _opt_s(o.trail_pct),
                     "extreme": _opt_s(o.extreme),
                     "oco_id": o.oco_id,
+                    "placed_at": _opt_s(o.placed_at),
                 }
                 for o in self._pending
             ],
@@ -1204,6 +1270,7 @@ class PaperTradingExecutor:
                     trail_pct=_opt_d(o["trail_pct"]),
                     extreme=_opt_d(o["extreme"]),
                     oco_id=o["oco_id"],
+                    placed_at=_opt_d(o.get("placed_at")),
                 )
                 for o in state["pending"]
             ]

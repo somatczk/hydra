@@ -2,7 +2,8 @@
 
 Wiring order (fixed): the session's closed-bar handler is subscribed before the engine, so the
 paper executor evaluates resting orders and marks to a bar before any strategy sees that bar;
-every fill is published before the strategy runs. Then signals, fills and feed status.
+every fill is published before the strategy runs. Then signals, fills, feed status and live
+prices (the executor's market-fill mark only; risk marks and resting orders stay on closed bars).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from hydra.core.events import (
     FeedStatusEvent,
     OrderCancelEvent,
     OrderFillEvent,
+    PriceEvent,
 )
 from hydra.core.types import (
     OHLCV,
@@ -49,6 +51,7 @@ from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import (
     LedgerInvariantError,
+    PaperFill,
     PaperSessionHaltedError,
     PaperTradingExecutor,
     PersistenceUnavailableError,
@@ -106,6 +109,8 @@ class ManualOrderResult:
     price: Decimal | None
     protection: str  # 'armed' | 'pending' | 'none'
     protective_order_id: str | None
+    fill_price: Decimal | None = None
+    mark_source: str | None = None
 
 
 class SessionRuntime:
@@ -201,7 +206,7 @@ class SessionRuntime:
         self.context.set_portfolio_value(await self.executor.get_equity())
 
     async def wire(self) -> None:
-        """Subscribe in order: closed bars, engine, signals, fills, feed status."""
+        """Subscribe in order: closed bars, engine, signals, fills, feed status, live prices."""
         await self.bus.subscribe("bar", self._on_bar)
         await self.engine.start()
         await self.bus.subscribe("entry_signal", self._on_signal)
@@ -209,6 +214,7 @@ class SessionRuntime:
         await self.bus.subscribe("order_fill", self._on_fill)
         await self.bus.subscribe("order_cancel", self._on_cancel)
         await self.bus.subscribe("feed_status", self._on_feed_status)
+        await self.bus.subscribe("price", self._on_price)
 
     async def prime(self, warm: WarmBars) -> None:
         """Treat each symbol's newest warm-up bar as the first closed bar: marks, resting orders."""
@@ -280,6 +286,18 @@ class SessionRuntime:
         halted = self.executor.get_account_snapshot().halted
         if halted is not None and not self.closing:
             await self._fail(f"paper ledger halted: {halted}")
+
+    async def _on_price(self, event: Event) -> None:
+        if (
+            not isinstance(event, PriceEvent)
+            or event.exchange_id != self.exchange_id
+            or str(event.symbol) not in self.cfg.symbols
+        ):
+            return
+        try:
+            self.executor.set_mark(str(event.symbol), event.price)
+        except Exception:
+            logger.exception("Live mark rejected for %s", event.symbol)
 
     async def _on_signal(self, event: Event) -> None:
         try:
@@ -368,6 +386,7 @@ class SessionRuntime:
                 "fee": str(event.fee),
                 "realized_pnl": None if event.realized_pnl is None else str(event.realized_pnl),
                 "tag": event.tag,
+                "mark_source": event.mark_source,
                 "timestamp": datetime.now(UTC).isoformat(),
             }
         )
@@ -384,6 +403,7 @@ class SessionRuntime:
                 logger.info("Feed live again: entries resumed for %s", self.session.session_id)
             self.entries_paused = None
             return
+        self.executor.mark_feed_stale()
         reasons = self.feed.stale_reasons(self.exchange_id)
         self.entries_paused = "feed stale: " + ", ".join(
             f"{scope} {'/'.join(r)}" for scope, r in sorted(reasons.items())
@@ -513,6 +533,7 @@ class SessionRuntime:
         filled = status == OrderStatus.FILLED
         if order_id is not None and status not in (OrderStatus.FILLED, OrderStatus.CANCELLED):
             self._manual_orders[order_id] = tag
+        fill = self._market_fill(order_id) if filled else None
         return ManualOrderResult(
             order_id=order_id,
             status=str(status) if status is not None else "NOOP",
@@ -520,6 +541,8 @@ class SessionRuntime:
             price=price,
             protection="armed" if filled and group is not None else "pending",
             protective_order_id=group.order_id if filled and group is not None else None,
+            fill_price=fill.price if fill is not None else None,
+            mark_source=fill.mark_source if fill is not None else None,
         )
 
     async def _manual_exit(
@@ -562,6 +585,7 @@ class SessionRuntime:
         if status != OrderStatus.FILLED:
             await self.protect.rearm(symbol)
         group = self.protect.armed(symbol)
+        fill = self._market_fill(order_id) if status == OrderStatus.FILLED else None
         return ManualOrderResult(
             order_id=order_id,
             status=str(status) if status is not None else "NOOP",
@@ -569,11 +593,18 @@ class SessionRuntime:
             price=None,
             protection="armed" if group is not None else "none",
             protective_order_id=group.order_id if group is not None else None,
+            fill_price=fill.price if fill is not None else None,
+            mark_source=fill.mark_source if fill is not None else None,
         )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _market_fill(self, order_id: str | None) -> PaperFill | None:
+        return next(
+            (f for f in reversed(self.executor.get_fills()) if f.order_id == order_id), None
+        )
 
     async def _holding(self, symbol: str) -> bool:
         if any(p.quantity > 0 for p in await self.executor.get_positions(symbol)):

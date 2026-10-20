@@ -1,7 +1,7 @@
 """Order lifecycle management: validation, dedup, submission, tracking, fill emission.
 
-The ``OrderManager`` sits between strategy signals and the exchange executor. Orders are
-classified as opening or reducing; reduce_only orders are clamped to the held position. With a
+The ``OrderManager`` sits between strategy signals and the exchange executor. An order is
+reducing exactly when ``reduce_only`` is set; it is clamped to the held position. With a
 RiskService, the account lock is held from the position read (clamp and classification) through
 the risk check and ``create_order``, and fill events are published after it is released.
 """
@@ -15,11 +15,7 @@ from dataclasses import replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol, cast, runtime_checkable
 
-from hydra.core.events import (
-    OrderCancelEvent,
-    OrderFillEvent,
-    RiskCheckResult,
-)
+from hydra.core.events import OrderCancelEvent, OrderFillEvent
 from hydra.core.metrics import record_risk_rejection
 from hydra.core.types import (
     ExchangeId,
@@ -34,8 +30,6 @@ from hydra.risk.pretrade import (
     OPEN,
     REDUCE,
     Intent,
-    PortfolioState,
-    PreTradeRiskManager,
     RiskDecision,
     classify_intent,
     closes_position,
@@ -80,11 +74,6 @@ class EventBusLike(Protocol):
     async def publish(self, event: Any) -> None: ...
 
 
-@runtime_checkable
-class RiskCheckerLike(Protocol):
-    async def check_order(self, order: OrderRequest, portfolio_state: Any) -> RiskCheckResult: ...
-
-
 # ---------------------------------------------------------------------------
 # Errors and helpers
 # ---------------------------------------------------------------------------
@@ -109,6 +98,10 @@ def _dec(value: Any) -> Decimal | None:
     if value is None or value == "":
         return None
     return Decimal(str(value))
+
+
+def _opt_str(value: Any) -> str | None:
+    return None if value is None else str(value)
 
 
 def _realized_pnl(
@@ -159,17 +152,14 @@ class _TrackedOrder:
 class OrderManager:
     """Signal -> OrderRequest -> risk check -> submit -> track -> emit fill.
 
-    ``risk``/``session_id`` select the RiskService path. ``risk_checker`` with
-    ``portfolio_state``/``portfolio_state_builder`` is the pre-RiskService path.
+    With ``risk`` (a RiskService) every order is risk-checked for ``session_id``; without it
+    orders go straight to the executor (tests and tools only).
     """
 
     def __init__(
         self,
         executor: ExecutorBackend,
         event_bus: EventBusLike,
-        risk_checker: RiskCheckerLike | None = None,
-        portfolio_state: Any = None,
-        portfolio_state_builder: Any = None,
         stale_order_timeout: float = 300.0,
         dedup_window: float = 1.0,
         *,
@@ -178,9 +168,6 @@ class OrderManager:
     ) -> None:
         self._executor = executor
         self._event_bus = event_bus
-        self._risk_checker = risk_checker
-        self._portfolio_state = portfolio_state
-        self._portfolio_state_builder = portfolio_state_builder
         self._risk = risk
         self._session_id = session_id
 
@@ -216,21 +203,15 @@ class OrderManager:
         if self._risk is not None:
             return await self._submit_with_risk(self._risk, order, now)
 
-        positions: list[Position] | None = None
+        positions: list[Position] = []
         if order.reduce_only:
             positions = list(await self._executor.get_positions(str(order.symbol)))
-        elif self._risk_checker is not None:
-            if self._portfolio_state_builder is not None:
-                self._portfolio_state = await self._portfolio_state_builder()
-            if isinstance(self._portfolio_state, PortfolioState):
-                positions = self._portfolio_state.positions
         resolved = self._resolve(order, positions)
         if resolved is None:
             return None
         order, intent = resolved
         if intent == OPEN:
             self._dedup(order, now)
-        await self._legacy_check(order, intent)
         resp = await self._create(order)
         return await self._track_and_publish(order, intent, resp, now)
 
@@ -259,14 +240,14 @@ class OrderManager:
         return await self._track_and_publish(order, intent, resp, now)
 
     def _resolve(
-        self, order: OrderRequest, positions: list[Position] | None
+        self, order: OrderRequest, positions: list[Position]
     ) -> tuple[OrderRequest, Intent] | None:
         """Clamp a reduce_only order to the held position (None: nothing to reduce); classify."""
         if order.reduce_only:
             held = next(
                 (
                     p
-                    for p in positions or []
+                    for p in positions
                     if str(p.symbol) == str(order.symbol)
                     and p.quantity > 0
                     and closes_position(order, p)
@@ -278,8 +259,7 @@ class OrderManager:
                 return None
             if order.quantity > held.quantity:
                 order = replace(order, quantity=held.quantity)
-        intent: Intent = classify_intent(order, positions) if positions is not None else OPEN
-        return order, intent
+        return order, classify_intent(order)
 
     def _dedup(self, order: OrderRequest, now: float) -> None:
         key = _dedup_key(order)
@@ -301,20 +281,6 @@ class OrderManager:
             "Order rejected (%s, %s): %s", decision.check, decision.intent, decision.reason
         )
         raise RiskRejectedError(decision.reason, decision.check, decision.intent)
-
-    async def _legacy_check(self, order: OrderRequest, intent: Intent) -> None:
-        if self._risk_checker is None:
-            return
-        state = self._portfolio_state
-        if isinstance(self._risk_checker, PreTradeRiskManager) and isinstance(
-            state, PortfolioState
-        ):
-            decision = self._risk_checker.evaluate(order, state, intent)
-        else:
-            result = await self._risk_checker.check_order(order, self._portfolio_state)
-            decision = RiskDecision(result.approved, "risk_checker", result.reason, intent)
-        if not decision.approved:
-            self._reject(decision)
 
     async def _create(self, order: OrderRequest) -> dict[str, Any]:
         return await self._executor.create_order(
@@ -365,6 +331,7 @@ class OrderManager:
                     reduce_only=order.reduce_only,
                     realized_pnl=realized,
                     gross_pnl=gross,
+                    mark_source=_opt_str(resp.get("mark_source")),
                 )
             )
             try:
@@ -472,6 +439,7 @@ class OrderManager:
             reduce_only=request.reduce_only if request is not None else fill.side == "SELL",
             realized_pnl=fill.net_pnl,
             gross_pnl=fill.gross_pnl,
+            mark_source=fill.mark_source,
         )
         await self._event_bus.publish(event)
         try:

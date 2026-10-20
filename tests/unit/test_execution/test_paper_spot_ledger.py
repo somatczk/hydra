@@ -16,7 +16,6 @@ from hydra.execution.paper_trading import (
     PaperSessionHaltedError,
     PaperTradingExecutor,
 )
-from hydra.execution.portfolio_state import build_portfolio_state
 
 D = Decimal
 SYM = "BTCUSDT"
@@ -227,8 +226,9 @@ async def test_get_balance_plus_position_value_equals_equity() -> None:
 
     assert await ex.get_balance() == {"USDT": D("5000.0")}
     assert await ex.fetch_balance() == {"USDT": D("4600.0"), "DOGE": D("10000")}
-    state = await build_portfolio_state(ex, [doge], None)
-    assert state.portfolio_value == await ex.get_equity() == D("10000.0")
+    mark = await ex.get_last_price(doge)
+    held = sum((p.quantity * mark for p in await ex.get_positions(doge)), D("0"))
+    assert (await ex.get_balance())["USDT"] + held == await ex.get_equity() == D("10000.0")
 
 
 async def test_broken_invariant_halts_entries_but_flatten_still_exits() -> None:

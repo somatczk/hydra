@@ -201,6 +201,8 @@ class QuickTradeResponse(BaseModel):
     protection: str
     protective_order_id: str | None = None
     exit_orders_deferred: bool = False
+    fill_price: float | None = None
+    mark_source: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -510,4 +512,6 @@ async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, An
         "protection": result.protection,
         "protective_order_id": result.protective_order_id,
         "exit_orders_deferred": side == Side.BUY and result.protection == "pending",
+        "fill_price": float(result.fill_price) if result.fill_price is not None else None,
+        "mark_source": result.mark_source,
     }

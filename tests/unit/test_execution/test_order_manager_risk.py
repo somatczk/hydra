@@ -12,20 +12,16 @@ from prometheus_client import REGISTRY
 
 from hydra.core import metrics
 from hydra.core.types import Side
-from hydra.execution.order_manager import OrderManager, RiskRejectedError, _realized_pnl
+from hydra.execution.order_manager import RiskRejectedError, _realized_pnl
 from hydra.execution.paper_trading import PaperTradingExecutor
-from hydra.execution.portfolio_state import build_portfolio_state
 from hydra.risk.circuit_breakers import CircuitBreakerState
-from hydra.risk.pretrade import PreTradeRiskManager, RiskConfig
+from hydra.risk.pretrade import RiskConfig
 from hydra.risk.state import RiskState
 from tests.unit.test_risk.harness import (
     BTC,
     T0,
     Account,
-    FillBus,
-    flat_bar,
     make_account,
-    order,
     permissive,
 )
 
@@ -139,11 +135,13 @@ class TestExitNeverBlocked:
         assert await acct.submit("s1", SELL, "0.005", reduce_only=True)
         assert await ex.get_positions(BTC) == []
 
-    async def test_unflagged_exit_within_position_is_a_reduction(self) -> None:
+    async def test_unflagged_sell_within_position_is_an_opening_and_refused(self) -> None:
         acct = await _kill_switch()
         ex = await _holding_long(acct)
-        assert await acct.submit("s1", SELL, "0.01")
-        assert await ex.get_positions(BTC) == []
+        with pytest.raises(RiskRejectedError) as info:
+            await acct.submit("s1", SELL, "0.01")
+        assert (info.value.check, info.value.intent) == ("kill_switch", "open")
+        assert [p.quantity for p in await ex.get_positions(BTC)] == [Decimal("0.01")]
 
 
 class TestConcurrentExits:
@@ -159,7 +157,7 @@ class TestConcurrentExits:
         assert (await ex.get_balance())["USDT"] == Decimal("9900.00")
         assert [f.quantity for f in acct.buses["s1"].fills] == [Decimal("0.01")]
 
-    async def test_second_unflagged_exit_is_an_opening_and_refused(self) -> None:
+    async def test_unflagged_sells_are_openings_and_refused_on_spot(self) -> None:
         acct = await make_account(permissive())
         ex = await _holding_long(acct)
         results = await asyncio.gather(
@@ -167,11 +165,9 @@ class TestConcurrentExits:
             acct.submit("s1", SELL, "0.01"),
             return_exceptions=True,
         )
-        assert sum(isinstance(r, str) for r in results) == 1
         errors = [(r.check, r.intent) for r in results if isinstance(r, RiskRejectedError)]
-        assert errors == [("spot_short", "open")]
-        assert await ex.get_positions(BTC) == []
-        assert (await ex.get_balance())["USDT"] == Decimal("9900.00")
+        assert errors == [("spot_short", "open"), ("spot_short", "open")]
+        assert [p.quantity for p in await ex.get_positions(BTC)] == [Decimal("0.01")]
 
 
 class TestRealizedPnl:
@@ -278,33 +274,3 @@ class TestOpeningPath:
         assert await acct.submit("s1", BUY, "0.01")
         with pytest.raises(RiskRejectedError, match="Duplicate order rejected"):
             await acct.submit("s1", BUY, "0.01")
-
-
-class TestLegacyPath:
-    async def test_pre_risk_service_path_prices_at_mark_and_exempts_exits(self) -> None:
-        ex = PaperTradingExecutor(
-            initial_balances={"USDT": Decimal("10000")},
-            slippage_pct=Decimal("0"),
-            fee_pct=Decimal("0"),
-        )
-        await ex.on_closed_bar(BTC, flat_bar(Decimal("60000"), T0))
-        await ex.create_order(BTC, "BUY", "MARKET", Decimal("0.01"))
-        await ex.on_closed_bar(BTC, flat_bar(Decimal("50000"), T0 + timedelta(hours=1)))
-
-        async def build() -> object:
-            return await build_portfolio_state(ex, [BTC], None)
-
-        om = OrderManager(
-            executor=ex,
-            event_bus=FillBus(None, ""),
-            risk_checker=PreTradeRiskManager(RiskConfig(max_portfolio_heat=Decimal("0.04"))),
-            portfolio_state_builder=build,
-            dedup_window=0.0,
-        )
-        with pytest.raises(RiskRejectedError, match="3000000"):
-            await om.submit_order(order(BUY, "60"))
-        with pytest.raises(RiskRejectedError) as info:
-            await om.submit_order(order(BUY, "0.001"))
-        assert info.value.check == "portfolio_heat"
-        assert await om.submit_order(order(SELL, "0.01"))
-        assert await ex.get_positions(BTC) == []

@@ -158,6 +158,27 @@ async def test_state_round_trip_is_exact() -> None:
     assert await restored.fetch_open_orders() == await ex.fetch_open_orders()
 
 
+async def test_restore_keeps_the_live_mark_an_order_was_placed_at() -> None:
+    a = PaperTradingExecutor(initial_balances={"USDT": D("1000")})
+    await a.on_closed_bar(BTC, bar(0, "100", "100", "100", "100"))
+    await a.create_order(BTC, "BUY", "MARKET", D("1"))
+    a.set_mark(BTC, D("106"))
+    await a.create_order(BTC, "SELL", "STOP_MARKET", D("1"), stop_price=D("101"))
+    state = paper_store.loads_state(paper_store.dumps_state(a.to_state()))
+    legacy = {
+        **state,
+        "pending": [{k: v for k, v in o.items() if k != "placed_at"} for o in state["pending"]],
+    }
+
+    restored = PaperTradingExecutor.from_state(state)
+    old = PaperTradingExecutor.from_state(legacy)
+
+    assert [o["placed_at"] for o in restored.to_state()["pending"]] == ["106"]
+    entry_bar = bar(1, "100", "106", "99", "104")
+    assert await restored.on_closed_bar(BTC, entry_bar) == []
+    assert [f.reason for f in await old.on_closed_bar(BTC, entry_bar)] == ["stop_loss"]
+
+
 async def test_restored_executor_fills_like_the_original() -> None:
     a = PaperTradingExecutor(initial_balances={"USDT": D("1000")})
     await a.on_closed_bar(BTC, bar(0, "100", "100", "100", "100"))

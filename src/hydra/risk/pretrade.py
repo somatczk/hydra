@@ -1,9 +1,9 @@
 """Pre-trade risk checks, priced at the mark and split by intent.
 
 Every order is classified first:
-    reduce - ``reduce_only`` is set, or the order sells (buys) at most the held long (short).
-             It cannot add exposure, so only sanity checks apply: exits, stops and flattens
-             are never blocked by the kill switch, breakers, limits, rate limit or balance.
+    reduce - ``reduce_only`` is set (the OrderManager clamps it to the held position). It
+             cannot add exposure, so only sanity checks apply: exits, stops and flattens are
+             never blocked by the kill switch, breakers, limits, rate limit or balance.
     open   - everything else; it runs the full sequence below, priced at the latest mark
              (falling back to an explicit order price; neither means rejection).
 """
@@ -130,14 +130,9 @@ def closes_position(order: OrderRequest, pos: Position) -> bool:
     )
 
 
-def classify_intent(order: OrderRequest, positions: list[Position]) -> Intent:
-    """reduce when flagged reduce_only, or when it closes at most the held position."""
-    if order.reduce_only:
-        return REDUCE
-    pos = _held(order, positions)
-    if pos is not None and closes_position(order, pos) and order.quantity <= pos.quantity:
-        return REDUCE
-    return OPEN
+def classify_intent(order: OrderRequest) -> Intent:
+    """reduce exactly when flagged reduce_only; an unflagged SELL on spot is an opening short."""
+    return REDUCE if order.reduce_only else OPEN
 
 
 def reference_price(order: OrderRequest, marks: Mapping[str, Decimal]) -> Decimal | None:
@@ -210,7 +205,7 @@ class PreTradeRiskManager:
         state: PortfolioState,
         intent: Intent | None = None,
     ) -> RiskDecision:
-        intent = intent or classify_intent(order, state.positions)
+        intent = intent or classify_intent(order)
         if order.quantity <= 0:
             return RiskDecision(False, "sanity", f"non-positive quantity {order.quantity}", intent)
         if intent == REDUCE:

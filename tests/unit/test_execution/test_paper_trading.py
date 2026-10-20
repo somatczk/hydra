@@ -335,3 +335,104 @@ class TestQueries:
             await ex.create_order(BTC, "BUY", "MARKET", D("1"))
         with pytest.raises(InsufficientBalanceError):
             await ex.create_order(BTC, "BUY", "MARKET", D("1"))
+
+
+class TestLiveMark:
+    async def test_market_buy_fills_at_the_live_mark(self) -> None:
+        ex = executor(capital="1000")
+        await ex.on_closed_bar(BTC, flat_bar(0, "100"))
+        ex.set_mark(BTC, D("103"))
+
+        result = await ex.create_order(BTC, "BUY", "MARKET", D("0.5"))
+
+        assert (result["price"], result["mark_source"]) == (103.103, "live")
+        (fill,) = ex.get_fills()
+        assert (fill.price, fill.fee, fill.mark_source) == (D("103.103"), D("0.0515515"), "live")
+        assert await ex.get_balance() == {"USDT": D("948.3969485")}
+
+    async def test_without_a_live_mark_market_fills_at_last_close_and_is_flagged(self) -> None:
+        ex = executor(capital="1000")
+        await ex.on_closed_bar(BTC, flat_bar(0, "100"))
+
+        result = await ex.create_order(BTC, "BUY", "MARKET", D("0.5"))
+
+        assert (result["price"], result["mark_source"]) == (100.1, "last_close")
+        assert ex.get_fills()[0].mark_source == "last_close"
+
+    async def test_next_closed_bar_replaces_the_live_mark(self) -> None:
+        ex = executor(capital="1000", fee="0", slippage="0")
+        await ex.on_closed_bar(BTC, flat_bar(0, "100"))
+        ex.set_mark(BTC, D("103"))
+        await ex.on_closed_bar(BTC, flat_bar(0, "100"))
+        assert (await ex.create_order(BTC, "BUY", "MARKET", D("1")))["price"] == 103.0
+
+        await ex.on_closed_bar(BTC, flat_bar(1, "101"))
+        result = await ex.create_order(BTC, "BUY", "MARKET", D("1"))
+        assert (result["price"], result["mark_source"]) == (101.0, "last_close")
+
+    async def test_live_mark_moves_neither_equity_nor_resting_orders(self) -> None:
+        ex = executor(capital="1000", fee="0", slippage="0")
+        await ex.on_closed_bar(BTC, flat_bar(0, "100"))
+        await ex.create_order(BTC, "BUY", "MARKET", D("2"))
+        await ex.create_order(BTC, "SELL", "STOP_MARKET", D("1"), stop_price=D("95"))
+        await ex.create_order(BTC, "BUY", "LIMIT", D("1"), price=D("90"))
+
+        ex.set_mark(BTC, D("85"))
+
+        assert await ex.get_equity() == D("1000")
+        assert len(await ex.fetch_open_orders()) == 2
+        assert [f.side for f in ex.get_fills()] == ["BUY"]
+        fills = await ex.on_closed_bar(BTC, bar(1, "88", "88", "85", "86"))
+        assert sorted((f.side, f.price) for f in fills) == [("BUY", D("88")), ("SELL", D("88"))]
+
+    async def test_trailing_stop_starts_from_the_live_mark(self) -> None:
+        ex = await holding("1", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("110"))
+        await ex.create_order(BTC, "SELL", "TRAILING_STOP", D("1"), params={"trail_pct": "0.02"})
+
+        assert await ex.on_closed_bar(BTC, bar(1, "109", "109", "107.5", "108")) == []
+        (fill,) = await ex.on_closed_bar(BTC, bar(2, "108", "108", "107", "107.5"))
+        assert (fill.reason, fill.price) == ("trailing_stop", D("107.80"))
+
+    async def test_order_placed_at_a_live_mark_sees_only_mark_to_close_on_its_bar(self) -> None:
+        ex = await holding("1", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("106"))
+        await ex.create_order(BTC, "SELL", "STOP_MARKET", D("1"), stop_price=D("101"))
+
+        assert await ex.on_closed_bar(BTC, bar(1, "100", "106", "99", "104")) == []
+        (fill,) = await ex.on_closed_bar(BTC, bar(2, "104", "104", "100", "100"))
+        assert (fill.reason, fill.price) == ("stop_loss", D("101"))
+
+    async def test_oco_placed_at_a_live_mark_skips_the_pre_placement_range(self) -> None:
+        ex = await holding("1", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("106"))
+        await ex.create_order(BTC, "SELL", "OCO", D("1"), price=D("112"), stop_price=D("101"))
+
+        (fill,) = await ex.on_closed_bar(BTC, bar(1, "100", "113", "99", "112.5"))
+        assert (fill.reason, fill.price) == ("take_profit", D("112"))
+
+    async def test_feed_stale_labels_the_held_mark_until_a_fresh_one(self) -> None:
+        ex = await holding("2", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("97"))
+        ex.mark_feed_stale()
+
+        stale = await ex.create_order(BTC, "SELL", "MARKET", D("1"))
+        ex.set_mark(BTC, D("98"))
+        fresh = await ex.create_order(BTC, "SELL", "MARKET", D("1"))
+
+        assert (stale["price"], stale["mark_source"]) == (97.0, "stale_live")
+        assert (fresh["price"], fresh["mark_source"]) == (98.0, "live")
+
+    async def test_flatten_sells_at_the_live_mark(self) -> None:
+        ex = await holding("1", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("97"))
+        (fill,) = await ex.flatten(BTC)
+        assert (fill.price, fill.mark_source, fill.net_pnl) == (D("97"), "live", D("-3"))
+
+    async def test_non_positive_mark_is_ignored_and_foreign_quote_rejected(self) -> None:
+        ex = executor(capital="1000", fee="0", slippage="0")
+        await ex.on_closed_bar(BTC, flat_bar(0, "100"))
+        ex.set_mark(BTC, D("0"))
+        assert (await ex.create_order(BTC, "BUY", "MARKET", D("1")))["price"] == 100.0
+        with pytest.raises(OrderRejectedError, match="USDT-quoted"):
+            ex.set_mark("BTCEUR", D("90"))

@@ -19,8 +19,8 @@ from typing import Any
 import yaml
 
 from hydra.core.config import HydraConfig
-from hydra.core.events import BarEvent
-from hydra.core.types import OHLCV, Symbol, Timeframe
+from hydra.core.events import BarEvent, PriceEvent
+from hydra.core.types import OHLCV, ExchangeId, Symbol, Timeframe
 from hydra.data.bars import last_closed_open
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.paper_trading import PaperTradingExecutor
@@ -187,6 +187,21 @@ class Harness:
         )
         await settle()
         return bar
+
+    async def price(
+        self,
+        session: TradingSession,
+        price: str,
+        *,
+        symbol: str = "BTCUSDT",
+        exchange_id: ExchangeId = "binance",
+    ) -> None:
+        """Publish a live price of the forming candle exactly as the feed does."""
+        assert session._event_bus is not None
+        await session._event_bus.publish(
+            PriceEvent(symbol=Symbol(symbol), price=D(price), exchange_id=exchange_id)
+        )
+        await settle()
 
     async def close(self) -> None:
         if self.mgr is not None:

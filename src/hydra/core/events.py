@@ -198,7 +198,9 @@ class OrderFillEvent(OrderEvent):
     """An order has been filled (fully or partially).
 
     ``realized_pnl`` is net of this fill's fee and the pro-rata entry fee;
-    ``realized_pnl`` and ``gross_pnl`` are None on opening fills.
+    ``realized_pnl`` and ``gross_pnl`` are None on opening fills. ``mark_source`` says what
+    priced a paper market fill (``live``/``stale_live``: a price between closed bars,
+    ``last_close``); None on bar-priced fills.
     """
 
     order_id: str = ""
@@ -217,6 +219,7 @@ class OrderFillEvent(OrderEvent):
     reduce_only: bool = False
     realized_pnl: Decimal | None = None
     gross_pnl: Decimal | None = None
+    mark_source: str | None = None
     event_type: str = field(default="order_fill", init=False)
 
 

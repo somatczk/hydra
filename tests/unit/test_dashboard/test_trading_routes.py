@@ -322,10 +322,30 @@ class TestQuickTrade:
             "armed",
             False,
         )
+        assert (body["fill_price"], body["mark_source"]) == (100.1, "last_close")
         orders = await executor(session).fetch_open_orders()
         assert [(o["type"], o["amount"], o["stop_price"], o["id"]) for o in orders] == [
             ("STOP_MARKET", 0.3, 92.0, body["protective_order_id"])
         ]
+
+    async def test_market_fill_reports_the_live_price_it_used(
+        self, h: Harness, session: Any, api: httpx.AsyncClient
+    ) -> None:
+        await h.price(session, "103")
+
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "buy", "quantity": "0.3"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert (body["status"], body["price"], body["fill_price"], body["mark_source"]) == (
+            "FILLED",
+            None,
+            103.103,
+            "live",
+        )
 
     async def test_limit_buy_defers_protection_until_the_fill(
         self, h: Harness, session: Any, api: httpx.AsyncClient
