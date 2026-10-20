@@ -1,4 +1,4 @@
-"""Producer/rule agreement for deploy/prometheus-rules.yml against hydra.dashboard.metrics."""
+"""Producer/rule agreement for deploy/prometheus-rules.yml against hydra.core.metrics."""
 
 from __future__ import annotations
 
@@ -15,11 +15,15 @@ import yaml
 from prometheus_client import generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
-from hydra.dashboard import metrics
+from hydra.core import metrics
 from hydra.execution.session_manager import SessionManager, TradingSession
 from hydra.risk.pretrade import PreTradeRiskManager
 
-RULES_PATH = Path(__file__).resolve().parents[3] / "deploy" / "prometheus-rules.yml"
+DEPLOY = Path(__file__).resolve().parents[3] / "deploy"
+RULES_PATH = DEPLOY / "prometheus-rules.yml"
+RULE_TESTS_PATH = DEPLOY / "prometheus-rules.test.yml"
+HYDRA_NAME = re.compile(r"\bhydra_\w+")
+EXTERNAL_SERIES = re.compile(r"^(up|process_\w+)\{")
 HISTOGRAM_RULE = re.compile(
     r"histogram_quantile\(\s*[\d.]+\s*,.*?(\w+)_bucket\b.*\)\s*>\s*([\d.]+)\s*$", re.S
 )
@@ -61,7 +65,7 @@ def _rules() -> dict[str, dict[str, Any]]:
 
 def _drawdown_threshold() -> float:
     expr = _rules()["HydraDrawdownExceedsThreshold"]["expr"].strip()
-    match = re.fullmatch(r"hydra_drawdown_pct\s*>\s*([\d.]+)", expr)
+    match = re.fullmatch(r"hydra_drawdown_ratio\s*>\s*([\d.]+)", expr)
     assert match, expr
     return float(match.group(1))
 
@@ -87,7 +91,7 @@ async def test_drawdown_emitted_as_fraction() -> None:
     state = await sessions._build_portfolio_state(session)
 
     assert state.current_drawdown == Decimal("0.12")
-    exported = _exported_sample("hydra_drawdown_pct")
+    exported = _exported_sample("hydra_drawdown_ratio")
     assert exported == pytest.approx(0.12)
     assert exported > _drawdown_threshold()
 
@@ -100,11 +104,10 @@ def test_drawdown_rule_threshold_matches_fraction_unit() -> None:
 
 
 def test_histogram_rule_thresholds_below_top_bucket() -> None:
-    metrics._ensure_initialized()
     top_bucket = {
-        c._name: max(b for b in c._upper_bounds if not math.isinf(b))
-        for c in metrics._metrics.values()
-        if hasattr(c, "_upper_bounds")
+        spec.name: max(b for b in spec.buckets if not math.isinf(b))
+        for spec in metrics.CONTRACT
+        if spec.kind == "histogram"
     }
 
     checked = {}
@@ -125,3 +128,39 @@ def test_histogram_rule_thresholds_below_top_bucket() -> None:
         "HydraExchangeAPILatencyHigh",
         "HydraMLInferenceLatencyHigh",
     }
+
+
+def test_every_hydra_series_in_rules_is_in_the_contract() -> None:
+    exported = {sample for spec in metrics.CONTRACT for sample in spec.samples}
+    for alert, rule in _rules().items():
+        names = set(HYDRA_NAME.findall(rule["expr"]))
+        if not names:
+            assert EXTERNAL_SERIES.search(rule["expr"]), f"{alert} reads no known series"
+        assert names <= exported, f"{alert}: {sorted(names - exported)} not exported"
+
+
+def test_rules_without_an_honest_producer_are_gone() -> None:
+    rules = _rules()
+    assert "HydraReconciliationMismatch" not in rules
+    assert "HydraDataGapDetected" not in rules
+    exprs = " ".join(r["expr"] for r in rules.values())
+    assert "hydra_reconciliation_mismatch" not in exprs
+
+
+def test_feed_staleness_rules_compare_against_prometheus_time() -> None:
+    rules = _rules()
+    assert rules["HydraFeedStale"]["expr"].startswith("time() - ")
+    assert rules["HydraClosedBarOverdue"]["expr"].startswith("time() - ")
+    assert "hydra_feed_bar_interval_seconds" in rules["HydraClosedBarOverdue"]["expr"]
+
+
+def test_every_alert_has_a_firing_and_a_silent_promtool_case() -> None:
+    cases = yaml.safe_load(RULE_TESTS_PATH.read_text())["tests"]
+    fires: set[str] = set()
+    silent: set[str] = set()
+    for case in cases:
+        for check in case.get("alert_rule_test", []):
+            (fires if check["exp_alerts"] else silent).add(check["alertname"])
+    alerts = set(_rules())
+    assert alerts - fires == set(), "alerts without a firing case"
+    assert alerts - silent == set(), "alerts without a non-firing case"

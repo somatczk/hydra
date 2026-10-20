@@ -48,11 +48,11 @@ Each PR that changes one of these rows updates the row.
 | Dashboard | Every page shows an error instead of defaults | **Known gap: unscheduled.** `/templates` swallows a failed fetch and shows "No templates available yet". `/` and `/portfolio` fall back to `trading_mode: 'paper'` when `/api/system/config` fails and show paper numbers with no error. `/portfolio` drops a failed strategy-list fetch silently. `/api/models` serves `version: v1.0.0` and `stage: Staging` for an `.onnx` without sidecar metadata. |
 | Dashboard | Real-time WebSocket updates | **Known gap: unscheduled.** The engine serves `/ws/market`, `/ws/trades`, `/ws/portfolio`, `/ws/signals` and `/ws/risk`; only per-session trade fills are ever broadcast. The session page re-fetches its detail on a fill (P0-C), which fixed the NaN P&L. |
 | Dashboard | TradingView charts | **Known gap: unscheduled.** A third-party TradingView embed on `/trading` only; every other chart is Recharts. |
-| Monitoring | Prometheus alert rules | **Working (rule logic).** `promtool test rules deploy/prometheus-rules.test.yml` (workflow "Prometheus Rules"), `tests/unit/test_deploy/test_prometheus_rules.py`. The drawdown gauge only moves on fills inside a running session, so in production it reads about 0 until P1 risk wiring. |
-| Monitoring | Grafana dashboards (Sharpe, drawdown, P&L) | **Partial.** Drawdown panels read the fraction unit (`tests/unit/test_deploy/test_grafana_dashboards.py`). The "Rolling Sharpe" panel is not a Sharpe ratio, and several panels plot a different metric than their title (Known gap: unscheduled). |
+| Monitoring | Prometheus alert rules | **Working (rule logic) → P1 producers.** `promtool test rules deploy/prometheus-rules.test.yml` (workflow "Prometheus Rules") has a firing and a non-firing case for every alert, and `tests/unit/test_deploy/test_prometheus_rules.py` checks that every rule reads a series defined in the metric contract (`src/hydra/core/metrics.py`). Exchange API latency and errors are recorded for every call and outcome (`tests/unit/test_execution/test_exchange_client_metrics.py`). Feed staleness compares timestamp gauges against Prometheus `time()`, but nothing sets those gauges until the P1 feed work. Drawdown (`hydra_drawdown_ratio`) only moves on fills inside a running session until P1 risk wiring. The reconciliation alert was removed: there is no reconciliation until P3. |
+| Monitoring | Grafana dashboards (drawdown, P&L, heat, exchange errors) | **Partial → P1 ops.** Every panel reads only exported series with their real labels (`tests/unit/test_deploy/test_grafana_dashboards.py`). Rolling Sharpe, Model Accuracy and Drift PSI were removed because nothing produces them (Sharpe needs a daily-return series; ML is P5). Portfolio Heat, drawdown and P&L stay empty or flat until P1 risk wiring sets them; Win Rate counts every fill with PnL <= 0 as a loss, opening fills (PnL 0) included, and "Strategy Latency" plots order fill latency. |
 | Monitoring | Telegram alerts | **Partial.** Paging goes through romulus Alertmanager to Telegram. The in-app bot was deleted in P0-D. |
 | Engineering | mypy strict | **Partial → P1 ops.** CI runs `mypy --strict` over eight packages, and `pyproject.toml` relaxes strict mode for most packages through overrides. |
-| Engineering | import-linter module boundaries | **Planned P1 ops.** `make imports` fails today (the layers contract is broken) and it is not in CI. |
+| Engineering | import-linter module boundaries | **Working.** `make imports` (`uv run lint-imports`) prints `Contracts: 1 kept, 0 broken.`; it runs in `make check` and in the CI "Lint & Format" job. Layers: dashboard > portfolio, backtest > execution > risk, ml > strategy > data > indicators > core, ops. |
 | Engineering | CI runs unit / integration / e2e | **Partial → P1 ops.** Unit, lint, type, security and dashboard jobs are real. Integration runs against TimescaleDB and Redis containers: the backtest DB tests run there, but the Redis tests always skip because they probe `localhost:6379`. E2E uses no infrastructure. The image build is not gated on CI. |
 | Engineering | Every module has tests | **Known gap: unscheduled.** No tests for `backtest/vectorbt_research.py`, `data/ingestion.py` or `ops/notifications.py`. `backtest/hyperopt.py` has no unit tests of its own; it is covered through the route tests and `tests/integration/test_backtest_real_data.py::test_hyperopt_grid_runs_on_stored_bars_reproducibly`. |
 | Engineering | Dockerfile references in Makefile, compose files and build workflow | **Working.** `tests/unit/test_repo/test_build_references.py`. |
@@ -120,7 +120,7 @@ graph LR
 
 ```
 src/hydra/
-├── core/         # Config (pydantic + layered YAML), domain types, events, InMemory/Redis event bus, WS manager
+├── core/         # Config (pydantic + layered YAML), domain types, events, InMemory/Redis event bus, WS manager, Prometheus metric contract (metrics.py)
 ├── data/         # Ingestion (ccxt.pro), bar storage, backfill, news/sentiment; migrations/ is unused alembic
 ├── indicators/   # TA-Lib wrappers + custom indicators
 ├── strategy/     # Strategy base, engine, rule engine, YAML config; builtin/ holds the built-in classes
@@ -129,7 +129,7 @@ src/hydra/
 ├── risk/         # Pre-trade checks, sizing, circuit breakers and exchange safety (not wired)
 ├── portfolio/    # P&L, positions, reconciliation; models.py + migrations/ are unused SQLAlchemy/alembic
 ├── ml/           # Features, ONNX serving/export, registry, drift, training (not wired, P5)
-├── dashboard/    # FastAPI app (api.py), routes/, Prometheus metrics (metrics.py)
+├── dashboard/    # FastAPI app (api.py), routes/
 └── ops/          # Discord / Slack webhook notifier
 dashboard/        # Next.js app (see dashboard/README.md)
 docker/           # engine/, dashboard/, backtest/, ml/ — one Dockerfile each
@@ -181,8 +181,8 @@ make unit          # all unit tests, verbose
 make integration   # integration tests; DB tests skip unless HYDRA_DB_HOST is set
 make e2e           # e2e tests (no infrastructure needed)
 make perf          # benchmarks, writes benchmark.json
-make imports       # import-linter: FAILS until P1 (layers contract broken)
-make check         # lint + type-check + security + test
+make imports       # import-linter layers contract
+make check         # lint + type-check + security + imports + test
 make dev-up        # TimescaleDB + Redis via docker-compose.dev.yml (needs Docker)
 make dev-down      # stop them
 make docker-build  # build hydra-engine, hydra-dashboard, hydra-backtest (needs Docker)

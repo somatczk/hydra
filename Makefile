@@ -43,7 +43,7 @@ imports:
 	uv run lint-imports
 
 # All checks
-check: lint type-check security test
+check: lint type-check security imports test
 
 # Infrastructure
 dev-up:

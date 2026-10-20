@@ -7,7 +7,7 @@ tests:
   - name: drawdown 0.12 (fraction) fires
     interval: 1m
     input_series:
-      - series: hydra_drawdown_pct
+      - series: hydra_drawdown_ratio
         values: "0.12x10"
     alert_rule_test:
       - eval_time: 2m
@@ -23,7 +23,7 @@ tests:
   - name: drawdown 0.08 does not fire
     interval: 1m
     input_series:
-      - series: hydra_drawdown_pct
+      - series: hydra_drawdown_ratio
         values: "0.08x10"
     alert_rule_test:
       - eval_time: 2m
@@ -33,26 +33,195 @@ tests:
   - name: drawdown exactly at 0.10 does not fire
     interval: 1m
     input_series:
-      - series: hydra_drawdown_pct
+      - series: hydra_drawdown_ratio
         values: "0.10x10"
     alert_rule_test:
       - eval_time: 2m
         alertname: HydraDrawdownExceedsThreshold
         exp_alerts: []
 
-  - name: exchange API p99 in +Inf bucket caps at 10s and fires against 5s
+  - name: ws reconnecting 5 times in 5m fires
     interval: 1m
     input_series:
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="1.0"}'
-        values: "0+50x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
-        values: "0+98x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
-        values: "0+98x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
-        values: "0+98x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+      - series: 'hydra_ws_reconnects_total{exchange_id="binance"}'
+        values: "0+1x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeWSDisconnected
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Exchange WebSocket reconnecting too frequently"
+              description: "Exchange binance has reconnected 5 times in the last 5 minutes."
+
+  - name: one ws reconnect does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_ws_reconnects_total{exchange_id="binance"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeWSDisconnected
+        exp_alerts: []
+
+  - name: order fill p99 9.5s fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_order_fill_latency_seconds_bucket{le="5.0"}'
+        values: "0+90x10"
+      - series: 'hydra_order_fill_latency_seconds_bucket{le="10.0"}'
         values: "0+100x10"
+      - series: 'hydra_order_fill_latency_seconds_bucket{le="30.0"}'
+        values: "0+100x10"
+      - series: 'hydra_order_fill_latency_seconds_bucket{le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraOrderFillLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: trading
+            exp_annotations:
+              summary: "Order fill latency p99 exceeds 5 seconds"
+              description: "The 99th percentile order fill latency is 9.50s, indicating exchange slowness or connectivity issues."
+
+  - name: order fills under 1s do not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_order_fill_latency_seconds_bucket{le="1.0"}'
+        values: "0+100x10"
+      - series: 'hydra_order_fill_latency_seconds_bucket{le="5.0"}'
+        values: "0+100x10"
+      - series: 'hydra_order_fill_latency_seconds_bucket{le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraOrderFillLatencyHigh
+        exp_alerts: []
+
+  - name: feed message timestamp frozen for 4m fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_message_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HydraFeedStale
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              symbol: BTCUSDT
+              timeframe: 1m
+              severity: critical
+              team: infra
+            exp_annotations:
+              summary: "Market data feed stale"
+              description: "No market data message for binance/BTCUSDT 1m in 240 seconds."
+
+  - name: feed message timestamp advancing does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_message_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "0+60x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HydraFeedStale
+        exp_alerts: []
+
+  - name: feed stale under the for window does not fire yet
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_message_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraFeedStale
+        exp_alerts: []
+
+  - name: 1m closed bar frozen for 5m fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_closed_bar_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "0x10"
+      - series: 'hydra_feed_bar_interval_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "60x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraClosedBarOverdue
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              symbol: BTCUSDT
+              timeframe: 1m
+              severity: critical
+              team: infra
+            exp_annotations:
+              summary: "Closed bar overdue"
+              description: "The last closed 1m bar for binance/BTCUSDT opened 300 seconds ago."
+
+  - name: 1m closed bars arriving on time do not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_closed_bar_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "-60+60x10"
+      - series: 'hydra_feed_bar_interval_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "60x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraClosedBarOverdue
+        exp_alerts: []
+
+  - name: 1m closed bars 90s later than usual stay inside the 60s grace and do not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_closed_bar_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "-150+60x10"
+      - series: 'hydra_feed_bar_interval_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1m"}'
+        values: "60x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraClosedBarOverdue
+        exp_alerts: []
+
+  - name: 1h closed bar 1h old does not fire (threshold scales with the interval)
+    interval: 1m
+    input_series:
+      - series: 'hydra_feed_last_closed_bar_timestamp_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1h"}'
+        values: "0x70"
+      - series: 'hydra_feed_bar_interval_seconds{exchange_id="binance",symbol="BTCUSDT",timeframe="1h"}'
+        values: "3600x70"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: HydraClosedBarOverdue
+        exp_alerts: []
+
+  - name: exchange API p99 in +Inf bucket (timed-out calls) caps at 10s and fires against 5s
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="1.0"}'
+        values: "0+50x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="2.5"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="5.0"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="10.0"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="+Inf"}'
+        values: "0+98x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="timeout",le="1.0"}'
+        values: "0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="timeout",le="2.5"}'
+        values: "0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="timeout",le="5.0"}'
+        values: "0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="timeout",le="10.0"}'
+        values: "0x10"
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="timeout",le="+Inf"}'
+        values: "0+2x10"
     alert_rule_test:
       - eval_time: 5m
         alertname: HydraExchangeAPILatencyHigh
@@ -64,18 +233,18 @@ tests:
               team: infra
             exp_annotations:
               summary: "Exchange API latency p99 exceeds 5 seconds"
-              description: "Exchange binance fetch_ticker p99 is 10.00s (successful calls only; timeouts and errors are not observed)."
+              description: "Exchange binance fetch_ticker p99 is 10.00s over all calls, failed and timed-out ones included."
 
   - name: exchange API p99 interpolated inside (5s, 10s] fires
     interval: 1m
     input_series:
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="2.5"}'
         values: "0+90x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="5.0"}'
         values: "0+98x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="10.0"}'
         values: "0+100x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="+Inf"}'
         values: "0+100x10"
     alert_rule_test:
       - eval_time: 5m
@@ -88,20 +257,20 @@ tests:
               team: infra
             exp_annotations:
               summary: "Exchange API latency p99 exceeds 5 seconds"
-              description: "Exchange binance fetch_ticker p99 is 7.50s (successful calls only; timeouts and errors are not observed)."
+              description: "Exchange binance fetch_ticker p99 is 7.50s over all calls, failed and timed-out ones included."
 
   - name: exchange API all calls under 1s does not fire
     interval: 1m
     input_series:
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="1.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="1.0"}'
         values: "0+100x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="2.5"}'
         values: "0+100x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="5.0"}'
         values: "0+100x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="10.0"}'
         values: "0+100x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="+Inf"}'
         values: "0+100x10"
     alert_rule_test:
       - eval_time: 5m
@@ -111,41 +280,41 @@ tests:
   - name: slow create_order fires despite high-volume fast fetch_ticker
     interval: 1m
     input_series:
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.05"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="0.05"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.1"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="0.1"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.25"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="0.25"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="0.5"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="0.5"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="1.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="1.0"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="2.5"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="2.5"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="5.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="5.0"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="10.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="10.0"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",le="+Inf"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="fetch_ticker",outcome="ok",le="+Inf"}'
         values: "0+200x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.05"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="0.05"}'
         values: "0+0x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.1"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="0.1"}'
         values: "0+0x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.25"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="0.25"}'
         values: "0+0x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="0.5"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="0.5"}'
         values: "0+0x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="1.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="1.0"}'
         values: "0+0x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="2.5"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="2.5"}'
         values: "0+0x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="5.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="5.0"}'
         values: "0+0x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="10.0"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="10.0"}'
         values: "0+1x10"
-      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",le="+Inf"}'
+      - series: 'hydra_exchange_api_latency_seconds_bucket{exchange_id="binance",endpoint="create_order",outcome="ok",le="+Inf"}'
         values: "0+1x10"
     alert_rule_test:
       - eval_time: 5m
@@ -158,7 +327,133 @@ tests:
               team: infra
             exp_annotations:
               summary: "Exchange API latency p99 exceeds 5 seconds"
-              description: "Exchange binance create_order p99 is 9.95s (successful calls only; timeouts and errors are not observed)."
+              description: "Exchange binance create_order p99 is 9.95s over all calls, failed and timed-out ones included."
+
+  - name: exchange API 30% errors fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="ok"}'
+        values: "0+7x10"
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="error"}'
+        values: "0+2x10"
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="timeout"}'
+        values: "0+1x10"
+      - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="fetch_balance",error_type="ExchangeNotAvailable"}'
+        values: "0+2x10"
+      - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="fetch_balance",error_type="RequestTimeout"}'
+        values: "0+1x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPIErrorRate
+        exp_alerts:
+          - exp_labels:
+              exchange_id: binance
+              endpoint: fetch_balance
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Exchange API error rate above 20%"
+              description: "Exchange binance fetch_balance: 30% of calls failed or timed out over 5 minutes."
+
+  - name: exchange API 10% errors does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="ok"}'
+        values: "0+9x10"
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="error"}'
+        values: "0+1x10"
+      - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="fetch_balance",error_type="ExchangeNotAvailable"}'
+        values: "0+1x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPIErrorRate
+        exp_alerts: []
+
+  - name: exchange API with zero traffic does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="fetch_balance",outcome="error"}'
+        values: "3x10"
+      - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="fetch_balance",error_type="ExchangeNotAvailable"}'
+        values: "3x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPIErrorRate
+        exp_alerts: []
+
+  - name: exchange API single failed call (under the volume guard) does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_exchange_api_latency_seconds_count{exchange_id="binance",endpoint="create_order",outcome="error"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1"
+      - series: 'hydra_exchange_api_errors_total{exchange_id="binance",endpoint="create_order",error_type="InsufficientFunds"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraExchangeAPIErrorRate
+        exp_alerts: []
+
+  - name: engine scrape down for 3m fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="hydra",instance="hydra-engine:8000"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraEngineDown
+        exp_alerts:
+          - exp_labels:
+              job: hydra
+              instance: "hydra-engine:8000"
+              severity: critical
+              team: infra
+            exp_annotations:
+              summary: "Hydra engine is down"
+              description: "The Hydra trading engine has been unreachable for over 2 minutes. All trading activity is halted."
+
+  - name: engine scrape up does not fire
+    interval: 1m
+    input_series:
+      - series: 'up{job="hydra",instance="hydra-engine:8000"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraEngineDown
+        exp_alerts: []
+
+  - name: event bus p99 0.95s fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_event_bus_latency_seconds_bucket{le="0.5"}'
+        values: "0+90x10"
+      - series: 'hydra_event_bus_latency_seconds_bucket{le="1.0"}'
+        values: "0+100x10"
+      - series: 'hydra_event_bus_latency_seconds_bucket{le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraEventBusLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Event bus latency p99 exceeds 500ms"
+              description: "In-process event dispatch p99 is 0.950s; a subscriber callback is slow."
+
+  - name: event bus under 10ms does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_event_bus_latency_seconds_bucket{le="0.01"}'
+        values: "0+100x10"
+      - series: 'hydra_event_bus_latency_seconds_bucket{le="0.5"}'
+        values: "0+100x10"
+      - series: 'hydra_event_bus_latency_seconds_bucket{le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraEventBusLatencyHigh
+        exp_alerts: []
 
   - name: ML inference p99 above 100ms fires with the 100ms budget text
     interval: 1m
@@ -182,3 +477,45 @@ tests:
             exp_annotations:
               summary: "ML inference latency p99 exceeds 100ms"
               description: "Model xgb inference p99 is 0.235s, exceeding the 100ms budget."
+
+  - name: ML inference under 10ms does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.01"}'
+        values: "0+100x10"
+      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.1"}'
+        values: "0+100x10"
+      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="+Inf"}'
+        values: "0+100x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HydraMLInferenceLatencyHigh
+        exp_alerts: []
+
+  - name: RSS above 2 GiB for 5m fires
+    interval: 1m
+    input_series:
+      - series: 'process_resident_memory_bytes{job="hydra",instance="hydra-engine:8000"}'
+        values: "3221225472x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraHighMemoryUsage
+        exp_alerts:
+          - exp_labels:
+              job: hydra
+              instance: "hydra-engine:8000"
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Hydra process using over 2 GiB of memory"
+              description: "RSS is 3GiB. Investigate for memory leaks."
+
+  - name: RSS 1 GiB does not fire
+    interval: 1m
+    input_series:
+      - series: 'process_resident_memory_bytes{job="hydra",instance="hydra-engine:8000"}'
+        values: "1073741824x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HydraHighMemoryUsage
+        exp_alerts: []

@@ -44,7 +44,8 @@ not duplicate it here; update that table in the PR that changes a row.
 
 ## Project structure
 - `src/hydra/`: 11 modules.
-  - `core`: config, domain types, events, event buses, WebSocket manager.
+  - `core`: config, domain types, events, event buses, WebSocket manager, the Prometheus metric contract
+    (`metrics.py`).
   - `data`: ingestion, bar storage, backfill, news and sentiment.
   - `indicators`: TA-Lib wrappers and custom indicators.
   - `strategy`: base class, engine, rule engine, YAML config, `builtin/`.
@@ -53,7 +54,7 @@ not duplicate it here; update that table in the PR that changes a row.
   - `risk`: pre-trade checks, sizing, circuit breakers, exchange safety.
   - `portfolio`: P&L, positions, reconciliation.
   - `ml`: features, serving, export, registry, drift, training.
-  - `dashboard`: the FastAPI app, `routes/`, Prometheus `metrics.py`.
+  - `dashboard`: the FastAPI app, `routes/`.
   - `ops`: Discord/Slack webhook notifier.
 - `dashboard/`: Next.js app (see `dashboard/README.md`).
 - `config/`: base/live/backtest YAML, `strategies/`, `templates/`.
@@ -70,8 +71,8 @@ make security                  # bandit
 make test                      # unit tests, not slow, with coverage
 make e2e                       # e2e tests, no infrastructure
 make integration               # integration tests; DB tests need HYDRA_DB_*
-make check                     # lint + type-check + security + test
-make imports                   # import-linter; fails until P1
+make check                     # lint + type-check + security + imports + test
+make imports                   # import-linter layers contract (also in CI lint)
 make docker-build              # needs Docker
 ```
 CI also runs `uv run mypy src/hydra/core/ src/hydra/data/ src/hydra/indicators/ src/hydra/strategy/
@@ -97,8 +98,8 @@ those packages, because `mypy src/` alone does not catch everything it catches.
 - Pydantic for config and request validation. asyncio throughout.
 - Type hints on new code. mypy: `pyproject.toml` sets strict with relaxed overrides for most packages; CI runs the
   strict command above.
-- import-linter (`[tool.importlinter]`) describes the intended layers, but the contract is broken today and it is not
-  in CI (P1 ops). Do not add new cross-layer imports.
+- import-linter (`[tool.importlinter]`) enforces the layers in `make check` and CI. Metrics live in `hydra.core.metrics`;
+  every metric is declared in its `CONTRACT`, and producers only call its setters.
 - New code comes with tests. Not every existing module has them.
 
 ## Versioning and release

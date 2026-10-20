@@ -31,7 +31,7 @@
         "type": "gauge",
         "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "targets": [{ "expr": "hydra_drawdown_pct", "legendFormat": "Drawdown %" }],
+        "targets": [{ "expr": "hydra_drawdown_ratio", "legendFormat": "Drawdown" }],
         "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 0.20, "thresholds": { "steps": [
           { "color": "green", "value": null },
           { "color": "yellow", "value": 0.03 },
@@ -59,7 +59,7 @@
         "type": "piechart",
         "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "targets": [{ "expr": "sum by (strategy) (hydra_trades_total)", "legendFormat": "{{strategy}}" }]
+        "targets": [{ "expr": "sum by (strategy_id) (hydra_trades_total)", "legendFormat": "{{strategy_id}}" }]
       }
     ]
   }

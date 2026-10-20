@@ -1,0 +1,188 @@
+"""Every ExchangeClient call records latency with an outcome label, and errors are counted."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Iterator
+from decimal import Decimal
+from typing import Any
+
+import ccxt
+import pytest
+from prometheus_client import REGISTRY
+
+from hydra.core import metrics
+from hydra.execution.exchange_client import ExchangeClient
+
+CALL_SECONDS = 0.25
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _FakeCcxt:
+    """Stands in for a ccxt exchange instance; each call takes CALL_SECONDS on the clock."""
+
+    def __init__(self, clock: _Clock, fail: BaseException | None = None) -> None:
+        self._clock = clock
+        self._fail = fail
+        self.calls: list[str] = []
+
+    async def _call(self, name: str, result: Any) -> Any:
+        self.calls.append(name)
+        self._clock.now += CALL_SECONDS
+        if self._fail is not None:
+            raise self._fail
+        return result
+
+    async def create_order(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("create_order", {"id": "o1", **kwargs})
+
+    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
+        return await self._call("cancel_order", {"id": order_id, "symbol": symbol})
+
+    async def fetch_balance(self) -> dict[str, Any]:
+        return await self._call("fetch_balance", {"free": {"USDT": 1000.5, "BTC": 0}})
+
+    async def fetch_open_orders(self, symbol: str | None) -> list[dict[str, Any]]:
+        return await self._call("fetch_open_orders", [])
+
+    async def fetch_positions(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
+        return await self._call("fetch_positions", [])
+
+    async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+        return await self._call("fetch_ticker", {"last": 65000.1})
+
+    async def set_leverage(self, leverage: int, symbol: str) -> None:
+        await self._call("set_leverage", None)
+
+    async def set_margin_mode(self, mode: str, symbol: str) -> None:
+        await self._call("set_margin_mode", None)
+
+
+ClientCall = Callable[[ExchangeClient], Awaitable[Any]]
+
+CALLS: list[tuple[str, ClientCall]] = [
+    (
+        "create_order",
+        lambda c: c.create_order("BTC/USDT", "BUY", "MARKET", Decimal("0.01")),
+    ),
+    ("cancel_order", lambda c: c.cancel_order("o1", "BTC/USDT")),
+    ("fetch_balance", lambda c: c.fetch_balance()),
+    ("fetch_open_orders", lambda c: c.fetch_open_orders("BTC/USDT")),
+    ("fetch_positions", lambda c: c.fetch_positions("BTC/USDT")),
+    ("fetch_ticker", lambda c: c.get_last_price("BTC/USDT")),
+    ("set_leverage", lambda c: c.set_leverage("BTC/USDT", 2)),
+    ("set_margin_mode", lambda c: c.set_margin_mode("BTC/USDT", "isolated")),
+]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_registry() -> Iterator[None]:
+    metrics._reset_metrics()
+    yield
+    metrics._reset_metrics()
+
+
+@pytest.fixture()
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    fake = _Clock()
+    monkeypatch.setattr(metrics, "_monotonic", fake)
+    return fake
+
+
+def _client(fake: _FakeCcxt) -> ExchangeClient:
+    client = ExchangeClient("binance", {})
+    client._exchange = fake
+    return client
+
+
+def _latency(endpoint: str, outcome: str, suffix: str) -> float | None:
+    labels = {"exchange_id": "binance", "endpoint": endpoint, "outcome": outcome}
+    return REGISTRY.get_sample_value(f"hydra_exchange_api_latency_seconds_{suffix}", labels)
+
+
+def _errors(endpoint: str, error_type: str) -> float | None:
+    labels = {"exchange_id": "binance", "endpoint": endpoint, "error_type": error_type}
+    return REGISTRY.get_sample_value("hydra_exchange_api_errors_total", labels)
+
+
+async def test_successful_fetch_balance_records_ok_latency(clock: _Clock) -> None:
+    balances = await _client(_FakeCcxt(clock)).fetch_balance()
+
+    assert balances == {"USDT": Decimal("1000.5")}
+    assert _latency("fetch_balance", "ok", "count") == 1.0
+    assert _latency("fetch_balance", "ok", "sum") == CALL_SECONDS
+    assert _latency("fetch_balance", "error", "count") is None
+    assert REGISTRY.get_sample_value("hydra_exchange_api_errors_total", {}) is None
+
+
+@pytest.mark.parametrize(("endpoint", "call"), CALLS, ids=[e for e, _ in CALLS])
+async def test_every_call_is_observed_on_success(
+    clock: _Clock, endpoint: str, call: ClientCall
+) -> None:
+    fake = _FakeCcxt(clock)
+    await call(_client(fake))
+
+    assert fake.calls == [endpoint]
+    assert _latency(endpoint, "ok", "count") == 1.0
+    assert _latency(endpoint, "ok", "sum") == CALL_SECONDS
+
+
+@pytest.mark.parametrize(("endpoint", "call"), CALLS, ids=[e for e, _ in CALLS])
+async def test_every_call_counts_errors_and_reraises(
+    clock: _Clock, endpoint: str, call: ClientCall
+) -> None:
+    with pytest.raises(ccxt.InsufficientFunds):
+        await call(_client(_FakeCcxt(clock, fail=ccxt.InsufficientFunds("no funds"))))
+
+    assert _latency(endpoint, "error", "count") == 1.0
+    assert _latency(endpoint, "error", "sum") == CALL_SECONDS
+    assert _latency(endpoint, "ok", "count") is None
+    assert _errors(endpoint, "InsufficientFunds") == 1.0
+
+
+async def test_ccxt_request_timeout_is_timeout_outcome(clock: _Clock) -> None:
+    client = _client(_FakeCcxt(clock, fail=ccxt.RequestTimeout("binance GET timed out")))
+    with pytest.raises(ccxt.RequestTimeout):
+        await client.create_order("BTC/USDT", "SELL", "MARKET", Decimal("0.01"))
+
+    assert _latency("create_order", "timeout", "count") == 1.0
+    assert _latency("create_order", "timeout", "sum") == CALL_SECONDS
+    assert _errors("create_order", "RequestTimeout") == 1.0
+
+
+async def test_builtin_timeout_is_timeout_outcome(clock: _Clock) -> None:
+    client = _client(_FakeCcxt(clock, fail=TimeoutError()))
+    with pytest.raises(TimeoutError):
+        await client.cancel_order("o1", "BTC/USDT")
+
+    assert _latency("cancel_order", "timeout", "count") == 1.0
+    assert _errors("cancel_order", "TimeoutError") == 1.0
+
+
+async def test_cancelled_call_is_observed_but_not_an_error(clock: _Clock) -> None:
+    client = _client(_FakeCcxt(clock, fail=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await client.fetch_open_orders("BTC/USDT")
+
+    assert _latency("fetch_open_orders", "cancelled", "count") == 1.0
+    assert _errors("fetch_open_orders", "CancelledError") is None
+
+
+async def test_outcomes_accumulate_per_endpoint(clock: _Clock) -> None:
+    ok = _client(_FakeCcxt(clock))
+    failing = _client(_FakeCcxt(clock, fail=ccxt.ExchangeNotAvailable("503")))
+    for _ in range(3):
+        await ok.get_last_price("BTC/USDT")
+    with pytest.raises(ccxt.ExchangeNotAvailable):
+        await failing.get_last_price("BTC/USDT")
+
+    assert _latency("fetch_ticker", "ok", "count") == 3.0
+    assert _latency("fetch_ticker", "error", "count") == 1.0
+    assert _errors("fetch_ticker", "ExchangeNotAvailable") == 1.0

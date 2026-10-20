@@ -50,7 +50,7 @@
         "name": "strategy_id",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "query": "label_values(hydra_signal_count, strategy_id)",
+        "query": "label_values(hydra_signal_count_total, strategy_id)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -147,13 +147,13 @@
       "type": "timeseries",
       "title": "Drawdown %",
       "description": "Current drawdown from peak equity (metric is a fraction, 0.05 = 5%)",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "hydra_drawdown_pct",
-          "legendFormat": "Drawdown %"
+          "expr": "hydra_drawdown_ratio",
+          "legendFormat": "Drawdown"
         }
       ],
       "fieldConfig": {
@@ -190,17 +190,17 @@
       "type": "stat",
       "title": "Win Rate",
       "description": "Percentage of profitable trades",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(hydra_trade_pnl_bucket{le=\"0\"}) / sum(hydra_trade_pnl_count) * 100",
+          "expr": "sum(hydra_trade_pnl_bucket{le=\"0.0\"}) / sum(hydra_trade_pnl_count) * 100",
           "legendFormat": "Loss Rate %"
         },
         {
           "refId": "B",
-          "expr": "100 - (sum(hydra_trade_pnl_bucket{le=\"0\"}) / sum(hydra_trade_pnl_count) * 100)",
+          "expr": "100 - (sum(hydra_trade_pnl_bucket{le=\"0.0\"}) / sum(hydra_trade_pnl_count) * 100)",
           "legendFormat": "Win Rate %"
         }
       ],
@@ -228,47 +228,6 @@
       }
     },
     {
-      "id": 5,
-      "type": "timeseries",
-      "title": "Rolling Sharpe Ratio",
-      "description": "Rolling 30-day annualized Sharpe ratio approximation",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "avg_over_time(hydra_daily_pnl[30d]) / stddev_over_time(hydra_daily_pnl[30d]) * 19.1049731745",
-          "legendFormat": "Sharpe (30d rolling)"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "fixed", "fixedColor": "#8AB8FF" },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "spanNulls": true
-          },
-          "decimals": 2,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "green", "value": 2 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "single" }
-      }
-    },
-    {
       "id": 200,
       "type": "row",
       "title": "Strategy Monitor",
@@ -286,7 +245,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (strategy_id) (rate(hydra_signal_count[$__rate_interval]))",
+          "expr": "sum by (strategy_id) (rate(hydra_signal_count_total[$__rate_interval]))",
           "legendFormat": "{{ strategy_id }}"
         }
       ],
@@ -320,7 +279,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(hydra_trades_total[$__rate_interval])) / sum(rate(hydra_signal_count[$__rate_interval])) * 100",
+          "expr": "sum(rate(hydra_trades_total[$__rate_interval])) / sum(rate(hydra_signal_count_total[$__rate_interval])) * 100",
           "legendFormat": "Fill Rate %"
         }
       ],
@@ -395,22 +354,22 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "hydra_drawdown_pct >= bool 0.03",
+          "expr": "hydra_drawdown_ratio >= bool 0.03",
           "legendFormat": "Tier 1 (3%)"
         },
         {
           "refId": "B",
-          "expr": "hydra_drawdown_pct >= bool 0.05",
+          "expr": "hydra_drawdown_ratio >= bool 0.05",
           "legendFormat": "Tier 2 (5%)"
         },
         {
           "refId": "C",
-          "expr": "hydra_drawdown_pct >= bool 0.10",
+          "expr": "hydra_drawdown_ratio >= bool 0.10",
           "legendFormat": "Tier 3 (10%)"
         },
         {
           "refId": "D",
-          "expr": "hydra_drawdown_pct >= bool 0.15",
+          "expr": "hydra_drawdown_ratio >= bool 0.15",
           "legendFormat": "Tier 4 (15%)"
         }
       ],
@@ -442,30 +401,28 @@
       "id": 10,
       "type": "gauge",
       "title": "Portfolio Heat",
-      "description": "Drawdown severity as heat gauge",
+      "description": "Gross open exposure across sessions divided by account equity (default cap 0.30)",
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "hydra_drawdown_pct",
-          "legendFormat": "Drawdown %"
+          "expr": "hydra_portfolio_heat_ratio",
+          "legendFormat": "Heat"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "min": 0,
-          "max": 0.20,
+          "max": 0.50,
           "color": { "mode": "thresholds" },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "#EAB839", "value": 0.03 },
-              { "color": "orange", "value": 0.05 },
-              { "color": "red", "value": 0.10 },
-              { "color": "dark-red", "value": 0.15 }
+              { "color": "orange", "value": 0.20 },
+              { "color": "red", "value": 0.30 }
             ]
           }
         },
@@ -647,19 +604,19 @@
       "id": 15,
       "type": "timeseries",
       "title": "Error Rate",
-      "description": "Rate of 5xx and error-level log events",
+      "description": "Failed or timed-out exchange API calls and WebSocket reconnects per second",
       "gridPos": { "h": 8, "w": 4, "x": 20, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(hydra_ws_reconnects_total[$__rate_interval]))",
-          "legendFormat": "WS Errors/s"
+          "expr": "sum by (exchange_id) (rate(hydra_ws_reconnects_total{exchange_id=~\"$exchange_id\"}[$__rate_interval]))",
+          "legendFormat": "{{ exchange_id }} WS reconnects/s"
         },
         {
           "refId": "B",
-          "expr": "sum(rate(hydra_exchange_api_latency_seconds_count[$__rate_interval])) - sum(rate(hydra_trades_total[$__rate_interval]))",
-          "legendFormat": "API Errors/s (est)"
+          "expr": "sum by (exchange_id) (rate(hydra_exchange_api_errors_total{exchange_id=~\"$exchange_id\"}[$__rate_interval]))",
+          "legendFormat": "{{ exchange_id }} API errors/s"
         }
       ],
       "fieldConfig": {
@@ -690,84 +647,11 @@
       "panels": []
     },
     {
-      "id": 16,
-      "type": "timeseries",
-      "title": "Model Accuracy",
-      "description": "Rolling model accuracy / AUC metric (if exposed as gauge)",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 45 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "hydra_ml_inference_latency_seconds_count",
-          "legendFormat": "{{ model_name }} inferences"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] },
-        "tooltip": { "mode": "multi" }
-      }
-    },
-    {
-      "id": 17,
-      "type": "timeseries",
-      "title": "Drift PSI",
-      "description": "Population Stability Index for feature drift monitoring",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 45 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "rate(hydra_ml_inference_latency_seconds_sum[$__rate_interval]) / rate(hydra_ml_inference_latency_seconds_count[$__rate_interval])",
-          "legendFormat": "{{ model_name }} avg latency"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "spanNulls": true
-          },
-          "unit": "s",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.25 },
-              { "color": "red", "value": 0.1 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
-      }
-    },
-    {
       "id": 18,
       "type": "heatmap",
       "title": "ML Inference Latency",
       "description": "Distribution of inference latency per model",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 45 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 45 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {

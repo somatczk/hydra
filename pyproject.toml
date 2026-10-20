@@ -162,8 +162,10 @@ type = "layers"
 layers = [
     "hydra.dashboard",
     "hydra.portfolio | hydra.backtest",
-    "hydra.execution | hydra.risk | hydra.ml",
-    "hydra.strategy | hydra.data",
+    "hydra.execution",
+    "hydra.risk | hydra.ml",
+    "hydra.strategy",
+    "hydra.data",
     "hydra.indicators",
-    "hydra.core",
+    "hydra.core | hydra.ops",
 ]

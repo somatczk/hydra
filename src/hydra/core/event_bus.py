@@ -53,7 +53,7 @@ class InMemoryEventBus:
         for callback in callbacks:
             await callback(event)
         try:
-            from hydra.dashboard.metrics import observe_event_bus_latency
+            from hydra.core.metrics import observe_event_bus_latency
 
             observe_event_bus_latency(time.monotonic() - t0)
         except Exception:

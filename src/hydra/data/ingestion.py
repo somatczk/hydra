@@ -203,13 +203,6 @@ class ExchangeFeedManager:
                     backoff = _INITIAL_BACKOFF_S
                 last_success = time.monotonic()
 
-                try:
-                    from hydra.dashboard.metrics import update_data_gap
-
-                    update_data_gap(exchange_id, symbol, 0.0)
-                except Exception:
-                    pass
-
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -222,18 +215,12 @@ class ExchangeFeedManager:
                     backoff=backoff,
                     consecutive_errors=consecutive_errors,
                 )
-                try:
-                    from hydra.dashboard.metrics import update_data_gap
-
-                    update_data_gap(exchange_id, symbol, time.monotonic() - last_success)
-                except Exception:
-                    pass
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * _BACKOFF_FACTOR, _MAX_BACKOFF_S)
 
                 if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                     try:
-                        from hydra.dashboard.metrics import record_ws_reconnect
+                        from hydra.core.metrics import record_ws_reconnect
 
                         record_ws_reconnect(exchange_id)
                     except Exception:
@@ -294,7 +281,7 @@ class ExchangeFeedManager:
 
                 if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                     try:
-                        from hydra.dashboard.metrics import record_ws_reconnect
+                        from hydra.core.metrics import record_ws_reconnect
 
                         record_ws_reconnect(exchange_id)
                     except Exception:
