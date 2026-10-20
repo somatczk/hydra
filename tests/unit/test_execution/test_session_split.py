@@ -17,6 +17,8 @@ import pytest
 from importlinter.cli import lint_imports
 
 from hydra.core.config import HydraConfig
+from hydra.core.events import EntrySignal, OrderFillEvent
+from hydra.core.types import OrderRequest, Symbol
 from hydra.execution import (
     client_factory,
     exchange_client,
@@ -28,6 +30,7 @@ from hydra.execution import (
 )
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.execution.session_manager import SessionManager
+from hydra.risk.pretrade import PreTradeRiskManager
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -120,6 +123,17 @@ def test_session_manager_no_longer_defines_moved_helper(name: str) -> None:
 @pytest.mark.parametrize("marker", MOVED_SOURCE_MARKERS)
 def test_moved_bodies_are_not_left_in_session_manager(marker: str) -> None:
     assert marker not in inspect.getsource(session_manager)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["InMemoryEventBus", "ExchangeFeedManager", "OrderManager", "PortfolioState", "StrategyEngine"],
+)
+def test_wiring_classes_are_not_runtime_attributes_of_session_manager(name: str) -> None:
+    # A stale patch("hydra.execution.session_manager.<name>") must fail loudly, not no-op.
+    assert not hasattr(session_manager, name)
+    with pytest.raises(AttributeError), patch(f"hydra.execution.session_manager.{name}"):
+        pass
 
 
 def test_class_map_moved_to_client_factory() -> None:
@@ -350,4 +364,74 @@ async def test_order_manager_state_builder_reads_manager_pool_at_call_time(
     assert state.consecutive_losses == 2
     assert state.portfolio_value == Decimal("1000")
     mgr._db_pool = None
+    await mgr.stop_session(session_id)
+
+
+class _RecordingRiskManager(PreTradeRiskManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fills: list[tuple[Decimal, Decimal]] = []
+
+    async def record_fill(self, pnl: Decimal, portfolio_value: Decimal) -> None:
+        self.fills.append((pnl, portfolio_value))
+
+
+@pytest.mark.usefixtures("idle_feed")
+async def test_entry_sizing_reads_risk_config_after_balance_await(
+    write_strategy: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mgr = SessionManager(db_pool=None, config=HydraConfig())
+    mgr._risk_config = {"max_risk_per_trade": "0.02"}
+    session_id = await mgr.start_session(write_strategy("split-cfg"), "paper", Decimal("1000"))
+    await _settle()
+    session = mgr.get_session(session_id)
+    assert session is not None and session._event_bus is not None
+
+    async def balance_with_reload() -> dict[str, Decimal]:
+        await asyncio.sleep(0)
+        mgr._risk_config = {"max_risk_per_trade": "0.001"}
+        return {"USDT": Decimal("10000")}
+
+    async def last_price(symbol: str) -> Decimal:
+        return Decimal("100")
+
+    submitted: list[OrderRequest] = []
+
+    async def record_submit(order: OrderRequest) -> str:
+        submitted.append(order)
+        return "oid"
+
+    monkeypatch.setattr(session._executor, "get_balance", balance_with_reload)
+    monkeypatch.setattr(session._executor, "get_last_price", last_price)
+    monkeypatch.setattr(session._order_manager, "submit_order", record_submit)
+
+    await session._event_bus.publish(EntrySignal(symbol=Symbol("BTCUSDT")))
+
+    assert [o.quantity for o in submitted] == [Decimal("0.10000000")]
+    await mgr.stop_session(session_id)
+
+
+@pytest.mark.usefixtures("idle_feed")
+async def test_fill_recorded_on_risk_manager_current_after_balance_await(
+    write_strategy: Callable[[str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mgr = SessionManager(db_pool=None, config=HydraConfig())
+    old, new = _RecordingRiskManager(), _RecordingRiskManager()
+    mgr._risk_manager = old
+    session_id = await mgr.start_session(write_strategy("split-fill"), "paper", Decimal("1000"))
+    await _settle()
+    session = mgr.get_session(session_id)
+    assert session is not None and session._event_bus is not None
+
+    async def balance_with_reload() -> dict[str, Decimal]:
+        await asyncio.sleep(0)
+        mgr._risk_manager = new
+        return {"USDT": Decimal("7000"), "BTC": Decimal("3")}
+
+    monkeypatch.setattr(session._executor, "get_balance", balance_with_reload)
+
+    await session._event_bus.publish(OrderFillEvent(symbol=Symbol("BTCUSDT")))
+
+    assert old.fills == []
+    assert new.fills == [(Decimal("0"), Decimal("7003"))]
     await mgr.stop_session(session_id)

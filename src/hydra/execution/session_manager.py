@@ -15,19 +15,22 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hydra.core.config import HydraConfig, load_config
-from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.types import Position, Timeframe
-from hydra.data.ingestion import ExchangeFeedManager
 from hydra.execution import client_factory, session_store, session_wiring
 from hydra.execution.flatten import flatten_session
-from hydra.execution.order_manager import OrderManager
 from hydra.execution.portfolio_state import build_portfolio_state
-from hydra.risk.pretrade import PortfolioState, PreTradeRiskManager, RiskConfig
+from hydra.risk.pretrade import PreTradeRiskManager, RiskConfig
 from hydra.strategy.config import StrategyConfig, load_strategy_config
-from hydra.strategy.engine import StrategyEngine
+
+if TYPE_CHECKING:
+    from hydra.core.event_bus import InMemoryEventBus
+    from hydra.data.ingestion import ExchangeFeedManager
+    from hydra.execution.order_manager import OrderManager
+    from hydra.risk.pretrade import PortfolioState
+    from hydra.strategy.engine import StrategyEngine
 
 logger = logging.getLogger(__name__)
 

@@ -115,7 +115,7 @@ async def start_session_runtime(
                 )
 
         async def on_signal(event: Event) -> None:
-            order = await signal_to_order(event, session, get_risk_config())
+            order = await signal_to_order(event, session, get_risk_config)
             if order is not None:
                 try:
                     await om.submit_order(order)
@@ -130,12 +130,11 @@ async def start_session_runtime(
 
         # Forward fill events to risk manager
         async def on_fill(event: Event) -> None:
-            risk_manager = get_risk_manager()
-            if risk_manager and session.status == "running":
+            if get_risk_manager() and session.status == "running":
                 pnl = Decimal(str(getattr(event, "pnl", 0) or 0))
                 balance = await session._executor.get_balance()
                 portfolio_val = sum(balance.values(), Decimal("0"))
-                await risk_manager.record_fill(pnl, portfolio_val)
+                await cast(PreTradeRiskManager, get_risk_manager()).record_fill(pnl, portfolio_val)
 
         await session._event_bus.subscribe("order_fill", on_fill)
 
@@ -256,7 +255,7 @@ async def execute_order_actions(actions: list[Any], executor: Any, session: Trad
 
 
 async def signal_to_order(
-    event: Event, session: TradingSession, risk_config: dict[str, Any]
+    event: Event, session: TradingSession, get_risk_config: Callable[[], dict[str, Any]]
 ) -> OrderRequest | None:
     """Convert a signal event into an OrderRequest for the live context."""
     if isinstance(event, EntrySignal):
@@ -266,7 +265,7 @@ async def signal_to_order(
             return None
 
         # Load max_risk_per_trade from risk config
-        max_risk_per_trade = Decimal(str(risk_config.get("max_risk_per_trade", "0.02")))
+        max_risk_per_trade = Decimal(str(get_risk_config().get("max_risk_per_trade", "0.02")))
 
         price = await session._executor.get_last_price(str(event.symbol))
         if price <= 0:
