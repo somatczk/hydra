@@ -1,6 +1,5 @@
 platform:
   name: hydra
-  version: "0.1.0"
 
 database:
   host: ${HYDRA_DB_HOST}

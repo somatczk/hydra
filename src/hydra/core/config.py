@@ -17,6 +17,8 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+import hydra
+
 # ---------------------------------------------------------------------------
 # Default config directory — can be overridden via HYDRA_CONFIG_DIR
 # ---------------------------------------------------------------------------
@@ -149,7 +151,10 @@ class PlatformConfig(BaseModel):
     """Platform metadata."""
 
     name: str = "hydra"
-    version: str = "0.1.0"
+
+    @property
+    def version(self) -> str:
+        return hydra.__version__
 
 
 # ---------------------------------------------------------------------------
