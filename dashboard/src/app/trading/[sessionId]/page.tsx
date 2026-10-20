@@ -11,6 +11,9 @@ import { ErrorCard } from '@/components/ui/ErrorCard';
 import { fetchApi, connectWebSocket } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
+import { classifySessionWsMessage, debounce } from '@/lib/sessionWs';
+
+const FILL_REFETCH_DEBOUNCE_MS = 500;
 
 /* ---------- Types ---------- */
 
@@ -201,28 +204,12 @@ export default function SessionDetailPage() {
       }
     };
 
-    // Try WebSocket connection (plain function, not a hook)
+    // Fills only trigger a re-fetch: the server's detail endpoint owns PnL and win rate
+    const refetchOnFill = debounce(fetchDetail, FILL_REFETCH_DEBOUNCE_MS);
     const ws = connectWebSocket(
       `/ws/trades?session_id=${sessionId}`,
       (data) => {
-        const trade = data as TradeItem;
-        setDetail((prev) => {
-          if (!prev) return prev;
-          const updatedTrades = [...prev.trades, trade];
-          const totalPnl = updatedTrades.reduce((sum, t) => sum + t.pnl, 0);
-          const wins = updatedTrades.filter((t) => t.pnl > 0).length;
-          const winRate = updatedTrades.length > 0 ? (wins / updatedTrades.length) * 100 : 0;
-          return {
-            ...prev,
-            trades: updatedTrades,
-            metrics: {
-              ...prev.metrics,
-              total_pnl: totalPnl,
-              total_trades: updatedTrades.length,
-              win_rate: winRate,
-            },
-          };
-        });
+        if (classifySessionWsMessage(data, sessionId) === 'refetch') refetchOnFill.trigger();
       },
     );
 
@@ -254,6 +241,7 @@ export default function SessionDetailPage() {
     }
 
     return () => {
+      refetchOnFill.cancel();
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;

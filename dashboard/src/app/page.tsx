@@ -22,7 +22,7 @@ import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
-import { ErrorCard } from '@/components/ui/ErrorCard';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { fetchApi } from '@/lib/api';
 import { logger } from '@/lib/logger';
 
@@ -196,7 +196,7 @@ export default function DashboardPage() {
   const [news, setNews] = useState<NewsItem[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [isDark, setIsDark] = useState(false);
-  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
+  const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
 
   useEffect(() => {
     setIsDark(document.documentElement.classList.contains('dark'));
@@ -214,25 +214,25 @@ export default function DashboardPage() {
     await Promise.all([
       fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
         .then(setSummary)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, summary: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, summary: err ?? true })); }),
       fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}&limit=5`)
         .then((data) => {
           const trades = Array.isArray(data) ? data : (data.trades ?? []);
           setRecentTrades(mapApiTrades(trades));
         })
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, trades: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, trades: err ?? true })); }),
       fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
         .then((data) => setPositionCount(data.length))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
       fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
         .then((data) => setEquityCurve(data))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, equity: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, equity: err ?? true })); }),
       fetchApi<LiveMetrics>(`/api/portfolio/live-metrics?source=${source}`)
         .then(setLiveMetrics)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, liveMetrics: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, liveMetrics: err ?? true })); }),
       fetchApi<NewsItem[]>('/api/market/news')
         .then((data) => setNews(data.slice(0, 5)))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, news: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, news: err ?? true })); }),
     ]);
 
     setLoading(false);
@@ -252,7 +252,7 @@ export default function DashboardPage() {
     <div className="flex flex-col gap-6">
       {/* Stat cards */}
       {fetchErrors.summary ? (
-        <ErrorCard message="Failed to load portfolio summary" onRetry={loadData} />
+        <DataStateErrorCard error={fetchErrors.summary} fallback="Failed to load portfolio summary" onRetry={loadData} />
       ) : loading ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           {Array.from({ length: 4 }).map((_, i) => (
@@ -296,7 +296,7 @@ export default function DashboardPage() {
       {/* Equity curve */}
       <DataCard title="Equity Curve" description="Portfolio performance over time">
         {fetchErrors.equity ? (
-          <ErrorCard message="Failed to load equity curve" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.equity} fallback="Failed to load equity curve" onRetry={loadData} />
         ) : loading ? (
           <div className="flex h-64 items-center justify-center">
             <div className="h-64 w-full animate-pulse rounded-lg bg-bg-tertiary" />
@@ -355,7 +355,7 @@ export default function DashboardPage() {
 
       {/* Live metrics */}
       {fetchErrors.liveMetrics ? (
-        <ErrorCard message="Failed to load live metrics" onRetry={loadData} />
+        <DataStateErrorCard error={fetchErrors.liveMetrics} fallback="Failed to load live metrics" onRetry={loadData} />
       ) : liveMetrics ? (
         <DataCard title="Live Performance (30d)">
           <div className="grid grid-cols-3 gap-4">
@@ -384,7 +384,7 @@ export default function DashboardPage() {
       {/* Recent trades */}
       <DataCard title="Recent Trades" description="Last 5 executed trades">
         {fetchErrors.trades ? (
-          <ErrorCard message="Failed to load recent trades" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.trades} fallback="Failed to load recent trades" onRetry={loadData} />
         ) : loading ? (
           <div className="space-y-3">
             {Array.from({ length: 3 }).map((_, i) => (
@@ -404,7 +404,7 @@ export default function DashboardPage() {
 
       {/* Market news */}
       {fetchErrors.news ? (
-        <ErrorCard message="Failed to load market news" onRetry={loadData} />
+        <DataStateErrorCard error={fetchErrors.news} fallback="Failed to load market news" onRetry={loadData} />
       ) : news && news.length > 0 ? (
         <DataCard title="Market News">
           <div className="space-y-3">

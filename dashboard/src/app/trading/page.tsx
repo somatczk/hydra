@@ -2,15 +2,16 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { ArrowUpDown, Eye, OctagonX, Shield, RotateCcw, Zap } from 'lucide-react';
+import { ArrowUpDown, Eye, OctagonX, Shield, Zap } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
-import { ErrorCard } from '@/components/ui/ErrorCard';
+import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { fetchApi } from '@/lib/api';
+import { describeApiError, isStale, stateFromError } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
 import { useTheme } from '@/components/layout/ThemeProvider';
 import { logger } from '@/lib/logger';
@@ -90,12 +91,22 @@ interface RiskStatus {
   max_drawdown_limit: number;
   daily_loss: number;
   daily_loss_limit: number;
-  circuit_breakers: CircuitBreaker[];
+  circuit_breakers: CircuitBreaker[] | null;
 }
 
 interface OrderBook {
+  symbol: string;
+  exchange: string;
   bids: [number, number][];
   asks: [number, number][];
+  spread: number;
+  timestamp: string;
+}
+
+const ORDER_BOOK_MAX_AGE_MS = 15_000;
+
+function fmtTime(d: Date): string {
+  return d.toLocaleTimeString('en-GB', { hour12: false });
 }
 
 interface FundingRate {
@@ -220,14 +231,18 @@ export default function TradingPage() {
   const [openPositions, setOpenPositions] = useState<Position[] | null>(null);
   const [recentTrades, setRecentTrades] = useState<RecentTrade[] | null>(null);
   const [sessions, setSessions] = useState<TradingSession[]>([]);
-  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  // null = unknown (risk config unreadable); activation stays available as the fail-safe
+  const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
   const [circuitBreakers, setCircuitBreakers] = useState<CircuitBreaker[] | null>(null);
+  const [cbError, setCbError] = useState<unknown>(null);
   const [riskStatus, setRiskStatus] = useState<RiskStatus | null>(null);
   const [loading, setLoading] = useState(true);
-  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
-  const [resettingTier, setResettingTier] = useState<number | null>(null);
+  const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
   const [orderBook, setOrderBook] = useState<OrderBook | null>(null);
+  const [bookError, setBookError] = useState<unknown>(null);
+  const [bookTimestampStale, setBookTimestampStale] = useState(false);
+  const [bookReceivedAt, setBookReceivedAt] = useState<Date | null>(null);
   const [fundingRate, setFundingRate] = useState<FundingRate | null>(null);
 
   // Quick trade form state
@@ -243,6 +258,22 @@ export default function TradingPage() {
   const { resolved: themeResolved } = useTheme();
   const widgetContainerRef = useRef<HTMLDivElement>(null);
 
+  const refreshOrderBook = useCallback(
+    () =>
+      fetchApi<OrderBook>('/api/market/orderbook?symbol=BTCUSDT')
+        .then((ob) => {
+          setOrderBook(ob);
+          setBookError(null);
+          setBookTimestampStale(isStale(ob.timestamp, ORDER_BOOK_MAX_AGE_MS));
+          setBookReceivedAt(new Date());
+        })
+        .catch((err) => {
+          logger.warn('Trading', 'Order book refresh failed', err);
+          setBookError(err);
+        }),
+    [],
+  );
+
   const loadData = useCallback(async () => {
     setLoading(true);
     setFetchErrors({});
@@ -255,35 +286,37 @@ export default function TradingPage() {
     await Promise.all([
       fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
         .then((data) => setOpenPositions(mapApiPositions(data)))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
       fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
         .then((data) => {
           const trades = Array.isArray(data) ? data : (data.trades ?? []);
           setRecentTrades(mapApiTrades(trades));
         })
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, trades: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, trades: err ?? true })); }),
       fetchApi<TradingSession[]>('/api/trading/sessions')
         .then((data) => setSessions(data.filter((s) => s.status === 'running')))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, sessions: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, sessions: err ?? true })); }),
       fetchApi<RiskConfig>('/api/risk/config')
         .then((cfg) => setKillSwitchActive(cfg.kill_switch_active))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, riskConfig: true })); }),
+        .catch((err) => {
+          logger.warn('Trading', 'Kill switch state unknown', err);
+          setKillSwitchActive(null);
+          setFetchErrors((prev) => ({ ...prev, riskConfig: true }));
+        }),
       fetchApi<CircuitBreaker[]>('/api/risk/circuit-breakers')
-        .then(setCircuitBreakers)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, circuitBreakers: true })); }),
-      fetchApi<RiskStatus>('/api/risk/status')
+        .then((data) => { setCircuitBreakers(data); setCbError(null); })
+        .catch((err) => { setCircuitBreakers(null); setCbError(err); }),
+      fetchApi<RiskStatus>(`/api/risk/status${qs}`)
         .then(setRiskStatus)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, riskStatus: true })); }),
-      fetchApi<OrderBook>('/api/market/orderbook?symbol=BTCUSDT')
-        .then(setOrderBook)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, orderBook: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, riskStatus: err ?? true })); }),
+      refreshOrderBook(),
       fetchApi<FundingRate[]>('/api/market/funding-rates/current?symbol=BTCUSDT')
         .then((arr) => setFundingRate(arr?.[0] ?? null))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, fundingRate: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, fundingRate: err ?? true })); }),
     ]);
 
     setLoading(false);
-  }, []);
+  }, [refreshOrderBook]);
 
   useEffect(() => {
     loadData();
@@ -291,15 +324,11 @@ export default function TradingPage() {
     return () => clearInterval(interval);
   }, [loadData]);
 
-  // Order book auto-refresh every 5s
+  // Order book auto-refresh every 5s; a failed poll keeps the last book and marks it stale
   useEffect(() => {
-    const interval = setInterval(() => {
-      fetchApi<OrderBook>('/api/market/orderbook?symbol=BTCUSDT')
-        .then(setOrderBook)
-        .catch(() => {});
-    }, 5_000);
+    const interval = setInterval(refreshOrderBook, 5_000);
     return () => clearInterval(interval);
-  }, []);
+  }, [refreshOrderBook]);
 
   useEffect(() => {
     const container = widgetContainerRef.current;
@@ -331,7 +360,7 @@ export default function TradingPage() {
   const handleToggleKillSwitch = async () => {
     setKillSwitchLoading(true);
     try {
-      if (killSwitchActive) {
+      if (killSwitchActive === true) {
         await fetchApi('/api/trading/kill-switch', { method: 'DELETE' });
         setKillSwitchActive(false);
         toast('success', 'Kill switch deactivated');
@@ -342,23 +371,9 @@ export default function TradingPage() {
       }
     } catch (err) {
       logger.error('Trading', 'Failed to toggle kill switch', err);
-      toast('error', 'Failed to toggle kill switch');
+      toast('error', describeApiError(err, 'Failed to toggle kill switch'));
     } finally {
       setKillSwitchLoading(false);
-    }
-  };
-
-  const handleResetCircuitBreaker = async (tier: number) => {
-    setResettingTier(tier);
-    try {
-      await fetchApi(`/api/risk/circuit-breakers/${tier}/reset`, { method: 'POST' });
-      toast('success', `Circuit breaker tier ${tier} reset`);
-      loadData();
-    } catch (err) {
-      logger.error('Trading', `Failed to reset circuit breaker tier ${tier}`, err);
-      toast('error', `Failed to reset tier ${tier}`);
-    } finally {
-      setResettingTier(null);
     }
   };
 
@@ -402,7 +417,7 @@ export default function TradingPage() {
   return (
     <div className="flex flex-col gap-6">
       {/* Kill switch banner */}
-      {killSwitchActive && (
+      {killSwitchActive === true && (
         <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center gap-3">
           <OctagonX className="h-6 w-6 text-status-error shrink-0" />
           <div>
@@ -422,17 +437,22 @@ export default function TradingPage() {
             <div className="flex items-center gap-3">
               <Shield className="h-4 w-4 text-text-muted shrink-0" />
               <div>
-                <p className="text-sm font-medium text-text-primary">Kill Switch</p>
+                <p className="flex items-center gap-2 text-sm font-medium text-text-primary">
+                  Kill Switch
+                  {killSwitchActive === null && (
+                    <DataStateBadge state="unknown" reason="Risk config could not be read" />
+                  )}
+                </p>
                 <p className="text-xs text-text-muted">Immediately halt all trading activity</p>
               </div>
             </div>
             <Button
-              variant={killSwitchActive ? 'primary' : 'danger'}
+              variant={killSwitchActive === true ? 'primary' : 'danger'}
               size="sm"
               onClick={handleToggleKillSwitch}
               loading={killSwitchLoading}
             >
-              {killSwitchActive ? 'Deactivate' : 'Activate'}
+              {killSwitchActive === true ? 'Deactivate' : 'Activate'}
             </Button>
           </div>
 
@@ -460,8 +480,14 @@ export default function TradingPage() {
           )}
 
           {/* Circuit breakers */}
-          {fetchErrors.circuitBreakers ? (
-            <ErrorCard message="Failed to load circuit breakers" onRetry={loadData} />
+          {cbError !== null ? (
+            <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
+              <div>
+                <p className="text-sm font-medium text-text-primary">Circuit breakers</p>
+                <p className="text-xs text-text-muted">{describeApiError(cbError, 'Circuit breaker state unavailable')}</p>
+              </div>
+              <DataStateBadge state={stateFromError(cbError)} />
+            </div>
           ) : circuitBreakers && circuitBreakers.length > 0 ? (
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-text-muted">Circuit Breakers</p>
@@ -478,17 +504,6 @@ export default function TradingPage() {
                       <p className="text-xs text-text-muted">Threshold: {cb.threshold} | Current: {cb.current_value}</p>
                     </div>
                   </div>
-                  {cb.status === 'tripped' && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleResetCircuitBreaker(cb.tier)}
-                      loading={resettingTier === cb.tier}
-                    >
-                      <RotateCcw className="h-3 w-3" />
-                      Reset
-                    </Button>
-                  )}
                 </div>
               ))}
             </div>
@@ -496,7 +511,7 @@ export default function TradingPage() {
 
           {/* Funding rate */}
           {fetchErrors.fundingRate ? (
-            <ErrorCard message="Failed to load funding rate" onRetry={loadData} />
+            <DataStateErrorCard error={fetchErrors.fundingRate} fallback="Failed to load funding rate" onRetry={loadData} />
           ) : fundingRate ? (
             <div className="space-y-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-text-muted">Funding Rate</p>
@@ -638,10 +653,22 @@ export default function TradingPage() {
       </DataCard>
 
       {/* Order Book */}
-      {fetchErrors.orderBook ? (
-        <ErrorCard message="Failed to load order book" onRetry={loadData} />
-      ) : orderBook ? (
-        <DataCard title="Order Book">
+      {orderBook ? (
+        <DataCard
+          title="Order Book"
+          description={`${orderBook.exchange} ${orderBook.symbol}${bookReceivedAt ? ` · last update ${fmtTime(bookReceivedAt)}` : ''}`}
+        >
+          {(bookError !== null || bookTimestampStale) && (
+            <div className="mb-3 flex items-center gap-2">
+              <DataStateBadge
+                state="stale"
+                reason={bookError !== null ? describeApiError(bookError, 'Order book refresh failed') : 'Exchange timestamp is older than 15s'}
+              />
+              <span className="text-xs text-text-muted">
+                Exchange time {fmtTime(new Date(orderBook.timestamp))}
+              </span>
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-status-success">Bids</p>
@@ -675,6 +702,13 @@ export default function TradingPage() {
             </div>
           </div>
         </DataCard>
+      ) : bookError !== null ? (
+        <DataCard title="Order Book">
+          <div className="flex items-center gap-3">
+            <DataStateBadge state={stateFromError(bookError)} />
+            <p className="text-sm text-text-muted">{describeApiError(bookError, 'Order book unavailable')}</p>
+          </div>
+        </DataCard>
       ) : null}
 
       {/* Candlestick chart */}
@@ -687,7 +721,7 @@ export default function TradingPage() {
       {/* Open positions */}
       <DataCard title="Open Positions" description="Currently active positions">
         {fetchErrors.positions ? (
-          <ErrorCard message="Failed to load positions" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.positions} fallback="Failed to load positions" onRetry={loadData} />
         ) : loading ? (
           <div className="space-y-3">
             {Array.from({ length: 3 }).map((_, i) => (
@@ -708,7 +742,7 @@ export default function TradingPage() {
       {/* Recent trades */}
       <DataCard title="Recent Trades">
         {fetchErrors.trades ? (
-          <ErrorCard message="Failed to load recent trades" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.trades} fallback="Failed to load recent trades" onRetry={loadData} />
         ) : loading ? (
           <div className="space-y-3">
             {Array.from({ length: 3 }).map((_, i) => (

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { ShieldCheck, ShieldAlert, AlertTriangle, Ban, OctagonX, Activity } from 'lucide-react';
+import { ShieldCheck, AlertTriangle, Ban, OctagonX, Activity } from 'lucide-react';
 import {
   RadialBarChart,
   RadialBar,
@@ -20,8 +20,9 @@ import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
-import { ErrorCard } from '@/components/ui/ErrorCard';
+import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
+import { describeApiError, stateFromError, type DataState } from '@/lib/apiState';
 
 /* ---------- Types ---------- */
 
@@ -48,7 +49,8 @@ interface ApiRiskStatus {
     threshold: string;
     current_value: number;
     status: string;
-  }>;
+  }> | null;
+  circuit_breakers_state?: 'unavailable';
 }
 
 interface RiskConfig {
@@ -68,13 +70,18 @@ interface VarEstimate {
   cvar_95: number;
   portfolio_value: number;
   calculation_method: string;
+  sample_days: number;
 }
 
 interface LiveStatus {
-  kill_switch_active: boolean;
-  running_sessions: number;
-  circuit_breaker_restrictions: Record<string, unknown> | null;
+  kill_switch_active: boolean | null;
+  kill_switch_state: 'active' | 'inactive' | 'unknown';
+  running_sessions: number | null;
+  circuit_breaker_restrictions: null;
+  circuit_breakers_state: 'unavailable';
 }
+
+const MIN_VAR_SAMPLE_DAYS = 5;
 
 /* ---------- Helpers ---------- */
 
@@ -90,21 +97,16 @@ function statusToColors(s: string) {
   }
 }
 
-interface RiskEvent {
-  time: string;
-  message: string;
-  severity: 'warning' | 'info';
-}
-
 interface RiskState {
-  circuitBreakers: CircuitBreaker[];
+  /** null while circuit breakers are not wired to the engine */
+  circuitBreakers: CircuitBreaker[] | null;
   drawdown: number;
   maxDrawdown: number;
   dailyLoss: number;
 }
 
 function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
-  const breakers: CircuitBreaker[] = data.circuit_breakers.map((cb) => {
+  const breakers: CircuitBreaker[] | null = data.circuit_breakers?.map((cb) => {
     const colors = statusToColors(cb.status);
     // Tier 4 always uses error colour scheme even when Normal
     const finalColors = cb.tier === 4
@@ -118,7 +120,7 @@ function mapApiRiskStatus(data: ApiRiskStatus): RiskState {
       status: cb.status as CircuitBreaker['status'],
       ...finalColors,
     };
-  });
+  }) ?? null;
   return {
     circuitBreakers: breakers,
     drawdown: data.current_drawdown,
@@ -150,31 +152,28 @@ function CardSkeleton() {
 export default function RiskPage() {
   const { toast } = useToast();
   const [state, setState] = useState<RiskState | null>(null);
-  const [stateError, setStateError] = useState(false);
+  const [stateError, setStateError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
   const [dailyPnl, setDailyPnl] = useState<DailyPnl[]>([]);
   const [isDark, setIsDark] = useState(false);
-  const [riskEvents] = useState<RiskEvent[]>([
-    { time: '14:32', message: 'Position stop-loss triggered on BTC/USDT short at $68,180', severity: 'warning' },
-    { time: '11:15', message: 'Strategy cooldown activated for Breakout Scanner after 3 consecutive losses', severity: 'warning' },
-    { time: '09:00', message: 'Daily risk limits reset. All circuit breakers cleared.', severity: 'info' },
-  ]);
 
   // VaR estimate
   const [varEstimate, setVarEstimate] = useState<VarEstimate | null>(null);
+  const [varState, setVarState] = useState<DataState>('ok');
 
-  // Live status (polled)
+  // Live status (polled); null kill switch means the state is unknown
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
 
-  // Risk config form state
+  // Risk config form state: empty until loaded, never pre-filled with defaults
   const [riskConfig, setRiskConfig] = useState<RiskConfig | null>(null);
-  const [maxPositionPct, setMaxPositionPct] = useState('10');
-  const [maxRiskPerTrade, setMaxRiskPerTrade] = useState('2');
-  const [maxPortfolioHeat, setMaxPortfolioHeat] = useState('6');
-  const [maxDailyLossPct, setMaxDailyLossPct] = useState('3');
-  const [maxDrawdownPct, setMaxDrawdownPct] = useState('15');
-  const [maxConcurrentPositions, setMaxConcurrentPositions] = useState('10');
-  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [riskConfigError, setRiskConfigError] = useState<unknown>(null);
+  const [maxPositionPct, setMaxPositionPct] = useState('');
+  const [maxRiskPerTrade, setMaxRiskPerTrade] = useState('');
+  const [maxPortfolioHeat, setMaxPortfolioHeat] = useState('');
+  const [maxDailyLossPct, setMaxDailyLossPct] = useState('');
+  const [maxDrawdownPct, setMaxDrawdownPct] = useState('');
+  const [maxConcurrentPositions, setMaxConcurrentPositions] = useState('');
+  const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
 
   const sourceRef = useRef<string>('paper');
@@ -193,11 +192,11 @@ export default function RiskPage() {
 
     await Promise.all([
       fetchApi<ApiRiskStatus>(`/api/risk/status${qs}`)
-        .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
-        .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); setStateError(true); }),
+        .then((data) => { setState(mapApiRiskStatus(data)); setStateError(null); })
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch risk status', err); setStateError(err); }),
       fetchApi<VarEstimate>(`/api/risk/var${qs}`)
-        .then((data) => setVarEstimate(data))
-        .catch((err) => { logger.warn('Risk', 'Failed to fetch VaR', err); }),
+        .then((data) => { setVarEstimate(data); setVarState('ok'); })
+        .catch((err) => { logger.warn('Risk', 'Failed to fetch VaR', err); setVarState(stateFromError(err)); }),
       fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
         .then((data) => setDailyPnl(data))
         .catch((err) => { logger.warn('Risk', 'Failed to fetch daily PnL', err); }),
@@ -211,8 +210,14 @@ export default function RiskPage() {
           setMaxDrawdownPct((riskCfg.max_drawdown_pct * 100).toFixed(0));
           setMaxConcurrentPositions(riskCfg.max_concurrent_positions.toString());
           setKillSwitchActive(riskCfg.kill_switch_active);
+          setRiskConfigError(null);
         })
-        .catch((err) => { logger.warn('Risk', 'Failed to fetch risk config', err); }),
+        .catch((err) => {
+          logger.warn('Risk', 'Failed to fetch risk config', err);
+          setRiskConfig(null);
+          setRiskConfigError(err);
+          setKillSwitchActive(null);
+        }),
     ]);
 
     setLoading(false);
@@ -234,10 +239,14 @@ export default function RiskPage() {
           setLiveStatus(data);
           setKillSwitchActive(data.kill_switch_active);
         })
-        .catch((err) => { logger.warn('Risk', 'Failed to fetch live status', err); });
+        .catch((err) => {
+          logger.warn('Risk', 'Failed to fetch live status', err);
+          setLiveStatus(null);
+          setKillSwitchActive(null);
+        });
       fetchApi<ApiRiskStatus>(`/api/risk/status${qs}`)
-        .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
-        .catch(() => {});
+        .then((data) => { setState(mapApiRiskStatus(data)); setStateError(null); })
+        .catch((err) => { logger.warn('Risk', 'Failed to refresh risk status', err); setStateError(err); });
     };
     fetchLiveStatus();
     const interval = setInterval(fetchLiveStatus, 10_000);
@@ -260,17 +269,18 @@ export default function RiskPage() {
       toast('success', 'Risk configuration saved');
     } catch (err) {
       logger.error('Risk', 'Failed to save risk config', err);
-      toast('error', 'Failed to save risk configuration');
+      toast('error', describeApiError(err, 'Failed to save risk configuration'));
     }
   };
 
+  // Unknown state only offers activation: it is the fail-safe direction.
   const handleKillSwitch = async () => {
-    if (!killSwitchActive) {
+    if (killSwitchActive !== true) {
       if (!confirm('ACTIVATE KILL SWITCH?\n\nThis will immediately stop ALL trading sessions. Are you sure?')) return;
     }
     setKillSwitchLoading(true);
     try {
-      if (killSwitchActive) {
+      if (killSwitchActive === true) {
         await fetchApi('/api/trading/kill-switch', { method: 'DELETE' });
         setKillSwitchActive(false);
         toast('success', 'Kill switch deactivated');
@@ -283,7 +293,7 @@ export default function RiskPage() {
       }
     } catch (err) {
       logger.error('Risk', 'Failed to toggle kill switch', err);
-      toast('error', 'Failed to toggle kill switch');
+      toast('error', describeApiError(err, 'Failed to toggle kill switch'));
     } finally {
       setKillSwitchLoading(false);
     }
@@ -292,25 +302,33 @@ export default function RiskPage() {
   return (
     <div className="flex flex-col gap-6">
       {/* Live status badge */}
-      {liveStatus && (
+      {!loading && (
         <div className="flex items-center gap-4">
           <div className={cn(
             'inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium',
-            liveStatus.kill_switch_active
+            killSwitchActive === true
               ? 'bg-status-error/10 text-status-error border border-status-error/30'
-              : 'bg-status-success/10 text-status-success border border-status-success/30',
+              : killSwitchActive === false
+                ? 'bg-status-success/10 text-status-success border border-status-success/30'
+                : 'bg-status-warning/10 text-status-warning border border-status-warning/30',
           )}>
             <Activity className="h-3.5 w-3.5" />
-            {liveStatus.kill_switch_active ? 'Kill Switch Active' : 'System Normal'}
+            {killSwitchActive === true
+              ? 'Kill Switch Active'
+              : killSwitchActive === false
+                ? 'System Normal'
+                : 'Kill switch: UNKNOWN'}
           </div>
-          <span className="text-xs text-text-muted">
-            {liveStatus.running_sessions} running session{liveStatus.running_sessions !== 1 ? 's' : ''}
-          </span>
+          {liveStatus?.running_sessions != null && (
+            <span className="text-xs text-text-muted">
+              {liveStatus.running_sessions} running session{liveStatus.running_sessions !== 1 ? 's' : ''}
+            </span>
+          )}
         </div>
       )}
 
       {/* Kill switch banner */}
-      {killSwitchActive && (
+      {killSwitchActive === true && (
         <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <OctagonX className="h-6 w-6 text-status-error" />
@@ -331,19 +349,31 @@ export default function RiskPage() {
           {Array.from({ length: 4 }).map((_, i) => <CardSkeleton key={i} />)}
         </div>
       ) : stateError || !state ? (
-        <ErrorCard
-          message="Failed to load risk status"
+        <DataStateErrorCard
+          error={stateError}
+          fallback="Failed to load risk status"
           onRetry={() => {
             setLoading(true);
-            setStateError(false);
-            fetchApi<ApiRiskStatus>('/api/risk/status')
-              .then((data) => { setState(mapApiRiskStatus(data)); setStateError(false); })
-              .catch(() => setStateError(true))
+            setStateError(null);
+            fetchApi<ApiRiskStatus>(`/api/risk/status?source=${sourceRef.current}`)
+              .then((data) => { setState(mapApiRiskStatus(data)); setStateError(null); })
+              .catch((err) => setStateError(err))
               .finally(() => setLoading(false));
           }}
         />
       ) : (
         <>
+          {state.circuitBreakers === null ? (
+            <div className="rounded-xl border border-border-default bg-bg-secondary p-4 md:p-5">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-text-primary">Circuit breakers</h3>
+                <DataStateBadge state="unavailable" reason="not wired to engine yet" />
+              </div>
+              <p className="mt-2 text-xs text-text-muted">
+                Circuit breaker state is not wired to the trading engine yet, so no tier status is shown.
+              </p>
+            </div>
+          ) : (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {state.circuitBreakers.map((cb) => (
               <div
@@ -384,6 +414,7 @@ export default function RiskPage() {
               </div>
             ))}
           </div>
+          )}
 
           {/* Gauges row */}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -506,8 +537,21 @@ export default function RiskPage() {
           </div>
 
           {/* Value at Risk card */}
-          {varEstimate && (
+          {varState !== 'ok' ? (
+            <DataCard title="Value at Risk" description="Historical simulation">
+              <div className="flex items-center gap-3">
+                <DataStateBadge state={varState} />
+                <p className="text-sm text-text-muted">VaR could not be computed.</p>
+              </div>
+            </DataCard>
+          ) : varEstimate && varEstimate.sample_days < MIN_VAR_SAMPLE_DAYS ? (
             <DataCard title="Value at Risk" description={`Method: ${varEstimate.calculation_method.replace(/_/g, ' ')}`}>
+              <p className="text-sm text-text-muted">
+                Insufficient history ({varEstimate.sample_days} day{varEstimate.sample_days !== 1 ? 's' : ''}, need {MIN_VAR_SAMPLE_DAYS})
+              </p>
+            </DataCard>
+          ) : varEstimate && (
+            <DataCard title="Value at Risk" description={`Method: ${varEstimate.calculation_method.replace(/_/g, ' ')} over ${varEstimate.sample_days} days`}>
               <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
                 <div>
                   <p className="text-xs text-text-muted">VaR 95%</p>
@@ -533,6 +577,16 @@ export default function RiskPage() {
 
       {/* Editable risk limits */}
       <DataCard title="Risk Limits" description="Configure global risk management parameters">
+        {riskConfigError !== null && (
+          <div className="mb-4">
+            <DataStateErrorCard
+              error={riskConfigError}
+              fallback="Failed to load risk limits"
+              onRetry={loadRiskData}
+            />
+          </div>
+        )}
+        {riskConfig !== null && (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
           <Input
             label="Max Position Size (%)"
@@ -577,42 +631,19 @@ export default function RiskPage() {
             hint="Maximum number of open positions"
           />
         </div>
+        )}
         <div className="mt-4 flex items-center justify-end">
           <div className="flex items-center gap-3">
-            <Button variant="primary" onClick={handleSaveRiskConfig}>
+            <Button variant="primary" onClick={handleSaveRiskConfig} disabled={riskConfig === null}>
               Save Risk Limits
             </Button>
-            {!killSwitchActive && (
+            {killSwitchActive !== true && (
               <Button variant="danger" onClick={handleKillSwitch} loading={killSwitchLoading}>
                 <OctagonX className="h-4 w-4" />
                 Kill Switch
               </Button>
             )}
           </div>
-        </div>
-      </DataCard>
-
-      {/* Risk alerts */}
-      <DataCard title="Recent Risk Events" description="Risk management actions taken today (sample data)">
-        <div className="space-y-3">
-          {riskEvents.map((event, idx) => (
-            <div
-              key={idx}
-              className="flex items-start gap-3 rounded-lg border border-border-default bg-bg-secondary p-3"
-            >
-              <ShieldAlert
-                className={cn(
-                  'mt-0.5 h-4 w-4 shrink-0',
-                  event.severity === 'warning' ? 'text-status-warning' : 'text-status-info',
-                )}
-                aria-hidden="true"
-              />
-              <div className="flex-1">
-                <p className="text-sm text-text-primary">{event.message}</p>
-                <p className="mt-0.5 text-xs text-text-light">{event.time}</p>
-              </div>
-            </div>
-          ))}
         </div>
       </DataCard>
     </div>

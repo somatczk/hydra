@@ -101,6 +101,7 @@ jobs:
       - run: npm run lint
       # TypeScript 7; lint and next build use the TypeScript 6 API package
       - run: npm run typecheck
+      - run: npm test
       - run: npm run build
 
   integration-tests:
