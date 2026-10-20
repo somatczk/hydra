@@ -11,6 +11,7 @@ import pytest
 from hydra.core.types import (
     OHLCV,
     Direction,
+    ExecutorState,
     MarketType,
     OrderFill,
     OrderRequest,
@@ -335,3 +336,108 @@ class TestPosition:
         assert pos.direction == Direction.FLAT
         assert pos.quantity == Decimal("0")
         assert pos.realized_pnl == Decimal("150.50")
+
+
+# ---------------------------------------------------------------------------
+# P1 additive contracts
+# ---------------------------------------------------------------------------
+
+
+class TestOrderRequestP1Fields:
+    def test_defaults_keep_existing_constructor(self) -> None:
+        req = OrderRequest(
+            symbol=Symbol("BTCUSDT"),
+            side=Side.BUY,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("0.01"),
+            strategy_id="momentum",
+            exchange_id="binance",
+            market_type=MarketType.SPOT,
+        )
+        assert req.reduce_only is False
+        assert req.tag == ""
+
+    def test_existing_positional_order_unchanged(self) -> None:
+        req = OrderRequest(
+            Symbol("BTCUSDT"),
+            Side.BUY,
+            OrderType.STOP_MARKET,
+            Decimal("0.01"),
+            "momentum",
+            "binance",
+            MarketType.SPOT,
+            None,
+            Decimal("60000"),
+            "req-1",
+        )
+        assert req.stop_price == Decimal("60000")
+        assert req.request_id == "req-1"
+        assert req.reduce_only is False
+        assert req.tag == ""
+
+    def test_explicit_values(self) -> None:
+        req = OrderRequest(
+            symbol=Symbol("BTCUSDT"),
+            side=Side.SELL,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("0.5"),
+            strategy_id="momentum",
+            exchange_id="binance",
+            market_type=MarketType.SPOT,
+            reduce_only=True,
+            tag="flatten",
+        )
+        assert req.reduce_only is True
+        assert req.tag == "flatten"
+
+    def test_still_mutable(self) -> None:
+        req = OrderRequest(
+            symbol=Symbol("BTCUSDT"),
+            side=Side.SELL,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("0.5"),
+            strategy_id="momentum",
+            exchange_id="binance",
+            market_type=MarketType.SPOT,
+        )
+        req.reduce_only = True
+        req.tag = "stop_loss"
+        assert req.reduce_only is True
+        assert req.tag == "stop_loss"
+
+
+class _FullExecutor:
+    async def get_balance(self) -> dict[str, Decimal]:
+        return {"USDT": Decimal("9000")}
+
+    async def get_positions(self, symbol: str | None = None) -> list[Position]:
+        return []
+
+    async def get_last_price(self, symbol: str) -> Decimal:
+        return Decimal("65000")
+
+    async def get_equity(self) -> Decimal:
+        return Decimal("9000") + Decimal("0.02") * Decimal("65000")
+
+
+class _PreP1Executor:
+    async def get_balance(self) -> dict[str, Decimal]:
+        return {}
+
+    async def get_positions(self, symbol: str | None = None) -> list[Position]:
+        return []
+
+    async def get_last_price(self, symbol: str) -> Decimal:
+        return Decimal("0")
+
+
+class TestExecutorStateGetEquity:
+    def test_full_implementation_satisfies_protocol(self) -> None:
+        assert isinstance(_FullExecutor(), ExecutorState)
+
+    def test_missing_get_equity_does_not_satisfy_protocol(self) -> None:
+        assert not isinstance(_PreP1Executor(), ExecutorState)
+
+    async def test_get_equity_is_awaitable_decimal(self) -> None:
+        executor: ExecutorState = _FullExecutor()
+        assert await executor.get_equity() == Decimal("10300.00")
