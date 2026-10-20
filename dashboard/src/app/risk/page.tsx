@@ -22,7 +22,7 @@ import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
-import { describeApiError, stateFromError, type DataState } from '@/lib/apiState';
+import { describeApiError, parseErrorDetail, stateFromError, type DataState } from '@/lib/apiState';
 import {
   buildRiskLimitsUpdate,
   riskLimitsToForm,
@@ -117,6 +117,34 @@ interface LiveStatus {
   running_sessions: number | null;
   circuit_breaker_restrictions: Restrictions | null;
   circuit_breakers_state: 'live' | 'unavailable';
+}
+
+interface KillSwitchResponse {
+  active: boolean;
+  message: string;
+  sessions_stopped: number;
+  positions_remaining: number;
+  persisted: boolean;
+  flatten_failures: string[];
+}
+
+/** What the last activation left behind: positions it could not flatten, an unsaved latch. */
+interface KillSwitchRemainder {
+  positionsRemaining: number;
+  flattenFailures: string[];
+  persisted: boolean;
+}
+
+function remainderFrom(body: Record<string, unknown>, persisted: boolean): KillSwitchRemainder | null {
+  const n = Number(body.positions_remaining);
+  const positionsRemaining = Number.isFinite(n) && n > 0 ? n : 0;
+  const failures = Array.isArray(body.flatten_failures) ? body.flatten_failures.map(String) : [];
+  if (positionsRemaining === 0 && persisted) return null;
+  return { positionsRemaining, flattenFailures: failures, persisted };
+}
+
+function latchedText(n: number): string {
+  return `LATCHED — ${n} ${n === 1 ? 'position' : 'positions'} could not be flattened`;
 }
 
 const MIN_VAR_SAMPLE_DAYS = 5;
@@ -227,6 +255,7 @@ export default function RiskPage() {
   const limitsDirtyRef = useRef(false);
   const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
+  const [killSwitchRemainder, setKillSwitchRemainder] = useState<KillSwitchRemainder | null>(null);
 
   // null until /api/system/config says which account the page reports on
   const sourceRef = useRef<string | null>(null);
@@ -303,6 +332,7 @@ export default function RiskPage() {
         .then((data) => {
           setLiveStatus(data);
           setKillSwitchActive(data.kill_switch_active);
+          if (data.kill_switch_active === false) setKillSwitchRemainder(null);
         })
         .catch((err) => {
           logger.warn('Risk', 'Failed to fetch live status', err);
@@ -372,17 +402,32 @@ export default function RiskPage() {
           body: JSON.stringify({ confirm: 'RELEASE', reason: releaseReason }),
         });
         setKillSwitchActive(false);
+        setKillSwitchRemainder(null);
         toast('success', 'Kill switch deactivated');
         logger.warn('Risk', 'Kill switch deactivated');
       } else {
-        await fetchApi('/api/trading/kill-switch', { method: 'POST' });
+        const res = await fetchApi<KillSwitchResponse>('/api/trading/kill-switch', { method: 'POST' });
+        const remainder = remainderFrom({ ...res }, true);
         setKillSwitchActive(true);
-        toast('warning', 'Kill switch ACTIVATED — all trading halted');
-        logger.warn('Risk', 'KILL SWITCH ACTIVATED');
+        setKillSwitchRemainder(remainder);
+        if (remainder) {
+          toast('error', `Kill switch ${latchedText(remainder.positionsRemaining)}`);
+        } else {
+          toast('warning', 'Kill switch ACTIVATED — all positions closed and trading halted');
+        }
+        logger.warn('Risk', 'KILL SWITCH ACTIVATED', res);
       }
     } catch (err) {
-      logger.error('Risk', 'Failed to toggle kill switch', err);
-      toast('error', describeApiError(err, 'Failed to toggle kill switch'));
+      const detail = parseErrorDetail(err);
+      if (killSwitchActive !== true && detail?.code === 'kill_switch_not_persisted') {
+        setKillSwitchActive(true);
+        setKillSwitchRemainder(remainderFrom(detail, false));
+        toast('error', detail.message || 'Kill switch latched but not persisted');
+        logger.error('Risk', 'Kill switch latched but not persisted', err);
+      } else {
+        logger.error('Risk', 'Failed to toggle kill switch', err);
+        toast('error', describeApiError(err, 'Failed to toggle kill switch'));
+      }
     } finally {
       setKillSwitchLoading(false);
     }
@@ -422,8 +467,23 @@ export default function RiskPage() {
           <div className="flex items-center gap-3">
             <OctagonX className="h-6 w-6 text-status-error" />
             <div>
-              <p className="text-sm font-semibold text-status-error">Kill Switch Active</p>
+              <p className="text-sm font-semibold text-status-error">
+                {killSwitchRemainder && killSwitchRemainder.positionsRemaining > 0
+                  ? latchedText(killSwitchRemainder.positionsRemaining)
+                  : 'Kill Switch Active'}
+              </p>
               <p className="text-xs text-text-muted">All trading is halted. No new sessions can start.</p>
+              {killSwitchRemainder && killSwitchRemainder.positionsRemaining > 0 && (
+                <p className="text-xs text-status-error">Those positions are still open: check the sessions.</p>
+              )}
+              {killSwitchRemainder?.flattenFailures.map((f, i) => (
+                <p key={`${i}:${f}`} className="text-xs text-text-muted">{f}</p>
+              ))}
+              {killSwitchRemainder && !killSwitchRemainder.persisted && (
+                <p className="text-xs text-status-error">
+                  Not persisted — the latch is in memory only and is lost on restart.
+                </p>
+              )}
             </div>
           </div>
           <Button variant="outline" size="sm" onClick={handleKillSwitch} loading={killSwitchLoading}>

@@ -1,4 +1,5 @@
 import { act } from 'react';
+import { ApiError } from '@/lib/api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buttonByText,
@@ -239,5 +240,95 @@ describe('RiskPage kill switch release', () => {
       ['/api/trading/kill-switch', { confirm: 'RELEASE', reason: 'post-mortem done' }],
     ]);
     prompt.mockRestore();
+  });
+});
+
+describe('RiskPage kill switch activation', () => {
+  const ACTIVATED = {
+    active: true,
+    message: 'Kill switch latched; 2 position(s) could NOT be closed - check the sessions',
+    sessions_stopped: 2,
+    positions_remaining: 2,
+    persisted: true,
+    flatten_failures: ['s1 BTCUSDT: no market price', 's2 ETHUSDT: ledger halted'],
+  };
+
+  function withActivation(routes: Routes, answer: () => unknown) {
+    const get = routeFetch(routes, calls);
+    return async (path: string, init?: RequestInit): Promise<unknown> => {
+      if (path === '/api/trading/kill-switch' && init?.method === 'POST') {
+        calls.push({ path, init });
+        const value = answer();
+        if (value instanceof Error) throw value;
+        return value;
+      }
+      return get(path, init);
+    };
+  }
+
+  function banner(container: HTMLElement): string {
+    const btn = buttonByText(container, 'Release Kill Switch');
+    return btn.closest('.rounded-xl')?.textContent ?? '';
+  }
+
+  async function activate(answer: () => unknown): Promise<Mounted> {
+    fetchApi.mockImplementation(withActivation(baseRoutes(), answer));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const mounted = await mount(<RiskPage />);
+    expect(mounted.container.textContent).toContain('System Normal');
+    await click(buttonByText(mounted.container, 'Kill Switch'));
+    confirm.mockRestore();
+    return mounted;
+  }
+
+  it('shows LATCHED with the positions it could not flatten', async () => {
+    page = await activate(() => ACTIVATED);
+
+    const text = banner(page.container);
+    expect(text).toContain('LATCHED — 2 positions could not be flattened');
+    expect(text).toContain('s1 BTCUSDT: no market price');
+    expect(text).toContain('s2 ETHUSDT: ledger halted');
+    expect(text).not.toContain('Not persisted');
+    expect(page.container.textContent).toContain('Kill Switch Active');
+    expect(page.container.textContent).not.toContain('System Normal');
+    expect(toast).toHaveBeenCalledWith('error', 'Kill switch LATCHED — 2 positions could not be flattened');
+    expect(toast).not.toHaveBeenCalledWith('warning', expect.anything());
+  });
+
+  it('says all positions closed when nothing remains', async () => {
+    page = await activate(() => ({ ...ACTIVATED, positions_remaining: 0, flatten_failures: [] }));
+
+    const text = banner(page.container);
+    expect(text).toContain('Kill Switch Active');
+    expect(text).not.toContain('LATCHED');
+    expect(toast).toHaveBeenCalledWith('warning', 'Kill switch ACTIVATED — all positions closed and trading halted');
+  });
+
+  it('treats a 503 kill_switch_not_persisted as latched, not inactive', async () => {
+    const detail = {
+      code: 'kill_switch_not_persisted',
+      message: 'Kill switch latched; 1 position(s) could NOT be closed - check the sessions; the latch is in memory only and is lost on restart',
+      state: 'unavailable',
+      active: true,
+      sessions_stopped: 1,
+      positions_remaining: 1,
+      persisted: false,
+      flatten_failures: ['s1 BTCUSDT: no market price'],
+    };
+    page = await activate(() => new ApiError(503, JSON.stringify({ detail })));
+
+    const text = banner(page.container);
+    expect(text).toContain('LATCHED — 1 position could not be flattened');
+    expect(text).toContain('Not persisted — the latch is in memory only and is lost on restart.');
+    expect(page.container.textContent).not.toContain('System Normal');
+    expect(toast).toHaveBeenCalledWith('error', detail.message);
+  });
+
+  it('keeps the switch inactive on any other failure', async () => {
+    page = await activate(() => unavailable('engine down'));
+
+    expect(page.container.textContent).toContain('System Normal');
+    expect(() => buttonByText(page!.container, 'Release Kill Switch')).toThrow();
+    expect(toast).toHaveBeenCalledWith('error', 'engine down');
   });
 });
