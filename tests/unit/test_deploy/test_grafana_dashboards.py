@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from collections.abc import Iterator
@@ -26,7 +27,7 @@ DRAWDOWN_DASHBOARDS = [
 ]
 DASHBOARDS = [*DRAWDOWN_DASHBOARDS, REPO_ROOT / "config" / "grafana" / "hydra-system.json"]
 RULES_PATH = REPO_ROOT / "deploy" / "prometheus-rules.yml"
-TIER_EXPR = re.compile(r"hydra_drawdown_ratio\s*>=\s*bool\s*([\d.]+)")
+SRC = REPO_ROOT / "src" / "hydra"
 TIER_VALUES = [float(spec.drawdown_threshold) for spec in _TIERS]
 HYDRA_NAME = re.compile(r"\bhydra_\w+")
 BY_CLAUSE = re.compile(r"\bby\s*\(([^)]*)\)")
@@ -79,28 +80,19 @@ def test_drawdown_value_panels_use_fraction_unit(path: Path) -> None:
             assert max(thresholds) < defaults["max"], panel["title"]
 
 
-def test_tier_timeline_matches_risk_tiers() -> None:
-    (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["title"] == "Drawdown vs Breaker Tiers"]
+def test_tier_timeline_shows_the_live_breaker_tier() -> None:
+    (panel,) = [p for p in _panels(DASHBOARDS[0]) if p["title"] == "Circuit Breaker Tier"]
     assert panel["type"] == "state-timeline"
+    assert [(t["expr"], t["legendFormat"]) for t in panel["targets"]] == [
+        ("max by (scope) (hydra_circuit_breaker_active_tier)", "{{scope}}")
+    ]
     texts = {
         value: option["text"]
         for mapping in panel["fieldConfig"]["defaults"]["mappings"]
         for value, option in mapping["options"].items()
     }
-    assert texts == {"0": "Below", "1": "At/above threshold"}
-
-    targets = sorted(panel["targets"], key=lambda t: t["refId"])
-
-    parsed = []
-    for target in targets:
-        match = TIER_EXPR.fullmatch(target["expr"].strip())
-        assert match, target["expr"]
-        parsed.append(float(match.group(1)))
-
-    assert parsed == TIER_VALUES
-    for spec, target in zip(_TIERS, targets, strict=True):
-        pct = f"{float(spec.drawdown_threshold) * 100:g}%"
-        assert target["legendFormat"] == f"Tier {spec.tier} ({pct})"
+    assert texts == {"0": "None"} | {str(t.tier): f"Tier {t.tier}: {t.action}" for t in _TIERS}
+    assert not [p for p in _panels(DASHBOARDS[0]) if "drawdown_ratio >= bool" in json.dumps(p)]
 
 
 @pytest.mark.parametrize("path", DASHBOARDS, ids=lambda p: p.name)
@@ -140,8 +132,49 @@ def test_bucket_matchers_name_a_real_bucket_bound(path: Path) -> None:
 @pytest.mark.parametrize("path", DASHBOARDS, ids=lambda p: p.name)
 def test_no_panel_without_an_honest_source(path: Path) -> None:
     titles = [p["title"] for p in _panels(path)]
-    for word in ("Sharpe", "Accuracy", "PSI"):
+    for word in ("Sharpe", "Accuracy", "PSI", "ML"):
         assert not [t for t in titles if word in t], (path.name, word)
+    assert "hydra_ml_" not in path.read_text(), path.name
+
+
+def _producers() -> dict[str, set[str]]:
+    """Contract metric -> the src/hydra functions outside core/metrics.py that call its setters.
+
+    ``hydra.ml`` is excluded: nothing on the runtime path imports it until P5.
+    """
+    module = (SRC / "core" / "metrics.py").read_text()
+    setters: dict[str, set[str]] = {}
+    for node in ast.parse(module).body:
+        if not isinstance(node, ast.FunctionDef) or node.name.startswith("forget_"):
+            continue
+        body = ast.get_source_segment(module, node) or ""
+        for spec in CONTRACT:
+            if f'"{spec.name}"' in body:
+                setters.setdefault(spec.name, set()).add(node.name)
+    callers: dict[str, set[str]] = {}
+    for path in SRC.rglob("*.py"):
+        rel = path.relative_to(SRC)
+        if rel.parts[0] == "ml" or rel == Path("core", "metrics.py"):
+            continue
+        text = path.read_text()
+        for name, fns in setters.items():
+            if any(re.search(rf"\b{fn}\(", text) for fn in fns):
+                callers.setdefault(name, set()).add(str(rel))
+    for name, fns in setters.items():
+        if "_ensure_initialized" in fns:
+            callers.setdefault(name, set()).add("core/metrics.py (_ensure_initialized)")
+    return callers
+
+
+def test_every_series_a_rule_or_panel_reads_has_a_runtime_producer() -> None:
+    texts = [RULES_PATH.read_text(), *(path.read_text() for path in DASHBOARDS)]
+    read = {
+        SAMPLE_TO_SPEC[n].name for t in texts for n in HYDRA_NAME.findall(t) if n in SAMPLE_TO_SPEC
+    }
+    producers = _producers()
+    assert read
+    assert {name for name in read if not producers.get(name)} == set()
+    assert producers["hydra_sessions_errored_total"] == {"execution/session_manager.py"}
 
 
 @pytest.fixture()
@@ -168,23 +201,23 @@ async def test_trade_series_count_each_paper_fill_once(strategies_dir: Path) -> 
         sid = write_strategy(
             strategies_dir,
             "pnl-once",
-            entry_long=rule(("less_than", 100.5), ("greater_than", 99.5)),
-            exit_long=rule(("greater_than", 104.0)),
+            entry_long=rule(("less_than", 100.05), ("greater_than", 99.95)),
+            exit_long=rule(("greater_than", 100.2)),
         )
         session = await h.session(sid)
         await h.bar(session, "100")
         assert await held(session) == Decimal("1.00000")
-        await h.bar(session, "105")
+        await h.bar(session, "100.3")
         assert await held(session) == Decimal("0")
     finally:
         await h.close()
 
     assert _sample("hydra_trades_total", side="BUY", strategy_id="pnl-once") == 1.0
     assert _sample("hydra_trades_total", side="SELL", strategy_id="pnl-once") == 1.0
-    # net = 1 x 104.895 - 1 x 100.1 - 0.104895 - 0.1001 = 4.590005 USDT
+    # gross = 100.1997 - 100.1 = +0.0997; net = gross - 0.1001997 - 0.1001 = -0.1005997 USDT
     assert _sample("hydra_trade_pnl_count", strategy_id="pnl-once") == 1.0
-    assert _sample("hydra_trade_pnl_bucket", strategy_id="pnl-once", le="0.0") == 0.0
-    assert _sample("hydra_trade_pnl_bucket", strategy_id="pnl-once", le="10.0") == 1.0
+    assert _sample("hydra_trade_pnl_bucket", strategy_id="pnl-once", le="-10.0") == 0.0
+    assert _sample("hydra_trade_pnl_bucket", strategy_id="pnl-once", le="0.0") == 1.0
 
 
 def test_win_rate_counts_break_even_as_a_loss() -> None:

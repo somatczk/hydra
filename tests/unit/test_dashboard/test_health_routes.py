@@ -7,6 +7,7 @@ queries. A zombie from a real DB row is in tests/integration/test_readiness.py.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from hydra.core import metrics
 from hydra.core.types import Timeframe
 from hydra.dashboard.api import app as real_app
 from hydra.dashboard.health import (
+    CACHE_INTERVALS,
     FEED_MESSAGE_MAX_AGE_S,
     HealthMonitor,
     closed_bar_max_age,
@@ -32,7 +34,7 @@ from hydra.dashboard.routes import health as health_routes
 from hydra.data.bars import last_closed_open
 from hydra.data.migrations.runner import head_revision
 from hydra.execution.client_factory import ClientFactory
-from hydra.execution.session_manager import TradingSession
+from hydra.execution.session_manager import HealthSnapshot, SessionHealth, TradingSession
 from tests.fixtures.binance_kline import FakeRestExchange, FakeWsExchange
 from tests.unit.test_execution.session_harness import (
     Harness,
@@ -52,15 +54,18 @@ def _fresh_registry() -> Iterator[None]:
 
 
 class FakePool:
-    """A trading_sessions table in memory plus the two readiness queries.
+    """A trading_sessions table in memory, the readiness queries and paper writes that land.
 
-    ``closed`` makes every query raise, the way a closed asyncpg pool does.
+    ``closed`` makes every query raise, the way a closed asyncpg pool does; ``gate`` holds
+    ``SELECT 1`` until it is set, and ``pings`` counts them.
     """
 
     def __init__(self) -> None:
         self.revision = head_revision()
         self.closed = False
         self.status: dict[str, tuple[str, str, str]] = {}
+        self.pings = 0
+        self.gate: asyncio.Event | None = None
 
     def _check(self) -> None:
         if self.closed:
@@ -68,7 +73,12 @@ class FakePool:
 
     async def fetchval(self, sql: str) -> Any:
         self._check()
-        return 1 if sql == "SELECT 1" else self.revision
+        if sql != "SELECT 1":
+            return self.revision
+        self.pings += 1
+        if self.gate is not None:
+            await self.gate.wait()
+        return 1
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         self._check()
@@ -85,11 +95,15 @@ class FakePool:
         self._check()
         if sql.lstrip().startswith("INSERT INTO trading_sessions"):
             self.status[str(args[0])] = (str(args[1]), str(args[2]), str(args[3]))
-        return "OK"
+        return "INSERT 0 1"
 
     @contextlib.asynccontextmanager
     async def acquire(self) -> AsyncIterator[FakePool]:
         yield self
+
+    @contextlib.asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        yield
 
 
 @dataclass
@@ -190,6 +204,7 @@ class TestReadiness:
     ) -> None:
         session = await _session(h, strategies_dir, "ready-1m")
         metrics.mark_feed_message("binance", "BTCUSDT", "1m", at=probe.clock.now)
+        await probe.monitor.run_once()
 
         resp = await probe.client.get("/readyz")
 
@@ -234,6 +249,7 @@ class TestReadiness:
         session._task.cancel()
         await settle()
         assert session.status == "running" and not session.task_alive
+        await probe.monitor.run_once()
 
         resp = await probe.client.get("/readyz")
 
@@ -256,10 +272,12 @@ class TestReadiness:
 
         probe.clock.now = bar_ts + 180.0
         metrics.mark_feed_message("binance", "BTCUSDT", "1m", at=probe.clock.now)
+        await probe.monitor.run_once()
         assert (await probe.client.get("/readyz")).status_code == 200
 
         probe.clock.now = bar_ts + 181.0
         metrics.mark_feed_message("binance", "BTCUSDT", "1m", at=probe.clock.now)
+        await probe.monitor.run_once()
         resp = await probe.client.get("/readyz")
 
         assert resp.status_code == 503
@@ -287,11 +305,13 @@ class TestReadiness:
         self, h: MinuteHarness, probe: Probe
     ) -> None:
         probe.pool.revision = "0001"
+        await probe.monitor.run_once()
         resp = await probe.client.get("/readyz")
         assert resp.status_code == 503
         assert resp.json()["checks"]["migrations"]["ok"] is False
 
         probe.pool.closed = True
+        await probe.monitor.run_once()
         resp = await probe.client.get("/readyz")
         assert resp.status_code == 503
         db = resp.json()["checks"]["db"]
@@ -303,6 +323,7 @@ class TestReadiness:
     ) -> None:
         assert h.mgr is not None
         await h.mgr.stop_all(actor="test", reason="readiness")
+        await probe.monitor.run_once()
 
         resp = await probe.client.get("/readyz")
 
@@ -312,6 +333,42 @@ class TestReadiness:
             "required": False,
             "active": True,
         }
+
+    async def test_probe_serves_a_fresh_result_and_never_writes_the_gauges(
+        self, probe: Probe
+    ) -> None:
+        assert _gauge("hydra_ready", check="db") == 1.0
+        probe.pool.closed = True
+
+        cached = await probe.client.get("/readyz")
+        assert cached.status_code == 200
+        assert probe.pool.pings == 1
+
+        probe.clock.now += CACHE_INTERVALS * probe.monitor.interval_s + 1
+        resp = await probe.client.get("/readyz")
+
+        assert resp.status_code == 503
+        assert resp.json()["checks"]["db"]["error"] == "RuntimeError"
+        assert probe.monitor.last is not None and probe.monitor.last.ready is False
+        assert _gauge("hydra_ready", check="db") == 1.0
+        await probe.monitor.run_once()
+        assert _gauge("hydra_ready", check="db") == 0.0
+
+    async def test_concurrent_probes_share_one_evaluation(self, probe: Probe) -> None:
+        assert probe.pool.pings == 1
+        probe.clock.now += CACHE_INTERVALS * probe.monitor.interval_s + 1
+        probe.pool.gate = asyncio.Event()
+
+        probes = [asyncio.create_task(probe.client.get("/readyz")) for _ in range(20)]
+        while probe.pool.pings < 2:
+            await asyncio.sleep(0)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        probe.pool.gate.set()
+        responses = await asyncio.gather(*probes)
+
+        assert [r.status_code for r in responses] == [200] * 20
+        assert probe.pool.pings == 2
 
     async def test_stopped_session_series_are_removed(
         self, h: MinuteHarness, probe: Probe, strategies_dir: Path
@@ -329,6 +386,83 @@ class TestReadiness:
         assert _gauge("hydra_session_desired", **labels) is None
         assert _gauge("hydra_session_supervised", **labels) is None
         assert _gauge("hydra_health_monitor_last_run_timestamp_seconds") == probe.clock.now
+
+
+class SnapshotManager:
+    """``health_snapshot`` returns the next prepared snapshot (the #136 contract)."""
+
+    def __init__(self, *snapshots: HealthSnapshot) -> None:
+        self._snapshots = list(snapshots)
+
+    async def health_snapshot(self) -> HealthSnapshot:
+        return self._snapshots.pop(0)
+
+    def get_session(self, session_id: str) -> None:
+        return None
+
+
+def _health(**fields: Any) -> SessionHealth:
+    base: dict[str, Any] = {
+        "session_id": "s-held",
+        "strategy_id": "held",
+        "mode": "paper",
+        "status": "running",
+        "desired": True,
+        "supervised": True,
+        "last_bar_at": None,
+        "last_bar_age_s": None,
+        "last_fill_at": None,
+        "open_positions": 1,
+        "flatten_incomplete": False,
+        "entries_paused": None,
+        "feed_live": True,
+        "feed_stale_reasons": {},
+        "persist_backlog": 0,
+        "persist_dirty": False,
+        "error_message": None,
+    }
+    return SessionHealth(**(base | fields))
+
+
+def _snapshot(*sessions: SessionHealth) -> HealthSnapshot:
+    return HealthSnapshot(
+        sessions=tuple(sessions), desired_from_db=True, risk_available=True, kill_switch=False
+    )
+
+
+async def test_errored_session_holding_base_keeps_its_position_and_dirty_series() -> None:
+    app = FastAPI()
+    app.state.db_pool = FakePool()
+    errored = {"status": "error", "desired": False, "supervised": False}
+    app.state.session_manager = SnapshotManager(
+        _snapshot(_health()),
+        _snapshot(_health(**errored, persist_dirty=True)),
+        _snapshot(_health(**errored, open_positions=0, flatten_incomplete=True)),
+        _snapshot(_health(**errored, open_positions=0)),
+    )
+    monitor = HealthMonitor(app)
+    metrics.set_session_position("s-held", "held", "binance", "BTCUSDT", 0.01)
+    position = {"session_id": "s-held", "strategy_id": "held", "exchange_id": "binance"}
+    labels = {"session_id": "s-held", "strategy_id": "held", "mode": "paper"}
+    await monitor.run_once()
+    metrics.set_paper_persist_dirty("s-held", True)
+
+    result = await monitor.run_once()
+
+    assert result.ready is True
+    assert _gauge("hydra_paper_persist_dirty", session_id="s-held") == 1.0
+    assert _gauge("hydra_position_size", symbol="BTCUSDT", **position) == 0.01
+    assert (
+        _gauge("hydra_session_desired", **labels),
+        _gauge("hydra_session_supervised", **labels),
+    ) == (0.0, 0.0)
+    await monitor.run_once()
+    assert _gauge("hydra_paper_persist_dirty", session_id="s-held") == 1.0
+
+    await monitor.run_once()
+    assert _gauge("hydra_paper_persist_dirty", session_id="s-held") is None
+    assert _gauge("hydra_position_size", symbol="BTCUSDT", **position) is None
+    assert _gauge("hydra_session_desired", **labels) is None
 
 
 class TestLiveness:

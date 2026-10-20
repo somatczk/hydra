@@ -13,6 +13,11 @@ Expected trades come from a reference evaluation of the strategy (close crosses 
 fixture's final closes, and expected prices and balances from the paper fill model: market fills at
 the closed-bar close +/- 0.1 % slippage, 0.1 % taker fee in USDT, entry notional = 10 % of the
 sleeve floored to the 0.00001 BTC lot.
+
+Live bars are dated from the current minute onwards, so a healthy ``/readyz`` cannot fail on
+closed-bar age; that threshold is covered by ``tests/unit/test_dashboard/test_health_routes.py``
+and here by the monitor clock. The feed's own staleness is real: the replay stalls once its
+released frames run out, and the feed watchdog flags ``ws_silence`` after 60 s on the wall clock.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ from hydra.execution.session_manager import SessionManager
 from tests.e2e.replay_exchange import ReplayMarket
 
 WARMUP = 30
+WS_SILENCE_WAIT_S = 120.0
 CAPITAL = Decimal("1000")
 FRACTION = Decimal("0.10")
 FEE = Decimal("0.001")
@@ -224,6 +230,13 @@ class Engine:
                 ):
                     return float(sample.value)
         return None
+
+    async def readyz(self) -> httpx.Response:
+        """/readyz after one background monitor run, which also writes the gauges."""
+        monitor = self.app.state.health_monitor
+        assert isinstance(monitor, HealthMonitor)
+        await monitor.run_once()
+        return await self.client.get("/readyz")
 
     async def fetch(self, sql: str, *args: Any) -> list[asyncpg.Record]:
         conn = await asyncpg.connect(self.dsn)
@@ -402,24 +415,38 @@ async def test_round_trip_on_closed_bars_then_a_stalled_feed_fails_readiness(
         assert await eng.metric("hydra_trades_total", strategy_id=STRATEGY_ID, side="BUY") == 1
         assert await eng.metric("hydra_trades_total", strategy_id=STRATEGY_ID, side="SELL") == 1
         assert await eng.metric("hydra_trade_pnl_count", strategy_id=STRATEGY_ID) == 1
+        loss = 1.0 if net <= 0 else 0.0
+        pnl_le0 = await eng.metric("hydra_trade_pnl_bucket", strategy_id=STRATEGY_ID, le="0.0")
+        assert pnl_le0 == loss
         feed = {"exchange_id": "binance", "symbol": "BTCUSDT", "timeframe": "1m"}
         bar_ts = market.live[j].open_time.timestamp()
         assert await eng.metric("hydra_feed_last_closed_bar_timestamp_seconds", **feed) == bar_ts
 
-        ready = await eng.client.get("/readyz")
+        ready = await eng.readyz()
         assert ready.status_code == 200, ready.json()
+        [stream] = ready.json()["checks"]["feeds"]["streams"]
+        assert (stream["session_id"], stream["live"], stream["stale_reasons"]) == (sid, True, [])
         assert market.served == market.allowed
+
+        async with asyncio.timeout(WS_SILENCE_WAIT_S):
+            while (await eng.mgr.health_snapshot()).sessions[0].feed_live:
+                await asyncio.sleep(1)
+        silent = await eng.readyz()
+        assert silent.status_code == 503
+        [stream] = silent.json()["checks"]["feeds"]["streams"]
+        assert (stream["session_id"], stream["live"], stream["ok"]) == (sid, False, False)
+        assert "ws_silence" in stream["stale_reasons"]
+        assert not {"message_age", "closed_bar_age"} & set(stream["stale_reasons"])
+        assert silent.json()["checks"]["sessions"]["ok"] is True
+        assert await eng.metric("hydra_ready", check="feeds") == 0.0
+
         message_ts = await eng.metric("hydra_feed_last_message_timestamp_seconds", **feed)
         assert message_ts is not None
         clock.offset = max(message_ts + 121, bar_ts + 181) - time.time()
-
         stalled = await eng.client.get("/readyz")
         assert stalled.status_code == 503
         [stream] = stalled.json()["checks"]["feeds"]["streams"]
-        assert stream["session_id"] == sid
-        assert {"message_age", "closed_bar_age"} <= set(stream["stale_reasons"])
-        assert stalled.json()["checks"]["sessions"]["ok"] is True
-        assert await eng.metric("hydra_ready", check="feeds") == 0.0
+        assert {"ws_silence", "message_age", "closed_bar_age"} <= set(stream["stale_reasons"])
         assert (await eng.client.get("/livez")).status_code == 200
 
 
@@ -495,7 +522,15 @@ async def test_restart_recovers_the_position_without_a_zombie_and_stop_flattens(
         assert [(p["symbol"], Decimal(str(p["quantity"]))) for p in detail["positions"]] == [
             ("BTCUSDT", entry.quantity)
         ]
-        ready = await eng.client.get("/readyz")
+        stops = await session._executor.fetch_open_orders("BTCUSDT")
+        assert [(o["type"], Decimal(str(o["amount"]))) for o in stops] == [
+            ("STOP_MARKET", entry.quantity)
+        ]
+        assert Decimal(str(stops[0]["stop_price"])) == entry.price * (1 - STOP_FRACTION)
+        assert session._runtime is not None
+        armed = session._runtime.protect.armed("BTCUSDT")
+        assert armed is not None and armed.order_id == stops[0]["id"]
+        ready = await eng.readyz()
         assert ready.status_code == 200, ready.json()
         sessions = ready.json()["checks"]["sessions"]
         assert sessions["zombies"] == []
@@ -522,7 +557,7 @@ async def test_restart_recovers_the_position_without_a_zombie_and_stop_flattens(
         )
         assert (row["status"], row["positions_at_stop"]) == ("stopped", 0)
         assert await open_lots(eng, sid) == 0
-        assert (await eng.client.get("/readyz")).json()["checks"]["sessions"]["sessions"] == []
+        assert (await eng.readyz()).json()["checks"]["sessions"]["sessions"] == []
 
 
 async def test_only_binance_paper_sessions_start(romulus_env: str, strategies_dir: Path) -> None:

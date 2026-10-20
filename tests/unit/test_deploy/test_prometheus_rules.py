@@ -100,7 +100,6 @@ def test_histogram_rule_thresholds_below_top_bucket() -> None:
         "HydraOrderFillLatencyHigh",
         "HydraEventBusLatencyHigh",
         "HydraExchangeAPILatencyHigh",
-        "HydraMLInferenceLatencyHigh",
     }
 
 
@@ -119,6 +118,8 @@ def test_rules_without_an_honest_producer_are_gone() -> None:
     assert "HydraDataGapDetected" not in rules
     exprs = " ".join(r["expr"] for r in rules.values())
     assert "hydra_reconciliation_mismatch" not in exprs
+    assert "HydraMLInferenceLatencyHigh" not in rules
+    assert "hydra_ml_" not in exprs
 
 
 def test_feed_staleness_rules_compare_against_prometheus_time() -> None:

@@ -27,23 +27,16 @@
         "targets": [{ "expr": "sum by (exchange_id) (rate(hydra_ws_reconnects_total[5m]))", "legendFormat": "{{exchange_id}} reconnects/s" }]
       },
       {
-        "title": "ML Inference Latency",
-        "type": "timeseries",
-        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "targets": [{ "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(hydra_ml_inference_latency_seconds_bucket[5m])))", "legendFormat": "{{model_name}} p99" }]
-      },
-      {
         "title": "Order Fill Latency",
         "type": "timeseries",
-        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
         "targets": [{ "expr": "histogram_quantile(0.95, sum by (le) (rate(hydra_order_fill_latency_seconds_bucket[5m])))", "legendFormat": "p95" }]
       },
       {
         "title": "Signal Count by Strategy",
         "type": "timeseries",
-        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
         "datasource": { "type": "prometheus", "uid": "prometheus" },
         "targets": [{ "expr": "sum by (strategy_id) (rate(hydra_signal_count_total[5m]))", "legendFormat": "{{strategy_id}}" }]
       }

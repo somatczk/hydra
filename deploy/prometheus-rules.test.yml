@@ -545,43 +545,6 @@ tests:
         alertname: HydraEventBusLatencyHigh
         exp_alerts: []
 
-  - name: ML inference p99 above 100ms fires with the 100ms budget text
-    interval: 1m
-    input_series:
-      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.1"}'
-        values: "0+90x10"
-      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.25"}'
-        values: "0+100x10"
-      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.5"}'
-        values: "0+100x10"
-      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="+Inf"}'
-        values: "0+100x10"
-    alert_rule_test:
-      - eval_time: 5m
-        alertname: HydraMLInferenceLatencyHigh
-        exp_alerts:
-          - exp_labels:
-              model_name: xgb
-              severity: warning
-              team: ml
-            exp_annotations:
-              summary: "ML inference latency p99 exceeds 100ms"
-              description: "Model xgb inference p99 is 0.235s, exceeding the 100ms budget."
-
-  - name: ML inference under 10ms does not fire
-    interval: 1m
-    input_series:
-      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.01"}'
-        values: "0+100x10"
-      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="0.1"}'
-        values: "0+100x10"
-      - series: 'hydra_ml_inference_latency_seconds_bucket{model_name="xgb",le="+Inf"}'
-        values: "0+100x10"
-    alert_rule_test:
-      - eval_time: 5m
-        alertname: HydraMLInferenceLatencyHigh
-        exp_alerts: []
-
   - name: readiness check failing for 3m fires
     interval: 1m
     input_series:
@@ -687,11 +650,11 @@ tests:
         alertname: HydraHealthMonitorStalled
         exp_alerts: []
 
-  - name: a session errored in the last 15m fires
+  - name: a strategy's first error (the series appears at 1) fires for 15m
     interval: 1m
     input_series:
       - series: 'hydra_sessions_errored_total{strategy_id="sma"}'
-        values: "0 0 1 1 1 1"
+        values: "_ _ _ 1x20"
     alert_rule_test:
       - eval_time: 3m
         alertname: HydraSessionErrored
@@ -703,14 +666,44 @@ tests:
             exp_annotations:
               summary: "Trading session moved to error"
               description: "1 session(s) of strategy sma errored in the last 15 minutes."
+      - eval_time: 17m
+        alertname: HydraSessionErrored
+        exp_alerts:
+          - exp_labels:
+              strategy_id: sma
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Trading session moved to error"
+              description: "1 session(s) of strategy sma errored in the last 15 minutes."
+      - eval_time: 19m
+        alertname: HydraSessionErrored
+        exp_alerts: []
 
-  - name: no session error does not fire
+  - name: a later error of a strategy that errored before fires
     interval: 1m
     input_series:
       - series: 'hydra_sessions_errored_total{strategy_id="sma"}'
-        values: "2x10"
+        values: "1x20 2x10"
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 23m
+        alertname: HydraSessionErrored
+        exp_alerts:
+          - exp_labels:
+              strategy_id: sma
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Trading session moved to error"
+              description: "1 session(s) of strategy sma errored in the last 15 minutes."
+
+  - name: no new session error does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_sessions_errored_total{strategy_id="sma"}'
+        values: "2x30"
+    alert_rule_test:
+      - eval_time: 20m
         alertname: HydraSessionErrored
         exp_alerts: []
 

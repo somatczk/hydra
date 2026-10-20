@@ -6,10 +6,12 @@ background. Each run sets ``hydra_ready{check}``, ``hydra_session_desired`` /
 Prometheus rules can alert on a failing check, a zombie session or a stalled monitor.
 
 - Liveness (``/livez``): startup completed and the background loop ran within 3 intervals.
-- Readiness (``/readyz``), recomputed per request: the DB answers ``SELECT 1``, the schema is at
-  the Alembic head, every session the DB marks running has a live task here (a desired session
-  without one is a zombie, OP-2), every supervised session's feed is live and fresh, and the
-  RiskService state is available. The kill switch is reported, not required.
+- Readiness (``/readyz``): the DB answers ``SELECT 1``, the schema is at the Alembic head, every
+  session the DB marks running has a live task here (a desired session without one is a zombie,
+  OP-2), every supervised session's feed is live and fresh, and the RiskService state is
+  available. The kill switch is reported, not required. A probe gets the last evaluation while it
+  is at most ``CACHE_INTERVALS`` intervals old, else one evaluation runs (one at a time); only the
+  background run writes the gauges.
 
 Feed freshness uses the same thresholds as ``HydraFeedStale`` and ``HydraClosedBarOverdue``,
 measured against the monitor's clock from the feed gauges.
@@ -43,6 +45,7 @@ HEALTH_INTERVAL_S = 15.0
 LIVENESS_INTERVALS = 3
 DB_TIMEOUT_S = 2.0
 SNAPSHOT_TIMEOUT_S = 5.0
+CACHE_INTERVALS = 2
 FEED_MESSAGE_MAX_AGE_S = 120.0
 CLOSED_BAR_GRACE_S = 60.0
 CLOSED_BAR_MAX_BARS = 2
@@ -87,6 +90,11 @@ def _gauge_value(name: str, labels: dict[str, str]) -> float | None:
     return REGISTRY.get_sample_value(name, labels)
 
 
+def _holds_state(health: SessionHealth) -> bool:
+    """A stopped or errored session whose position or unpersisted fills still need watching."""
+    return health.open_positions > 0 or health.persist_dirty or health.flatten_incomplete
+
+
 class HealthMonitor:
     """Background readiness checks for one app (``app.state.health_monitor``)."""
 
@@ -107,6 +115,7 @@ class HealthMonitor:
         self._last_run: float | None = None
         self._published: set[SessionKey] = set()
         self._first_supervised: dict[str, float] = {}
+        self._lock = asyncio.Lock()
         self.last: Readiness | None = None
 
     @property
@@ -151,17 +160,33 @@ class HealthMonitor:
 
     async def run_once(self) -> Readiness:
         """One background run: check, publish the gauges, record the heartbeat."""
-        result = await self.readiness()
+        async with self._lock:
+            result = await self.check()
+            self.last = result
+            self._publish_ready(result)
         self._last_run = self._monotonic()
         metrics.mark_health_monitor_run(at=self._clock())
         return result
 
+    def _fresh(self) -> Readiness | None:
+        last = self.last
+        if last is None:
+            return None
+        age = self._clock() - last.checked_at
+        return last if 0 <= age <= CACHE_INTERVALS * self._interval_s else None
+
     async def readiness(self) -> Readiness:
-        """Evaluate every check now and publish the gauges."""
-        result = await self.check()
-        self._publish_ready(result)
-        self.last = result
-        return result
+        """The last evaluation while fresh, else a new one; never writes the gauges."""
+        cached = self._fresh()
+        if cached is not None:
+            return cached
+        async with self._lock:
+            cached = self._fresh()
+            if cached is not None:
+                return cached
+            result = await self.check()
+            self.last = result
+            return result
 
     # ------------------------------------------------------------------
     # Checks
@@ -226,7 +251,7 @@ class HealthMonitor:
     ) -> dict[str, Any]:
         if snap is None:
             return {"ok": False, "required": True, "error": error, "zombies": [], "sessions": []}
-        items = [s for s in snap.sessions if s.desired or s.supervised]
+        items = [s for s in snap.sessions if s.desired or s.supervised or _holds_state(s)]
         zombies = sorted(s.session_id for s in items if s.desired and not s.supervised)
         orphans = sorted(s.session_id for s in items if s.supervised and not s.desired)
         labels = await self._zombie_labels(pool, [s for s in items if not s.strategy_id])

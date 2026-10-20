@@ -64,6 +64,7 @@ async def test_ready_with_a_real_pool_and_not_ready_once_it_closes(
     assert checks["risk"] == {"ok": True, "required": True}
 
     await api.app.state.db_pool.close()
+    await api.app.state.health_monitor.run_once()
 
     resp = await engine.get("/readyz")
     assert resp.status_code == 503
@@ -87,6 +88,7 @@ async def test_running_row_without_a_task_is_a_zombie(
         )
     finally:
         await conn.close()
+    await api.app.state.health_monitor.run_once()
 
     resp = await engine.get("/readyz")
 
