@@ -5,12 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # never cancel a main run mid-publish; superseded PR runs are cancelled
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -22,6 +24,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
+          version: "0.13.3"
           enable-cache: true
       - run: uv sync --locked --extra dev
       - run: uv run ruff check src/ tests/
@@ -37,6 +40,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
+          version: "0.13.3"
           enable-cache: true
       - run: uv sync --locked --extra dev
       - run: uv run mypy src/hydra/core/ src/hydra/data/ src/hydra/indicators/ src/hydra/strategy/ src/hydra/backtest/ src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ --strict
@@ -50,6 +54,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
+          version: "0.13.3"
           enable-cache: true
       - run: uv sync --locked --extra dev
       - run: uv run bandit -r src/ -c pyproject.toml
@@ -63,6 +68,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
+          version: "0.13.3"
           enable-cache: true
       - run: uv sync --locked --extra dev
       - run: uv run pytest tests/unit/ --cov -m "not slow" --junitxml=${{ runner.temp }}/junit.xml
@@ -105,54 +111,64 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  promtool:
+    name: promtool check + test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # same image romulus pins in stacks/monitoring/prometheus/Dockerfile
+      PROMETHEUS_IMAGE: prom/prometheus:v3.15.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check rules
+        run: docker run --rm -v "$PWD/deploy:/rules:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" check rules /rules/prometheus-rules.yml
+      - name: Test rules
+        run: docker run --rm -v "$PWD/deploy:/rules:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" test rules /rules/prometheus-rules.test.yml
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.30.2-pg16
+        env:
+          POSTGRES_DB: hydra_test
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U hydra -d hydra_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
+          version: "0.13.3"
           enable-cache: true
       - run: uv sync --locked --extra dev
-
-      - name: Start test infrastructure
-        id: infra
-        run: |
-          docker rm -f hydra-int-pg-${{ github.run_id }} hydra-int-redis-${{ github.run_id }} 2>/dev/null || true
-          docker run -d --name hydra-int-pg-${{ github.run_id }} \
-            -e POSTGRES_DB=hydra_test -e POSTGRES_USER=hydra -e POSTGRES_PASSWORD=test \
-            -p 0:5432 \
-            --health-cmd "pg_isready -U hydra" --health-interval 5s --health-retries 10 \
-            timescale/timescaledb:2.30.2-pg16
-          docker run -d --name hydra-int-redis-${{ github.run_id }} \
-            -p 0:6379 \
-            --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10 \
-            redis:8-alpine
-          PG_PORT=$(docker port hydra-int-pg-${{ github.run_id }} 5432 | cut -d: -f2)
-          REDIS_PORT=$(docker port hydra-int-redis-${{ github.run_id }} 6379 | cut -d: -f2)
-          echo "pg_port=$PG_PORT" >> $GITHUB_OUTPUT
-          echo "redis_port=$REDIS_PORT" >> $GITHUB_OUTPUT
-          for i in $(seq 1 30); do
-            docker inspect --format='{{.State.Health.Status}}' hydra-int-pg-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
-            sleep 2
-          done
-          for i in $(seq 1 15); do
-            docker inspect --format='{{.State.Health.Status}}' hydra-int-redis-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
-            sleep 1
-          done
-
       - name: Run integration tests
-        run: uv run pytest tests/integration/ -v -m integration --no-header || [ $? -eq 5 ]
+        run: uv run pytest tests/integration/ -v -m integration --no-header
         env:
+          HYDRA_REQUIRE_INFRA: "1"
           HYDRA_DB_HOST: localhost
-          HYDRA_DB_PORT: ${{ steps.infra.outputs.pg_port }}
+          HYDRA_DB_PORT: ${{ job.services.timescaledb.ports['5432'] }}
           HYDRA_DB_NAME: hydra_test
           HYDRA_DB_USER: hydra
           HYDRA_DB_PASSWORD: test
-          HYDRA_REDIS_URL: redis://localhost:${{ steps.infra.outputs.redis_port }}/0
-
+          HYDRA_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}/0
       - name: Tests left working tree clean
         if: ${{ !cancelled() }}
         run: |
@@ -163,12 +179,6 @@ jobs:
             git diff --stat
             exit 1
           fi
-
-      - name: Cleanup test infrastructure
-        if: always()
-        run: |
-          docker rm -f hydra-int-pg-${{ github.run_id }} 2>/dev/null || true
-          docker rm -f hydra-int-redis-${{ github.run_id }} 2>/dev/null || true
 
   e2e-tests:
     name: E2E Tests
@@ -176,49 +186,42 @@ jobs:
     permissions:
       contents: read
     needs: [unit-tests, integration-tests]
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.30.2-pg16
+        env:
+          POSTGRES_DB: hydra_test
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U hydra -d hydra_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
+          version: "0.13.3"
           enable-cache: true
       - run: uv sync --locked --extra dev
-
-      - name: Start test infrastructure
-        id: e2e-infra
-        run: |
-          docker rm -f hydra-e2e-pg-${{ github.run_id }} hydra-e2e-redis-${{ github.run_id }} 2>/dev/null || true
-          docker run -d --name hydra-e2e-pg-${{ github.run_id }} \
-            -e POSTGRES_DB=hydra_test -e POSTGRES_USER=hydra -e POSTGRES_PASSWORD=test \
-            -p 0:5432 \
-            --health-cmd "pg_isready -U hydra" --health-interval 5s --health-retries 10 \
-            timescale/timescaledb:2.30.2-pg16
-          docker run -d --name hydra-e2e-redis-${{ github.run_id }} \
-            -p 0:6379 \
-            --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10 \
-            redis:8-alpine
-          PG_PORT=$(docker port hydra-e2e-pg-${{ github.run_id }} 5432 | cut -d: -f2)
-          REDIS_PORT=$(docker port hydra-e2e-redis-${{ github.run_id }} 6379 | cut -d: -f2)
-          echo "pg_port=$PG_PORT" >> $GITHUB_OUTPUT
-          echo "redis_port=$REDIS_PORT" >> $GITHUB_OUTPUT
-          for i in $(seq 1 30); do
-            docker inspect --format='{{.State.Health.Status}}' hydra-e2e-pg-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
-            sleep 2
-          done
-          for i in $(seq 1 15); do
-            docker inspect --format='{{.State.Health.Status}}' hydra-e2e-redis-${{ github.run_id }} 2>/dev/null | grep -q healthy && break
-            sleep 1
-          done
-
       - name: Run e2e tests
-        run: uv run pytest tests/e2e/ -v -m e2e --no-header || [ $? -eq 5 ]
+        run: uv run pytest tests/e2e/ -v -m e2e --no-header
         env:
+          HYDRA_REQUIRE_INFRA: "1"
           HYDRA_DB_HOST: localhost
-          HYDRA_DB_PORT: ${{ steps.e2e-infra.outputs.pg_port }}
+          HYDRA_DB_PORT: ${{ job.services.timescaledb.ports['5432'] }}
           HYDRA_DB_NAME: hydra_test
           HYDRA_DB_USER: hydra
           HYDRA_DB_PASSWORD: test
-          HYDRA_REDIS_URL: redis://localhost:${{ steps.e2e-infra.outputs.redis_port }}/0
-
+          HYDRA_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}/0
       - name: Tests left working tree clean
         if: ${{ !cancelled() }}
         run: |
@@ -230,8 +233,194 @@ jobs:
             exit 1
           fi
 
-      - name: Cleanup test infrastructure
-        if: always()
+  image-smoke:
+    name: Image Smoke (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: hydra-engine
+            dockerfile: docker/engine/Dockerfile
+            context: .
+          - image: hydra-dashboard
+            dockerfile: docker/dashboard/Dockerfile
+            context: .
+          - image: hydra-backtest
+            dockerfile: docker/backtest/Dockerfile
+            context: .
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.30.2-pg16
+        env:
+          POSTGRES_DB: hydra_test
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U hydra -d hydra_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ matrix.image }}:smoke
+          cache-from: type=gha,scope=${{ matrix.image }}
+          # PR-scoped caches are unreadable from main, so only main runs write them
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope={0}', matrix.image) || '' }}
+      - name: Start check
+        env:
+          IMAGE: ${{ matrix.image }}
+          PG_PORT: ${{ job.services.timescaledb.ports['5432'] }}
+          REDIS_PORT: ${{ job.services.redis.ports['6379'] }}
         run: |
-          docker rm -f hydra-e2e-pg-${{ github.run_id }} 2>/dev/null || true
-          docker rm -f hydra-e2e-redis-${{ github.run_id }} 2>/dev/null || true
+          set -euo pipefail
+          wait_for() {
+            for _ in $(seq 1 60); do
+              if "$@"; then return 0; fi
+              sleep 2
+            done
+            echo "::error::timed out waiting for: $*"
+            return 1
+          }
+          case "$IMAGE" in
+            hydra-engine)
+              # romulus env shape: only DATABASE_URL and REDIS_URL
+              docker run -d --name smoke --network host \
+                -e DATABASE_URL="postgresql://hydra:test@localhost:${PG_PORT}/hydra_test" \
+                -e REDIS_URL="redis://localhost:${REDIS_PORT}/0" \
+                "$IMAGE:smoke"
+              wait_for curl -fsS -o /dev/null http://localhost:8000/health
+              body=$(curl -fsS http://localhost:8000/health)
+              echo "$body"
+              jq -e '.status == "ok" and .db == "connected"' <<<"$body"
+              docker logs smoke 2>&1 | grep -F 'Application startup complete' \
+                | jq -e 'select(.logger == "uvicorn.error" and .level == "info" and .timestamp != null)'
+              docker logs smoke 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
+              docker exec smoke python -c "import hydra.dashboard.api"
+              ;;
+            hydra-backtest)
+              docker run -d --name smoke "$IMAGE:smoke"
+              wait_for sh -c "docker logs smoke 2>&1 | grep -qF 'Backtest worker started'"
+              test "$(docker inspect -f '{{.State.Running}}' smoke)" = true
+              docker logs smoke 2>&1 | grep -F 'Backtest worker started' \
+                | jq -e 'select(.level == "info" and .timestamp != null)'
+              docker logs smoke 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
+              docker exec smoke python -c "import hydra.backtest.runner"
+              ;;
+            hydra-dashboard)
+              docker run -d --name smoke -p 3000:3000 "$IMAGE:smoke"
+              wait_for curl -fsS -o /dev/null http://localhost:3000/
+              ;;
+          esac
+      - name: Container logs
+        if: ${{ !cancelled() }}
+        run: docker logs smoke 2>&1 | tail -n 200 || true
+
+  publish:
+    name: Publish ${{ matrix.image }}
+    needs:
+      - lint
+      - type-check
+      - security
+      - unit-tests
+      - dashboard
+      - promtool
+      - integration-tests
+      - e2e-tests
+      - image-smoke
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # every path a published Dockerfile COPYs from the build context
+      IMAGE_INPUTS: src config scripts docker dashboard pyproject.toml uv.lock README.md
+    strategy:
+      matrix:
+        include:
+          - image: hydra-engine
+            dockerfile: docker/engine/Dockerfile
+            context: .
+          - image: hydra-dashboard
+            dockerfile: docker/dashboard/Dockerfile
+            context: .
+          - image: hydra-backtest
+            dockerfile: docker/backtest/Dockerfile
+            context: .
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Image inputs changed
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          build=true
+          if [ "$EVENT" = push ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+            && git diff --quiet "$BEFORE" "$GITHUB_SHA" -- $IMAGE_INPUTS; then
+            echo "::notice::no image input changed since ${BEFORE::7}; manual dispatch republishes"
+            build=false
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        if: steps.changes.outputs.build == 'true'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.changes.outputs.build == 'true'
+
+      # version tags are releases and never move; a rebuild without a version bump only updates main and sha
+      - name: Tags
+        id: tags
+        if: steps.changes.outputs.build == 'true'
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          release="$IMAGE:$version"
+          if docker buildx imagetools inspect "$release" >/dev/null 2>&1; then
+            echo "::notice::$release already exists, bump the version in pyproject.toml to release"
+            release=""
+          fi
+          printf 'list<<EOF\n%s:main\n%s:sha-%s\n%s\nEOF\n' "$IMAGE" "$IMAGE" "${GITHUB_SHA::7}" "$release" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        if: steps.changes.outputs.build == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

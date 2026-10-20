@@ -3,10 +3,10 @@
 
 # Development setup
 install:
-	uv sync
+	uv sync --locked
 
 dev:
-	uv sync --all-extras
+	uv sync --locked --all-extras
 
 # Testing
 test:

@@ -1,4 +1,4 @@
-"""Every Dockerfile referenced by the Makefile, compose files and build workflow exists."""
+"""Every Dockerfile referenced by the Makefile, compose files and CI publish job exists."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ def _makefile_dockerfiles() -> list[str]:
 
 
 def _build_matrix() -> list[dict[str, Any]]:
-    workflow = yaml.safe_load((_ROOT / ".github" / "workflows" / "build.yml").read_text())
-    include: list[dict[str, Any]] = workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
+    workflow = yaml.safe_load((_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    include: list[dict[str, Any]] = workflow["jobs"]["publish"]["strategy"]["matrix"]["include"]
     return include
 
 

@@ -12,6 +12,8 @@ from typing import Any
 
 import structlog
 
+_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
 
 def setup_logging(
     level: str = "INFO",
@@ -39,12 +41,13 @@ def setup_logging(
         structlog.processors.UnicodeDecoder(),
     ]
 
+    render_chain: list[structlog.types.Processor]
     if log_format == "colored":
         # Development: colored console output
-        renderer: structlog.types.Processor = structlog.dev.ConsoleRenderer(colors=True)
+        render_chain = [structlog.dev.ConsoleRenderer(colors=True)]
     else:
         # Production: JSON lines
-        renderer = structlog.processors.JSONRenderer()
+        render_chain = [structlog.processors.format_exc_info, structlog.processors.JSONRenderer()]
 
     structlog.configure(
         processors=[
@@ -57,9 +60,10 @@ def setup_logging(
     )
 
     formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            renderer,
+            *render_chain,
         ],
     )
 
@@ -70,6 +74,11 @@ def setup_logging(
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
     root_logger.setLevel(log_level)
+
+    for name in _UVICORN_LOGGERS:
+        uvicorn_logger = logging.getLogger(name)
+        uvicorn_logger.handlers.clear()
+        uvicorn_logger.propagate = True
 
 
 def get_logger(name: str, **initial_context: Any) -> structlog.stdlib.BoundLogger:
