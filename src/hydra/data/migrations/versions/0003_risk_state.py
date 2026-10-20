@@ -1,7 +1,7 @@
 """Risk state: account ledger and breaker columns on risk_state, the risk_events audit log.
 
-Revision ID: 0002
-Revises: 0001
+Revision ID: 0003_risk_state
+Revises: 0002_paper_state
 Create Date: 2026-10-20
 
 Additive and idempotent. Seeds the 'paper' risk_state row the RiskService uses; its
@@ -17,8 +17,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0002"
-down_revision: str | None = "0001"
+revision: str = "0003_risk_state"
+down_revision: str | None = "0002_paper_state"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

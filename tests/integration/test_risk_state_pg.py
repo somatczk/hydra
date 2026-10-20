@@ -23,7 +23,7 @@ from hydra.risk.state import PgRiskStateStore, RiskState
 from tests.unit.test_risk.harness import Clock, rules_cache
 
 REVISION = (
-    Path(__file__).resolve().parents[2] / "src/hydra/data/migrations/versions/0002_risk_state.py"
+    Path(__file__).resolve().parents[2] / "src/hydra/data/migrations/versions/0003_risk_state.py"
 )
 T0 = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
 

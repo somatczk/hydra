@@ -732,6 +732,8 @@ class RiskService:
         if not self._recovered:
             raise RiskStateUnavailableError("risk state recovering; paper reset refused")
         async with self._state_lock:
+            if paper_capital == self._paper_capital and self._pending_capital is None:
+                return
             if (await self._account()).unmarked:
                 raise RiskStateUnavailableError("a held position has no mark; paper reset refused")
             st = self._state

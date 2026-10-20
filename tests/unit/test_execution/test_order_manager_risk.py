@@ -12,7 +12,7 @@ from prometheus_client import REGISTRY
 
 from hydra.core import metrics
 from hydra.core.types import Side
-from hydra.execution.order_manager import OrderManager, RiskRejectedError
+from hydra.execution.order_manager import OrderManager, RiskRejectedError, _realized_pnl
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.execution.portfolio_state import build_portfolio_state
 from hydra.risk.circuit_breakers import CircuitBreakerState
@@ -181,6 +181,31 @@ class TestRealizedPnl:
         )
         assert acct.store.state.consecutive_losses == 1
         assert (_trade_pnl(), _trade_pnl("0.0"), _trade_pnl("-10.0")) == (1.0, 1.0, 0.0)
+
+
+class TestRealizedPnlFromResponse:
+    @pytest.mark.parametrize(
+        ("side", "resp", "fee", "expected"),
+        [
+            (SELL, {"pnl": 1.0, "cost": 501.0}, "0.501", (Decimal("-0.001"), Decimal("1.0"))),
+            (BUY, {"pnl": 1.0, "cost": 499.0}, "0.499", (Decimal("0.001"), Decimal("1.0"))),
+            (
+                SELL,
+                {"pnl": 1.0, "cost": 501.0, "net_pnl": -0.002},
+                "0.501",
+                (Decimal("-0.002"), Decimal("1.0")),
+            ),
+            (SELL, {"cost": 501.0}, "0.501", (None, None)),
+        ],
+    )
+    def test_gross_only_response_takes_pro_rata_entry_fee(
+        self,
+        side: Side,
+        resp: dict[str, float],
+        fee: str,
+        expected: tuple[Decimal | None, Decimal | None],
+    ) -> None:
+        assert _realized_pnl(resp, Decimal(fee), side) == expected
 
 
 class TestReduceOnlyClamp:
