@@ -13,6 +13,7 @@ from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from pydantic import ValidationError
 
+from hydra.core.config import ConfigError
 from hydra.core.encryption import CredentialKeyError, encrypt
 from hydra.dashboard import lifespan
 
@@ -49,6 +50,19 @@ async def test_bad_config_aborts_startup(
         async with lifespan.run(app):
             pytest.fail("startup must not complete")
     assert ("trading", "tesnet") in {tuple(e["loc"]) for e in exc_info.value.errors()}
+    assert pool_calls == []
+
+
+async def test_retired_env_name_aborts_startup(
+    monkeypatch: pytest.MonkeyPatch, pool_calls: list[str]
+) -> None:
+    monkeypatch.setenv("HYDRA_CORS_ORIGINS", "https://trading.example.com")
+    monkeypatch.setenv("DATABASE_URL", _closed_port_dsn())
+    monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
+    app = FastAPI()
+    with pytest.raises(ConfigError, match="HYDRA_API__CORS_ORIGINS"):
+        async with lifespan.run(app):
+            pytest.fail("startup must not complete")
     assert pool_calls == []
 
 

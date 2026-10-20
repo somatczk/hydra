@@ -59,7 +59,8 @@ class TestRepoConfig:
 
         assert cfg.database_url is not None
         assert cfg.database_url.get_secret_value() == ROMULUS_DSN
-        assert cfg.redis_url == "redis://hydra-redis:6379"
+        assert cfg.redis_url is not None
+        assert cfg.redis_url.get_secret_value() == "redis://hydra-redis:6379"
         assert cfg.credential_key is not None
         assert cfg.credential_key.get_secret_value() == key
         assert cfg.api.cors_origins == ["https://trading.example.com"]
@@ -70,10 +71,13 @@ class TestRepoConfig:
 
     def test_secrets_do_not_leak_into_repr(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DATABASE_URL", ROMULUS_DSN)
+        monkeypatch.setenv("REDIS_URL", "redis://:R3disPw@hydra-redis:6379")
         monkeypatch.setenv("HYDRA_API_TOKEN", "t" * 40)
-        text = repr(load_config())
-        assert "pw@" not in text
-        assert "t" * 40 not in text
+        cfg = load_config()
+        for text in (repr(cfg), str(cfg.model_dump())):
+            assert "pw@" not in text
+            assert "R3disPw" not in text
+            assert "t" * 40 not in text
 
     @pytest.mark.parametrize(
         "path", sorted(_DEFAULT_CONFIG_DIR.glob("*.yaml")), ids=lambda p: p.name
@@ -227,6 +231,83 @@ class TestFailFast:
         with pytest.raises(ValidationError, match="postgresql"):
             load_config()
 
+    def test_validation_errors_do_not_print_secrets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_API_TOKEN", "tok_SECRETabcdefghijklmnopqrstu")
+        monkeypatch.setenv("DATABASE_URL", "mysql://hydra:S3cretPassw0rd@db:5432/hydra")
+        monkeypatch.setenv("REDIS_URL", "http://:R3disPw@redis:6379")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config()
+        text = str(exc_info.value)
+        assert {loc for loc, _ in _loc_types(exc_info.value)} >= {
+            ("HYDRA_API_TOKEN",),
+            ("DATABASE_URL",),
+            ("REDIS_URL",),
+        }
+        for secret in ("SECRETabc", "tPassw0rd", "S3cret", "R3disPw"):
+            assert secret not in text
+
+    def test_model_level_error_does_not_print_the_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("DATABASE_URL", ROMULUS_DSN)
+        monkeypatch.setenv("REDIS_URL", "redis://hydra-redis:6379")
+        monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", key)
+        monkeypatch.setenv("HYDRA_API__AUTH_MODE", "token")
+        with pytest.raises(ValidationError, match="HYDRA_API_TOKEN") as exc_info:
+            load_config()
+        text = str(exc_info.value)
+        assert key[-12:] not in text
+        assert key[:12] not in text
+        assert "pw@" not in text
+
+
+# ---------------------------------------------------------------------------
+# HYDRA_* variables outside the model
+# ---------------------------------------------------------------------------
+
+
+class TestHydraEnvNames:
+    @pytest.mark.parametrize(
+        ("name", "replacement"),
+        [
+            ("HYDRA_TESTNET", "HYDRA_TRADING__TESTNET"),
+            ("HYDRA_CORS_ORIGINS", "HYDRA_API__CORS_ORIGINS"),
+            ("HYDRA_AUTH_MODE", "HYDRA_API__AUTH_MODE"),
+            ("HYDRA_TRUSTED_PROXY_CIDRS", "HYDRA_API__TRUSTED_PROXY_CIDRS"),
+            ("HYDRA_LOG_LEVEL", "HYDRA_LOGGING__LEVEL"),
+            ("HYDRA_DATABASE_DSN", "DATABASE_URL"),
+        ],
+    )
+    def test_retired_name_fails_with_its_replacement(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, replacement: str
+    ) -> None:
+        monkeypatch.setenv(name, "dev")
+        with pytest.raises(ConfigError, match=rf"^{name} is no longer read; set {replacement}"):
+            load_config()
+
+    @pytest.mark.parametrize("name", ["HYDRA_TRADING_TESTNET", "HYDRA_FOO__BAR", "hydra_typo"])
+    def test_unknown_name_fails(self, monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+        monkeypatch.setenv(name, "x")
+        with pytest.raises(ConfigError, match=rf"^{name} is not a Hydra setting"):
+            load_config()
+
+    def test_known_names_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name, value in {
+            "HYDRA_ENV": "base",
+            "HYDRA_CONFIG_DIR": str(_DEFAULT_CONFIG_DIR),
+            "HYDRA_REQUIRE_INFRA": "1",
+            "HYDRA_DB_HOST": "localhost",
+            "HYDRA_REDIS_URL": "redis://localhost:6379",
+            "HYDRA_TRADING_MODE": "paper",
+            "HYDRA_MAX_STRATEGIES": "5",
+            "HYDRA_DEFAULT_PAIR": "BTC/USDT",
+            "HYDRA_DEFAULT_TIMEFRAME": "1h",
+            "hydra_api__port": "9001",
+        }.items():
+            monkeypatch.setenv(name, value)
+        assert load_config().api.port == 9001
+
 
 # ---------------------------------------------------------------------------
 # API auth fields (validated now, enforced by the API security layer)
@@ -244,7 +325,9 @@ class TestApiAuthFields:
     def test_env_lists_are_comma_separated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HYDRA_API__CORS_ORIGINS", "https://a.example, https://b.example")
         monkeypatch.setenv("HYDRA_API__TRUSTED_PROXY_CIDRS", "10.10.16.0/24,fd00::/64")
+        monkeypatch.setenv("HYDRA_TRADING__DEFAULT_SYMBOLS", "BTCUSDT, ETHUSDT")
         cfg = load_config()
+        assert cfg.trading.default_symbols == ["BTCUSDT", "ETHUSDT"]
         assert cfg.api.cors_origins == ["https://a.example", "https://b.example"]
         assert cfg.api.trusted_proxy_cidrs[0] == IPv4Network("10.10.16.0/24")
         assert str(cfg.api.trusted_proxy_cidrs[1]) == "fd00::/64"
@@ -260,6 +343,13 @@ class TestApiAuthFields:
         monkeypatch.setenv("HYDRA_API__TRUSTED_PROXY_CIDRS", "10.0.0.1/33")
         with pytest.raises(ValidationError):
             load_config()
+
+    @pytest.mark.parametrize("cidrs", ["0.0.0.0/0", "10.10.16.0/24,::/0"])
+    def test_catch_all_cidr_fails(self, monkeypatch: pytest.MonkeyPatch, cidrs: str) -> None:
+        monkeypatch.setenv("HYDRA_API__TRUSTED_PROXY_CIDRS", cidrs)
+        with pytest.raises(ValidationError, match="trusts every peer") as exc_info:
+            load_config()
+        assert ("api", "trusted_proxy_cidrs") in {loc for loc, _ in _loc_types(exc_info.value)}
 
     def test_unknown_auth_mode_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HYDRA_API__AUTH_MODE", "none")

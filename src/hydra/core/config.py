@@ -3,8 +3,9 @@
 Precedence (highest first): environment, ``{HYDRA_ENV}.yaml``, ``base.yaml``, model defaults. Any
 behaviour key can be overridden from the environment as ``HYDRA_<SECTION>__<KEY>``. Infrastructure
 settings come only from the environment: ``DATABASE_URL``, ``REDIS_URL``, ``HYDRA_CREDENTIAL_KEY``
-and ``HYDRA_API_TOKEN``. Unknown keys, unresolved ``${VAR}`` placeholders and infrastructure keys in
-YAML are startup errors.
+and ``HYDRA_API_TOKEN``. Unknown keys, unknown or retired ``HYDRA_*`` variables, unresolved
+``${VAR}`` placeholders and infrastructure keys in YAML are startup errors. Validation errors never
+echo input values, so a bad secret is named but not printed.
 """
 
 from __future__ import annotations
@@ -43,6 +44,33 @@ _ENV_ONLY_SOURCES: dict[str, tuple[str, ...]] = {
     "the Settings page (exchange keys are stored encrypted in the database)": ("exchanges",),
 }
 _ENV_ONLY_KEYS = {key: source for source, keys in _ENV_ONLY_SOURCES.items() for key in keys}
+
+# HYDRA_* names read outside HydraConfig; the system.py ones go when P1-F-b drops its env reads
+_OTHER_HYDRA_ENV = frozenset(
+    {
+        "HYDRA_ENV",
+        "HYDRA_CONFIG_DIR",
+        "HYDRA_REQUIRE_INFRA",
+        "HYDRA_REDIS_URL",
+        "HYDRA_TRADING_MODE",
+        "HYDRA_MAX_STRATEGIES",
+        "HYDRA_DEFAULT_PAIR",
+        "HYDRA_DEFAULT_TIMEFRAME",
+    }
+)
+_OTHER_HYDRA_ENV_PREFIXES = ("HYDRA_DB_",)
+_RETIRED_HYDRA_ENV = {
+    "HYDRA_TESTNET": "HYDRA_TRADING__TESTNET",
+    "HYDRA_PAPER_TRADING": "HYDRA_TRADING__PAPER_TRADING",
+    "HYDRA_CORS_ORIGINS": "HYDRA_API__CORS_ORIGINS",
+    "HYDRA_AUTH_MODE": "HYDRA_API__AUTH_MODE",
+    "HYDRA_TRUSTED_PROXY_CIDRS": "HYDRA_API__TRUSTED_PROXY_CIDRS",
+    "HYDRA_LOG_LEVEL": "HYDRA_LOGGING__LEVEL",
+    "HYDRA_LOG_FORMAT": "HYDRA_LOGGING__FORMAT",
+    "HYDRA_MODELS_DIR": "HYDRA_ML__MODELS_DIR",
+    "HYDRA_DATABASE_DSN": "DATABASE_URL",
+    "HYDRA_DATABASE_URL": "DATABASE_URL",
+}
 
 _yaml_layer: ContextVar[dict[str, Any] | None] = ContextVar("hydra_yaml_layer", default=None)
 
@@ -144,7 +172,12 @@ class TradingConfig(_Section):
 
     testnet: bool = True
     paper_trading: bool = True
-    default_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT"])
+    default_symbols: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["BTCUSDT"])
+
+    @field_validator("default_symbols", mode="before")
+    @classmethod
+    def _csv(cls, v: Any) -> Any:
+        return _split_csv(v)
 
 
 class LoggingConfig(_Section):
@@ -189,6 +222,16 @@ class ApiConfig(_Section):
                 raise ValueError(f"CORS origin {origin!r} must start with http:// or https://")
         return v
 
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def _no_catch_all(cls, v: list[ProxyNetwork]) -> list[ProxyNetwork]:
+        for network in v:
+            if network.prefixlen == 0:
+                raise ValueError(
+                    f"api.trusted_proxy_cidrs: {network} trusts every peer; list the proxy network"
+                )
+        return v
+
 
 class MlConfig(_Section):
     """Machine learning settings."""
@@ -219,6 +262,7 @@ class HydraConfig(BaseSettings):
         env_prefix="HYDRA_",
         env_nested_delimiter="__",
         extra="forbid",
+        hide_input_in_errors=True,
     )
 
     platform: PlatformConfig = Field(default_factory=PlatformConfig)
@@ -228,7 +272,7 @@ class HydraConfig(BaseSettings):
     ml: MlConfig = Field(default_factory=MlConfig)
 
     database_url: SecretStr | None = Field(None, validation_alias="DATABASE_URL")
-    redis_url: str | None = Field(None, validation_alias="REDIS_URL")
+    redis_url: SecretStr | None = Field(None, validation_alias="REDIS_URL")
     credential_key: SecretStr | None = Field(None, validation_alias="HYDRA_CREDENTIAL_KEY")
     api_token: SecretStr | None = Field(None, validation_alias="HYDRA_API_TOKEN")
 
@@ -246,8 +290,10 @@ class HydraConfig(BaseSettings):
 
     @field_validator("redis_url")
     @classmethod
-    def _redis_url(cls, v: str | None) -> str | None:
-        if v is not None and not v.startswith(("redis://", "rediss://", "unix://")):
+    def _redis_url(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is not None and not v.get_secret_value().startswith(
+            ("redis://", "rediss://", "unix://")
+        ):
             raise ValueError("REDIS_URL must be a redis:// URL")
         return v
 
@@ -287,12 +333,44 @@ def config_dir_from_env() -> Path:
     return Path(raw) if raw else _DEFAULT_CONFIG_DIR
 
 
+def _check_hydra_env_names() -> None:
+    """Reject ``HYDRA_*`` variables nothing reads; pydantic-settings would drop them silently."""
+    sections = {
+        name.upper()
+        for name, field in HydraConfig.model_fields.items()
+        if isinstance(field.annotation, type) and issubclass(field.annotation, _Section)
+    }
+    aliases = {
+        str(field.validation_alias).upper()
+        for field in HydraConfig.model_fields.values()
+        if field.validation_alias is not None
+    }
+    for raw_name in sorted(os.environ):
+        name = raw_name.upper()
+        if not name.startswith("HYDRA_") or name in aliases or name in _OTHER_HYDRA_ENV:
+            continue
+        if name.startswith(_OTHER_HYDRA_ENV_PREFIXES):
+            continue
+        section, nested, _ = name.removeprefix("HYDRA_").partition("__")
+        if nested and section in sections:
+            continue
+        replacement = _RETIRED_HYDRA_ENV.get(name)
+        if replacement is not None:
+            raise ConfigError(f"{raw_name} is no longer read; set {replacement} instead")
+        raise ConfigError(
+            f"{raw_name} is not a Hydra setting; overrides are HYDRA_<SECTION>__<KEY> "
+            f"(sections: {', '.join(sorted(s.lower() for s in sections))})"
+        )
+
+
 def load_config(env: str | None = None, config_dir: str | Path | None = None) -> HydraConfig:
     """Load and validate the config once: env > ``{env}.yaml`` > ``base.yaml`` > defaults.
 
     ``env`` defaults to ``HYDRA_ENV`` (or ``"base"``: base.yaml only); ``config_dir`` defaults to
-    ``HYDRA_CONFIG_DIR``. A named overlay that does not exist is an error.
+    ``HYDRA_CONFIG_DIR``. A named overlay that does not exist is an error, and so is an unknown or
+    retired ``HYDRA_*`` variable.
     """
+    _check_hydra_env_names()
     config_path = Path(config_dir) if config_dir else config_dir_from_env()
     overlay = env if env is not None else os.environ.get(CONFIG_ENV_ENV, "base")
     data = _load_yaml(config_path / "base.yaml")

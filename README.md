@@ -39,7 +39,7 @@ Each PR that changes one of these rows updates the row.
 | Risk | Quick-trade TP / SL / trailing stop | **Planned P1 (stops).** An entry that is not filled at once (any LIMIT quick-trade) returns 200 with `exit_orders_deferred: true`, and its TP / SL / trailing orders are never placed: nothing reads the flag, and the UI shows a success toast. On a filled entry, a failed attach logs a warning and still returns 200. Either way the position looks protected when it is not. |
 | Risk | Kill switch | **Partial → P1.** It stops running sessions, and the UI shows active / inactive / unknown. The flag is persisted only when the engine has a DB pool (not the case under `deploy/compose.yml`), yet `POST /api/trading/kill-switch` reports "all trading halted" either way, so a restart forgets it. The flatten step fails and positions stay open. |
 | Paper trading | Per-strategy capital, P&L | **Partial → P1.** Per-strategy paper capital slices work. Unrealized P&L is never updated, P&L is gross of fees, and live P&L is 0. |
-| Paper trading | Testnet + paper by default | **Partial → P1.** The trading mode defaults to `paper`, and session `ExchangeClient`s default to `testnet=True`. `HYDRA_TESTNET`, `trading.testnet` and `config/live.yaml` are never read. The settings page's balance / orders / positions endpoints use stored keys against mainnet (`testnet=False`), read-only. |
+| Paper trading | Testnet + paper by default | **Partial → P1.** The trading mode defaults to `paper`, and session `ExchangeClient`s default to `testnet=True`. `HYDRA_TESTNET` stops startup (use `HYDRA_TRADING__TESTNET`), and `trading.testnet` is never read. The settings page's balance / orders / positions endpoints use stored keys against mainnet (`testnet=False`), read-only. |
 | Data | Redis Streams event bus | **Planned P1** (event-bus isolation decides the transport). Sessions use an in-process `InMemoryEventBus`; `RedisEventBus` is used only in tests. Redis is only health-pinged by `/api/system/health`. |
 | Data | PostgreSQL as source of truth | **Partial → P1.** Backtest results and trades are persisted (P0-B). Live fills are not stored, paper state is not reloaded, and system config lives in memory. |
 | Data | Decimal for financial values | **Known gap: unscheduled.** Decimal in domain types and fills; floats at the exchange boundary, in routes, VaR and the flatten path. |
@@ -182,14 +182,17 @@ Keep that key: credentials stored under it cannot be read with another one. `.en
 ### Configuration
 
 - One model, `HydraConfig` (`src/hydra/core/config.py`), loaded and validated once at startup. Precedence:
-  environment > `config/{HYDRA_ENV}.yaml` > `config/base.yaml` > defaults. `HYDRA_CONFIG_DIR` points at another
-  config directory; `HYDRA_ENV` (default `base`) selects an overlay, which must exist.
+  environment > `config/{HYDRA_ENV}.yaml` > `config/base.yaml` > defaults. `HYDRA_CONFIG_DIR` selects the directory
+  for `base.yaml` and the overlay only; `strategies/` and `templates/` are still read from the repo/image `config/`.
+  `HYDRA_ENV` (default `base`) selects an overlay, which must exist.
 - Override any key from the environment as `HYDRA_<SECTION>__<KEY>`, e.g. `HYDRA_TRADING__TESTNET=false`,
   `HYDRA_LOGGING__LEVEL=DEBUG`, `HYDRA_API__CORS_ORIGINS=https://a.example,https://b.example`.
 - Infrastructure comes only from the environment: `DATABASE_URL`, `REDIS_URL`, `HYDRA_CREDENTIAL_KEY`,
   `HYDRA_API_TOKEN`. Putting them (or `database:`, `redis:`, `exchanges:`) in YAML is a startup error.
-- An unknown key at any depth, an unresolved `${VAR}` or an invalid value stops startup with the key, variable or file
-  in the message. Without `DATABASE_URL` the engine runs without a database (dev only).
+- An unknown key at any depth, an unknown or retired `HYDRA_*` variable (the message names the replacement, e.g.
+  `HYDRA_CORS_ORIGINS` -> `HYDRA_API__CORS_ORIGINS`), an unresolved `${VAR}` or an invalid value stops startup with
+  the key, variable or file in the message; secret values are never printed. Without `DATABASE_URL` the engine runs
+  without a database (dev only).
 - `HYDRA_CREDENTIAL_KEY` encrypts exchange credentials in the database and is required whenever `DATABASE_URL` is set.
   It is never generated or written to disk. Rotate with a comma list: set `new,old`, reconnect each exchange in
   Settings (re-encrypts under `new`), then drop `old`. Rows no configured key can decrypt show as undecryptable and

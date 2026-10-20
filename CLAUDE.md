@@ -40,7 +40,9 @@ not duplicate it here; update that table in the PR that changes a row.
   a new revision on the single head (CI checks `python -m hydra.data.migrations heads`).
 - **Config**: one `HydraConfig` (`src/hydra/core/config.py`), loaded once by `src/hydra/dashboard/lifespan.py` and read
   from `app.state.config` (`hydra.dashboard.deps.get_config`). env > `{HYDRA_ENV}.yaml` > `base.yaml` > defaults;
-  overrides as `HYDRA_<SECTION>__<KEY>`; unknown keys fail. New code reads settings from it, not from `os.environ`.
+  overrides as `HYDRA_<SECTION>__<KEY>`; unknown keys and unknown `HYDRA_*` variables fail. New code reads settings
+  from it, not from `os.environ`. The one exception is `src/hydra/core/encryption.py`, which reads
+  `HYDRA_CREDENTIAL_KEY` (env-only by construction) after the lifespan has validated it.
 - **Exchange**: ccxt async (REST) and ccxt.pro (session market-data feed).
 - **Database**: TimescaleDB (PostgreSQL 16). `ts` schema for hypertables (`ts.ohlcv_1m`, `ts.funding_rates`),
   `public` for relational data.
