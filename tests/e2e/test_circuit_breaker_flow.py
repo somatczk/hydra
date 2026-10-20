@@ -1,7 +1,7 @@
-"""E2E: Circuit breaker lifecycle -- drawdown triggers, tier escalation, reset.
+"""E2E: account drawdown -> breaker tiers -> tier-3 flatten -> audited reset -> trading resumes.
 
-Tests the full flow from losing trades through circuit breaker activation
-to manual reset and resumed trading.
+Real PaperTradingExecutor, OrderManager and RiskService; the flatten callback stands in for the
+session owner's flatten primitive and submits reduce_only orders through the OrderManager.
 """
 
 from __future__ import annotations
@@ -10,249 +10,86 @@ from decimal import Decimal
 
 import pytest
 
-from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import CircuitBreakerEvent
-from hydra.risk.circuit_breakers import CircuitBreakerManager
+from hydra.core.types import Side
+from hydra.execution.order_manager import RiskRejectedError
+from hydra.risk.circuit_breakers import TierNotActiveError
+from tests.unit.test_risk.harness import BTC, Account, make_account, order, permissive
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+
+async def _account_with_flatten() -> Account:
+    holder: dict[str, Account] = {}
+
+    async def flatten(reason: str) -> list[str]:
+        acct = holder["acct"]
+        failures: list[str] = []
+        for sid, ex in acct.executors.items():
+            for pos in await ex.get_positions():
+                try:
+                    await acct.managers[sid].submit_order(
+                        order(Side.SELL, str(pos.quantity), reduce_only=True)
+                    )
+                except Exception as exc:
+                    failures.append(f"{sid}: {exc}")
+        return failures
+
+    acct = await make_account(
+        permissive(max_daily_loss_pct=Decimal("0.5")), on_must_flatten=flatten
+    )
+    holder["acct"] = acct
+    await acct.add_session("s1", "10000")
+    await acct.mark("60000")
+    assert await acct.submit("s1", Side.BUY, "0.1")
+    return acct
 
 
 @pytest.mark.e2e
 class TestCircuitBreakerFlow:
-    """Drawdown -> breaker activation -> flatten -> alert -> reset."""
+    async def test_tier3_flattens_then_audited_reset_resumes_trading(self) -> None:
+        acct = await _account_with_flatten()
+        ex = acct.executors["s1"]
 
-    async def test_drawdown_triggers_tier1(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """3% drawdown triggers tier 1 (reduce size 50%)."""
-        cb_events: list[CircuitBreakerEvent] = []
+        await acct.mark("57000")
+        assert acct.svc.account().tier == 1
+        assert await acct.svc.size_entry("s1", BTC, Decimal("0.01")) == Decimal("0.00085")
 
-        async def _on_cb(event):
-            if isinstance(event, CircuitBreakerEvent):
-                cb_events.append(event)
+        await acct.mark("54800")
+        assert acct.svc.account().tier == 2
+        with pytest.raises(RiskRejectedError) as info:
+            await acct.submit("s1", Side.BUY, "0.001")
+        assert info.value.check == "circuit_breaker"
 
-        await event_bus.subscribe("circuit_breaker", _on_cb)
+        await acct.mark("49500")
+        assert acct.svc.account().tier == 3
+        assert await ex.get_positions(BTC) == []
+        assert (await ex.get_balance())["USDT"] == Decimal("8950.0")
+        assert acct.buses["s1"].fills[-1].realized_pnl == Decimal("-1050.0")
 
-        cbm = CircuitBreakerManager(event_bus=event_bus)
+        with pytest.raises(TierNotActiveError):
+            await acct.svc.reset_breaker(2, actor="ops", reason="wrong tier", confirm_tier=2)
+        await acct.svc.reset_breaker(3, actor="ops", reason="reviewed flatten", confirm_tier=3)
+        kinds = [e.kind for e in acct.store.events]
+        assert kinds.count("cb_escalate") == 3
+        assert kinds[-1] == "cb_reset"
 
-        # Initial state -- no active tier
-        assert cbm.get_active_tier() == 0
+        await acct.mark("49600")
+        assert acct.svc.account().tier == 0
+        assert acct.svc.account().peak_equity == Decimal("8950.0")
+        assert await acct.submit("s1", Side.BUY, "0.001")
 
-        restrictions = cbm.get_restrictions()
-        assert restrictions.can_open_new_trades is True
-        assert restrictions.position_size_multiplier == Decimal("1.0")
+    async def test_tier4_latches_kill_switch_and_reset_needs_confirmation(self) -> None:
+        acct = await _account_with_flatten()
+        await acct.mark("44900")
+        assert acct.svc.account().tier == 4
+        assert acct.svc.kill_switch_active() is True
+        assert await acct.executors["s1"].get_positions(BTC) == []
 
-        # Simulate 3% drawdown
-        await cbm.update(
-            current_drawdown=Decimal("0.03"),
-            daily_loss=Decimal("0.01"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
+        with pytest.raises(ValueError, match="confirm_tier"):
+            await acct.svc.reset_breaker(4, actor="ops", reason="reviewed", confirm_tier=3)
+        await acct.svc.reset_breaker(4, actor="ops", reason="reviewed", confirm_tier=4)
+        assert acct.svc.account().tier == 0
+        with pytest.raises(RiskRejectedError) as info:
+            await acct.submit("s1", Side.BUY, "0.001")
+        assert info.value.check == "kill_switch"
 
-        assert cbm.get_active_tier() == 1
-
-        restrictions = cbm.get_restrictions()
-        assert restrictions.position_size_multiplier == Decimal("0.5")
-        # Tier 1 does NOT halt new trades
-        assert restrictions.can_open_new_trades is True
-
-        # Should have published a circuit breaker event
-        assert len(cb_events) == 1
-        assert cb_events[0].tier == 1
-        assert cb_events[0].action == "reduce_size_50"
-
-    async def test_drawdown_triggers_tier2(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """5% drawdown triggers tier 2 (halt new trades)."""
-        cbm = CircuitBreakerManager(event_bus=event_bus)
-
-        await cbm.update(
-            current_drawdown=Decimal("0.05"),
-            daily_loss=Decimal("0.01"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
-
-        assert cbm.get_active_tier() == 2
-        restrictions = cbm.get_restrictions()
-        assert restrictions.can_open_new_trades is False
-        assert restrictions.position_size_multiplier == Decimal("0.5")
-
-    async def test_tier3_flattens_all_positions(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """10% drawdown triggers tier 3 -> must flatten all positions."""
-        cb_events: list[CircuitBreakerEvent] = []
-
-        async def _on_cb(event):
-            if isinstance(event, CircuitBreakerEvent):
-                cb_events.append(event)
-
-        await event_bus.subscribe("circuit_breaker", _on_cb)
-
-        cbm = CircuitBreakerManager(event_bus=event_bus)
-
-        await cbm.update(
-            current_drawdown=Decimal("0.10"),
-            daily_loss=Decimal("0.05"),
-            consecutive_losses=3,
-            current_vol=Decimal("0.04"),
-            normal_vol=Decimal("0.02"),
-        )
-
-        assert cbm.get_active_tier() == 3
-
-        restrictions = cbm.get_restrictions()
-        assert restrictions.must_flatten is True
-        assert restrictions.can_open_new_trades is False
-
-        # Event should have been published
-        tier3_events = [e for e in cb_events if e.tier == 3]
-        assert len(tier3_events) == 1
-        assert tier3_events[0].action == "flatten_all"
-
-    async def test_tier_escalation_from_1_to_3(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """Drawdown increasing from 3% to 10% escalates through tiers."""
-        cb_events: list[CircuitBreakerEvent] = []
-
-        async def _on_cb(event):
-            if isinstance(event, CircuitBreakerEvent):
-                cb_events.append(event)
-
-        await event_bus.subscribe("circuit_breaker", _on_cb)
-
-        cbm = CircuitBreakerManager(event_bus=event_bus)
-
-        # Tier 1 at 3%
-        await cbm.update(
-            current_drawdown=Decimal("0.03"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
-        assert cbm.get_active_tier() == 1
-
-        # Tier 2 at 5%
-        await cbm.update(
-            current_drawdown=Decimal("0.05"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
-        assert cbm.get_active_tier() == 2
-
-        # Tier 3 at 10%
-        await cbm.update(
-            current_drawdown=Decimal("0.10"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
-        assert cbm.get_active_tier() == 3
-
-        # Should have 3 escalation events
-        assert len(cb_events) == 3
-        assert [e.tier for e in cb_events] == [1, 2, 3]
-
-    async def test_circuit_breaker_reset(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """Manual reset restores trading after tier activation."""
-        cbm = CircuitBreakerManager(event_bus=event_bus)
-
-        # Activate tier 2
-        await cbm.update(
-            current_drawdown=Decimal("0.05"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
-        assert cbm.get_active_tier() == 2
-
-        restrictions = cbm.get_restrictions()
-        assert restrictions.can_open_new_trades is False
-
-        # Manual reset
-        cbm.reset(tier=2)
-
-        assert cbm.get_active_tier() == 0
-        restrictions = cbm.get_restrictions()
-        assert restrictions.can_open_new_trades is True
-        assert restrictions.position_size_multiplier == Decimal("1.0")
-
-    async def test_consecutive_loss_pause(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """5 consecutive losses triggers a pause on new trades."""
-        cbm = CircuitBreakerManager(event_bus=event_bus, max_consecutive_losses=5)
-
-        await cbm.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0.01"),
-            consecutive_losses=5,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
-
-        restrictions = cbm.get_restrictions()
-        assert restrictions.consecutive_loss_pause is True
-        assert restrictions.can_open_new_trades is False
-
-    async def test_daily_loss_halt(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """Daily loss exceeding 3% halts trading for the rest of the day."""
-        cbm = CircuitBreakerManager(event_bus=event_bus, daily_loss_limit=Decimal("0.03"))
-
-        await cbm.update(
-            current_drawdown=Decimal("0.01"),
-            daily_loss=Decimal("0.03"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.02"),
-            normal_vol=Decimal("0.02"),
-        )
-
-        restrictions = cbm.get_restrictions()
-        assert restrictions.daily_halt is True
-        assert restrictions.can_open_new_trades is False
-
-    async def test_volatility_spike_reduces_size(
-        self,
-        event_bus: InMemoryEventBus,
-    ) -> None:
-        """Volatility spike (>3x normal) reduces position sizes by 50%."""
-        cbm = CircuitBreakerManager(
-            event_bus=event_bus,
-            volatility_spike_multiplier=Decimal("3.0"),
-        )
-
-        await cbm.update(
-            current_drawdown=Decimal("0"),
-            daily_loss=Decimal("0"),
-            consecutive_losses=0,
-            current_vol=Decimal("0.09"),  # 3x the normal vol
-            normal_vol=Decimal("0.02"),
-        )
-
-        restrictions = cbm.get_restrictions()
-        assert restrictions.volatility_reduction is True
-        assert restrictions.position_size_multiplier == Decimal("0.5")
+        await acct.svc.release_kill_switch("ops", "post-mortem done")
+        assert await acct.submit("s1", Side.BUY, "0.001")

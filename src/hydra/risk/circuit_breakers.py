@@ -1,303 +1,343 @@
-"""Circuit breaker system with 4 tiers of protection and additional breakers.
+"""Account circuit breakers: four drawdown tiers, the daily-loss halt and the loss-streak pause.
 
-Tiers:
-    1: 3% drawdown  -> reduce_size_50  (auto-reset 24h)
-    2: 5% drawdown  -> halt_new_trades (auto-reset 48h)
-    3: 10% drawdown -> flatten_all     (auto-reset 72h, requires manual review)
-    4: 15% drawdown -> emergency_shutdown (no auto-reset)
+Tier 4 sits at ``max_drawdown_pct``; tiers 1-3 at 1/5, 1/3 and 2/3 of it (3/5/10/15% at 15%):
+    1 -> size x0.5 (auto-reset after 24h once drawdown is back below 1's threshold)
+    2 -> no new entries (auto-reset after 48h, same condition)
+    3 -> flatten every session (manual reset only)
+    4 -> emergency shutdown, kill switch (manual reset only, with confirmation)
 
-Additional breakers:
-    - Daily loss 3%  -> halt rest of day
-    - 5 consecutive losses -> pause 4h
-    - Volatility spike (>3x normal) -> reduce position sizes 50%
+The daily halt is latched until the next 00:00 UTC. The consecutive-loss pause ends after
+``consecutive_pause_hours`` and then asks the caller to reset its loss counter. All times are
+wall-clock UTC and the whole state is serialisable, so it survives a restart.
 """
 
 from __future__ import annotations
 
 import logging
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Protocol, runtime_checkable
-
-from hydra.core.events import CircuitBreakerEvent
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
+TIER_FRACTIONS: tuple[Decimal, ...] = (
+    Decimal(1) / Decimal(5),
+    Decimal(1) / Decimal(3),
+    Decimal(2) / Decimal(3),
+    Decimal(1),
+)
+TIER_ACTIONS: tuple[str, ...] = (
+    "reduce_size_50",
+    "halt_new_trades",
+    "flatten_all",
+    "emergency_shutdown",
+)
+TIER_LABELS: tuple[str, ...] = (
+    "Reduce size 50%",
+    "Halt new entries",
+    "Flatten all sessions",
+    "Emergency shutdown",
+)
+AUTO_RESET_HOURS: tuple[float | None, ...] = (24.0, 48.0, None, None)
+_THRESHOLD_QUANTUM = Decimal("0.00000001")
 
-# ---------------------------------------------------------------------------
-# Protocols
-# ---------------------------------------------------------------------------
 
-
-@runtime_checkable
-class EventBusLike(Protocol):
-    async def publish(self, event: Any) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# Tier definitions
-# ---------------------------------------------------------------------------
+class TierNotActiveError(ValueError):
+    """A reset named a tier other than the active one."""
 
 
 @dataclass(frozen=True, slots=True)
-class _TierSpec:
-    tier: int
-    drawdown_threshold: Decimal
-    action: str
-    auto_reset_hours: float | None  # None = no auto-reset
+class CircuitBreakerConfig:
+    max_drawdown_pct: Decimal = Decimal("0.15")
+    daily_loss_limit: Decimal = Decimal("0.03")
+    max_consecutive_losses: int = 5
+    consecutive_pause_hours: float = 4.0
 
+    def __post_init__(self) -> None:
+        if self.max_drawdown_pct <= 0:
+            raise ValueError("max_drawdown_pct must be > 0")
 
-_TIERS: list[_TierSpec] = [
-    _TierSpec(
-        tier=1,
-        drawdown_threshold=Decimal("0.03"),
-        action="reduce_size_50",
-        auto_reset_hours=24.0,
-    ),
-    _TierSpec(
-        tier=2,
-        drawdown_threshold=Decimal("0.05"),
-        action="halt_new_trades",
-        auto_reset_hours=48.0,
-    ),
-    _TierSpec(
-        tier=3,
-        drawdown_threshold=Decimal("0.10"),
-        action="flatten_all",
-        auto_reset_hours=72.0,
-    ),
-    _TierSpec(
-        tier=4,
-        drawdown_threshold=Decimal("0.15"),
-        action="emergency_shutdown",
-        auto_reset_hours=None,
-    ),
-]
-
-
-# ---------------------------------------------------------------------------
-# Restrictions dataclass
-# ---------------------------------------------------------------------------
+    def thresholds(self) -> tuple[Decimal, ...]:
+        return tuple(
+            (self.max_drawdown_pct * f).quantize(_THRESHOLD_QUANTUM) for f in TIER_FRACTIONS
+        )
 
 
 @dataclass(slots=True)
-class CircuitBreakerRestrictions:
-    """What actions are currently allowed/restricted."""
+class CircuitBreakerState:
+    """Persisted breaker state (risk_state cb_* columns)."""
 
+    tier: int = 0
+    tier_since: datetime | None = None
+    requires_manual_review: bool = False
+    daily_halt_until: datetime | None = None
+    consecutive_pause_until: datetime | None = None
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "cb_tier": self.tier,
+            "cb_tier_since": self.tier_since,
+            "cb_requires_review": self.requires_manual_review,
+            "daily_halt_until": self.daily_halt_until,
+            "consecutive_pause_until": self.consecutive_pause_until,
+        }
+
+    @classmethod
+    def from_row(cls, row: Any) -> CircuitBreakerState:
+        tier = int(row["cb_tier"] or 0)
+        if tier not in range(5):
+            raise ValueError(f"persisted circuit-breaker tier {tier} out of range")
+        return cls(
+            tier=tier,
+            tier_since=row["cb_tier_since"],
+            requires_manual_review=bool(row["cb_requires_review"]),
+            daily_halt_until=row["daily_halt_until"],
+            consecutive_pause_until=row["consecutive_pause_until"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Transition:
+    """One state change for the audit log: kind is cb_escalate, cb_auto_reset, daily_halt,
+    daily_halt_lifted, consecutive_pause or consecutive_reset."""
+
+    kind: str
+    tier: int
+    previous_tier: int
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerRestrictions:
+    """What the breakers allow right now."""
+
+    tier: int = 0
     can_open_new_trades: bool = True
-    position_size_multiplier: Decimal = Decimal("1.0")
+    position_size_multiplier: Decimal = Decimal("1")
     must_flatten: bool = False
     is_shutdown: bool = False
     daily_halt: bool = False
     consecutive_loss_pause: bool = False
-    volatility_reduction: bool = False
+    daily_halt_until: datetime | None = None
+    consecutive_pause_until: datetime | None = None
+
+    def blocking_reason(self) -> tuple[str, str] | None:
+        """(check, reason) for the first restriction that blocks an opening order."""
+        if self.is_shutdown:
+            return "circuit_breaker", "circuit breaker tier 4 active: emergency shutdown"
+        if self.tier >= 2:
+            return "circuit_breaker", f"circuit breaker tier {self.tier} active: new trades halted"
+        if self.daily_halt:
+            return "daily_loss_halt", f"daily loss halt until {self.daily_halt_until}"
+        if self.consecutive_loss_pause:
+            return (
+                "consecutive_loss_pause",
+                f"consecutive_loss_pause until {self.consecutive_pause_until}",
+            )
+        return None
 
 
-# ---------------------------------------------------------------------------
-# CircuitBreakerManager
-# ---------------------------------------------------------------------------
+def next_utc_midnight(now: datetime) -> datetime:
+    day = now.astimezone(UTC).date() + timedelta(days=1)
+    return datetime(day.year, day.month, day.day, tzinfo=UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class TierSpec:
+    tier: int
+    drawdown_threshold: Decimal
+    action: str
+    auto_reset_hours: float | None
+
+
+def tier_specs(config: CircuitBreakerConfig) -> tuple[TierSpec, ...]:
+    return tuple(
+        TierSpec(i + 1, threshold, TIER_ACTIONS[i], AUTO_RESET_HOURS[i])
+        for i, threshold in enumerate(config.thresholds())
+    )
+
+
+_TIERS = tier_specs(CircuitBreakerConfig())
 
 
 class CircuitBreakerManager:
-    """Manages circuit breaker tiers and additional safety breakers.
-
-    Parameters
-    ----------
-    event_bus:
-        Optional event bus for publishing ``CircuitBreakerEvent`` on tier changes.
-    daily_loss_limit:
-        Fraction of portfolio for the daily loss breaker (default 3%).
-    max_consecutive_losses:
-        Number of consecutive losses before the pause breaker fires.
-    consecutive_pause_hours:
-        How long the consecutive-loss pause lasts.
-    volatility_spike_multiplier:
-        Current vol / normal vol threshold that triggers size reduction.
-    """
+    """Pure state machine; the RiskService feeds it account metrics and persists its state."""
 
     def __init__(
         self,
-        event_bus: EventBusLike | None = None,
-        daily_loss_limit: Decimal = Decimal("0.03"),
-        max_consecutive_losses: int = 5,
-        consecutive_pause_hours: float = 4.0,
-        volatility_spike_multiplier: Decimal = Decimal("3.0"),
+        config: CircuitBreakerConfig | None = None,
+        state: CircuitBreakerState | None = None,
     ) -> None:
-        self._event_bus = event_bus
+        self._config = config or CircuitBreakerConfig()
+        self._state = state or CircuitBreakerState()
 
-        # Config
-        self._daily_loss_limit = daily_loss_limit
-        self._max_consecutive_losses = max_consecutive_losses
-        self._consecutive_pause_hours = consecutive_pause_hours
-        self._volatility_spike_multiplier = volatility_spike_multiplier
+    @property
+    def config(self) -> CircuitBreakerConfig:
+        return self._config
 
-        # State
-        self._active_tier: int = 0
-        self._tier_activated_at: float | None = None
-        self._requires_manual_review: bool = False
+    @property
+    def state(self) -> CircuitBreakerState:
+        return self._state
 
-        # Additional breaker state
-        self._daily_halt: bool = False
-        self._consecutive_pause: bool = False
-        self._consecutive_pause_until: float | None = None
-        self._volatility_reduction: bool = False
+    def reconfigure(self, config: CircuitBreakerConfig) -> None:
+        self._config = config
 
-    # ------------------------------------------------------------------
-    # Update
-    # ------------------------------------------------------------------
-
-    async def update(
-        self,
-        current_drawdown: Decimal,
-        daily_loss: Decimal,
-        consecutive_losses: int,
-        current_vol: Decimal,
-        normal_vol: Decimal,
-    ) -> None:
-        """Update circuit breaker state from current market/portfolio metrics.
-
-        Parameters
-        ----------
-        current_drawdown:
-            Current portfolio drawdown as a positive decimal fraction (0.05 = 5%).
-        daily_loss:
-            Today's loss as a positive decimal fraction.
-        consecutive_losses:
-            Number of consecutive losing trades.
-        current_vol:
-            Current realized volatility.
-        normal_vol:
-            Normal (baseline) realized volatility.
-        """
-        now = time.monotonic()
-
-        # --- Check auto-reset of tier breaker ---
-        if self._active_tier > 0 and self._tier_activated_at is not None:
-            spec = _TIERS[self._active_tier - 1]
-            if spec.auto_reset_hours is not None:
-                elapsed_hours = (now - self._tier_activated_at) / 3600.0
-                if elapsed_hours >= spec.auto_reset_hours:
-                    if self._active_tier == 3 and self._requires_manual_review:
-                        pass  # Tier 3 stays until manual review + auto-reset time
-                    else:
-                        old_tier = self._active_tier
-                        self._active_tier = 0
-                        self._tier_activated_at = None
-                        logger.info("Circuit breaker tier %d auto-reset", old_tier)
-
-        # --- Check consecutive loss pause auto-reset ---
-        if (
-            self._consecutive_pause
-            and self._consecutive_pause_until is not None
-            and now >= self._consecutive_pause_until
-        ):
-            self._consecutive_pause = False
-            self._consecutive_pause_until = None
-            logger.info("Consecutive loss pause auto-reset")
-
-        # --- Evaluate tier breakers (highest tier wins) ---
-        new_tier = 0
-        for spec in reversed(_TIERS):
-            if current_drawdown >= spec.drawdown_threshold:
-                new_tier = spec.tier
-                break
-
-        if new_tier > self._active_tier:
-            old_tier = self._active_tier
-            self._active_tier = new_tier
-            self._tier_activated_at = now
-
-            if new_tier == 3:
-                self._requires_manual_review = True
-
-            tier_spec = _TIERS[new_tier - 1]
-            logger.warning(
-                "Circuit breaker escalated: tier %d -> %d (%s)",
-                old_tier,
-                new_tier,
-                tier_spec.action,
-            )
-
-            if self._event_bus is not None:
-                await self._event_bus.publish(
-                    CircuitBreakerEvent(
-                        tier=new_tier,
-                        action=tier_spec.action,
-                        drawdown_pct=current_drawdown,
-                    )
-                )
-
-        # --- Additional breakers ---
-
-        # Daily loss halt
-        self._daily_halt = daily_loss >= self._daily_loss_limit
-
-        # Consecutive loss pause
-        if consecutive_losses >= self._max_consecutive_losses and not self._consecutive_pause:
-            self._consecutive_pause = True
-            self._consecutive_pause_until = now + self._consecutive_pause_hours * 3600.0
-            logger.warning("Consecutive loss pause activated (%d losses)", consecutive_losses)
-
-        # Volatility spike
-        if normal_vol > Decimal("0") and current_vol > Decimal("0"):
-            vol_ratio = current_vol / normal_vol
-            self._volatility_reduction = vol_ratio > self._volatility_spike_multiplier
-        else:
-            self._volatility_reduction = False
-
-    # ------------------------------------------------------------------
-    # Queries
-    # ------------------------------------------------------------------
+    def thresholds(self) -> tuple[Decimal, ...]:
+        return self._config.thresholds()
 
     def get_active_tier(self) -> int:
-        """Return the active circuit breaker tier (0 = none, 1-4 = active)."""
-        return self._active_tier
+        return self._state.tier
 
-    def get_restrictions(self) -> CircuitBreakerRestrictions:
-        """Return the current set of restrictions based on all active breakers."""
-        r = CircuitBreakerRestrictions()
+    def tier_for(self, drawdown: Decimal) -> int:
+        tier = 0
+        for i, threshold in enumerate(self.thresholds(), start=1):
+            if drawdown >= threshold:
+                tier = i
+        return tier
 
-        # Tier-based restrictions
-        if self._active_tier >= 1:
-            r.position_size_multiplier = Decimal("0.5")
-        if self._active_tier >= 2:
-            r.can_open_new_trades = False
-        if self._active_tier >= 3:
-            r.must_flatten = True
-        if self._active_tier >= 4:
-            r.is_shutdown = True
+    def expire(self, now: datetime) -> list[Transition]:
+        """Lift the daily halt after UTC rollover and end an elapsed consecutive-loss pause."""
+        st = self._state
+        out: list[Transition] = []
+        if st.daily_halt_until is not None and now >= st.daily_halt_until:
+            out.append(Transition("daily_halt_lifted", st.tier, st.tier, "UTC day rolled over"))
+            st.daily_halt_until = None
+        if st.consecutive_pause_until is not None and now >= st.consecutive_pause_until:
+            out.append(
+                Transition("consecutive_reset", st.tier, st.tier, "pause elapsed; counter reset")
+            )
+            st.consecutive_pause_until = None
+        return out
 
-        # Additional breakers
-        if self._daily_halt:
-            r.daily_halt = True
-            r.can_open_new_trades = False
+    def update(
+        self,
+        *,
+        drawdown: Decimal,
+        daily_loss: Decimal,
+        consecutive_losses: int,
+        now: datetime,
+    ) -> list[Transition]:
+        """Apply account metrics (fractions) at wall-clock *now*; return the transitions."""
+        st = self._state
+        out = self.expire(now)
+        expired_pause = any(t.kind == "consecutive_reset" for t in out)
+        thresholds = self.thresholds()
 
-        if self._consecutive_pause:
-            r.consecutive_loss_pause = True
-            r.can_open_new_trades = False
+        hours = AUTO_RESET_HOURS[st.tier - 1] if st.tier else None
+        if (
+            hours is not None
+            and st.tier_since is not None
+            and now - st.tier_since >= timedelta(hours=hours)
+            and drawdown < thresholds[st.tier - 1]
+        ):
+            new_tier = self.tier_for(drawdown)
+            out.append(
+                Transition(
+                    "cb_auto_reset",
+                    new_tier,
+                    st.tier,
+                    f"drawdown {drawdown:.4f} below tier {st.tier} after {hours:g}h",
+                )
+            )
+            st.tier = new_tier
+            st.tier_since = now if new_tier else None
 
-        if self._volatility_reduction:
-            r.volatility_reduction = True
-            r.position_size_multiplier = min(
-                r.position_size_multiplier,
-                Decimal("0.5"),
+        target = self.tier_for(drawdown)
+        if target > st.tier:
+            out.append(
+                Transition(
+                    "cb_escalate",
+                    target,
+                    st.tier,
+                    f"drawdown {drawdown:.4f} >= {thresholds[target - 1]} "
+                    f"({TIER_ACTIONS[target - 1]})",
+                )
+            )
+            st.tier = target
+            st.tier_since = now
+            if target >= 3:
+                st.requires_manual_review = True
+
+        if st.daily_halt_until is None and daily_loss >= self._config.daily_loss_limit:
+            st.daily_halt_until = next_utc_midnight(now)
+            out.append(
+                Transition(
+                    "daily_halt",
+                    st.tier,
+                    st.tier,
+                    f"daily loss {daily_loss:.4f} >= {self._config.daily_loss_limit}",
+                )
             )
 
-        return r
+        if (
+            not expired_pause
+            and st.consecutive_pause_until is None
+            and consecutive_losses >= self._config.max_consecutive_losses
+        ):
+            st.consecutive_pause_until = now + timedelta(hours=self._config.consecutive_pause_hours)
+            out.append(
+                Transition(
+                    "consecutive_pause",
+                    st.tier,
+                    st.tier,
+                    f"{consecutive_losses} consecutive losing closes",
+                )
+            )
 
-    # ------------------------------------------------------------------
-    # Manual reset
-    # ------------------------------------------------------------------
+        for t in out:
+            logger.warning("Circuit breaker %s: %s", t.kind, t.detail)
+        return out
+
+    def restrictions(self, now: datetime) -> CircuitBreakerRestrictions:
+        st = self._state
+        halted = st.daily_halt_until is not None and now < st.daily_halt_until
+        paused = st.consecutive_pause_until is not None and now < st.consecutive_pause_until
+        return CircuitBreakerRestrictions(
+            tier=st.tier,
+            can_open_new_trades=st.tier < 2 and not halted and not paused,
+            position_size_multiplier=Decimal("0.5") if st.tier >= 1 else Decimal("1"),
+            must_flatten=st.tier >= 3,
+            is_shutdown=st.tier >= 4,
+            daily_halt=halted,
+            consecutive_loss_pause=paused,
+            daily_halt_until=st.daily_halt_until if halted else None,
+            consecutive_pause_until=st.consecutive_pause_until if paused else None,
+        )
+
+    def reset_check(self, tier: int) -> None:
+        """Raise ValueError / TierNotActiveError unless *tier* is exactly the active tier."""
+        if tier not in range(1, 5):
+            raise ValueError(f"tier must be 1-4, got {tier}")
+        if tier != self._state.tier:
+            raise TierNotActiveError(f"tier {tier} is not active (active tier {self._state.tier})")
 
     def reset(self, tier: int) -> None:
-        """Manually reset a circuit breaker tier.
+        """Clear the active tier; *tier* must name it exactly."""
+        self.reset_check(tier)
+        self._state.tier = 0
+        self._state.tier_since = None
+        self._state.requires_manual_review = False
 
-        If the currently active tier is equal to the specified tier (or lower),
-        the breaker is cleared.
-        """
-        if tier >= self._active_tier:
-            self._active_tier = 0
-            self._tier_activated_at = None
-            self._requires_manual_review = False
-            logger.info("Circuit breaker manually reset (was tier %d)", tier)
+    def clear(self) -> None:
+        """Paper-account reset: every breaker back to its initial state."""
+        self._state = CircuitBreakerState()
+
+    def snapshot_state(self) -> CircuitBreakerState:
+        return replace(self._state)
+
+
+__all__ = [
+    "AUTO_RESET_HOURS",
+    "TIER_ACTIONS",
+    "TIER_LABELS",
+    "CircuitBreakerConfig",
+    "CircuitBreakerManager",
+    "CircuitBreakerRestrictions",
+    "CircuitBreakerState",
+    "TierNotActiveError",
+    "TierSpec",
+    "Transition",
+    "next_utc_midnight",
+    "tier_specs",
+]

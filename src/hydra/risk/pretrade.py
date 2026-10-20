@@ -1,20 +1,35 @@
-"""Pre-trade risk manager implementing a 10-point check sequence.
+"""Pre-trade risk checks, priced at the mark and split by intent.
 
-Every order must pass all 10 checks before it is approved for submission.
+Every order is classified first:
+    reduce - ``reduce_only`` is set, or the order sells (buys) at most the held long (short).
+             It cannot add exposure, so only sanity checks apply: exits, stops and flattens
+             are never blocked by the kill switch, breakers, limits, rate limit or balance.
+    open   - everything else; it runs the full sequence below, priced at the latest mark
+             (falling back to an explicit order price; neither means rejection).
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from hydra.core.events import RiskCheckResult
-from hydra.core.types import OrderRequest, Position
+from hydra.core.types import Direction, MarketType, OrderRequest, Position, Side
+
+if TYPE_CHECKING:
+    from hydra.risk.circuit_breakers import CircuitBreakerRestrictions
+    from hydra.risk.market_rules import MarketRules
 
 logger = logging.getLogger(__name__)
+
+Intent = Literal["open", "reduce"]
+OPEN: Intent = "open"
+REDUCE: Intent = "reduce"
+SPOT_MAX_LEVERAGE = Decimal("1")
 
 
 # ---------------------------------------------------------------------------
@@ -22,18 +37,34 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PortfolioState:
-    """Snapshot of portfolio state used by the risk manager."""
+    """What the checks see for one order.
 
+    ``portfolio_value`` is account equity (all sessions) and has no default. ``positions`` and
+    ``balances`` are the ordering session's; ``account_positions`` covers every session (None
+    means this session is the whole account). ``restrictions`` comes from the RiskService; None
+    marks the pre-RiskService path, where the constructor tier and the legacy daily_pnl /
+    consecutive_losses fields are used instead.
+    """
+
+    portfolio_value: Decimal
     positions: list[Position] = field(default_factory=list)
     balances: dict[str, Decimal] = field(default_factory=dict)
+    marks: Mapping[str, Decimal] = field(default_factory=dict)
+    sleeve_equity: Decimal | None = None
+    account_positions: list[Position] | None = None
+    restrictions: CircuitBreakerRestrictions | None = None
+    kill_switch: bool = False
+    state_available: bool = True
+    opening_orders_last_minute: int = 0
+    market_rules: Mapping[str, MarketRules] = field(default_factory=dict)
+    average_volume: Decimal | None = None
+    correlation_map: dict[str, list[str]] = field(default_factory=dict)
+    quote_currency: str = "USDT"
     daily_pnl: Decimal = Decimal("0")
     consecutive_losses: int = 0
     current_drawdown: Decimal = Decimal("0")
-    portfolio_value: Decimal = Decimal("10000")
-    average_volume: Decimal = Decimal("1000000")
-    correlation_map: dict[str, list[str]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -43,18 +74,90 @@ class PortfolioState:
 
 @dataclass(frozen=True, slots=True)
 class RiskConfig:
-    """Configuration for pre-trade risk checks."""
+    """Limits (risk_config 'global'). Fractions of equity unless stated otherwise.
 
-    max_position_pct: Decimal = Decimal("0.10")  # 10% of portfolio
-    max_risk_per_trade: Decimal = Decimal("0.02")  # 2%
-    max_portfolio_heat: Decimal = Decimal("0.06")  # 6%
-    max_daily_loss_pct: Decimal = Decimal("0.03")  # 3%
+    max_position_pct caps one order's notional against the sleeve; max_portfolio_heat caps gross
+    exposure across all sessions against account equity; max_risk_per_trade applies only to
+    orders that carry a stop (loss to stop vs sleeve).
+    """
+
+    max_position_pct: Decimal = Decimal("0.10")
+    max_risk_per_trade: Decimal = Decimal("0.02")
+    max_portfolio_heat: Decimal = Decimal("0.30")
+    max_daily_loss_pct: Decimal = Decimal("0.03")
     max_consecutive_losses: int = 5
     consecutive_loss_cooldown_hours: float = 4.0
-    max_liquidity_pct: Decimal = Decimal("0.01")  # 1% of avg volume
-    min_leverage: int = 1
-    max_leverage: int = 20
+    max_liquidity_pct: Decimal = Decimal("0.01")
     correlation_threshold: Decimal = Decimal("0.70")
+    max_drawdown_pct: Decimal = Decimal("0.15")
+    max_concurrent_positions: int = 10
+    max_orders_per_minute: int = 6
+    fee_buffer: Decimal = Decimal("0.002")
+
+
+# ---------------------------------------------------------------------------
+# Decisions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RiskDecision:
+    approved: bool
+    check: str
+    reason: str
+    intent: Intent
+
+    def to_result(self, order: OrderRequest) -> RiskCheckResult:
+        return RiskCheckResult(
+            order_request_id=order.request_id, approved=self.approved, reason=self.reason
+        )
+
+
+def _held(order: OrderRequest, positions: list[Position]) -> Position | None:
+    for pos in positions:
+        if (
+            str(pos.symbol) == str(order.symbol)
+            and pos.direction != Direction.FLAT
+            and pos.quantity > 0
+        ):
+            return pos
+    return None
+
+
+def closes_position(order: OrderRequest, pos: Position) -> bool:
+    return (pos.direction == Direction.LONG and order.side == Side.SELL) or (
+        pos.direction == Direction.SHORT and order.side == Side.BUY
+    )
+
+
+def classify_intent(order: OrderRequest, positions: list[Position]) -> Intent:
+    """reduce when flagged reduce_only, or when it closes at most the held position."""
+    if order.reduce_only:
+        return REDUCE
+    pos = _held(order, positions)
+    if pos is not None and closes_position(order, pos) and order.quantity <= pos.quantity:
+        return REDUCE
+    return OPEN
+
+
+def reference_price(order: OrderRequest, marks: Mapping[str, Decimal]) -> Decimal | None:
+    mark = marks.get(str(order.symbol))
+    if mark is not None and mark > 0:
+        return mark
+    if order.price is not None and order.price > 0:
+        return order.price
+    return None
+
+
+def gross_exposure(positions: list[Position], marks: Mapping[str, Decimal]) -> Decimal:
+    """Sum of |qty x mark| (entry price when a symbol has no mark)."""
+    total = Decimal("0")
+    for pos in positions:
+        if pos.direction == Direction.FLAT or pos.quantity <= 0:
+            continue
+        price = marks.get(str(pos.symbol)) or pos.avg_entry_price
+        total += abs(pos.quantity * price)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -63,20 +166,7 @@ class RiskConfig:
 
 
 class PreTradeRiskManager:
-    """10-point pre-trade risk check sequence.
-
-    Checks:
-        1. Position size <= max_position_pct of portfolio
-        2. Risk per trade <= max_risk_per_trade (2% default)
-        3. Portfolio heat <= max_portfolio_heat (6% default)
-        4. Correlation check -- no highly correlated duplicate exposure
-        5. Circuit breaker status -- reject if tier 2+ active
-        6. Daily loss limit -- reject if daily loss exceeds 3%
-        7. Consecutive loss counter -- pause after 5 consecutive losses
-        8. Sufficient balance/margin for the order
-        9. Liquidity check -- order size < 1% of recent avg volume
-       10. Leverage bounds -- within configured min/max
-    """
+    """Stateless check sequence; account state arrives in the PortfolioState."""
 
     def __init__(
         self,
@@ -88,12 +178,16 @@ class PreTradeRiskManager:
         self._circuit_breaker_tier = circuit_breaker_tier
         self._db_pool = db_pool
 
-        # Cached risk state (loaded from DB)
+        # Legacy per-process counters for the pre-RiskService session path (P1-E removes it).
         self._daily_pnl = Decimal("0")
-        self._daily_pnl_date: date = date.today()
+        self._daily_pnl_date: date = datetime.now(UTC).date()
         self._consecutive_losses = 0
         self._current_drawdown = Decimal("0")
         self._peak_portfolio_value = Decimal("0")
+
+    @property
+    def config(self) -> RiskConfig:
+        return self._config
 
     @property
     def circuit_breaker_tier(self) -> int:
@@ -108,47 +202,47 @@ class PreTradeRiskManager:
         order: OrderRequest,
         portfolio_state: PortfolioState,
     ) -> RiskCheckResult:
-        """Run the full 10-point check sequence.  All must pass."""
-        checks_passed: list[str] = []
-        checks_failed: list[str] = []
+        return self.evaluate(order, portfolio_state).to_result(order)
 
-        checkers = [
-            ("position_size", self._check_position_size),
-            ("risk_per_trade", self._check_risk_per_trade),
-            ("portfolio_heat", self._check_portfolio_heat),
-            ("correlation", self._check_correlation),
-            ("circuit_breaker", self._check_circuit_breaker),
-            ("daily_loss", self._check_daily_loss),
-            ("consecutive_losses", self._check_consecutive_losses),
-            ("balance", self._check_balance),
-            ("liquidity", self._check_liquidity),
-            ("leverage", self._check_leverage),
-        ]
-
-        for name, checker in checkers:
-            ok, reason = checker(order, portfolio_state)
-            if ok:
-                checks_passed.append(name)
-            else:
-                checks_failed.append(name)
-                return RiskCheckResult(
-                    order_request_id=order.request_id,
-                    approved=False,
-                    reason=reason,
-                )
-
-        return RiskCheckResult(
-            order_request_id=order.request_id,
-            approved=True,
-            reason="All checks approved",
-        )
+    def evaluate(
+        self,
+        order: OrderRequest,
+        state: PortfolioState,
+        intent: Intent | None = None,
+    ) -> RiskDecision:
+        intent = intent or classify_intent(order, state.positions)
+        if order.quantity <= 0:
+            return RiskDecision(False, "sanity", f"non-positive quantity {order.quantity}", intent)
+        if intent == REDUCE:
+            return RiskDecision(True, "reduce", "reducing order: entry checks exempt", intent)
+        for check in (
+            self._check_price,
+            self._check_state,
+            self._check_kill_switch,
+            self._check_restrictions,
+            self._check_spot_short,
+            self._check_position_size,
+            self._check_risk_per_trade,
+            self._check_portfolio_heat,
+            self._check_concurrent_positions,
+            self._check_balance,
+            self._check_market_rules,
+            self._check_leverage,
+            self._check_liquidity,
+            self._check_correlation,
+            self._check_rate_limit,
+        ):
+            failed = check(order, state)
+            if failed is not None:
+                return RiskDecision(False, failed[0], failed[1], OPEN)
+        return RiskDecision(True, "all", "All checks approved", OPEN)
 
     # ------------------------------------------------------------------
-    # DB-backed risk state tracking
+    # Legacy DB-backed counters (session path before P1-E wires the RiskService)
     # ------------------------------------------------------------------
 
     async def load_state(self, db_pool: Any = None) -> None:
-        """Load risk state from DB on startup."""
+        """Load the legacy 'global' risk_state row."""
         pool = db_pool or self._db_pool
         if pool is None:
             return
@@ -166,31 +260,22 @@ class PreTradeRiskManager:
             logger.exception("Failed to load risk state from DB")
 
     async def record_fill(self, pnl: Decimal, portfolio_value: Decimal) -> None:
-        """Update risk state after a fill. Persists to DB."""
-        today = date.today()
-
-        # Reset daily PnL if new day
+        """Update the legacy 'global' counters; the RiskService path uses RiskService.on_fill."""
+        today = datetime.now(UTC).date()
         if self._daily_pnl_date != today:
             self._daily_pnl = Decimal("0")
             self._daily_pnl_date = today
-
         self._daily_pnl += pnl
-
-        # Update consecutive losses
         if pnl < 0:
             self._consecutive_losses += 1
         else:
             self._consecutive_losses = 0
-
-        # Update drawdown tracking
         if portfolio_value > self._peak_portfolio_value:
             self._peak_portfolio_value = portfolio_value
         if self._peak_portfolio_value > 0:
             self._current_drawdown = (
                 self._peak_portfolio_value - portfolio_value
             ) / self._peak_portfolio_value
-
-        # Persist to DB
         if self._db_pool is not None:
             try:
                 async with self._db_pool.acquire() as conn:
@@ -214,171 +299,180 @@ class PreTradeRiskManager:
                 logger.exception("Failed to persist risk state to DB")
 
     # ------------------------------------------------------------------
-    # Individual checks
+    # Opening-order checks: each returns (check, reason) on failure
     # ------------------------------------------------------------------
 
-    def _check_position_size(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """1. Position size <= max_position_pct of portfolio."""
-        if state.portfolio_value == Decimal("0"):
-            return False, "position size check failed: zero portfolio value"
-        order_value = order.quantity * (order.price or Decimal("0"))
-        max_value = state.portfolio_value * self._config.max_position_pct
-        if order_value > max_value:
-            return False, (
-                f"position size {order_value} exceeds max "
-                f"{self._config.max_position_pct * 100}% of portfolio ({max_value})"
+    def _ref(self, order: OrderRequest, state: PortfolioState) -> Decimal:
+        price = reference_price(order, state.marks)
+        if price is None:
+            raise ValueError(f"no mark price for {order.symbol}")
+        return price
+
+    def _sleeve(self, state: PortfolioState) -> Decimal:
+        return state.sleeve_equity if state.sleeve_equity is not None else state.portfolio_value
+
+    def _check_price(self, order: OrderRequest, state: PortfolioState) -> tuple[str, str] | None:
+        if reference_price(order, state.marks) is None:
+            return "no_mark", f"no mark price for {order.symbol}"
+        return None
+
+    def _check_state(self, order: OrderRequest, state: PortfolioState) -> tuple[str, str] | None:
+        if not state.state_available:
+            return "risk_state", "risk state unavailable"
+        if state.portfolio_value <= 0:
+            return "equity", f"non-positive account equity {state.portfolio_value}"
+        return None
+
+    def _check_kill_switch(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        if state.kill_switch:
+            return "kill_switch", "kill switch active"
+        return None
+
+    def _check_restrictions(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        if state.restrictions is not None:
+            return state.restrictions.blocking_reason()
+        if self._circuit_breaker_tier >= 2:
+            return (
+                "circuit_breaker",
+                f"circuit breaker tier {self._circuit_breaker_tier} active: new trades halted",
             )
-        return True, "position size ok"
+        if state.daily_pnl < 0:
+            loss = abs(state.daily_pnl) / state.portfolio_value
+            if loss > self._config.max_daily_loss_pct:
+                return "daily_loss_halt", (
+                    f"daily loss {loss:.4f} exceeds max {self._config.max_daily_loss_pct}"
+                )
+        if state.consecutive_losses >= self._config.max_consecutive_losses:
+            return "consecutive_loss_pause", (
+                f"consecutive_loss_pause: {state.consecutive_losses} losses "
+                f">= max {self._config.max_consecutive_losses}"
+            )
+        return None
+
+    def _check_spot_short(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        if order.market_type == MarketType.SPOT and order.side == Side.SELL:
+            return "spot_short", f"opening SELL of {order.symbol} on spot (no shorting)"
+        return None
+
+    def _check_position_size(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        notional = order.quantity * self._ref(order, state)
+        sleeve = self._sleeve(state)
+        cap = self._config.max_position_pct * sleeve
+        if sleeve <= 0 or notional > cap:
+            return "position_size", (
+                f"position notional {notional:f} exceeds max_position_pct "
+                f"{self._config.max_position_pct} of sleeve equity {sleeve} ({cap:f})"
+            )
+        return None
 
     def _check_risk_per_trade(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """2. Risk per trade <= max_risk_per_trade."""
-        if state.portfolio_value == Decimal("0"):
-            return False, "risk per trade check failed: zero portfolio value"
-        # Estimate risk as order value / portfolio value
-        price = order.price or Decimal("1")
-        order_value = order.quantity * price
-        risk_pct = order_value / state.portfolio_value
-        if risk_pct > self._config.max_risk_per_trade:
-            return False, (
-                f"risk per trade {risk_pct:.4f} exceeds max {self._config.max_risk_per_trade}"
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        if order.stop_price is None:
+            return None
+        loss = order.quantity * abs(self._ref(order, state) - order.stop_price)
+        cap = self._config.max_risk_per_trade * self._sleeve(state)
+        if loss > cap:
+            return "risk_per_trade", (
+                f"loss to stop {loss:f} exceeds max_risk_per_trade "
+                f"{self._config.max_risk_per_trade} of sleeve ({cap:f})"
             )
-        return True, "risk per trade ok"
+        return None
+
+    def _account_positions(self, state: PortfolioState) -> list[Position]:
+        return state.account_positions if state.account_positions is not None else state.positions
 
     def _check_portfolio_heat(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """3. Portfolio heat (sum of all position risks) <= max_portfolio_heat."""
-        if state.portfolio_value == Decimal("0"):
-            return False, "portfolio heat check failed: zero portfolio value"
-        total_risk = Decimal("0")
-        for pos in state.positions:
-            pos_value = pos.quantity * pos.avg_entry_price
-            total_risk += pos_value / state.portfolio_value
-
-        # Add risk from the proposed order
-        price = order.price or Decimal("1")
-        proposed_risk = (order.quantity * price) / state.portfolio_value
-        total_risk += proposed_risk
-
-        if total_risk > self._config.max_portfolio_heat:
-            return False, (
-                f"portfolio heat {total_risk:.4f} exceeds max {self._config.max_portfolio_heat}"
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        gross = gross_exposure(self._account_positions(state), state.marks)
+        heat = (gross + order.quantity * self._ref(order, state)) / state.portfolio_value
+        if heat > self._config.max_portfolio_heat:
+            return "portfolio_heat", (
+                f"gross exposure {heat:.4f} of account equity exceeds max "
+                f"{self._config.max_portfolio_heat}"
             )
-        return True, "portfolio heat ok"
+        return None
 
-    def _check_correlation(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """4. Correlation check -- don't add highly correlated position."""
-        symbol = str(order.symbol)
-        correlated_symbols = state.correlation_map.get(symbol, [])
-        for pos in state.positions:
-            if str(pos.symbol) in correlated_symbols and pos.quantity > Decimal("0"):
-                return False, (
-                    f"correlation check failed: {symbol} is highly correlated "
-                    f"with existing position {pos.symbol}"
-                )
-        return True, "correlation check ok"
-
-    def _check_circuit_breaker(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """5. Circuit breaker status -- reject if tier 2+ active."""
-        if self._circuit_breaker_tier >= 2:
-            return False, (
-                f"circuit breaker tier {self._circuit_breaker_tier} active: new trades halted"
+    def _check_concurrent_positions(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        if _held(order, state.positions) is not None:
+            return None
+        open_count = sum(
+            1
+            for p in self._account_positions(state)
+            if p.direction != Direction.FLAT and p.quantity > 0
+        )
+        if open_count >= self._config.max_concurrent_positions:
+            return "concurrent_positions", (
+                f"{open_count} open positions >= max {self._config.max_concurrent_positions}"
             )
-        return True, "circuit breaker ok"
+        return None
 
-    def _check_daily_loss(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """6. Daily loss limit -- reject if daily loss exceeds 3%."""
-        if state.portfolio_value == Decimal("0"):
-            return False, "daily loss check failed: zero portfolio value"
-        if state.daily_pnl < 0:
-            daily_loss_pct = abs(state.daily_pnl) / state.portfolio_value
-        else:
-            daily_loss_pct = Decimal("0")
-        if daily_loss_pct > self._config.max_daily_loss_pct:
-            return False, (
-                f"daily loss {daily_loss_pct:.4f} exceeds max {self._config.max_daily_loss_pct}"
-            )
-        return True, "daily loss ok"
+    def _check_balance(self, order: OrderRequest, state: PortfolioState) -> tuple[str, str] | None:
+        if order.side != Side.BUY:
+            return None
+        cost = order.quantity * self._ref(order, state) * (1 + self._config.fee_buffer)
+        have = state.balances.get(state.quote_currency, Decimal("0"))
+        if cost > have:
+            return "balance", (f"insufficient {state.quote_currency}: need {cost:f}, have {have}")
+        return None
 
-    def _check_consecutive_losses(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """7. Consecutive loss counter -- pause after 5 consecutive losses."""
-        if state.consecutive_losses >= self._config.max_consecutive_losses:
-            return False, (
-                f"consecutive losses ({state.consecutive_losses}) "
-                f">= max ({self._config.max_consecutive_losses}): "
-                f"{self._config.consecutive_loss_cooldown_hours}h cooldown"
-            )
-        return True, "consecutive losses ok"
+    def _check_market_rules(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        rules = state.market_rules.get(str(order.symbol))
+        if rules is None:
+            return None
+        reason = rules.validate_open(order.quantity, self._ref(order, state))
+        return None if reason is None else ("market_rules", reason)
 
-    def _check_balance(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """8. Sufficient balance/margin for the order."""
-        price = order.price or Decimal("1")
-        required = order.quantity * price
-        available = sum(state.balances.values()) if state.balances else Decimal("0")
-        if required > available:
-            return False, (f"insufficient balance: need {required}, have {available}")
-        return True, "balance ok"
+    def _check_leverage(self, order: OrderRequest, state: PortfolioState) -> tuple[str, str] | None:
+        gross = gross_exposure(self._account_positions(state), state.marks)
+        leverage = (gross + order.quantity * self._ref(order, state)) / state.portfolio_value
+        if leverage > SPOT_MAX_LEVERAGE:
+            return "leverage", f"spot leverage {leverage:.2f} exceeds {SPOT_MAX_LEVERAGE}"
+        return None
 
     def _check_liquidity(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """9. Liquidity check -- order size < 1% of recent average volume."""
-        if state.average_volume <= Decimal("0"):
-            return True, "liquidity check skipped (no volume data)"
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        if state.average_volume is None or state.average_volume <= 0:
+            return None
         max_size = state.average_volume * self._config.max_liquidity_pct
         if order.quantity > max_size:
-            return False, (
-                f"liquidity check failed: order size {order.quantity} "
-                f"> {self._config.max_liquidity_pct * 100}% of avg volume ({max_size})"
+            return "liquidity", (
+                f"order size {order.quantity} > {self._config.max_liquidity_pct} "
+                f"of average volume ({max_size})"
             )
-        return True, "liquidity ok"
+        return None
 
-    def _check_leverage(
-        self,
-        order: OrderRequest,
-        state: PortfolioState,
-    ) -> tuple[bool, str]:
-        """10. Leverage bounds -- within configured min/max."""
-        if state.portfolio_value == Decimal("0"):
-            return False, "leverage check failed: zero portfolio value"
-        price = order.price or Decimal("1")
-        order_value = order.quantity * price
-        effective_leverage = order_value / state.portfolio_value
-        if effective_leverage > Decimal(str(self._config.max_leverage)):
-            return False, (
-                f"effective leverage {effective_leverage:.2f} "
-                f"exceeds max {self._config.max_leverage}"
+    def _check_correlation(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        correlated = state.correlation_map.get(str(order.symbol), [])
+        for pos in self._account_positions(state):
+            if str(pos.symbol) in correlated and pos.quantity > 0:
+                return "correlation", (
+                    f"{order.symbol} is highly correlated with open position {pos.symbol}"
+                )
+        return None
+
+    def _check_rate_limit(
+        self, order: OrderRequest, state: PortfolioState
+    ) -> tuple[str, str] | None:
+        if state.opening_orders_last_minute >= self._config.max_orders_per_minute:
+            return "rate_limit", (
+                f"{state.opening_orders_last_minute} opening orders in the last minute "
+                f">= max {self._config.max_orders_per_minute}"
             )
-        return True, "leverage ok"
+        return None

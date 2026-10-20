@@ -1,8 +1,9 @@
 """Order lifecycle management: validation, dedup, submission, tracking, fill emission.
 
-The ``OrderManager`` sits between strategy signals and the exchange executor.  It
-performs duplicate-order detection, delegates pre-trade risk checks, submits to the
-configured executor, and publishes fill / cancel events to the event bus.
+The ``OrderManager`` sits between strategy signals and the exchange executor. Orders are
+classified as opening or reducing; reduce_only orders are clamped to the held position. With a
+RiskService, the account lock is held from the risk check through ``create_order``, and fill
+events are published after it is released.
 """
 
 from __future__ import annotations
@@ -10,18 +11,35 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from dataclasses import replace
 from decimal import Decimal
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from hydra.core.events import (
     OrderCancelEvent,
     OrderFillEvent,
     RiskCheckResult,
 )
+from hydra.core.metrics import record_risk_rejection
 from hydra.core.types import (
     OrderRequest,
     OrderStatus,
+    Position,
 )
+from hydra.risk.pretrade import (
+    OPEN,
+    REDUCE,
+    Intent,
+    PortfolioState,
+    PreTradeRiskManager,
+    RiskDecision,
+    classify_intent,
+    closes_position,
+)
+from hydra.risk.service import RiskLockTimeoutError
+
+if TYPE_CHECKING:
+    from hydra.risk.service import RiskService
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +65,8 @@ class ExecutorBackend(Protocol):
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]: ...
 
+    async def get_positions(self, symbol: str | None = None) -> list[Position]: ...
+
 
 @runtime_checkable
 class EventBusLike(Protocol):
@@ -59,13 +79,39 @@ class RiskCheckerLike(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Dedup key helper
+# Errors and helpers
 # ---------------------------------------------------------------------------
+
+
+class RiskRejectedError(ValueError):
+    """A risk check refused the order (a ValueError, so existing callers still catch it)."""
+
+    def __init__(self, reason: str, check: str, intent: Intent) -> None:
+        super().__init__(f"Risk check failed: {reason}")
+        self.reason = reason
+        self.check = check
+        self.intent = intent
 
 
 def _dedup_key(order: OrderRequest) -> str:
     """Build a deduplication key from symbol + side + quantity."""
     return f"{order.symbol}|{order.side}|{order.quantity}"
+
+
+def _dec(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    return Decimal(str(value))
+
+
+def _realized_pnl(resp: dict[str, Any], fee: Decimal) -> tuple[Decimal | None, Decimal | None]:
+    """(net, gross) PnL of a closing fill from the executor response."""
+    gross = _dec(resp.get("pnl"))
+    for key in ("net_pnl", "realized_pnl"):
+        net = _dec(resp.get(key))
+        if net is not None:
+            return net, gross
+    return (None, None) if gross is None else (gross - fee, gross)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +137,11 @@ class _TrackedOrder:
 
 
 class OrderManager:
-    """Signal -> OrderRequest -> risk check -> submit -> track -> emit fill."""
+    """Signal -> OrderRequest -> risk check -> submit -> track -> emit fill.
+
+    ``risk``/``session_id`` select the RiskService path. ``risk_checker`` with
+    ``portfolio_state``/``portfolio_state_builder`` is the pre-RiskService path.
+    """
 
     def __init__(
         self,
@@ -102,12 +152,17 @@ class OrderManager:
         portfolio_state_builder: Any = None,
         stale_order_timeout: float = 300.0,
         dedup_window: float = 1.0,
+        *,
+        risk: RiskService | None = None,
+        session_id: str = "",
     ) -> None:
         self._executor = executor
         self._event_bus = event_bus
         self._risk_checker = risk_checker
         self._portfolio_state = portfolio_state
         self._portfolio_state_builder = portfolio_state_builder
+        self._risk = risk
+        self._session_id = session_id
 
         # Config
         self._stale_order_timeout = stale_order_timeout
@@ -121,32 +176,103 @@ class OrderManager:
     # Public API
     # ------------------------------------------------------------------
 
-    async def submit_order(self, order: OrderRequest) -> str:
-        """Validate, dedup check, optionally risk-check, submit to executor, return order_id."""
+    async def submit_order(self, order: OrderRequest) -> str | None:
+        """Classify, clamp, dedup, risk-check, submit; returns the order id.
 
-        # 1. Deduplication
-        key = _dedup_key(order)
+        A reduce_only order with nothing to reduce is a no-op and returns None. A refused order
+        raises RiskRejectedError.
+        """
         now = time.monotonic()
-        if key in self._dedup_cache:
-            elapsed = now - self._dedup_cache[key]
-            if elapsed < self._dedup_window:
-                raise ValueError(
-                    f"Duplicate order rejected (same symbol+side+quantity within "
-                    f"{self._dedup_window}s window)"
+        if order.quantity <= 0:
+            self._reject(
+                RiskDecision(
+                    False,
+                    "sanity",
+                    f"non-positive quantity {order.quantity}",
+                    REDUCE if order.reduce_only else OPEN,
                 )
-        self._dedup_cache[key] = now
+            )
 
-        # 2. Pre-trade risk check (if checker configured)
-        if self._risk_checker is not None:
-            # Refresh portfolio state if a builder is available
+        positions: list[Position] | None = None
+        if order.reduce_only or self._risk is not None:
+            positions = list(await self._executor.get_positions(str(order.symbol)))
+        elif self._risk_checker is not None:
             if self._portfolio_state_builder is not None:
                 self._portfolio_state = await self._portfolio_state_builder()
-            result = await self._risk_checker.check_order(order, self._portfolio_state)
-            if not result.approved:
-                raise ValueError(f"Risk check failed: {result.reason}")
+            if isinstance(self._portfolio_state, PortfolioState):
+                positions = self._portfolio_state.positions
+        if order.reduce_only:
+            held = next(
+                (
+                    p
+                    for p in positions or []
+                    if str(p.symbol) == str(order.symbol)
+                    and p.quantity > 0
+                    and closes_position(order, p)
+                ),
+                None,
+            )
+            if held is None:
+                logger.info("reduce_only %s %s: no position to reduce", order.side, order.symbol)
+                return None
+            if order.quantity > held.quantity:
+                order = replace(order, quantity=held.quantity)
+        intent: Intent = classify_intent(order, positions) if positions is not None else OPEN
 
-        # 3. Submit to executor backend
-        resp = await self._executor.create_order(
+        if intent == OPEN:
+            key = _dedup_key(order)
+            if key in self._dedup_cache and now - self._dedup_cache[key] < self._dedup_window:
+                self._reject(
+                    RiskDecision(
+                        False,
+                        "duplicate",
+                        f"Duplicate order rejected (same symbol+side+quantity within "
+                        f"{self._dedup_window}s window)",
+                        OPEN,
+                    )
+                )
+            self._dedup_cache[key] = now
+
+        if self._risk is not None:
+            try:
+                async with self._risk.order_slot(intent):
+                    decision = await self._risk.check(order, self._session_id, intent)
+                    if not decision.approved:
+                        self._reject(decision)
+                    resp = await self._create(order)
+                    if intent == OPEN:
+                        self._risk.record_opening(self._session_id)
+            except RiskLockTimeoutError as exc:
+                self._reject(RiskDecision(False, "lock_timeout", str(exc), intent))
+        else:
+            await self._legacy_check(order, intent)
+            resp = await self._create(order)
+
+        return await self._track_and_publish(order, intent, resp, now)
+
+    def _reject(self, decision: RiskDecision) -> None:
+        record_risk_rejection(decision.check, decision.intent)
+        logger.warning(
+            "Order rejected (%s, %s): %s", decision.check, decision.intent, decision.reason
+        )
+        raise RiskRejectedError(decision.reason, decision.check, decision.intent)
+
+    async def _legacy_check(self, order: OrderRequest, intent: Intent) -> None:
+        if self._risk_checker is None:
+            return
+        state = self._portfolio_state
+        if isinstance(self._risk_checker, PreTradeRiskManager) and isinstance(
+            state, PortfolioState
+        ):
+            decision = self._risk_checker.evaluate(order, state, intent)
+        else:
+            result = await self._risk_checker.check_order(order, self._portfolio_state)
+            decision = RiskDecision(result.approved, "risk_checker", result.reason, intent)
+        if not decision.approved:
+            self._reject(decision)
+
+    async def _create(self, order: OrderRequest) -> dict[str, Any]:
+        return await self._executor.create_order(
             symbol=str(order.symbol),
             side=str(order.side),
             order_type=str(order.order_type),
@@ -155,17 +281,17 @@ class OrderManager:
             stop_price=order.stop_price,
         )
 
+    async def _track_and_publish(
+        self, order: OrderRequest, intent: Intent, resp: dict[str, Any], started: float
+    ) -> str:
         order_id = str(resp.get("id", str(uuid.uuid4())))
-
-        # 4. Track
         tracked = _TrackedOrder(request=order, order_id=order_id)
         self._orders[order_id] = tracked
 
-        # 5. If the response indicates an immediate fill, emit fill event
         status_str = str(resp.get("status", "")).upper()
         if status_str == "FILLED" or resp.get("filled", False):
             tracked.status = OrderStatus.FILLED
-            fill_price = Decimal(str(resp.get("price", resp.get("average", "0"))))
+            fill_price = _dec(resp.get("average")) or _dec(resp.get("price")) or Decimal("0")
             raw_fee = resp.get("fee")
             if isinstance(raw_fee, dict):
                 fee = Decimal(str(raw_fee.get("cost", "0")))
@@ -173,6 +299,7 @@ class OrderManager:
             else:
                 fee = Decimal("0")
                 fee_currency = ""
+            realized, gross = _realized_pnl(resp, fee) if intent == REDUCE else (None, None)
             await self._event_bus.publish(
                 OrderFillEvent(
                     order_id=order_id,
@@ -185,6 +312,12 @@ class OrderManager:
                     fee_currency=fee_currency,
                     exchange_id=order.exchange_id,
                     status=OrderStatus.FILLED,
+                    session_id=self._session_id,
+                    strategy_id=order.strategy_id,
+                    tag=order.tag,
+                    reduce_only=order.reduce_only,
+                    realized_pnl=realized,
+                    gross_pnl=gross,
                 )
             )
             try:
@@ -196,9 +329,9 @@ class OrderManager:
                     order.strategy_id,
                     order.exchange_id,
                 )
-                observe_order_fill_latency(time.monotonic() - now)
+                observe_order_fill_latency(time.monotonic() - started)
             except Exception:
-                pass
+                logger.debug("trade metrics not recorded", exc_info=True)
 
         return order_id
 
