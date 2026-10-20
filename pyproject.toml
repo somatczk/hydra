@@ -83,7 +83,7 @@ build-backend = "hatchling.build"
 packages = ["src/hydra"]
 
 [tool.uv]
-required-version = ">=0.13.3,<0.14"
+required-version = ">=0.12.18"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

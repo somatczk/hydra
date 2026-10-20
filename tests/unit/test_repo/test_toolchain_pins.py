@@ -88,6 +88,7 @@ def test_every_uv_job_pins_the_same_uv_as_the_images() -> None:
     pinned = set(ci_versions.values()) | {v[0] for v in image_versions.values()}
     assert pinned == {"0.13.3"}
     assert required.contains("0.13.3")
+    assert required.contains("0.12.18"), "Dependabot's bundled uv must satisfy required-version"
     assert not required.contains("0.6.10")
 
 
