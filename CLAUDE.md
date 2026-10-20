@@ -35,8 +35,12 @@ not duplicate it here; update that table in the PR that changes a row.
   ML image uses 3.12. uv is pinned to 0.13.3 (setup-uv, Dockerfiles); `[tool.uv] required-version >=0.12.18` refuses
   older uvs that rewrite `uv.lock` while still admitting Dependabot's bundled uv;
   `tests/unit/test_repo/test_toolchain_pins.py` keeps the pins in agreement.
-- **Backend**: FastAPI + uvicorn, raw asyncpg with inline DDL in `src/hydra/dashboard/api.py`, pydantic. SQLAlchemy
-  and alembic are declared but not used at runtime.
+- **Backend**: FastAPI + uvicorn, raw asyncpg (no ORM), pydantic. The schema comes only from Alembic revisions in
+  `src/hydra/data/migrations/versions/` (SQLAlchemy is used only by Alembic); never add inline DDL. A schema change is
+  a new revision on the single head (CI checks `python -m hydra.data.migrations heads`).
+- **Config**: one `HydraConfig` (`src/hydra/core/config.py`), loaded once by `src/hydra/dashboard/lifespan.py` and read
+  from `app.state.config` (`hydra.dashboard.deps.get_config`). env > `{HYDRA_ENV}.yaml` > `base.yaml` > defaults;
+  overrides as `HYDRA_<SECTION>__<KEY>`; unknown keys fail. New code reads settings from it, not from `os.environ`.
 - **Exchange**: ccxt async (REST) and ccxt.pro (session market-data feed).
 - **Database**: TimescaleDB (PostgreSQL 16). `ts` schema for hypertables (`ts.ohlcv_1m`, `ts.funding_rates`),
   `public` for relational data.
@@ -59,7 +63,7 @@ not duplicate it here; update that table in the PR that changes a row.
   - `dashboard`: the FastAPI app, `routes/`.
   - `ops`: Discord/Slack webhook notifier.
 - `dashboard/`: Next.js app (see `dashboard/README.md`).
-- `config/`: base/live/backtest YAML, `strategies/`, `templates/`.
+- `config/`: `base.yaml`, `strategies/`, `templates/`.
 - `deploy/`: local compose, Prometheus rules and promtool tests, Grafana dashboard.
 - `docker/<image>/Dockerfile`: engine, dashboard, backtest, ml.
 - `tests/`: `unit/`, `integration/`, `e2e/`, `performance/`.
@@ -86,9 +90,11 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   health-pinged; it is not on the trading path.
 - Signal path: ccxt.pro bar → StrategyEngine → OrderManager (pre-trade check by PreTradeRiskManager) →
   PaperTradingExecutor or ExchangeClient. ExchangeClient defaults to `testnet=True`.
-- Persisted (only when the engine has a DB pool): risk config and kill-switch flag, trading sessions, paper
-  trades, positions and balance snapshots, backtest results and trades with data provenance. In memory only: system config, background task state
-  (backtest, hyperopt, walk-forward). Circuit breakers are not instantiated. Paper state is not reloaded on restart.
+- Persisted (the engine has a DB pool whenever `DATABASE_URL` is set; startup fails without one): risk config and
+  kill-switch flag, trading sessions, paper trades, positions and balance snapshots, backtest results and trades with
+  data provenance, exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`), and `system_config` rows (read at startup;
+  `PUT /api/system/config` still changes memory only). In memory only: background task state (backtest, hyperopt,
+  walk-forward). Circuit breakers are not instantiated. Paper state is not reloaded on restart.
 - No exchange-side stops yet (P3). Only Binance is supported in practice; the explicit gate is P1.
 - Errors from dashboard routes use one envelope, `{"detail": {"code", "message", "state", ...}}`, built by
   `src/hydra/dashboard/routes/_db.py`; the frontend reads it with `dashboard/src/lib/apiState.ts`. Reuse both.
@@ -116,8 +122,8 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   mypy over eight packages, bandit, unit tests with a clean-tree check, dashboard (lint, typecheck, test, build),
   promtool check + test for `deploy/prometheus-rules.yml`, integration and e2e on TimescaleDB + Redis service
   containers with `HYDRA_REQUIRE_INFRA=1`, and `image-smoke`, which builds each image without pushing and starts it
-  (engine against the services with only `DATABASE_URL` and `REDIS_URL`; every engine and backtest log line must be
-  JSON). PR runs read the image build cache but do not write it.
+  (engine against the services with `DATABASE_URL`, `REDIS_URL` and a throwaway `HYDRA_CREDENTIAL_KEY`; every
+  engine and backtest log line must be JSON). PR runs read the image build cache but do not write it.
 - `publish` (in `ci.yml`) needs every other job and runs only on pushes to `main` and manual dispatch on `main`: it
   builds `hydra-engine`, `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag
   only if it does not exist yet. Version tags never move. A push that changes no image input (`IMAGE_INPUTS`) skips
@@ -130,5 +136,7 @@ those packages, because `mypy src/` alone does not catch everything it catches.
 romulus (homelab infra repo) runs the `hydra` stack on a ZimaCube with Ubuntu 26.04, applied by doco-cd. Images come
 from `ghcr.io/somatczk/hydra-*`; romulus Dependabot opens the tag-bump PRs. Romulus P0-E2 (in progress) holds hydra
 bumps back from auto-merge, drops the public `/health` + `/metrics` router and removes the Telegram env. The engine
-reads `DATABASE_URL`, `REDIS_URL`, `LOG_LEVEL` and `LOG_FORMAT` (romulus sets the first two), and the host bind-mounts
-its own `/app/config` over the image's.
+reads infra only from `DATABASE_URL`, `REDIS_URL`, `HYDRA_CREDENTIAL_KEY` (required with a DB; comma list = rotation)
+and `HYDRA_API_TOKEN`, and behaviour overrides as `HYDRA_<SECTION>__<KEY>` (e.g. `HYDRA_API__CORS_ORIGINS`). Until the
+P1 release romulus bind-mounts its own `/app/config` over the image's; from then on it mounts only
+`config/strategies`. `HYDRA_DB_*` and `HYDRA_REDIS_URL` are test-infra env only (`tests/infra.py`).

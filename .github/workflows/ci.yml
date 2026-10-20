@@ -30,6 +30,8 @@ jobs:
       - run: uv run ruff check src/ tests/
       - run: uv run ruff format --check src/ tests/
       - run: uv run lint-imports
+      - name: Single Alembic head
+        run: uv run python -m hydra.data.migrations heads
 
   type-check:
     name: Type Check
@@ -304,10 +306,11 @@ jobs:
           }
           case "$IMAGE" in
             hydra-engine)
-              # romulus env shape: only DATABASE_URL and REDIS_URL
+              # romulus env shape: DATABASE_URL, REDIS_URL and a throwaway HYDRA_CREDENTIAL_KEY
               docker run -d --name smoke --network host \
                 -e DATABASE_URL="postgresql://hydra:test@localhost:${PG_PORT}/hydra_test" \
                 -e REDIS_URL="redis://localhost:${REDIS_PORT}/0" \
+                -e HYDRA_CREDENTIAL_KEY="$(openssl rand -base64 32 | tr '+/' '-_')" \
                 "$IMAGE:smoke"
               wait_for curl -fsS -o /dev/null http://localhost:8000/health
               body=$(curl -fsS http://localhost:8000/health)

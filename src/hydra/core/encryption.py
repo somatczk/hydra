@@ -1,60 +1,56 @@
-"""Fernet-based credential encryption for exchange API keys.
+"""Fernet encryption for credentials stored in the database.
 
-Uses the ``cryptography`` library to encrypt/decrypt sensitive credentials
-at rest. The encryption key is sourced from the ``HYDRA_CREDENTIAL_KEY``
-environment variable.
+The key comes only from ``HYDRA_CREDENTIAL_KEY``: one Fernet key, or a comma-separated list for
+rotation (``new,old``: the first key encrypts, every key decrypts). A key is never generated or
+written anywhere; a missing or malformed key raises :class:`CredentialKeyError`. ``decrypt`` lets
+``cryptography.fernet.InvalidToken`` through so callers can report undecryptable rows.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 
-logger = logging.getLogger(__name__)
-
-_KEY_ENV_VAR = "HYDRA_CREDENTIAL_KEY"
+KEY_ENV_VAR = "HYDRA_CREDENTIAL_KEY"
 
 
-def get_fernet_key() -> bytes:
-    """Return the Fernet encryption key from the environment.
+class CredentialKeyError(RuntimeError):
+    """HYDRA_CREDENTIAL_KEY is missing or is not a valid Fernet key list."""
 
-    If ``HYDRA_CREDENTIAL_KEY`` is not set, a new key is generated and
-    written to ``.env`` for persistence, with a warning logged.
-    """
-    raw = os.environ.get(_KEY_ENV_VAR)
-    if raw:
-        return raw.encode()
 
-    # Generate a new key and persist it
-    key = Fernet.generate_key()
-    logger.warning(
-        "No %s found in environment — generated a new key. "
-        "Set this in your environment for production use.",
-        _KEY_ENV_VAR,
-    )
+def _parse(raw: str | None) -> MultiFernet:
+    if raw is None or not raw.strip():
+        raise CredentialKeyError(
+            f"{KEY_ENV_VAR} is not set; it is required whenever DATABASE_URL is set"
+        )
+    parts = [part.strip() for part in raw.split(",")]
+    fernets: list[Fernet] = []
+    for index, part in enumerate(parts, start=1):
+        try:
+            fernets.append(Fernet(part.encode()))
+        except ValueError:
+            raise CredentialKeyError(
+                f"{KEY_ENV_VAR}: key {index} of {len(parts)} is not a valid Fernet key"
+            ) from None
+    return MultiFernet(fernets)
 
-    # Attempt to persist to .env for convenience
-    try:
-        env_path = os.path.join(os.getcwd(), ".env")
-        with open(env_path, "a") as f:
-            f.write(f"\n{_KEY_ENV_VAR}={key.decode()}\n")
-        logger.info("Wrote new credential key to %s", env_path)
-    except OSError:
-        logger.debug("Could not write key to .env file")
 
-    os.environ[_KEY_ENV_VAR] = key.decode()
-    return key
+def get_cipher() -> MultiFernet:
+    """The cipher for the current ``HYDRA_CREDENTIAL_KEY``."""
+    return _parse(os.environ.get(KEY_ENV_VAR))
+
+
+def require_credential_key(raw: str | None = None) -> None:
+    """Fail fast at startup: validate *raw*, or ``HYDRA_CREDENTIAL_KEY`` when not given."""
+    _parse(raw if raw is not None else os.environ.get(KEY_ENV_VAR))
 
 
 def encrypt(plaintext: str) -> str:
-    """Encrypt a plaintext string using Fernet. Returns base64-encoded ciphertext."""
-    f = Fernet(get_fernet_key())
-    return f.encrypt(plaintext.encode()).decode()
+    """Encrypt with the first key. Returns the Fernet token as text."""
+    return get_cipher().encrypt(plaintext.encode()).decode()
 
 
 def decrypt(ciphertext: str) -> str:
-    """Decrypt a Fernet-encrypted ciphertext string."""
-    f = Fernet(get_fernet_key())
-    return f.decrypt(ciphertext.encode()).decode()
+    """Decrypt with any configured key; raises ``InvalidToken`` when none matches."""
+    return get_cipher().decrypt(ciphertext.encode()).decode()

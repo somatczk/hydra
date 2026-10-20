@@ -13,7 +13,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from hydra.dashboard import api
+from hydra.dashboard import lifespan
 from hydra.dashboard.routes import market_data
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.market_data import close_market_clients, router
@@ -218,18 +218,20 @@ class TestLifespanClosesClients:
     async def test_app_shutdown_closes_cached_clients(self) -> None:
         names = [
             "_init_logging",
+            "_require_credential_key",
             "_init_db_pool",
-            "_load_exchange_credentials",
-            "_init_session_manager",
             "_run_migrations",
+            "_load_exchange_credentials",
+            "_load_system_config",
+            "_init_session_manager",
             "_populate_backtest_cache",
             "_shutdown_session_manager",
             "_close_db_pool",
         ]
         fake = _FakeExchange()
         app = FastAPI()
-        with patch.multiple(api, **{n: AsyncMock() for n in names}):
-            async with api._lifespan(app):
+        with patch.multiple(lifespan, **{n: AsyncMock() for n in names}):
+            async with lifespan.run(app):
                 app.state.market_data_clients = {"binance": fake}
         assert fake.closed == 1
         assert app.state.market_data_clients == {}

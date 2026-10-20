@@ -349,7 +349,7 @@ class TestSystemHealth:
 
 @pytest.fixture()
 def credential_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    # encrypt() writes a generated key into ./.env when this is unset
+    # encrypt() raises CredentialKeyError when this is unset
     monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
 
 

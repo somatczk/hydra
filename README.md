@@ -59,6 +59,7 @@ Each PR that changes one of these rows updates the row.
 | Engineering | JSON logs carry level, logger, timestamp and tracebacks | **Working.** Stdlib, structlog and uvicorn records, uvicorn's startup lines included, render as one JSON line each, with the traceback text; the image smoke job requires every engine and backtest log line to be JSON (`tests/unit/test_core/test_logging.py`). |
 | Engineering | Every module has tests | **Known gap: unscheduled.** No tests for `backtest/vectorbt_research.py`, `data/ingestion.py` or `ops/notifications.py`. `backtest/hyperopt.py` has no unit tests of its own; it is covered through the route tests and `tests/integration/test_backtest_real_data.py::test_hyperopt_grid_runs_on_stored_bars_reproducibly`. |
 | Engineering | Dockerfile references in Makefile, compose files and CI publish job | **Working.** `tests/unit/test_repo/test_build_references.py`. |
+| Engineering | One config, encrypted credentials, one schema source, fail-fast startup | **Working.** One `HydraConfig` is loaded once in the lifespan: env > `{HYDRA_ENV}.yaml` > `base.yaml` > defaults; unknown keys at any depth, unresolved `${VAR}` and infra keys in YAML stop startup (`tests/unit/test_core/test_config.py`). `HYDRA_CREDENTIAL_KEY` is required whenever `DATABASE_URL` is set and is never generated; rows it cannot decrypt are reported, not fatal (`tests/unit/test_core/test_encryption.py`, `tests/unit/test_dashboard/test_lifespan.py`). Alembic (`hydra.data.migrations`) is the only schema source and runs first under an advisory lock; a failed migration stops startup and leaves no partial schema (`tests/integration/test_migrations.py`, `tests/integration/test_startup_romulus_env.py`). `PUT /api/system/config` is not persisted yet (P1-F). |
 | Engineering | One version (pyproject) reported everywhere | **Partial.** The engine package, OpenAPI and `PlatformConfig` report the pyproject version (`tests/unit/test_repo/test_version_single_source.py`). The dashboard sidebar still shows `dashboard/package.json`'s version (1.2.0); fixing it needs a build arg in `docker/dashboard/Dockerfile` (Known gap: unscheduled). |
 
 ## Architecture (as is)
@@ -88,8 +89,8 @@ graph LR
 ```
 
 - The engine is one process: FastAPI, the session manager and every session's event bus. Redis is not on the trading path.
-- The schema is created by inline DDL in `src/hydra/dashboard/api.py` at startup. The alembic files under
-  `data/migrations` and `portfolio/migrations` and the SQLAlchemy models in `portfolio/models.py` are not used at runtime.
+- The schema comes only from Alembic revisions in `src/hydra/data/migrations/versions/`. The engine upgrades to head as
+  its first database step at startup, under a Postgres advisory lock, and exits if that fails.
 - Backtests load bars through `hydra.backtest.data` from `ts.ohlcv_1m`; nothing is fetched or synthesised on the fly.
 
 ## Planned architecture
@@ -124,20 +125,20 @@ graph LR
 ```
 src/hydra/
 ├── core/         # Config (pydantic + layered YAML), domain types, events, InMemory/Redis event bus, WS manager, Prometheus metric contract (metrics.py)
-├── data/         # Ingestion (ccxt.pro), bar storage, backfill, news/sentiment; migrations/ is unused alembic
+├── data/         # Ingestion (ccxt.pro), bar storage, backfill, news/sentiment; migrations/ (Alembic, the schema)
 ├── indicators/   # TA-Lib wrappers + custom indicators
 ├── strategy/     # Strategy base, engine, rule engine, YAML config; builtin/ holds the built-in classes
 ├── backtest/     # Runner, bar loader, fills, metrics, hyperopt, walk-forward, vectorbt_research
 ├── execution/    # SessionManager, OrderManager, paper executor, ccxt ExchangeClient
 ├── risk/         # Pre-trade checks, sizing, circuit breakers and exchange safety (not wired)
-├── portfolio/    # P&L, positions, reconciliation; models.py + migrations/ are unused SQLAlchemy/alembic
+├── portfolio/    # P&L, positions, reconciliation
 ├── ml/           # Features, ONNX serving/export, registry, drift, training (not wired, P5)
 ├── dashboard/    # FastAPI app (api.py), routes/
 └── ops/          # Discord / Slack webhook notifier
 dashboard/        # Next.js app (see dashboard/README.md)
 docker/           # engine/, dashboard/, backtest/, ml/ — one Dockerfile each
 deploy/           # Local full-stack compose, Prometheus rules + promtool tests, Grafana dashboard
-config/           # base/live/backtest YAML, strategies/, templates/, grafana/
+config/           # base.yaml, strategies/, templates/, grafana/
 scripts/          # download_history.py, seed_db.py, sync_models.py
 tests/            # unit/, integration/, e2e/, performance/
 ```
@@ -168,10 +169,47 @@ uv run pytest tests/unit -m "not slow"
 `make dev` installs every extra, including `ml-training` (torch, xgboost, mlflow), which is large. `make install`
 installs runtime dependencies only, without the test tools.
 
-To run the engine against a local database, start TimescaleDB and Redis with `make dev-up` (needs Docker), then set
-`DATABASE_URL` (and `REDIS_URL`) and run `uv run python -m hydra.dashboard.api`. `.env.example` predates the current
-config: several of its keys (`HYDRA_DB_*` for the API, `HYDRA_PAPER_TRADING`, `HYDRA_CORS_ORIGINS`) are not read the
-way it implies; P1 config rewrites it.
+To run the engine against a local database, start TimescaleDB and Redis with `make dev-up` (needs Docker), then:
+
+```bash
+export DATABASE_URL=postgresql://hydra:hydra_dev@localhost:5432/hydra REDIS_URL=redis://localhost:6379/0
+export HYDRA_CREDENTIAL_KEY=$(uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+uv run python -m hydra.dashboard.api
+```
+
+Keep that key: credentials stored under it cannot be read with another one. `.env.example` lists every variable.
+
+### Configuration
+
+- One model, `HydraConfig` (`src/hydra/core/config.py`), loaded and validated once at startup. Precedence:
+  environment > `config/{HYDRA_ENV}.yaml` > `config/base.yaml` > defaults. `HYDRA_CONFIG_DIR` points at another
+  config directory; `HYDRA_ENV` (default `base`) selects an overlay, which must exist.
+- Override any key from the environment as `HYDRA_<SECTION>__<KEY>`, e.g. `HYDRA_TRADING__TESTNET=false`,
+  `HYDRA_LOGGING__LEVEL=DEBUG`, `HYDRA_API__CORS_ORIGINS=https://a.example,https://b.example`.
+- Infrastructure comes only from the environment: `DATABASE_URL`, `REDIS_URL`, `HYDRA_CREDENTIAL_KEY`,
+  `HYDRA_API_TOKEN`. Putting them (or `database:`, `redis:`, `exchanges:`) in YAML is a startup error.
+- An unknown key at any depth, an unresolved `${VAR}` or an invalid value stops startup with the key, variable or file
+  in the message. Without `DATABASE_URL` the engine runs without a database (dev only).
+- `HYDRA_CREDENTIAL_KEY` encrypts exchange credentials in the database and is required whenever `DATABASE_URL` is set.
+  It is never generated or written to disk. Rotate with a comma list: set `new,old`, reconnect each exchange in
+  Settings (re-encrypts under `new`), then drop `old`. Rows no configured key can decrypt show as undecryptable and
+  must be re-entered.
+
+### Database schema
+
+- Alembic in `src/hydra/data/migrations` is the only schema source; never add inline DDL. Every schema change is a new
+  revision on the single head (`uv run alembic revision -m "..."` with the root `alembic.ini`; CI fails on two heads).
+- The engine upgrades to head at startup, under `pg_advisory_xact_lock`, in one transaction; a failure stops startup.
+  By hand: `DATABASE_URL=... uv run python -m hydra.data.migrations upgrade|current|check|heads`.
+- `0001` (baseline) is the 2.2.0 inline schema made idempotent, plus `system_config` with default rows. It upgrades an
+  empty database and a 2.1.x/2.2.0 one in place, deletes `backtest_results` rows without data provenance (P0-B,
+  irreversible) and adds no retention, compression or continuous aggregates. There is no downgrade: roll back from a
+  `pg_dump`.
+- Before the first deploy of this baseline onto an existing database: take `pg_dump -Fc` and `pg_dump -s`; check
+  `SELECT * FROM alembic_version` fails (no table) and `SELECT hypertable_name FROM timescaledb_information.hypertables`
+  lists `ohlcv_1m`, `trades` and `funding_rates` (a plain `ts` table with rows would be converted in place); then
+  restore the dump into a scratch database and run `python -m hydra.data.migrations upgrade` from the new image
+  against it.
 
 ## Development
 
@@ -195,9 +233,8 @@ make clean         # remove caches and build output
 
 Other compose files:
 
-- `deploy/compose.yml` is a local full-stack approximation, not the deployment. Its env names do not match what the
-  engine reads, so the engine starts without a DB pool, and the dashboard's `/api` rewrite does not reach the engine.
-  Both wait for P1 config.
+- `deploy/compose.yml` is a local full-stack approximation, not the deployment. It needs `HYDRA_CREDENTIAL_KEY` in the
+  environment; the dashboard's `/api` rewrite still does not reach the engine.
 - `docker-compose.ml.yml` is non-functional until P5 (see its header).
 
 ## Testing
@@ -219,7 +256,8 @@ What CI runs (`.github/workflows/ci.yml`, Python 3.14, uv 0.13.3): lint and `lin
 data, indicators, strategy, backtest, execution, risk and portfolio, bandit, unit tests with a clean-tree check, the
 dashboard (lint, typecheck, test, build), promtool on the Prometheus rules, integration and e2e on TimescaleDB and
 Redis service containers, and an image smoke job that builds each image and starts it (the engine against the service
-containers with only `DATABASE_URL` and `REDIS_URL`). Performance tests are not run in CI.
+containers with `DATABASE_URL`, `REDIS_URL` and a throwaway `HYDRA_CREDENTIAL_KEY`). Performance tests are not run in
+CI.
 
 ## CI/CD and releases
 

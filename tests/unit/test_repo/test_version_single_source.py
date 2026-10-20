@@ -6,8 +6,10 @@ import textwrap
 import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 import hydra
 from hydra.core.config import PlatformConfig, load_config
@@ -43,13 +45,12 @@ def test_stale_yaml_version_cannot_override(tmp_path: Path) -> None:
         platform:
           name: hydra
           version: "0.1.0"
-        database:
-          port: 5432
         """)
     )
-    cfg = load_config(env="base", config_dir=tmp_path)
-    assert cfg.platform.version == _pyproject_version()
-    assert cfg.platform.version != "0.1.0"
+    with pytest.raises(ValidationError) as exc_info:
+        load_config(env="base", config_dir=tmp_path)
+    assert ("platform", "version") in {tuple(e["loc"]) for e in exc_info.value.errors()}
+    assert PlatformConfig().version == _pyproject_version()
 
 
 def test_repo_base_yaml_carries_no_version() -> None:

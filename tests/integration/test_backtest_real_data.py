@@ -20,9 +20,9 @@ import yaml
 from fastapi import FastAPI
 
 from hydra.core.types import OHLCV, Timeframe
-from hydra.dashboard import api
 from hydra.dashboard.routes import backtest, strategies
 from hydra.dashboard.routes._db import install_error_handlers
+from hydra.data.migrations.runner import upgrade_to_head
 from hydra.data.storage import MarketDataRepository
 
 pytestmark = pytest.mark.integration
@@ -87,8 +87,7 @@ _NEW_COLUMNS = {
 
 
 async def _migrate(monkeypatch: pytest.MonkeyPatch, dsn: str) -> None:
-    monkeypatch.setenv("DATABASE_URL", dsn)
-    await api._run_migrations()
+    await asyncio.to_thread(upgrade_to_head, dsn)
 
 
 async def _columns(conn: asyncpg.Connection) -> dict[str, str]:
