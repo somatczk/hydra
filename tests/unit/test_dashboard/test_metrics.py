@@ -209,9 +209,9 @@ class TestMetricHelpers:
             update_portfolio,
         )
 
-        update_portfolio(value=100_000.0, drawdown_pct=3.5, daily_pnl=250.0)
+        update_portfolio(value=100_000.0, drawdown_pct=0.035, daily_pnl=250.0)
         assert get_portfolio_value()._value.get() == 100_000.0
-        assert get_drawdown_pct()._value.get() == 3.5
+        assert get_drawdown_pct()._value.get() == 0.035
         assert get_daily_pnl()._value.get() == 250.0
 
     def test_record_signal(self) -> None:
