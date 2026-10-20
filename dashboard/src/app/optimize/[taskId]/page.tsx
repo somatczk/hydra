@@ -8,6 +8,9 @@ import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { ProvenancePanel, type DataProvenance } from '@/components/backtest/DataProvenance';
+import { stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -29,6 +32,7 @@ interface HyperoptResult {
   trials: TrialRecord[];
   total_trials: number;
   completed_trials: number;
+  provenance?: DataProvenance | null;
 }
 
 interface HyperoptProgress {
@@ -39,6 +43,8 @@ interface HyperoptProgress {
   total_trials: number;
   best_so_far: number | null;
   created_at: string;
+  error?: string | null;
+  provenance?: DataProvenance | null;
 }
 
 /* ---------- Page ---------- */
@@ -51,6 +57,7 @@ export default function HyperoptDetailPage() {
   const [result, setResult] = useState<HyperoptResult | null>(null);
   const [progress, setProgress] = useState<HyperoptProgress | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<unknown>(null);
   const [sortKey, setSortKey] = useState<'sharpe' | 'total_return' | 'max_drawdown' | 'total_trades'>('sharpe');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
 
@@ -72,6 +79,7 @@ export default function HyperoptDetailPage() {
         }
       } catch (err) {
         logger.warn('HyperoptDetail', 'Failed to load hyperopt run', err);
+        setLoadError(err);
       } finally {
         setLoading(false);
       }
@@ -107,9 +115,14 @@ export default function HyperoptDetailPage() {
   }
 
   if (!progress) {
+    const missing = loadError === null || stateFromError(loadError) === 'not_found';
     return (
       <div className="flex flex-col items-center justify-center gap-4 py-20">
-        <p className="text-sm text-text-muted">Hyperopt run not found</p>
+        {missing ? (
+          <p className="text-sm text-text-muted">Hyperopt run not found</p>
+        ) : (
+          <DataStateErrorCard error={loadError} fallback="Failed to load hyperopt run" />
+        )}
         <Button variant="outline" onClick={() => router.push('/optimize')}>
           <ArrowLeft className="h-4 w-4" /> Back to Optimizer
         </Button>
@@ -142,6 +155,10 @@ export default function HyperoptDetailPage() {
           variant={progress.status === 'completed' ? 'success' : progress.status === 'failed' ? 'error' : 'info'}
         />
       </div>
+
+      {(result?.provenance ?? progress.provenance) && (
+        <ProvenancePanel provenance={result?.provenance ?? progress.provenance} />
+      )}
 
       {/* Summary metrics */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -184,7 +201,9 @@ export default function HyperoptDetailPage() {
       {/* Not completed states */}
       {progress.status === 'failed' && (
         <DataCard>
-          <p className="text-sm text-status-error">This hyperopt run failed.</p>
+          <p className="text-sm text-status-error">
+            This hyperopt run failed{progress.error ? `: ${progress.error}` : '.'}
+          </p>
         </DataCard>
       )}
 

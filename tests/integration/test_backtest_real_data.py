@@ -462,6 +462,8 @@ async def test_hyperopt_grid_runs_on_stored_bars_reproducibly(
     _, second = await _hyperopt(client)
 
     assert progress["provenance"]["bar_count"] == H1_COUNT
+    assert progress["strategy_id"] == "saw"
+    assert progress["start_date"] == "2026-01-01T00:00:00Z"
     assert first["provenance"]["exchange"] == "binance"
     assert [t["params"] for t in first["trials"]] == [{"sma_period": 4}, {"sma_period": 5}]
     assert first["best_metric"] == second["best_metric"]

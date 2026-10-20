@@ -1096,6 +1096,8 @@ class HyperoptRunResponse(BaseModel):
 class HyperoptProgressResponse(BaseModel):
     task_id: str
     status: str
+    strategy_id: str = ""
+    created_at: str = ""
     completed_trials: int
     total_trials: int
     best_so_far: float | None = None
@@ -1290,6 +1292,8 @@ async def get_hyperopt_progress(task_id: str) -> dict[str, Any]:
     return {
         "task_id": task_id,
         "status": t["status"],
+        "strategy_id": t.get("strategy_id", ""),
+        "created_at": t.get("created_at", ""),
         "completed_trials": t["completed_trials"],
         "total_trials": t["total_trials"],
         "best_so_far": t.get("best_so_far"),

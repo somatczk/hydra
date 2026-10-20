@@ -5,7 +5,11 @@ import { Eye, TrendingUp, TrendingDown, BarChart3 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { fetchApi } from '@/lib/api';
+import { describeApiError } from '@/lib/apiState';
+import { formatUtc, type DataProvenance } from '@/components/backtest/DataProvenance';
 import type { PreviewResponse, PreviewSignal, BuilderState, SerializedConditionGroup } from './types';
+
+type PreviewResult = PreviewResponse & { provenance?: DataProvenance };
 
 interface SignalPreviewProps {
   state: BuilderState;
@@ -28,7 +32,7 @@ function serializeGroup(
 
 export function SignalPreview({ state }: SignalPreviewProps) {
   const [loading, setLoading] = useState(false);
-  const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const handlePreview = async () => {
@@ -43,18 +47,20 @@ export function SignalPreview({ state }: SignalPreviewProps) {
         exit_short: serializeGroup(state.exitShort),
       },
       timeframe: state.timeframes.primary,
-      symbol: 'BTCUSDT',
+      exchange_id: state.exchangeId,
+      symbol: state.symbol,
       bars_count: 200,
     };
 
     try {
-      const data = await fetchApi<PreviewResponse>('/api/strategies/preview', {
+      setPreview(null);
+      const data = await fetchApi<PreviewResult>('/api/strategies/preview', {
         method: 'POST',
         body: JSON.stringify(requestBody),
       });
       setPreview(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Preview failed');
+      setError(describeApiError(err, 'Preview failed'));
     } finally {
       setLoading(false);
     }
@@ -67,7 +73,7 @@ export function SignalPreview({ state }: SignalPreviewProps) {
     state.exitShort.conditions.length > 0;
 
   return (
-    <DataCard title="Signal Preview" description="Test your strategy on sample data">
+    <DataCard title="Signal Preview" description="Test your strategy on the latest stored bars">
       <div className="flex flex-col gap-4">
         {/* Preview button */}
         <div className="flex items-center gap-3">
@@ -98,6 +104,14 @@ export function SignalPreview({ state }: SignalPreviewProps) {
         {/* Results */}
         {preview && (
           <div className="flex flex-col gap-4">
+            {preview.provenance && (
+              <p className="text-xs text-text-muted" data-testid="preview-provenance">
+                {preview.provenance.bar_count} stored bars, {preview.provenance.exchange}{' '}
+                {preview.provenance.symbol} {preview.provenance.timeframe},{' '}
+                {formatUtc(preview.provenance.first_ts)} to {formatUtc(preview.provenance.last_ts)}
+                {preview.provenance.gap_count ? ` (${preview.provenance.gap_count} gaps)` : ''}
+              </p>
+            )}
             {/* Metrics */}
             <div className="grid grid-cols-3 gap-3">
               <div className="rounded-lg border border-border-default bg-bg-primary p-3 text-center">
