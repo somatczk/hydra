@@ -14,6 +14,8 @@ const BADGES: Record<BadgeState, { label: string; variant: Variant }> = {
   not_found: { label: 'NOT FOUND', variant: 'neutral' },
   invalid: { label: 'INVALID', variant: 'error' },
   not_implemented: { label: 'NOT IMPLEMENTED', variant: 'neutral' },
+  unauthenticated: { label: 'NOT SIGNED IN', variant: 'error' },
+  forbidden: { label: 'FORBIDDEN', variant: 'error' },
   mock: { label: 'MOCK', variant: 'warning' },
 };
 

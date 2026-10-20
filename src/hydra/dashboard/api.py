@@ -8,8 +8,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 
 import hydra
 from hydra.core.websocket import manager
@@ -27,6 +27,7 @@ from hydra.dashboard.routes import (
     trading,
 )
 from hydra.dashboard.routes._db import install_error_handlers
+from hydra.dashboard.security import install_security
 
 # ---------------------------------------------------------------------------
 # Application factory
@@ -39,15 +40,8 @@ app = FastAPI(
     description="REST and WebSocket API for the Hydra Bitcoin auto-trading platform.",
 )
 
-# CORS middleware for the Next.js dashboard
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# Auth + CSRF, with CORS (api.cors_origins) outermost; see hydra.dashboard.security
+install_security(app)
 install_error_handlers(app)
 
 app.state.config = None
@@ -173,12 +167,16 @@ async def ws_risk(websocket: WebSocket) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
+def build_uvicorn_config() -> uvicorn.Config:
+    """Server config; proxy_headers=False keeps the raw TCP peer that proxy auth trusts."""
+    return uvicorn.Config(app, host="0.0.0.0", port=8000, log_config=None, proxy_headers=False)
+
+
 if __name__ == "__main__":
     import os
-
-    import uvicorn
 
     from hydra.core.logging import setup_logging
 
     setup_logging(os.environ.get("LOG_LEVEL", "INFO"), os.environ.get("LOG_FORMAT", "json"))
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)
+    uvicorn.Server(build_uvicorn_config()).run()

@@ -15,7 +15,15 @@ from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-ErrorState = Literal["unavailable", "no_data", "not_found", "invalid", "not_implemented"]
+ErrorState = Literal[
+    "unavailable",
+    "no_data",
+    "not_found",
+    "invalid",
+    "not_implemented",
+    "unauthenticated",
+    "forbidden",
+]
 
 DB_ERRORS: tuple[type[BaseException], ...] = (
     OSError,
@@ -23,6 +31,11 @@ DB_ERRORS: tuple[type[BaseException], ...] = (
     asyncpg.PostgresError,
     asyncpg.InterfaceError,
 )
+
+
+def error_detail(code: str, message: str, state: ErrorState, **extra: Any) -> dict[str, Any]:
+    """The envelope's ``detail`` object; raw ASGI responses (security.py) use it directly."""
+    return {"code": code, "message": message, "state": state, **extra}
 
 
 def api_error(
@@ -35,12 +48,20 @@ def api_error(
     """Build an HTTPException whose detail follows the shared envelope."""
     return HTTPException(
         status_code=status_code,
-        detail={"code": code, "message": message, "state": state, **extra},
+        detail=error_detail(code, message, state, **extra),
     )
 
 
 def database_unavailable(message: str = "Database is not available") -> HTTPException:
     return api_error(503, "database_unavailable", message, "unavailable")
+
+
+def unauthenticated(code: str, message: str) -> HTTPException:
+    return api_error(401, code, message, "unauthenticated")
+
+
+def forbidden(code: str, message: str) -> HTTPException:
+    return api_error(403, code, message, "forbidden")
 
 
 def require_pool(request: Request) -> Any:

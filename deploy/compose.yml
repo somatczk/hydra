@@ -10,12 +10,13 @@ services:
     container_name: hydra-engine
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: postgresql://hydra:${HYDRA_DB_PASSWORD:-hydra_dev}@timescaledb:5432/hydra
       REDIS_URL: redis://redis:6379
       HYDRA_CREDENTIAL_KEY: ${HYDRA_CREDENTIAL_KEY:?HYDRA_CREDENTIAL_KEY missing (see .env.example)}
       HYDRA_LOGGING__LEVEL: ${HYDRA_LOGGING__LEVEL:-INFO}
+      HYDRA_API__AUTH_MODE: dev
     volumes:
       - ml-models:/app/models:ro
     depends_on:

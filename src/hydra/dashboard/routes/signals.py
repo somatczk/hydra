@@ -1,19 +1,22 @@
-"""Webhook endpoints for receiving external trading signals.
+"""Webhook endpoint for external trading signals (TradingView-style JSON).
 
-Supports TradingView alerts and custom JSON payloads. Signals are
-routed to running trading sessions for immediate execution.
+The route sits behind the API auth middleware, and the body must also carry the configured
+``webhook_secret``: with no secret configured the webhook is disabled (503), a wrong one is 401.
+Entries need an explicit ``quantity``; exits default to closing the open position.
 """
 
 from __future__ import annotations
 
+import hmac
 import logging
-import re
 import uuid
 from decimal import Decimal
-from typing import Any
+from typing import Any, Self
 
-from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, Field, model_validator
+
+from hydra.dashboard.routes._db import api_error, unauthenticated
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 logger = logging.getLogger(__name__)
@@ -28,12 +31,17 @@ class WebhookSignal(BaseModel):
     """Incoming webhook signal (TradingView format)."""
 
     symbol: str = "BTCUSDT"
-    side: str = Field(..., pattern="^(buy|sell)$")  # buy or sell
+    side: str = Field(..., pattern="^(buy|sell)$")
     action: str = Field("entry", pattern="^(entry|exit)$")
-    strategy_id: str = ""
+    strategy_id: str = Field(..., min_length=1)
     secret: str = ""
-    price: float | None = None
-    quantity: float | None = None
+    quantity: Decimal | None = Field(None, gt=0, max_digits=18, decimal_places=8)
+
+    @model_validator(mode="after")
+    def _entry_needs_quantity(self) -> Self:
+        if self.action == "entry" and self.quantity is None:
+            raise ValueError("quantity is required for entry signals")
+        return self
 
 
 class WebhookResponse(BaseModel):
@@ -48,9 +56,24 @@ class WebhookResponse(BaseModel):
 
 
 def _get_webhook_secret(request: Request) -> str:
-    """Read webhook_secret from system config."""
+    """Read webhook_secret from system config; empty when none is configured."""
     cfg = getattr(request.app.state, "system_config", None) or {}
-    return str(cfg.get("webhook_secret", ""))
+    secret = cfg.get("webhook_secret")
+    return secret if isinstance(secret, str) else ""
+
+
+def _require_webhook_secret(request: Request, presented: str) -> None:
+    """Fail closed: no configured secret disables the webhook; compare in constant time."""
+    expected = _get_webhook_secret(request)
+    if not expected:
+        raise api_error(
+            503,
+            "webhook_disabled",
+            "Signal webhook is disabled: set a webhook secret in Settings",
+            "unavailable",
+        )
+    if not hmac.compare_digest(presented.encode(), expected.encode()):
+        raise unauthenticated("invalid_webhook_secret", "Invalid webhook secret")
 
 
 def _get_session_manager(request: Request) -> Any:
@@ -66,55 +89,37 @@ def _get_session_manager(request: Request) -> Any:
 async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, Any]:
     """Receive a trading signal via webhook (TradingView, custom, etc).
 
-    The signal is routed to the running session for the given strategy_id.
-    If no strategy_id is provided, the signal is sent to all running sessions
-    matching the symbol.
+    The signal goes only to the running session(s) of ``strategy_id``; there is no symbol fan-out.
     """
-    # Validate secret
-    expected_secret = _get_webhook_secret(request)
-    if expected_secret and body.secret != expected_secret:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid webhook secret",
-        )
+    _require_webhook_secret(request, body.secret)
 
     signal_id = f"sig-{uuid.uuid4().hex[:8]}"
 
     mgr = _get_session_manager(request)
     if mgr is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Trading engine not initialized",
-        )
+        raise api_error(503, "engine_not_ready", "Trading engine not initialized", "unavailable")
 
-    # Find running session(s) to route the signal to
     sessions = mgr.list_sessions()
     running = [s for s in sessions if s.status == "running"]
 
-    if body.strategy_id:
-        targets = [s for s in running if s.strategy_id == body.strategy_id]
-    else:
-        targets = [s for s in running if body.symbol in s.symbols]
-
+    targets = [s for s in running if s.strategy_id == body.strategy_id]
     if not targets:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No running session found for strategy_id='{body.strategy_id}' "
-            f"or symbol='{body.symbol}'",
+        raise api_error(
+            404,
+            "session_not_found",
+            f"No running session for strategy_id '{body.strategy_id}'",
+            "not_found",
         )
 
-    # Execute signal on each matching session
     executed = 0
+    failed = 0
     for session in targets:
         executor = session._executor
         if executor is None:
             continue
 
         try:
-            side = "BUY" if body.side == "buy" else "SELL"
-
             if body.action == "exit":
-                # Exit: close the position for this symbol
                 positions = await executor.fetch_positions(body.symbol)
                 if not positions:
                     logger.info(
@@ -125,41 +130,20 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
                     continue
                 pos = positions[0]
                 qty = (
-                    Decimal(str(body.quantity))
-                    if body.quantity
+                    body.quantity
+                    if body.quantity is not None
                     else Decimal(str(pos.get("contracts", pos.get("quantity", 0))))
                 )
-                # Flip the side for closing
                 close_side = "SELL" if pos.get("side", "").lower() in ("long", "buy") else "BUY"
                 await executor.create_order(
-                    symbol=body.symbol,
-                    side=close_side,
-                    order_type="MARKET",
-                    quantity=qty,
+                    symbol=body.symbol, side=close_side, order_type="MARKET", quantity=qty
                 )
             else:
-                # Entry: auto-compute quantity from session balance if missing
-                if body.quantity is None:
-                    try:
-                        balance = await executor.get_balance()
-                        bal_usdt = balance.get("USDT", Decimal("0"))
-                        price = await executor.get_last_price(body.symbol)
-                        if bal_usdt > 0 and price > 0:
-                            body.quantity = float(
-                                Decimal(str(bal_usdt)) * Decimal("0.01") / Decimal(str(price))
-                            )
-                    except Exception:
-                        logger.debug("Could not auto-compute quantity for %s", body.symbol)
-                if body.quantity is None:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="quantity is required for entry signals",
-                    )
                 await executor.create_order(
                     symbol=body.symbol,
-                    side=side,
+                    side="BUY" if body.side == "buy" else "SELL",
                     order_type="MARKET",
-                    quantity=Decimal(str(body.quantity)),
+                    quantity=body.quantity,
                 )
 
             executed += 1
@@ -171,9 +155,8 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
                 body.symbol,
                 session.session_id,
             )
-        except HTTPException:
-            raise
         except Exception:
+            failed += 1
             logger.exception(
                 "Failed to execute webhook signal %s on session %s",
                 signal_id,
@@ -181,9 +164,19 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
             )
 
     if executed == 0:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Signal received but could not be executed on any session",
+        if failed:
+            raise api_error(
+                502,
+                "execution_failed",
+                f"Signal {signal_id} failed on every session of '{body.strategy_id}'",
+                "unavailable",
+            )
+        if body.action == "exit":
+            raise api_error(
+                409, "no_position", f"No open {body.symbol} position to exit", "no_data"
+            )
+        raise api_error(
+            503, "executor_not_ready", "No session executor is ready for this signal", "unavailable"
         )
 
     return {
@@ -191,66 +184,3 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
         "signal_id": signal_id,
         "message": f"Signal executed on {executed} session(s)",
     }
-
-
-# ---------------------------------------------------------------------------
-# Telegram signal format parser
-# ---------------------------------------------------------------------------
-
-_TELEGRAM_PATTERN = re.compile(
-    r"(BUY|SELL|LONG|SHORT)"  # side
-    r"[ \t]+"  # required whitespace (no \s to avoid matching newlines)
-    r"(?:(\d+(?:\.\d+)?)[ \t]+)?"  # optional quantity
-    r"([A-Za-z0-9]+)"  # symbol (explicit charset, no \w backtrack)
-    r"(?:[ \t]*@[ \t]*(\d+(?:\.\d+)?))?"  # optional @ price
-    r"(?:[ \t]+TP[ \t]*(\d+(?:\.\d+)?))?"  # optional TP
-    r"(?:[ \t]+SL[ \t]*(\d+(?:\.\d+)?))?",  # optional SL
-    re.IGNORECASE,
-)
-
-
-class TelegramSignal(BaseModel):
-    """Raw text message from a Telegram signal group."""
-
-    text: str
-    strategy_id: str = ""
-    secret: str = ""
-
-
-@router.post("/telegram", response_model=WebhookResponse)
-async def receive_telegram_signal(body: TelegramSignal, request: Request) -> dict[str, Any]:
-    """Parse a Telegram-style text signal and execute it.
-
-    Accepts formats like: ``BUY BTCUSDT @ 85000 TP 87000 SL 84000``
-    """
-    if len(body.text) > 500:
-        raise HTTPException(status_code=422, detail="Signal text too long (max 500 chars)")
-
-    expected_secret = _get_webhook_secret(request)
-    if expected_secret and body.secret != expected_secret:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-
-    match = _TELEGRAM_PATTERN.search(body.text)
-    if not match:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not parse signal. Expected format: BUY BTCUSDT @ 85000 TP 87000 SL 84000",
-        )
-
-    raw_side = match.group(1).upper()
-    side = "buy" if raw_side in ("BUY", "LONG") else "sell"
-    quantity_str = match.group(2)  # optional quantity before symbol
-    symbol = match.group(3).upper()
-
-    quantity = float(quantity_str) if quantity_str else None
-
-    # Convert to standard webhook format and reuse existing handler
-    webhook = WebhookSignal(
-        symbol=symbol,
-        side=side,
-        action="entry",
-        strategy_id=body.strategy_id,
-        secret=body.secret,
-        quantity=quantity,
-    )
-    return await receive_webhook(webhook, request)

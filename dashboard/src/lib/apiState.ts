@@ -5,7 +5,9 @@ export type ServerErrorState =
   | 'no_data'
   | 'not_found'
   | 'invalid'
-  | 'not_implemented';
+  | 'not_implemented'
+  | 'unauthenticated'
+  | 'forbidden';
 
 export type DataState = 'ok' | 'stale' | 'unknown' | ServerErrorState;
 
@@ -27,6 +29,8 @@ const SERVER_STATES: ReadonlySet<string> = new Set([
   'not_found',
   'invalid',
   'not_implemented',
+  'unauthenticated',
+  'forbidden',
 ]);
 
 function isHttpError(err: unknown): err is HttpErrorLike {
@@ -41,6 +45,8 @@ function isHttpError(err: unknown): err is HttpErrorLike {
 function stateForStatus(status: number): ServerErrorState | null {
   if (status === 502 || status === 503 || status === 504) return 'unavailable';
   if (status === 501) return 'not_implemented';
+  if (status === 401) return 'unauthenticated';
+  if (status === 403) return 'forbidden';
   if (status === 404) return 'not_found';
   if (status === 400 || status === 422) return 'invalid';
   return null;

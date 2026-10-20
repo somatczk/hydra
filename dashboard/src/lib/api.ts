@@ -11,7 +11,9 @@ const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000');
 
+/** NEXT_PUBLIC_WS_URL lets local dev reach the engine's WebSockets while REST stays same-origin. */
 const WS_BASE = (
+  process.env.NEXT_PUBLIC_WS_URL ||
   process.env.NEXT_PUBLIC_API_URL ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
 ).replace(/^http/, 'ws');
@@ -30,11 +32,26 @@ export class ApiError extends Error {
   }
 }
 
+/** The engine refuses non-GET browser requests without this header (CSRF guard). */
+export const CSRF_HEADER = 'x-hydra-request';
+
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+/** Headers for a raw `fetch` to the API (e.g. a FormData upload) that bypasses `fetchApi`. */
+export function apiHeaders(method = 'POST'): Record<string, string> {
+  return SAFE_METHODS.has(method.toUpperCase()) ? {} : { [CSRF_HEADER]: '1' };
+}
+
+function callerHeaders(headers: HeadersInit | undefined): Record<string, string> {
+  if (!headers) return {};
+  return Object.fromEntries(new Headers(headers).entries());
+}
+
 /**
  * Typed fetch wrapper for the Hydra API.
  *
  * @param path  - API path starting with `/` (e.g. `/api/strategies`)
- * @param options - Standard `RequestInit` overrides
+ * @param options - Standard `RequestInit` overrides; caller headers are merged, not replaced
  * @returns Parsed JSON response typed as `T`
  * @throws {ApiError} when the server returns a non-2xx status
  */
@@ -42,19 +59,18 @@ export async function fetchApi<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
-  const method = options?.method ?? 'GET';
+  const method = (options?.method ?? 'GET').toUpperCase();
   const url = `${API_BASE}${path}`;
   const t0 = performance.now();
+  const headers: Record<string, string> = {
+    ...(typeof options?.body === 'string' ? { 'content-type': 'application/json' } : {}),
+    ...apiHeaders(method),
+    ...callerHeaders(options?.headers),
+  };
 
   let res: Response;
   try {
-    res = await fetch(url, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...(options?.headers as Record<string, string> | undefined),
-      },
-      ...options,
-    });
+    res = await fetch(url, { ...options, method, headers });
   } catch (err) {
     const ms = Math.round(performance.now() - t0);
     logger.error('API', `${method} ${path} NETWORK_ERROR (${ms}ms)`, err);

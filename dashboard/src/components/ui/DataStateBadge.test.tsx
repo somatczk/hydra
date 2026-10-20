@@ -38,6 +38,8 @@ describe('DataStateBadge', () => {
     ['unknown', 'UNKNOWN', '.text-status-warning'],
     ['not_implemented', 'NOT IMPLEMENTED', '.text-text-muted'],
     ['mock', 'MOCK', '.text-status-warning'],
+    ['unauthenticated', 'NOT SIGNED IN', '.text-status-error'],
+    ['forbidden', 'FORBIDDEN', '.text-status-error'],
   ] as const)('renders %s as %s', (state, label, tone) => {
     render(<DataStateBadge state={state} />);
     const badge = container.querySelector('[role="status"]');
