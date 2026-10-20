@@ -250,3 +250,72 @@ async def test_display_rows_never_replace_a_running_session(
         }
     finally:
         await h.close()
+
+
+async def test_restored_account_that_cannot_resume_is_flattened_not_orphaned(
+    strategies_dir: Path, restore_from: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a REST outage at boot: the account restores, warm-up then finds no history
+    h = Harness(strategies_dir, history_bars=0)
+    write_strategy(strategies_dir, "paper-a")
+    restore_from["s1"] = await _account_with_long(h.end, stop="95")
+    rows = [_row("s1", "paper-a")]
+    mgr, _ = await _boot(h, rows, monkeypatch)
+    try:
+        s1 = mgr.get_session("s1")
+        assert s1 is not None and s1.status == "error" and not s1.task_alive
+        assert "recovery failed" in (s1.error_message or "")
+        assert "restored holdings flattened" in (s1.error_message or "")
+        ex = s1._executor
+        assert await ex.get_positions("BTCUSDT") == []
+        assert await ex.fetch_open_orders("BTCUSDT") == []
+        last = ex.get_fills()[-1]
+        # sold at the restored mark 100 less 0.1 % slippage
+        assert (last.side, last.quantity, last.price) == ("SELL", D("0.05"), D("99.9"))
+        # 994.989995 + 0.05 x 99.9 - fee 0.004995
+        assert (await ex.get_balance())["USDT"] == D("999.980000")
+        assert mgr.risk is not None and mgr.risk.registered_sessions() == []
+        assert mgr.risk.account().carried_pnl == D("-0.020000")
+        assert (s1.positions_at_stop, s1.flatten_incomplete) == (0, False)
+        assert rows[0]["status"] == "error"
+    finally:
+        await h.close()
+
+
+async def test_unflattened_restored_holdings_stay_reachable_by_the_kill_switch(
+    strategies_dir: Path, restore_from: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = Harness(strategies_dir, history_bars=0)
+    write_strategy(strategies_dir, "paper-a")
+    write_strategy(strategies_dir, "paper-b")
+    restore_from["s1"] = await _account_with_long(h.end)
+    real_flatten = PaperTradingExecutor.flatten
+    calls: list[str] = []
+
+    async def first_flatten_fails(self: PaperTradingExecutor, *a: Any, **k: Any) -> Any:
+        calls.append(self._session_id)
+        if len(calls) == 1:
+            raise RuntimeError("no fill")
+        return await real_flatten(self, *a, **k)
+
+    monkeypatch.setattr(PaperTradingExecutor, "flatten", first_flatten_fails)
+    mgr, _ = await _boot(h, [_row("s1", "paper-a")], monkeypatch)
+    try:
+        s1 = mgr.get_session("s1")
+        assert s1 is not None and s1.status == "error" and s1._runtime is None
+        assert (s1.positions_at_stop, s1.flatten_incomplete, s1.holdings) == (1, True, 1)
+        assert "1 position(s) could not be flattened" in (s1.error_message or "")
+        assert mgr.risk is not None and mgr.risk.registered_sessions() == ["s1"]
+        # its 1000 stays allocated while it holds base
+        with pytest.raises(ValueError, match="Insufficient paper capital"):
+            await mgr.start_session("paper-b", "paper")
+        snap = await mgr.health_snapshot()
+        assert [(x.session_id, x.open_positions) for x in snap.sessions] == [("s1", 1)]
+
+        report = await mgr.stop_all(actor="test", reason="drill")
+        assert (report.sessions_stopped, report.positions_remaining) == (1, 0)
+        assert await s1._executor.get_positions("BTCUSDT") == []
+        assert (s1.status, s1.positions_at_stop, s1.flatten_incomplete) == ("error", 0, False)
+        assert mgr.risk.registered_sessions() == []
+    finally:
+        await h.close()

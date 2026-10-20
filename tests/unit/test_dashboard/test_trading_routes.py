@@ -18,6 +18,7 @@ from tests.unit.test_execution.session_harness import (
     Harness,
     executor,
     held,
+    settle,
     write_strategy,
 )
 
@@ -45,6 +46,24 @@ async def api() -> AsyncIterator[httpx.AsyncClient]:
         headers={"Authorization": f"Bearer {TEST_API_TOKEN}"},
     ) as client:
         yield client
+
+
+@pytest.fixture()
+def broadcasts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    from hydra.core.websocket import manager
+
+    sent: list[dict[str, Any]] = []
+
+    async def broadcast(channel: str, payload: dict[str, Any]) -> None:
+        sent.append(payload)
+
+    monkeypatch.setattr(manager, "broadcast", broadcast)
+    return sent
+
+
+class _DownPool:
+    def acquire(self) -> Any:
+        raise ConnectionError("database down")
 
 
 def _detail(resp: httpx.Response) -> dict[str, Any]:
@@ -129,7 +148,10 @@ class TestKillSwitch:
     ) -> None:
         session = await h.session(write_strategy(strategies_dir, "ks"))
         await h.bar(session, "100")
-        resp = await api.post("/api/trading/quick-trade", json={"side": "buy", "quantity": "0.5"})
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "buy", "quantity": "0.5"},
+        )
         assert resp.status_code == 200, resp.text
         resp = await api.post("/api/trading/kill-switch")
         assert resp.status_code == 200, resp.text
@@ -151,7 +173,10 @@ class TestKillSwitch:
     ) -> None:
         session = await h.session(write_strategy(strategies_dir, "stuck"))
         await h.bar(session, "100")
-        await api.post("/api/trading/quick-trade", json={"side": "buy", "quantity": "0.5"})
+        await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "buy", "quantity": "0.5"},
+        )
         ex = executor(session)
         real = ex.create_order
 
@@ -201,8 +226,24 @@ class TestKillSwitch:
         assert resp.status_code == 422
         assert h.mgr is not None and h.mgr.kill_switch_active()
 
-    async def test_release(self, h: Harness, api: httpx.AsyncClient) -> None:
+    async def test_release_without_a_database_is_503_and_stays_latched(
+        self, h: Harness, api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         await api.post("/api/trading/kill-switch")
+        monkeypatch.setattr(app.state, "db_pool", None, raising=False)
+        resp = await api.request(
+            "DELETE",
+            "/api/trading/kill-switch",
+            json={"confirm": "RELEASE", "reason": "drill over"},
+        )
+        assert (resp.status_code, _detail(resp)["code"]) == (503, "database_unavailable")
+        assert h.mgr is not None and h.mgr.kill_switch_active()
+
+    async def test_release(
+        self, h: Harness, api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await api.post("/api/trading/kill-switch")
+        monkeypatch.setattr(app.state, "db_pool", object(), raising=False)
         resp = await api.request(
             "DELETE",
             "/api/trading/kill-switch",
@@ -222,7 +263,10 @@ class TestQuickTrade:
     async def test_oversized_order_is_risk_rejected(
         self, session: Any, api: httpx.AsyncClient
     ) -> None:
-        resp = await api.post("/api/trading/quick-trade", json={"side": "buy", "quantity": "5"})
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "buy", "quantity": "5"},
+        )
         assert resp.status_code == 422
         assert (_detail(resp)["code"], _detail(resp)["check"]) == ("risk_rejected", "position_size")
         assert executor(session).get_fills() == []
@@ -236,12 +280,15 @@ class TestQuickTrade:
             {"side": "buy", "quantity": "0.1", "order_type": "LIMIT"},
             {"side": "buy", "quantity": "0.1", "stop_loss": "90", "trailing_stop_pct": "2"},
             {"side": "buy", "quantity": "0.1", "stop_loss": "110", "take_profit": "105"},
+            {"side": "buy", "quantity": "0.1", "session_id": ""},
         ],
     )
     async def test_invalid_requests_are_422(
         self, session: Any, api: httpx.AsyncClient, body: dict[str, Any]
     ) -> None:
-        resp = await api.post("/api/trading/quick-trade", json=body)
+        resp = await api.post(
+            "/api/trading/quick-trade", json={"session_id": session.session_id, **body}
+        )
         assert resp.status_code == 422
         assert _detail(resp)["state"] == "invalid"
         assert executor(session).get_fills() == []
@@ -249,7 +296,10 @@ class TestQuickTrade:
     async def test_sell_without_holdings_is_refused(
         self, session: Any, api: httpx.AsyncClient
     ) -> None:
-        resp = await api.post("/api/trading/quick-trade", json={"side": "sell", "quantity": "0.1"})
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "sell", "quantity": "0.1"},
+        )
         assert (resp.status_code, _detail(resp)["code"]) == (422, "spot_short")
 
     async def test_market_buy_places_the_stop_on_the_fill(
@@ -257,7 +307,13 @@ class TestQuickTrade:
     ) -> None:
         resp = await api.post(
             "/api/trading/quick-trade",
-            json={"side": "BUY", "quantity": "0.3", "order_type": "market", "stop_loss": "92"},
+            json={
+                "session_id": session.session_id,
+                "side": "BUY",
+                "quantity": "0.3",
+                "order_type": "market",
+                "stop_loss": "92",
+            },
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -277,6 +333,7 @@ class TestQuickTrade:
         resp = await api.post(
             "/api/trading/quick-trade",
             json={
+                "session_id": session.session_id,
                 "side": "buy",
                 "quantity": "0.2",
                 "order_type": "limit",
@@ -298,6 +355,104 @@ class TestQuickTrade:
         )
         assert legs == [("LIMIT", 0.2, None, 110.0), ("STOP_MARKET", 0.2, 90.0, None)]
 
+    async def test_limit_buy_outlives_the_stale_cleanup_until_a_bar_fills_it(
+        self, h: Harness, session: Any, api: httpx.AsyncClient
+    ) -> None:
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "side": "buy",
+                "quantity": "0.2",
+                "order_type": "LIMIT",
+                "price": "98",
+                "stop_loss": "90",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        om = session._order_manager
+        # two primary (1h) bars, not the 300 s live default
+        assert om._stale_order_timeout == 7200.0
+        assert await om.cleanup_stale_orders() == []
+        await h.bar(session, "99", open="100", high="100", low="97")
+        assert [(f.side, f.price) for f in executor(session).get_fills()] == [("BUY", D("98"))]
+        orders = await executor(session).fetch_open_orders()
+        assert [(o["type"], o["stop_price"]) for o in orders] == [("STOP_MARKET", 90.0)]
+
+    async def test_stale_limit_entry_releases_its_protection_and_tells_the_client(
+        self,
+        h: Harness,
+        session: Any,
+        api: httpx.AsyncClient,
+        broadcasts: list[dict[str, Any]],
+    ) -> None:
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "side": "buy",
+                "quantity": "0.2",
+                "order_type": "LIMIT",
+                "price": "98",
+                "stop_loss": "90",
+            },
+        )
+        order_id = resp.json()["order_id"]
+        runtime = session._runtime
+        assert len(runtime.protect._manual) == 1
+        session._order_manager._stale_order_timeout = 0.0
+        assert await session._order_manager.cleanup_stale_orders() == [order_id]
+        await settle()
+        assert runtime.protect._manual == {}
+        cancels = [b for b in broadcasts if b.get("event") == "order_cancel"]
+        assert [(b["order_id"], b["reason"]) for b in cancels] == [(order_id, "user_cancel")]
+        await h.bar(session, "99", open="100", high="100", low="97")
+        assert executor(session).get_fills() == []
+        assert await executor(session).fetch_open_orders() == []
+
+    @pytest.mark.parametrize(
+        ("protection", "status", "stop"),
+        [
+            # 0.9 x (100 - 70) = 27 > 2 % of the 1000 sleeve
+            ({"stop_loss": "70"}, 422, None),
+            # trailing 25 %: initial stop 75, 0.9 x 25 = 22.5 > 20
+            ({"trailing_stop_pct": "25"}, 422, None),
+            # the strategy's 5 % default from the limit price: 0.9 x 5 = 4.5
+            ({}, 200, 95.0),
+        ],
+    )
+    async def test_limit_entry_is_risk_checked_against_its_stop(
+        self,
+        session: Any,
+        api: httpx.AsyncClient,
+        protection: dict[str, str],
+        status: int,
+        stop: float | None,
+    ) -> None:
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "side": "buy",
+                "quantity": "0.9",
+                "order_type": "LIMIT",
+                "price": "100",
+                **protection,
+            },
+        )
+        assert resp.status_code == status, resp.text
+        orders = await executor(session).fetch_open_orders()
+        if status == 422:
+            assert (_detail(resp)["code"], _detail(resp)["check"]) == (
+                "risk_rejected",
+                "risk_per_trade",
+            )
+            assert orders == []
+        else:
+            assert [(o["type"], o["price"], o["stop_price"]) for o in orders] == [
+                ("LIMIT", 100.0, stop)
+            ]
+
     @pytest.mark.parametrize(
         ("error", "code"),
         [
@@ -317,15 +472,36 @@ class TestQuickTrade:
             raise error
 
         monkeypatch.setattr(executor(session), "create_order", refuse)
-        resp = await api.post("/api/trading/quick-trade", json={"side": "buy", "quantity": "0.1"})
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "buy", "quantity": "0.1"},
+        )
         assert (resp.status_code, _detail(resp)["code"]) == (503, code)
         assert _detail(resp)["state"] == "unavailable"
 
     async def test_no_running_session_is_404(self, h: Harness, api: httpx.AsyncClient) -> None:
         resp = await api.post(
-            "/api/trading/quick-trade", json={"symbol": "ETHUSDT", "side": "buy", "quantity": "1"}
+            "/api/trading/quick-trade",
+            json={"session_id": "nope", "symbol": "BTCUSDT", "side": "buy", "quantity": "1"},
         )
         assert (resp.status_code, _detail(resp)["code"]) == (404, "session_not_running")
+
+    async def test_session_id_is_required_and_picks_the_session(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "qt1"), capital="500")
+        other = await h.session(write_strategy(strategies_dir, "qt2"), capital="400")
+        await h.bar(session, "100")
+        await h.bar(other, "100")
+        resp = await api.post("/api/trading/quick-trade", json={"side": "buy", "quantity": "0.1"})
+        assert resp.status_code == 422
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": other.session_id, "side": "buy", "quantity": "0.1"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["session_id"] == other.session_id
+        assert (await held(other), await held(session)) == (D("0.1"), D("0"))
 
 
 class TestStopAndDetail:
@@ -334,7 +510,10 @@ class TestStopAndDetail:
     ) -> None:
         session = await h.session(write_strategy(strategies_dir, "stop"))
         await h.bar(session, "100")
-        await api.post("/api/trading/quick-trade", json={"side": "buy", "quantity": "0.5"})
+        await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "buy", "quantity": "0.5"},
+        )
         resp = await api.delete(f"/api/trading/sessions/{session.session_id}")
         assert resp.status_code == 200
         assert (resp.json()["status"], resp.json()["positions_at_stop"]) == ("stopped", 0)
@@ -343,6 +522,22 @@ class TestStopAndDetail:
         assert detail["metrics"]["total_pnl"] == pytest.approx(
             float(executor(session).get_account_snapshot().realized_net)
         )
+
+    async def test_stop_that_cannot_be_persisted_is_503(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "unsaved"))
+        await h.bar(session, "100")
+        assert h.mgr is not None
+        h.mgr._db_pool = _DownPool()
+        resp = await api.delete(f"/api/trading/sessions/{session.session_id}")
+        assert (resp.status_code, _detail(resp)["code"]) == (503, "session_stop_not_persisted")
+        assert session.status == "stopped" and not session.task_alive
+        listed = (await api.get("/api/trading/sessions")).json()
+        assert [s["persist_error"] for s in listed] == [
+            "session status 'stopped' not persisted; retrying every minute"
+        ]
+        h.mgr._db_pool = None
 
     async def test_unknown_session_is_404(self, h: Harness, api: httpx.AsyncClient) -> None:
         resp = await api.delete("/api/trading/sessions/nope")

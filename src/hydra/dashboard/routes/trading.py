@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hydra.core.types import OrderType, Side
-from hydra.dashboard.routes._db import api_error
+from hydra.dashboard.routes._db import api_error, require_pool
 from hydra.dashboard.routes.strategies import build_strategy_name_map
 from hydra.dashboard.security import audit
 from hydra.data.ingestion import InsufficientHistoryError
@@ -24,6 +24,7 @@ from hydra.execution.errors import (
     LiveTradingDisabledError,
     PaperCapitalUnavailableError,
     SessionNotRunningError,
+    SessionPersistError,
     SpotShortError,
     UnsupportedStrategyError,
     UnsupportedVenueError,
@@ -63,6 +64,7 @@ class SessionResponse(BaseModel):
     error_message: str | None = None
     positions_at_stop: int = 0
     flatten_incomplete: bool = False
+    persist_error: str | None = None
 
 
 class PositionItem(BaseModel):
@@ -122,6 +124,8 @@ class SessionDetailResponse(BaseModel):
     flatten_incomplete: bool = False
     last_bar_at: str | None = None
     entries_paused: str | None = None
+    protection_failures: list[str] = Field(default_factory=list)
+    persist_error: str | None = None
     metrics: SessionMetrics = Field(default_factory=SessionMetrics)
     positions: list[PositionItem] = Field(default_factory=list)
     trades: list[TradeItem] = Field(default_factory=list)
@@ -156,7 +160,7 @@ class QuickTradeRequest(BaseModel):
     take_profit: Decimal | None = Field(None, gt=0, max_digits=24, decimal_places=8)
     stop_loss: Decimal | None = Field(None, gt=0, max_digits=24, decimal_places=8)
     trailing_stop_pct: Decimal | None = Field(None, gt=0, lt=100)
-    session_id: str | None = None
+    session_id: str = Field(..., min_length=1)
 
     @field_validator("side", mode="before")
     @classmethod
@@ -235,6 +239,7 @@ def _session_to_dict(session: Any) -> dict[str, Any]:
         "error_message": session.error_message,
         "positions_at_stop": session.positions_at_stop,
         "flatten_incomplete": session.flatten_incomplete,
+        "persist_error": session.persist_error,
     }
 
 
@@ -325,6 +330,19 @@ async def stop_session(session_id: str, request: Request) -> dict[str, Any]:
         raise api_error(
             404, "session_not_found", f"Session {session_id} not found", "not_found"
         ) from exc
+    except SessionPersistError as exc:
+        audit(
+            getattr(request.state, "principal", None),
+            "session_stop",
+            session_id=session_id,
+            persisted=False,
+        )
+        raise api_error(
+            503,
+            exc.code,
+            f"Session {session_id} stopped, but the database still says running: {exc}",
+            "unavailable",
+        ) from exc
     audit(getattr(request.state, "principal", None), "session_stop", session_id=session_id)
     session = mgr.get_session(session_id)
     d = _session_to_dict(session)
@@ -406,6 +424,7 @@ async def activate_kill_switch(request: Request) -> dict[str, Any]:
 async def release_kill_switch(body: KillSwitchRelease, request: Request) -> dict[str, Any]:
     """Release the kill switch (``{"confirm": "RELEASE", "reason": ...}``)."""
     mgr = _get_session_manager(request)
+    require_pool(request)
     try:
         await mgr.release_kill_switch(actor=_actor(request), reason=body.reason)
     except Exception as exc:
@@ -431,7 +450,7 @@ async def release_kill_switch(body: KillSwitchRelease, request: Request) -> dict
 
 @router.post("/quick-trade", response_model=QuickTradeResponse)
 async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, Any]:
-    """A risk-checked manual order on a running session (``session_id`` or the symbol's first).
+    """A risk-checked manual order on the running session ``session_id``.
 
     SL/TP (or a trailing stop) are placed reduce-only when the entry fills; without them the
     strategy's protective stop (default 5 %) is placed. A SELL only reduces the held position.

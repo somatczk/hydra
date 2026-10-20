@@ -52,3 +52,9 @@ class SpotShortError(ValueError):
     """A SELL on spot with nothing to sell would open a naked short."""
 
     code = "spot_short"
+
+
+class SessionPersistError(RuntimeError):
+    """The session stopped, but its terminal status could not be written (retried in background)."""
+
+    code = "session_stop_not_persisted"

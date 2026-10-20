@@ -20,8 +20,10 @@ from pydantic import BaseModel, Field
 
 from hydra.core.types import OrderType, Side
 from hydra.dashboard.routes._db import api_error, unauthenticated
+from hydra.dashboard.security import audit
 from hydra.execution.errors import SessionNotRunningError, SpotShortError
 from hydra.execution.order_manager import RiskRejectedError
+from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 logger = logging.getLogger(__name__)
@@ -130,6 +132,10 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
         ) from exc
     except ValueError as exc:
         raise api_error(422, "order_rejected", str(exc), "invalid") from exc
+    except PersistenceUnavailableError as exc:
+        raise api_error(503, "paper_state_unpersisted", str(exc), "unavailable") from exc
+    except PaperSessionHaltedError as exc:
+        raise api_error(503, "paper_session_halted", str(exc), "unavailable") from exc
     except Exception as exc:
         logger.exception("Webhook signal %s failed", signal_id)
         raise api_error(
@@ -139,6 +145,19 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
             "unavailable",
         ) from exc
     executed = 1 if result.order_id is not None else 0
+    audit(
+        getattr(request.state, "principal", None),
+        "manual_order",
+        source="webhook",
+        signal_id=signal_id,
+        session_id=session.session_id,
+        strategy_id=body.strategy_id,
+        symbol=body.symbol,
+        side=body.side,
+        signal_action=body.action,
+        quantity=None if body.quantity is None else str(body.quantity),
+        order_id=result.order_id,
+    )
     logger.info(
         "Webhook signal %s: %s %s %s on session %s -> %s",
         signal_id,

@@ -26,6 +26,7 @@ from hydra.core.events import (
     Event,
     ExitSignal,
     FeedStatusEvent,
+    OrderCancelEvent,
     OrderFillEvent,
 )
 from hydra.core.types import (
@@ -40,12 +41,18 @@ from hydra.core.types import (
     Symbol,
     Timeframe,
 )
+from hydra.data.bars import timeframe_seconds
 from hydra.data.ingestion import ExchangeFeedManager
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import SessionNotRunningError, SpotShortError
 from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
-from hydra.execution.paper_trading import PaperTradingExecutor, PersistenceUnavailableError
+from hydra.execution.paper_trading import (
+    LedgerInvariantError,
+    PaperSessionHaltedError,
+    PaperTradingExecutor,
+    PersistenceUnavailableError,
+)
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.risk.service import RiskService
 from hydra.strategy.base import BaseStrategy
@@ -60,7 +67,9 @@ logger = logging.getLogger(__name__)
 
 ENTRY_TAG = "entry"
 EXIT_TAG = "exit"
+UNPROTECTED_TAG = "unprotected"
 MANUAL_TAG_PREFIX = "manual:"
+_HALT_ERRORS = (PaperSessionHaltedError, LedgerInvariantError)
 _HUNDRED = Decimal("100")
 
 FailureCallback = Callable[["TradingSession", str], Coroutine[Any, Any, None]]
@@ -134,7 +143,13 @@ class SessionRuntime:
         )
         self.context = StrategyContext(max_bars=self.feed.window_for(required_history))
         self.engine = StrategyEngine(config=hydra_config, event_bus=self.bus, context=self.context)
-        self.om = OrderManager(executor, self.bus, risk=risk, session_id=session.session_id)
+        self.om = OrderManager(
+            executor,
+            self.bus,
+            stale_order_timeout=max(300.0, 2.0 * timeframe_seconds(self.primary)),
+            risk=risk,
+            session_id=session.session_id,
+        )
         self.protect = ProtectiveOrderManager(
             self.om,
             executor,
@@ -149,6 +164,7 @@ class SessionRuntime:
         self.closing = False
         self.entries_paused: str | None = None
         self.spot_shorts_ignored = 0
+        self._manual_orders: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Build, warm up, wire, connect
@@ -191,6 +207,7 @@ class SessionRuntime:
         await self.bus.subscribe("entry_signal", self._on_signal)
         await self.bus.subscribe("exit_signal", self._on_signal)
         await self.bus.subscribe("order_fill", self._on_fill)
+        await self.bus.subscribe("order_cancel", self._on_cancel)
         await self.bus.subscribe("feed_status", self._on_feed_status)
 
     async def prime(self, warm: WarmBars) -> None:
@@ -253,6 +270,8 @@ class SessionRuntime:
                 await self.om.on_external_fill(fill)
             except Exception:
                 logger.exception("Publishing paper fill %s failed", fill.order_id)
+            if fill.status == "CANCELLED":
+                await self._release_manual(fill.parent_order_id or fill.order_id, "gap_cancel")
         self.session.last_bar_at = datetime.now(UTC)
         try:
             await self.risk.on_mark(self.exchange_id, symbol, bar.close, bar.timestamp)
@@ -270,6 +289,8 @@ class SessionRuntime:
                 order = await self.entry_order(event)
                 if order is not None:
                     await self.om.submit_order(order)
+        except _HALT_ERRORS as exc:
+            await self._fail(f"paper ledger halted: {exc}")
         except (RiskRejectedError, ValueError) as exc:
             logger.warning("Skipped order from signal in %s: %s", self.session.session_id, exc)
         except PersistenceUnavailableError as exc:
@@ -278,17 +299,21 @@ class SessionRuntime:
             )
         except Exception:
             logger.exception("Failed to submit order from signal in %s", self.session.session_id)
+        await self._fail_if_halted()
 
     async def _exit(self, event: ExitSignal) -> None:
         order = await self.exit_order(event)
         if order is None:
             return
         symbol = str(order.symbol)
+        if await self._fail_if_halted():
+            return
         await self.protect.disarm(symbol)
         try:
             order_id = await self.om.submit_order(order)
         except BaseException:
-            await self.protect.rearm(symbol)
+            if not await self._fail_if_halted():
+                await self.protect.rearm(symbol)
             raise
         if order_id is None or self.om.get_order_status(order_id) != OrderStatus.FILLED:
             await self.protect.rearm(symbol)
@@ -311,11 +336,18 @@ class SessionRuntime:
                     await strategy.on_fill(event)
                 except Exception:
                     logger.exception("Strategy %s on_fill failed", strategy.strategy_id)
+        self._manual_orders.pop(event.order_id, None)
         if not self.closing:
             try:
                 await self.protect.on_fill(event)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Protective orders not updated for %s", self.session.session_id)
+                self.protect.failures.append(f"{symbol}: protective update failed ({exc})")
+            halted = await self._fail_if_halted()
+            if not halted and position is not None and self.protect.armed(symbol) is None:
+                await self._close_unprotected(symbol, position.quantity)
+                held = await self.executor.get_positions(symbol)
+                position = next((p for p in held if p.quantity > 0), None)
         self.session.last_fill_at = datetime.now(UTC)
         metrics.set_session_position(
             self.session.session_id,
@@ -402,9 +434,6 @@ class SessionRuntime:
         if not positions:
             return None
         pos = positions[0]
-        if pos.direction != Direction.LONG:
-            await self._spot_short_ignored("exit_short", symbol)
-            return None
         close_pct = Decimal(str(min(max(event.close_pct, 0.0), 1.0)))
         quantity = pos.quantity if close_pct == 1 else self._floor(symbol, pos.quantity * close_pct)
         if quantity <= 0:
@@ -448,13 +477,17 @@ class SessionRuntime:
             quantity = await self.risk.size_entry(self.session.session_id, symbol, fraction)
             if quantity is None:
                 raise ValueError(f"no tradable entry size for {symbol}")
+        if await self._fail_if_halted():
+            raise PaperSessionHaltedError(f"session {self.session.session_id} ledger is halted")
         tag = f"{MANUAL_TAG_PREFIX}{uuid.uuid4()}"
         self.protect.register_manual(tag, protection)
         reference = price if price is not None else self.risk.mark(self.exchange_id, symbol)
         stop = None
         if protection is not None and protection.stop_loss is not None:
             stop = protection.stop_loss
-        elif reference is not None and (protection is None or protection.trailing_pct is None):
+        elif protection is not None and protection.trailing_pct is not None:
+            stop = reference * (1 - protection.trailing_pct) if reference is not None else None
+        elif reference is not None:
             stop = self.protect.planned_stop(symbol, reference)
         order = OrderRequest(
             symbol=Symbol(symbol),
@@ -465,17 +498,21 @@ class SessionRuntime:
             exchange_id=self.exchange_id,
             market_type=self.market_type,
             price=price,
-            stop_price=stop if order_type == OrderType.MARKET else None,
+            stop_price=stop,
             tag=tag,
         )
         try:
             order_id = await self.om.submit_order(order)
-        except BaseException:
+        except BaseException as exc:
             self.protect.discard_manual(tag)
+            if isinstance(exc, _HALT_ERRORS):
+                await self._fail(f"paper ledger halted: {exc}")
             raise
         status = self.om.get_order_status(order_id) if order_id is not None else None
         group = self.protect.armed(symbol)
         filled = status == OrderStatus.FILLED
+        if order_id is not None and status not in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+            self._manual_orders[order_id] = tag
         return ManualOrderResult(
             order_id=order_id,
             status=str(status) if status is not None else "NOOP",
@@ -512,11 +549,14 @@ class SessionRuntime:
             reduce_only=True,
             tag=f"{MANUAL_TAG_PREFIX}exit",
         )
+        if await self._fail_if_halted():
+            raise PaperSessionHaltedError(f"session {self.session.session_id} ledger is halted")
         await self.protect.disarm(symbol)
         try:
             order_id = await self.om.submit_order(order)
         except BaseException:
-            await self.protect.rearm(symbol)
+            if not await self._fail_if_halted():
+                await self.protect.rearm(symbol)
             raise
         status = self.om.get_order_status(order_id) if order_id is not None else None
         if status != OrderStatus.FILLED:
@@ -555,6 +595,70 @@ class SessionRuntime:
             return None
         last = float(values[-1])
         return None if math.isnan(last) else Decimal(str(last))
+
+    async def _fail_if_halted(self) -> bool:
+        """A halted ledger takes no more orders: error, flatten and stop the session."""
+        halted = self.executor.get_account_snapshot().halted
+        if halted is None:
+            return False
+        await self._fail(f"paper ledger halted: {halted}")
+        return True
+
+    async def _close_unprotected(self, symbol: str, quantity: Decimal) -> None:
+        """Decision 17: a position whose protective stop cannot be placed is closed."""
+        reason = self.protect.failures[-1] if self.protect.failures else "no protective order"
+        logger.error("Closing unprotected %s in %s: %s", symbol, self.session.session_id, reason)
+        await self._broadcast(
+            {
+                "event": "protection_failed",
+                "session_id": self.session.session_id,
+                "symbol": symbol,
+                "quantity": str(quantity),
+                "reason": reason,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+        try:
+            await self.om.submit_order(
+                OrderRequest(
+                    symbol=Symbol(symbol),
+                    side=Side.SELL,
+                    order_type=OrderType.MARKET,
+                    quantity=quantity,
+                    strategy_id=self.cfg.id,
+                    exchange_id=self.exchange_id,
+                    market_type=self.market_type,
+                    reduce_only=True,
+                    tag=UNPROTECTED_TAG,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Reduce-only close of unprotected %s failed (%s)", symbol, exc)
+            try:
+                for fill in await self.executor.flatten(symbol, reason=UNPROTECTED_TAG):
+                    await self.om.on_external_fill(fill)
+            except Exception as flatten_exc:
+                await self._fail(f"{symbol} is unprotected and could not be closed: {flatten_exc}")
+
+    async def _on_cancel(self, event: Event) -> None:
+        if isinstance(event, OrderCancelEvent):
+            await self._release_manual(event.order_id, event.reason or "cancelled")
+
+    async def _release_manual(self, order_id: str, reason: str) -> None:
+        """A manual entry that will never fill: drop its protection spec and tell the client."""
+        tag = self._manual_orders.pop(order_id, None)
+        if tag is None:
+            return
+        self.protect.discard_manual(tag)
+        await self._broadcast(
+            {
+                "event": "order_cancel",
+                "session_id": self.session.session_id,
+                "order_id": order_id,
+                "reason": reason,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
 
     async def _spot_short_ignored(self, signal_type: str, symbol: str) -> None:
         self.spot_shorts_ignored += 1

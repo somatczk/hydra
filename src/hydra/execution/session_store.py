@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -11,41 +12,55 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def persist_session(db_pool: Any, session: TradingSession) -> None:
-    """Upsert session row to DB; a failure is logged (the in-memory registry stays truthful)."""
+async def persist_session(db_pool: Any, session: TradingSession, *, attempts: int = 1) -> bool:
+    """Upsert the session row; False when every attempt failed (each failure is logged)."""
     if db_pool is None:
-        return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO trading_sessions
-                    (id, strategy_id, trading_mode, status, exchange_id,
-                     symbols, timeframe, paper_capital, started_at,
-                     stopped_at, error_message, positions_at_stop)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                ON CONFLICT (id) DO UPDATE SET
-                    status = EXCLUDED.status,
-                    started_at = EXCLUDED.started_at,
-                    stopped_at = EXCLUDED.stopped_at,
-                    error_message = EXCLUDED.error_message,
-                    positions_at_stop = EXCLUDED.positions_at_stop
-                """,
+        return True
+    for attempt in range(1, attempts + 1):
+        try:
+            await _upsert(db_pool, session)
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to persist session %s (attempt %d/%d)",
                 session.session_id,
-                session.strategy_id,
-                session.trading_mode,
-                session.status,
-                session.exchange_id,
-                session.symbols,
-                session.timeframe,
-                session.paper_capital,
-                session.started_at,
-                session.stopped_at,
-                session.error_message,
-                session.positions_at_stop,
+                attempt,
+                attempts,
             )
-    except Exception:
-        logger.exception("Failed to persist session %s", session.session_id)
+        if attempt < attempts:
+            await asyncio.sleep(0.2 * attempt)
+    return False
+
+
+async def _upsert(db_pool: Any, session: TradingSession) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO trading_sessions
+                (id, strategy_id, trading_mode, status, exchange_id,
+                 symbols, timeframe, paper_capital, started_at,
+                 stopped_at, error_message, positions_at_stop)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                started_at = EXCLUDED.started_at,
+                stopped_at = EXCLUDED.stopped_at,
+                error_message = EXCLUDED.error_message,
+                positions_at_stop = EXCLUDED.positions_at_stop
+            """,
+            session.session_id,
+            session.strategy_id,
+            session.trading_mode,
+            session.status,
+            session.exchange_id,
+            session.symbols,
+            session.timeframe,
+            session.paper_capital,
+            session.started_at,
+            session.stopped_at,
+            session.error_message,
+            session.positions_at_stop,
+        )
 
 
 async def load_session_trades(db_pool: Any, session: TradingSession) -> list[dict[str, Any]]:

@@ -7,6 +7,7 @@ limit and open, maker).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,7 @@ import pytest
 from hydra.core.events import ExitSignal, OrderFillEvent
 from hydra.core.types import OrderStatus, Side, Symbol
 from hydra.execution.order_manager import PROTECTIVE_TAG
+from hydra.execution.paper_trading import OrderRejectedError
 from hydra.execution.protective_orders import ProtectionSpec, default_stop, spec_from_policy
 from hydra.strategy.config import StrategyRiskConfig
 from tests.unit.test_execution.session_harness import (
@@ -24,6 +26,7 @@ from tests.unit.test_execution.session_harness import (
     executor,
     held,
     rule,
+    settle,
     usdt,
     write_strategy,
 )
@@ -184,6 +187,104 @@ class TestStopFills:
         )
         assert await held(session) == D("0.50000")
         assert await _open(session) == [("SELL", "STOP_MARKET", 0.5, 95.095, None)]
+
+
+async def _failure_handled() -> None:
+    from hydra.execution import session_wiring
+
+    await asyncio.gather(*list(session_wiring._BACKGROUND))
+    await settle()
+
+
+@pytest.fixture()
+def broadcasts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    from hydra.core.websocket import manager
+
+    sent: list[dict[str, Any]] = []
+
+    async def broadcast(channel: str, payload: dict[str, Any]) -> None:
+        sent.append(payload)
+
+    monkeypatch.setattr(manager, "broadcast", broadcast)
+    return sent
+
+
+class TestUnprotected:
+    async def test_exit_on_a_halted_ledger_fails_the_session_instead_of_dropping_the_stop(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        session = await _entered(h, strategies_dir, "halt-exit")
+        assert await _open(session) == [("SELL", "STOP_MARKET", 1.0, 95.095, None)]
+        executor(session)._halt("second writer")
+        await session._runtime.bus.publish(
+            ExitSignal(symbol=Symbol("BTCUSDT"), strategy_id="halt-exit")
+        )
+        await _failure_handled()
+        assert session.status == "error" and "halted" in (session.error_message or "")
+        assert not session.task_alive
+        # closed by the executor's own flatten at the mark: 899.7999 + 99.9 - 0.0999
+        assert await held(session) == 0 and await usdt(session) == D("999.6000")
+        assert (session.positions_at_stop, session.flatten_incomplete) == (0, False)
+
+    async def test_halt_while_the_entry_fill_persists_fails_the_session(
+        self, h: Harness, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = await h.session(
+            write_strategy(strategies_dir, "halt-entry", entry_long=ENTRY_AT_100)
+        )
+        ex = executor(session)
+        real_persist = ex._persist
+
+        async def second_writer_on_the_fill(*args: Any, **kwargs: Any) -> None:
+            await real_persist(*args, **kwargs)
+            if ex.get_fills() and ex.get_account_snapshot().halted is None:
+                ex._halt("second writer")
+
+        monkeypatch.setattr(ex, "_persist", second_writer_on_the_fill)
+        await h.bar(session, "100")
+        await _failure_handled()
+        assert session.status == "error" and "halted" in (session.error_message or "")
+        assert [f.side for f in ex.get_fills()] == ["BUY", "SELL"]
+        assert await held(session) == 0
+
+    async def test_rejected_stop_and_fallback_close_the_position(
+        self,
+        h: Harness,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        broadcasts: list[dict[str, Any]],
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "nostop", entry_long=ENTRY_AT_100))
+        ex = executor(session)
+        real = ex.create_order
+
+        async def no_resting_sells(*args: Any, **kwargs: Any) -> Any:
+            if (kwargs.get("side"), kwargs.get("order_type")) in (
+                ("SELL", "STOP_MARKET"),
+                ("SELL", "OCO"),
+            ):
+                raise OrderRejectedError("venue refuses stops")
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(ex, "create_order", no_resting_sells)
+        await h.bar(session, "100")
+        await settle()
+        assert session.status == "running"
+        assert [(f.side, f.price) for f in ex.get_fills()] == [
+            ("BUY", D("100.100")),
+            ("SELL", D("99.900")),
+        ]
+        assert await held(session) == 0 and await usdt(session) == D("999.6000")
+        failed = [b for b in broadcasts if b.get("event") == "protection_failed"]
+        assert [(b["symbol"], b["quantity"]) for b in failed] == [("BTCUSDT", "1.00000")]
+        assert h.mgr is not None
+        health = (await h.mgr.health_snapshot()).sessions[0]
+        # the policy stop is the 5 % default, so there is no separate fallback attempt
+        assert len(health.protection_failures) == 1
+        assert "95.09500" in health.protection_failures[0]
+        assert "venue refuses stops" in health.protection_failures[0]
+        detail = await h.mgr.get_session_detail(session.session_id)
+        assert detail["protection_failures"] == list(health.protection_failures)
 
 
 class TestManualProtection:

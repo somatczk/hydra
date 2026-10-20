@@ -115,12 +115,14 @@ def test_import_linter_contracts_kept(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_injected_config_reaches_the_engine_and_load_config_is_never_called(
     strategies_dir: Path,
 ) -> None:
+    assert "load_config" not in Path(session_manager.__file__).read_text()
+    config = inspect.signature(SessionManager).parameters["config"]
+    assert (config.kind, config.default) == (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.empty,
+    )
     h = Harness(strategies_dir)
-    with patch.object(
-        session_manager, "load_config", side_effect=AssertionError("load_config called")
-    ) as load:
-        mgr = await h.start()
-        session = await h.session(write_strategy(strategies_dir, "cfg"))
-        assert session._engine is not None and session._engine._config is mgr._config
-        await h.close()
-    load.assert_not_called()
+    mgr = await h.start()
+    session = await h.session(write_strategy(strategies_dir, "cfg"))
+    assert session._engine is not None and session._engine._config is mgr._config
+    await h.close()

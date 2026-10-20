@@ -100,10 +100,29 @@ async def test_builder_sl_tp_is_persisted_read_back_and_enforced(
         await h.close()
 
 
-async def test_trailing_stop_with_a_take_profit_is_refused(api: httpx.AsyncClient) -> None:
-    resp = await api.post("/api/strategies/save", json=_payload(stop_loss_method="trailing_stop"))
+async def test_builder_trailing_stop_saves_without_its_take_profit(
+    api: httpx.AsyncClient,
+) -> None:
+    # the builder always sends a take-profit; a trailing stop sells the whole position, so it wins
+    resp = await api.post(
+        "/api/strategies/save",
+        json=_payload(stop_loss_method="trailing_stop", stop_loss_value=2.0),
+    )
+    assert resp.status_code == 201, resp.text
+    path = Path(resp.json()["config_path"])
+    assert yaml.safe_load(path.read_text())["risk"] == {
+        "stop_loss_method": "trailing_stop",
+        "stop_loss_value": 2.0,
+        "take_profit_method": "none",
+        "take_profit_value": 0.0,
+        "atr_period": 14,
+    }
+
+
+async def test_invalid_builder_risk_settings_are_refused(api: httpx.AsyncClient) -> None:
+    resp = await api.post("/api/strategies/save", json=_payload(stop_loss_value=150.0))
     assert resp.status_code == 422
-    assert "trailing stop cannot be combined" in resp.json()["detail"]
+    assert "below 100" in resp.json()["detail"]
 
 
 async def test_strategy_without_a_risk_block_reports_the_default_stop(

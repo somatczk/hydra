@@ -211,12 +211,13 @@ class RiskInput(BaseModel):
 
 
 def _risk_block(risk: RiskInput) -> dict[str, Any]:
-    """The YAML ``risk:`` block for builder SL/TP; invalid combinations are a 422."""
+    """The YAML ``risk:`` block for builder SL/TP; a trailing stop drops the take-profit."""
+    trailing = risk.stop_loss_method == "trailing_stop"
     block = {
         "stop_loss_method": risk.stop_loss_method,
         "stop_loss_value": risk.stop_loss_value,
-        "take_profit_method": risk.take_profit_method,
-        "take_profit_value": risk.take_profit_value,
+        "take_profit_method": "none" if trailing else risk.take_profit_method,
+        "take_profit_value": 0.0 if trailing else risk.take_profit_value,
     }
     try:
         return StrategyRiskConfig(**block).model_dump(mode="json")

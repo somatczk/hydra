@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from hydra.core import metrics
-from hydra.core.config import HydraConfig, load_config
+from hydra.core.config import HydraConfig
 from hydra.core.types import ExchangeId, OrderType, Side, Timeframe
 from hydra.execution import client_factory, session_store
 from hydra.execution.client_factory import ClientFactory
@@ -28,6 +28,7 @@ from hydra.execution.errors import (
     LiveTradingDisabledError,
     PaperCapitalUnavailableError,
     SessionNotRunningError,
+    SessionPersistError,
     UnsupportedStrategyError,
 )
 from hydra.execution.flatten import FlattenResult
@@ -73,6 +74,7 @@ class TradingSession:
     last_bar_at: datetime | None = None
     last_fill_at: datetime | None = None
     flatten_incomplete: bool = False
+    persist_error: str | None = None
 
     # Runtime components (not persisted)
     _runtime: SessionRuntime | None = field(default=None, repr=False)
@@ -87,6 +89,14 @@ class TradingSession:
     @property
     def task_alive(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    @property
+    def holdings(self) -> int:
+        """Symbols with base held by this session's paper account (resting stops included)."""
+        ex = self._executor
+        if not isinstance(ex, PaperTradingExecutor):
+            return 0
+        return sum(1 for q in ex.get_account_snapshot().base_totals.values() if q > 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +127,8 @@ class SessionHealth:
     persist_backlog: int
     persist_dirty: bool
     error_message: str | None
+    protection_failures: tuple[str, ...] = ()
+    status_persisted: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +145,8 @@ class SessionManager:
     def __init__(
         self,
         db_pool: Any = None,
-        config: HydraConfig | None = None,
         *,
+        config: HydraConfig,
         clients: ClientFactory | None = None,
         risk: RiskService | None = None,
         risk_store: RiskStateStore | None = None,
@@ -151,6 +163,7 @@ class SessionManager:
         self._stale_cleanup_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
+        self._unpersisted: set[str] = set()
 
     # -- Startup -------------------------------------------------------------
 
@@ -199,9 +212,6 @@ class SessionManager:
             )
         return self.risk
 
-    def _hydra_config(self) -> HydraConfig:
-        return self._config if self._config is not None else load_config()
-
     # -- Public API ----------------------------------------------------------
 
     def kill_switch_active(self) -> bool:
@@ -231,7 +241,7 @@ class SessionManager:
             )
             if trading_mode == "live":
                 raise LiveTradingDisabledError("live trading is disabled until P3")
-            probe = await probe_strategy(cfg, self._hydra_config())
+            probe = await probe_strategy(cfg, self._config)
             if probe.order_management:
                 raise UnsupportedStrategyError(
                     f"{cfg.strategy_class} manages its own orders; DCA/Grid run in P2"
@@ -275,6 +285,8 @@ class SessionManager:
             raise KeyError(f"Session {session_id} not found")
         await self._stop_session_internal(session)
         logger.info("Stopped session %s", session_id)
+        if session.persist_error is not None:
+            raise SessionPersistError(session.persist_error)
 
     async def stop_all(
         self, actor: str = "operator", reason: str = "kill switch"
@@ -290,8 +302,9 @@ class SessionManager:
     async def _stop_targets(self, persisted: bool, reason: str) -> KillSwitchReport:
         targets = [
             s
-            for s in self._sessions.values()
-            if s.status == "running" or (s._runtime is not None and s.status == "error")
+            for s in list(self._sessions.values())
+            if s.status == "running"
+            or (s.status == "error" and (s._runtime is not None or s.holdings > 0))
         ]
         failures: list[str] = []
         remaining = 0
@@ -303,6 +316,8 @@ class SessionManager:
                     f"{session.session_id}: {result.positions_remaining} position(s) remain"
                     + (f" ({'; '.join(result.failures)})" if result.failures else "")
                 )
+            if session.persist_error is not None:
+                failures.append(f"{session.session_id}: {session.persist_error}")
         logger.warning(
             "Kill switch: stopped %d session(s), %d position(s) remain",
             len(targets),
@@ -392,6 +407,8 @@ class SessionManager:
             "flatten_incomplete": session.flatten_incomplete,
             "last_bar_at": session.last_bar_at.isoformat() if session.last_bar_at else None,
             "entries_paused": runtime.entries_paused if runtime is not None else None,
+            "protection_failures": list(runtime.protect.failures[-10:]) if runtime else [],
+            "persist_error": session.persist_error,
         }
         balance: dict[str, float] = {}
         positions: list[dict[str, Any]] = []
@@ -467,9 +484,7 @@ class SessionManager:
                     last_bar_at=s.last_bar_at,
                     last_bar_age_s=(now - s.last_bar_at).total_seconds() if s.last_bar_at else None,
                     last_fill_at=s.last_fill_at,
-                    open_positions=sum(1 for q in snap.base_totals.values() if q > 0)
-                    if snap is not None
-                    else 0,
+                    open_positions=s.holdings,
                     flatten_incomplete=s.flatten_incomplete,
                     entries_paused=rt.entries_paused if rt is not None else None,
                     feed_live=rt.feed.is_live(eid) if rt is not None and s.task_alive else False,
@@ -477,6 +492,8 @@ class SessionManager:
                     persist_backlog=rt.feed.persist_backlog(eid) if rt is not None else 0,
                     persist_dirty=bool(snap.persist_dirty) if snap is not None else False,
                     error_message=s.error_message,
+                    protection_failures=tuple(rt.protect.failures[-10:]) if rt is not None else (),
+                    status_persisted=s.persist_error is None,
                 )
             )
         for sid in sorted((desired_ids or set()) - set(self._sessions)):
@@ -514,7 +531,7 @@ class SessionManager:
             self._stale_cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._stale_cleanup_task
-        for session in self._sessions.values():
+        for session in list(self._sessions.values()):
             if session._runtime is not None and session.status == "running":
                 await session._runtime.shutdown()
                 await self._await_task(session)
@@ -547,7 +564,7 @@ class SessionManager:
             (
                 s.paper_capital
                 for s in self._sessions.values()
-                if s.status == "running" and s.paper_capital
+                if (s.status == "running" or s.holdings > 0) and s.paper_capital
             ),
             Decimal("0"),
         )
@@ -573,7 +590,7 @@ class SessionManager:
             executor=executor,
             risk=self._require_risk(),
             clients=self._clients,
-            hydra_config=self._hydra_config(),
+            hydra_config=self._config,
             db_pool=self._db_pool,
             required_history=required_history,
             on_failure=self._on_runtime_failure,
@@ -602,6 +619,8 @@ class SessionManager:
                 await runtime.protect.adopt(session.symbols)
             await runtime.prime(warm)
             await runtime.connect()
+            if risk.kill_switch_active():
+                raise KillSwitchActiveError("Kill switch latched while the session was starting")
         except BaseException:
             await runtime.shutdown()
             if registered:
@@ -625,14 +644,48 @@ class SessionManager:
             if session.status == "running":
                 session.status = "stopped"
             session.stopped_at = datetime.now(UTC)
-            await session_store.persist_session(self._db_pool, session)
+            await self._persist_terminal(session)
             await runtime.broadcast_status()
+        elif session.holdings > 0:
+            result = await self._close_executor(session, reason)
+            if session.status == "running":
+                session.status = "stopped"
+            session.stopped_at = datetime.now(UTC)
+            await self._persist_terminal(session)
         elif session.status == "running":
             session.status = "stopped"
             session.stopped_at = datetime.now(UTC)
-            await session_store.persist_session(self._db_pool, session)
+            await self._persist_terminal(session)
         logger.info("Session %s stopped (%s)", session.session_id, reason)
         return result
+
+    async def _close_executor(self, session: TradingSession, reason: str) -> FlattenResult:
+        """Flatten a paper account that has no runtime (cancel resting orders, sell base)."""
+        executor = session._executor
+        failures: list[str] = []
+        try:
+            await executor.flatten(reason=reason)
+        except Exception as exc:
+            logger.exception("Flatten of %s without a runtime failed", session.session_id)
+            failures.append(str(exc))
+        remaining = session.holdings
+        session.positions_at_stop = remaining
+        session.flatten_incomplete = remaining > 0
+        risk = self.risk
+        if remaining == 0 and risk is not None and session.session_id in risk.registered_sessions():
+            await risk.unregister_session(session.session_id)
+        return FlattenResult(positions_remaining=remaining, failures=tuple(failures))
+
+    async def _persist_terminal(self, session: TradingSession) -> None:
+        """A stopped/errored row must reach the DB, or a restart would resume the session."""
+        if await session_store.persist_session(self._db_pool, session, attempts=3):
+            session.persist_error = None
+            self._unpersisted.discard(session.session_id)
+            return
+        session.persist_error = (
+            f"session status '{session.status}' not persisted; retrying every minute"
+        )
+        self._unpersisted.add(session.session_id)
 
     async def _await_task(self, session: TradingSession) -> None:
         task = session._task
@@ -663,17 +716,32 @@ class SessionManager:
                 and session.session_id in self.risk.registered_sessions()
             ):
                 await self.risk.unregister_session(session.session_id)
-        await session_store.persist_session(self._db_pool, session)
+        await self._persist_terminal(session)
         if runtime is not None:
             await runtime.broadcast_status()
+
+    async def retry_unpersisted(self) -> None:
+        """Write the stopped/errored rows whose terminal status did not reach the DB yet."""
+        for sid in sorted(self._unpersisted):
+            session = self._sessions.get(sid)
+            if session is not None:
+                await self._persist_terminal(session)
 
     # -- Internal: risk callbacks ---------------------------------------------
 
     async def _flatten_for_risk(self, reason: str) -> list[str]:
         """Tier-3 breaker: flatten every session (they keep running; entries stay blocked)."""
         failures: list[str] = []
-        for session in self._sessions.values():
+        for session in list(self._sessions.values()):
             runtime = session._runtime
+            if runtime is None and session.status == "error" and session.holdings > 0:
+                result = await self._close_executor(session, reason)
+                await session_store.persist_session(self._db_pool, session)
+                if result.positions_remaining:
+                    failures.append(
+                        f"{session.session_id}: {result.positions_remaining} position(s) remain"
+                    )
+                continue
             if runtime is None or session.status not in ("running", "error"):
                 continue
             was_closing = runtime.closing
@@ -725,22 +793,20 @@ class SessionManager:
             await session_store.persist_session(self._db_pool, session)
 
     async def _recover_one(self, session: TradingSession) -> None:
+        """Restore the paper account first; once restored it is either resumed or closed."""
         if session.trading_mode != "paper":
             session.status = "stopped"
             session.error_message = LIVE_NOT_RESUMED
             session.stopped_at = datetime.now(UTC)
             return
         risk = self._require_risk()
-        cfg = self._find_strategy_config(session.strategy_id)
-        exchange_id: ExchangeId = client_factory.validate_venue(
-            session.exchange_id, cfg.exchange.market_type
-        )
-        probe = await probe_strategy(cfg, self._hydra_config())
-        if probe.order_management:
-            raise UnsupportedStrategyError(f"{cfg.strategy_class}: DCA/Grid run in P2")
-        if session.paper_capital is None or session.paper_capital <= 0:
-            raise PaperCapitalUnavailableError("the session row has no allocated paper_capital")
-        rules = await self._market_rules.get(exchange_id, session.symbols)
+        exchange_id: ExchangeId = client_factory.validate_venue(session.exchange_id)
+        rules_error: Exception | None = None
+        rules: Any = None
+        try:
+            rules = await self._market_rules.get(exchange_id, session.symbols)
+        except Exception as exc:
+            rules_error = exc
         try:
             executor = await PaperTradingExecutor.restore(
                 self._db_pool, session.session_id, market_rules=rules
@@ -751,41 +817,57 @@ class SessionManager:
         if executor is None:
             self._mark_error(session, PRE_P1_STATE)
             return
+        session._executor = executor
         if risk.kill_switch_active():
-            await self._flatten_restored(session, executor)
+            await self._close_restored(session, "kill_switch", None)
             return
-        runtime = self._runtime(session, cfg, executor, probe.required_history)
-        await self._launch(runtime, session.paper_capital, recovering=True)
+        try:
+            if rules_error is not None:
+                raise rules_error
+            cfg = self._find_strategy_config(session.strategy_id)
+            client_factory.validate_venue(session.exchange_id, cfg.exchange.market_type)
+            probe = await probe_strategy(cfg, self._config)
+            if probe.order_management:
+                raise UnsupportedStrategyError(f"{cfg.strategy_class}: DCA/Grid run in P2")
+            if session.paper_capital is None or session.paper_capital <= 0:
+                raise PaperCapitalUnavailableError("the session row has no allocated paper_capital")
+            runtime = self._runtime(session, cfg, executor, probe.required_history)
+            await self._launch(runtime, session.paper_capital, recovering=True)
+        except Exception as exc:
+            logger.exception("Restored session %s cannot resume", session.session_id)
+            await self._close_restored(session, "recovery_failed", f"recovery failed: {exc}")
+            return
         logger.info("Recovered session %s for strategy %s", session.session_id, session.strategy_id)
 
-    async def _flatten_restored(
-        self, session: TradingSession, executor: PaperTradingExecutor
+    async def _close_restored(
+        self, session: TradingSession, reason: str, failure: str | None
     ) -> None:
-        """Kill switch latched across the restart: sell the restored holdings, do not resume."""
+        """A restored account that will not resume: sell its holdings at the restored marks."""
         risk = self._require_risk()
-        await risk.register_session(
-            session.session_id,
-            executor,
-            allocated=session.paper_capital or Decimal("0"),
-            symbols=session.symbols,
-            exchange_id=session.exchange_id,
-            strategy_id=session.strategy_id,
-        )
         try:
-            await executor.flatten(reason="kill_switch")
-        except Exception as exc:
-            logger.exception("Flatten of restored session %s failed", session.session_id)
-            session._executor = executor
-            self._mark_error(session, f"kill switch active; flatten after restart failed: {exc}")
-            session.positions_at_stop = len(await executor.get_positions())
-            session.flatten_incomplete = session.positions_at_stop > 0
+            await risk.register_session(
+                session.session_id,
+                session._executor,
+                allocated=session.paper_capital or Decimal("0"),
+                symbols=session.symbols,
+                exchange_id=session.exchange_id,
+                strategy_id=session.strategy_id,
+            )
+        except Exception:
+            logger.exception("Session %s not registered for its PnL carry", session.session_id)
+        result = await self._close_executor(session, reason)
+        outcome = (
+            f"{result.positions_remaining} position(s) could not be flattened"
+            + (f" ({'; '.join(result.failures)})" if result.failures else "")
+            if result.positions_remaining
+            else "restored holdings flattened"
+        )
+        if failure is None and not result.positions_remaining:
+            session.status = "stopped"
+            session.stopped_at = datetime.now(UTC)
+            session.error_message = f"Not resumed after restart: kill switch active ({outcome})"
             return
-        await risk.unregister_session(session.session_id)
-        session._executor = executor
-        session.status = "stopped"
-        session.stopped_at = datetime.now(UTC)
-        session.error_message = "Not resumed after restart: kill switch active (flattened)"
-        session.positions_at_stop = len(await executor.get_positions())
+        self._mark_error(session, f"{failure or 'kill switch active'}; {outcome}")
 
     def _mark_error(self, session: TradingSession, message: str) -> None:
         session.status = "error"
@@ -827,6 +909,7 @@ class SessionManager:
         while True:
             try:
                 await asyncio.sleep(60)
+                await self.retry_unpersisted()
                 for session in list(self._sessions.values()):
                     om = session._order_manager
                     if session.status != "running" or om is None:

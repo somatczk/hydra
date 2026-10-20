@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -11,7 +12,7 @@ from typing import Any
 import pytest
 
 from hydra.core.types import OrderStatus
-from hydra.execution.errors import KillSwitchActiveError
+from hydra.execution.errors import KillSwitchActiveError, SessionPersistError
 from hydra.risk.pretrade import RiskConfig
 from tests.unit.test_execution.session_harness import (
     Harness,
@@ -206,3 +207,95 @@ class TestBreakers:
             assert (big.status, other.status) == (expected, expected)
         finally:
             await h.close()
+
+
+class _Pool:
+    def __init__(self) -> None:
+        self.down = True
+        self.rows: dict[str, str] = {}
+
+    def acquire(self) -> Any:
+        if self.down:
+            raise ConnectionError("database down")
+        return self
+
+    async def __aenter__(self) -> Any:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.rows[args[0]] = args[3]
+        return "INSERT 0 1"
+
+
+class TestRaces:
+    async def test_kill_switch_during_a_start_refuses_the_new_session(
+        self, h: Harness, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hydra.execution.session_wiring import SessionRuntime
+
+        entered, gate = asyncio.Event(), asyncio.Event()
+        real = SessionRuntime.warm_up
+
+        async def slow_warm_up(self: SessionRuntime) -> Any:
+            entered.set()
+            await gate.wait()
+            return await real(self)
+
+        monkeypatch.setattr(SessionRuntime, "warm_up", slow_warm_up)
+        assert h.mgr is not None and h.mgr.risk is not None
+        start = asyncio.create_task(
+            h.mgr.start_session(write_strategy(strategies_dir, "late"), "paper")
+        )
+        await entered.wait()
+        report = await h.mgr.stop_all(actor="test", reason="drill")
+        gate.set()
+        with pytest.raises(KillSwitchActiveError):
+            await start
+        assert report.sessions_stopped == 0
+        assert h.mgr.list_sessions() == []
+        assert h.mgr.risk.registered_sessions() == []
+
+    async def test_tier_three_flatten_survives_a_session_starting_meanwhile(
+        self, h: Harness, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first = await _entered(h, strategies_dir, "t3-a", "400")
+        second = await _entered(h, strategies_dir, "t3-b", "400")
+        assert h.mgr is not None and first._runtime is not None
+        real = first._runtime.flatten
+
+        async def flatten_while_a_session_starts() -> Any:
+            if len(h.mgr.list_sessions()) == 2:
+                await h.mgr.start_session(write_strategy(strategies_dir, "t3-c"), "paper")
+            return await real()
+
+        monkeypatch.setattr(first._runtime, "flatten", flatten_while_a_session_starts)
+        failures = await h.mgr._flatten_for_risk("tier 3")
+        assert failures == []
+        assert (await held(first), await held(second)) == (0, 0)
+        assert len(h.mgr.list_sessions()) == 3
+
+
+class TestTerminalStatus:
+    async def test_unpersisted_stop_is_reported_and_retried(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        session = await _entered(h, strategies_dir, "unsaved")
+        assert h.mgr is not None
+        pool = _Pool()
+        h.mgr._db_pool = pool
+        with pytest.raises(SessionPersistError):
+            await h.mgr.stop_session(session.session_id)
+        assert session.status == "stopped" and await held(session) == 0
+        snap = await h.mgr.health_snapshot()
+        assert [x.status_persisted for x in snap.sessions] == [False]
+
+        await h.mgr.retry_unpersisted()
+        assert session.persist_error is not None
+        pool.down = False
+        await h.mgr.retry_unpersisted()
+        assert session.persist_error is None
+        assert pool.rows == {session.session_id: "stopped"}
+        h.mgr._db_pool = None

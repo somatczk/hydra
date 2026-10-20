@@ -16,7 +16,10 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from structlog import get_logger
+from structlog.testing import capture_logs
 
+from hydra.dashboard import security
 from hydra.dashboard.api import app
 from hydra.dashboard.routes import signals
 from hydra.execution.paper_trading import PaperTradingExecutor
@@ -128,6 +131,26 @@ class TestTargeting:
         ]
         assert await _untouched(sessions["breakout"])
 
+    async def test_webhook_order_is_on_the_audit_trail(
+        self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
+        with capture_logs() as logs:
+            resp = await _post(secret=SECRET, quantity="0.01")
+        assert resp.status_code == 200, resp.text
+        orders = [line for line in logs if line.get("action") == "manual_order"]
+        assert len(orders) == 1
+        line = orders[0]
+        assert (line["source"], line["strategy_id"], line["side"], line["quantity"]) == (
+            "webhook",
+            "momentum",
+            "buy",
+            "0.01",
+        )
+        assert (line["principal"], line["signal_action"]) == ("api-token", "entry")
+        assert line["order_id"] is not None and line["session_id"]
+
     async def test_unknown_strategy_is_404_and_trades_nothing(
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -202,6 +225,16 @@ class TestExecutionOutcome:
         assert resp.status_code == 422
         detail = resp.json()["detail"]
         assert (detail["code"], detail["check"]) == ("risk_rejected", "position_size")
+        assert await _untouched(sessions["momentum"])
+
+    async def test_halted_paper_account_is_503_and_fails_the_session(
+        self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        sessions["momentum"]._halt("second writer")
+        resp = await _post(secret=SECRET, quantity="0.01")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "paper_session_halted"
         assert await _untouched(sessions["momentum"])
 
     async def test_executor_failure_is_502_not_a_validation_error(
