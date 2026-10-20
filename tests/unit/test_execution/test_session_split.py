@@ -195,13 +195,12 @@ class _IdleExchange:
     def __init__(self) -> None:
         self._never = asyncio.Event()
 
-    async def watch_ohlcv(self, symbol: str, timeframe: str) -> list[list[float]]:
-        await self._never.wait()
-        return []
+    async def load_markets(self) -> dict[str, dict[str, Any]]:
+        return {"BTC/USDT": {"id": "BTCUSDT", "symbol": "BTC/USDT", "spot": True}}
 
-    async def watch_trades(self, symbol: str) -> list[dict[str, Any]]:
+    async def watch_ohlcv_for_symbols(self, subscriptions: list[list[str]]) -> dict[str, Any]:
         await self._never.wait()
-        return []
+        return {}
 
     async def close(self) -> None:
         return None

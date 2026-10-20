@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import importlib
 import logging
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from hydra.core.config import HydraConfig
 from hydra.core.events import BarEvent, Event
 from hydra.core.protocols import EventBus
+from hydra.core.types import OHLCV, Timeframe
 from hydra.strategy.base import BaseStrategy, OrderManagementStrategy
 from hydra.strategy.config import StrategyConfig, load_all_strategy_configs
 from hydra.strategy.context import StrategyContext
@@ -106,36 +108,52 @@ class StrategyEngine:
 
     # -- Event routing -------------------------------------------------------
 
-    async def _on_bar_event(self, event: Event) -> None:
-        """Route a bar event to matching signal-based strategies.
+    def _tracks(self, symbol: str, timeframe: Timeframe) -> bool:
+        """True when any loaded strategy declares this symbol and timeframe."""
+        return any(
+            symbol in cfg.symbols and timeframe in cfg.all_timeframes()
+            for cfg in self._strategy_configs.values()
+        )
 
-        OrderManagementStrategy instances are handled separately by the
-        session manager, so they are skipped here.
+    async def warm_up(
+        self, bars_by_stream: Mapping[tuple[str, Timeframe], Sequence[OHLCV]]
+    ) -> None:
+        """Seed the context with history, oldest first, without calling ``on_bar``."""
+        for (symbol, timeframe), bars in bars_by_stream.items():
+            for bar in sorted(bars, key=lambda b: b.timestamp):
+                self._context.add_bar(symbol, timeframe, bar)
+        logger.info(
+            "Strategy context warmed up: %s",
+            {f"{s}/{tf}": len(b) for (s, tf), b in bars_by_stream.items()},
+        )
+
+    async def _on_bar_event(self, event: Event) -> None:
+        """Add a closed bar to the context once, then evaluate the strategies it drives.
+
+        Every declared timeframe (primary, confirmation, entry) reaches the context; only
+        signal strategies whose primary timeframe matches are evaluated, and never on a
+        replayed catch-up bar. OrderManagementStrategy instances are wired by the session.
         """
-        if not isinstance(event, BarEvent):
+        if not isinstance(event, BarEvent) or event.ohlcv is None:
             return
         bar = event
+        symbol = str(bar.symbol)
+        if not self._tracks(symbol, bar.timeframe):
+            return
+        self._context.add_bar(symbol, bar.timeframe, event.ohlcv)
+        if bar.replay:
+            return
         for sid, strategy in self._strategies.items():
-            # OMS strategies are wired separately in session_manager
             if isinstance(strategy, OrderManagementStrategy):
                 continue
             cfg = self._strategy_configs[sid]
-            # Check symbol match
-            if str(bar.symbol) not in cfg.symbols:
+            if symbol not in cfg.symbols or bar.timeframe != cfg.timeframes.primary:
                 continue
-            # Check timeframe match
-            if bar.timeframe != cfg.timeframes.primary:
-                continue
-            # Update context with the new bar
-            if bar.ohlcv is not None:
-                self._context.add_bar(str(bar.symbol), bar.timeframe, bar.ohlcv)
-            # Dispatch to strategy
             try:
                 signals = await strategy.on_bar(bar)
             except Exception:
                 logger.exception("Error in strategy %s on_bar", sid)
                 continue
-            # Publish signals
             for signal in signals:
                 await self._event_bus.publish(signal)
                 try:

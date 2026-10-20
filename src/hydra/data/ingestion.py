@@ -1,7 +1,21 @@
-"""Multi-exchange WebSocket feed manager via CCXT Pro.
+"""Live market-data feed over ccxt.pro: closed bars only, each delivered once and in order.
 
-Manages concurrent WebSocket connections to multiple exchanges, normalizes
-incoming data to ``hydra.core.types``, and publishes events via the event bus.
+Per exchange the feed runs one watch loop (``watch_ohlcv_for_symbols`` over every symbol and
+timeframe), one dispatcher that drains a bounded queue into the event bus, one watchdog and,
+with a repository, one persistence task. A slow or failing subscriber therefore never stalls
+or tears down the WebSocket.
+
+- ``ClosedBarAssembler`` emits candle T when a later candle arrives (ccxt.pro drops
+  Binance's closed flag). Closed bars are validated, counted, persisted with an upsert into
+  ``ts.ohlcv_1m`` under the config symbol and published as ``BarEvent``.
+- When timeframes of one symbol close at the same boundary, the higher timeframe is
+  published first; a bar waits at most ``mtf_barrier_s`` for its siblings (never blocking).
+- After any WebSocket error the held candles are dropped and, before the next watch, the
+  missed closed bars are fetched over REST and published with ``replay=True`` except the
+  newest per stream.
+- The watchdog publishes ``FeedStatusEvent('stale')`` on WebSocket silence (and forces a
+  reconnect), an overdue closed bar or a lagging consumer, and ``'live'`` once recovered.
+- ``warm_up`` returns stored history (topped up over REST) for the strategy context.
 """
 
 from __future__ import annotations
@@ -9,12 +23,27 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from typing import Any
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any
 
-from hydra.core.events import BarEvent, TradeEvent
+from hydra.core import metrics
+from hydra.core.events import BarEvent, Event, FeedStatusEvent, PriceEvent
 from hydra.core.logging import get_logger
-from hydra.core.types import ExchangeId, Side, Symbol, Timeframe
+from hydra.core.types import OHLCV, ExchangeId, Symbol, Timeframe
+from hydra.data.backfill import error_is, fetch_closed_bars
+from hydra.data.bars import (
+    ClosedBarAssembler,
+    close_time,
+    last_closed_open,
+    timeframe_seconds,
+)
 from hydra.data.normalizer import DataNormalizer
+
+if TYPE_CHECKING:
+    from hydra.data.storage import MarketDataRepository
 
 logger = get_logger(__name__)
 
@@ -23,27 +52,165 @@ _INITIAL_BACKOFF_S = 1.0
 _MAX_BACKOFF_S = 60.0
 _BACKOFF_FACTOR = 2.0
 _STABLE_THRESHOLD_S = 30.0  # sustained success before resetting backoff
-_MAX_CONSECUTIVE_ERRORS = 5  # recreate exchange after this many consecutive failures
+_MAX_CONSECUTIVE_ERRORS = 5  # recreate the exchange instance after this many failures
+_RATE_LIMIT_BACKOFF_S = 60.0
+_PRICE_INTERVAL_S = 1.0
+_PERSIST_ATTEMPTS = 5
+_PERSIST_BACKOFF_S = 0.5
+_PERSIST_BATCH = 500
+_PERSIST_DRAIN_S = 5.0
+
+type Sleep = Callable[[float], Awaitable[None]]
+type Clock = Callable[[], float]
+type RestFactory = Callable[[str], Any]
+type StreamKey = tuple[str, Timeframe]
+type StatusKey = tuple[str, Timeframe | None]
+type PersistRow = tuple[str, str, Timeframe, OHLCV]
+
+_EXCHANGE_SCOPE: StatusKey = ("", None)
+
+
+class InsufficientHistoryError(Exception):
+    """Fewer closed bars are available than the strategy needs before it may trade."""
+
+    def __init__(
+        self, exchange_id: str, symbol: str, timeframe: Timeframe, have: int, need: int
+    ) -> None:
+        self.exchange_id = exchange_id
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.have = have
+        self.need = need
+        super().__init__(
+            f"{exchange_id} {symbol} {timeframe}: {have} closed bars available, {need} required"
+        )
+
+
+def _default_rest_factory(exchange_id: str) -> Any:
+    import ccxt.async_support as ccxt_async
+
+    cls = getattr(ccxt_async, exchange_id)
+    return cls(
+        {
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}},
+        }
+    )
+
+
+def resolve_spot_symbol(markets: dict[str, Any], symbol: str, exchange_id: str = "") -> str:
+    """Unified spot symbol for a config symbol (exchange id like ``BTCUSDT`` or unified)."""
+    matches = {
+        m["symbol"]
+        for m in markets.values()
+        if m.get("spot") is True and symbol in (m.get("id"), m.get("symbol"))
+    }
+    if len(matches) != 1:
+        found = sorted(matches) or "no spot market"
+        msg = f"{exchange_id}: symbol {symbol!r} must match exactly one spot market, got {found}"
+        raise ValueError(msg)
+    unified = matches.pop()
+    if markets[unified].get("active") is False:
+        msg = f"{exchange_id}: spot market {unified} is not active"
+        raise ValueError(msg)
+    return unified
+
+
+def _reject_reason(errors: list[str]) -> str:
+    text = " ".join(errors)
+    if "volume" in text:
+        return "negative_volume"
+    if "timezone" in text:
+        return "no_timezone"
+    return "ohlc_inconsistent"
+
+
+def _anomaly_kind(description: str) -> str:
+    for prefix, kind in (
+        ("price spike", "price_spike"),
+        ("zero volume", "zero_volume"),
+        ("negative volume", "negative_volume"),
+        ("timestamp", "timestamp_not_advancing"),
+    ):
+        if description.startswith(prefix):
+            return kind
+    return "other"
+
+
+@dataclass(eq=False)
+class _Stream:
+    symbol: str
+    unified: str
+    timeframe: Timeframe
+    tf_s: int
+    assembler: ClosedBarAssembler
+    started_at: float
+    delivered: datetime | None = None
+    previous: OHLCV | None = None
+    refill_from: datetime | None = None
+
+    def next_missing(self) -> datetime | None:
+        """Open time of the first bar not yet delivered, if known."""
+        if self.delivered is not None:
+            return self.delivered + timedelta(seconds=self.tf_s)
+        return self.refill_from
+
+
+@dataclass(eq=False)
+class _Parked:
+    deadline: float
+    events: list[tuple[int, BarEvent]] = field(default_factory=list)
+
+
+@dataclass(eq=False)
+class _Feed:
+    exchange_id: ExchangeId
+    streams: dict[StreamKey, _Stream]
+    by_unified: dict[tuple[str, str], _Stream]
+    queue: asyncio.Queue[tuple[float, Event]]
+    persist_queue: asyncio.Queue[PersistRow]
+    markets: dict[str, Any]
+    last_message: float
+    resync_needed: bool = False
+    reconnect_requested: bool = False
+    last_forced_close: float | None = None
+    stale: dict[StatusKey, set[str]] = field(default_factory=dict)
+    parked: dict[tuple[str, datetime], _Parked] = field(default_factory=dict)
+    last_price_at: dict[str, float] = field(default_factory=dict)
+    inflight_since: float | None = None
+    pending_watch: asyncio.Future[Any] | None = None
+
+    @property
+    def subscriptions(self) -> list[list[str]]:
+        return [[s.unified, str(s.timeframe)] for s in self.streams.values()]
+
+    @property
+    def min_tf_s(self) -> int:
+        return min(s.tf_s for s in self.streams.values())
 
 
 class ExchangeFeedManager:
-    """Manage live WebSocket data streams from multiple exchanges.
-
-    Uses CCXT Pro's ``watch_ohlcv()``, ``watch_trades()``, and
-    ``watch_order_book()`` to stream data, normalizes it via
-    ``DataNormalizer``, and publishes ``BarEvent`` / ``TradeEvent``
-    instances through the provided event bus.
+    """Live closed-bar feed for one or more exchanges (see the module docstring).
 
     Parameters
     ----------
     event_bus:
-        An object satisfying the ``EventBus`` protocol (``publish()``
-        method).
+        An object satisfying the ``EventBus`` protocol (``publish()`` method).
     normalizer:
-        ``DataNormalizer`` instance for raw data conversion.
+        ``DataNormalizer`` for conversion, validation and anomaly checks.
     exchange_factories:
-        Mapping of exchange id to a callable returning a CCXT Pro exchange
-        instance.
+        Exchange id -> callable returning a ccxt.pro instance (the WebSocket client).
+    repository:
+        Where closed bars are upserted and warm-up history is read; ``None`` disables both.
+    rest_factory:
+        Exchange id -> ccxt async REST instance for warm-up and gap fills. Defaults to a
+        rate-limited spot instance.
+    history_window:
+        Bars returned per stream by ``warm_up`` (at least ``min_bars``).
+    stale_after_bars, ws_silence_s, watchdog_interval_s, mtf_barrier_s, queue_maxsize:
+        Watchdog and dispatch thresholds.
+    clock, sleep:
+        Wall clock in Unix seconds and the backoff sleep (injectable for tests).
     """
 
     def __init__(
@@ -51,6 +218,17 @@ class ExchangeFeedManager:
         event_bus: Any,
         normalizer: DataNormalizer | None = None,
         exchange_factories: dict[str, Any] | None = None,
+        *,
+        repository: MarketDataRepository | None = None,
+        rest_factory: RestFactory | None = None,
+        history_window: int = 1000,
+        stale_after_bars: int = 2,
+        ws_silence_s: float = 60.0,
+        watchdog_interval_s: float = 5.0,
+        mtf_barrier_s: float = 5.0,
+        queue_maxsize: int = 1024,
+        clock: Clock = time.time,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._event_bus = event_bus
         self._normalizer = normalizer or DataNormalizer()
@@ -58,6 +236,36 @@ class ExchangeFeedManager:
         self._exchanges: dict[str, Any] = {}
         self._tasks: dict[str, list[asyncio.Task[None]]] = {}
         self._running: dict[ExchangeId, bool] = {}
+        self._feeds: dict[str, _Feed] = {}
+        self._rest: dict[str, Any] = {}
+        self._rest_markets: dict[str, dict[str, Any]] = {}
+        self._warm_tails: dict[tuple[str, str, Timeframe], datetime] = {}
+        self._repository = repository
+        self._rest_factory = rest_factory or _default_rest_factory
+        self._history_window = history_window
+        self._stale_after_bars = stale_after_bars
+        self._ws_silence_s = ws_silence_s
+        self._watchdog_interval_s = watchdog_interval_s
+        self._mtf_barrier_s = mtf_barrier_s
+        self._queue_maxsize = queue_maxsize
+        self._clock = clock
+        self._sleep = sleep
+
+    @property
+    def history_window(self) -> int:
+        """Bars per stream that ``warm_up`` loads; live contexts keep this many."""
+        return self._history_window
+
+    def stale_reasons(self, exchange_id: str) -> dict[str, list[str]]:
+        """Current stale reasons by scope (``"*"`` = whole exchange, else ``symbol/tf``)."""
+        feed = self._feeds.get(exchange_id)
+        if feed is None:
+            return {}
+        return {
+            "*" if key == _EXCHANGE_SCOPE else f"{key[0]}/{key[1]}": sorted(reasons)
+            for key, reasons in feed.stale.items()
+            if reasons
+        }
 
     # ------------------------------------------------------------------
     # Connection management
@@ -69,69 +277,83 @@ class ExchangeFeedManager:
         symbols: list[str],
         timeframes: list[Timeframe],
     ) -> None:
-        """Start WebSocket streams for an exchange.
+        """Resolve the spot markets and start the watch, dispatch and watchdog tasks.
 
-        Creates asyncio tasks for each symbol/timeframe combination to
-        stream OHLCV bars and trades.
-
-        Parameters
-        ----------
-        exchange_id:
-            The exchange to connect to.
-        symbols:
-            Trading pair symbols to subscribe to.
-        timeframes:
-            Bar timeframes to stream.
+        Raises ``ValueError`` when a symbol is not exactly one active spot market.
         """
         if self._running.get(exchange_id, False):
             logger.warning("Already connected", exchange=exchange_id)
             return
 
         exchange = await self._get_or_create_exchange(exchange_id)
-        self._running[exchange_id] = True
-        self._tasks[exchange_id] = []
+        try:
+            markets = dict(await exchange.load_markets())
+            feed = self._build_feed(exchange_id, markets, symbols, timeframes)
+        except BaseException:
+            self._exchanges.pop(exchange_id, None)
+            with contextlib.suppress(Exception):
+                await exchange.close()
+            raise
 
-        # Start OHLCV streams
-        for symbol in symbols:
-            for timeframe in timeframes:
-                task = asyncio.create_task(
-                    self._watch_ohlcv_loop(exchange_id, exchange, symbol, timeframe),
-                    name=f"ohlcv-{exchange_id}-{symbol}-{timeframe}",
-                )
-                self._tasks[exchange_id].append(task)
-
-        # Start trade streams
-        for symbol in symbols:
-            task = asyncio.create_task(
-                self._watch_trades_loop(exchange_id, exchange, symbol),
-                name=f"trades-{exchange_id}-{symbol}",
+        for stream in feed.streams.values():
+            metrics.set_feed_bar_interval(
+                exchange_id, stream.symbol, str(stream.timeframe), stream.tf_s
             )
-            self._tasks[exchange_id].append(task)
+        self._feeds[exchange_id] = feed
+        self._running[exchange_id] = True
+        tasks = [
+            asyncio.create_task(self._watch_loop(feed), name=f"ohlcv-{exchange_id}"),
+            asyncio.create_task(self._dispatch_loop(feed), name=f"dispatch-{exchange_id}"),
+            asyncio.create_task(self._watchdog_loop(feed), name=f"watchdog-{exchange_id}"),
+        ]
+        if self._repository is not None:
+            tasks.append(
+                asyncio.create_task(self._persist_loop(feed), name=f"persist-{exchange_id}")
+            )
+        self._tasks[exchange_id] = tasks
 
         logger.info(
             "Exchange feed started",
             exchange=exchange_id,
             symbols=symbols,
             timeframes=[str(tf) for tf in timeframes],
-            tasks=len(self._tasks[exchange_id]),
+            persisting=self._repository is not None,
         )
 
     async def disconnect(self, exchange_id: ExchangeId) -> None:
-        """Gracefully close an exchange connection and cancel its tasks."""
+        """Stop the feed: cancel its tasks, persist bars already accepted, close clients."""
         self._running[exchange_id] = False
 
         tasks = self._tasks.pop(exchange_id, [])
+        persist = [t for t in tasks if t.get_name().startswith("persist-")]
         for task in tasks:
+            if task not in persist:
+                task.cancel()
+        feed = self._feeds.get(exchange_id)
+        if persist and feed is not None:
+            try:
+                await asyncio.wait_for(feed.persist_queue.join(), _PERSIST_DRAIN_S)
+            except TimeoutError:
+                logger.error(
+                    "Feed stopped with unpersisted closed bars",
+                    exchange=exchange_id,
+                    pending=feed.persist_queue.qsize(),
+                )
+        for task in persist:
             task.cancel()
-
-        # Wait for tasks to finish
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Close the exchange connection
-        exchange = self._exchanges.pop(exchange_id, None)
-        if exchange is not None and hasattr(exchange, "close"):
-            await exchange.close()
+        for instance in (self._exchanges.pop(exchange_id, None), self._rest.pop(exchange_id, None)):
+            if instance is not None and hasattr(instance, "close"):
+                with contextlib.suppress(Exception):
+                    await instance.close()
+        self._rest_markets.pop(exchange_id, None)
+
+        feed = self._feeds.pop(exchange_id, None)
+        if feed is not None:
+            for stream in feed.streams.values():
+                metrics.forget_feed(exchange_id, stream.symbol, str(stream.timeframe))
 
         logger.info("Exchange feed disconnected", exchange=exchange_id)
 
@@ -140,6 +362,101 @@ class ExchangeFeedManager:
         exchange_ids: list[ExchangeId] = list(self._running.keys())
         for eid in exchange_ids:
             await self.disconnect(eid)
+        for rest_id in list(self._rest):
+            rest = self._rest.pop(rest_id)
+            with contextlib.suppress(Exception):
+                await rest.close()
+
+    # ------------------------------------------------------------------
+    # Warm-up
+    # ------------------------------------------------------------------
+
+    async def warm_up(
+        self,
+        symbols: Sequence[str],
+        timeframes: Sequence[Timeframe],
+        min_bars: int,
+        *,
+        exchange_id: ExchangeId = "binance",
+    ) -> dict[tuple[str, Timeframe], list[OHLCV]]:
+        """Closed history per (symbol, timeframe), ending at the newest closed bar.
+
+        Reads up to ``max(history_window, min_bars)`` stored bars, fetches the missing tail
+        over REST, upserts it and reads the window back, so the context holds exactly the
+        stored rows a backtest would read. Without a repository the REST bars are returned
+        unpersisted. Raises ``InsufficientHistoryError`` below ``min_bars``.
+        """
+        window = max(self._history_window, min_bars)
+        now = datetime.fromtimestamp(self._clock(), UTC)
+        out: dict[tuple[str, Timeframe], list[OHLCV]] = {}
+        if self._repository is None:
+            logger.warning(
+                "Feed has no repository; warm-up bars are fetched over REST and not persisted",
+                exchange=exchange_id,
+            )
+        for symbol in symbols:
+            for timeframe in dict.fromkeys(timeframes):
+                bars = await self._warm_stream(exchange_id, symbol, timeframe, window, now)
+                if len(bars) < min_bars:
+                    raise InsufficientHistoryError(
+                        exchange_id, symbol, timeframe, len(bars), min_bars
+                    )
+                out[(symbol, timeframe)] = bars
+                if bars:
+                    self._seed_tail(exchange_id, symbol, timeframe, bars[-1].timestamp)
+                    for _ in bars:
+                        metrics.record_feed_bar(exchange_id, symbol, str(timeframe), "warmup")
+                    metrics.mark_closed_bar(
+                        exchange_id, symbol, str(timeframe), bars[-1].timestamp.timestamp()
+                    )
+        return out
+
+    async def _warm_stream(
+        self,
+        exchange_id: ExchangeId,
+        symbol: str,
+        timeframe: Timeframe,
+        window: int,
+        now: datetime,
+    ) -> list[OHLCV]:
+        end = last_closed_open(now, timeframe)
+        tf = timedelta(seconds=timeframe_seconds(timeframe))
+        repo = self._repository
+        stored: list[OHLCV] = []
+        if repo is not None:
+            stored = await repo.get_latest_bars(exchange_id, symbol, timeframe, window, end)
+            if len(stored) >= window and stored[-1].timestamp >= end:
+                return stored
+        start = stored[-1].timestamp + tf if len(stored) >= window else end - (window - 1) * tf
+        fetched = await self._fetch_rest(exchange_id, symbol, timeframe, start, end, now)
+        valid = [b for b in fetched if self._valid(exchange_id, symbol, b)]
+        logger.info(
+            "Warm-up REST fill",
+            exchange=exchange_id,
+            symbol=symbol,
+            timeframe=str(timeframe),
+            stored=len(stored),
+            fetched=len(valid),
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
+        if repo is None:
+            return valid[-window:]
+        if valid:
+            await repo.upsert_closed_bars([(exchange_id, symbol, timeframe, b) for b in valid])
+        return await repo.get_latest_bars(exchange_id, symbol, timeframe, window, end)
+
+    def _seed_tail(
+        self, exchange_id: ExchangeId, symbol: str, timeframe: Timeframe, tail: datetime
+    ) -> None:
+        self._warm_tails[(exchange_id, symbol, timeframe)] = tail
+        feed = self._feeds.get(exchange_id)
+        stream = feed.streams.get((symbol, timeframe)) if feed else None
+        if feed is not None and stream is not None:
+            stream.assembler.seed(tail)
+            if stream.delivered is None or tail > stream.delivered:
+                stream.delivered = tail
+            feed.resync_needed = True
 
     # ------------------------------------------------------------------
     # Internal: exchange lifecycle
@@ -155,136 +472,554 @@ class ExchangeFeedManager:
             self._exchanges[exchange_id] = factory()
         return self._exchanges[exchange_id]
 
-    # ------------------------------------------------------------------
-    # Internal: watch loops with auto-reconnect
-    # ------------------------------------------------------------------
+    async def _new_ws_instance(self, feed: _Feed) -> Any:
+        """Create a replacement WebSocket instance, reusing the loaded markets."""
+        exchange = await self._get_or_create_exchange(feed.exchange_id)
+        if hasattr(exchange, "set_markets"):
+            exchange.set_markets(feed.markets)
+        metrics.record_ws_reconnect(feed.exchange_id)
+        logger.info("Recreated exchange instance", exchange=feed.exchange_id)
+        return exchange
 
-    async def _recreate_exchange(self, exchange_id: ExchangeId) -> Any:
-        """Close and recreate a CCXT exchange instance to get fresh WebSocket state."""
-        old = self._exchanges.pop(exchange_id, None)
+    async def _drop_ws_instance(self, feed: _Feed) -> None:
+        old = self._exchanges.pop(feed.exchange_id, None)
         if old is not None and hasattr(old, "close"):
             with contextlib.suppress(Exception):
                 await old.close()
-        exchange = await self._get_or_create_exchange(exchange_id)
-        logger.info("Recreated exchange instance", exchange=exchange_id)
-        return exchange
 
-    async def _watch_ohlcv_loop(
+    async def _rest_exchange(self, exchange_id: str) -> tuple[Any, dict[str, Any]]:
+        rest = self._rest.get(exchange_id)
+        if rest is None:
+            rest = self._rest[exchange_id] = self._rest_factory(exchange_id)
+        markets = self._rest_markets.get(exchange_id)
+        if markets is None:
+            markets = self._rest_markets[exchange_id] = dict(await rest.load_markets())
+        return rest, markets
+
+    async def _fetch_rest(
         self,
         exchange_id: ExchangeId,
-        exchange: Any,
         symbol: str,
         timeframe: Timeframe,
-    ) -> None:
-        """Continuously watch OHLCV bars with exponential backoff reconnect."""
-        backoff = _INITIAL_BACKOFF_S
-        last_success = time.monotonic()
-        consecutive_errors = 0
+        start: datetime,
+        end: datetime,
+        now: datetime,
+        unified: str | None = None,
+    ) -> list[OHLCV]:
+        rest, markets = await self._rest_exchange(exchange_id)
+        unified = unified or resolve_spot_symbol(markets, symbol, exchange_id)
+        return await fetch_closed_bars(
+            rest,
+            unified,
+            timeframe,
+            start,
+            end,
+            exchange_id=exchange_id,
+            now=now,
+            sleep=self._sleep,
+        )
 
-        while self._running.get(exchange_id, False):
-            try:
-                ohlcv_data = await exchange.watch_ohlcv(symbol, str(timeframe))
-
-                # CCXT Pro returns list of [timestamp, o, h, l, c, v]
-                for raw_bar in ohlcv_data:
-                    ohlcv = self._normalizer.normalize_ohlcv(raw_bar, exchange_id)
-
-                    event = BarEvent(
-                        symbol=Symbol(symbol),
-                        timeframe=timeframe,
-                        ohlcv=ohlcv,
-                        exchange_id=exchange_id,
-                    )
-                    await self._event_bus.publish(event)
-
-                # Only reset backoff after sustained success
-                consecutive_errors = 0
-                if time.monotonic() - last_success >= _STABLE_THRESHOLD_S:
-                    backoff = _INITIAL_BACKOFF_S
-                last_success = time.monotonic()
-
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                consecutive_errors += 1
-                logger.warning(
-                    "OHLCV watch error, reconnecting",
-                    exchange=exchange_id,
-                    symbol=symbol,
-                    timeframe=str(timeframe),
-                    backoff=backoff,
-                    consecutive_errors=consecutive_errors,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * _BACKOFF_FACTOR, _MAX_BACKOFF_S)
-
-                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
-                    try:
-                        from hydra.core.metrics import record_ws_reconnect
-
-                        record_ws_reconnect(exchange_id)
-                    except Exception:
-                        pass
-                    exchange = await self._recreate_exchange(exchange_id)
-                    consecutive_errors = 0
-
-    async def _watch_trades_loop(
+    def _build_feed(
         self,
         exchange_id: ExchangeId,
-        exchange: Any,
-        symbol: str,
-    ) -> None:
-        """Continuously watch trades with exponential backoff reconnect."""
-        backoff = _INITIAL_BACKOFF_S
-        last_success = time.monotonic()
-        consecutive_errors = 0
-
-        while self._running.get(exchange_id, False):
-            try:
-                trades = await exchange.watch_trades(symbol)
-
-                for trade in trades:
-                    from decimal import Decimal
-
-                    side_str = trade.get("side", "buy").upper()
-                    side = Side.BUY if side_str == "BUY" else Side.SELL
-
-                    event = TradeEvent(
-                        symbol=Symbol(symbol),
-                        price=Decimal(str(trade.get("price", 0))),
-                        quantity=Decimal(str(trade.get("amount", 0))),
-                        side=side,
-                        exchange_id=exchange_id,
-                        trade_id=str(trade.get("id", "")),
-                    )
-                    await self._event_bus.publish(event)
-
-                # Only reset backoff after sustained success
-                consecutive_errors = 0
-                if time.monotonic() - last_success >= _STABLE_THRESHOLD_S:
-                    backoff = _INITIAL_BACKOFF_S
-                last_success = time.monotonic()
-
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                consecutive_errors += 1
-                logger.warning(
-                    "Trade watch error, reconnecting",
-                    exchange=exchange_id,
+        markets: dict[str, Any],
+        symbols: list[str],
+        timeframes: list[Timeframe],
+    ) -> _Feed:
+        now = self._clock()
+        streams: dict[StreamKey, _Stream] = {}
+        resync = False
+        for symbol in dict.fromkeys(symbols):
+            unified = resolve_spot_symbol(markets, symbol, exchange_id)
+            for timeframe in dict.fromkeys(timeframes):
+                tail = self._warm_tails.get((exchange_id, symbol, timeframe))
+                resync = resync or tail is not None
+                streams[(symbol, timeframe)] = _Stream(
                     symbol=symbol,
-                    backoff=backoff,
-                    consecutive_errors=consecutive_errors,
+                    unified=unified,
+                    timeframe=timeframe,
+                    tf_s=timeframe_seconds(timeframe),
+                    assembler=ClosedBarAssembler(timeframe, last_emitted=tail),
+                    started_at=now,
+                    delivered=tail,
                 )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * _BACKOFF_FACTOR, _MAX_BACKOFF_S)
+        if not streams:
+            msg = f"{exchange_id}: connect() needs at least one symbol and timeframe"
+            raise ValueError(msg)
+        return _Feed(
+            exchange_id=exchange_id,
+            streams=streams,
+            by_unified={(s.unified, str(s.timeframe)): s for s in streams.values()},
+            queue=asyncio.Queue(maxsize=self._queue_maxsize),
+            persist_queue=asyncio.Queue(),
+            markets=markets,
+            last_message=now,
+            resync_needed=resync,
+        )
 
-                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+    # ------------------------------------------------------------------
+    # Internal: watch loop
+    # ------------------------------------------------------------------
+
+    async def _watch_loop(self, feed: _Feed) -> None:
+        """Single watch loop for every stream of the exchange, with reconnect and backoff."""
+        eid = feed.exchange_id
+        backoff = _INITIAL_BACKOFF_S
+        consecutive_errors = 0
+        healthy_since: float | None = None
+
+        while self._running.get(eid, False):
+            try:
+                exchange = self._exchanges.get(eid)
+                if exchange is None:
+                    feed.reconnect_requested = False
+                    self._mark_disrupted(feed)
+                    exchange = await self._new_ws_instance(feed)
+                if feed.resync_needed:
+                    await self._resync(feed)
+                feed.pending_watch = asyncio.ensure_future(
+                    exchange.watch_ohlcv_for_symbols(feed.subscriptions)
+                )
+                result = await feed.pending_watch
+            except asyncio.CancelledError as exc:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                error: BaseException = exc
+            except Exception as exc:
+                error = exc
+            else:
+                now = self._clock()
+                consecutive_errors = 0
+                if healthy_since is None:
+                    healthy_since = now
+                elif now - healthy_since >= _STABLE_THRESHOLD_S:
+                    backoff = _INITIAL_BACKOFF_S
+                try:
+                    await self._on_watch_result(feed, result, now)
+                    await self._flush_expired(feed, now)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Failed to process watch result", exchange=eid)
+                continue
+
+            if not self._running.get(eid, False):
+                break
+            consecutive_errors += 1
+            healthy_since = None
+            self._mark_disrupted(feed)
+            forced = feed.reconnect_requested
+            logger.warning(
+                "OHLCV watch error, reconnecting",
+                exchange=eid,
+                error=type(error).__name__,
+                detail=str(error)[:200],
+                backoff=backoff,
+                consecutive_errors=consecutive_errors,
+                forced=forced,
+            )
+            if forced or consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                consecutive_errors = 0
+                await self._drop_ws_instance(feed)
+            wait = backoff
+            if error_is(error, "RateLimitExceeded", "DDoSProtection"):
+                wait = max(wait, _RATE_LIMIT_BACKOFF_S)
+            await self._sleep(wait)
+            backoff = min(backoff * _BACKOFF_FACTOR, _MAX_BACKOFF_S)
+
+    def _mark_disrupted(self, feed: _Feed) -> None:
+        """Updates may have been missed: drop held candles and refill over REST next."""
+        for stream in feed.streams.values():
+            held = stream.assembler.held
+            if held is not None and stream.delivered is None:
+                stream.refill_from = held.timestamp
+            stream.assembler.reset_after_reconnect()
+        feed.resync_needed = True
+
+    async def _on_watch_result(self, feed: _Feed, result: Any, now: float) -> None:
+        eid = feed.exchange_id
+        feed.last_message = now
+        for unified, by_timeframe in dict(result).items():
+            for tf_name, rows in dict(by_timeframe).items():
+                stream = feed.by_unified.get((unified, tf_name))
+                if stream is None:
+                    continue
+                metrics.mark_feed_message(eid, stream.symbol, tf_name, at=now)
+                bars: list[OHLCV] = []
+                for row in rows:
                     try:
-                        from hydra.core.metrics import record_ws_reconnect
+                        bars.append(self._normalizer.normalize_ohlcv(list(row), eid))
+                    except ValueError:
+                        metrics.record_feed_bar_rejected(eid, stream.symbol, "malformed")
+                        logger.warning("Malformed candle row", exchange=eid, row=repr(row))
+                assembled = stream.assembler.feed(bars)
+                for bar in assembled.closed:
+                    await self._fill_hole(feed, stream, bar.timestamp, now)
+                    await self._accept_closed(feed, stream, bar, source="ws", replay=False)
+                held = stream.assembler.held
+                if held is not None:
+                    await self._fill_hole(feed, stream, held.timestamp, now)
+                if assembled.latest_price is not None:
+                    self._offer_price(feed, stream, assembled.latest_price, now)
+        if not feed.resync_needed:
+            self._clear_stale(feed, _EXCHANGE_SCOPE, "ws_silence")
 
-                        record_ws_reconnect(exchange_id)
-                    except Exception:
-                        pass
-                    exchange = await self._recreate_exchange(exchange_id)
-                    consecutive_errors = 0
+    async def _fill_hole(self, feed: _Feed, stream: _Stream, until: datetime, now: float) -> None:
+        """REST-fill closed bars skipped between the last delivered bar and ``until``."""
+        start = stream.next_missing()
+        if start is None or until <= start:
+            return
+        end = until - timedelta(seconds=stream.tf_s)
+        try:
+            missed = await self._fetch_rest(
+                feed.exchange_id,
+                stream.symbol,
+                stream.timeframe,
+                start,
+                end,
+                datetime.fromtimestamp(now, UTC),
+                stream.unified,
+            )
+        except Exception:
+            logger.exception(
+                "Could not fill missed bars; they are skipped",
+                exchange=feed.exchange_id,
+                symbol=stream.symbol,
+                timeframe=str(stream.timeframe),
+                start=start.isoformat(),
+                end=end.isoformat(),
+            )
+            missed = []
+        for bar in missed:
+            await self._accept_closed(feed, stream, bar, source="rest_gap", replay=True)
+        stream.refill_from = None
+        if stream.delivered is None or end > stream.delivered:
+            stream.delivered = end
+
+    async def _resync(self, feed: _Feed) -> None:
+        """Fetch every stream's missed closed bars, then deliver them oldest first."""
+        await self._flush_all(feed)
+        now = self._clock()
+        now_dt = datetime.fromtimestamp(now, UTC)
+        pending: list[tuple[_Stream, OHLCV]] = []
+        fetched_to: dict[_Stream, datetime] = {}
+        for stream in feed.streams.values():
+            start = stream.next_missing()
+            if start is None:
+                continue
+            end = last_closed_open(now_dt, stream.timeframe)
+            if start > end:
+                continue
+            fetched_to[stream] = end
+            bars = await self._fetch_rest(
+                feed.exchange_id,
+                stream.symbol,
+                stream.timeframe,
+                start,
+                end,
+                now_dt,
+                stream.unified,
+            )
+            pending.extend((stream, bar) for bar in bars)
+
+        newest: dict[_Stream, datetime] = {}
+        for stream, bar in pending:
+            newest[stream] = max(bar.timestamp, newest.get(stream, bar.timestamp))
+        pending.sort(key=lambda p: (close_time(p[1].timestamp, p[0].timeframe), -p[0].tf_s))
+        for stream, bar in pending:
+            replay = bar.timestamp != newest[stream]
+            await self._accept_closed(feed, stream, bar, source="rest_gap", replay=replay)
+        for stream in feed.streams.values():
+            stream.refill_from = None
+        for stream, end in fetched_to.items():
+            if stream.delivered is None or end > stream.delivered:
+                stream.delivered = end
+        feed.resync_needed = False
+        if pending:
+            logger.info("Feed gap filled over REST", exchange=feed.exchange_id, bars=len(pending))
+        for stream in feed.streams.values():
+            self._check_overdue(feed, stream, now)
+
+    # ------------------------------------------------------------------
+    # Internal: closed-bar path
+    # ------------------------------------------------------------------
+
+    def _valid(self, exchange_id: str, symbol: str, bar: OHLCV) -> bool:
+        ok, errors = self._normalizer.validate_bar(bar)
+        if not ok:
+            metrics.record_feed_bar_rejected(exchange_id, symbol, _reject_reason(errors))
+            logger.warning(
+                "Rejected invalid closed bar",
+                exchange=exchange_id,
+                symbol=symbol,
+                timestamp=bar.timestamp.isoformat(),
+                errors=errors,
+            )
+        return ok
+
+    async def _accept_closed(
+        self, feed: _Feed, stream: _Stream, bar: OHLCV, *, source: str, replay: bool
+    ) -> None:
+        eid = feed.exchange_id
+        if source == "rest_gap":
+            stream.assembler.seed(bar.timestamp)
+        if stream.delivered is None or bar.timestamp > stream.delivered:
+            stream.delivered = bar.timestamp
+        if not self._valid(eid, stream.symbol, bar):
+            return
+        for anomaly in self._normalizer.detect_anomaly(bar, stream.previous):
+            metrics.record_feed_anomaly(eid, stream.symbol, _anomaly_kind(anomaly))
+            logger.warning(
+                "Closed bar anomaly",
+                exchange=eid,
+                symbol=stream.symbol,
+                timeframe=str(stream.timeframe),
+                timestamp=bar.timestamp.isoformat(),
+                anomaly=anomaly,
+            )
+        stream.previous = bar
+        tf_name = str(stream.timeframe)
+        metrics.record_feed_bar(eid, stream.symbol, tf_name, source)
+        metrics.mark_closed_bar(eid, stream.symbol, tf_name, bar.timestamp.timestamp())
+        if self._repository is not None:
+            feed.persist_queue.put_nowait((eid, stream.symbol, stream.timeframe, bar))
+        event = BarEvent(
+            symbol=Symbol(stream.symbol),
+            timeframe=stream.timeframe,
+            ohlcv=bar,
+            exchange_id=eid,
+            replay=replay,
+        )
+        if source == "ws":
+            await self._route(feed, stream, event, bar)
+            self._check_overdue(feed, stream, self._clock())
+        else:
+            await self._put(feed, event)
+
+    async def _route(self, feed: _Feed, stream: _Stream, event: BarEvent, bar: OHLCV) -> None:
+        """Hold a bar while a sibling timeframe still has a candle closing at the same time."""
+        closes = close_time(bar.timestamp, stream.timeframe)
+        key = (stream.symbol, closes)
+        waiting = any(
+            other is not stream
+            and other.symbol == stream.symbol
+            and other.assembler.held is not None
+            and close_time(other.assembler.held.timestamp, other.timeframe) == closes
+            for other in feed.streams.values()
+        )
+        group = feed.parked.get(key)
+        if waiting:
+            if group is None:
+                group = feed.parked[key] = _Parked(deadline=self._clock() + self._mtf_barrier_s)
+            group.events.append((stream.tf_s, event))
+            return
+        if group is None:
+            await self._put(feed, event)
+            return
+        group.events.append((stream.tf_s, event))
+        await self._flush(feed, key)
+
+    async def _flush(self, feed: _Feed, key: tuple[str, datetime]) -> None:
+        group = feed.parked.pop(key, None)
+        if group is None:
+            return
+        for _, event in sorted(group.events, key=lambda item: -item[0]):
+            await self._put(feed, event)
+
+    async def _flush_expired(self, feed: _Feed, now: float) -> None:
+        for key in [k for k, group in feed.parked.items() if now >= group.deadline]:
+            await self._flush(feed, key)
+
+    async def _flush_all(self, feed: _Feed) -> None:
+        for key in sorted(feed.parked, key=lambda k: k[1]):
+            await self._flush(feed, key)
+
+    def _offer_price(self, feed: _Feed, stream: _Stream, price: Decimal, now: float) -> None:
+        if now - feed.last_price_at.get(stream.symbol, float("-inf")) < _PRICE_INTERVAL_S:
+            return
+        feed.last_price_at[stream.symbol] = now
+        self._offer(
+            feed,
+            PriceEvent(symbol=Symbol(stream.symbol), price=price, exchange_id=feed.exchange_id),
+        )
+
+    # ------------------------------------------------------------------
+    # Internal: dispatch queue
+    # ------------------------------------------------------------------
+
+    async def _put(self, feed: _Feed, event: Event) -> None:
+        """Enqueue a bar; when the queue is full the consumer is lagging, so wait for room."""
+        if feed.queue.full():
+            logger.error(
+                "Feed dispatch queue full; waiting for the consumer",
+                exchange=feed.exchange_id,
+                size=feed.queue.qsize(),
+            )
+            self._set_stale(feed, _EXCHANGE_SCOPE, "consumer_lag", 0.0)
+        await feed.queue.put((self._clock(), event))
+
+    def _offer(self, feed: _Feed, event: Event) -> bool:
+        """Enqueue a price or status event; False when the full queue dropped it."""
+        try:
+            feed.queue.put_nowait((self._clock(), event))
+        except asyncio.QueueFull:
+            logger.warning(
+                "Feed dispatch queue full; dropped event",
+                exchange=feed.exchange_id,
+                event_type=event.event_type,
+            )
+            return False
+        return True
+
+    async def _dispatch_loop(self, feed: _Feed) -> None:
+        while True:
+            enqueued_at, event = await feed.queue.get()
+            feed.inflight_since = enqueued_at
+            try:
+                await self._event_bus.publish(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Feed event dispatch failed",
+                    exchange=feed.exchange_id,
+                    event_type=event.event_type,
+                )
+            finally:
+                feed.inflight_since = None
+
+    # ------------------------------------------------------------------
+    # Internal: persistence
+    # ------------------------------------------------------------------
+
+    async def _persist_loop(self, feed: _Feed) -> None:
+        repo = self._repository
+        if repo is None:
+            return
+        while True:
+            batch = [await feed.persist_queue.get()]
+            while not feed.persist_queue.empty() and len(batch) < _PERSIST_BATCH:
+                batch.append(feed.persist_queue.get_nowait())
+            try:
+                await self._persist_batch(feed, repo, batch)
+            finally:
+                for _ in batch:
+                    feed.persist_queue.task_done()
+
+    async def _persist_batch(
+        self, feed: _Feed, repo: MarketDataRepository, batch: list[PersistRow]
+    ) -> None:
+        for attempt in range(1, _PERSIST_ATTEMPTS + 1):
+            try:
+                await repo.upsert_closed_bars(batch)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                metrics.record_feed_persist_error(feed.exchange_id)
+                last = attempt == _PERSIST_ATTEMPTS
+                logger.exception(
+                    "Closed-bar persist failed" + ("; dropping batch" if last else ""),
+                    exchange=feed.exchange_id,
+                    bars=len(batch),
+                    attempt=attempt,
+                )
+                if not last:
+                    await self._sleep(_PERSIST_BACKOFF_S * 2 ** (attempt - 1))
+
+    # ------------------------------------------------------------------
+    # Internal: watchdog and feed status
+    # ------------------------------------------------------------------
+
+    async def _watchdog_loop(self, feed: _Feed) -> None:
+        while self._running.get(feed.exchange_id, False):
+            await asyncio.sleep(self._watchdog_interval_s)
+            try:
+                await self._watchdog_tick(feed)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Feed watchdog tick failed", exchange=feed.exchange_id)
+
+    async def _watchdog_tick(self, feed: _Feed) -> None:
+        now = self._clock()
+        silence = now - feed.last_message
+        recently_forced = (
+            feed.last_forced_close is not None
+            and now - feed.last_forced_close <= self._ws_silence_s
+        )
+        if silence > self._ws_silence_s and not recently_forced:
+            self._set_stale(feed, _EXCHANGE_SCOPE, "ws_silence", silence)
+            feed.reconnect_requested = True
+            feed.last_forced_close = now
+            await self._drop_ws_instance(feed)
+            if feed.pending_watch is not None and not feed.pending_watch.done():
+                feed.pending_watch.cancel()
+
+        for stream in feed.streams.values():
+            self._check_overdue(feed, stream, now)
+
+        if feed.inflight_since is not None and now - feed.inflight_since > feed.min_tf_s:
+            self._set_stale(feed, _EXCHANGE_SCOPE, "consumer_lag", now - feed.inflight_since)
+        elif feed.inflight_since is None and not feed.queue.full():
+            self._clear_stale(feed, _EXCHANGE_SCOPE, "consumer_lag")
+
+        await self._flush_expired(feed, now)
+
+    def _check_overdue(self, feed: _Feed, stream: _Stream, now: float) -> None:
+        last = stream.assembler.last_emitted
+        if last is not None:
+            age = now - close_time(last, stream.timeframe).timestamp()
+        else:
+            age = now - stream.started_at - stream.tf_s
+        key: StatusKey = (stream.symbol, stream.timeframe)
+        if age > self._stale_after_bars * stream.tf_s:
+            self._set_stale(feed, key, "bar_overdue", age)
+        else:
+            self._clear_stale(feed, key, "bar_overdue")
+
+    def _set_stale(self, feed: _Feed, key: StatusKey, reason: str, age: float) -> None:
+        reasons = feed.stale.setdefault(key, set())
+        if reason in reasons:
+            return
+        reasons.add(reason)
+        logger.warning(
+            "Market data feed stale",
+            exchange=feed.exchange_id,
+            symbol=key[0] or None,
+            timeframe=str(key[1]) if key[1] else None,
+            reason=reason,
+            age_seconds=round(age, 1),
+        )
+        if not self._offer(feed, self._status_event(feed, key, "stale", reason, age)):
+            reasons.discard(reason)
+
+    def _clear_stale(self, feed: _Feed, key: StatusKey, reason: str) -> None:
+        reasons = feed.stale.get(key)
+        if not reasons or reason not in reasons:
+            return
+        reasons.discard(reason)
+        if reasons:
+            return
+        logger.info(
+            "Market data feed live",
+            exchange=feed.exchange_id,
+            symbol=key[0] or None,
+            timeframe=str(key[1]) if key[1] else None,
+            recovered_from=reason,
+        )
+        self._offer(feed, self._status_event(feed, key, "live", reason, 0.0))
+
+    @staticmethod
+    def _status_event(
+        feed: _Feed, key: StatusKey, status: str, reason: str, age: float
+    ) -> FeedStatusEvent:
+        return FeedStatusEvent(
+            exchange_id=feed.exchange_id,
+            symbol=Symbol(key[0]),
+            timeframe=key[1],
+            status="stale" if status == "stale" else "live",
+            reason=reason,
+            age_seconds=age,
+        )

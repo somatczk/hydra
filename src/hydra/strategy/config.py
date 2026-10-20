@@ -78,6 +78,15 @@ class StrategyConfig(BaseModel):
     schedule: ScheduleConfig | None = None
     ml_overlay: MLOverlayConfig | None = None
 
+    def all_timeframes(self) -> list[Timeframe]:
+        """Primary, confirmation and entry timeframes, deduplicated, in that order."""
+        declared = (self.timeframes.primary, self.timeframes.confirmation, self.timeframes.entry)
+        out: list[Timeframe] = []
+        for tf in declared:
+            if tf is not None and tf not in out:
+                out.append(tf)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # YAML loading helpers
