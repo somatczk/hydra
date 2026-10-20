@@ -146,7 +146,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Drawdown %",
-      "description": "Current drawdown from peak as percentage",
+      "description": "Current drawdown from peak equity (metric is a fraction, 0.05 = 5%)",
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
@@ -166,13 +166,15 @@
             "showPoints": "never",
             "spanNulls": true
           },
-          "unit": "percent",
+          "unit": "percentunit",
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "yellow", "value": 5 },
-              { "color": "red", "value": 10 }
+              { "color": "yellow", "value": 0.03 },
+              { "color": "orange", "value": 0.05 },
+              { "color": "red", "value": 0.10 },
+              { "color": "dark-red", "value": 0.15 }
             ]
           }
         },
@@ -235,7 +237,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "avg_over_time(hydra_daily_pnl[30d]) / stddev_over_time(hydra_daily_pnl[30d]) * sqrt(365)",
+          "expr": "avg_over_time(hydra_daily_pnl[30d]) / stddev_over_time(hydra_daily_pnl[30d]) * 19.1049731745",
           "legendFormat": "Sharpe (30d rolling)"
         }
       ],
@@ -386,30 +388,30 @@
     {
       "id": 9,
       "type": "state-timeline",
-      "title": "Circuit Breaker Status",
-      "description": "State of each circuit breaker tier over time",
+      "title": "Drawdown vs Breaker Tiers",
+      "description": "Drawdown against each circuit breaker tier threshold (not live breaker state)",
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "hydra_drawdown_pct > bool 5",
-          "legendFormat": "Tier 1 (5%)"
+          "expr": "hydra_drawdown_pct >= bool 0.03",
+          "legendFormat": "Tier 1 (3%)"
         },
         {
           "refId": "B",
-          "expr": "hydra_drawdown_pct > bool 10",
-          "legendFormat": "Tier 2 (10%)"
+          "expr": "hydra_drawdown_pct >= bool 0.05",
+          "legendFormat": "Tier 2 (5%)"
         },
         {
           "refId": "C",
-          "expr": "hydra_drawdown_pct > bool 15",
-          "legendFormat": "Tier 3 (15%)"
+          "expr": "hydra_drawdown_pct >= bool 0.10",
+          "legendFormat": "Tier 3 (10%)"
         },
         {
           "refId": "D",
-          "expr": "hydra_drawdown_pct > bool 20",
-          "legendFormat": "Tier 4 (20%)"
+          "expr": "hydra_drawdown_pct >= bool 0.15",
+          "legendFormat": "Tier 4 (15%)"
         }
       ],
       "fieldConfig": {
@@ -423,8 +425,8 @@
             ]
           },
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "Normal", "color": "green" } } },
-            { "type": "value", "options": { "1": { "text": "Triggered", "color": "red" } } }
+            { "type": "value", "options": { "0": { "text": "Below", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "At/above threshold", "color": "red" } } }
           ]
         },
         "overrides": []
@@ -452,17 +454,18 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percent",
+          "unit": "percentunit",
           "min": 0,
-          "max": 25,
+          "max": 0.20,
           "color": { "mode": "thresholds" },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "#EAB839", "value": 5 },
-              { "color": "orange", "value": 10 },
-              { "color": "red", "value": 15 }
+              { "color": "#EAB839", "value": 0.03 },
+              { "color": "orange", "value": 0.05 },
+              { "color": "red", "value": 0.10 },
+              { "color": "dark-red", "value": 0.15 }
             ]
           }
         },
@@ -624,7 +627,7 @@
         "overrides": [
           {
             "matcher": { "id": "byName", "options": "RSS (MB)" },
-            "properties": [{ "id": "unit", "value": "decmbytes" }]
+            "properties": [{ "id": "unit", "value": "mbytes" }]
           },
           {
             "matcher": { "id": "byName", "options": "CPU %" },
