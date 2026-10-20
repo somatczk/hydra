@@ -10,16 +10,24 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import UTC, datetime, timedelta
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request, Response, UploadFile, status
+from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 
-from hydra.core.types import OHLCV, Timeframe
+from hydra.backtest.data import (
+    DataProvenance,
+    InvalidMarketDataError,
+    NoMarketDataError,
+    load_latest_bars,
+)
+from hydra.core.types import ExchangeId, Timeframe
+from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
+from hydra.data.storage import MarketDataRepository
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 logger = logging.getLogger(__name__)
@@ -41,9 +49,7 @@ _VALID_EXCHANGES = {"binance", "bybit", "kraken", "okx"}
 
 
 _STRATEGY_DESCRIPTIONS: dict[str, str] = {
-    "LSTM Momentum": "ML-based momentum strategy using LSTM predictions on 1h BTC/USDT",
     "Mean Reversion": "RSI-based mean reversion with Bollinger Band confirmation",
-    "Funding Arbitrage": "Cross-exchange funding rate arbitrage between perpetual swaps",
     "Breakout Scanner": "Volume-weighted breakout detection across multiple timeframes",
 }
 _DEFAULT_DESCRIPTION = "Custom strategy"
@@ -62,7 +68,8 @@ def _name_to_id(name: str) -> str:
     return slug or "strategy"
 
 
-def _parse_any_strategy_yaml(path: Path) -> dict[str, Any] | None:
+def parse_strategy_file(path: Path) -> dict[str, Any] | None:
+    """Read a strategy YAML file; None if unreadable or not a mapping."""
     try:
         with path.open() as f:
             data = yaml.safe_load(f)
@@ -73,7 +80,7 @@ def _parse_any_strategy_yaml(path: Path) -> dict[str, Any] | None:
 
 def _parse_strategy_yaml(path: Path) -> dict[str, Any] | None:
     """Read a YAML strategy file, returning None if not a RuleBasedStrategy."""
-    data = _parse_any_strategy_yaml(path)
+    data = parse_strategy_file(path)
     if data is None:
         return None
     if data.get("strategy_class") != _RULE_BASED_CLASS:
@@ -81,26 +88,34 @@ def _parse_strategy_yaml(path: Path) -> dict[str, Any] | None:
     return data
 
 
-def _find_strategy_file(strategy_id: str) -> Path | None:
+def iter_strategy_yamls() -> Iterator[tuple[Path, dict[str, Any]]]:
+    """Yield ``(path, data)`` for every readable strategy YAML, read from the dir at call time."""
     if not _CONFIG_DIR.is_dir():
-        return None
-    for path in _CONFIG_DIR.glob("*.yaml"):
-        data = _parse_any_strategy_yaml(path)
-        if data is not None and data.get("id") == strategy_id:
+        return
+    for path in sorted(_CONFIG_DIR.glob("*.yaml")):
+        data = parse_strategy_file(path)
+        if data is not None:
+            yield path, data
+
+
+def find_strategy_file(strategy_id: str) -> Path | None:
+    for path, data in iter_strategy_yamls():
+        if data.get("id") == strategy_id:
             return path
     return None
 
 
 def build_strategy_name_map() -> dict[str, str]:
     """Return {strategy_id: friendly_name} from all YAML configs."""
-    name_map: dict[str, str] = {}
-    if not _CONFIG_DIR.is_dir():
-        return name_map
-    for path in _CONFIG_DIR.glob("*.yaml"):
-        data = _parse_any_strategy_yaml(path)
-        if data is not None and "id" in data:
-            name_map[data["id"]] = data.get("name", data["id"])
-    return name_map
+    return {
+        data["id"]: data.get("name", data["id"])
+        for _, data in iter_strategy_yamls()
+        if "id" in data
+    }
+
+
+def _strategy_not_found(strategy_id: str) -> HTTPException:
+    return api_error(404, "strategy_not_found", f"Strategy {strategy_id} not found", "not_found")
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +210,8 @@ class RiskInput(BaseModel):
 
 class PreviewRequest(BaseModel):
     rules: RuleSetInput
-    timeframe: str = "1h"
+    timeframe: Timeframe = Timeframe.H1
+    exchange_id: ExchangeId = "binance"
     symbol: str = "BTCUSDT"
     bars_count: int = Field(default=200, ge=50, le=1000)
 
@@ -212,9 +228,21 @@ class MetricsOutput(BaseModel):
     pnl: float
 
 
+class PreviewProvenance(BaseModel):
+    exchange: str
+    symbol: str
+    timeframe: str
+    bar_count: int
+    first_ts: str
+    last_ts: str
+    gap_count: int
+    data_source: str
+
+
 class PreviewResponse(BaseModel):
     signals: list[SignalOutput]
     metrics: MetricsOutput
+    provenance: PreviewProvenance
 
 
 class SaveRequest(BaseModel):
@@ -259,39 +287,6 @@ class StrategyDetailResponse(BaseModel):
     risk: RiskInput = Field(default_factory=RiskInput)
     performance: StrategyPerformance = Field(default_factory=StrategyPerformance)
     ml_overlay: dict[str, Any] | None = None
-
-
-# ---------------------------------------------------------------------------
-# In-memory placeholder data (fallback when DB is not available)
-# ---------------------------------------------------------------------------
-
-_STRATEGIES: dict[str, dict[str, Any]] = {
-    "strat-1": {
-        "id": "strat-1",
-        "name": "LSTM Momentum",
-        "description": "ML-based momentum strategy using LSTM predictions on 1h BTC/USDT",
-        "status": "Active",
-        "enabled": True,
-        "editable": False,
-        "config_yaml": "strategy:\n  type: lstm_momentum\n  timeframe: 1h\n",
-        "performance": {
-            "total_pnl": 1240.50,
-            "win_rate": 68.7,
-            "total_trades": 32,
-            "sharpe_ratio": 1.84,
-            "max_drawdown": 8.2,
-        },
-    },
-}
-
-
-def _get_strategy(strategy_id: str) -> dict[str, Any]:
-    if strategy_id not in _STRATEGIES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Strategy {strategy_id} not found",
-        )
-    return _STRATEGIES[strategy_id]
 
 
 def _row_to_strategy(row: Any) -> dict[str, Any]:
@@ -373,34 +368,6 @@ def _validate_rules(rules: RuleSetInput) -> Any:
     )
 
 
-def _generate_sample_bars(count: int) -> list[OHLCV]:
-    import numpy as np
-
-    rng = np.random.default_rng(42)
-    base_price = 42000.0
-    bars: list[OHLCV] = []
-    price = base_price
-    for i in range(count):
-        change = rng.normal(0, 0.005)
-        price = max(price * (1 + change), 100.0)
-        intra_vol = abs(rng.normal(0, 0.003))
-        open_price = price * (1 + rng.normal(0, 0.001))
-        high_price = max(price, open_price) * (1 + intra_vol)
-        low_price = min(price, open_price) * (1 - intra_vol)
-        volume = abs(rng.normal(1000, 200))
-        bars.append(
-            OHLCV(
-                open=Decimal(str(round(open_price, 2))),
-                high=Decimal(str(round(high_price, 2))),
-                low=Decimal(str(round(low_price, 2))),
-                close=Decimal(str(round(price, 2))),
-                volume=Decimal(str(round(volume, 2))),
-                timestamp=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(hours=i),
-            )
-        )
-    return bars
-
-
 def _to_condition_group_input(group_data: dict[str, Any] | None) -> ConditionGroupInput | None:
     if group_data is None:
         return None
@@ -461,37 +428,35 @@ async def list_strategies(request: Request) -> list[dict[str, Any]]:
     """List all strategy configs from YAML files, merged with DB performance."""
     # 1. Scan YAML files for strategy definitions
     strategies: dict[str, dict[str, Any]] = {}
-    if _CONFIG_DIR.is_dir():
-        for path in _CONFIG_DIR.glob("*.yaml"):
-            data = _parse_any_strategy_yaml(path)
-            if data is None or "id" not in data:
-                continue
-            sid = data["id"]
-            name = data.get("name", sid)
-            enabled = data.get("enabled", False)
-            strategy_class = data.get("strategy_class", "")
-            strategies[sid] = {
-                "id": sid,
-                "name": name,
-                "description": data.get("parameters", {}).get("description")
-                or _STRATEGY_DESCRIPTIONS.get(name, _DEFAULT_DESCRIPTION),
-                "status": _status_from_enabled(enabled),
-                "enabled": enabled,
-                "editable": strategy_class == _RULE_BASED_CLASS,
-                "config_yaml": "",
-                "performance": {
-                    "total_pnl": 0.0,
-                    "win_rate": 0.0,
-                    "total_trades": 0,
-                    "sharpe_ratio": 0.0,
-                    "max_drawdown": 0.0,
-                },
-            }
+    for _, data in iter_strategy_yamls():
+        if "id" not in data:
+            continue
+        sid = data["id"]
+        name = data.get("name", sid)
+        enabled = data.get("enabled", False)
+        strategy_class = data.get("strategy_class", "")
+        strategies[sid] = {
+            "id": sid,
+            "name": name,
+            "description": data.get("parameters", {}).get("description")
+            or _STRATEGY_DESCRIPTIONS.get(name, _DEFAULT_DESCRIPTION),
+            "status": _status_from_enabled(enabled),
+            "enabled": enabled,
+            "editable": strategy_class == _RULE_BASED_CLASS,
+            "config_yaml": "",
+            "performance": {
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
+                "total_trades": 0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+            },
+        }
 
     # 2. Overlay DB performance stats
     pool = _pool_from_request(request)
-    if pool is not None:
-        try:
+    if pool is not None and strategies:
+        async with db_errors_to_503("loading strategy performance"):
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT strategy_id, "
@@ -512,11 +477,6 @@ async def list_strategies(request: Request) -> list[dict[str, Any]]:
                         "win_rate": round(float(row["win_rate"]), 1),
                         "total_trades": row["total_trades"],
                     }
-        except Exception:
-            logger.exception("Failed to fetch strategy performance from DB")
-
-    if not strategies:
-        return list(_STRATEGIES.values())
 
     return list(strategies.values())
 
@@ -581,13 +541,27 @@ async def list_comparators() -> list[dict[str, str]]:
     ]
 
 
+async def _fetch_trade_performance(pool: Any, strategy_id: str) -> Any:
+    async with db_errors_to_503("loading strategy performance"), pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
+            "COUNT(id) AS total_trades, "
+            "COALESCE("
+            "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
+            "  / NULLIF(COUNT(id), 0) * 100, 0"
+            ") AS win_rate "
+            "FROM trades WHERE strategy_id = $1",
+            strategy_id,
+        )
+
+
 @router.get("/{strategy_id}", response_model=StrategyDetailResponse)
 async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
     """Get a single strategy detail with structured builder fields."""
     # Try YAML first
-    path = _find_strategy_file(strategy_id)
+    path = find_strategy_file(strategy_id)
     if path is not None:
-        data = _parse_any_strategy_yaml(path)
+        data = parse_strategy_file(path)
         if data is not None:
             name = data.get("name", strategy_id)
             enabled = data.get("enabled", False)
@@ -616,56 +590,34 @@ async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
             # Overlay DB performance
             pool = _pool_from_request(request)
             if pool is not None:
-                try:
-                    async with pool.acquire() as conn:
-                        row = await conn.fetchrow(
-                            "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
-                            "COUNT(id) AS total_trades, "
-                            "COALESCE("
-                            "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
-                            "  / NULLIF(COUNT(id), 0) * 100, 0"
-                            ") AS win_rate "
-                            "FROM trades WHERE strategy_id = $1",
-                            strategy_id,
-                        )
-                    if row:
-                        result["performance"] = {
-                            **result["performance"],
-                            "total_pnl": round(float(row["total_pnl"]), 2),
-                            "win_rate": round(float(row["win_rate"]), 1),
-                            "total_trades": row["total_trades"],
-                        }
-                except Exception:
-                    logger.exception("Failed to fetch performance for %s", strategy_id)
+                row = await _fetch_trade_performance(pool, strategy_id)
+                if row:
+                    result["performance"] = {
+                        **result["performance"],
+                        "total_pnl": round(float(row["total_pnl"]), 2),
+                        "win_rate": round(float(row["win_rate"]), 1),
+                        "total_trades": row["total_trades"],
+                    }
             return result
 
-    # Fallback to DB / in-memory
+    # No YAML: the strategy may only exist in trading-session history
     pool = _pool_from_request(request)
     if pool is None:
-        return _get_strategy(strategy_id)
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                _STRATEGIES_QUERY + " HAVING ts.strategy_id = $1",
-                strategy_id,
-            )
-        if row is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Strategy {strategy_id} not found",
-            )
-        return _row_to_strategy(row)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Failed to fetch strategy %s from DB", strategy_id)
-        return _get_strategy(strategy_id)
+        raise _strategy_not_found(strategy_id)
+    async with db_errors_to_503("loading the strategy"), pool.acquire() as conn:
+        row = await conn.fetchrow(
+            _STRATEGIES_QUERY + " HAVING ts.strategy_id = $1",
+            strategy_id,
+        )
+    if row is None:
+        raise _strategy_not_found(strategy_id)
+    return _row_to_strategy(row)
 
 
 @router.put("/{strategy_id}", response_model=SaveResponse)
 async def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
     """Update a rule-based strategy config (structured payload -> YAML)."""
-    path = _find_strategy_file(strategy_id)
+    path = find_strategy_file(strategy_id)
     if path is None:
         raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
 
@@ -743,39 +695,19 @@ async def get_strategy_performance(strategy_id: str, request: Request) -> dict[s
         "max_drawdown": 0.0,
     }
 
-    # Check YAML or in-memory existence
-    path = _find_strategy_file(strategy_id)
-    if path is None and strategy_id not in _STRATEGIES:
-        raise HTTPException(status_code=404, detail=f"Strategy {strategy_id} not found")
+    if find_strategy_file(strategy_id) is None:
+        raise _strategy_not_found(strategy_id)
 
-    # If in-memory fallback has performance, use it as base
-    if strategy_id in _STRATEGIES:
-        default_perf = _STRATEGIES[strategy_id].get("performance", default_perf)
-
-    # Overlay DB performance if available
     pool = _pool_from_request(request)
     if pool is not None:
-        try:
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
-                    "COUNT(id) AS total_trades, "
-                    "COALESCE("
-                    "  COUNT(CASE WHEN pnl > 0 THEN 1 END)::float "
-                    "  / NULLIF(COUNT(id), 0) * 100, 0"
-                    ") AS win_rate "
-                    "FROM trades WHERE strategy_id = $1",
-                    strategy_id,
-                )
-            if row and row["total_trades"] > 0:
-                return {
-                    **default_perf,
-                    "total_pnl": round(float(row["total_pnl"]), 2),
-                    "win_rate": round(float(row["win_rate"]), 1),
-                    "total_trades": row["total_trades"],
-                }
-        except Exception:
-            logger.exception("Failed to fetch performance for %s", strategy_id)
+        row = await _fetch_trade_performance(pool, strategy_id)
+        if row and row["total_trades"] > 0:
+            return {
+                **default_perf,
+                "total_pnl": round(float(row["total_pnl"]), 2),
+                "win_rate": round(float(row["win_rate"]), 1),
+                "total_trades": row["total_trades"],
+            }
 
     return default_perf
 
@@ -783,7 +715,7 @@ async def get_strategy_performance(strategy_id: str, request: Request) -> dict[s
 @router.delete("/{strategy_id}")
 async def delete_strategy(strategy_id: str) -> Response:
     """Delete a saved strategy."""
-    path = _find_strategy_file(strategy_id)
+    path = find_strategy_file(strategy_id)
     if path is None:
         raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
     try:
@@ -797,9 +729,9 @@ async def delete_strategy(strategy_id: str) -> Response:
 async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
     """Toggle enabled flag of a strategy."""
     # Try YAML file first
-    path = _find_strategy_file(strategy_id)
+    path = find_strategy_file(strategy_id)
     if path is not None:
-        data = _parse_any_strategy_yaml(path)
+        data = parse_strategy_file(path)
         if data is not None:
             data["enabled"] = not data.get("enabled", False)
             try:
@@ -809,11 +741,7 @@ async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
             return {"id": strategy_id, "enabled": data["enabled"]}
 
-    # Fall back to in-memory
-    strat = _get_strategy(strategy_id)
-    strat["enabled"] = not strat["enabled"]
-    strat["status"] = _status_from_enabled(strat["enabled"])
-    return {"id": strategy_id, "enabled": strat["enabled"]}
+    raise _strategy_not_found(strategy_id)
 
 
 # ---------------------------------------------------------------------------
@@ -822,32 +750,42 @@ async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
 
 
 @router.post("/preview", response_model=PreviewResponse)
-async def preview_signals(request: PreviewRequest) -> PreviewResponse:
-    """Run a quick backtest on sample data and return signals and metrics."""
-    try:
-        rule_set = _validate_rules(request.rules)
-    except (ValueError, KeyError) as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid rules: {exc}") from exc
+async def preview_signals(body: PreviewRequest, request: Request) -> PreviewResponse:
+    """Run a quick backtest on the latest stored bars and return signals and metrics.
 
-    if request.timeframe not in _VALID_TIMEFRAMES:
-        raise HTTPException(status_code=422, detail=f"Invalid timeframe: {request.timeframe}")
+    ``metrics.win_rate`` is a fraction (0-1), unlike the percentage in backtest results.
+    """
+    try:
+        rule_set = _validate_rules(body.rules)
+    except (ValueError, KeyError) as exc:
+        raise api_error(422, "invalid_rules", f"Invalid rules: {exc}", "invalid") from exc
+
+    pool = require_pool(request)
+    repo = MarketDataRepository.from_pool(pool)
+    try:
+        async with db_errors_to_503("loading market data for preview"):
+            bars, provenance = await load_latest_bars(
+                repo, body.exchange_id, body.symbol, body.timeframe, body.bars_count
+            )
+    except NoMarketDataError as exc:
+        raise HTTPException(status_code=422, detail=exc.to_detail()) from exc
+    except InvalidMarketDataError as exc:
+        raise api_error(422, "invalid_market_data", str(exc), "invalid") from exc
 
     from hydra.backtest.runner import BacktestRunner
     from hydra.strategy.builtin.rule_based import RuleBasedStrategy
     from hydra.strategy.config import ExchangeStrategyConfig, StrategyConfig, TimeframeConfig
 
-    strategy_id = f"preview_{uuid.uuid4().hex[:8]}"
     config = StrategyConfig(
-        id=strategy_id,
+        id=f"preview_{uuid.uuid4().hex[:8]}",
         name="Preview Strategy",
         strategy_class=_RULE_BASED_CLASS,
-        symbols=[request.symbol],
-        exchange=ExchangeStrategyConfig(exchange_id="binance"),
-        timeframes=TimeframeConfig(primary=Timeframe(request.timeframe)),
+        symbols=[body.symbol],
+        exchange=ExchangeStrategyConfig(exchange_id=body.exchange_id),
+        timeframes=TimeframeConfig(primary=body.timeframe),
         parameters={"rules": rule_set.model_dump(), "required_history": 50},
     )
 
-    bars = _generate_sample_bars(request.bars_count)
     runner = BacktestRunner()
     try:
         result = await runner.run(
@@ -855,8 +793,8 @@ async def preview_signals(request: PreviewRequest) -> PreviewResponse:
             strategy_config=config,
             bars=bars,
             initial_capital=Decimal("100000"),
-            symbol=request.symbol,
-            timeframe=Timeframe(request.timeframe),
+            symbol=body.symbol,
+            timeframe=body.timeframe,
         )
     except Exception as exc:
         logger.exception("Preview backtest failed")
@@ -885,7 +823,23 @@ async def preview_signals(request: PreviewRequest) -> PreviewResponse:
         win_rate=float(result.win_rate),
         pnl=round(total_pnl, 2),
     )
-    return PreviewResponse(signals=signals, metrics=metrics)
+    return PreviewResponse(
+        signals=signals, metrics=metrics, provenance=_preview_provenance(provenance)
+    )
+
+
+def _preview_provenance(provenance: DataProvenance) -> PreviewProvenance:
+    data = provenance.to_dict()
+    return PreviewProvenance(
+        exchange=data["exchange"],
+        symbol=data["symbol"],
+        timeframe=data["timeframe"],
+        bar_count=data["bar_count"],
+        first_ts=data["first_ts"],
+        last_ts=data["last_ts"],
+        gap_count=data["gap_count"],
+        data_source=data["data_source"],
+    )
 
 
 @router.post("/save", response_model=SaveResponse, status_code=201)
@@ -961,7 +915,7 @@ async def save_strategy(request: SaveRequest) -> SaveResponse:
 @router.get("/{strategy_id}/export")
 async def export_strategy(strategy_id: str) -> Response:
     """Export a strategy as a downloadable YAML file."""
-    path = _find_strategy_file(strategy_id)
+    path = find_strategy_file(strategy_id)
     if path is None:
         raise HTTPException(status_code=404, detail=f"Strategy '{strategy_id}' not found")
     content = path.read_text()

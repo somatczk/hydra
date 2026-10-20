@@ -70,7 +70,7 @@ class TestRowToStrategy:
     def test_known_strategy_name(self) -> None:
         row = {
             "id": "s1",
-            "name": "LSTM Momentum",
+            "name": "Mean Reversion",
             "enabled": True,
             "total_pnl": 1000.25,
             "win_rate": 72.36,
@@ -78,8 +78,8 @@ class TestRowToStrategy:
         }
         result = _row_to_strategy(row)
         assert result["id"] == "s1"
-        assert result["name"] == "LSTM Momentum"
-        assert "LSTM" in result["description"]
+        assert result["name"] == "Mean Reversion"
+        assert "Bollinger" in result["description"]
         assert result["status"] == "Active"
         assert result["enabled"] is True
         assert result["performance"]["total_pnl"] == 1000.25
@@ -108,37 +108,27 @@ class TestRowToStrategy:
 
 
 class TestStrategiesFallback:
-    def test_list_returns_all_strategies(self, client_no_pool: TestClient) -> None:
+    def test_empty_config_dir_lists_nothing(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.get("/api/strategies")
         assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) >= 1
-        first = data[0]
-        assert "id" in first
-        assert "name" in first
-        assert "description" in first
-        assert "status" in first
-        assert "performance" in first
+        assert resp.json() == []
 
-    def test_get_known_strategy(self, client_no_pool: TestClient) -> None:
+    def test_placeholder_strategy_is_gone(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.get("/api/strategies/strat-1")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["name"] == "LSTM Momentum"
-        assert data["id"] == "strat-1"
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == {
+            "code": "strategy_not_found",
+            "message": "Strategy strat-1 not found",
+            "state": "not_found",
+        }
 
     def test_get_unknown_strategy_returns_404(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.get("/api/strategies/does-not-exist")
         assert resp.status_code == 404
 
-    def test_toggle_strategy(self, client_no_pool: TestClient) -> None:
+    def test_toggle_placeholder_is_404(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.post("/api/strategies/strat-1/toggle")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "id" in data
-        assert "enabled" in data
-        assert data["id"] == "strat-1"
+        assert resp.status_code == 404
 
     def test_toggle_unknown_strategy_returns_404(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.post("/api/strategies/nonexistent/toggle")
@@ -260,15 +250,23 @@ class TestStrategiesFallback:
             )
         assert resp.status_code == 404
 
-    def test_performance_endpoint(self, client_no_pool: TestClient) -> None:
+    def test_placeholder_performance_is_404(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.get("/api/strategies/strat-1/performance")
+        assert resp.status_code == 404
+
+    def test_performance_for_yaml_strategy_without_trades_is_zero(
+        self, client_no_pool: TestClient, strategies_dir: Path
+    ) -> None:
+        (strategies_dir / "s.yaml").write_text("id: s1\nname: S\nstrategy_class: x.Y\n")
+        resp = client_no_pool.get("/api/strategies/s1/performance")
         assert resp.status_code == 200
-        data = resp.json()
-        assert "total_pnl" in data
-        assert "win_rate" in data
-        assert "total_trades" in data
-        assert "sharpe_ratio" in data
-        assert "max_drawdown" in data
+        assert resp.json() == {
+            "total_pnl": 0.0,
+            "win_rate": 0.0,
+            "total_trades": 0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+        }
 
     def test_performance_unknown_strategy_returns_404(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.get("/api/strategies/nonexistent/performance")
@@ -587,17 +585,24 @@ class TestStrategiesWithPool:
         assert data[0]["editable"] is True
         assert data[0]["performance"]["total_pnl"] == 500.0
 
-    def test_list_strategies_db_exception_falls_back(self) -> None:
+    def test_list_strategies_db_error_is_503(self, strategies_dir: Path) -> None:
+        (strategies_dir / "s.yaml").write_text("id: s1\nname: S\nstrategy_class: x.Y\n")
         pool, conn = _make_mock_pool()
-        conn.fetch = AsyncMock(side_effect=RuntimeError("DB down"))
+        conn.fetch = AsyncMock(side_effect=OSError("connection refused"))
 
         client = TestClient(_make_app(pool=pool))
         resp = client.get("/api/strategies")
-        assert resp.status_code == 200
-        data = resp.json()
-        # Falls back to placeholder strategies
-        assert isinstance(data, list)
-        assert len(data) >= 1
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
+
+    def test_performance_db_error_is_503(self, strategies_dir: Path) -> None:
+        (strategies_dir / "s.yaml").write_text("id: s1\nname: S\nstrategy_class: x.Y\n")
+        pool, conn = _make_mock_pool()
+        conn.fetchrow = AsyncMock(side_effect=OSError("connection refused"))
+
+        client = TestClient(_make_app(pool=pool))
+        resp = client.get("/api/strategies/s1/performance")
+        assert resp.status_code == 503
 
     def test_get_strategy_from_db(self) -> None:
         pool, conn = _make_mock_pool()
@@ -628,27 +633,22 @@ class TestStrategiesWithPool:
         resp = client.get("/api/strategies/nonexistent")
         assert resp.status_code == 404
 
-    def test_get_strategy_db_exception_falls_back(self) -> None:
-        """On DB error, falls back to in-memory lookup for known strategies."""
+    def test_get_strategy_db_error_is_503(self) -> None:
+        """A DB error is reported as unavailable, not answered with a placeholder."""
         pool, conn = _make_mock_pool()
-        conn.fetchrow = AsyncMock(side_effect=RuntimeError("DB down"))
+        conn.fetchrow = AsyncMock(side_effect=OSError("connection refused"))
 
         client = TestClient(_make_app(pool=pool))
         resp = client.get("/api/strategies/strat-1")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["name"] == "LSTM Momentum"
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
 
-    def test_toggle_strategy_with_pool_uses_memory(self) -> None:
-        """Toggle is always in-memory now (no seed_strategies table)."""
+    def test_toggle_placeholder_with_pool_is_404(self) -> None:
         pool, _conn = _make_mock_pool()
 
         client = TestClient(_make_app(pool=pool))
         resp = client.post("/api/strategies/strat-1/toggle")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["id"] == "strat-1"
-        assert "enabled" in data
+        assert resp.status_code == 404
 
     def test_toggle_strategy_not_found(self) -> None:
         pool, _conn = _make_mock_pool()

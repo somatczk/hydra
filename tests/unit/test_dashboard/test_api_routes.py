@@ -38,30 +38,23 @@ class TestHealth:
 
 
 class TestStrategies:
-    def test_list_strategies(self, client: TestClient) -> None:
+    def test_empty_config_dir_lists_no_strategies(self, client: TestClient) -> None:
         resp = client.get("/api/strategies")
         assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) > 0
-        assert "name" in data[0]
-        assert "performance" in data[0]
+        assert resp.json() == []
 
-    def test_get_strategy_detail(self, client: TestClient) -> None:
+    def test_placeholder_strategy_is_gone(self, client: TestClient) -> None:
         resp = client.get("/api/strategies/strat-1")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["name"] == "LSTM Momentum"
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["state"] == "not_found"
 
     def test_get_strategy_not_found(self, client: TestClient) -> None:
         resp = client.get("/api/strategies/nonexistent")
         assert resp.status_code == 404
 
-    def test_toggle_strategy(self, client: TestClient) -> None:
+    def test_toggle_placeholder_is_404(self, client: TestClient) -> None:
         resp = client.post("/api/strategies/strat-1/toggle")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "enabled" in data
+        assert resp.status_code == 404
 
     def test_update_strategy_config(self, tmp_path: Path) -> None:
         yaml_file = tmp_path / "test.yaml"
@@ -134,12 +127,9 @@ class TestStrategies:
         assert data["name"] == "Updated Test"
         assert "config_path" in data
 
-    def test_strategy_performance(self, client: TestClient) -> None:
+    def test_placeholder_performance_is_404(self, client: TestClient) -> None:
         resp = client.get("/api/strategies/strat-1/performance")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "total_pnl" in data
-        assert "win_rate" in data
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +138,7 @@ class TestStrategies:
 
 
 class TestBacktest:
-    def test_run_backtest(self, client: TestClient) -> None:
+    def test_unknown_strategy_is_404_not_a_default_rsi_run(self, client: TestClient) -> None:
         resp = client.post(
             "/api/backtest/run",
             json={
@@ -158,43 +148,35 @@ class TestBacktest:
                 "initial_capital": 10000,
             },
         )
-        assert resp.status_code == 202
-        data = resp.json()
-        assert "task_id" in data
-        assert data["status"] == "queued"
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "strategy_not_found"
 
-    def test_backtest_status(self, client: TestClient) -> None:
-        # First start a backtest to get a valid task_id
-        run_resp = client.post(
-            "/api/backtest/run",
-            json={
-                "strategy_id": "strat-1",
-                "start_date": "2026-01-01",
-                "end_date": "2026-03-01",
-            },
+    def test_known_strategy_without_database_is_503(
+        self, client: TestClient, strategies_dir: Path
+    ) -> None:
+        (strategies_dir / "rsi.yaml").write_text(
+            "id: rsi\n"
+            "name: RSI\n"
+            "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
         )
-        task_id = run_resp.json()["task_id"]
-        resp = client.get(f"/api/backtest/status/{task_id}")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["task_id"] == task_id
+        resp = client.post(
+            "/api/backtest/run",
+            json={"strategy_id": "rsi", "start_date": "2026-01-01", "end_date": "2026-03-01"},
+        )
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
 
     def test_backtest_status_not_found(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/status/nonexistent")
         assert resp.status_code == 404
 
-    def test_list_results(self, client: TestClient) -> None:
+    def test_list_results_without_database_is_503(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/results")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
+        assert resp.status_code == 503
 
-    def test_get_result_detail(self, client: TestClient) -> None:
+    def test_seeded_result_is_gone(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/results/bt-1")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "equity_curve" in data
-        assert "trades" in data
+        assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +194,7 @@ class TestBuilder:
         assert "name" in data[0]
         assert "params" in data[0]
 
-    def test_preview_strategy(self, client: TestClient) -> None:
+    def test_preview_without_database_is_503(self, client: TestClient) -> None:
         resp = client.post(
             "/api/strategies/preview",
             json={
@@ -234,10 +216,8 @@ class TestBuilder:
                 "symbol": "BTCUSDT",
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "signals" in data
-        assert "metrics" in data
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
 
     def test_save_strategy(self, client: TestClient) -> None:
         resp = client.post(

@@ -523,6 +523,24 @@ async def _run_migrations() -> None:
                 CREATE INDEX IF NOT EXISTS ix_backtest_result_trades_backtest
                     ON backtest_result_trades(backtest_id)
             """)
+            await conn.execute("""
+                ALTER TABLE backtest_results
+                    ADD COLUMN IF NOT EXISTS strategy_id TEXT,
+                    ADD COLUMN IF NOT EXISTS initial_capital DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS data_source TEXT,
+                    ADD COLUMN IF NOT EXISTS data_exchange TEXT,
+                    ADD COLUMN IF NOT EXISTS data_symbol TEXT,
+                    ADD COLUMN IF NOT EXISTS data_timeframe TEXT,
+                    ADD COLUMN IF NOT EXISTS bar_count INTEGER,
+                    ADD COLUMN IF NOT EXISTS first_ts TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS last_ts TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS gap_count INTEGER,
+                    ADD COLUMN IF NOT EXISTS requested_start TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS requested_end TIMESTAMPTZ
+            """)
+            # Rows without provenance ran on synthetic bars; trades go with them via the FK.
+            await conn.execute("DELETE FROM backtest_results WHERE data_source IS NULL")
+            await conn.execute("ALTER TABLE backtest_results ALTER COLUMN data_source SET NOT NULL")
         finally:
             await conn.close()
     except Exception as exc:
