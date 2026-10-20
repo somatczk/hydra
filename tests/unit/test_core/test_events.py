@@ -416,7 +416,7 @@ class TestBarEventReplay:
         restored = _msgpack_roundtrip(bar)
         assert type(restored) is BarEvent
         assert restored.replay is True
-        assert restored.timeframe == Timeframe.H1
+        assert restored.timeframe is Timeframe.H1
         assert restored.ohlcv == _ohlcv()
 
     def test_replay_frozen(self) -> None:
@@ -478,7 +478,8 @@ class TestFeedStatusEvent:
         assert type(restored) is FeedStatusEvent
         assert restored.event_id == fs.event_id
         assert restored.symbol == "BTCUSDT"
-        assert restored.timeframe == Timeframe.H1
+        assert isinstance(restored.timeframe, Timeframe)
+        assert restored.timeframe is Timeframe.H1
         assert restored.status == "stale"
         assert restored.reason == "bar_overdue"
         assert restored.age_seconds == 7325.5
@@ -496,6 +497,18 @@ class TestFeedStatusEvent:
         name = "status"
         with pytest.raises(FrozenInstanceError):
             setattr(fs, name, "live")
+
+    @pytest.mark.parametrize("status", ["STALE", "degraded", ""])
+    def test_rejects_unknown_status(self, status: str) -> None:
+        with pytest.raises(ValueError, match="must be 'live' or 'stale'"):
+            FeedStatusEvent(**{"status": status})
+
+    def test_rejects_unknown_status_from_wire(self) -> None:
+        payload = event_to_dict(FeedStatusEvent(status="stale", reason="bar_overdue"))
+        payload["status"] = "degraded"
+        packed = msgpack.packb(payload, use_bin_type=True)
+        with pytest.raises(ValueError, match="got 'degraded'"):
+            event_from_dict(msgpack.unpackb(packed, raw=False))
 
 
 class TestOrderFillEventP1Fields:
@@ -559,6 +572,9 @@ class TestOrderFillEventP1Fields:
         assert restored.strategy_id == "momentum"
         assert restored.tag == "stop_loss"
         assert restored.reduce_only is True
+        assert restored.side is Side.SELL
+        assert restored.order_type is OrderType.MARKET
+        assert restored.status is OrderStatus.FILLED
         assert restored.gross_pnl == Decimal("500.0")
         assert restored.realized_pnl == Decimal("434.5")
         assert isinstance(restored.realized_pnl, Decimal)
@@ -604,6 +620,9 @@ class TestOrderRequestEventP1Fields:
         assert restored.order_request is not None
         assert restored.order_request.reduce_only is True
         assert restored.order_request.tag == "flatten"
+        assert restored.order_request.side is Side.SELL
+        assert restored.order_request.order_type is OrderType.MARKET
+        assert restored.order_request.market_type is MarketType.SPOT
         assert restored.order_request.quantity == Decimal("0.5")
         assert restored.order_request.request_id == req.request_id
 
@@ -622,3 +641,36 @@ class TestOrderRequestEventP1Fields:
         assert restored.order_request is not None
         assert restored.order_request.reduce_only is False
         assert restored.order_request.tag == ""
+
+
+class TestEnumReconstruction:
+    def test_trade_event_side(self) -> None:
+        restored = _msgpack_roundtrip(TradeEvent(side=Side.SELL, price=Decimal("1")))
+        assert isinstance(restored, TradeEvent)
+        assert restored.side is Side.SELL
+
+    def test_entry_signal_direction_and_market_type(self) -> None:
+        sig = EntrySignal(direction=Direction.SHORT, market_type=MarketType.FUTURES)
+        restored = _msgpack_roundtrip(sig)
+        assert isinstance(restored, EntrySignal)
+        assert restored.direction is Direction.SHORT
+        assert restored.market_type is MarketType.FUTURES
+
+    def test_exit_signal_direction(self) -> None:
+        restored = _msgpack_roundtrip(ExitSignal(direction=Direction.LONG))
+        assert isinstance(restored, ExitSignal)
+        assert restored.direction is Direction.LONG
+
+    def test_unknown_enum_value_stays_str(self) -> None:
+        payload = event_to_dict(BarEvent(timeframe=Timeframe.H1))
+        payload["timeframe"] = "7h"
+        restored = event_from_dict(payload)
+        assert isinstance(restored, BarEvent)
+        assert restored.timeframe == "7h"
+        assert not isinstance(restored.timeframe, Timeframe)
+
+    def test_literal_fields_stay_str(self) -> None:
+        restored = _msgpack_roundtrip(FeedStatusEvent(exchange_id="bybit", status="stale"))
+        assert isinstance(restored, FeedStatusEvent)
+        assert type(restored.exchange_id) is str
+        assert type(restored.status) is str

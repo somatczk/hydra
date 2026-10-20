@@ -7,10 +7,14 @@ They are serializable via msgpack for Redis Streams transport.
 from __future__ import annotations
 
 import contextlib
+import functools
+import types
+import typing
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Literal
 
 from hydra.core.types import (
@@ -69,7 +73,9 @@ class MarketDataEvent(Event):
 class BarEvent(MarketDataEvent):
     """A closed OHLCV bar.
 
-    ``replay`` is True for catch-up bars back-filled after a reconnect.
+    ``replay`` is True for catch-up bars back-filled after a reconnect: they are persisted and
+    added to context but not evaluated. The newest catch-up bar is emitted with ``replay=False``
+    so strategies still evaluate it.
     """
 
     symbol: Symbol = field(default=Symbol(""))
@@ -318,6 +324,9 @@ class ErrorEvent(SystemEvent):
     event_type: str = field(default="error", init=False)
 
 
+_FEED_STATUSES: frozenset[str] = frozenset({"live", "stale"})
+
+
 @dataclass(frozen=True, slots=True)
 class FeedStatusEvent(SystemEvent):
     """Market-data feed health transition (empty symbol/None timeframe = whole exchange)."""
@@ -329,6 +338,11 @@ class FeedStatusEvent(SystemEvent):
     reason: str = ""
     age_seconds: float = 0.0
     event_type: str = field(default="feed_status", init=False)
+
+    def __post_init__(self) -> None:
+        if self.status not in _FEED_STATUSES:
+            msg = f"FeedStatusEvent.status must be 'live' or 'stale', got {self.status!r}"
+            raise ValueError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +435,7 @@ def event_from_dict(data: dict[str, Any]) -> Event:
 
     # Reconstruct Decimal fields based on known field types
     _reconstruct_decimals(data, event_cls)
+    _reconstruct_enums(data, event_cls)
 
     # Remove event_type as it is set by __init__ (init=False)
     data.pop("event_type", None)
@@ -442,6 +457,7 @@ def event_from_dict(data: dict[str, Any]) -> Event:
         for rkey in ("quantity", "price", "stop_price"):
             if rkey in req_data and isinstance(req_data[rkey], str):
                 req_data[rkey] = Decimal(req_data[rkey])
+        _reconstruct_enums(req_data, OrderRequest)
         data["order_request"] = OrderRequest(**req_data)
 
     # Handle bids/asks tuples
@@ -479,3 +495,25 @@ def _reconstruct_decimals(data: dict[str, Any], cls: type[Event]) -> None:
     for key in decimal_fields:
         if key in data and isinstance(data[key], str):
             data[key] = Decimal(data[key])
+
+
+@functools.cache
+def _enum_fields(cls: type) -> dict[str, type[Enum]]:
+    """Map each field typed as an Enum (or ``Enum | None``) to its Enum class."""
+    result: dict[str, type[Enum]] = {}
+    for name, hint in typing.get_type_hints(cls).items():
+        candidates = typing.get_args(hint) if isinstance(hint, types.UnionType) else (hint,)
+        for candidate in candidates:
+            if isinstance(candidate, type) and issubclass(candidate, Enum):
+                result[name] = candidate
+                break
+    return result
+
+
+def _reconstruct_enums(data: dict[str, Any], cls: type) -> None:
+    """Convert string values back to their Enum members; unknown values stay as str."""
+    for key, enum_cls in _enum_fields(cls).items():
+        value = data.get(key)
+        if isinstance(value, str) and not isinstance(value, enum_cls):
+            with contextlib.suppress(ValueError):
+                data[key] = enum_cls(value)
