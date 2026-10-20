@@ -237,18 +237,19 @@ def log_auth_posture(cfg: HydraConfig | None) -> None:
             "set" if cfg.api_token is not None else "unset",
         )
     if cfg is not None and cfg.api.auth_mode == "proxy":
-        for network in wide_trusted_networks(cfg.api):
+        wide = count_wide_trusted_networks(cfg.api)
+        if wide:
             logger.warning(
-                "api.trusted_proxy_cidrs entry %s spans more than one host: every peer in it "
+                "%d api.trusted_proxy_cidrs entries span more than one host: every peer in them "
                 "(including the Docker bridge gateway, i.e. host processes) can assert "
                 "Remote-User. Pin Traefik to a static address and trust only that /32 or /128",
-                network,
+                wide,
             )
 
 
-def wide_trusted_networks(api: ApiConfig) -> list[str]:
-    """Trusted proxy entries wider than a single address."""
-    return [str(n) for n in api.trusted_proxy_cidrs if n.prefixlen < n.max_prefixlen]
+def count_wide_trusted_networks(api: ApiConfig) -> int:
+    """Number of trusted proxy entries wider than a single address."""
+    return sum(1 for n in api.trusted_proxy_cidrs if n.prefixlen < n.max_prefixlen)
 
 
 class ConfigCORSMiddleware:
