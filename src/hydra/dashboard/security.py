@@ -35,7 +35,7 @@ from hydra.dashboard.routes._db import ErrorState, error_detail, unauthenticated
 logger = logging.getLogger(__name__)
 audit_logger = get_logger("hydra.audit")
 
-PUBLIC_PATHS: frozenset[str] = frozenset({"/health", "/metrics"})
+PUBLIC_PATHS: frozenset[str] = frozenset({"/health", "/livez", "/readyz", "/metrics"})
 SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 CSRF_HEADER = "x-hydra-request"
 ALLOWED_FETCH_SITES: frozenset[str] = frozenset({"same-origin", "none"})

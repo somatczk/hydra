@@ -235,6 +235,59 @@ jobs:
             exit 1
           fi
 
+  paper-smoke:
+    name: Paper Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.30.2-pg16
+        env:
+          POSTGRES_DB: hydra_test
+          POSTGRES_USER: hydra
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U hydra -d hydra_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.3"
+          enable-cache: true
+      - run: uv sync --locked --extra dev
+      - name: Run the paper smoke test
+        run: make smoke
+        env:
+          HYDRA_REQUIRE_INFRA: "1"
+          HYDRA_DB_HOST: localhost
+          HYDRA_DB_PORT: ${{ job.services.timescaledb.ports['5432'] }}
+          HYDRA_DB_NAME: hydra_test
+          HYDRA_DB_USER: hydra
+          HYDRA_DB_PASSWORD: test
+          HYDRA_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}/0
+      - name: Tests left working tree clean
+        if: ${{ !cancelled() }}
+        run: |
+          status=$(git status --porcelain --untracked-files=all)
+          echo "$status"
+          if [ -n "$status" ]; then
+            echo "::error::tests modified the working tree"
+            git diff --stat
+            exit 1
+          fi
+
   image-smoke:
     name: Image Smoke (${{ matrix.image }})
     runs-on: ubuntu-latest
@@ -312,10 +365,14 @@ jobs:
                 -e REDIS_URL="redis://localhost:${REDIS_PORT}/0" \
                 -e HYDRA_CREDENTIAL_KEY="$(openssl rand -base64 32 | tr '+/' '-_')" \
                 "$IMAGE:smoke"
-              wait_for curl -fsS -o /dev/null http://localhost:8000/health
-              body=$(curl -fsS http://localhost:8000/health)
-              echo "$body"
-              jq -e '.status == "ok" and .db == "connected"' <<<"$body"
+              wait_for curl -fsS -o /dev/null http://localhost:8000/livez
+              live=$(curl -fsS http://localhost:8000/livez)
+              echo "$live"
+              jq -e '.status == "ok"' <<<"$live"
+              test "$(curl -fsS http://localhost:8000/health)" = "$live"
+              ready=$(curl -fsS http://localhost:8000/readyz)
+              echo "$ready"
+              jq -e '.status == "ok" and .checks.db.ok == true and .checks.migrations.ok == true' <<<"$ready"
               docker logs smoke 2>&1 | grep -F 'Application startup complete' \
                 | jq -e 'select(.logger == "uvicorn.error" and .level == "info" and .timestamp != null)'
               docker logs smoke 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
@@ -350,6 +407,7 @@ jobs:
       - promtool
       - integration-tests
       - e2e-tests
+      - paper-smoke
       - image-smoke
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest

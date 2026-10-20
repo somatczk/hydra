@@ -1,7 +1,14 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import type { NextConfig } from "next";
-import packageJson from "./package.json";
+import { readReleaseVersion } from "./src/lib/releaseVersion";
 
 const isProduction = process.env.NODE_ENV === "production";
+
+// The image build copies pyproject.toml to /pyproject.toml, next to the /app build dir
+const RELEASE_VERSION = readReleaseVersion(
+  readFileSync(path.resolve(process.cwd(), "..", "pyproject.toml"), "utf8"),
+);
 
 /**
  * Production CSP: only first-party scripts run; the TradingView chart is a cross-origin iframe.
@@ -30,7 +37,7 @@ export const SECURITY_HEADERS = [
 const nextConfig: NextConfig = {
   output: "standalone",
   env: {
-    APP_VERSION: packageJson.version,
+    APP_VERSION: RELEASE_VERSION,
   },
   async headers() {
     // next dev needs eval for fast refresh, so the policy applies to production builds only

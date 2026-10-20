@@ -94,6 +94,7 @@ _READ_ONLY_REPO_PATHS = {
     ("hydra.core.config", "_DEFAULT_CONFIG_DIR"),
     ("hydra.dashboard.routes.templates", "_TEMPLATES_DIR"),
     ("hydra.execution.session_manager", "_CONFIG_DIR"),
+    ("hydra.data.migrations.runner", "_SCRIPT_LOCATION"),
 }
 
 

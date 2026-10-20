@@ -78,7 +78,8 @@ make lint                      # ruff check + format check (src/ tests/)
 make type-check                # mypy src/
 make security                  # bandit
 make test                      # unit tests, not slow, with coverage
-make e2e                       # e2e tests, no infrastructure
+make e2e                       # e2e tests (the paper smoke needs HYDRA_DB_* and HYDRA_REDIS_URL)
+make smoke                     # paper smoke: real lifespan on TimescaleDB, replayed Binance bars
 make integration               # integration tests; need HYDRA_DB_* and HYDRA_REDIS_URL
 make check                     # lint + type-check + security + imports + test
 make imports                   # import-linter layers contract (also in CI lint)
@@ -103,8 +104,14 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   paper sessions are restored from `paper_accounts` by `SessionManager.startup()`.
 - Every paper entry gets a protective stop (strategy `risk:` block, 5 % default); no exchange-side stops yet (P3).
   Only Binance SPOT is accepted (`client_factory.validate_venue`).
+- Probes (`src/hydra/dashboard/health.py`, `routes/health.py`): a `HealthMonitor` started last by the lifespan runs
+  every 15 s and sets `hydra_ready{check}`, the per-session desired/supervised gauges and its heartbeat; `/readyz`
+  serves its last result while it is at most 30 s old and never writes gauges. `/livez`
+  (Docker healthcheck; `/health` is its alias until P3) needs startup done and a recent monitor run; `/readyz` (alerts,
+  never restarts) needs the DB, the Alembic head, no zombie session (running in the DB without a live task), fresh
+  feeds for supervised sessions and the RiskService. Session health comes from `SessionManager.health_snapshot()`.
 - API auth lives in one pure-ASGI middleware, `src/hydra/dashboard/security.py`: every route and WebSocket except
-  `PUBLIC_PATHS` (`/health`, `/metrics`) needs a principal (Authelia `Remote-User` from a peer in
+  `PUBLIC_PATHS` (`/health`, `/livez`, `/readyz`, `/metrics`) needs a principal (Authelia `Remote-User` from a peer in
   `api.trusted_proxy_cidrs`, bearer `HYDRA_API_TOKEN`, or anyone in `api.auth_mode: dev`), and browser principals
   must send `X-Hydra-Request: 1` on non-GET requests. `api.trusted_proxy_cidrs` lists Traefik's static /32, never
   the hydra-edge subnet (its bridge gateway is the host). Routes need no auth code; read the caller with
@@ -130,15 +137,17 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   matches; CI uses `uv sync --locked` and fails on drift.
 - Bumps happen only at phase end. The same release moves the romulus image tags for engine, dashboard and
   backtest-worker (`romulus/stacks/hydra/*/Dockerfile`) in one romulus PR.
-- `dashboard/package.json` has its own version, shown in the sidebar; it is not the release version.
+- The dashboard sidebar shows the pyproject version: `dashboard/next.config.ts` reads `../pyproject.toml` (the image
+  build copies it to `/pyproject.toml`). `dashboard/package.json`'s own version is not shown anywhere.
 
 ## CI/CD
 - `ci.yml` on PRs, pushes to `main` and manual dispatch, on Python 3.14 and uv 0.13.3: ruff and `lint-imports`, strict
   mypy over eight packages, bandit, unit tests with a clean-tree check, dashboard (lint, typecheck, test, build),
   promtool check + test for `deploy/prometheus-rules.yml`, integration and e2e on TimescaleDB + Redis service
-  containers with `HYDRA_REQUIRE_INFRA=1`, and `image-smoke`, which builds each image without pushing and starts it
-  (engine against the services with `DATABASE_URL`, `REDIS_URL` and a throwaway `HYDRA_CREDENTIAL_KEY`; every
-  engine and backtest log line must be JSON). PR runs read the image build cache but do not write it.
+  containers with `HYDRA_REQUIRE_INFRA=1`, `paper-smoke` ("Paper Smoke", `make smoke`, the P1 acceptance test on the
+  same services), and `image-smoke`, which builds each image without pushing and starts it (engine against the
+  services with `DATABASE_URL`, `REDIS_URL` and a throwaway `HYDRA_CREDENTIAL_KEY`; `/livez` and `/readyz` must be
+  green and every engine and backtest log line must be JSON). PR runs read the image build cache but do not write it.
 - `publish` (in `ci.yml`) needs every other job and runs only on pushes to `main` and manual dispatch on `main`: it
   builds `hydra-engine`, `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag
   only if it does not exist yet. Version tags never move. A push that changes no image input (`IMAGE_INPUTS`) skips

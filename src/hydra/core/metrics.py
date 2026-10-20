@@ -21,10 +21,10 @@ Contract (name: type, unit / labels / producer):
   producer: core.metrics at init
 - hydra_trades_total: counter, fills
   labels: symbol, side, strategy_id, exchange_id
-  producer: OrderManager and paper executor (paper market fills counted twice until P1-D)
+  producer: OrderManager, once per fill
 - hydra_trade_pnl: histogram, USDT
   labels: symbol, strategy_id
-  producer: paper executor; P1-C/P1-E from realized_pnl
+  producer: OrderManager, net PnL of closing fills (PaperFill.net_pnl)
 - hydra_position_size: gauge, base asset
   labels: session_id, strategy_id, exchange_id, symbol
   producer: P1-E session_wiring on fill
@@ -141,7 +141,7 @@ MetricKind = Literal["counter", "gauge", "histogram"]
 EXCHANGE_CALL_OUTCOMES = ("ok", "error", "timeout", "cancelled")
 FEED_BAR_SOURCES = ("ws", "rest_gap", "warmup")
 RISK_INTENTS = ("open", "reduce")
-READY_CHECKS = ("db", "sessions", "feeds")
+READY_CHECKS = ("db", "migrations", "sessions", "feeds", "risk")
 SPOT_SHORT_SIGNALS = ("entry_short", "exit_short")
 CIRCUIT_BREAKER_TIERS = range(5)
 
@@ -189,19 +189,18 @@ CONTRACT: tuple[MetricSpec, ...] = (
     MetricSpec(
         "hydra_trades_total",
         "counter",
-        "Executed fills by symbol, side, strategy and exchange; "
-        "paper market fills are counted twice until P1-D",
+        "Executed fills by symbol, side, strategy and exchange",
         "fills",
-        "OrderManager and paper executor (paper market fills counted twice until P1-D)",
+        "OrderManager, once per fill",
         ("symbol", "side", "strategy_id", "exchange_id"),
     ),
     MetricSpec(
         "hydra_trade_pnl",
         "histogram",
-        "PnL per paper fill in USDT; opening fills observe 0 until P1-D "
+        "Net PnL in USDT of each closing fill, fees included; opening fills are not observed "
         "(no _sum series: the buckets are negative)",
         "USDT",
-        "paper executor; P1-C/P1-E from realized_pnl",
+        "OrderManager, net PnL of closing fills (PaperFill.net_pnl)",
         ("symbol", "strategy_id"),
         (-500, -200, -100, -50, -20, -10, 0, 10, 20, 50, 100, 200, 500, 1000),
     ),
@@ -454,7 +453,7 @@ CONTRACT: tuple[MetricSpec, ...] = (
     MetricSpec(
         "hydra_ready",
         "gauge",
-        "1 when a readiness check passes (db, sessions, feeds)",
+        "1 when a readiness check passes (db, migrations, sessions, feeds, risk)",
         "1",
         "P1-G1 HealthMonitor",
         ("check",),

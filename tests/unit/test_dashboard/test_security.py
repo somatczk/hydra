@@ -151,7 +151,7 @@ class TestFailClosed:
     def test_no_loaded_config_refuses_everyone(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(app.state, "config", None)
         _assert_401(_client().get(PROTECTED), "auth_not_configured")
-        assert _client().get("/health").status_code == 200
+        assert _client().get("/health").status_code == 503
 
     @pytest.mark.parametrize("env", ["HYDRA_API_TOKEN", "HYDRA_API__CORS_ORIGINS"])
     def test_weak_settings_stop_startup(self, env: str, monkeypatch: pytest.MonkeyPatch) -> None:

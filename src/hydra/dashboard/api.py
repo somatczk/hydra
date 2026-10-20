@@ -16,6 +16,7 @@ from hydra.core.websocket import manager
 from hydra.dashboard import lifespan
 from hydra.dashboard.routes import (
     backtest,
+    health,
     market_data,
     models,
     portfolio,
@@ -50,8 +51,10 @@ app.state.exchange_credentials = {}
 app.state.exchange_credential_errors = {}
 app.state.system_config = None
 app.state.session_manager = None
+app.state.health_monitor = None
 
 # Include all route modules
+app.include_router(health.router)
 app.include_router(strategies.router)
 app.include_router(portfolio.router)
 app.include_router(backtest.router)
@@ -65,16 +68,8 @@ app.include_router(market_data.router)
 
 
 # ---------------------------------------------------------------------------
-# Health / metrics
+# Metrics (probes: routes/health.py)
 # ---------------------------------------------------------------------------
-
-
-@app.get("/health", tags=["health"])
-async def health() -> dict[str, str]:
-    """Liveness probe with DB pool status."""
-    pool = getattr(app.state, "db_pool", None)
-    db_ok = pool is not None and not pool._closed if pool else False
-    return {"status": "ok" if db_ok else "degraded", "db": "connected" if db_ok else "disconnected"}
 
 
 @app.get("/metrics", tags=["observability"])

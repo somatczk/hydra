@@ -26,7 +26,7 @@ from hydra.dashboard.security import PUBLIC_PATHS
 
 from .conftest import TEST_API_TOKEN
 
-EXPECTED_PUBLIC = {"/health", "/metrics"}
+EXPECTED_PUBLIC = {"/health", "/livez", "/readyz", "/metrics"}
 DOC_PATHS = ["/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"]
 EXPECTED_WS = {"/ws/market", "/ws/trades", "/ws/portfolio", "/ws/signals", "/ws/risk"}
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
@@ -68,7 +68,8 @@ def test_every_operation_needs_credentials() -> None:
     for method, path in ops:
         resp = client.request(method, path, headers={"X-Hydra-Request": "1"})
         if path in EXPECTED_PUBLIC:
-            assert resp.status_code == 200, (method, path)
+            # probes answer 503 without a lifespan; public means never 401
+            assert resp.status_code in (200, 503), (method, path)
             continue
         body = resp.json() if resp.headers.get("content-type") == "application/json" else None
         if resp.status_code != 401 or body["detail"]["code"] != "unauthenticated":

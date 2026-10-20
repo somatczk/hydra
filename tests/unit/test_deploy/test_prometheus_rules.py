@@ -15,6 +15,7 @@ from prometheus_client import generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from hydra.core import metrics
+from hydra.dashboard.health import FEED_MESSAGE_MAX_AGE_S, closed_bar_max_age
 from tests.unit.test_risk.harness import make_account, permissive
 
 DEPLOY = Path(__file__).resolve().parents[3] / "deploy"
@@ -99,7 +100,6 @@ def test_histogram_rule_thresholds_below_top_bucket() -> None:
         "HydraOrderFillLatencyHigh",
         "HydraEventBusLatencyHigh",
         "HydraExchangeAPILatencyHigh",
-        "HydraMLInferenceLatencyHigh",
     }
 
 
@@ -118,6 +118,8 @@ def test_rules_without_an_honest_producer_are_gone() -> None:
     assert "HydraDataGapDetected" not in rules
     exprs = " ".join(r["expr"] for r in rules.values())
     assert "hydra_reconciliation_mismatch" not in exprs
+    assert "HydraMLInferenceLatencyHigh" not in rules
+    assert "hydra_ml_" not in exprs
 
 
 def test_feed_staleness_rules_compare_against_prometheus_time() -> None:
@@ -125,6 +127,41 @@ def test_feed_staleness_rules_compare_against_prometheus_time() -> None:
     assert rules["HydraFeedStale"]["expr"].startswith("time() - ")
     assert rules["HydraClosedBarOverdue"]["expr"].startswith("time() - ")
     assert "hydra_feed_bar_interval_seconds" in rules["HydraClosedBarOverdue"]["expr"]
+
+
+def test_feed_thresholds_match_the_readiness_check() -> None:
+    rules = _rules()
+    stale = re.fullmatch(
+        r"time\(\) - hydra_feed_last_message_timestamp_seconds > ([\d.]+)",
+        rules["HydraFeedStale"]["expr"].strip(),
+    )
+    assert stale and float(stale.group(1)) == FEED_MESSAGE_MAX_AGE_S
+    overdue = re.fullmatch(
+        r"time\(\) - hydra_feed_last_closed_bar_timestamp_seconds"
+        r" > ([\d.]+) \* hydra_feed_bar_interval_seconds \+ ([\d.]+)",
+        rules["HydraClosedBarOverdue"]["expr"].strip(),
+    )
+    assert overdue
+    bars, grace = float(overdue.group(1)), float(overdue.group(2))
+    for interval in (60.0, 3600.0):
+        assert bars * interval + grace == closed_bar_max_age(interval)
+
+
+def test_health_rules_read_the_monitor_gauges() -> None:
+    rules = _rules()
+    assert rules["HydraNotReady"]["expr"] == "hydra_ready == 0"
+    assert rules["HydraSessionNotSupervised"]["expr"] == (
+        "hydra_session_desired == 1 unless on (session_id) hydra_session_supervised == 1"
+    )
+    assert rules["HydraHealthMonitorStalled"]["expr"].startswith(
+        "time() - hydra_health_monitor_last_run_timestamp_seconds > "
+    )
+
+
+def test_memory_is_left_to_the_container_limit_rules() -> None:
+    rules = _rules()
+    assert "HydraHighMemoryUsage" not in rules
+    assert not [a for a, r in rules.items() if "memory" in r["expr"]]
 
 
 def test_every_alert_has_a_firing_and_a_silent_promtool_case() -> None:

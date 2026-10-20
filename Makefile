@@ -1,4 +1,4 @@
-.PHONY: install dev test lint type-check security check unit integration e2e perf \
+.PHONY: install dev test lint type-check security check unit integration e2e smoke perf \
 	dev-up dev-down format clean docker-build imports
 
 # Development setup
@@ -20,6 +20,10 @@ integration:
 
 e2e:
 	uv run pytest tests/e2e/ -v -m e2e
+
+# Paper smoke: real lifespan on TimescaleDB (HYDRA_DB_*, HYDRA_REDIS_URL), replayed Binance bars
+smoke:
+	uv run pytest tests/e2e/test_paper_smoke.py -v -m e2e
 
 perf:
 	uv run pytest tests/performance/ -v -m performance --benchmark-json=benchmark.json

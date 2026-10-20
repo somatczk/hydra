@@ -1,20 +1,22 @@
 """Engine startup and shutdown.
 
 Startup order: config, logging, credential key, DB pool, Alembic migrations, stored credentials,
-system config, SessionManager (``startup()``: risk state, recovery, display rows), backtest cache.
+system config, SessionManager (``startup()``: risk state, recovery, display rows), backtest cache,
+HealthMonitor (first readiness run; ``/livez`` turns green). Shutdown stops the monitor first.
 Any startup error propagates, so uvicorn exits non-zero instead of serving without a schema or a
 key. Without DATABASE_URL (dev only) there is no pool, no migration and no key requirement.
 ``app.state.session_clients`` (a ``ClientFactory``), when set before startup, replaces the public
-exchange clients of every session (the paper smoke test injects its fakes there).
+exchange clients of every session, and ``app.state.health_monitor_factory`` builds the
+``HealthMonitor`` (the paper smoke test injects its fakes and a monitor clock there).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 
@@ -22,6 +24,9 @@ from hydra.core.config import HydraConfig, load_config
 from hydra.dashboard.deps import bind_config
 from hydra.dashboard.routes import market_data
 from hydra.execution.client_factory import ClientFactory
+
+if TYPE_CHECKING:
+    from hydra.dashboard.health import HealthMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     app.state.exchange_credential_errors = {}
     app.state.system_config = None
     app.state.session_manager = None
+    app.state.health_monitor = None
     clients: ClientFactory | None = getattr(app.state, "session_clients", None)
     try:
         await _init_logging(cfg)
@@ -53,8 +59,10 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             await _load_system_config(app)
         await _init_session_manager(app, cfg, clients)
         await _populate_backtest_cache(app)
+        await _start_health_monitor(app)
         yield
     finally:
+        await _stop_health_monitor(app)
         await _shutdown_session_manager(app)
         await market_data.close_market_clients(app)
         await _close_db_pool(app)
@@ -165,9 +173,26 @@ async def _populate_backtest_cache(app: FastAPI) -> None:
     await populate_cache_from_db(pool)
 
 
+async def _start_health_monitor(app: FastAPI) -> None:
+    from hydra.dashboard.health import HealthMonitor as Monitor
+
+    factory: Callable[[FastAPI], HealthMonitor] = (
+        getattr(app.state, "health_monitor_factory", None) or Monitor
+    )
+    monitor = factory(app)
+    app.state.health_monitor = monitor
+    await monitor.start()
+
+
 # ---------------------------------------------------------------------------
 # Shutdown steps
 # ---------------------------------------------------------------------------
+
+
+async def _stop_health_monitor(app: FastAPI) -> None:
+    monitor = getattr(app.state, "health_monitor", None)
+    if monitor is not None:
+        await monitor.stop()
 
 
 async def _shutdown_session_manager(app: FastAPI) -> None:
