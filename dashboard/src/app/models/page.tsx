@@ -17,7 +17,8 @@ import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { Button } from '@/components/ui/Button';
 import { ErrorCard } from '@/components/ui/ErrorCard';
-import { fetchApi } from '@/lib/api';
+import { ApiError, apiHeaders, fetchApi } from '@/lib/api';
+import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 
@@ -143,7 +144,7 @@ export default function ModelsPage() {
       loadData();
     } catch (err) {
       logger.error('Models', `Failed to promote ${model.name}`, err);
-      toast('error', `Failed to promote ${model.name}`);
+      toast('error', describeApiError(err, `Failed to promote ${model.name}`));
     } finally {
       setActionLoading((prev) => ({ ...prev, [model.id]: null }));
     }
@@ -158,10 +159,23 @@ export default function ModelsPage() {
       loadData();
     } catch (err) {
       logger.error('Models', `Failed to rollback ${model.name}`, err);
-      toast('error', `Failed to rollback ${model.name}`);
+      toast('error', describeApiError(err, `Failed to rollback ${model.name}`));
     } finally {
       setActionLoading((prev) => ({ ...prev, [model.id]: null }));
     }
+  };
+
+  const postUpload = async (file: File, replace: boolean): Promise<void> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const qs = replace ? '?replace=true' : '';
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/models/upload${qs}`, {
+      method: 'POST',
+      body: formData,
+      credentials: 'include',
+      headers: apiHeaders('POST'),
+    });
+    if (!res.ok) throw new ApiError(res.status, await res.text());
   };
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -169,21 +183,18 @@ export default function ModelsPage() {
     if (!file) return;
     setUploading(true);
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/models/upload`, {
-        method: 'POST',
-        body: formData,
-        credentials: 'include',
-      }).then((res) => {
-        if (!res.ok) return res.json().then((d) => { throw new Error(d.detail || 'Upload failed'); });
-        return res.json();
-      });
+      try {
+        await postUpload(file, false);
+      } catch (err) {
+        if (parseErrorDetail(err)?.code !== 'model_exists') throw err;
+        if (!confirm(`A model named "${file.name}" already exists. Replace it?`)) return;
+        await postUpload(file, true);
+      }
       toast('success', `Model "${file.name}" uploaded`);
       loadData();
     } catch (err) {
       logger.error('Models', 'Failed to upload model', err);
-      toast('error', `Upload failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+      toast('error', describeApiError(err, 'Upload failed'));
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';

@@ -7,7 +7,6 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
-import { ErrorCard } from '@/components/ui/ErrorCard';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
@@ -19,21 +18,32 @@ import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDial
 
 /* ---------- Types ---------- */
 
+type CredentialState = 'ok' | 'undecryptable' | 'missing';
+type Environment = 'testnet' | 'mainnet';
+
 interface Exchange {
   id: string;
   name: string;
   logo: string;
+  supported: boolean;
   connected: boolean;
   apiKeySet: boolean;
-  lastSync: string;
+  credentialState: CredentialState;
+  validatedAt: string | null;
+  environment: Environment;
+  validatedEnvironment: Environment | null;
 }
 
 interface ApiExchange {
   id: string;
   name: string;
+  supported: boolean;
   connected: boolean;
   api_key_set: boolean;
-  last_sync: string;
+  credential_state: CredentialState;
+  last_sync: string | null;
+  environment: Environment;
+  validated_environment: Environment | null;
 }
 
 interface PlatformConfig {
@@ -42,6 +52,7 @@ interface PlatformConfig {
   default_timeframe: string;
   max_concurrent_strategies: number;
   paper_capital: number;
+  paper_capital_pending: number | null;
   webhook_secret_set: boolean;
   discord_webhook_url_set: boolean;
   slack_webhook_url_set: boolean;
@@ -62,29 +73,34 @@ interface ExchangeBalance {
   total: number;
 }
 
+interface ApiOrder {
+  symbol: string;
+  side: string;
+  type: string | null;
+  amount: number | null;
+  price: number | null;
+  status: string | null;
+}
+
 interface ExchangeOrder {
   symbol: string;
   side: string;
   type: string;
-  quantity: number;
-  price: number;
+  quantity: number | null;
+  price: number | null;
   status: string;
-}
-
-interface ExchangePosition {
-  symbol: string;
-  direction: string;
-  quantity: number;
-  entry: number;
-  unrealized_pnl: number;
 }
 
 type ConnectionStatus = 'live' | 'error' | 'retrying';
 
+interface Panel<T> {
+  data: T | null;
+  error: string | null;
+}
+
 interface ExchangeDetail {
-  balances: ExchangeBalance[] | null;
-  orders: ExchangeOrder[] | null;
-  positions: ExchangePosition[] | null;
+  balances: Panel<ExchangeBalance[]>;
+  orders: Panel<ExchangeOrder[]>;
   status: ConnectionStatus;
   error: string | null;
 }
@@ -108,11 +124,42 @@ function mapApiExchanges(data: ApiExchange[]): Exchange[] {
     id: e.id,
     name: e.name,
     logo: logoMap[e.id] || e.name[0],
+    supported: e.supported,
     connected: e.connected,
     apiKeySet: e.api_key_set,
-    lastSync: e.last_sync,
+    credentialState: e.credential_state,
+    validatedAt: e.last_sync,
+    environment: e.environment,
+    validatedEnvironment: e.validated_environment,
   }));
 }
+
+function validationText(exchange: Exchange): string {
+  if (!exchange.supported) return 'Not supported yet (Binance only)';
+  if (exchange.credentialState === 'undecryptable') return 'Stored keys cannot be decrypted';
+  if (!exchange.validatedAt) return exchange.apiKeySet ? 'Never validated' : 'Not connected';
+  if (exchange.validatedEnvironment !== exchange.environment) {
+    return `Checked on ${exchange.validatedEnvironment ?? 'an unknown environment'} only; connect again for ${exchange.environment}`;
+  }
+  return `Validated on ${exchange.environment} ${new Date(exchange.validatedAt).toLocaleString()}`;
+}
+
+function toOrder(o: ApiOrder): ExchangeOrder {
+  return {
+    symbol: o.symbol,
+    side: o.side,
+    type: o.type ?? '',
+    quantity: o.amount,
+    price: o.price,
+    status: o.status ?? '',
+  };
+}
+
+const CREDENTIAL_LABELS: Record<CredentialState, string> = {
+  ok: 'Stored (encrypted)',
+  undecryptable: 'Undecryptable, enter the keys again',
+  missing: 'Not set',
+};
 
 const BACKOFF_STEPS = [30000, 60000, 120000, 300000];
 
@@ -122,12 +169,14 @@ export default function SettingsPage() {
   const { toast } = useToast();
   const [exchanges, setExchanges] = useState<Exchange[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
+  const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
   const [tradingMode, setTradingMode] = useState('paper');
-  const [defaultPair, setDefaultPair] = useState('btcusdt');
+  const [defaultPair, setDefaultPair] = useState('BTC/USDT');
   const [defaultTimeframe, setDefaultTimeframe] = useState('1h');
   const [maxStrategies, setMaxStrategies] = useState('5');
-  const [paperCapital, setPaperCapital] = useState('10000');
+  const [paperCapital, setPaperCapital] = useState('');
+  const [savedPaperCapital, setSavedPaperCapital] = useState<number | null>(null);
+  const [pendingPaperCapital, setPendingPaperCapital] = useState<number | null>(null);
   // null = unknown: the risk config could not be read
   const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [notifications, setNotifications] = useState<Record<string, boolean> | null>(null);
@@ -175,17 +224,19 @@ export default function SettingsPage() {
     await Promise.all([
       fetchApi<ApiExchange[]>('/api/system/exchanges')
         .then((ex) => setExchanges(mapApiExchanges(ex)))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, exchanges: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, exchanges: err ?? true })); }),
       fetchApi<PlatformConfig>('/api/system/config')
         .then((cfg) => {
           setTradingMode(cfg.trading_mode);
           setDefaultPair(cfg.default_pair);
           setDefaultTimeframe(cfg.default_timeframe);
           setMaxStrategies(cfg.max_concurrent_strategies.toString());
-          if (cfg.paper_capital) setPaperCapital(cfg.paper_capital.toString());
+          setPaperCapital(cfg.paper_capital.toString());
+          setSavedPaperCapital(cfg.paper_capital);
+          setPendingPaperCapital(cfg.paper_capital_pending);
           applySecretsSet(cfg);
         })
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, config: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, config: err ?? true })); }),
       fetchApi<RiskConfig>('/api/risk/config')
         .then((risk) => setKillSwitchActive(risk.kill_switch_active))
         .catch((err) => {
@@ -217,49 +268,46 @@ export default function SettingsPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch exchange detail data with polling
-  const fetchExchangeDetail = useCallback(async (exchangeId: string) => {
-    try {
-      const [balancesRaw, ordersRaw, positionsRaw] = await Promise.all([
+  // Each panel loads on its own: one failing read never hides the other
+  const fetchExchangeDetail = useCallback((exchangeId: string) => {
+    async function load(): Promise<void> {
+      const [balancesRes, ordersRes] = await Promise.allSettled([
         fetchApi<{ exchange_id: string; balances: Record<string, number> }>(`/api/system/exchanges/${exchangeId}/balance`),
-        fetchApi<{ exchange_id: string; orders: ExchangeOrder[] }>(`/api/system/exchanges/${exchangeId}/orders`),
-        fetchApi<{ exchange_id: string; positions: ExchangePosition[] }>(`/api/system/exchanges/${exchangeId}/positions`),
+        fetchApi<{ exchange_id: string; orders: ApiOrder[] }>(`/api/system/exchanges/${exchangeId}/orders`),
       ]);
-      const balances: ExchangeBalance[] = Object.entries(balancesRaw.balances || {}).map(
-        ([currency, amount]) => ({ currency, available: amount, total: amount })
-      );
-      const orders = ordersRaw.orders || [];
-      const positions = positionsRaw.positions || [];
-      setExchangeDetails((prev) => ({
-        ...prev,
-        [exchangeId]: { balances, orders, positions, status: 'live', error: null },
-      }));
-      failCounts.current[exchangeId] = 0;
-      // Success: poll again in 30s
-      pollTimers.current[exchangeId] = setTimeout(() => fetchExchangeDetail(exchangeId), 30000);
-    } catch (err) {
-      const count = (failCounts.current[exchangeId] || 0) + 1;
-      failCounts.current[exchangeId] = count;
-      const backoffIdx = Math.min(count - 1, BACKOFF_STEPS.length - 1);
-      const backoff = BACKOFF_STEPS[backoffIdx];
+      const balances: Panel<ExchangeBalance[]> = balancesRes.status === 'fulfilled'
+        ? {
+            data: Object.entries(balancesRes.value.balances || {}).map(
+              ([currency, amount]) => ({ currency, available: amount, total: amount }),
+            ),
+            error: null,
+          }
+        : { data: null, error: describeApiError(balancesRes.reason, 'Balance unavailable') };
+      const orders: Panel<ExchangeOrder[]> = ordersRes.status === 'fulfilled'
+        ? { data: (ordersRes.value.orders || []).map(toOrder), error: null }
+        : { data: null, error: describeApiError(ordersRes.reason, 'Open orders unavailable') };
+      const failed = [balances.error, orders.error].filter((e): e is string => e !== null);
 
       setExchangeDetails((prev) => ({
         ...prev,
         [exchangeId]: {
-          ...(prev[exchangeId] || { balances: null, orders: null, positions: null }),
-          status: 'retrying',
-          error: err instanceof Error ? err.message : 'Connection failed',
+          balances,
+          orders,
+          status: failed.length === 0 ? 'live' : 'retrying',
+          error: failed[0] ?? null,
         },
       }));
-
-      pollTimers.current[exchangeId] = setTimeout(() => {
-        setExchangeDetails((prev) => ({
-          ...prev,
-          [exchangeId]: { ...(prev[exchangeId] || { balances: null, orders: null, positions: null }), status: 'retrying', error: prev[exchangeId]?.error || null },
-        }));
-        fetchExchangeDetail(exchangeId);
-      }, backoff);
+      if (failed.length === 0) {
+        failCounts.current[exchangeId] = 0;
+        pollTimers.current[exchangeId] = setTimeout(load, 30000);
+        return;
+      }
+      const count = (failCounts.current[exchangeId] || 0) + 1;
+      failCounts.current[exchangeId] = count;
+      const backoff = BACKOFF_STEPS[Math.min(count - 1, BACKOFF_STEPS.length - 1)];
+      pollTimers.current[exchangeId] = setTimeout(load, backoff);
     }
+    void load();
   }, []);
 
   const toggleExchangePanel = useCallback((exchangeId: string) => {
@@ -291,18 +339,36 @@ export default function SettingsPage() {
   };
 
   const handleSaveConfig = async () => {
+    const capital = Number(paperCapital);
+    if (
+      savedPaperCapital !== null &&
+      capital !== savedPaperCapital &&
+      !confirm(
+        `Change paper capital from ${savedPaperCapital} to ${capital} USDT?\n\n` +
+          'The paper account ledger is reset to the new capital (audited): peak, day start and ' +
+          'carried PnL are rebased. Circuit breaker tiers are not cleared.',
+      )
+    ) {
+      return;
+    }
     try {
-      await fetchApi('/api/system/config', {
+      const cfg = await fetchApi<PlatformConfig>('/api/system/config', {
         method: 'PUT',
         body: JSON.stringify({
           trading_mode: tradingMode,
           default_pair: defaultPair,
           default_timeframe: defaultTimeframe,
           max_concurrent_strategies: Number(maxStrategies),
-          paper_capital: Number(paperCapital),
+          paper_capital: capital,
         }),
       });
-      toast('success', 'Platform configuration saved');
+      setSavedPaperCapital(cfg.paper_capital);
+      setPendingPaperCapital(cfg.paper_capital_pending);
+      if (typeof cfg.paper_capital_pending === 'number') {
+        toast('warning', 'Saved. The paper ledger switches to the new capital once every held position has a price');
+      } else {
+        toast('success', 'Platform configuration saved');
+      }
     } catch (err) {
       logger.error('Settings', 'Failed to save config', err);
       toast('error', describeApiError(err, 'Failed to save configuration'));
@@ -363,7 +429,7 @@ export default function SettingsPage() {
       {/* Exchange connections */}
       <DataCard title="Exchange Connections" description="Manage your exchange API connections">
         {fetchErrors.exchanges ? (
-          <ErrorCard message="Failed to load exchange connections" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.exchanges} fallback="Failed to load exchange connections" onRetry={loadData} />
         ) : loading ? (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -402,8 +468,8 @@ export default function SettingsPage() {
                           <h4 className="text-sm font-semibold text-text-primary">
                             {exchange.name}
                           </h4>
-                          <p className="mt-0.5 text-xs text-text-muted">
-                            Last sync: {exchange.lastSync}
+                          <p className="mt-0.5 text-xs text-text-muted" data-testid={`validation-${exchange.id}`}>
+                            {validationText(exchange)}
                           </p>
                         </div>
                       </div>
@@ -417,8 +483,11 @@ export default function SettingsPage() {
                       </div>
                     </div>
                     <div className="mt-3 flex items-center justify-between">
-                      <span className="text-xs text-text-muted">
-                        API Key: {exchange.apiKeySet ? 'Configured' : 'Not set'}
+                      <span className="flex items-center gap-2 text-xs text-text-muted">
+                        API Key: {CREDENTIAL_LABELS[exchange.credentialState]}
+                        {exchange.credentialState === 'undecryptable' && (
+                          <DataStateBadge state="invalid" reason="HYDRA_CREDENTIAL_KEY cannot decrypt the stored keys" />
+                        )}
                       </span>
                       <div className="flex items-center gap-2">
                         {exchange.connected && (
@@ -434,6 +503,7 @@ export default function SettingsPage() {
                         <Button
                           variant={exchange.connected ? 'ghost' : 'outline'}
                           size="sm"
+                          disabled={!exchange.supported}
                           onClick={() => {
                             setSelectedExchange(exchange);
                             setModalOpen(true);
@@ -451,7 +521,9 @@ export default function SettingsPage() {
                       {/* Balances */}
                       <div>
                         <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Balances</h5>
-                        {detail?.balances && detail.balances.length > 0 ? (
+                        {detail?.balances.error ? (
+                          <p className="text-xs text-status-error" data-testid={`balances-error-${exchange.id}`}>{detail.balances.error}</p>
+                        ) : detail?.balances.data && detail.balances.data.length > 0 ? (
                           <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                               <thead>
@@ -462,7 +534,7 @@ export default function SettingsPage() {
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-border-default">
-                                {detail.balances.map((b) => (
+                                {detail.balances.data.map((b) => (
                                   <tr key={b.currency}>
                                     <td className="px-2 py-1.5 text-text-primary font-medium">{b.currency}</td>
                                     <td className="px-2 py-1.5 text-right text-text-primary">{b.available.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
@@ -480,7 +552,9 @@ export default function SettingsPage() {
                       {/* Open Orders */}
                       <div>
                         <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Open Orders</h5>
-                        {detail?.orders && detail.orders.length > 0 ? (
+                        {detail?.orders.error ? (
+                          <p className="text-xs text-status-error" data-testid={`orders-error-${exchange.id}`}>{detail.orders.error}</p>
+                        ) : detail?.orders.data && detail.orders.data.length > 0 ? (
                           <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                               <thead>
@@ -494,15 +568,15 @@ export default function SettingsPage() {
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-border-default">
-                                {detail.orders.map((o, i) => (
+                                {detail.orders.data.map((o, i) => (
                                   <tr key={i}>
                                     <td className="px-2 py-1.5 text-text-primary">{o.symbol}</td>
                                     <td className="px-2 py-1.5">
                                       <StatusBadge status={o.side} variant={o.side.toLowerCase() === 'buy' ? 'success' : 'error'} size="sm" />
                                     </td>
                                     <td className="px-2 py-1.5 text-text-primary">{o.type}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.quantity}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">${o.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.quantity ?? '-'}</td>
+                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.price === null ? 'Market' : `$${o.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}</td>
                                     <td className="px-2 py-1.5">
                                       <StatusBadge status={o.status} variant="neutral" size="sm" />
                                     </td>
@@ -516,41 +590,12 @@ export default function SettingsPage() {
                         )}
                       </div>
 
-                      {/* Positions */}
+                      {/* Positions: a spot account has none */}
                       <div>
                         <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Positions</h5>
-                        {detail?.positions && detail.positions.length > 0 ? (
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-xs">
-                              <thead>
-                                <tr className="border-b border-border-default">
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Symbol</th>
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Direction</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Qty</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Entry</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Unrealized PnL</th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-border-default">
-                                {detail.positions.map((p, i) => (
-                                  <tr key={i}>
-                                    <td className="px-2 py-1.5 text-text-primary">{p.symbol}</td>
-                                    <td className="px-2 py-1.5">
-                                      <StatusBadge status={p.direction} variant={p.direction.toLowerCase() === 'long' ? 'success' : 'error'} size="sm" />
-                                    </td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{p.quantity}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">${p.entry.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                    <td className={cn('px-2 py-1.5 text-right font-medium', p.unrealized_pnl >= 0 ? 'text-status-success' : 'text-status-error')}>
-                                      {p.unrealized_pnl >= 0 ? '+' : ''}${p.unrealized_pnl.toFixed(2)}
-                                    </td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        ) : (
-                          <p className="text-xs text-text-muted">No open positions</p>
-                        )}
+                        <p className="text-xs text-text-muted">
+                          Spot account: there are no positions; holdings are listed under Balances.
+                        </p>
                       </div>
                     </div>
                   )}
@@ -763,7 +808,7 @@ export default function SettingsPage() {
       {/* Platform config */}
       <DataCard title="Platform Configuration" description="General platform settings">
         {fetchErrors.config ? (
-          <ErrorCard message="Failed to load platform configuration" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.config} fallback="Failed to load platform configuration" onRetry={loadData} />
         ) : loading ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             {Array.from({ length: 5 }).map((_, i) => (
@@ -776,9 +821,8 @@ export default function SettingsPage() {
               <Select
                 label="Default Trading Pair"
                 options={[
-                  { value: 'btcusdt', label: 'BTC/USDT' },
-                  { value: 'ethusdt', label: 'ETH/USDT' },
-                  { value: 'btcusd', label: 'BTC/USD' },
+                  { value: 'BTC/USDT', label: 'BTC/USDT' },
+                  { value: 'ETH/USDT', label: 'ETH/USDT' },
                 ]}
                 value={defaultPair}
                 onChange={(e) => setDefaultPair(e.target.value)}
@@ -814,7 +858,11 @@ export default function SettingsPage() {
                 type="number"
                 value={paperCapital}
                 onChange={(e) => setPaperCapital(e.target.value)}
-                hint="Starting balance for paper trading sessions"
+                hint={
+                  pendingPaperCapital !== null
+                    ? `Pending: the paper ledger moves to ${pendingPaperCapital} USDT once every held position has a price`
+                    : 'Capital of the paper account; changing it resets the paper ledger (audited)'
+                }
               />
             </div>
             <div className="mt-4 flex items-center justify-end gap-3">

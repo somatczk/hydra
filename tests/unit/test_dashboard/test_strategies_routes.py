@@ -113,18 +113,22 @@ class TestStrategiesFallback:
         assert resp.status_code == 200
         assert resp.json() == []
 
-    def test_placeholder_strategy_is_gone(self, client_no_pool: TestClient) -> None:
+    def test_non_yaml_strategy_without_db_is_503_not_404(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.get("/api/strategies/strat-1")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "database_unavailable"
+        assert resp.json()["detail"]["state"] == "unavailable"
+
+    def test_unknown_strategy_with_db_is_404(self) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetchrow = AsyncMock(return_value=None)
+        resp = TestClient(_make_app(pool=pool)).get("/api/strategies/strat-1")
         assert resp.status_code == 404
         assert resp.json()["detail"] == {
             "code": "strategy_not_found",
             "message": "Strategy strat-1 not found",
             "state": "not_found",
         }
-
-    def test_get_unknown_strategy_returns_404(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/strategies/does-not-exist")
-        assert resp.status_code == 404
 
     def test_toggle_placeholder_is_404(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.post("/api/strategies/strat-1/toggle")
@@ -698,3 +702,50 @@ class TestStrategiesWithPool:
         client = TestClient(_make_app(pool=pool))
         resp = client.post("/api/strategies/nonexistent/toggle")
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# #123 tail: backtest share no longer swallows DB errors
+# ---------------------------------------------------------------------------
+
+
+def _share_app(pool: object | None) -> FastAPI:
+    from hydra.dashboard.routes.backtest import router as backtest_router
+
+    test_app = FastAPI()
+    test_app.include_router(backtest_router)
+    test_app.state.db_pool = pool
+    return test_app
+
+
+class TestBacktestShare:
+    def test_share_without_db_is_503_and_issues_no_token(self) -> None:
+        from hydra.dashboard.routes.backtest import _SHARED_TOKENS
+
+        before = dict(_SHARED_TOKENS)
+        resp = TestClient(_share_app(None)).post("/api/backtest/results/bt-x/share")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "database_unavailable"
+        assert before == _SHARED_TOKENS
+
+    def test_share_db_error_is_503_not_a_token(self) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetchval = AsyncMock(side_effect=OSError("connection refused"))
+        resp = TestClient(_share_app(pool)).post("/api/backtest/results/bt-x/share")
+        assert resp.status_code == 503
+        assert "token" not in resp.json()
+
+    def test_share_unknown_result_is_404_envelope(self) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetchval = AsyncMock(return_value=None)
+        resp = TestClient(_share_app(pool)).post("/api/backtest/results/bt-x/share")
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "result_not_found"
+
+    def test_share_existing_result_returns_a_token(self) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetchval = AsyncMock(return_value=1)
+        resp = TestClient(_share_app(pool)).post("/api/backtest/results/bt-x/share")
+        assert resp.status_code == 200
+        token = resp.json()["token"]
+        assert resp.json()["share_url"] == f"/api/backtest/shared/{token}"

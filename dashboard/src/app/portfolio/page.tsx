@@ -31,7 +31,8 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Table } from '@/components/ui/Table';
 import { useToast } from '@/components/ui/Toast';
-import { fetchApi } from '@/lib/api';
+import { ApiError, fetchApi } from '@/lib/api';
+import { describeApiError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -44,6 +45,7 @@ interface PortfolioSummary {
   max_drawdown_pct: number;
   total_fees: number;
   change_pct: number;
+  paper_capital_pending?: number | null;
 }
 
 interface Position {
@@ -223,30 +225,41 @@ export default function PortfolioPage() {
     setLoading(true);
     setFetchErrors({});
 
-    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
-      .catch(() => ({ trading_mode: 'paper' }));
-    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    // No guessed source: without the platform config, source-specific widgets show why
+    let source: 'live' | 'paper' | null = null;
+    let configError: unknown = null;
+    try {
+      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config');
+      source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    } catch (err) {
+      logger.warn('Portfolio', 'Trading mode unknown; portfolio data not requested', err);
+      configError = err ?? true;
+    }
     const qs = `?source=${source}`;
 
     await Promise.all([
-      fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
-        .then(setSummary)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, summary: err ?? true })); }),
-      fetchApi<Position[]>(`/api/portfolio/positions${qs}`)
-        .then(setPositions)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
-      fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
-        .then(setEquityCurve)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, equity: err ?? true })); }),
-      fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
-        .then(setDailyPnl)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, dailyPnl: err ?? true })); }),
-      fetchApi<MonthlyReturn[]>(`/api/portfolio/monthly-returns${qs}`)
-        .then(setMonthlyReturns)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, monthlyReturns: err ?? true })); }),
-      fetchApi<AttributionItem[]>(`/api/portfolio/attribution${qs}`)
-        .then(setAttribution)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, attribution: err ?? true })); }),
+      ...(source === null
+        ? []
+        : [
+            fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
+              .then(setSummary)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, summary: err ?? true })); }),
+            fetchApi<Position[]>(`/api/portfolio/positions${qs}`)
+              .then(setPositions)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
+            fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
+              .then(setEquityCurve)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, equity: err ?? true })); }),
+            fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
+              .then(setDailyPnl)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, dailyPnl: err ?? true })); }),
+            fetchApi<MonthlyReturn[]>(`/api/portfolio/monthly-returns${qs}`)
+              .then(setMonthlyReturns)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, monthlyReturns: err ?? true })); }),
+            fetchApi<AttributionItem[]>(`/api/portfolio/attribution${qs}`)
+              .then(setAttribution)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, attribution: err ?? true })); }),
+          ]),
       fetchApi<SentimentData[]>('/api/market/sentiment')
         .then((arr) => setSentiment(arr?.[0] ?? null))
         .catch((err) => { setFetchErrors((prev) => ({ ...prev, sentiment: err ?? true })); }),
@@ -255,6 +268,17 @@ export default function PortfolioPage() {
         .catch(() => {}),
     ]);
 
+    if (configError !== null) {
+      setFetchErrors((prev) => ({
+        ...prev,
+        summary: configError,
+        positions: configError,
+        equity: configError,
+        dailyPnl: configError,
+        monthlyReturns: configError,
+        attribution: configError,
+      }));
+    }
     setLoading(false);
   }, []);
 
@@ -281,8 +305,8 @@ export default function PortfolioPage() {
       setTradesTotal(res.total);
       setTradesPage(res.page);
       setTradesPages(res.pages);
-    } catch {
-      toast('error', 'Failed to load trades');
+    } catch (err) {
+      toast('error', describeApiError(err, 'Failed to load trades'));
     } finally {
       setTradesLoading(false);
     }
@@ -351,7 +375,7 @@ export default function PortfolioPage() {
     try {
       const url = `${process.env.NEXT_PUBLIC_API_URL || window.location.origin}/api/portfolio/export/csv?${params.toString()}`;
       const res = await fetch(url);
-      if (!res.ok) throw new Error('Export failed');
+      if (!res.ok) throw new ApiError(res.status, await res.text());
       const blob = await res.blob();
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -361,8 +385,8 @@ export default function PortfolioPage() {
       document.body.removeChild(a);
       URL.revokeObjectURL(a.href);
       toast('success', 'Export downloaded');
-    } catch {
-      toast('error', 'Failed to export trades');
+    } catch (err) {
+      toast('error', describeApiError(err, 'Failed to export trades'));
     } finally {
       setExporting(false);
     }
@@ -524,6 +548,12 @@ export default function PortfolioPage() {
         </div>
       </DataCard>
 
+      {summary?.paper_capital_pending != null && (
+        <p className="rounded-lg border border-status-warning/30 bg-status-warning/5 p-3 text-xs text-text-primary" data-testid="capital-pending">
+          Paper capital change to ${summary.paper_capital_pending.toLocaleString('en-US')} is pending: the
+          ledger rebases once every held position has a mark. Values below use the capital in force.
+        </p>
+      )}
       {/* Stat cards + Sentiment */}
       {fetchErrors.summary ? (
         <DataStateErrorCard error={fetchErrors.summary} fallback="Failed to load portfolio summary" onRetry={loadData} />

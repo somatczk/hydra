@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { buttonByText, click, mount, routeFetch, type Mounted, type Routes } from '@/test/pageHarness';
+import {
+  buttonByText,
+  click,
+  inputByLabel,
+  mount,
+  routeFetch,
+  sectionText,
+  typeInto,
+  unavailable,
+  type Mounted,
+  type Routes,
+} from '@/test/pageHarness';
 import { CLEAR_WEBHOOK_SECRET_WARNING } from '@/lib/platformConfig';
 
 const fetchApi = vi.fn();
@@ -21,6 +32,7 @@ function routes(): Routes {
       default_timeframe: '1h',
       max_concurrent_strategies: 5,
       paper_capital: 10000,
+      paper_capital_pending: null,
       webhook_secret_set: true,
       discord_webhook_url_set: false,
       slack_webhook_url_set: false,
@@ -79,5 +91,151 @@ describe('SettingsPage', () => {
     await click(buttonByText(page.container, 'Clear'));
 
     expect(puts()).toEqual([{ webhook_secret: '' }]);
+  });
+});
+
+const EXCHANGES = [
+  {
+    id: 'binance',
+    name: 'Binance',
+    supported: true,
+    connected: true,
+    api_key_set: true,
+    credential_state: 'ok',
+    last_sync: '2026-10-20T12:00:00+00:00',
+    environment: 'testnet',
+    validated_environment: 'testnet',
+  },
+  {
+    id: 'bybit',
+    name: 'Bybit',
+    supported: false,
+    connected: false,
+    api_key_set: true,
+    credential_state: 'undecryptable',
+    last_sync: null,
+    environment: 'testnet',
+    validated_environment: null,
+  },
+  {
+    id: 'kraken',
+    name: 'Kraken',
+    supported: false,
+    connected: false,
+    api_key_set: false,
+    credential_state: 'missing',
+    last_sync: null,
+    environment: 'testnet',
+    validated_environment: null,
+  },
+];
+
+describe('SettingsPage exchange credential state', () => {
+  it('shows when the keys were validated and which stored keys cannot be decrypted', async () => {
+    const r = routes();
+    r['/api/system/exchanges'] = EXCHANGES;
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page = await mount(<SettingsPage />);
+
+    const binance = page.container.querySelector('[data-testid="validation-binance"]');
+    expect(binance?.textContent).toContain('Validated on testnet');
+    expect(binance?.textContent).not.toContain('Active');
+    expect(page.container.textContent).toContain('Undecryptable, enter the keys again');
+    expect(page.container.textContent).toContain('Not supported yet (Binance only)');
+    const connect = Array.from(page.container.querySelectorAll('button')).filter(
+      (b) => b.textContent?.trim() === 'Connect',
+    );
+    expect(connect.every((b) => b.disabled)).toBe(true);
+  });
+
+  it('does not count keys checked on testnet as validated on mainnet', async () => {
+    const r = routes();
+    r['/api/system/exchanges'] = [
+      { ...EXCHANGES[0], connected: false, environment: 'mainnet', validated_environment: 'testnet' },
+    ];
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page = await mount(<SettingsPage />);
+
+    const binance = page.container.querySelector('[data-testid="validation-binance"]');
+    expect(binance?.textContent).toBe('Checked on testnet only; connect again for mainnet');
+  });
+
+  it('shows the balance when open orders fail and never asks a spot account for positions', async () => {
+    const r = routes();
+    r['/api/system/exchanges'] = EXCHANGES;
+    r['/api/system/exchanges/binance/balance'] = { exchange_id: 'binance', balances: { USDT: 12.5 } };
+    r['/api/system/exchanges/binance/orders'] = unavailable('Request to Binance testnet failed');
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page = await mount(<SettingsPage />);
+    await click(buttonByText(page.container, 'Details'));
+
+    const balances = page.container.textContent ?? '';
+    expect(balances).toContain('USDT');
+    expect(balances).toContain('12.50');
+    expect(page.container.querySelector('[data-testid="orders-error-binance"]')?.textContent).toBe(
+      'Request to Binance testnet failed',
+    );
+    expect(balances).toContain('Spot account: there are no positions');
+    expect(calls.some((c) => c.path.endsWith('/positions'))).toBe(false);
+  });
+
+  it('shows the server message when exchanges cannot be read', async () => {
+    const r = routes();
+    r['/api/system/exchanges'] = unavailable('Database error while reading exchange credentials');
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page = await mount(<SettingsPage />);
+
+    const card = sectionText(page.container, 'Exchange Connections');
+    expect(card).toContain('UNAVAILABLE');
+    expect(card).toContain('Database error while reading exchange credentials');
+  });
+});
+
+describe('SettingsPage platform config', () => {
+  it('shows why the config is unavailable and no 10000 default', async () => {
+    const r = routes();
+    r['/api/system/config'] = unavailable('system_config has no row for: paper_capital');
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page = await mount(<SettingsPage />);
+
+    const card = sectionText(page.container, 'Platform Configuration');
+    expect(card).toContain('system_config has no row for: paper_capital');
+    expect(page.container.textContent).not.toContain('10000');
+  });
+
+  it('asks before a paper capital change, which resets the paper ledger', async () => {
+    const ask = vi.fn(() => false);
+    vi.stubGlobal('confirm', ask);
+    page = await mount(<SettingsPage />);
+
+    await typeInto(inputByLabel(page.container, 'Paper Trading Capital (USDT)'), '25000');
+    await click(buttonByText(page.container, 'Save Configuration'));
+
+    expect(String((ask.mock.calls[0] as unknown[])[0])).toContain('from 10000 to 25000');
+    expect(puts()).toEqual([]);
+  });
+
+  it('saves other settings without asking when the capital is unchanged', async () => {
+    const ask = vi.fn(() => false);
+    vi.stubGlobal('confirm', ask);
+    page = await mount(<SettingsPage />);
+
+    await click(buttonByText(page.container, 'Save Configuration'));
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(puts()).toEqual([
+      {
+        trading_mode: 'paper',
+        default_pair: 'BTC/USDT',
+        default_timeframe: '1h',
+        max_concurrent_strategies: 5,
+        paper_capital: 10000,
+      },
+    ]);
+  });
+
+  it('says a webhook without a secret rejects every signal', () => {
+    expect(CLEAR_WEBHOOK_SECRET_WARNING).toContain('rejects every signal');
+    expect(CLEAR_WEBHOOK_SECRET_WARNING).not.toContain('accept payloads without a secret');
   });
 });

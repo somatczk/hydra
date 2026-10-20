@@ -5,6 +5,7 @@ import { X, Plug, Unplug } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { fetchApi } from '@/lib/api';
+import { describeApiError } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 
@@ -12,6 +13,12 @@ interface Exchange {
   id: string;
   name: string;
   connected: boolean;
+  credentialState?: 'ok' | 'undecryptable' | 'missing';
+  environment: 'testnet' | 'mainnet';
+}
+
+interface ConnectResponse {
+  message: string;
 }
 
 interface ExchangeConnectDialogProps {
@@ -48,7 +55,7 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
     setSaving(true);
     setError(null);
     try {
-      await fetchApi(`/api/system/exchanges/${exchange.id}/connect`, {
+      const res = await fetchApi<ConnectResponse>(`/api/system/exchanges/${exchange.id}/connect`, {
         method: 'POST',
         body: JSON.stringify({
           api_key: apiKey.trim(),
@@ -57,11 +64,12 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
         }),
       });
       logger.info('Settings', `Exchange ${exchange.name} connected`);
-      toast('success', `${exchange.name} connected`);
+      toast('success', res.message);
       onUpdated();
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Connection failed');
+      logger.warn('Settings', `Exchange ${exchange.name} connect refused`, err);
+      setError(describeApiError(err, 'Connection failed'));
     } finally {
       setSaving(false);
     }
@@ -79,7 +87,8 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
       onUpdated();
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Disconnect failed');
+      logger.warn('Settings', `Exchange ${exchange.name} disconnect failed`, err);
+      setError(describeApiError(err, 'Disconnect failed'));
     } finally {
       setSaving(false);
     }
@@ -121,6 +130,18 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
         ) : (
           /* Connect mode */
           <div className="flex flex-col gap-4">
+            <p className="text-xs text-text-muted" data-testid="connect-target">
+              The keys are checked against {exchange.name} {exchange.environment} with a read-only
+              balance call before anything is stored. Use read-only keys
+              {exchange.environment === 'testnet'
+                ? ' from testnet.binance.vision; mainnet keys are rejected there.'
+                : ' from your mainnet account.'}
+            </p>
+            {exchange.credentialState === 'undecryptable' && (
+              <p className="text-xs text-status-warning">
+                The stored keys cannot be decrypted with the current credential key; enter them again.
+              </p>
+            )}
             <Input label="API Key" type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Enter API key" autoFocus />
             <Input label="API Secret" type="password" value={apiSecret} onChange={(e) => setApiSecret(e.target.value)} placeholder="Enter API secret" />
             <Input label="Passphrase (optional)" type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="Required for some exchanges" />

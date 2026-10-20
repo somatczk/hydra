@@ -256,9 +256,9 @@ class TestStartup:
 
 
 def test_audit_line_carries_principal_and_fields(monkeypatch: pytest.MonkeyPatch) -> None:
-    # an earlier route's audit() call may have cached the shared logger's configuration
-    monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
     with capture_logs() as logs:
+        # a logger cached by an earlier audit() call would bypass capture_logs
+        monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
         audit(Principal("user", "soma"), "kill_switch.activate", sessions_stopped=2)
     assert logs == [
         {

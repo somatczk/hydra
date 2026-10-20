@@ -47,7 +47,8 @@ not duplicate it here; update that table in the PR that changes a row.
 - **Database**: TimescaleDB (PostgreSQL 16). `ts` schema for hypertables (`ts.ohlcv_1m`, `ts.funding_rates`),
   `public` for relational data.
 - **Frontend**: Next.js 16.4, React 19, TypeScript 7 for `tsc --noEmit` (lint and `next build` use the TypeScript 6
-  API package), Tailwind CSS 4, Recharts, vitest + jsdom. The TradingView chart on `/trading` is a third-party embed.
+  API package), Tailwind CSS 4, Recharts, vitest + jsdom. The TradingView chart on `/trading` is a cross-origin
+  iframe; production responses carry a CSP (`dashboard/next.config.ts`).
 - **ML**: onnxruntime, plus xgboost/torch/mlflow in the `ml-training` extra. Not wired into trading (P5).
 
 ## Project structure
@@ -95,10 +96,11 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   built by `hydra.execution.client_factory` (Binance spot only); live sessions are refused until P3.
 - Persisted (the engine has a DB pool whenever `DATABASE_URL` is set; startup fails without one): risk config and
   kill-switch flag, trading sessions, paper trades, positions and balance snapshots, backtest results and trades with
-  data provenance, exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`), and `system_config` rows (read at startup;
-  `PUT /api/system/config` still changes memory only). In memory only: background task state (backtest, hyperopt,
-  walk-forward). Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`; paper
-  sessions are restored from `paper_accounts` by `SessionManager.startup()`.
+  data provenance, exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`), and `system_config` rows (`PUT
+  /api/system/config` writes them, secrets Fernet-encrypted; a missing row is a 503, never a default; a
+  `paper_capital` change goes through `RiskService.reload_config`). In memory only: background task state (backtest,
+  hyperopt, walk-forward). Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`;
+  paper sessions are restored from `paper_accounts` by `SessionManager.startup()`.
 - Every paper entry gets a protective stop (strategy `risk:` block, 5 % default); no exchange-side stops yet (P3).
   Only Binance SPOT is accepted (`client_factory.validate_venue`).
 - API auth lives in one pure-ASGI middleware, `src/hydra/dashboard/security.py`: every route and WebSocket except

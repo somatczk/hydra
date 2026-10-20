@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import UTC
+import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,12 +16,18 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from hydra.dashboard.routes import portfolio
+from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.portfolio import router
+from hydra.risk.service import RiskService
+from hydra.risk.state import InMemoryRiskStateStore
+from tests.unit.test_risk.harness import Clock, rules_cache
 
 
 def _make_app(pool: Any = None) -> FastAPI:
     app = FastAPI()
     app.state.db_pool = pool
+    install_error_handlers(app)
     app.include_router(router)
     return app
 
@@ -148,94 +159,458 @@ class TestEmptyDatabase:
         assert resp.status_code == 200
         assert resp.json() == {"trades": [], "total": 0, "page": 1, "limit": 20, "pages": 0}
 
-    def test_paper_summary_is_the_real_paper_capital(self) -> None:
-        resp = self._client().get("/api/portfolio/summary?source=paper")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["total_value"] == 10000.0
+
+# ---------------------------------------------------------------------------
+# Account maths on a table-level fake (the DB boundary): RK-13, RK-15, DA-5, paper capital
+# ---------------------------------------------------------------------------
+
+T0 = datetime(2026, 10, 20, 10, 0, tzinfo=UTC)
+
+
+class FakePortfolioDb:
+    """The rows the portfolio queries read, answered the way the SQL defines them."""
+
+    def __init__(self) -> None:
+        self.paper_capital: str | None = "10000"
+        self.sessions: dict[str, dict[str, Any]] = {}
+        self.trades: list[dict[str, Any]] = []
+        self.positions: list[dict[str, Any]] = []
+        self.snapshots: list[dict[str, Any]] = []
+        self.bars: list[dict[str, Any]] = []
+        self.resets: list[dict[str, Any]] = []
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[FakePortfolioDb]:
+        yield self
+
+    def session(
+        self,
+        sid: str,
+        allocated: float | None,
+        status: str = "running",
+        stopped_at: datetime | None = None,
+    ) -> None:
+        self.sessions[sid] = {
+            "paper_capital": allocated,
+            "status": status,
+            "timeframe": "1h",
+            "stopped_at": stopped_at,
+        }
+
+    def snapshot(
+        self,
+        sid: str | None,
+        hour: float,
+        value: float,
+        source: str = "paper",
+        at: datetime | None = None,
+    ) -> None:
+        self.snapshots.append(
+            {
+                "id": len(self.snapshots) + 1,
+                "timestamp": at if at is not None else T0 + timedelta(hours=hour),
+                "session_id": sid,
+                "total_value": Decimal(str(value)),
+                "source": source,
+            }
+        )
+
+    def reset(self, hour: float, old: str, new: str) -> None:
+        details = {"old_capital": old, "new_capital": new, "old_carried": "0"}
+        self.resets.append({"ts": T0 + timedelta(hours=hour), "details": json.dumps(details)})
+
+    def _paper_rows(self) -> list[dict[str, Any]]:
+        return [
+            {
+                **b,
+                "allocated": self.sessions[b["session_id"]]["paper_capital"],
+                "stopped_at": self.sessions[b["session_id"]]["stopped_at"],
+            }
+            for b in self.snapshots
+            if b["source"] == "paper"
+            and b["session_id"] in self.sessions
+            and self.sessions[b["session_id"]]["paper_capital"] is not None
+        ]
+
+    def trade(
+        self, sid: str, pnl: float, fee: float, when: datetime, source: str = "paper"
+    ) -> None:
+        self.trades.append(
+            {"session_id": sid, "pnl": pnl, "fee": fee, "timestamp": when, "source": source}
+        )
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        if sql == "SELECT value FROM system_config WHERE key = 'paper_capital'":
+            return self.paper_capital
+        if sql == portfolio._RUNNING_UNREALIZED_SQL:
+            (source,) = args
+            return sum(
+                p["unrealized_pnl"]
+                for p in self.positions
+                if self.sessions.get(p["session_id"], {}).get("status") == "running"
+                and source in (None, p["source"])
+            )
+        if sql == portfolio._LATEST_CLOSE_SQL:
+            exchange, symbol, timeframe = args
+            bars = [
+                b
+                for b in self.bars
+                if (b["exchange"], b["symbol"], b["timeframe"]) == (exchange, symbol, timeframe)
+            ]
+            return max(bars, key=lambda b: b["timestamp"])["close"] if bars else None
+        raise AssertionError(f"unexpected fetchval: {sql}")
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
+        if sql.startswith("SELECT COUNT(*) AS cnt FROM trades"):
+            return {"cnt": 0}
+        assert sql == portfolio._TRADE_TOTALS_SQL
+        (source,) = args
+        rows = [t for t in self.trades if source in (None, t["source"])]
+        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        return {
+            "realized": sum(t["pnl"] for t in rows),
+            "fees": sum(t["fee"] for t in rows),
+            "daily": sum(t["pnl"] - t["fee"] for t in rows if t["timestamp"] >= today),
+        }
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        if sql == portfolio._SESSION_BUCKETS_SQL:
+            (since,) = args
+            buckets: dict[tuple[str, datetime], dict[str, Any]] = {}
+            for row in sorted(self._paper_rows(), key=lambda r: (r["timestamp"], r["id"])):
+                if since is None or row["timestamp"] >= since:
+                    hour = row["timestamp"].replace(minute=0, second=0, microsecond=0)
+                    buckets[(row["session_id"], hour)] = row
+            return list(buckets.values())
+        if sql == portfolio._SESSION_SEED_SQL:
+            (since,) = args
+            seeds: dict[str, dict[str, Any]] = {}
+            for row in sorted(self._paper_rows(), key=lambda r: (r["timestamp"], r["id"])):
+                if row["timestamp"] < since:
+                    seeds[row["session_id"]] = row
+            return list(seeds.values())
+        if sql == portfolio._PAPER_RESETS_SQL:
+            return sorted(self.resets, key=lambda r: r["ts"])
+        if sql == portfolio._ACCOUNT_SNAPSHOTS_SQL:
+            source, since = args
+            rows = [
+                b
+                for b in self.snapshots
+                if b["session_id"] is None
+                and source in (None, b["source"])
+                and (since is None or b["timestamp"] >= since)
+            ]
+            return sorted(rows, key=lambda r: (r["timestamp"], r["id"]))
+        if sql == portfolio._DAILY_PNL_30D_SQL:
+            return []
+        if sql == portfolio._DAILY_PNL_SQL:
+            (source,) = args
+            days: dict[datetime, float] = {}
+            for t in self.trades:
+                if source in (None, t["source"]):
+                    utc = t["timestamp"].astimezone(UTC)
+                    day = utc.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+                    days[day] = days.get(day, 0.0) + t["pnl"] - t["fee"]
+            return [{"date": d, "pnl": v} for d, v in sorted(days.items())]
+        if sql == portfolio._POSITIONS_SQL:
+            (source,) = args
+            return [
+                {
+                    **p,
+                    "timeframe": self.sessions.get(p["session_id"], {}).get("timeframe", "1m"),
+                }
+                for p in self.positions
+                if p["quantity"] != 0 and source in (None, p["source"])
+            ]
+        raise AssertionError(f"unexpected fetch: {sql}")
+
+
+@pytest.fixture()
+def db() -> FakePortfolioDb:
+    return FakePortfolioDb()
+
+
+@pytest.fixture()
+def client(db: FakePortfolioDb) -> TestClient:
+    return TestClient(_make_app(pool=db))
+
+
+class TestPaperSummary:
+    def test_empty_paper_account_is_the_persisted_paper_capital(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.paper_capital = "25000"
+        data = client.get("/api/portfolio/summary?source=paper").json()
+        assert data["total_value"] == 25000.0
         assert data["realized_pnl"] == 0.0
-        assert data["unrealized_pnl"] == 0.0
+        assert data["max_drawdown_pct"] == 0.0
+
+    def test_missing_paper_capital_row_is_503_never_10000(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.paper_capital = None
+        for path in ("summary", "equity-curve", "monthly-returns", "live-metrics"):
+            resp = client.get(f"/api/portfolio/{path}?source=paper")
+            assert resp.status_code == 503, path
+            assert resp.json()["detail"]["code"] == "system_config_missing"
+
+    def test_two_interleaved_sleeves_are_not_an_80pct_drawdown(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        # RK-13: 9000 and 1000 sleeves, both profitable, snapshots interleaved
+        db.session("big", 9000)
+        db.session("small", 1000)
+        for minute, (sid, value) in enumerate(
+            [("big", 9100), ("small", 1050), ("big", 9150), ("small", 1060)]
+        ):
+            db.snapshot(sid, minute, value)
+        data = client.get("/api/portfolio/summary?source=paper").json()
+        assert data["max_drawdown_pct"] == 0.0
+        curve = client.get("/api/portfolio/equity-curve?source=paper").json()
+        assert [p["value"] for p in curve] == [10100.0, 10150.0, 10200.0, 10210.0]
+
+    def test_account_drawdown_from_one_losing_sleeve(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.session("big", 9000)
+        db.session("small", 1000)
+        db.snapshot("big", 0, 9100)
+        db.snapshot("small", 1, 1050)
+        db.snapshot("big", 2, 8600)
+        # peak 10150, trough 10000 - 400 + 50 = 9650
+        data = client.get("/api/portfolio/summary?source=paper").json()
+        assert data["max_drawdown_pct"] == round((10150 - 9650) / 10150 * 100, 1)
+
+    def test_stopped_session_keeps_its_result_and_legacy_rows_are_ignored(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.session("old", 5000, status="stopped")
+        db.session("new", 5000)
+        db.snapshot("old", 0, 4800)
+        db.snapshot(None, 1, 123.0)
+        db.snapshot("new", 2, 5100)
+        curve = client.get("/api/portfolio/equity-curve?source=paper").json()
+        assert [p["value"] for p in curve] == [9800.0, 9900.0]
+
+    def test_daily_pnl_counts_stopped_sessions_and_nets_fees(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        # RK-15: stopping the losing session must not hide today's loss
+        now = datetime.now(UTC)
+        db.session("loser", 5000, status="stopped")
+        db.session("winner", 5000)
+        db.trade("loser", -100.0, 20.0, now)
+        db.trade("winner", 50.0, 0.0, now)
+        db.trade("winner", 500.0, 0.0, now - timedelta(days=2))
+        db.snapshot("loser", 0, 4880)
+        db.snapshot("winner", 0, 5550)
+        data = client.get("/api/portfolio/summary?source=paper").json()
+        assert data["daily_pnl"] == -70.0
+        assert data["realized_pnl"] == 450.0
+        assert data["total_fees"] == 20.0
+        assert data["total_value"] == 10000.0 - 120.0 + 550.0
+
+    def test_unrealized_counts_running_sessions_only(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.session("run", 5000)
+        db.session("done", 5000, status="stopped")
+        db.positions = [
+            {"session_id": "run", "unrealized_pnl": 30.0, "source": "paper"},
+            {"session_id": "done", "unrealized_pnl": 999.0, "source": "paper"},
+        ]
+        db.snapshot("run", 0, 5030)
+        data = client.get("/api/portfolio/summary?source=paper").json()
+        assert data["unrealized_pnl"] == 30.0
+        assert data["total_value"] == 10030.0
+
+    def test_monthly_returns_from_the_account_curve(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.session("a", 5000)
+        db.session("b", 5000)
+        db.snapshot("a", 0, 5000)
+        db.snapshot("b", 1, 5500)
+        assert client.get("/api/portfolio/monthly-returns?source=paper").json() == [
+            {"month": "2026-10", "return_pct": 5.0}
+        ]
 
 
-# ---------------------------------------------------------------------------
-# DB path (mock pool)
-# ---------------------------------------------------------------------------
+class TestPaperLedger:
+    """The paper account follows the RiskService ledger: its capital and its audited resets."""
 
-
-class TestPortfolioWithPool:
-    """Endpoints should query the DB and return transformed rows."""
-
-    def test_summary_from_db(self) -> None:
-        pool, conn = _make_mock_pool()
-        # No source param: fetchval called 4 times:
-        # realized_pnl, fees, daily_pnl, unrealized_pnl
-        # Then fetchrow for snapshot (total_value), then fetch for equity curve
-        conn.fetchval = AsyncMock(side_effect=[1500.00, 85.50, 42.00, 200.00])
-        conn.fetchrow = AsyncMock(return_value={"total_value": 12000.50})
-        conn.fetch = AsyncMock(
-            return_value=[
-                {"total_value": 10000.00},
-                {"total_value": 12000.50},
-            ]
+    async def test_pending_capital_change_does_not_move_the_account(
+        self, db: FakePortfolioDb
+    ) -> None:
+        clock = Clock()
+        svc = RiskService(
+            InMemoryRiskStateStore(paper_capital=Decimal("10000")),
+            clock=clock,
+            market_rules=rules_cache(clock),
         )
-        client = TestClient(_make_app(pool=pool))
-        resp = client.get("/api/portfolio/summary")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["total_value"] == 12000.50
-        assert data["total_fees"] == 85.50
-        assert data["daily_pnl"] == 42.00
-        assert data["max_drawdown_pct"] == 0.0  # monotonically increasing curve
+        await svc.load()
+        app = _make_app(pool=db)
+        app.state.session_manager = SimpleNamespace(risk=svc)
+        db.paper_capital = "25000"
+        db.session("a", 5000)
+        db.snapshot("a", 0, 5100)
+        client = TestClient(app)
+        data = client.get("/api/portfolio/summary?source=paper").json()
+        assert data["total_value"] == 10100.0
+        assert data["paper_capital_pending"] == 25000.0
+        curve = client.get("/api/portfolio/equity-curve?source=paper").json()
+        assert [p["value"] for p in curve] == [10100.0]
 
-    def test_positions_from_db(self) -> None:
-        pool, conn = _make_mock_pool()
-        conn.fetch = AsyncMock(
-            return_value=[
-                {
-                    "id": 1,
-                    "strategy_id": "strat-1",
-                    "exchange_id": "binance",
-                    "symbol": "BTCUSDT",
-                    "direction": "LONG",
-                    "quantity": 0.15,
-                    "avg_entry_price": 67420.0,
-                    "unrealized_pnl": 100.0,
-                    "realized_pnl": 0.0,
-                }
-            ]
-        )
-        conn.fetchval = AsyncMock(return_value=68000.0)
-        client = TestClient(_make_app(pool=pool))
-        resp = client.get("/api/portfolio/positions")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) == 1
-        assert data[0]["pair"] == "BTC/USDT"
-        assert data[0]["current_price"] == 68000.0
-        assert data[0]["unrealized_pnl"] == 87.0
+    def test_reset_rebases_without_rewriting_history(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.paper_capital = "20000"
+        db.session("old", 5000, status="stopped", stopped_at=T0 + timedelta(hours=1))
+        db.session("run", 5000)
+        db.snapshot("old", 0, 4500)
+        db.snapshot("run", 0, 5000)
+        db.snapshot("old", 1, 4000)
+        db.snapshot("run", 2, 5200)
+        db.reset(3, "10000", "20000")
+        db.snapshot("run", 4, 5300)
+        curve = client.get("/api/portfolio/equity-curve?source=paper").json()
+        # before the reset: 10000 + sleeves; after: 20000 + running sleeves (carried PnL dropped)
+        assert [p["value"] for p in curve] == [9500.0, 9000.0, 9200.0, 20200.0, 20300.0]
+        data = client.get("/api/portfolio/summary?source=paper").json()
+        assert data["total_value"] == 20300.0
+        assert data["max_drawdown_pct"] == round((9500 - 9000) / 9500 * 100, 1)
+        monthly = client.get("/api/portfolio/monthly-returns?source=paper").json()
+        twr = (9200 / 9500) * (20300 / 20200) - 1
+        assert monthly == [{"month": "2026-10", "return_pct": round(twr * 100, 2)}]
 
-    def test_positions_missing_ohlcv_table_uses_entry_price(self) -> None:
+    def test_snapshots_fold_to_one_point_per_hour(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.session("a", 5000)
+        for minute, value in ((0, 5100), (20, 4900), (59, 5050), (60, 5070)):
+            db.snapshot("a", minute / 60, value)
+        curve = client.get("/api/portfolio/equity-curve?source=paper").json()
+        assert [p["value"] for p in curve] == [10050.0, 10070.0]
+
+    def test_live_metrics_twr_seeds_sessions_from_before_the_window(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        now = datetime.now(UTC)
+        db.session("idle", 5000)
+        db.session("busy", 5000)
+        db.snapshot("idle", 0, 5500, at=now - timedelta(days=40))
+        db.snapshot("busy", 0, 5100, at=now - timedelta(days=10))
+        db.snapshot("busy", 0, 5200, at=now - timedelta(days=5))
+        data = client.get("/api/portfolio/live-metrics?source=paper").json()
+        assert data["time_weighted_return_30d"] == round((10700 / 10600 - 1) * 100, 2)
+
+    def test_daily_pnl_is_net_of_fees_per_utc_day(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.trade("a", 100.0, 4.0, T0)
+        db.trade("a", -50.0, 1.0, T0 + timedelta(hours=1))
+        assert client.get("/api/portfolio/daily-pnl?source=paper").json() == [
+            {"date": "2026-10-20", "pnl": 45.0}
+        ]
+
+
+def _position(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "id": 1,
+        "strategy_id": "strat-1",
+        "session_id": "s1",
+        "exchange_id": "binance",
+        "symbol": "BTCUSDT",
+        "direction": "LONG",
+        "quantity": 0.15,
+        "avg_entry_price": 67420.0,
+        "unrealized_pnl": 100.0,
+        "realized_pnl": 0.0,
+        "source": "paper",
+    }
+    row.update(overrides)
+    return row
+
+
+def _bar(exchange: str, timeframe: str, minute: int, close: float) -> dict[str, Any]:
+    return {
+        "exchange": exchange,
+        "symbol": "BTCUSDT",
+        "timeframe": timeframe,
+        "timestamp": T0 + timedelta(minutes=minute),
+        "close": close,
+    }
+
+
+class TestPositions:
+    def test_mark_is_the_positions_own_exchange_and_session_timeframe(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        # DA-5: other venues and other timeframes are newer but must not be read
+        db.session("s1", 5000)
+        db.positions = [_position()]
+        db.bars = [
+            _bar("binance", "1h", 0, 68000.0),
+            _bar("bybit", "1h", 30, 99999.0),
+            _bar("binance", "1d", 45, 50000.0),
+        ]
+        [pos] = client.get("/api/portfolio/positions?source=paper").json()
+        assert pos["pair"] == "BTC/USDT"
+        assert pos["current_price"] == 68000.0
+        assert pos["unrealized_pnl"] == 87.0
+
+    def test_no_bar_uses_the_stored_unrealized_pnl(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.session("s1", 5000)
+        db.positions = [_position(unrealized_pnl=15.0, quantity=0.1, avg_entry_price=60000.0)]
+        [pos] = client.get("/api/portfolio/positions").json()
+        assert pos["unrealized_pnl"] == 15.0
+        assert pos["current_price"] == 60150.0
+
+    def test_missing_ohlcv_table_uses_the_stored_unrealized_pnl(self) -> None:
         pool, conn = _make_mock_pool()
-        conn.fetch = AsyncMock(
-            return_value=[
-                {
-                    "id": 1,
-                    "strategy_id": "strat-1",
-                    "exchange_id": "binance",
-                    "symbol": "BTCUSDT",
-                    "direction": "LONG",
-                    "quantity": 0.15,
-                    "avg_entry_price": 67420.0,
-                    "unrealized_pnl": 0.0,
-                    "realized_pnl": 0.0,
-                }
-            ]
-        )
+        conn.fetch = AsyncMock(return_value=[{**_position(unrealized_pnl=0.0), "timeframe": "1h"}])
         conn.fetchval = AsyncMock(side_effect=asyncpg.UndefinedTableError("no ts.ohlcv_1m"))
-        client = TestClient(_make_app(pool=pool))
-        resp = client.get("/api/portfolio/positions")
+        resp = TestClient(_make_app(pool=pool)).get("/api/portfolio/positions")
         assert resp.status_code == 200
         assert resp.json()[0]["current_price"] == 67420.0
+
+    def test_flat_rows_are_not_positions(self, db: FakePortfolioDb, client: TestClient) -> None:
+        db.positions = [_position(quantity=0)]
+        assert client.get("/api/portfolio/positions").json() == []
+
+
+class TestDateFilters:
+    """DB-20: a bad date is a 422 envelope, never a 500."""
+
+    @pytest.mark.parametrize("path", ["/api/portfolio/trades", "/api/portfolio/export/csv"])
+    @pytest.mark.parametrize("param", ["from_date", "to_date"])
+    def test_bad_date_is_422_envelope(self, path: str, param: str) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetchval = AsyncMock(return_value=0)
+        conn.fetch = AsyncMock(return_value=[])
+        resp = TestClient(_make_app(pool=pool)).get(f"{path}?{param}=notadate")
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "validation_error"
+        assert detail["state"] == "invalid"
+        assert detail["errors"][0]["loc"] == ["query", param]
+        conn.fetch.assert_not_awaited()
+
+    @pytest.mark.parametrize("path", ["/api/portfolio/trades", "/api/portfolio/export/csv"])
+    def test_dates_reach_the_query_as_aware_utc(self, path: str) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetchval = AsyncMock(return_value=0)
+        conn.fetch = AsyncMock(return_value=[])
+        resp = TestClient(_make_app(pool=pool)).get(
+            f"{path}?from_date=2026-01-01&to_date=2026-01-31T12:00:00%2B02:00"
+        )
+        assert resp.status_code == 200
+        args = conn.fetch.await_args.args[1:]
+        assert args[0] == datetime(2026, 1, 1, tzinfo=UTC)
+        assert args[1] == datetime(2026, 1, 31, 10, 0, tzinfo=UTC)
+        assert all(a.tzinfo is not None for a in args[:2])
 
 
 # ---------------------------------------------------------------------------

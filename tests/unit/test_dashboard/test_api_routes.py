@@ -45,12 +45,8 @@ class TestStrategies:
 
     def test_placeholder_strategy_is_gone(self, client: TestClient) -> None:
         resp = client.get("/api/strategies/strat-1")
-        assert resp.status_code == 404
-        assert resp.json()["detail"]["state"] == "not_found"
-
-    def test_get_strategy_not_found(self, client: TestClient) -> None:
-        resp = client.get("/api/strategies/nonexistent")
-        assert resp.status_code == 404
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
 
     def test_toggle_placeholder_is_404(self, client: TestClient) -> None:
         resp = client.post("/api/strategies/strat-1/toggle")
@@ -253,26 +249,15 @@ class TestBuilder:
 
 
 class TestSystem:
-    def test_get_config(self, client: TestClient) -> None:
-        resp = client.get("/api/system/config")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "trading_mode" in data
+    @pytest.mark.parametrize("path", ["/api/system/config", "/api/system/exchanges"])
+    def test_reads_without_db_are_503(self, client: TestClient, path: str) -> None:
+        resp = client.get(path)
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "database_unavailable"
 
-    def test_update_config(self, client: TestClient) -> None:
-        resp = client.put(
-            "/api/system/config",
-            json={"trading_mode": "live"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["trading_mode"] == "live"
-
-    def test_exchanges(self, client: TestClient) -> None:
-        resp = client.get("/api/system/exchanges")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
+    def test_update_config_without_db_is_503(self, client: TestClient) -> None:
+        resp = client.put("/api/system/config", json={"trading_mode": "live"})
+        assert resp.status_code == 503
 
     def test_system_health(self, client: TestClient) -> None:
         resp = client.get("/api/system/health")

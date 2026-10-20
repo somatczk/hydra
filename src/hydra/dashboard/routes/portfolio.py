@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
@@ -31,6 +32,11 @@ _BASE_CURRENCIES = sorted(
 _PAIR_RE = re.compile(rf"^({'|'.join(_BASE_CURRENCIES)})(\w+)$")
 
 
+def _aware(ts: datetime) -> datetime:
+    """Query dates without an offset are UTC (asyncpg refuses naive values for timestamptz)."""
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+
+
 def _format_pair(symbol: str) -> str:
     """Convert raw symbol (e.g. ``BTCUSDT``) to pair format (``BTC/USDT``)."""
     m = _PAIR_RE.match(symbol)
@@ -53,6 +59,7 @@ class PortfolioSummary(BaseModel):
     max_drawdown_pct: float = 0.0
     total_fees: float = 0.0
     change_pct: float = 0.0
+    paper_capital_pending: float | None = None
 
 
 class Position(BaseModel):
@@ -120,166 +127,252 @@ class TradeUpdateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_paper_capital(request: Request) -> float:
-    """Read the global paper_capital from system config (the central wallet)."""
-    from hydra.dashboard.routes.system import get_paper_capital
+_TRADE_TOTALS_SQL = (
+    "SELECT COALESCE(SUM(pnl), 0) AS realized, COALESCE(SUM(fee), 0) AS fees, "
+    "COALESCE(SUM(pnl - fee) FILTER (WHERE timestamp >= "
+    "date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'), 0) AS daily "
+    "FROM trades WHERE ($1::text IS NULL OR source = $1)"
+)
 
-    return get_paper_capital(request)
+_RUNNING_UNREALIZED_SQL = (
+    "SELECT COALESCE(SUM(p.unrealized_pnl), 0) FROM positions p "
+    "JOIN trading_sessions s ON s.id = p.session_id "
+    "WHERE s.status = 'running' AND ($1::text IS NULL OR p.source = $1)"
+)
+
+_SNAPSHOT_COLUMNS = (
+    "b.timestamp, b.session_id, b.total_value, s.paper_capital AS allocated, s.stopped_at "
+    "FROM balance_snapshots b JOIN trading_sessions s ON s.id = b.session_id "
+    "WHERE b.source = 'paper' AND s.paper_capital IS NOT NULL "
+)
+
+# each session's last sleeve value per hour, from $1 on (all history when NULL)
+_SESSION_BUCKETS_SQL = (
+    "SELECT DISTINCT ON (b.session_id, date_trunc('hour', b.timestamp)) "
+    + _SNAPSHOT_COLUMNS
+    + "AND ($1::timestamptz IS NULL OR b.timestamp >= $1) "
+    "ORDER BY b.session_id, date_trunc('hour', b.timestamp), b.timestamp DESC, b.id DESC"
+)
+
+# each session's last sleeve value before $1, so a bounded curve starts from the right sum
+_SESSION_SEED_SQL = (
+    "SELECT DISTINCT ON (b.session_id) " + _SNAPSHOT_COLUMNS + "AND b.timestamp < $1 "
+    "ORDER BY b.session_id, b.timestamp DESC, b.id DESC"
+)
+
+_PAPER_RESETS_SQL = (
+    "SELECT ts, details FROM risk_events WHERE scope = 'paper' AND kind = 'paper_reset' "
+    "ORDER BY ts, id"
+)
+
+_ACCOUNT_SNAPSHOTS_SQL = (
+    "SELECT timestamp, total_value FROM balance_snapshots "
+    "WHERE session_id IS NULL AND ($1::text IS NULL OR source = $1) "
+    "AND ($2::timestamptz IS NULL OR timestamp >= $2) "
+    "ORDER BY timestamp, id"
+)
+
+# (timestamp, account value, segment); a paper reset starts a new segment
+CurvePoint = tuple[datetime, float, int]
+
+
+async def _ledger_capital(request: Request, pool: Any) -> float:
+    """The capital the risk ledger runs on; the system_config row (503 if missing) without it."""
+    from hydra.dashboard.routes.system import get_paper_capital, risk_service
+
+    svc = risk_service(request)
+    if svc is not None and svc.paper_capital is not None:
+        return float(svc.paper_capital)
+    return await get_paper_capital(pool)
+
+
+def _capital(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _paper_resets(conn: Any) -> list[tuple[datetime, float | None, float | None]]:
+    resets: list[tuple[datetime, float | None, float | None]] = []
+    for row in await conn.fetch(_PAPER_RESETS_SQL):
+        details = row["details"]
+        if isinstance(details, str):
+            details = json.loads(details)
+        resets.append(
+            (row["ts"], _capital(details.get("old_capital")), _capital(details.get("new_capital")))
+        )
+    return resets
+
+
+async def _account_curve(
+    conn: Any, source: str | None, capital: float | None, since: datetime | None = None
+) -> list[CurvePoint]:
+    """Account equity over time, at most one point per hour (and one per paper reset).
+
+    Paper mirrors the RiskService ledger: capital in effect at t (from the audited paper_reset
+    events, else the ledger's capital) + the sum over sessions of (last sleeve value - allocation).
+    A stopped session keeps its result until the next reset, which drops it (carried PnL -> 0).
+    Other sources keep one account-level row per snapshot (rows without a session).
+    """
+    if source != "paper":
+        rows = await conn.fetch(_ACCOUNT_SNAPSHOTS_SQL, source, since)
+        return [(row["timestamp"], float(row["total_value"]), 0) for row in rows]
+
+    resets = await _paper_resets(conn)
+    first_old = next((old for _, old, _ in resets if old is not None), None)
+    base: float = first_old if first_old is not None else (capital or 0.0)
+    seed = list(await conn.fetch(_SESSION_SEED_SQL, since)) if since is not None else []
+    rows = sorted(
+        [*seed, *await conn.fetch(_SESSION_BUCKETS_SQL, since)],
+        key=lambda r: r["timestamp"],
+    )
+    last: dict[str, float] = {}
+    stopped: dict[str, datetime | None] = {}
+    points: list[CurvePoint] = []
+    segment = 0
+    pending = list(resets)
+
+    def emit(ts: datetime) -> None:
+        if since is not None and ts < since:
+            return
+        value = base + sum(last.values())
+        hour = ts.replace(minute=0, second=0, microsecond=0)
+        prev = points[-1] if points else None
+        if (
+            prev is not None
+            and prev[2] == segment
+            and prev[0].replace(minute=0, second=0, microsecond=0) == hour
+        ):
+            points[-1] = (ts, value, segment)
+        else:
+            points.append((ts, value, segment))
+
+    def apply_resets(until: datetime | None) -> None:
+        nonlocal base, segment
+        while pending and (until is None or pending[0][0] <= until):
+            ts, _, new = pending.pop(0)
+            if new is not None:
+                base = new
+            for sid in [s for s, at in stopped.items() if at is not None and at <= ts]:
+                last.pop(sid, None)
+            segment += 1
+            emit(ts)
+
+    for row in rows:
+        apply_resets(row["timestamp"])
+        sid = row["session_id"]
+        last[sid] = float(row["total_value"]) - float(row["allocated"])
+        stopped[sid] = row["stopped_at"]
+        emit(row["timestamp"])
+    apply_resets(None)
+    return points
+
+
+def _max_drawdown_pct(curve: list[CurvePoint]) -> float:
+    """Largest peak-to-trough fall within a segment; a capital change is not a drawdown."""
+    max_dd = 0.0
+    peak = 0.0
+    segment = None
+    for _, value, seg in curve:
+        if seg != segment:
+            peak, segment = 0.0, seg
+        peak = max(peak, value)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - value) / peak * 100)
+    return max_dd
+
+
+def _time_weighted_return_pct(curve: list[CurvePoint]) -> float:
+    """Chained return over segments, so a capital change is not a gain or a loss."""
+    growth = 1.0
+    first: float | None = None
+    prev: tuple[float, int] | None = None
+    for _, value, seg in curve:
+        if prev is None or seg != prev[1]:
+            if prev is not None and first:
+                growth *= prev[0] / first
+            first = value
+        prev = (value, seg)
+    if prev is not None and first:
+        growth *= prev[0] / first
+    return (growth - 1) * 100
+
+
+async def _pending_capital(request: Request, pool: Any) -> float | None:
+    from hydra.dashboard.routes.system import get_paper_capital, pending_capital, risk_service
+
+    if risk_service(request) is None:
+        return None
+    pending = pending_capital(request, await get_paper_capital(pool))
+    return float(pending) if pending is not None else None
 
 
 @router.get("/summary", response_model=PortfolioSummary)
 async def get_summary(request: Request, source: str | None = None) -> PortfolioSummary | dict:
-    """Total value, unrealized PnL, realized PnL, fees.
+    """Account value and max drawdown from the account curve; PnL and fees from trades.
 
-    For paper mode, total_value uses the central-wallet model:
-    global paper_capital is the "exchange balance", each strategy draws
-    from it.  total_value = paper_capital + realized_pnl + unrealized_pnl.
+    Paper: total_value is the ledger the RiskService runs on (capital + sleeves, carried PnL
+    dropped at a paper reset); realized PnL and fees count every paper session (running or
+    stopped), unrealized PnL running sessions, and daily PnL is net realized since 00:00 UTC.
     """
     pool = require_pool(request)
+    capital = await _ledger_capital(request, pool) if source == "paper" else None
+    pending = await _pending_capital(request, pool) if source == "paper" else None
 
     async with db_errors_to_503("reading portfolio summary"), pool.acquire() as conn:
-        # Determine running session IDs for the requested source
-        running_ids: list[str] = []
-        if source:
-            rows = await conn.fetch(
-                "SELECT id FROM trading_sessions WHERE status = 'running' AND trading_mode = $1",
-                source,
-            )
-            running_ids = [r["id"] for r in rows]
+        totals = await conn.fetchrow(_TRADE_TOTALS_SQL, source)
+        realized_pnl = float(totals["realized"])
+        total_fees = float(totals["fees"])
+        daily_pnl = float(totals["daily"])
+        unrealized_pnl = float(await conn.fetchval(_RUNNING_UNREALIZED_SQL, source))
+        curve = await _account_curve(conn, source, capital)
 
-        # --- Realized PnL & fees: only from running sessions ---
-        if running_ids:
-            realized_pnl = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE source = $1 AND session_id = ANY($2)",
-                    source,
-                    running_ids,
-                )
-            )
-            total_fees = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(fee), 0) FROM trades "
-                    "WHERE source = $1 AND session_id = ANY($2)",
-                    source,
-                    running_ids,
-                )
-            )
-            daily_pnl = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE source = $1 AND session_id = ANY($2) "
-                    "AND timestamp >= date_trunc('day', now())",
-                    source,
-                    running_ids,
-                )
-            )
-        elif source:
-            realized_pnl = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE source = $1",
-                    source,
-                )
-            )
-            total_fees = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(fee), 0) FROM trades WHERE source = $1",
-                    source,
-                )
-            )
-            daily_pnl = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE source = $1 AND timestamp >= date_trunc('day', now())",
-                    source,
-                )
-            )
-        else:
-            realized_pnl = float(await conn.fetchval("SELECT COALESCE(SUM(pnl), 0) FROM trades"))
-            total_fees = float(await conn.fetchval("SELECT COALESCE(SUM(fee), 0) FROM trades"))
-            daily_pnl = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(pnl), 0) FROM trades "
-                    "WHERE timestamp >= date_trunc('day', now())"
-                )
-            )
+    total_value = curve[-1][1] if curve else (capital or 0.0)
 
-        # --- Unrealized PnL: from open positions of running sessions ---
-        if running_ids:
-            unrealized_pnl = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions "
-                    "WHERE source = $1 AND session_id = ANY($2)",
-                    source,
-                    running_ids,
-                )
-            )
-        elif source:
-            unrealized_pnl = float(
-                await conn.fetchval(
-                    "SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions WHERE source = $1",
-                    source,
-                )
-            )
-        else:
-            unrealized_pnl = float(
-                await conn.fetchval("SELECT COALESCE(SUM(unrealized_pnl), 0) FROM positions")
-            )
+    change_pct = (
+        round((realized_pnl + unrealized_pnl) / total_value * 100, 2) if total_value else 0.0
+    )
 
-        # --- Total value: central-wallet model ---
-        # Paper mode: total = global paper_capital + PnL (strategies
-        # draw from the wallet; profit/loss adjusts it).
-        # Live/other: fall back to latest balance snapshot.
-        if source == "paper":
-            wallet = _get_paper_capital(request)
-            total_value = wallet + realized_pnl + unrealized_pnl - total_fees
-        else:
-            if source:
-                snapshot = await conn.fetchrow(
-                    "SELECT total_value FROM balance_snapshots "
-                    "WHERE source = $1 ORDER BY timestamp DESC LIMIT 1",
-                    source,
-                )
-            else:
-                snapshot = await conn.fetchrow(
-                    "SELECT total_value FROM balance_snapshots ORDER BY timestamp DESC LIMIT 1"
-                )
-            total_value = float(snapshot["total_value"]) if snapshot else 0.0
+    return {
+        "total_value": round(total_value, 2),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "realized_pnl": round(realized_pnl, 2),
+        "daily_pnl": round(daily_pnl, 2),
+        "max_drawdown_pct": round(_max_drawdown_pct(curve), 1),
+        "total_fees": round(total_fees, 2),
+        "change_pct": change_pct,
+        "paper_capital_pending": pending,
+    }
 
-        # Max drawdown from equity curve
-        if source:
-            equity_rows = await conn.fetch(
-                "SELECT total_value FROM balance_snapshots WHERE source = $1 ORDER BY timestamp",
-                source,
-            )
-        else:
-            equity_rows = await conn.fetch(
-                "SELECT total_value FROM balance_snapshots ORDER BY timestamp"
-            )
-        max_drawdown_pct = 0.0
-        peak = 0.0
-        for row in equity_rows:
-            val = float(row["total_value"])
-            if val > peak:
-                peak = val
-            if peak > 0:
-                dd = (peak - val) / peak * 100
-                if dd > max_drawdown_pct:
-                    max_drawdown_pct = dd
 
-        change_pct = (
-            round((realized_pnl + unrealized_pnl) / total_value * 100, 2) if total_value else 0.0
-        )
+_DAILY_PNL_SQL = (
+    "SELECT date_trunc('day', timestamp AT TIME ZONE 'UTC') AS date, SUM(pnl - fee) AS pnl "
+    "FROM trades WHERE ($1::text IS NULL OR source = $1) GROUP BY date ORDER BY date"
+)
 
-        return {
-            "total_value": round(total_value, 2),
-            "unrealized_pnl": round(unrealized_pnl, 2),
-            "realized_pnl": round(realized_pnl, 2),
-            "daily_pnl": round(daily_pnl, 2),
-            "max_drawdown_pct": round(max_drawdown_pct, 1),
-            "total_fees": round(total_fees, 2),
-            "change_pct": change_pct,
-        }
+_DAILY_PNL_30D_SQL = (
+    "SELECT date_trunc('day', timestamp AT TIME ZONE 'UTC') AS d, SUM(pnl - fee) AS pnl "
+    "FROM trades WHERE ($1::text IS NULL OR source = $1) "
+    "AND timestamp >= now() - interval '30 days' GROUP BY d ORDER BY d"
+)
+
+_ATTRIBUTION_SQL = (
+    "SELECT strategy_id AS name, SUM(pnl - fee) AS pnl FROM trades "
+    "WHERE ($1::text IS NULL OR source = $1) GROUP BY strategy_id"
+)
+
+_POSITIONS_SQL = (
+    "SELECT p.id, p.strategy_id, p.exchange_id, p.symbol, p.direction, p.quantity, "
+    "p.avg_entry_price, p.unrealized_pnl, p.realized_pnl, COALESCE(s.timeframe, '1m') AS timeframe "
+    "FROM positions p LEFT JOIN trading_sessions s ON s.id = p.session_id "
+    "WHERE p.quantity <> 0 AND ($1::text IS NULL OR p.source = $1)"
+)
+
+_LATEST_CLOSE_SQL = (
+    "SELECT close FROM ts.ohlcv_1m WHERE exchange = $1 AND symbol = $2 AND timeframe = $3 "
+    "ORDER BY timestamp DESC LIMIT 1"
+)
 
 
 @router.get("/positions", response_model=list[Position])
@@ -289,36 +382,19 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
 
     async with db_errors_to_503("reading positions"):
         async with pool.acquire() as conn:
-            if source:
-                rows = await conn.fetch(
-                    "SELECT id, strategy_id, exchange_id, symbol, direction, quantity, "
-                    "avg_entry_price, unrealized_pnl, realized_pnl FROM positions "
-                    "WHERE source = $1",
-                    source,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT id, strategy_id, exchange_id, symbol, direction, quantity, "
-                    "avg_entry_price, unrealized_pnl, realized_pnl FROM positions"
-                )
-
+            rows = await conn.fetch(_POSITIONS_SQL, source)
             if not rows:
                 return []
 
-            # Fetch latest prices from OHLCV for all position symbols
-            symbols = list({row["symbol"] for row in rows})
-            latest_prices: dict[str, float] = {}
+            # Latest stored close on the position's own venue and the session's bar timeframe
+            latest_prices: dict[tuple[str, str, str], float] = {}
             try:
-                for sym in symbols:
-                    price_row = await conn.fetchval(
-                        "SELECT close FROM ts.ohlcv_1m WHERE symbol = $1 "
-                        "ORDER BY timestamp DESC LIMIT 1",
-                        sym,
-                    )
+                for key in {(r["exchange_id"], r["symbol"], r["timeframe"]) for r in rows}:
+                    price_row = await conn.fetchval(_LATEST_CLOSE_SQL, *key)
                     if price_row is not None:
-                        latest_prices[sym] = float(price_row)
+                        latest_prices[key] = float(price_row)
             except asyncpg.UndefinedTableError:
-                logger.warning("ts.ohlcv_1m missing; positions use entry price as current price")
+                logger.warning("ts.ohlcv_1m missing; positions use their stored unrealized PnL")
 
         positions: list[dict] = []
         for row in rows:
@@ -326,13 +402,16 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
             quantity = float(row["quantity"])
             direction = row["direction"]
             symbol = row["symbol"]
-            current_price = latest_prices.get(symbol, entry_price)
-
-            # Recompute unrealized PnL from current price
-            if direction == "LONG":
-                unrealized_pnl = (current_price - entry_price) * quantity
+            sign = 1.0 if direction == "LONG" else -1.0
+            price = latest_prices.get((row["exchange_id"], symbol, row["timeframe"]))
+            if price is not None:
+                current_price = price
+                unrealized_pnl = (current_price - entry_price) * quantity * sign
             else:
-                unrealized_pnl = (entry_price - current_price) * quantity
+                unrealized_pnl = float(row["unrealized_pnl"])
+                current_price = (
+                    entry_price + unrealized_pnl / quantity * sign if quantity else entry_price
+                )
 
             pnl_pct = (
                 round(unrealized_pnl / (entry_price * quantity) * 100, 2)
@@ -358,52 +437,22 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
 
 @router.get("/equity-curve", response_model=list[EquityPoint])
 async def get_equity_curve(request: Request, source: str | None = None) -> list[dict]:
-    """Time series data for the equity chart."""
+    """Account equity over time, hourly (paper: the ledger's capital plus per-session sleeves)."""
     pool = require_pool(request)
-
-    async with db_errors_to_503("reading equity curve"):
-        async with pool.acquire() as conn:
-            if source:
-                rows = await conn.fetch(
-                    "SELECT timestamp, total_value FROM balance_snapshots "
-                    "WHERE source = $1 ORDER BY timestamp",
-                    source,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT timestamp, total_value FROM balance_snapshots ORDER BY timestamp"
-                )
-
-        if not rows:
-            return []
-
-        return [
-            {
-                "timestamp": row["timestamp"].isoformat(),
-                "value": float(row["total_value"]),
-            }
-            for row in rows
-        ]
+    capital = await _ledger_capital(request, pool) if source == "paper" else None
+    async with db_errors_to_503("reading equity curve"), pool.acquire() as conn:
+        curve = await _account_curve(conn, source, capital)
+    return [{"timestamp": ts.isoformat(), "value": value} for ts, value, _ in curve]
 
 
 @router.get("/daily-pnl", response_model=list[DailyPnl])
 async def get_daily_pnl(request: Request, source: str | None = None) -> list[dict]:
-    """Daily PnL series."""
+    """Net (after fees) realized PnL per UTC day."""
     pool = require_pool(request)
 
     async with db_errors_to_503("reading daily PnL"):
         async with pool.acquire() as conn:
-            if source:
-                rows = await conn.fetch(
-                    "SELECT date_trunc('day', timestamp) AS date, SUM(pnl) AS pnl "
-                    "FROM trades WHERE source = $1 GROUP BY date ORDER BY date",
-                    source,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT date_trunc('day', timestamp) AS date, SUM(pnl) AS pnl "
-                    "FROM trades GROUP BY date ORDER BY date"
-                )
+            rows = await conn.fetch(_DAILY_PNL_SQL, source)
 
         if not rows:
             return []
@@ -419,60 +468,29 @@ async def get_daily_pnl(request: Request, source: str | None = None) -> list[dic
 
 @router.get("/monthly-returns", response_model=list[MonthlyReturn])
 async def get_monthly_returns(request: Request, source: str | None = None) -> list[dict]:
-    """Monthly return percentages derived from balance snapshots."""
+    """Monthly time-weighted return of the account curve (a capital change is not a return)."""
     pool = require_pool(request)
+    capital = await _ledger_capital(request, pool) if source == "paper" else None
+    async with db_errors_to_503("reading monthly returns"), pool.acquire() as conn:
+        curve = await _account_curve(conn, source, capital)
 
-    async with db_errors_to_503("reading monthly returns"):
-        async with pool.acquire() as conn:
-            if source:
-                rows = await conn.fetch(
-                    "SELECT "
-                    "  to_char(date_trunc('month', timestamp), 'YYYY-MM') AS month, "
-                    "  (array_agg(total_value ORDER BY timestamp ASC))[1] AS first_val, "
-                    "  (array_agg(total_value ORDER BY timestamp DESC))[1] AS last_val "
-                    "FROM balance_snapshots "
-                    "WHERE source = $1 "
-                    "GROUP BY date_trunc('month', timestamp) "
-                    "ORDER BY date_trunc('month', timestamp)",
-                    source,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT "
-                    "  to_char(date_trunc('month', timestamp), 'YYYY-MM') AS month, "
-                    "  (array_agg(total_value ORDER BY timestamp ASC))[1] AS first_val, "
-                    "  (array_agg(total_value ORDER BY timestamp DESC))[1] AS last_val "
-                    "FROM balance_snapshots "
-                    "GROUP BY date_trunc('month', timestamp) "
-                    "ORDER BY date_trunc('month', timestamp)"
-                )
-
-        results: list[dict] = []
-        for row in rows:
-            first_val = float(row["first_val"])
-            last_val = float(row["last_val"])
-            return_pct = round((last_val - first_val) / first_val * 100, 2) if first_val else 0.0
-            results.append({"month": row["month"], "return_pct": return_pct})
-        return results
+    months: dict[str, list[CurvePoint]] = {}
+    for point in curve:
+        months.setdefault(point[0].strftime("%Y-%m"), []).append(point)
+    return [
+        {"month": month, "return_pct": round(_time_weighted_return_pct(points), 2)}
+        for month, points in months.items()
+    ]
 
 
 @router.get("/attribution", response_model=list[AttributionItem])
 async def get_attribution(request: Request, source: str | None = None) -> list[dict]:
-    """PnL broken down by strategy."""
+    """Net (after fees) realized PnL broken down by strategy."""
     pool = require_pool(request)
 
     async with db_errors_to_503("reading attribution"):
         async with pool.acquire() as conn:
-            if source:
-                rows = await conn.fetch(
-                    "SELECT strategy_id AS name, SUM(pnl) AS pnl "
-                    "FROM trades WHERE source = $1 GROUP BY strategy_id",
-                    source,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT strategy_id AS name, SUM(pnl) AS pnl FROM trades GROUP BY strategy_id"
-                )
+            rows = await conn.fetch(_ATTRIBUTION_SQL, source)
 
         total_pnl = sum(float(r["pnl"]) for r in rows)
         return [
@@ -493,8 +511,8 @@ async def get_trades(
     source: str | None = None,
     strategy_id: str | None = None,
     symbol: str | None = None,
-    from_date: str | None = None,
-    to_date: str | None = None,
+    from_date: datetime | None = None,
+    to_date: datetime | None = None,
     min_pnl: float | None = None,
     max_pnl: float | None = None,
     page: int = 1,
@@ -527,9 +545,9 @@ async def get_trades(
     if symbol is not None:
         _add("symbol = ${n}", symbol)
     if from_date is not None:
-        _add("timestamp >= ${n}", datetime.fromisoformat(from_date))
+        _add("timestamp >= ${n}", _aware(from_date))
     if to_date is not None:
-        _add("timestamp <= ${n}", datetime.fromisoformat(to_date))
+        _add("timestamp <= ${n}", _aware(to_date))
     if min_pnl is not None:
         _add("pnl >= ${n}", min_pnl)
     if max_pnl is not None:
@@ -747,8 +765,8 @@ def _row_turbotax(row: Any) -> list[str]:
 @router.get("/export/csv")
 async def export_trades_csv(
     request: Request,
-    from_date: str | None = None,
-    to_date: str | None = None,
+    from_date: datetime | None = None,
+    to_date: datetime | None = None,
     format: str = "generic",
 ) -> StreamingResponse:
     """Export trades as a downloadable CSV file.
@@ -773,9 +791,9 @@ async def export_trades_csv(
         conditions.append(condition.format(n=len(params)))
 
     if from_date is not None:
-        _add("timestamp >= ${n}", datetime.fromisoformat(from_date))
+        _add("timestamp >= ${n}", _aware(from_date))
     if to_date is not None:
-        _add("timestamp <= ${n}", datetime.fromisoformat(to_date))
+        _add("timestamp <= ${n}", _aware(to_date))
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -815,23 +833,11 @@ class LiveMetrics(BaseModel):
 async def get_live_metrics(request: Request, source: str | None = None) -> LiveMetrics | dict:
     """Rolling 30-day performance metrics computed from trade history."""
     pool = require_pool(request)
+    capital = await _ledger_capital(request, pool) if source == "paper" else None
+    cutoff = datetime.now(UTC) - timedelta(days=30)
 
     async with db_errors_to_503("computing live metrics"), pool.acquire() as conn:
-        # Daily PnL for last 30 days
-        if source:
-            daily_rows = await conn.fetch(
-                "SELECT date_trunc('day', timestamp) AS d, SUM(pnl) AS pnl "
-                "FROM trades WHERE source = $1 "
-                "AND timestamp >= now() - interval '30 days' "
-                "GROUP BY d ORDER BY d",
-                source,
-            )
-        else:
-            daily_rows = await conn.fetch(
-                "SELECT date_trunc('day', timestamp) AS d, SUM(pnl) AS pnl "
-                "FROM trades WHERE timestamp >= now() - interval '30 days' "
-                "GROUP BY d ORDER BY d"
-            )
+        daily_rows = await conn.fetch(_DAILY_PNL_30D_SQL, source)
         daily_pnls = [float(r["pnl"]) for r in daily_rows]
 
         # Sharpe ratio (30d daily)
@@ -847,26 +853,9 @@ async def get_live_metrics(request: Request, source: str | None = None) -> LiveM
             if std > 0:
                 sharpe = round(mean / std * math.sqrt(252), 2)
 
-        # Time-weighted return (30d)
-        if source:
-            equity_rows = await conn.fetch(
-                "SELECT total_value FROM balance_snapshots "
-                "WHERE source = $1 AND timestamp >= now() - interval '30 days' "
-                "ORDER BY timestamp",
-                source,
-            )
-        else:
-            equity_rows = await conn.fetch(
-                "SELECT total_value FROM balance_snapshots "
-                "WHERE timestamp >= now() - interval '30 days' "
-                "ORDER BY timestamp"
-            )
-        twr = 0.0
-        if len(equity_rows) >= 2:
-            first = float(equity_rows[0]["total_value"])
-            last = float(equity_rows[-1]["total_value"])
-            if first > 0:
-                twr = round((last - first) / first * 100, 2)
+        # Time-weighted return (30d) on the account equity curve
+        recent = await _account_curve(conn, source, capital, since=cutoff)
+        twr = round(_time_weighted_return_pct(recent), 2) if len(recent) >= 2 else 0.0
 
         # Trades per day
         if source:
