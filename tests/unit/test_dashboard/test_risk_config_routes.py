@@ -26,24 +26,13 @@ def client() -> TestClient:
 
 
 class TestGetRiskConfig:
-    def test_get_risk_config_returns_200(self, client: TestClient) -> None:
+    def test_get_risk_config_without_db_is_503(self, client: TestClient) -> None:
+        app.state.db_pool = None
         resp = client.get("/api/risk/config")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "max_position_pct" in data
-        assert "max_risk_per_trade" in data
-        assert "max_daily_loss_pct" in data
-        assert "max_drawdown_pct" in data
-        assert "max_concurrent_positions" in data
-        assert "kill_switch_active" in data
-
-    def test_get_risk_config_returns_defaults_without_db(self, client: TestClient) -> None:
-        resp = client.get("/api/risk/config")
-        data = resp.json()
-        # Default values when DB is unavailable
-        assert data["max_position_pct"] == 0.10
-        assert data["max_drawdown_pct"] == 0.15
-        assert data["kill_switch_active"] is False
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert detail["state"] == "unavailable"
+        assert detail["code"] == "database_unavailable"
 
 
 class TestUpdateRiskConfig:
@@ -80,33 +69,26 @@ class TestRiskConfigValidation:
 
 
 class TestLiveRiskStatus:
-    def test_live_risk_status_returns_200(self, client: TestClient) -> None:
+    def test_live_risk_status_without_db_reports_unknown(self, client: TestClient) -> None:
+        app.state.db_pool = None
         resp = client.get("/api/risk/live-status")
         assert resp.status_code == 200
         data = resp.json()
-        assert "kill_switch_active" in data
-        assert "running_sessions" in data
+        assert data["kill_switch_active"] is None
+        assert data["kill_switch_state"] == "unknown"
 
 
 class TestExistingRiskEndpoints:
-    """Ensure existing risk endpoints still work after the changes."""
+    """Without a DB the risk endpoints report unavailable instead of defaults."""
 
-    def test_risk_status(self, client: TestClient) -> None:
-        resp = client.get("/api/risk/status")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "current_drawdown" in data
-        assert "circuit_breakers" in data
+    @pytest.mark.parametrize("path", ["/api/risk/status", "/api/risk/var"])
+    def test_without_db_is_503(self, client: TestClient, path: str) -> None:
+        app.state.db_pool = None
+        resp = client.get(path)
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
 
-    def test_circuit_breakers(self, client: TestClient) -> None:
+    def test_circuit_breakers_unavailable(self, client: TestClient) -> None:
         resp = client.get("/api/risk/circuit-breakers")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 4
-
-    def test_var_estimate(self, client: TestClient) -> None:
-        resp = client.get("/api/risk/var")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "var_95" in data
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"

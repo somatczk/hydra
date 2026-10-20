@@ -6,6 +6,7 @@ from datetime import UTC
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncpg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -35,77 +36,125 @@ def client_no_pool() -> TestClient:
 
 
 # ---------------------------------------------------------------------------
-# Fallback (no pool)
+# Outages are 503, empty data is 200, real bugs are 500
 # ---------------------------------------------------------------------------
 
+_GET_ENDPOINTS = [
+    "/api/portfolio/summary",
+    "/api/portfolio/positions",
+    "/api/portfolio/equity-curve",
+    "/api/portfolio/daily-pnl",
+    "/api/portfolio/monthly-returns",
+    "/api/portfolio/attribution",
+    "/api/portfolio/trades",
+    "/api/portfolio/live-metrics",
+]
 
-class TestPortfolioFallback:
-    def test_summary_returns_defaults(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/summary")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "total_value" in data
-        assert "unrealized_pnl" in data
-        assert "realized_pnl" in data
-        assert "total_fees" in data
-        assert "change_pct" in data
-        assert isinstance(data["total_value"], float)
 
-    def test_positions_returns_empty_list(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/positions")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
+def _assert_unavailable(resp: Any) -> None:
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["state"] == "unavailable"
+    assert detail["code"] == "database_unavailable"
+    assert isinstance(detail["message"], str)
 
-    def test_equity_curve_returns_empty(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/equity-curve")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
 
-    def test_daily_pnl_returns_empty(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/daily-pnl")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
+def _make_refusing_pool() -> MagicMock:
+    pool = MagicMock()
+    pool.acquire.return_value.__aenter__ = AsyncMock(side_effect=ConnectionError("refused"))
+    pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+    return pool
 
-    def test_monthly_returns_empty(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/monthly-returns")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
 
-    def test_attribution_returns_empty(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/attribution")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
+class TestPortfolioUnavailable:
+    @pytest.mark.parametrize("path", _GET_ENDPOINTS)
+    def test_no_pool_is_503(self, client_no_pool: TestClient, path: str) -> None:
+        _assert_unavailable(client_no_pool.get(path))
 
-    def test_trades_returns_empty(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/trades")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, dict)
-        assert data["trades"] == []
-        assert data["total"] == 0
+    @pytest.mark.parametrize("path", _GET_ENDPOINTS)
+    def test_acquire_failure_is_503(self, path: str) -> None:
+        client = TestClient(_make_app(pool=_make_refusing_pool()))
+        _assert_unavailable(client.get(path))
+
+    @pytest.mark.parametrize("path", _GET_ENDPOINTS)
+    def test_query_failure_is_503(self, path: str) -> None:
+        pool, conn = _make_mock_pool()
+        err = asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed")
+        conn.fetch = AsyncMock(side_effect=err)
+        conn.fetchval = AsyncMock(side_effect=err)
+        conn.fetchrow = AsyncMock(side_effect=err)
+        client = TestClient(_make_app(pool=pool))
+        _assert_unavailable(client.get(path))
+
+    @pytest.mark.parametrize("path", _GET_ENDPOINTS)
+    def test_postgres_error_is_503(self, path: str) -> None:
+        pool, conn = _make_mock_pool()
+        err = asyncpg.PostgresError("boom")
+        conn.fetch = AsyncMock(side_effect=err)
+        conn.fetchval = AsyncMock(side_effect=err)
+        conn.fetchrow = AsyncMock(side_effect=err)
+        client = TestClient(_make_app(pool=pool))
+        _assert_unavailable(client.get(path))
+
+    @pytest.mark.parametrize("path", _GET_ENDPOINTS)
+    def test_handler_bug_is_500_not_503(self, path: str) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetch = AsyncMock(return_value=[{"bogus": 1}])
+        conn.fetchval = AsyncMock(return_value=1)
+        conn.fetchrow = AsyncMock(return_value={"bogus": 1})
+        client = TestClient(_make_app(pool=pool), raise_server_exceptions=False)
+        assert client.get(path).status_code == 500
 
     def test_update_trade_no_pool_returns_503(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.patch("/api/portfolio/trades/1", json={"notes": "hello"})
-        assert resp.status_code == 503
+        _assert_unavailable(client_no_pool.patch("/api/portfolio/trades/1", json={"notes": "x"}))
 
     def test_export_csv_no_pool_returns_503(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/portfolio/export/csv")
-        assert resp.status_code == 503
+        _assert_unavailable(client_no_pool.get("/api/portfolio/export/csv"))
 
     def test_export_csv_invalid_format_returns_422(self, client_no_pool: TestClient) -> None:
         # Invalid format is caught before the pool check
         resp = client_no_pool.get("/api/portfolio/export/csv?format=invalid")
         assert resp.status_code == 422
+        assert resp.json()["detail"]["state"] == "invalid"
+
+
+class TestEmptyDatabase:
+    """A working DB with no rows is not an outage."""
+
+    def _client(self) -> TestClient:
+        pool, conn = _make_mock_pool()
+        conn.fetch = AsyncMock(return_value=[])
+        conn.fetchval = AsyncMock(return_value=0)
+        conn.fetchrow = AsyncMock(return_value=None)
+        return TestClient(_make_app(pool=pool))
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/portfolio/positions",
+            "/api/portfolio/equity-curve",
+            "/api/portfolio/daily-pnl",
+            "/api/portfolio/monthly-returns",
+            "/api/portfolio/attribution",
+        ],
+    )
+    def test_lists_are_200_empty(self, path: str) -> None:
+        resp = self._client().get(path)
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_trades_are_200_empty(self) -> None:
+        resp = self._client().get("/api/portfolio/trades")
+        assert resp.status_code == 200
+        assert resp.json() == {"trades": [], "total": 0, "page": 1, "limit": 20, "pages": 0}
+
+    def test_paper_summary_is_the_real_paper_capital(self) -> None:
+        resp = self._client().get("/api/portfolio/summary?source=paper")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_value"] == 10000.0
+        assert data["realized_pnl"] == 0.0
+        assert data["unrealized_pnl"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -155,32 +204,38 @@ class TestPortfolioWithPool:
                 }
             ]
         )
+        conn.fetchval = AsyncMock(return_value=68000.0)
         client = TestClient(_make_app(pool=pool))
         resp = client.get("/api/portfolio/positions")
         assert resp.status_code == 200
         data = resp.json()
         assert len(data) == 1
         assert data[0]["pair"] == "BTC/USDT"
+        assert data[0]["current_price"] == 68000.0
+        assert data[0]["unrealized_pnl"] == 87.0
 
-    def test_positions_db_exception_returns_empty(self) -> None:
+    def test_positions_missing_ohlcv_table_uses_entry_price(self) -> None:
         pool, conn = _make_mock_pool()
-        conn.fetch = AsyncMock(side_effect=RuntimeError("DB down"))
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "id": 1,
+                    "strategy_id": "strat-1",
+                    "exchange_id": "binance",
+                    "symbol": "BTCUSDT",
+                    "direction": "LONG",
+                    "quantity": 0.15,
+                    "avg_entry_price": 67420.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 0.0,
+                }
+            ]
+        )
+        conn.fetchval = AsyncMock(side_effect=asyncpg.UndefinedTableError("no ts.ohlcv_1m"))
         client = TestClient(_make_app(pool=pool))
         resp = client.get("/api/portfolio/positions")
         assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
-
-    def test_equity_curve_db_exception_returns_empty(self) -> None:
-        pool, conn = _make_mock_pool()
-        conn.fetch = AsyncMock(side_effect=RuntimeError("DB down"))
-        client = TestClient(_make_app(pool=pool))
-        resp = client.get("/api/portfolio/equity-curve")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 0
+        assert resp.json()[0]["current_price"] == 67420.0
 
 
 # ---------------------------------------------------------------------------
@@ -254,17 +309,6 @@ class TestTradeJournal:
         assert trade["tags"] == ["swing", "btc"]
         assert "strategy_id" in trade
 
-    def test_trades_db_exception_returns_empty_response(self) -> None:
-        pool, conn = _make_mock_pool()
-        conn.fetchval = AsyncMock(side_effect=RuntimeError("DB down"))
-        client = TestClient(_make_app(pool=pool))
-
-        resp = client.get("/api/portfolio/trades")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["trades"] == []
-        assert data["total"] == 0
-
     def test_trades_page_clamped_to_minimum(self) -> None:
         pool, conn = _make_mock_pool()
         conn.fetchval = AsyncMock(return_value=0)
@@ -307,13 +351,12 @@ class TestTradeJournal:
         resp = client.patch("/api/portfolio/trades/1", json={})
         assert resp.status_code == 422
 
-    def test_update_trade_db_exception_returns_500(self) -> None:
+    def test_update_trade_db_exception_returns_503(self) -> None:
         pool, conn = _make_mock_pool()
-        conn.fetchrow = AsyncMock(side_effect=RuntimeError("DB error"))
+        conn.fetchrow = AsyncMock(side_effect=ConnectionResetError("DB error"))
         client = TestClient(_make_app(pool=pool))
 
-        resp = client.patch("/api/portfolio/trades/1", json={"notes": "fail"})
-        assert resp.status_code == 500
+        _assert_unavailable(client.patch("/api/portfolio/trades/1", json={"notes": "fail"}))
 
 
 # ---------------------------------------------------------------------------
@@ -376,13 +419,12 @@ class TestCSVExport:
         lines = [ln for ln in resp.text.strip().splitlines() if ln]
         assert len(lines) == 1  # header row only
 
-    def test_csv_export_db_exception_returns_500(self) -> None:
+    def test_csv_export_db_exception_returns_503(self) -> None:
         pool, conn = _make_mock_pool()
-        conn.fetch = AsyncMock(side_effect=RuntimeError("DB down"))
+        conn.fetch = AsyncMock(side_effect=asyncpg.PostgresError("DB down"))
         client = TestClient(_make_app(pool=pool))
 
-        resp = client.get("/api/portfolio/export/csv")
-        assert resp.status_code == 500
+        _assert_unavailable(client.get("/api/portfolio/export/csv"))
 
     def test_koinly_buy_row_populates_correctly(self) -> None:
         pool, conn = _make_mock_pool()

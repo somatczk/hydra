@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 logger = logging.getLogger(__name__)
@@ -25,6 +29,17 @@ _EXCHANGE_DEFS: list[tuple[str, str, str]] = [
     ("okx", "OKX", "OKX_API_KEY"),
 ]
 
+TradingMode = Literal["paper", "live"]
+_TRADING_MODES: frozenset[str] = frozenset({"paper", "live"})
+_SECRET_FIELDS: tuple[str, ...] = ("webhook_secret", "discord_webhook_url", "slack_webhook_url")
+_DEFAULT_PAPER_CAPITAL = 10000.0
+
+# allowed host -> required path prefix
+_WEBHOOK_HOSTS: dict[str, str] = {
+    "discord.com": "/api/webhooks/",
+    "hooks.slack.com": "/services/",
+}
+
 
 def _pool_from_request(request: Request) -> Any:
     """Return the asyncpg connection pool from app state, or ``None``."""
@@ -33,7 +48,7 @@ def _pool_from_request(request: Request) -> Any:
 
 def _get_system_config(request: Request) -> dict[str, Any]:
     """Return persisted system config from app state, if any."""
-    return getattr(request.app.state, "system_config", {})
+    return getattr(request.app.state, "system_config", None) or {}
 
 
 def _set_system_config(request: Request, config: dict[str, Any]) -> None:
@@ -46,6 +61,65 @@ def _get_exchange_credentials(request: Request) -> dict[str, Any]:
     if not hasattr(request.app.state, "exchange_credentials"):
         request.app.state.exchange_credentials = {}
     return request.app.state.exchange_credentials
+
+
+def _validate_webhook_url(url: str, allowed_host: str) -> str:
+    """Accept only https URLs on the exact webhook host; raises ValueError otherwise."""
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError("webhook URL must use https")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("webhook URL must not contain credentials")
+    if parts.hostname != allowed_host:
+        raise ValueError(f"webhook URL host must be {allowed_host}")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("webhook URL has an invalid port") from exc
+    if port not in (None, 443):
+        raise ValueError("webhook URL must use the default https port")
+    if not parts.path.startswith(_WEBHOOK_HOSTS[allowed_host]):
+        raise ValueError(f"webhook URL path must start with {_WEBHOOK_HOSTS[allowed_host]}")
+    return url
+
+
+def _coerce_trading_mode(value: Any, origin: str) -> str:
+    if value in _TRADING_MODES:
+        return str(value)
+    logger.warning("Ignoring invalid trading_mode %r from %s; using 'paper'", value, origin)
+    return "paper"
+
+
+def _env_config() -> dict[str, Any]:
+    max_strategies_raw = os.environ.get("HYDRA_MAX_STRATEGIES", "5")
+    try:
+        max_strategies = int(max_strategies_raw)
+    except ValueError:
+        max_strategies = 5
+    return {
+        "trading_mode": _coerce_trading_mode(
+            os.environ.get("HYDRA_TRADING_MODE", "paper"), "HYDRA_TRADING_MODE"
+        ),
+        "default_pair": os.environ.get("HYDRA_DEFAULT_PAIR", "BTC/USDT"),
+        "default_timeframe": os.environ.get("HYDRA_DEFAULT_TIMEFRAME", "1h"),
+        "max_concurrent_strategies": max_strategies,
+        "paper_capital": _DEFAULT_PAPER_CAPITAL,
+        **dict.fromkeys(_SECRET_FIELDS, ""),
+    }
+
+
+def _load_stored_config(request: Request) -> dict[str, Any]:
+    """Stored config (raw secrets included); env defaults fill missing keys."""
+    stored = {**_env_config(), **_get_system_config(request)}
+    stored["trading_mode"] = _coerce_trading_mode(stored["trading_mode"], "stored config")
+    return stored
+
+
+def _to_public(stored: dict[str, Any]) -> dict[str, Any]:
+    public = {k: v for k, v in stored.items() if k not in _SECRET_FIELDS}
+    for field in _SECRET_FIELDS:
+        public[f"{field}_set"] = bool(stored.get(field))
+    return public
 
 
 # ---------------------------------------------------------------------------
@@ -62,25 +136,39 @@ class ExchangeStatus(BaseModel):
 
 
 class PlatformConfig(BaseModel):
-    trading_mode: str = "paper"
-    default_pair: str = "BTC/USDT"
-    default_timeframe: str = "1h"
-    max_concurrent_strategies: int = 5
-    paper_capital: float = 10000.0
-    webhook_secret: str = ""
-    discord_webhook_url: str = ""
-    slack_webhook_url: str = ""
+    """Public view of the platform config: secrets are reported as *_set only."""
+
+    trading_mode: TradingMode
+    default_pair: str
+    default_timeframe: str
+    max_concurrent_strategies: int
+    paper_capital: float
+    webhook_secret_set: bool
+    discord_webhook_url_set: bool
+    slack_webhook_url_set: bool
 
 
 class PlatformConfigUpdate(BaseModel):
-    trading_mode: str | None = None
+    """Omitted or null fields are unchanged; an empty string clears a secret."""
+
+    trading_mode: TradingMode | None = None
     default_pair: str | None = None
     default_timeframe: str | None = None
-    max_concurrent_strategies: int | None = None
-    paper_capital: float | None = None
+    max_concurrent_strategies: int | None = Field(None, ge=1, le=100)
+    paper_capital: float | None = Field(None, gt=0, allow_inf_nan=False)
     webhook_secret: str | None = None
     discord_webhook_url: str | None = None
     slack_webhook_url: str | None = None
+
+    @field_validator("discord_webhook_url")
+    @classmethod
+    def _check_discord(cls, v: str | None) -> str | None:
+        return _validate_webhook_url(v, "discord.com") if v else v
+
+    @field_validator("slack_webhook_url")
+    @classmethod
+    def _check_slack(cls, v: str | None) -> str | None:
+        return _validate_webhook_url(v, "hooks.slack.com") if v else v
 
 
 class ServiceHealth(BaseModel):
@@ -108,50 +196,6 @@ class ExchangeConnectResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Placeholder data (fallback when DB is not available)
-# ---------------------------------------------------------------------------
-
-_EXCHANGES_PLACEHOLDER: list[dict[str, Any]] = [
-    {
-        "id": "binance",
-        "name": "Binance",
-        "connected": True,
-        "api_key_set": True,
-        "last_sync": "2 min ago",
-    },
-    {
-        "id": "bybit",
-        "name": "Bybit",
-        "connected": True,
-        "api_key_set": True,
-        "last_sync": "5 min ago",
-    },
-    {
-        "id": "kraken",
-        "name": "Kraken",
-        "connected": False,
-        "api_key_set": False,
-        "last_sync": "Never",
-    },
-    {
-        "id": "okx",
-        "name": "OKX",
-        "connected": False,
-        "api_key_set": True,
-        "last_sync": "3 days ago",
-    },
-]
-
-_HEALTH_PLACEHOLDER: dict[str, Any] = {
-    "overall": "degraded",
-    "services": [
-        {"service": "TimescaleDB", "status": "down", "latency_ms": None},
-        {"service": "Redis", "status": "down", "latency_ms": None},
-    ],
-}
-
-
-# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -164,42 +208,26 @@ def get_paper_capital(request: Request) -> float:
     cfg = _get_system_config(request)
     if cfg and "paper_capital" in cfg:
         return float(cfg["paper_capital"])
-    return PlatformConfig().paper_capital
+    return _DEFAULT_PAPER_CAPITAL
 
 
 @router.get("/config", response_model=PlatformConfig)
-async def get_config(request: Request) -> PlatformConfig:
-    """Return the platform configuration from persisted state or env vars."""
-    persisted = _get_system_config(request)
-    if persisted:
-        return PlatformConfig(**persisted)
-
-    trading_mode = os.environ.get("HYDRA_TRADING_MODE", "paper")
-    default_pair = os.environ.get("HYDRA_DEFAULT_PAIR", "BTC/USDT")
-    default_timeframe = os.environ.get("HYDRA_DEFAULT_TIMEFRAME", "1h")
-    max_strategies_raw = os.environ.get("HYDRA_MAX_STRATEGIES", "5")
-    try:
-        max_strategies = int(max_strategies_raw)
-    except ValueError:
-        max_strategies = 5
-
-    return PlatformConfig(
-        trading_mode=trading_mode,
-        default_pair=default_pair,
-        default_timeframe=default_timeframe,
-        max_concurrent_strategies=max_strategies,
-    )
+async def get_config(request: Request) -> dict[str, Any]:
+    """Return the platform configuration; secrets are never returned."""
+    return _to_public(_load_stored_config(request))
 
 
 @router.put("/config", response_model=PlatformConfig)
-async def update_config(body: PlatformConfigUpdate, request: Request) -> PlatformConfig:
-    """Update platform configuration fields and persist to app state."""
-    current = (await get_config(request)).model_dump()
-    update_data = body.model_dump(exclude_none=True)
-    current.update(update_data)
-    config = PlatformConfig(**current)
-    _set_system_config(request, config.model_dump())
-    return config
+async def update_config(body: PlatformConfigUpdate, request: Request) -> dict[str, Any]:
+    """Merge the given fields into the stored config (in memory until P1 persistence)."""
+    stored = _load_stored_config(request)
+    stored.update(body.model_dump(exclude_none=True))
+    _set_system_config(request, stored)
+    return _to_public(stored)
+
+
+def _unknown_exchange(exchange_id: str) -> HTTPException:
+    return api_error(404, "unknown_exchange", f"Unknown exchange: {exchange_id}", "not_found")
 
 
 @router.get("/exchanges", response_model=list[ExchangeStatus])
@@ -237,43 +265,38 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
             }
         )
 
-    return results if results else _EXCHANGES_PLACEHOLDER
+    return results
 
 
 @router.post("/exchanges/{exchange_id}/connect", response_model=ExchangeConnectResponse)
 async def connect_exchange(
     exchange_id: str, body: ExchangeConnectRequest, request: Request
 ) -> dict[str, Any]:
-    """Store exchange API credentials and mark as connected."""
+    """Encrypt and persist exchange API credentials; 503 if they cannot be stored."""
     known_ids = {eid for eid, _, _ in _EXCHANGE_DEFS}
     if exchange_id not in known_ids:
-        raise HTTPException(status_code=404, detail=f"Unknown exchange: {exchange_id}")
+        raise _unknown_exchange(exchange_id)
 
     display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
-    # Encrypt and persist to DB
     from hydra.core.encryption import encrypt
 
-    pool = _pool_from_request(request)
-    if pool is not None:
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO exchange_credentials "
-                    "(exchange_id, encrypted_key, encrypted_secret, "
-                    "encrypted_passphrase, updated_at) "
-                    "VALUES ($1, $2, $3, $4, now()) "
-                    "ON CONFLICT (exchange_id) DO UPDATE SET "
-                    "encrypted_key = EXCLUDED.encrypted_key, "
-                    "encrypted_secret = EXCLUDED.encrypted_secret, "
-                    "encrypted_passphrase = EXCLUDED.encrypted_passphrase, "
-                    "updated_at = now()",
-                    exchange_id,
-                    encrypt(body.api_key),
-                    encrypt(body.api_secret),
-                    encrypt(body.passphrase) if body.passphrase else None,
-                )
-        except Exception:
-            logger.exception("Failed to persist encrypted credentials for %s", exchange_id)
+    pool = require_pool(request)
+    async with db_errors_to_503("storing exchange credentials"), pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO exchange_credentials "
+            "(exchange_id, encrypted_key, encrypted_secret, "
+            "encrypted_passphrase, updated_at) "
+            "VALUES ($1, $2, $3, $4, now()) "
+            "ON CONFLICT (exchange_id) DO UPDATE SET "
+            "encrypted_key = EXCLUDED.encrypted_key, "
+            "encrypted_secret = EXCLUDED.encrypted_secret, "
+            "encrypted_passphrase = EXCLUDED.encrypted_passphrase, "
+            "updated_at = now()",
+            exchange_id,
+            encrypt(body.api_key),
+            encrypt(body.api_secret),
+            encrypt(body.passphrase) if body.passphrase else None,
+        )
 
     # Keep in app state for fast access (plaintext in memory)
     creds = _get_exchange_credentials(request)
@@ -294,24 +317,19 @@ async def connect_exchange(
 
 @router.delete("/exchanges/{exchange_id}/connect", response_model=ExchangeConnectResponse)
 async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, Any]:
-    """Remove stored exchange credentials."""
+    """Remove stored exchange credentials; 503 (and no change) if the DB delete fails."""
     known_ids = {eid for eid, _, _ in _EXCHANGE_DEFS}
     if exchange_id not in known_ids:
-        raise HTTPException(status_code=404, detail=f"Unknown exchange: {exchange_id}")
+        raise _unknown_exchange(exchange_id)
 
     display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
 
-    # Remove from DB
-    pool = _pool_from_request(request)
-    if pool is not None:
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "DELETE FROM exchange_credentials WHERE exchange_id = $1",
-                    exchange_id,
-                )
-        except Exception:
-            logger.exception("Failed to delete credentials for %s", exchange_id)
+    pool = require_pool(request)
+    async with db_errors_to_503("deleting exchange credentials"), pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM exchange_credentials WHERE exchange_id = $1",
+            exchange_id,
+        )
 
     creds = _get_exchange_credentials(request)
     creds.pop(exchange_id, None)
@@ -406,52 +424,38 @@ class NotificationPreferences(BaseModel):
 
 @router.get("/notifications")
 async def get_notifications(request: Request) -> dict[str, Any]:
-    """Get notification preferences."""
-    pool = _pool_from_request(request)
-    if pool is not None:
-        try:
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT preferences FROM notification_preferences ORDER BY id LIMIT 1"
-                )
-                if row is not None:
-                    import json
-
-                    prefs = row["preferences"]
-                    if isinstance(prefs, str):
-                        prefs = json.loads(prefs)
-                    return {"preferences": prefs}
-        except Exception:
-            logger.exception("Failed to fetch notification preferences")
-    return {"preferences": {}}
+    """Get notification preferences; 503 when they cannot be read."""
+    pool = require_pool(request)
+    async with db_errors_to_503("reading notification preferences"), pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT preferences FROM notification_preferences ORDER BY id LIMIT 1"
+        )
+    if row is None:
+        return {"preferences": {}}
+    prefs = row["preferences"]
+    if isinstance(prefs, str):
+        prefs = json.loads(prefs)
+    return {"preferences": prefs}
 
 
 @router.put("/notifications")
 async def update_notifications(body: NotificationPreferences, request: Request) -> dict[str, Any]:
     """Update notification preferences (upsert)."""
-    pool = _pool_from_request(request)
-    if pool is None:
-        raise HTTPException(status_code=503, detail="Database not available")
-    try:
-        import json
-
-        prefs_json = json.dumps(body.preferences)
-        async with pool.acquire() as conn:
-            # Upsert: try update first, then insert if no rows exist
-            result = await conn.execute(
-                "UPDATE notification_preferences "
-                "SET preferences = $1::jsonb, updated_at = now() "
-                "WHERE id = (SELECT id FROM notification_preferences ORDER BY id LIMIT 1)",
+    pool = require_pool(request)
+    prefs_json = json.dumps(body.preferences)
+    async with db_errors_to_503("updating notification preferences"), pool.acquire() as conn:
+        # Upsert: try update first, then insert if no rows exist
+        result = await conn.execute(
+            "UPDATE notification_preferences "
+            "SET preferences = $1::jsonb, updated_at = now() "
+            "WHERE id = (SELECT id FROM notification_preferences ORDER BY id LIMIT 1)",
+            prefs_json,
+        )
+        if result == "UPDATE 0":
+            await conn.execute(
+                "INSERT INTO notification_preferences (preferences) VALUES ($1::jsonb)",
                 prefs_json,
             )
-            if result == "UPDATE 0":
-                await conn.execute(
-                    "INSERT INTO notification_preferences (preferences) VALUES ($1::jsonb)",
-                    prefs_json,
-                )
-    except Exception as exc:
-        logger.exception("Failed to update notification preferences")
-        raise HTTPException(status_code=500, detail="Failed to update preferences") from exc
     return {"preferences": body.preferences}
 
 
@@ -470,10 +474,10 @@ class NotificationTestResponse(BaseModel):
 async def test_notifications(request: Request) -> NotificationTestResponse:
     """Send a test message to all configured webhook channels.
 
-    Reads ``discord_webhook_url`` and ``slack_webhook_url`` from the persisted
-    platform config.  Returns the delivery status for each channel.
+    Stored URLs are re-validated before any request leaves the server, because
+    state can predate the allowlist.
     """
-    from hydra.ops.notifications import NotificationDispatcher
+    from hydra.ops.notifications import DiscordWebhookNotifier, SlackWebhookNotifier
 
     cfg_dict = _get_system_config(request)
     discord_url: str = cfg_dict.get("discord_webhook_url", "")
@@ -489,24 +493,26 @@ async def test_notifications(request: Request) -> NotificationTestResponse:
             ),
         )
 
-    dispatcher = NotificationDispatcher()
-    dispatcher.configure(discord_url=discord_url, slack_url=slack_url)
-
-    discord_sent = False
-    slack_sent = False
-
-    from hydra.ops.notifications import DiscordWebhookNotifier, SlackWebhookNotifier
+    for field, url, host in (
+        ("discord_webhook_url", discord_url, "discord.com"),
+        ("slack_webhook_url", slack_url, "hooks.slack.com"),
+    ):
+        if not url:
+            continue
+        try:
+            _validate_webhook_url(url, host)
+        except ValueError as exc:
+            raise api_error(
+                422, "invalid_webhook_url", f"{field}: {exc}", "invalid", field=field
+            ) from exc
 
     title = "Hydra — Test Notification"
     body = "This is a test message from the Hydra trading platform."
 
-    if discord_url:
-        notifier = DiscordWebhookNotifier(discord_url)
-        discord_sent = await notifier.send(title, body)
-
-    if slack_url:
-        notifier_slack = SlackWebhookNotifier(slack_url)
-        slack_sent = await notifier_slack.send(title, body)
+    discord_sent = (
+        await DiscordWebhookNotifier(discord_url).send(title, body) if discord_url else False
+    )
+    slack_sent = await SlackWebhookNotifier(slack_url).send(title, body) if slack_url else False
 
     parts: list[str] = []
     if discord_url:
@@ -541,9 +547,8 @@ async def _get_exchange_client(exchange_id: str, request: Request) -> Any:
 
     creds = _get_exchange_credentials(request)
     if exchange_id not in creds:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No credentials stored for {exchange_id}",
+        raise api_error(
+            404, "credentials_not_found", f"No credentials stored for {exchange_id}", "not_found"
         )
     from hydra.execution.exchange_client import ExchangeClient
 
@@ -561,6 +566,11 @@ async def _get_exchange_client(exchange_id: str, request: Request) -> Any:
     return client
 
 
+def _exchange_error(exchange_id: str) -> HTTPException:
+    logger.warning("Exchange request to %s failed", exchange_id, exc_info=True)
+    return api_error(502, "exchange_error", f"Request to {exchange_id} failed", "unavailable")
+
+
 @router.get("/exchanges/{exchange_id}/balance")
 async def get_exchange_balance(exchange_id: str, request: Request) -> dict[str, Any]:
     """Fetch live balance from a configured exchange."""
@@ -571,7 +581,7 @@ async def get_exchange_balance(exchange_id: str, request: Request) -> dict[str, 
     except Exception as exc:
         # Evict cached client on error so next request creates a fresh one
         _get_exchange_clients(request).pop(exchange_id, None)
-        raise HTTPException(status_code=502, detail=f"Exchange error: {exc}") from exc
+        raise _exchange_error(exchange_id) from exc
 
 
 @router.get("/exchanges/{exchange_id}/orders")
@@ -583,7 +593,7 @@ async def get_exchange_orders(exchange_id: str, request: Request) -> dict[str, A
         return {"exchange_id": exchange_id, "orders": orders}
     except Exception as exc:
         _get_exchange_clients(request).pop(exchange_id, None)
-        raise HTTPException(status_code=502, detail=f"Exchange error: {exc}") from exc
+        raise _exchange_error(exchange_id) from exc
 
 
 @router.get("/exchanges/{exchange_id}/positions")
@@ -595,4 +605,4 @@ async def get_exchange_positions(exchange_id: str, request: Request) -> dict[str
         return {"exchange_id": exchange_id, "positions": positions}
     except Exception as exc:
         _get_exchange_clients(request).pop(exchange_id, None)
-        raise HTTPException(status_code=502, detail=f"Exchange error: {exc}") from exc
+        raise _exchange_error(exchange_id) from exc

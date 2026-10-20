@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -88,7 +89,7 @@ class TestGetConfig:
     def test_persisted_config_takes_precedence(self) -> None:
         app = _make_app(pool=None)
         app.state.system_config = {
-            "trading_mode": "testnet",
+            "trading_mode": "live",
             "default_pair": "SOL/USDT",
             "default_timeframe": "15m",
             "max_concurrent_strategies": 3,
@@ -97,7 +98,7 @@ class TestGetConfig:
         resp = client.get("/api/system/config")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["trading_mode"] == "testnet"
+        assert data["trading_mode"] == "live"
         assert data["default_pair"] == "SOL/USDT"
 
 
@@ -118,7 +119,7 @@ class TestUpdateConfig:
         resp = client_no_pool.put(
             "/api/system/config",
             json={
-                "trading_mode": "testnet",
+                "trading_mode": "live",
                 "default_pair": "ETH/BTC",
                 "default_timeframe": "4h",
                 "max_concurrent_strategies": 2,
@@ -126,7 +127,7 @@ class TestUpdateConfig:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["trading_mode"] == "testnet"
+        assert data["trading_mode"] == "live"
         assert data["default_pair"] == "ETH/BTC"
         assert data["max_concurrent_strategies"] == 2
 
@@ -346,10 +347,23 @@ class TestSystemHealth:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture()
+def credential_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # encrypt() writes a generated key into ./.env when this is unset
+    monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
+
+
+def _connected_app() -> tuple[FastAPI, AsyncMock]:
+    pool, conn = _make_mock_pool()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    return _make_app(pool=pool), conn
+
+
+@pytest.mark.usefixtures("credential_key")
 class TestExchangeConnect:
     def test_connect_exchange_success(self) -> None:
-        """POST connect stores credentials and returns success."""
-        app = _make_app(pool=None)
+        """POST connect encrypts, persists and returns success."""
+        app, conn = _connected_app()
         client = TestClient(app)
         resp = client.post(
             "/api/system/exchanges/binance/connect",
@@ -361,10 +375,14 @@ class TestExchangeConnect:
         assert data["name"] == "Binance"
         assert data["connected"] is True
         assert "Successfully connected" in data["message"]
+        args = conn.execute.await_args.args
+        assert args[1] == "binance"
+        assert "key123" not in args[2:]
+        assert app.state.exchange_credentials["binance"]["api_key"] == "key123"
 
     def test_connect_exchange_with_passphrase(self) -> None:
         """POST connect with optional passphrase."""
-        app = _make_app(pool=None)
+        app, conn = _connected_app()
         client = TestClient(app)
         resp = client.post(
             "/api/system/exchanges/okx/connect",
@@ -374,6 +392,28 @@ class TestExchangeConnect:
         data = resp.json()
         assert data["id"] == "okx"
         assert data["connected"] is True
+        assert conn.execute.await_args.args[4] is not None
+
+    def test_connect_without_db_is_503_and_stores_nothing(self) -> None:
+        app = _make_app(pool=None)
+        resp = TestClient(app).post(
+            "/api/system/exchanges/binance/connect",
+            json={"api_key": "key", "api_secret": "secret"},
+        )
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
+        assert "binance" not in getattr(app.state, "exchange_credentials", {})
+
+    def test_connect_persist_failure_is_503_and_stores_nothing(self) -> None:
+        app, conn = _connected_app()
+        conn.execute = AsyncMock(side_effect=ConnectionResetError("db went away"))
+        resp = TestClient(app).post(
+            "/api/system/exchanges/binance/connect",
+            json={"api_key": "key", "api_secret": "secret"},
+        )
+        assert resp.status_code == 503
+        assert "Successfully" not in resp.text
+        assert "binance" not in getattr(app.state, "exchange_credentials", {})
 
     def test_connect_unknown_exchange_returns_404(self) -> None:
         """POST connect with unknown exchange ID returns 404."""
@@ -384,22 +424,34 @@ class TestExchangeConnect:
             json={"api_key": "key", "api_secret": "secret"},
         )
         assert resp.status_code == 404
+        assert resp.json()["detail"]["state"] == "not_found"
 
     def test_disconnect_exchange_success(self) -> None:
         """DELETE connect removes credentials."""
-        app = _make_app(pool=None)
+        app, _ = _connected_app()
         client = TestClient(app)
-        # First connect
         client.post(
             "/api/system/exchanges/binance/connect",
             json={"api_key": "key", "api_secret": "secret"},
         )
-        # Then disconnect
         resp = client.delete("/api/system/exchanges/binance/connect")
         assert resp.status_code == 200
         data = resp.json()
         assert data["connected"] is False
         assert "Disconnected" in data["message"]
+        assert "binance" not in app.state.exchange_credentials
+
+    def test_disconnect_delete_failure_is_503_and_keeps_credentials(self) -> None:
+        app, conn = _connected_app()
+        client = TestClient(app)
+        client.post(
+            "/api/system/exchanges/binance/connect",
+            json={"api_key": "key", "api_secret": "secret"},
+        )
+        conn.execute = AsyncMock(side_effect=OSError("db went away"))
+        resp = client.delete("/api/system/exchanges/binance/connect")
+        assert resp.status_code == 503
+        assert "binance" in app.state.exchange_credentials
 
     def test_disconnect_unknown_exchange_returns_404(self) -> None:
         """DELETE connect with unknown exchange returns 404."""
@@ -417,14 +469,13 @@ class TestExchangeConnect:
             "OKX_API_KEY": "",
         }
         with patch.dict("os.environ", env, clear=False):
-            app = _make_app(pool=None)
+            app, conn = _connected_app()
+            conn.fetchval = AsyncMock(return_value=1)
             client = TestClient(app)
-            # Connect binance via the endpoint
             client.post(
                 "/api/system/exchanges/binance/connect",
                 json={"api_key": "key", "api_secret": "secret"},
             )
-            # Check exchanges list
             resp = client.get("/api/system/exchanges")
             assert resp.status_code == 200
             data = resp.json()
@@ -441,15 +492,14 @@ class TestExchangeConnect:
             "OKX_API_KEY": "",
         }
         with patch.dict("os.environ", env, clear=False):
-            app = _make_app(pool=None)
+            app, conn = _connected_app()
+            conn.fetchval = AsyncMock(return_value=1)
             client = TestClient(app)
-            # Connect then disconnect
             client.post(
                 "/api/system/exchanges/binance/connect",
                 json={"api_key": "key", "api_secret": "secret"},
             )
             client.delete("/api/system/exchanges/binance/connect")
-            # Check exchanges list
             resp = client.get("/api/system/exchanges")
             assert resp.status_code == 200
             data = resp.json()
