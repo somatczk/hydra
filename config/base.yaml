@@ -30,10 +30,6 @@ api:
   cors_origins:
     - ${HYDRA_CORS_ORIGINS:http://localhost:3000}
 
-telegram:
-  bot_token: ${HYDRA_TELEGRAM_BOT_TOKEN:}
-  chat_id: ${HYDRA_TELEGRAM_CHAT_ID:}
-
 ml:
   models_dir: ${HYDRA_MODELS_DIR:/app/models}
   inference_timeout_ms: 5

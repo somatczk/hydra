@@ -4,7 +4,7 @@ Tiers:
     1: 3% drawdown  -> reduce_size_50  (auto-reset 24h)
     2: 5% drawdown  -> halt_new_trades (auto-reset 48h)
     3: 10% drawdown -> flatten_all     (auto-reset 72h, requires manual review)
-    4: 15% drawdown -> emergency_shutdown (no auto-reset, Telegram alert)
+    4: 15% drawdown -> emergency_shutdown (no auto-reset)
 
 Additional breakers:
     - Daily loss 3%  -> halt rest of day
