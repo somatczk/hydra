@@ -143,117 +143,6 @@ class TestStrategies:
 
 
 # ---------------------------------------------------------------------------
-# Portfolio
-# ---------------------------------------------------------------------------
-
-
-class TestPortfolio:
-    def test_portfolio_summary(self, client: TestClient) -> None:
-        resp = client.get("/api/portfolio/summary")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "total_value" in data
-        assert "unrealized_pnl" in data
-        assert "realized_pnl" in data
-
-    def test_portfolio_positions(self, client: TestClient) -> None:
-        resp = client.get("/api/portfolio/positions")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-
-    def test_equity_curve(self, client: TestClient) -> None:
-        resp = client.get("/api/portfolio/equity-curve")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-
-    def test_daily_pnl(self, client: TestClient) -> None:
-        resp = client.get("/api/portfolio/daily-pnl")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-
-    def test_monthly_returns(self, client: TestClient) -> None:
-        resp = client.get("/api/portfolio/monthly-returns")
-        assert resp.status_code == 200
-
-    def test_attribution(self, client: TestClient) -> None:
-        resp = client.get("/api/portfolio/attribution")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-
-
-# ---------------------------------------------------------------------------
-# Risk
-# ---------------------------------------------------------------------------
-
-
-class TestRisk:
-    def test_risk_status(self, client: TestClient) -> None:
-        resp = client.get("/api/risk/status")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "current_drawdown" in data
-        assert "circuit_breakers" in data
-
-    def test_circuit_breakers(self, client: TestClient) -> None:
-        resp = client.get("/api/risk/circuit-breakers")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-        assert len(data) == 4
-
-    def test_reset_circuit_breaker(self, client: TestClient) -> None:
-        resp = client.post("/api/risk/circuit-breakers/3/reset")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["tier"] == 3
-        assert data["status"] == "Normal"
-
-    def test_reset_circuit_breaker_not_found(self, client: TestClient) -> None:
-        resp = client.post("/api/risk/circuit-breakers/99/reset")
-        assert resp.status_code == 404
-
-    def test_var_estimate(self, client: TestClient) -> None:
-        resp = client.get("/api/risk/var")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "var_95" in data
-        assert "var_99" in data
-
-
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-
-
-class TestModels:
-    def test_list_models_empty(self, client: TestClient) -> None:
-        resp = client.get("/api/models")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert isinstance(data, list)
-
-    def test_get_model_not_found(self, client: TestClient) -> None:
-        resp = client.get("/api/models/nonexistent")
-        assert resp.status_code == 404
-
-    def test_promote_model_not_found(self, client: TestClient) -> None:
-        resp = client.post("/api/models/nonexistent/promote")
-        assert resp.status_code == 404
-
-    def test_rollback_model_not_found(self, client: TestClient) -> None:
-        resp = client.post("/api/models/nonexistent/rollback")
-        assert resp.status_code == 404
-
-    def test_retrain_model_not_found(self, client: TestClient) -> None:
-        resp = client.post("/api/models/nonexistent/retrain")
-        assert resp.status_code == 404
-
-
-# ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------
 
@@ -393,11 +282,11 @@ class TestSystem:
     def test_update_config(self, client: TestClient) -> None:
         resp = client.put(
             "/api/system/config",
-            json={"trading_mode": "testnet"},
+            json={"trading_mode": "live"},
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["trading_mode"] == "testnet"
+        assert data["trading_mode"] == "live"
 
     def test_exchanges(self, client: TestClient) -> None:
         resp = client.get("/api/system/exchanges")

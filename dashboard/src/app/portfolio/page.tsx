@@ -25,7 +25,7 @@ import {
 } from 'recharts';
 import { StatCard } from '@/components/ui/DataCard';
 import { DataCard } from '@/components/ui/DataCard';
-import { ErrorCard } from '@/components/ui/ErrorCard';
+import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
@@ -184,7 +184,7 @@ export default function PortfolioPage() {
   const [attribution, setAttribution] = useState<AttributionItem[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [isDark, setIsDark] = useState(false);
-  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
+  const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
 
   // Sentiment state
   const [sentiment, setSentiment] = useState<SentimentData | null>(null);
@@ -231,25 +231,25 @@ export default function PortfolioPage() {
     await Promise.all([
       fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
         .then(setSummary)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, summary: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, summary: err ?? true })); }),
       fetchApi<Position[]>(`/api/portfolio/positions${qs}`)
         .then(setPositions)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, positions: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
       fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
         .then(setEquityCurve)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, equity: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, equity: err ?? true })); }),
       fetchApi<DailyPnl[]>(`/api/portfolio/daily-pnl${qs}`)
         .then(setDailyPnl)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, dailyPnl: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, dailyPnl: err ?? true })); }),
       fetchApi<MonthlyReturn[]>(`/api/portfolio/monthly-returns${qs}`)
         .then(setMonthlyReturns)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, monthlyReturns: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, monthlyReturns: err ?? true })); }),
       fetchApi<AttributionItem[]>(`/api/portfolio/attribution${qs}`)
         .then(setAttribution)
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, attribution: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, attribution: err ?? true })); }),
       fetchApi<SentimentData[]>('/api/market/sentiment')
         .then((arr) => setSentiment(arr?.[0] ?? null))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, sentiment: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, sentiment: err ?? true })); }),
       fetchApi<StrategyOption[]>('/api/strategies')
         .then((data) => setStrategies(data.map((s) => ({ id: s.id, name: s.name }))))
         .catch(() => {}),
@@ -526,7 +526,7 @@ export default function PortfolioPage() {
 
       {/* Stat cards + Sentiment */}
       {fetchErrors.summary ? (
-        <ErrorCard message="Failed to load portfolio summary" onRetry={loadData} />
+        <DataStateErrorCard error={fetchErrors.summary} fallback="Failed to load portfolio summary" onRetry={loadData} />
       ) : loading ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
           {Array.from({ length: 5 }).map((_, i) => (
@@ -684,7 +684,7 @@ export default function PortfolioPage() {
         {/* Equity Curve */}
         <DataCard title="Equity Curve" description="Portfolio value over time">
           {fetchErrors.equity ? (
-            <ErrorCard message="Failed to load equity curve" onRetry={loadData} />
+            <DataStateErrorCard error={fetchErrors.equity} fallback="Failed to load equity curve" onRetry={loadData} />
           ) : loading ? (
             <div className="h-64 animate-pulse rounded-lg bg-bg-tertiary" />
           ) : equityCurve && equityCurve.length > 0 ? (
@@ -745,7 +745,7 @@ export default function PortfolioPage() {
         {/* Drawdown Chart */}
         <DataCard title="Drawdown" description="Maximum drawdown over time">
           {fetchErrors.equity ? (
-            <ErrorCard message="Failed to load drawdown data" onRetry={loadData} />
+            <DataStateErrorCard error={fetchErrors.equity} fallback="Failed to load drawdown data" onRetry={loadData} />
           ) : loading ? (
             <div className="h-64 animate-pulse rounded-lg bg-bg-tertiary" />
           ) : equityCurve && equityCurve.length > 0 ? (
@@ -808,7 +808,7 @@ export default function PortfolioPage() {
       {/* Monthly returns heatmap */}
       <DataCard title="Monthly Returns" description="Calendar heatmap of monthly performance">
         {fetchErrors.monthlyReturns ? (
-          <ErrorCard message="Failed to load monthly returns" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.monthlyReturns} fallback="Failed to load monthly returns" onRetry={loadData} />
         ) : loading ? (
           <div className="h-32 animate-pulse rounded-lg bg-bg-tertiary" />
         ) : monthlyReturns && monthlyReturns.length > 0 ? (
@@ -858,7 +858,7 @@ export default function PortfolioPage() {
       {/* Attribution bar chart */}
       <DataCard title="Strategy Attribution" description="PnL contribution per strategy">
         {fetchErrors.attribution ? (
-          <ErrorCard message="Failed to load attribution data" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.attribution} fallback="Failed to load attribution data" onRetry={loadData} />
         ) : loading ? (
           <div className="h-56 animate-pulse rounded-lg bg-bg-tertiary" />
         ) : attribution && attribution.length > 0 ? (
@@ -913,7 +913,7 @@ export default function PortfolioPage() {
       {/* Allocation breakdown */}
       <DataCard title="Position Allocation" description="Current portfolio breakdown">
         {fetchErrors.positions ? (
-          <ErrorCard message="Failed to load positions" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.positions} fallback="Failed to load positions" onRetry={loadData} />
         ) : loading ? (
           <div className="space-y-3">
             {Array.from({ length: 3 }).map((_, i) => (

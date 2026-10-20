@@ -5,12 +5,13 @@ import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, UploadFile, status
+from fastapi import APIRouter, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from hydra.core.config import HydraConfig
+from hydra.dashboard.routes._db import api_error
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)
@@ -19,13 +20,14 @@ logger = logging.getLogger(__name__)
 _SAFE_MODEL_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
 
+def _model_not_found(model_id: str) -> HTTPException:
+    return api_error(404, "model_not_found", f"Model {model_id} not found", "not_found")
+
+
 def _validate_model_id(model_id: str) -> str:
     """Validate model_id contains no path traversal characters."""
     if not _SAFE_MODEL_ID.match(model_id) or ".." in model_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid model ID",
-        )
+        raise api_error(400, "invalid_model_id", "Invalid model ID", "invalid")
     return model_id
 
 
@@ -47,6 +49,10 @@ def _models_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 
+DriftStatus = Literal["unknown", "low", "moderate", "high"]
+_DRIFT_STATUSES: frozenset[str] = frozenset({"low", "moderate", "high"})
+
+
 class ModelMetrics(BaseModel):
     accuracy: float | None = None
     precision: float | None = None
@@ -59,7 +65,7 @@ class ModelResponse(BaseModel):
     stage: str  # Production | Staging | Training | Archived
     metrics: ModelMetrics
     drift: float | None = None
-    drift_status: str = "low"  # low | moderate | high
+    drift_status: DriftStatus = "unknown"
     last_trained: str = ""
     file_size: int = 0
     file_name: str = ""
@@ -87,11 +93,6 @@ class RollbackResponse(BaseModel):
     message: str
 
 
-class RetrainResponse(BaseModel):
-    task_id: str
-    message: str
-
-
 # ---------------------------------------------------------------------------
 # Placeholder data (fallback when models dir is empty / not mounted)
 # ---------------------------------------------------------------------------
@@ -113,6 +114,14 @@ def _read_meta(onnx_path: Path) -> dict[str, Any]:
         except (json.JSONDecodeError, OSError):
             pass
     return {}
+
+
+def _drift_status(meta: dict[str, Any]) -> str:
+    """A drift label is only trusted when a measured drift value backs it."""
+    if meta.get("drift") is None:
+        return "unknown"
+    status = meta.get("drift_status")
+    return status if status in _DRIFT_STATUSES else "unknown"
 
 
 def _write_meta(onnx_path: Path, meta: dict[str, Any]) -> None:
@@ -151,7 +160,7 @@ def _scan_models_dir() -> list[dict[str, Any]]:
                     "precision": metrics_data.get("precision"),
                 },
                 "drift": meta.get("drift"),
-                "drift_status": meta.get("drift_status", "low"),
+                "drift_status": _drift_status(meta),
                 "last_trained": meta.get("last_trained", mtime.strftime("%Y-%m-%d %H:%M UTC")),
                 "file_size": stat.st_size,
                 "file_name": onnx_file.name,
@@ -181,7 +190,7 @@ def _get_model_from_dir(model_id: str) -> tuple[dict[str, Any], Path] | None:
             "precision": metrics_data.get("precision"),
         },
         "drift": meta.get("drift"),
-        "drift_status": meta.get("drift_status", "low"),
+        "drift_status": _drift_status(meta),
         "last_trained": meta.get("last_trained", mtime.strftime("%Y-%m-%d %H:%M UTC")),
         "file_size": stat.st_size,
         "file_name": onnx_file.name,
@@ -211,17 +220,14 @@ async def get_model(model_id: str) -> dict[str, Any]:
     # Fallback to placeholder
     if model_id in _MODELS:
         return _MODELS[model_id]
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Model {model_id} not found",
-    )
+    raise _model_not_found(model_id)
 
 
 @router.post("/upload", response_model=ModelUploadResponse, status_code=201)
 async def upload_model(file: UploadFile) -> dict[str, Any]:
     """Upload an ONNX model file. Validates it can be loaded by onnxruntime."""
     if not file.filename or not file.filename.endswith(".onnx"):
-        raise HTTPException(status_code=422, detail="File must have .onnx extension")
+        raise api_error(422, "invalid_file", "File must have .onnx extension", "invalid")
 
     # Sanitize filename — use only the basename to prevent path traversal
     safe_filename = Path(file.filename).name
@@ -229,7 +235,7 @@ async def upload_model(file: UploadFile) -> dict[str, Any]:
 
     content = await file.read()
     if len(content) == 0:
-        raise HTTPException(status_code=422, detail="Empty file")
+        raise api_error(422, "invalid_file", "Empty file", "invalid")
 
     # Validate ONNX by attempting to create an InferenceSession
     try:
@@ -237,7 +243,7 @@ async def upload_model(file: UploadFile) -> dict[str, Any]:
 
         ort.InferenceSession(content)
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid ONNX model: {exc}") from exc
+        raise api_error(422, "invalid_onnx", f"Invalid ONNX model: {exc}", "invalid") from exc
 
     models_path = _models_dir()
     models_path.mkdir(parents=True, exist_ok=True)
@@ -292,7 +298,7 @@ async def promote_model(model_id: str) -> dict[str, Any]:
         }
     # Fallback to placeholder
     if model_id not in _MODELS:
-        raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
+        raise _model_not_found(model_id)
     model = _MODELS[model_id]
     previous_stage = model["stage"]
     model["stage"] = "Production"
@@ -321,7 +327,7 @@ async def rollback_model(model_id: str) -> dict[str, Any]:
         }
     # Fallback to placeholder
     if model_id not in _MODELS:
-        raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
+        raise _model_not_found(model_id)
     model = _MODELS[model_id]
     current_version = model["version"]
     model["stage"] = "Staging"
@@ -333,17 +339,13 @@ async def rollback_model(model_id: str) -> dict[str, Any]:
     }
 
 
-@router.post("/{model_id}/retrain", response_model=RetrainResponse)
-async def retrain_model(model_id: str) -> dict[str, str]:
-    """Trigger retraining of a specific ML model."""
-    import uuid
-
-    # Check existence in dir or fallback
-    result = _get_model_from_dir(model_id)
-    if result is None and model_id not in _MODELS:
-        raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
-    task_id = f"retrain-{uuid.uuid4().hex[:8]}"
-    return {
-        "task_id": task_id,
-        "message": f"Retraining job started for model {model_id}",
-    }
+@router.post("/{model_id}/retrain", status_code=501)
+async def retrain_model(model_id: str) -> None:
+    """Retraining is not implemented; no job is started."""
+    raise api_error(
+        501,
+        "not_implemented",
+        "Model retraining is not implemented",
+        "not_implemented",
+        model_id=model_id,
+    )

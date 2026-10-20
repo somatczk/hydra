@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Brain, ArrowUpCircle, RotateCcw, RefreshCw, Upload } from 'lucide-react';
+import { Brain, ArrowUpCircle, RotateCcw, Upload } from 'lucide-react';
 import {
   BarChart,
   Bar,
@@ -32,7 +32,7 @@ interface Model {
   accuracy: string;
   precision: string;
   drift: string;
-  driftStatus: 'success' | 'warning' | 'error';
+  driftStatus: 'success' | 'warning' | 'error' | 'neutral';
   lastTrained: string;
   fileSize: string;
 }
@@ -61,11 +61,13 @@ function stageToVariant(stage: string): 'success' | 'warning' | 'info' | 'neutra
   }
 }
 
-function driftToStatus(ds: string): 'success' | 'warning' | 'error' {
+// Drift is only labelled when the backend has a measured drift value
+function driftToStatus(ds: string): 'success' | 'warning' | 'error' | 'neutral' {
   switch (ds) {
+    case 'low': return 'success';
     case 'moderate': return 'warning';
     case 'high': return 'error';
-    default: return 'success';
+    default: return 'neutral';
   }
 }
 
@@ -96,6 +98,7 @@ const driftLabels: Record<string, string> = {
   success: 'Low',
   warning: 'Moderate',
   error: 'High',
+  neutral: 'Unknown',
 };
 
 /* ---------- Page ---------- */
@@ -156,21 +159,6 @@ export default function ModelsPage() {
     } catch (err) {
       logger.error('Models', `Failed to rollback ${model.name}`, err);
       toast('error', `Failed to rollback ${model.name}`);
-    } finally {
-      setActionLoading((prev) => ({ ...prev, [model.id]: null }));
-    }
-  };
-
-  const handleRetrain = async (model: Model) => {
-    if (!confirm(`Start retraining for "${model.name}"?`)) return;
-    setActionLoading((prev) => ({ ...prev, [model.id]: 'retrain' }));
-    try {
-      await fetchApi(`/api/models/${model.id}/retrain`, { method: 'POST' });
-      toast('success', `Retraining started for ${model.name}`);
-      loadData();
-    } catch (err) {
-      logger.error('Models', `Failed to retrain ${model.name}`, err);
-      toast('error', `Failed to retrain ${model.name}`);
     } finally {
       setActionLoading((prev) => ({ ...prev, [model.id]: null }));
     }
@@ -267,16 +255,6 @@ export default function ModelsPage() {
             >
               <RotateCcw className="h-3.5 w-3.5" />
               <span className="hidden lg:inline">Rollback</span>
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => handleRetrain(row)}
-              loading={currentAction === 'retrain'}
-              disabled={!!currentAction || row.status === 'Training'}
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              <span className="hidden lg:inline">Retrain</span>
             </Button>
           </div>
         );

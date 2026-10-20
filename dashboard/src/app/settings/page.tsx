@@ -8,8 +8,11 @@ import { Select } from '@/components/ui/Select';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { ErrorCard } from '@/components/ui/ErrorCard';
+import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
+import { describeApiError } from '@/lib/apiState';
+import { CLEAR_WEBHOOK_SECRET_WARNING, TRADING_MODE_OPTIONS } from '@/lib/platformConfig';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDialog';
@@ -39,10 +42,15 @@ interface PlatformConfig {
   default_timeframe: string;
   max_concurrent_strategies: number;
   paper_capital: number;
-  webhook_secret?: string;
-  discord_webhook_url?: string;
-  slack_webhook_url?: string;
+  webhook_secret_set: boolean;
+  discord_webhook_url_set: boolean;
+  slack_webhook_url_set: boolean;
 }
+
+type SecretField = 'webhook_secret' | 'discord_webhook_url' | 'slack_webhook_url';
+type SecretsSet = Record<SecretField, boolean>;
+
+const SECRET_PLACEHOLDER = 'Configured, enter a new value to replace';
 
 interface RiskConfig {
   kill_switch_active: boolean;
@@ -120,8 +128,15 @@ export default function SettingsPage() {
   const [defaultTimeframe, setDefaultTimeframe] = useState('1h');
   const [maxStrategies, setMaxStrategies] = useState('5');
   const [paperCapital, setPaperCapital] = useState('10000');
-  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  // null = unknown: the risk config could not be read
+  const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [notifications, setNotifications] = useState<Record<string, boolean> | null>(null);
+  const [notificationsError, setNotificationsError] = useState<unknown>(null);
+  const [secretsSet, setSecretsSet] = useState<SecretsSet>({
+    webhook_secret: false,
+    discord_webhook_url: false,
+    slack_webhook_url: false,
+  });
   const [selectedExchange, setSelectedExchange] = useState<Exchange | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
@@ -134,6 +149,24 @@ export default function SettingsPage() {
   const [exchangeDetails, setExchangeDetails] = useState<Record<string, ExchangeDetail>>({});
   const pollTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const failCounts = useRef<Record<string, number>>({});
+
+  const applySecretsSet = (cfg: PlatformConfig) => {
+    setSecretsSet({
+      webhook_secret: cfg.webhook_secret_set,
+      discord_webhook_url: cfg.discord_webhook_url_set,
+      slack_webhook_url: cfg.slack_webhook_url_set,
+    });
+  };
+
+  // Secrets are write-only: only fields in `patch` are sent, '' clears one.
+  const saveSecrets = async (patch: Partial<Record<SecretField, string>>, success: string) => {
+    const cfg = await fetchApi<PlatformConfig>('/api/system/config', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    });
+    applySecretsSet(cfg);
+    toast('success', success);
+  };
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -150,25 +183,21 @@ export default function SettingsPage() {
           setDefaultTimeframe(cfg.default_timeframe);
           setMaxStrategies(cfg.max_concurrent_strategies.toString());
           if (cfg.paper_capital) setPaperCapital(cfg.paper_capital.toString());
-          if (cfg.webhook_secret) setWebhookSecret(cfg.webhook_secret);
-          if (cfg.discord_webhook_url) setDiscordWebhookUrl(cfg.discord_webhook_url);
-          if (cfg.slack_webhook_url) setSlackWebhookUrl(cfg.slack_webhook_url);
+          applySecretsSet(cfg);
         })
         .catch(() => { setFetchErrors((prev) => ({ ...prev, config: true })); }),
       fetchApi<RiskConfig>('/api/risk/config')
         .then((risk) => setKillSwitchActive(risk.kill_switch_active))
-        .catch(() => {}),
+        .catch((err) => {
+          logger.warn('Settings', 'Kill switch state unknown', err);
+          setKillSwitchActive(null);
+        }),
       fetchApi<{ preferences: Record<string, boolean> }>('/api/system/notifications')
-        .then((data) => setNotifications(data.preferences || data as unknown as Record<string, boolean>))
-        .catch(() => {
-          // Fallback to defaults if API fails
-          setNotifications({
-            'Trade Executions': true,
-            'Risk Alerts': true,
-            'Model Drift': true,
-            'Strategy Signals': false,
-            'System Health': true,
-          });
+        .then((data) => { setNotifications(data.preferences); setNotificationsError(null); })
+        .catch((err) => {
+          logger.warn('Settings', 'Failed to load notification preferences', err);
+          setNotifications(null);
+          setNotificationsError(err);
         }),
     ]);
 
@@ -180,9 +209,9 @@ export default function SettingsPage() {
   // Poll kill switch state every 15s so banner stays in sync
   useEffect(() => {
     const pollKillSwitch = () => {
-      fetchApi<{ kill_switch_active: boolean; running_sessions: number }>('/api/risk/live-status')
+      fetchApi<{ kill_switch_active: boolean | null }>('/api/risk/live-status')
         .then((data) => setKillSwitchActive(data.kill_switch_active))
-        .catch(() => {});
+        .catch(() => setKillSwitchActive(null));
     };
     const interval = setInterval(pollKillSwitch, 15_000);
     return () => clearInterval(interval);
@@ -276,7 +305,7 @@ export default function SettingsPage() {
       toast('success', 'Platform configuration saved');
     } catch (err) {
       logger.error('Settings', 'Failed to save config', err);
-      toast('error', 'Failed to save configuration');
+      toast('error', describeApiError(err, 'Failed to save configuration'));
     }
   };
 
@@ -311,7 +340,15 @@ export default function SettingsPage() {
   return (
     <div className="flex flex-col gap-6">
       {/* Kill switch warning banner */}
-      {killSwitchActive && (
+      {!loading && killSwitchActive === null && (
+        <div className="rounded-xl border border-status-warning/30 bg-status-warning/5 p-4 flex items-center gap-3">
+          <DataStateBadge state="unknown" reason="Risk config could not be read" />
+          <p className="text-sm text-text-primary">
+            Kill switch state is unknown. Check the Risk page before trading.
+          </p>
+        </div>
+      )}
+      {killSwitchActive === true && (
         <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center gap-3">
           <OctagonX className="h-6 w-6 text-status-error shrink-0" />
           <div>
@@ -528,7 +565,13 @@ export default function SettingsPage() {
 
       {/* Notification preferences */}
       <DataCard title="Notification Preferences" description="Configure alert and notification settings">
-        {notifications === null && loading ? (
+        {notificationsError !== null ? (
+          <DataStateErrorCard
+            error={notificationsError}
+            fallback="Failed to load notification preferences"
+            onRetry={loadData}
+          />
+        ) : notifications === null && loading ? (
           <div className="space-y-3">
             {Array.from({ length: 5 }).map((_, i) => (
               <div key={i} className="h-14 animate-pulse rounded-lg bg-bg-tertiary" />
@@ -609,24 +652,40 @@ export default function SettingsPage() {
           </div>
           <Input
             label="Webhook Secret"
-            type="text"
+            type="password"
+            autoComplete="off"
             value={webhookSecret}
+            placeholder={secretsSet.webhook_secret ? SECRET_PLACEHOLDER : 'Not set'}
             onChange={(e) => setWebhookSecret(e.target.value)}
             hint="Shared secret for verifying webhook payloads"
           />
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-2">
+            {secretsSet.webhook_secret && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  if (!confirm(CLEAR_WEBHOOK_SECRET_WARNING)) return;
+                  try {
+                    await saveSecrets({ webhook_secret: '' }, 'Webhook secret cleared');
+                  } catch (err) {
+                    toast('error', describeApiError(err, 'Failed to clear webhook secret'));
+                  }
+                }}
+              >
+                Clear
+              </Button>
+            )}
             <Button
               variant="primary"
               size="sm"
+              disabled={webhookSecret === ''}
               onClick={async () => {
                 try {
-                  await fetchApi('/api/system/config', {
-                    method: 'PUT',
-                    body: JSON.stringify({ webhook_secret: webhookSecret }),
-                  });
-                  toast('success', 'Webhook secret saved');
-                } catch {
-                  toast('error', 'Failed to save webhook secret');
+                  await saveSecrets({ webhook_secret: webhookSecret }, 'Webhook secret saved');
+                  setWebhookSecret('');
+                } catch (err) {
+                  toast('error', describeApiError(err, 'Failed to save webhook secret'));
                 }
               }}
             >
@@ -639,38 +698,57 @@ export default function SettingsPage() {
       {/* Integration URLs */}
       <DataCard title="Integration URLs" description="Connect Discord and Slack for notifications">
         <div className="space-y-4">
-          <Input
-            label="Discord Webhook URL"
-            type="text"
-            value={discordWebhookUrl}
-            onChange={(e) => setDiscordWebhookUrl(e.target.value)}
-            hint="Discord channel webhook URL for trade notifications"
-          />
-          <Input
-            label="Slack Webhook URL"
-            type="text"
-            value={slackWebhookUrl}
-            onChange={(e) => setSlackWebhookUrl(e.target.value)}
-            hint="Slack incoming webhook URL for trade notifications"
-          />
+          {([
+            ['discord_webhook_url', 'Discord Webhook URL', discordWebhookUrl, setDiscordWebhookUrl, 'https://discord.com/api/webhooks/...'],
+            ['slack_webhook_url', 'Slack Webhook URL', slackWebhookUrl, setSlackWebhookUrl, 'https://hooks.slack.com/services/...'],
+          ] as const).map(([field, label, value, setValue, example]) => (
+            <div key={field} className="flex items-end gap-2">
+              <div className="flex-1">
+                <Input
+                  label={label}
+                  type="text"
+                  autoComplete="off"
+                  value={value}
+                  placeholder={secretsSet[field] ? SECRET_PLACEHOLDER : example}
+                  onChange={(e) => setValue(e.target.value)}
+                  hint={`${label.replace(' URL', '')} for trade notifications`}
+                />
+              </div>
+              {secretsSet[field] && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mb-6"
+                  onClick={async () => {
+                    try {
+                      await saveSecrets({ [field]: '' }, `${label} cleared`);
+                    } catch (err) {
+                      toast('error', describeApiError(err, `Failed to clear ${label}`));
+                    }
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
+            </div>
+          ))}
           <div className="flex justify-end">
             <Button
               variant="primary"
               size="sm"
               loading={savingIntegrations}
+              disabled={discordWebhookUrl === '' && slackWebhookUrl === ''}
               onClick={async () => {
+                const patch: Partial<Record<SecretField, string>> = {};
+                if (discordWebhookUrl !== '') patch.discord_webhook_url = discordWebhookUrl;
+                if (slackWebhookUrl !== '') patch.slack_webhook_url = slackWebhookUrl;
                 setSavingIntegrations(true);
                 try {
-                  await fetchApi('/api/system/config', {
-                    method: 'PUT',
-                    body: JSON.stringify({
-                      discord_webhook_url: discordWebhookUrl,
-                      slack_webhook_url: slackWebhookUrl,
-                    }),
-                  });
-                  toast('success', 'Integration URLs saved');
-                } catch {
-                  toast('error', 'Failed to save integration URLs');
+                  await saveSecrets(patch, 'Integration URLs saved');
+                  setDiscordWebhookUrl('');
+                  setSlackWebhookUrl('');
+                } catch (err) {
+                  toast('error', describeApiError(err, 'Failed to save integration URLs'));
                 }
                 setSavingIntegrations(false);
               }}
@@ -719,11 +797,7 @@ export default function SettingsPage() {
               />
               <Select
                 label="Trading Mode"
-                options={[
-                  { value: 'paper', label: 'Paper Trading' },
-                  { value: 'testnet', label: 'Testnet' },
-                  { value: 'live', label: 'Live Trading' },
-                ]}
+                options={[...TRADING_MODE_OPTIONS]}
                 value={tradingMode}
                 onChange={(e) => setTradingMode(e.target.value)}
                 hint="Paper trading mode is recommended for testing"

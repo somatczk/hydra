@@ -7,3 +7,5 @@ export { Table } from './Table';
 export { StatusBadge } from './StatusBadge';
 export { ToastProvider, useToast } from './Toast';
 export { ErrorCard } from './ErrorCard';
+export { DataStateBadge, DataStateErrorCard } from './DataStateBadge';
+export type { BadgeState } from './DataStateBadge';

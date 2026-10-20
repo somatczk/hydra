@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import random
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Request
+from ccxt.base.errors import BadSymbol, BaseError
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
+
+from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
 
 router = APIRouter(prefix="/api/market", tags=["market"])
 logger = logging.getLogger(__name__)
-
-
-def _pool_from_request(request: Request) -> Any:
-    return getattr(request.app.state, "db_pool", None)
 
 
 # ---------------------------------------------------------------------------
@@ -37,19 +37,14 @@ class CurrentFundingRate(BaseModel):
     next_funding_time: str | None = None
 
 
-class OrderBookLevel(BaseModel):
-    price: float
-    quantity: float
-
-
 class OrderBookSnapshot(BaseModel):
     symbol: str
     exchange: str
     bids: list[list[float]]  # [[price, qty], ...]
     asks: list[list[float]]  # [[price, qty], ...]
     spread: float
-    timestamp: str
-    mock: bool = False
+    timestamp: str | None  # exchange time; None when the exchange does not report one
+    fetched_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -65,32 +60,25 @@ async def get_funding_rates(
     days: int = 30,
 ) -> list[dict[str, Any]]:
     """Historical funding rates for a symbol (from ts.funding_rates)."""
-    pool = _pool_from_request(request)
-    if pool is None:
-        return []
-
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT timestamp, rate FROM ts.funding_rates "
-                "WHERE exchange = $1 AND symbol = $2 "
-                "AND timestamp >= now() - make_interval(days => $3) "
-                "ORDER BY timestamp",
-                exchange,
-                symbol,
-                days,
-            )
-        return [
-            {
-                "timestamp": row["timestamp"].isoformat(),
-                "rate": float(row["rate"]),
-                "annualized_rate": round(float(row["rate"]) * 3 * 365 * 100, 4),
-            }
-            for row in rows
-        ]
-    except Exception:
-        logger.exception("Failed to fetch funding rates")
-        return []
+    pool = require_pool(request)
+    async with db_errors_to_503("reading funding rates"), pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT timestamp, rate FROM ts.funding_rates "
+            "WHERE exchange = $1 AND symbol = $2 "
+            "AND timestamp >= now() - make_interval(days => $3) "
+            "ORDER BY timestamp",
+            exchange,
+            symbol,
+            days,
+        )
+    return [
+        {
+            "timestamp": row["timestamp"].isoformat(),
+            "rate": float(row["rate"]),
+            "annualized_rate": round(float(row["rate"]) * 3 * 365 * 100, 4),
+        }
+        for row in rows
+    ]
 
 
 @router.get("/funding-rates/current", response_model=list[CurrentFundingRate])
@@ -99,139 +87,152 @@ async def get_current_funding_rates(
     symbol: str = "BTCUSDT",
 ) -> list[dict[str, Any]]:
     """Latest funding rate for a symbol across all exchanges."""
-    pool = _pool_from_request(request)
-    if pool is None:
-        return []
+    pool = require_pool(request)
+    async with db_errors_to_503("reading current funding rates"), pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT ON (exchange) "
+            "exchange, symbol, rate, next_funding_time, timestamp "
+            "FROM ts.funding_rates "
+            "WHERE symbol = $1 "
+            "ORDER BY exchange, timestamp DESC",
+            symbol,
+        )
+    return [
+        {
+            "exchange": row["exchange"],
+            "symbol": row["symbol"],
+            "rate": float(row["rate"]),
+            "annualized_rate": round(float(row["rate"]) * 3 * 365 * 100, 4),
+            "next_funding_time": (
+                row["next_funding_time"].isoformat() if row["next_funding_time"] else None
+            ),
+        }
+        for row in rows
+    ]
 
+
+# ---------------------------------------------------------------------------
+# Order book: one cached public CCXT client per exchange, stored on app.state
+# ---------------------------------------------------------------------------
+
+_ALLOWED_EXCHANGES = frozenset({"binance"})
+
+
+def _default_exchange_factory(exchange_id: str) -> Any:
+    import ccxt.async_support as ccxt_async
+
+    return getattr(ccxt_async, exchange_id)({"enableRateLimit": True})
+
+
+_exchange_factory: Callable[[str], Any] = _default_exchange_factory
+
+
+def _client_state(app: FastAPI) -> tuple[dict[str, Any], asyncio.Lock]:
+    clients: dict[str, Any] | None = getattr(app.state, "market_data_clients", None)
+    if clients is None:
+        clients = {}
+        app.state.market_data_clients = clients
+    lock: asyncio.Lock | None = getattr(app.state, "market_data_clients_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app.state.market_data_clients_lock = lock
+    return clients, lock
+
+
+async def _get_market_client(app: FastAPI, exchange_id: str) -> Any:
+    clients, lock = _client_state(app)
+    async with lock:
+        client = clients.get(exchange_id)
+        if client is None:
+            client = _exchange_factory(exchange_id)
+            clients[exchange_id] = client
+        return client
+
+
+async def _evict_market_client(app: FastAPI, exchange_id: str, client: Any) -> None:
+    """Drop and close the client that failed; a newer cached replacement is left alone."""
+    clients, lock = _client_state(app)
+    async with lock:
+        if clients.get(exchange_id) is client:
+            clients.pop(exchange_id)
     try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT DISTINCT ON (exchange) "
-                "exchange, symbol, rate, next_funding_time, timestamp "
-                "FROM ts.funding_rates "
-                "WHERE symbol = $1 "
-                "ORDER BY exchange, timestamp DESC",
-                symbol,
-            )
-        return [
-            {
-                "exchange": row["exchange"],
-                "symbol": row["symbol"],
-                "rate": float(row["rate"]),
-                "annualized_rate": round(float(row["rate"]) * 3 * 365 * 100, 4),
-                "next_funding_time": (
-                    row["next_funding_time"].isoformat() if row["next_funding_time"] else None
-                ),
-            }
-            for row in rows
-        ]
+        await client.close()
     except Exception:
-        logger.exception("Failed to fetch current funding rates")
-        return []
+        logger.debug("Failed to close market data client for %s", exchange_id, exc_info=True)
 
 
-# ---------------------------------------------------------------------------
-# Order book helpers + REST snapshot endpoint
-# ---------------------------------------------------------------------------
-
-_MOCK_MID_PRICES: dict[str, float] = {
-    "BTCUSDT": 65000.0,
-    "ETHUSDT": 3500.0,
-    "SOLUSDT": 150.0,
-}
-_MOCK_TICK_SIZES: dict[str, float] = {
-    "BTCUSDT": 0.1,
-    "ETHUSDT": 0.01,
-    "SOLUSDT": 0.001,
-}
-
-
-def _build_mock_order_book(symbol: str, depth: int = 20) -> dict[str, Any]:
-    """Generate a plausible mock order book when no live feed is available."""
-    mid = _MOCK_MID_PRICES.get(symbol, 1000.0)
-    tick = _MOCK_TICK_SIZES.get(symbol, 0.01)
-
-    bids: list[list[float]] = []
-    asks: list[list[float]] = []
-
-    for i in range(depth):
-        bid_price = round(mid - tick * (i + 1), 8)
-        ask_price = round(mid + tick * (i + 1), 8)
-        bid_qty = round(random.uniform(0.01, 2.0), 4)  # noqa: S311  # nosec B311
-        ask_qty = round(random.uniform(0.01, 2.0), 4)  # noqa: S311  # nosec B311
-        bids.append([bid_price, bid_qty])
-        asks.append([ask_price, ask_qty])
-
-    best_bid = bids[0][0] if bids else 0.0
-    best_ask = asks[0][0] if asks else 0.0
-    spread = round(best_ask - best_bid, 8)
-
-    return {
-        "symbol": symbol,
-        "exchange": "mock",
-        "bids": bids,
-        "asks": asks,
-        "spread": spread,
-        "timestamp": datetime.now(UTC).isoformat(),
-        "mock": True,
-    }
-
-
-async def _fetch_live_order_book(
-    symbol: str, exchange: str, depth: int = 20
-) -> dict[str, Any] | None:
-    """Attempt to fetch a live order book snapshot via CCXT.
-
-    Returns ``None`` if CCXT is unavailable or the call fails.
-    """
-    try:
-        import ccxt.async_support as ccxt
-
-        exchange_cls = getattr(ccxt, exchange, None)
-        if exchange_cls is None:
-            return None
-
-        ex = exchange_cls({"enableRateLimit": True})
+async def close_market_clients(app: FastAPI) -> None:
+    """Close every cached market data client (called on app shutdown)."""
+    clients: dict[str, Any] | None = getattr(app.state, "market_data_clients", None)
+    if not clients:
+        return
+    for exchange_id in list(clients):
+        client = clients.pop(exchange_id)
         try:
-            ob = await ex.fetch_order_book(symbol, limit=depth)
-            bids = [[float(p), float(q)] for p, q in ob.get("bids", [])[:depth]]
-            asks = [[float(p), float(q)] for p, q in ob.get("asks", [])[:depth]]
-            best_bid = bids[0][0] if bids else 0.0
-            best_ask = asks[0][0] if asks else 0.0
-            return {
-                "symbol": symbol,
-                "exchange": exchange,
-                "bids": bids,
-                "asks": asks,
-                "spread": round(best_ask - best_bid, 8),
-                "timestamp": datetime.now(UTC).isoformat(),
-                "mock": False,
-            }
-        finally:
-            await ex.close()
-    except Exception:
-        return None
+            await client.close()
+        except Exception:
+            logger.warning("Failed to close market data client for %s", exchange_id, exc_info=True)
+
+
+def _exchange_unavailable(exchange: str) -> HTTPException:
+    return api_error(
+        503,
+        "exchange_unavailable",
+        f"Order book from {exchange} is unavailable",
+        "unavailable",
+        exchange=exchange,
+    )
 
 
 @router.get("/orderbook", response_model=OrderBookSnapshot)
 async def get_order_book(
+    request: Request,
     symbol: str = "BTCUSDT",
-    exchange: str = "binance",
-    depth: int = 20,
+    exchange: str = Query("binance"),
+    depth: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
-    """Order book snapshot (top N bid/ask levels).
+    """Order book snapshot (top N bid/ask levels) from the exchange, never synthesised."""
+    if exchange not in _ALLOWED_EXCHANGES:
+        raise api_error(
+            422,
+            "exchange_not_allowed",
+            f"Order book is only available for: {', '.join(sorted(_ALLOWED_EXCHANGES))}",
+            "invalid",
+            allowed=sorted(_ALLOWED_EXCHANGES),
+        )
 
-    Tries a live CCXT fetch first; falls back to mock data with ``mock: true``
-    so the frontend always has something to render on initial load before the
-    WebSocket connects.
-    """
-    live = await _fetch_live_order_book(symbol, exchange, depth=depth)
-    if live is not None:
-        return live
-    logger.debug(
-        "Order book live feed unavailable for %s/%s — returning mock data", symbol, exchange
+    app = request.app
+    client = await _get_market_client(app, exchange)
+    try:
+        ob = await client.fetch_order_book(symbol, limit=depth)
+    except BadSymbol as exc:
+        raise api_error(
+            422, "unknown_symbol", f"Unknown symbol {symbol} on {exchange}", "invalid"
+        ) from exc
+    except (BaseError, OSError, TimeoutError) as exc:
+        logger.warning("Order book fetch failed for %s/%s", exchange, symbol, exc_info=True)
+        await _evict_market_client(app, exchange, client)
+        raise _exchange_unavailable(exchange) from exc
+
+    bids = [[float(p), float(q)] for p, q, *_ in ob.get("bids", [])[:depth]]
+    asks = [[float(p), float(q)] for p, q, *_ in ob.get("asks", [])[:depth]]
+    best_bid = bids[0][0] if bids else 0.0
+    best_ask = asks[0][0] if asks else 0.0
+    ts_ms = ob.get("timestamp")
+    exchange_ts = (
+        datetime.fromtimestamp(ts_ms / 1000, tz=UTC).isoformat()
+        if isinstance(ts_ms, int | float)
+        else None
     )
-    return _build_mock_order_book(symbol, depth=depth)
+    return {
+        "symbol": symbol,
+        "exchange": exchange,
+        "bids": bids,
+        "asks": asks,
+        "spread": round(best_ask - best_bid, 8),
+        "timestamp": exchange_ts,
+        "fetched_at": datetime.now(UTC).isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
