@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import structlog
+import uvicorn
 from uvicorn.config import LOGGING_CONFIG
 
 from hydra.core.logging import get_logger, setup_logging
@@ -122,6 +123,29 @@ def test_uvicorn_loggers_are_routed_to_root_as_json(capsys: pytest.CaptureFixtur
     for name in _UVICORN:
         assert logging.getLogger(name).handlers == []
         assert logging.getLogger(name).propagate is True
+
+
+async def _asgi_app(scope: Any, receive: Any, send: Any) -> None:
+    return None
+
+
+def test_uvicorn_startup_lines_stay_json_only_with_log_config_none(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_logging("INFO", "json")
+    uvicorn.Config(_asgi_app, log_config=None)
+    logging.getLogger("uvicorn.error").info("Started server process [%d]", 7)
+
+    captured = capsys.readouterr()
+    [started] = _json_lines(captured.out)
+    _assert_envelope(started, "info", "uvicorn.error")
+    assert started["event"] == "Started server process [7]"
+    assert captured.err == ""
+
+    uvicorn.Config(_asgi_app)
+    logging.getLogger("uvicorn.error").info("Started server process [%d]", 7)
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "INFO:     Started server process [7]\n")
 
 
 def test_colored_format_still_renders_the_traceback(capsys: pytest.CaptureFixture[str]) -> None:

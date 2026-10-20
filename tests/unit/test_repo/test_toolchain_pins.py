@@ -13,7 +13,9 @@ from packaging.specifiers import SpecifierSet
 _ROOT = Path(__file__).resolve().parents[3]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _PYTHON_DOCKERFILES = ["docker/engine/Dockerfile", "docker/backtest/Dockerfile"]
+_DASHBOARD_DOCKERFILE = "docker/dashboard/Dockerfile"
 _UV_DOCKERFILES = [*_PYTHON_DOCKERFILES, "docker/ml/Dockerfile"]
+_DIGEST = re.compile(r"[a-z0-9./-]+:[\w.-]+@sha256:[0-9a-f]{64}")
 _UV_IMAGE = re.compile(r"^COPY --from=ghcr\.io/astral-sh/uv:(\S+) /uv /uvx /bin/$", re.M)
 _UV_SYNC = re.compile(r"\buv sync\b[^\n]*")
 
@@ -53,8 +55,19 @@ def test_python_version_file_matches_the_runtime_images() -> None:
     pinned = (_ROOT / ".python-version").read_text().strip()
     assert pinned == "3.14"
     for rel in _PYTHON_DOCKERFILES:
-        bases = re.findall(r"^FROM python:(\d+\.\d+)-slim", (_ROOT / rel).read_text(), re.M)
+        bases = re.findall(r"^FROM python:(\d+\.\d+)-slim@", (_ROOT / rel).read_text(), re.M)
         assert bases == [pinned, pinned], rel
+
+
+def test_published_images_pin_one_base_digest_per_image() -> None:
+    bases: dict[str, set[str]] = {}
+    for rel in [*_PYTHON_DOCKERFILES, _DASHBOARD_DOCKERFILE]:
+        froms = re.findall(r"^FROM (\S+)", (_ROOT / rel).read_text(), re.M)
+        assert len(froms) == 2, rel
+        assert all(_DIGEST.fullmatch(ref) for ref in froms), froms
+        bases[rel] = set(froms)
+    assert all(len(refs) == 1 for refs in bases.values()), bases
+    assert bases[_PYTHON_DOCKERFILES[0]] == bases[_PYTHON_DOCKERFILES[1]]
 
 
 def test_python_floor_and_lint_targets_stay_3_12() -> None:
@@ -88,7 +101,7 @@ def test_every_job_running_uv_installs_it_with_setup_uv() -> None:
 
 
 def test_uv_is_never_installed_with_pip() -> None:
-    files = [*_UV_DOCKERFILES, "docker/dashboard/Dockerfile", "Makefile"]
+    files = [*_UV_DOCKERFILES, _DASHBOARD_DOCKERFILE, "Makefile"]
     files += [str(p.relative_to(_ROOT)) for p in (_ROOT / ".github" / "workflows").glob("*.yml")]
     offenders = [f for f in files if re.search(r"pip install[^\n]*\buv\b", (_ROOT / f).read_text())]
     assert offenders == []
@@ -110,8 +123,8 @@ def test_ci_services_use_the_dev_compose_images() -> None:
 
 
 def test_ci_node_matches_the_dashboard_image() -> None:
-    dockerfile = (_ROOT / "docker/dashboard/Dockerfile").read_text()
-    [base] = re.findall(r"^FROM node:(\d+)-alpine AS builder", dockerfile, re.M)
+    dockerfile = (_ROOT / _DASHBOARD_DOCKERFILE).read_text()
+    [base] = re.findall(r"^FROM node:(\d+)-alpine@\S+ AS builder$", dockerfile, re.M)
     node_versions = {
         str(step["with"]["node-version"])
         for job in _ci()["jobs"].values()

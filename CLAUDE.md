@@ -115,10 +115,13 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   mypy over eight packages, bandit, unit tests with a clean-tree check, dashboard (lint, typecheck, test, build),
   promtool check + test for `deploy/prometheus-rules.yml`, integration and e2e on TimescaleDB + Redis service
   containers with `HYDRA_REQUIRE_INFRA=1`, and `image-smoke`, which builds each image without pushing and starts it
-  (engine against the services with only `DATABASE_URL` and `REDIS_URL`).
-- `publish` (in `ci.yml`) needs every other job and runs only on pushes to `main`: it builds `hydra-engine`,
-  `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag only if it does not
-  exist yet. Version tags never move. `tests/unit/test_repo/test_ci_gating.py` enforces the gating.
+  (engine against the services with only `DATABASE_URL` and `REDIS_URL`; every engine and backtest log line must be
+  JSON). PR runs read the image build cache but do not write it.
+- `publish` (in `ci.yml`) needs every other job and runs only on pushes to `main` and manual dispatch on `main`: it
+  builds `hydra-engine`, `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag
+  only if it does not exist yet. Version tags never move. A push that changes no image input (`IMAGE_INPUTS`) skips
+  it; dispatch always publishes. Published base images are pinned by digest (Dependabot bumps them).
+  `tests/unit/test_repo/test_ci_gating.py` enforces the gating.
 - `dependabot-auto-merge.yml`: Dependabot minor/patch PRs merge on green CI; majors, 0.x minors, pre-releases and base
   images wait for review.
 

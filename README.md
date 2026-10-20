@@ -53,10 +53,10 @@ Each PR that changes one of these rows updates the row.
 | Monitoring | Telegram alerts | **Partial.** Paging goes through romulus Alertmanager to Telegram. The in-app bot was deleted in P0-D. |
 | Engineering | mypy strict | **Partial → P1 ops.** CI runs `mypy --strict` over eight packages, and `pyproject.toml` relaxes strict mode for most packages through overrides. |
 | Engineering | import-linter module boundaries | **Working.** `make imports` (`uv run lint-imports`) prints `Contracts: 1 kept, 0 broken.`; it runs in `make check` and in the CI "Lint & Format" job. Layers: dashboard > portfolio, backtest > execution > risk, ml > strategy > data > indicators > core, ops. |
-| Engineering | CI runs unit / integration / e2e | **Working.** Integration and e2e run against TimescaleDB 2.30.2 and Redis 8 service containers with `HYDRA_REQUIRE_INFRA=1`, which turns any skipped integration or e2e test into a failure; there is no exit-code-5 escape (`tests/unit/test_repo/test_ci_gating.py::test_infra_tiers_run_on_service_containers_with_skips_as_failures`, `::test_require_infra_turns_tier_skips_into_failures`). |
-| Engineering | Images publish only after CI passes | **Working.** The publish jobs in `ci.yml` need every other job and run only on pushes to `main`; PRs build every image and start it in the "Image Smoke" job (`tests/unit/test_repo/test_ci_gating.py::test_publish_needs_every_other_job_and_runs_only_on_main_pushes`). |
+| Engineering | CI runs unit / integration / e2e | **Working.** Integration and e2e run against TimescaleDB 2.30.2 and Redis 8 service containers with `HYDRA_REQUIRE_INFRA=1`, which turns any skipped integration or e2e test, or a tier module skipped at collection, into a failure. Tests under `tests/integration` and `tests/e2e` take their tier marker from the directory, so `-m` cannot drop one; there is no exit-code-5 escape (`tests/unit/test_repo/test_ci_gating.py::test_infra_tiers_run_on_service_containers_with_skips_as_failures`, `::test_require_infra_turns_tier_skips_into_failures`, `::test_require_infra_fails_collection_time_and_unmarked_tier_skips`). |
+| Engineering | Images publish only after CI passes | **Working.** The publish jobs in `ci.yml` need every other job and run only on pushes to `main` and manual dispatch on `main`; a push that changes no image input publishes nothing. PRs build every image and start it in the "Image Smoke" job. Published base images are pinned by digest, so publish rebuilds on the base the smoke job ran (`tests/unit/test_repo/test_ci_gating.py::test_publish_needs_every_other_job_and_runs_only_on_main_pushes`, `::test_publish_skips_pushes_that_change_no_image_input`, `tests/unit/test_repo/test_toolchain_pins.py::test_published_images_pin_one_base_digest_per_image`). |
 | Engineering | Python and uv pinned in one place | **Working.** CI runs Python 3.14 from `.python-version` and uv 0.13.3 (`[tool.uv] required-version`, setup-uv, the `ghcr.io/astral-sh/uv` image in each Dockerfile); every `uv sync` is `--locked` (`tests/unit/test_repo/test_toolchain_pins.py`). |
-| Engineering | JSON logs carry level, logger, timestamp and tracebacks | **Working.** Stdlib, structlog and uvicorn records render as one JSON line each, with the traceback text (`tests/unit/test_core/test_logging.py`). |
+| Engineering | JSON logs carry level, logger, timestamp and tracebacks | **Working.** Stdlib, structlog and uvicorn records, uvicorn's startup lines included, render as one JSON line each, with the traceback text; the image smoke job requires every engine and backtest log line to be JSON (`tests/unit/test_core/test_logging.py`). |
 | Engineering | Every module has tests | **Known gap: unscheduled.** No tests for `backtest/vectorbt_research.py`, `data/ingestion.py` or `ops/notifications.py`. `backtest/hyperopt.py` has no unit tests of its own; it is covered through the route tests and `tests/integration/test_backtest_real_data.py::test_hyperopt_grid_runs_on_stored_bars_reproducibly`. |
 | Engineering | Dockerfile references in Makefile, compose files and CI publish job | **Working.** `tests/unit/test_repo/test_build_references.py`. |
 | Engineering | One version (pyproject) reported everywhere | **Partial.** The engine package, OpenAPI and `PlatformConfig` report the pyproject version (`tests/unit/test_repo/test_version_single_source.py`). The dashboard sidebar still shows `dashboard/package.json`'s version (1.2.0); fixing it needs a build arg in `docker/dashboard/Dockerfile` (Known gap: unscheduled). |
@@ -212,7 +212,7 @@ Other compose files:
 
 The shared fixtures live in `tests/infra.py` (`fresh_database`, `database_dsn`, `redis_url`). DB tests create and drop
 their own database. Tests skip when their env is unset and fail when it is set but the server is unreachable; with
-`HYDRA_REQUIRE_INFRA=1` (as in CI) a skipped integration or e2e test fails. For the current number of tests, run
+`HYDRA_REQUIRE_INFRA=1` (as in CI) a skipped integration or e2e test or module fails. For the current number of tests, run
 `uv run pytest --collect-only -q`.
 
 What CI runs (`.github/workflows/ci.yml`, Python 3.14, uv 0.13.3): lint and `lint-imports`, `mypy --strict` over core,
@@ -225,7 +225,9 @@ containers with only `DATABASE_URL` and `REDIS_URL`). Performance tests are not 
 
 - Every PR to `main` runs CI, including the image smoke build (nothing is pushed).
 - A push to `main` runs the same jobs; only when all of them pass do the publish jobs build `hydra-engine`,
-  `hydra-dashboard` and `hydra-backtest` and push `main` and `sha-<7>` tags to GHCR. The version tag from
+  `hydra-dashboard` and `hydra-backtest` and push `main` and `sha-<7>` tags to GHCR. A push that changes none of
+  `src`, `config`, `scripts`, `docker`, `dashboard`, `pyproject.toml`, `uv.lock` or `README.md` publishes nothing;
+  a manual dispatch on `main` always publishes. The version tag from
   `pyproject.toml` is pushed only if it does not exist yet, so version tags never move: releasing means bumping the
   version.
 - Releases happen at the end of a phase: `pyproject.toml` version, `uv lock`, and the romulus image tags move together.

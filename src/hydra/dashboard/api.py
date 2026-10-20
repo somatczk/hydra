@@ -573,6 +573,11 @@ async def _populate_backtest_cache() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import os
+
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    from hydra.core.logging import setup_logging
+
+    setup_logging(os.environ.get("LOG_LEVEL", "INFO"), os.environ.get("LOG_FORMAT", "json"))
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)
