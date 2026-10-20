@@ -2,7 +2,8 @@
 
 Wiring order (fixed): the session's closed-bar handler is subscribed before the engine, so the
 paper executor evaluates resting orders and marks to a bar before any strategy sees that bar;
-every fill is published before the strategy runs. Then signals, fills and feed status.
+every fill is published before the strategy runs. Then signals, fills, feed status and live
+prices (the executor's market-fill mark only; risk marks and resting orders stay on closed bars).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from hydra.core.events import (
     FeedStatusEvent,
     OrderCancelEvent,
     OrderFillEvent,
+    PriceEvent,
 )
 from hydra.core.types import (
     OHLCV,
@@ -201,7 +203,7 @@ class SessionRuntime:
         self.context.set_portfolio_value(await self.executor.get_equity())
 
     async def wire(self) -> None:
-        """Subscribe in order: closed bars, engine, signals, fills, feed status."""
+        """Subscribe in order: closed bars, engine, signals, fills, feed status, live prices."""
         await self.bus.subscribe("bar", self._on_bar)
         await self.engine.start()
         await self.bus.subscribe("entry_signal", self._on_signal)
@@ -209,6 +211,7 @@ class SessionRuntime:
         await self.bus.subscribe("order_fill", self._on_fill)
         await self.bus.subscribe("order_cancel", self._on_cancel)
         await self.bus.subscribe("feed_status", self._on_feed_status)
+        await self.bus.subscribe("price", self._on_price)
 
     async def prime(self, warm: WarmBars) -> None:
         """Treat each symbol's newest warm-up bar as the first closed bar: marks, resting orders."""
@@ -280,6 +283,18 @@ class SessionRuntime:
         halted = self.executor.get_account_snapshot().halted
         if halted is not None and not self.closing:
             await self._fail(f"paper ledger halted: {halted}")
+
+    async def _on_price(self, event: Event) -> None:
+        if (
+            not isinstance(event, PriceEvent)
+            or event.exchange_id != self.exchange_id
+            or str(event.symbol) not in self.cfg.symbols
+        ):
+            return
+        try:
+            self.executor.set_mark(str(event.symbol), event.price)
+        except Exception:
+            logger.exception("Live mark rejected for %s", event.symbol)
 
     async def _on_signal(self, event: Event) -> None:
         try:
