@@ -7,6 +7,7 @@ substitution.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -19,6 +20,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # ---------------------------------------------------------------------------
 # Default config directory — can be overridden via HYDRA_CONFIG_DIR
 # ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 
@@ -135,13 +138,6 @@ class ApiConfig(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
 
-class TelegramConfig(BaseModel):
-    """Telegram bot settings."""
-
-    bot_token: str = ""
-    chat_id: str = ""
-
-
 class MlConfig(BaseModel):
     """Machine learning settings."""
 
@@ -179,7 +175,6 @@ class HydraConfig(BaseSettings):
     trading: TradingConfig = Field(default_factory=TradingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
-    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     ml: MlConfig = Field(default_factory=MlConfig)
 
 
@@ -212,4 +207,10 @@ def load_config(
         overlay = _load_yaml(config_path / f"{env}.yaml")
         data = _deep_merge(data, overlay)
 
+    # Legacy shim: only the retired top-level telegram key is tolerated.
+    if "telegram" in data:
+        del data["telegram"]
+        logger.warning(
+            "Config key 'telegram' is retired and ignored; remove it from %s", config_path
+        )
     return HydraConfig(**data)

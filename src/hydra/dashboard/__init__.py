@@ -1,1 +1,1 @@
-"""M10: FastAPI backend, WebSocket, Telegram bot."""
+"""M10: FastAPI backend and WebSocket."""

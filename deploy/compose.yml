@@ -19,8 +19,6 @@ services:
       HYDRA_REDIS_URL: redis://redis:6379
       HYDRA_LOG_LEVEL: ${HYDRA_LOG_LEVEL:-INFO}
       HYDRA_LOG_FORMAT: json
-      HYDRA_TELEGRAM_BOT_TOKEN: ${HYDRA_TELEGRAM_BOT_TOKEN:-}
-      HYDRA_TELEGRAM_CHAT_ID: ${HYDRA_TELEGRAM_CHAT_ID:-}
     volumes:
       - ml-models:/app/models:ro
     depends_on:

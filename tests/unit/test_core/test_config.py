@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
+from pydantic import ValidationError
 
 from hydra.core.config import (
+    _DEFAULT_CONFIG_DIR,
     HydraConfig,
     _deep_merge,
     _substitute_env_vars,
@@ -233,7 +237,6 @@ class TestNestedConfigs:
         assert cfg.trading is not None
         assert cfg.logging is not None
         assert cfg.api is not None
-        assert cfg.telegram is not None
         assert cfg.ml is not None
 
     def test_real_base_config_loads(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,3 +250,74 @@ class TestNestedConfigs:
         cfg = load_config(env="base")
         assert cfg.trading.testnet is True
         assert cfg.trading.default_symbols == ["BTCUSDT"]
+
+
+# ---------------------------------------------------------------------------
+# Retired telegram section (legacy-key shim)
+# ---------------------------------------------------------------------------
+
+
+def _config_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records if r.name == "hydra.core.config" and r.levelno == logging.WARNING
+    ]
+
+
+class TestRetiredTelegramKey:
+    def test_model_has_no_telegram_field(self) -> None:
+        assert "telegram" not in HydraConfig.model_fields
+
+    def test_real_base_config_has_no_telegram_section(self) -> None:
+        raw = yaml.safe_load((_DEFAULT_CONFIG_DIR / "base.yaml").read_text())
+        assert "telegram" not in raw
+
+    def test_legacy_telegram_key_is_dropped_with_one_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        (tmp_path / "base.yaml").write_text(
+            textwrap.dedent("""\
+            telegram:
+              bot_token: x
+              chat_id: y
+            trading:
+              testnet: false
+        """)
+        )
+        with caplog.at_level(logging.WARNING, logger="hydra.core.config"):
+            cfg = load_config(env="base", config_dir=tmp_path)
+        assert not hasattr(cfg, "telegram")
+        assert cfg.trading.testnet is False
+        warnings = _config_warnings(caplog)
+        assert len(warnings) == 1
+        assert "telegram" in warnings[0].getMessage()
+
+    def test_legacy_telegram_key_in_env_overlay_is_dropped(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        (tmp_path / "base.yaml").write_text("telegram:\n  bot_token: x\n")
+        (tmp_path / "live.yaml").write_text("telegram:\n  chat_id: y\n")
+        with caplog.at_level(logging.WARNING, logger="hydra.core.config"):
+            cfg = load_config(env="live", config_dir=tmp_path)
+        assert not hasattr(cfg, "telegram")
+        assert len(_config_warnings(caplog)) == 1
+
+    def test_empty_legacy_telegram_key_is_dropped(self, tmp_path: Path) -> None:
+        (tmp_path / "base.yaml").write_text("telegram:\n")
+        cfg = load_config(env="base", config_dir=tmp_path)
+        assert not hasattr(cfg, "telegram")
+
+    def test_no_warning_without_telegram_key(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        (tmp_path / "base.yaml").write_text("trading:\n  testnet: true\n")
+        with caplog.at_level(logging.WARNING, logger="hydra.core.config"):
+            load_config(env="base", config_dir=tmp_path)
+        assert _config_warnings(caplog) == []
+
+    @pytest.mark.parametrize("key", ["telegrm", "Telegram", "slack"])
+    def test_other_unknown_top_level_keys_still_fail(self, tmp_path: Path, key: str) -> None:
+        (tmp_path / "base.yaml").write_text(f"{key}:\n  bot_token: x\n")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config(env="base", config_dir=tmp_path)
+        errors = exc_info.value.errors()
+        assert any(e["loc"] == (key,) and e["type"] == "extra_forbidden" for e in errors)
