@@ -72,6 +72,29 @@ function baseRoutes(): Routes {
       circuit_breaker_restrictions: null,
       circuit_breakers_state: 'unavailable',
     },
+    '/api/trading/sessions': [],
+  };
+}
+
+const LATCHED_STATUS = {
+  kill_switch_active: true,
+  kill_switch_state: 'active',
+  running_sessions: 0,
+  circuit_breaker_restrictions: null,
+  circuit_breakers_state: 'unavailable',
+};
+
+function stoppedSession(id: string, positionsAtStop: number) {
+  return {
+    session_id: id,
+    strategy_id: 'manual',
+    trading_mode: 'paper',
+    status: 'stopped',
+    exchange_id: 'binance',
+    symbols: ['BTCUSDT'],
+    timeframe: '1h',
+    positions_at_stop: positionsAtStop,
+    flatten_incomplete: positionsAtStop > 0,
   };
 }
 
@@ -243,6 +266,56 @@ describe('RiskPage kill switch release', () => {
   });
 });
 
+describe('RiskPage latched kill switch from server state', () => {
+  function latchedRoutes(sessions: unknown[]): Routes {
+    const routes = baseRoutes();
+    routes['/api/risk/config'] = { ...RISK_CONFIG, kill_switch_active: true };
+    routes['/api/risk/live-status'] = LATCHED_STATUS;
+    routes['/api/trading/sessions'] = sessions;
+    return routes;
+  }
+
+  function bannerText(container: HTMLElement): string {
+    return buttonByText(container, 'Release Kill Switch').closest('.rounded-xl')?.textContent ?? '';
+  }
+
+  it('shows LATCHED on load when a session could not be flattened', async () => {
+    fetchApi.mockImplementation(
+      routeFetch(latchedRoutes([stoppedSession('s1', 1), stoppedSession('s2', 0)]), calls),
+    );
+    page = await mount(<RiskPage />);
+
+    const text = bannerText(page.container);
+    expect(text).toContain('LATCHED — 1 position could not be flattened');
+    expect(text).toContain('Those positions are still open: check the sessions.');
+  });
+
+  it('sums the remainder across sessions', async () => {
+    fetchApi.mockImplementation(
+      routeFetch(latchedRoutes([stoppedSession('s1', 1), stoppedSession('s2', 2)]), calls),
+    );
+    page = await mount(<RiskPage />);
+
+    expect(bannerText(page.container)).toContain('LATCHED — 3 positions could not be flattened');
+  });
+
+  it('shows a plain active switch when every session is flat', async () => {
+    fetchApi.mockImplementation(routeFetch(latchedRoutes([stoppedSession('s1', 0)]), calls));
+    page = await mount(<RiskPage />);
+
+    const text = bannerText(page.container);
+    expect(text).toContain('Kill Switch Active');
+    expect(text).not.toContain('LATCHED');
+  });
+
+  it('does not read sessions while the switch is released', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
+    page = await mount(<RiskPage />);
+
+    expect(calls.some((c) => c.path === '/api/trading/sessions')).toBe(false);
+  });
+});
+
 describe('RiskPage kill switch activation', () => {
   const ACTIVATED = {
     active: true,
@@ -322,6 +395,31 @@ describe('RiskPage kill switch activation', () => {
     expect(text).toContain('Not persisted — the latch is in memory only and is lost on restart.');
     expect(page.container.textContent).not.toContain('System Normal');
     expect(toast).toHaveBeenCalledWith('error', detail.message);
+  });
+
+  it('drops LATCHED once the server shows those positions closed', async () => {
+    vi.useFakeTimers();
+    const routes = baseRoutes();
+    let status: unknown = routes['/api/risk/live-status'];
+    routes['/api/risk/live-status'] = () => status;
+    routes['/api/trading/sessions'] = [stoppedSession('s1', 0), stoppedSession('s2', 0)];
+    fetchApi.mockImplementation(withActivation(routes, () => ACTIVATED));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    page = await mount(<RiskPage />);
+    await click(buttonByText(page.container, 'Kill Switch'));
+    confirm.mockRestore();
+    expect(banner(page.container)).toContain('LATCHED — 2 positions could not be flattened');
+
+    status = LATCHED_STATUS;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    const text = banner(page.container);
+    expect(text).toContain('Kill Switch Active');
+    expect(text).not.toContain('LATCHED');
+    expect(text).not.toContain('still open');
+    expect(text).not.toContain('s1 BTCUSDT: no market price');
   });
 
   it('keeps the switch inactive on any other failure', async () => {

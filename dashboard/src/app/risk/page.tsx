@@ -143,6 +143,19 @@ function remainderFrom(body: Record<string, unknown>, persisted: boolean): KillS
   return { positionsRemaining, flattenFailures: failures, persisted };
 }
 
+interface SessionRemainder {
+  positions_at_stop: number;
+  flatten_incomplete: boolean;
+}
+
+/** Positions the sessions still hold after a flatten that did not finish (server state). */
+function remainingFromSessions(sessions: SessionRemainder[]): number {
+  return sessions.reduce(
+    (sum, s) => sum + (s.flatten_incomplete ? Math.max(0, Number(s.positions_at_stop) || 0) : 0),
+    0,
+  );
+}
+
 function latchedText(n: number): string {
   return `LATCHED — ${n} ${n === 1 ? 'position' : 'positions'} could not be flattened`;
 }
@@ -256,6 +269,8 @@ export default function RiskPage() {
   const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [killSwitchLoading, setKillSwitchLoading] = useState(false);
   const [killSwitchRemainder, setKillSwitchRemainder] = useState<KillSwitchRemainder | null>(null);
+  // null until the sessions list has been read while the switch is latched
+  const [serverRemaining, setServerRemaining] = useState<number | null>(null);
 
   // null until /api/system/config says which account the page reports on
   const sourceRef = useRef<string | null>(null);
@@ -332,7 +347,14 @@ export default function RiskPage() {
         .then((data) => {
           setLiveStatus(data);
           setKillSwitchActive(data.kill_switch_active);
-          if (data.kill_switch_active === false) setKillSwitchRemainder(null);
+          if (data.kill_switch_active === false) {
+            setKillSwitchRemainder(null);
+            setServerRemaining(null);
+          } else if (data.kill_switch_active === true) {
+            fetchApi<SessionRemainder[]>('/api/trading/sessions')
+              .then((sessions) => setServerRemaining(remainingFromSessions(sessions)))
+              .catch((err) => logger.warn('Risk', 'Failed to fetch sessions for the kill switch remainder', err));
+          }
         })
         .catch((err) => {
           logger.warn('Risk', 'Failed to fetch live status', err);
@@ -403,6 +425,7 @@ export default function RiskPage() {
         });
         setKillSwitchActive(false);
         setKillSwitchRemainder(null);
+        setServerRemaining(null);
         toast('success', 'Kill switch deactivated');
         logger.warn('Risk', 'Kill switch deactivated');
       } else {
@@ -410,6 +433,7 @@ export default function RiskPage() {
         const remainder = remainderFrom({ ...res }, true);
         setKillSwitchActive(true);
         setKillSwitchRemainder(remainder);
+        setServerRemaining(null);
         if (remainder) {
           toast('error', `Kill switch ${latchedText(remainder.positionsRemaining)}`);
         } else {
@@ -422,6 +446,7 @@ export default function RiskPage() {
       if (killSwitchActive !== true && detail?.code === 'kill_switch_not_persisted') {
         setKillSwitchActive(true);
         setKillSwitchRemainder(remainderFrom(detail, false));
+        setServerRemaining(null);
         toast('error', detail.message || 'Kill switch latched but not persisted');
         logger.error('Risk', 'Kill switch latched but not persisted', err);
       } else {
@@ -432,6 +457,9 @@ export default function RiskPage() {
       setKillSwitchLoading(false);
     }
   };
+
+  const positionsOpen = serverRemaining ?? killSwitchRemainder?.positionsRemaining ?? 0;
+  const activationFailures = positionsOpen > 0 ? killSwitchRemainder?.flattenFailures ?? [] : [];
 
   return (
     <div className="flex flex-col gap-6">
@@ -468,15 +496,16 @@ export default function RiskPage() {
             <OctagonX className="h-6 w-6 text-status-error" />
             <div>
               <p className="text-sm font-semibold text-status-error">
-                {killSwitchRemainder && killSwitchRemainder.positionsRemaining > 0
-                  ? latchedText(killSwitchRemainder.positionsRemaining)
-                  : 'Kill Switch Active'}
+                {positionsOpen > 0 ? latchedText(positionsOpen) : 'Kill Switch Active'}
               </p>
               <p className="text-xs text-text-muted">All trading is halted. No new sessions can start.</p>
-              {killSwitchRemainder && killSwitchRemainder.positionsRemaining > 0 && (
+              {positionsOpen > 0 && (
                 <p className="text-xs text-status-error">Those positions are still open: check the sessions.</p>
               )}
-              {killSwitchRemainder?.flattenFailures.map((f, i) => (
+              {activationFailures.length > 0 && (
+                <p className="text-xs text-text-muted">At activation:</p>
+              )}
+              {activationFailures.map((f, i) => (
                 <p key={`${i}:${f}`} className="text-xs text-text-muted">{f}</p>
               ))}
               {killSwitchRemainder && !killSwitchRemainder.persisted && (
