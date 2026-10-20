@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -84,7 +85,8 @@ async def test_schema_has_paper_objects_and_upgrade_is_idempotent(
                 "WHERE table_name IN ('trades', 'balance_snapshots')"
             )
         }
-    assert {"order_id", "fill_seq", "net_pnl", "liquidity", "reason", "session_id"} <= cols
+    assert {"order_id", "order_type", "fill_seq", "net_pnl", "liquidity", "reason"} <= cols
+    assert "session_id" in cols
 
 
 async def test_restore_reproduces_state_and_the_next_bar(pool: asyncpg.Pool) -> None:
@@ -97,6 +99,8 @@ async def test_restore_reproduces_state_and_the_next_bar(pool: asyncpg.Pool) -> 
     assert b.get_account_snapshot() == a.get_account_snapshot()
     assert await b.fetch_open_orders() == await a.fetch_open_orders()
     assert b._state_version == a._state_version
+    assert await b.get_filled_orders() == await a.get_filled_orders()
+    assert [f.fill_seq for f in b.get_fills()] == [1, 2]
 
     shadow = PaperTradingExecutor.from_state(a.to_state())
     nxt = bar(4, "104", "105", "85", "88")
@@ -144,6 +148,7 @@ async def test_trade_rows_are_unique_per_fill_seq(pool: asyncpg.Pool) -> None:
         gross_pnl=D("0"),
         net_pnl=None,
         order_id=first.order_id,
+        order_type=first.order_type,
         fill_seq=first.fill_seq,
         liquidity=first.liquidity,
         reason=first.reason,
@@ -212,3 +217,46 @@ async def test_restore_rejects_corrupt_state(pool: asyncpg.Pool) -> None:
         )
     with pytest.raises(PaperStateCorruptError):
         await PaperTradingExecutor.restore(pool, SID)
+
+
+class _AckLostPool:
+    """The real pool, except that one COMMIT's acknowledgement is lost after it lands."""
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+        self.lose_next = False
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[asyncpg.Connection]:
+        async with self._pool.acquire() as conn:
+            yield conn
+        if self.lose_next:
+            self.lose_next = False
+            raise ConnectionResetError("connection lost after COMMIT")
+
+
+async def test_lost_commit_ack_is_adopted_on_the_real_jsonb_row(pool: asyncpg.Pool) -> None:
+    flaky = _AckLostPool(pool)
+    ex = PaperTradingExecutor(
+        initial_balances={"USDT": D("10000")}, db_pool=flaky, session_id=SID, strategy_id="rsi"
+    )
+    await ex.checkpoint()
+    await ex.on_closed_bar(BTC, bar(0, "100", "101", "99", "100"))
+    flaky.lose_next = True
+    await ex.create_order(BTC, "BUY", "MARKET", D("2"))
+    assert ex.get_account_snapshot().persist_dirty is True
+
+    await ex.on_closed_bar(BTC, bar(1, "100", "102", "99", "101"))
+    await ex.create_order(BTC, "SELL", "MARKET", D("1"))
+
+    snap = ex.get_account_snapshot()
+    assert (snap.persist_dirty, snap.halted) == (False, None)
+    async with pool.acquire() as conn:
+        version = await conn.fetchval(
+            "SELECT state_version FROM paper_accounts WHERE session_id = $1", SID
+        )
+        seqs = await conn.fetch(
+            "SELECT fill_seq FROM trades WHERE session_id = $1 ORDER BY fill_seq", SID
+        )
+    assert version == ex._state_version == 5
+    assert [r["fill_seq"] for r in seqs] == [1, 2]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import numpy as np
 import pytest
 
 from hydra.backtest.fills import CommissionConfig, FillSimulator, SlippageModel
@@ -70,10 +71,27 @@ class TestGapAndLimitRules:
 
 
 class TestStopLimit:
-    def test_triggered_and_marketable_fills_at_limit(self) -> None:
+    def test_triggered_and_marketable_fills_at_trigger_not_limit(self) -> None:
         out = fill_rules.stop_limit_fill("SELL", D("95"), D("94"), bar("100", "101", "93", "96"))
         assert out is not None
-        assert out.fill == FillPrice(D("94"), "taker")
+        assert out.fill == FillPrice(D("95"), "taker")
+
+    def test_marketable_stop_limit_never_fills_outside_the_bar(self) -> None:
+        sell = fill_rules.stop_limit_fill(
+            "SELL", D("95"), D("94"), bar("100", "100.5", "94.8", "96")
+        )
+        assert sell is not None
+        assert sell.fill == FillPrice(D("95"), "taker")
+        buy = fill_rules.stop_limit_fill(
+            "BUY", D("105"), D("106"), bar("100", "105.5", "99", "105")
+        )
+        assert buy is not None
+        assert buy.fill == FillPrice(D("105"), "taker")
+
+    def test_gap_inside_the_limit_fills_at_the_open(self) -> None:
+        out = fill_rules.stop_limit_fill("SELL", D("95"), D("94"), bar("94.5", "95", "93", "94"))
+        assert out is not None
+        assert out.fill == FillPrice(D("94.5"), "taker")
 
     def test_stop_limit_not_reached_converts_to_resting_limit(self) -> None:
         out = fill_rules.stop_limit_fill("SELL", D("95"), D("94"), bar("90", "92", "88", "91"))
@@ -148,6 +166,10 @@ def _oco_request(side: Side, tp: str, sl: str) -> OrderRequest:
 
 
 _PARITY_BARS = [
+    ("gap_below_stop_bearish", bar("85", "112", "80", "84"), Side.SELL, "110", "90"),
+    ("gap_above_tp_bullish", bar("120", "130", "80", "125"), Side.SELL, "110", "90"),
+    ("buy_gap_above_stop_bullish", bar("115", "120", "80", "118"), Side.BUY, "90", "110"),
+    ("buy_gap_below_tp_bearish", bar("85", "120", "80", "84"), Side.BUY, "90", "110"),
     ("bullish_both", bar("100", "120", "80", "110"), Side.SELL, "110", "90"),
     ("bearish_both", bar("100", "120", "80", "95"), Side.SELL, "110", "90"),
     ("flat_both", bar("100", "120", "80", "100"), Side.SELL, "110", "90"),
@@ -173,7 +195,8 @@ class TestOcoParityWithBacktest:
         outcome = fill_rules.oco_fill(side.value, D(sl), D(tp), b, D("0"))
         assert outcome is not None
         assert outcome[0] is bt_stop_won
-        assert outcome[1].price == bt.price
+        if not name.startswith(("gap", "buy_gap")):
+            assert outcome[1].price == bt.price
 
     def test_oco_both_legs_hit_bullish_bar_stop_wins(self) -> None:
         assert fill_rules.oco_stop_first("SELL", D("90"), D("110"), bar("100", "120", "80", "110"))
@@ -194,3 +217,38 @@ class TestOcoParityWithBacktest:
             fill_rules.oco_fill("SELL", D("90"), D("110"), bar("100", "105", "95", "101"), D("0"))
             is None
         )
+
+
+def test_every_fill_rule_fills_inside_the_bar() -> None:
+    gen = np.random.default_rng(7)
+
+    def num(lo: int, hi: int) -> Decimal:
+        return D(int(gen.integers(lo, hi + 1)))
+
+    zero = D("0")
+    checked = 0
+    for _ in range(3000):
+        o, c = num(80, 120), num(80, 120)
+        b = bar(str(o), str(max(o, c) + num(0, 10)), str(min(o, c) - num(0, 10)), str(c))
+        side = "BUY" if num(0, 1) else "SELL"
+        level, other = num(70, 130), num(70, 130)
+        prices: list[Decimal] = []
+        if (lf := fill_rules.limit_fill(side, level, b)) is not None:
+            prices.append(lf.price)
+        if (sm := fill_rules.stop_market_fill(side, level, b, zero)) is not None:
+            prices.append(sm.price)
+        sl = fill_rules.stop_limit_fill(side, level, other, b)
+        if sl is not None and sl.fill is not None:
+            prices.append(sl.fill.price)
+        stop, tp = (min(level, other), max(level, other))
+        if side == "BUY":
+            stop, tp = tp, stop
+        if stop != tp and (oco := fill_rules.oco_fill(side, stop, tp, b, zero)) is not None:
+            prices.append(oco[1].price)
+        trail = fill_rules.trailing_fill(side, num(80, 120), D("0.05"), b, zero)
+        if trail.fill is not None:
+            prices.append(trail.fill.price)
+        for price in prices:
+            assert b.low <= price <= b.high, (side, level, other, b)
+        checked += len(prices)
+    assert checked > 3000

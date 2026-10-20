@@ -11,9 +11,12 @@ import pytest
 from hydra.core.types import OHLCV, Direction, Position
 from hydra.execution.paper_trading import (
     InsufficientBalanceError,
+    LedgerInvariantError,
     OrderRejectedError,
+    PaperSessionHaltedError,
     PaperTradingExecutor,
 )
+from hydra.execution.portfolio_state import build_portfolio_state
 
 D = Decimal
 SYM = "BTCUSDT"
@@ -48,7 +51,7 @@ async def test_sell_without_base_is_rejected_and_state_unchanged() -> None:
     with pytest.raises(InsufficientBalanceError, match="cannot sell short"):
         await ex.create_order(SYM, "SELL", "MARKET", D("1"))
 
-    assert await ex.get_balance() == {"USDT": D("100")}
+    assert await ex.fetch_balance() == {"USDT": D("100")}
     assert await ex.get_positions() == []
     assert await ex.get_equity() == D("100")
 
@@ -59,17 +62,17 @@ async def test_buy_more_than_quote_rejected() -> None:
 
     with pytest.raises(InsufficientBalanceError):
         await ex.create_order(SYM, "BUY", "MARKET", D("10"))
-    assert await ex.get_balance() == {"USDT": D("1000")}
+    assert await ex.fetch_balance() == {"USDT": D("1000")}
 
     await ex.create_order(SYM, "BUY", "MARKET", D("9.98"))
-    assert await ex.get_balance() == {"USDT": D("1.002"), "BTC": D("9.98")}
+    assert await ex.fetch_balance() == {"USDT": D("1.002"), "BTC": D("9.98")}
 
 
 async def test_equity_is_cash_plus_marked_base_no_double_count() -> None:
     ex = executor("10000")
     await ex.on_closed_bar(SYM, flat_bar(0, "100"))
     await ex.create_order(SYM, "BUY", "MARKET", D("1"))
-    assert (await ex.get_balance())["USDT"] == D("9899.9")
+    assert (await ex.fetch_balance())["USDT"] == D("9899.9")
 
     await ex.on_closed_bar(SYM, flat_bar(1, "150"))
 
@@ -99,7 +102,7 @@ async def test_round_trip_fees_in_net_pnl() -> None:
     fills = ex.get_fills()
     assert fills[1].gross_pnl == D("0")
     assert fills[1].net_pnl == D("-2.00")
-    assert await ex.get_balance() == {"USDT": D("998.00")}
+    assert await ex.fetch_balance() == {"USDT": D("998.00")}
     wallet = D("1000")
     sum_pnl = sum((f.gross_pnl or D(0) for f in fills), D(0))
     sum_fee = sum((f.fee for f in fills), D(0))
@@ -138,7 +141,7 @@ async def test_second_independent_sell_rejected_by_lock() -> None:
     oco = await ex.create_order(SYM, "SELL", "OCO", D("1"), price=D("110"), stop_price=D("90"))
     assert oco["status"] == "PENDING"
     assert ex.get_account_snapshot().open_orders == 2
-    assert await ex.get_balance() == {"USDT": D("899.900")}
+    assert await ex.fetch_balance() == {"USDT": D("899.900")}
 
 
 async def test_stop_locked_market_sell_needs_disarm_first() -> None:
@@ -153,7 +156,7 @@ async def test_stop_locked_market_sell_needs_disarm_first() -> None:
     await ex.cancel_order(stop["id"], SYM)
     sold = await ex.create_order(SYM, "SELL", "MARKET", D("1"))
     assert sold["status"] == "FILLED"
-    assert await ex.get_balance() == {"USDT": D("999.800")}
+    assert await ex.fetch_balance() == {"USDT": D("999.800")}
 
 
 async def test_buy_limit_locks_quote_until_cancelled() -> None:
@@ -179,7 +182,7 @@ async def test_gap_up_buy_stop_draws_shortfall_from_free_quote() -> None:
     (fill,) = await ex.on_closed_bar(SYM, bar(1, "130", "131", "129", "130"))
 
     assert fill.price == D("130")
-    assert await ex.get_balance() == {"USDT": D("869.870"), "BTC": D("1")}
+    assert await ex.fetch_balance() == {"USDT": D("869.870"), "BTC": D("1")}
 
 
 async def test_gap_up_buy_stop_without_enough_quote_is_cancelled() -> None:
@@ -187,10 +190,65 @@ async def test_gap_up_buy_stop_without_enough_quote_is_cancelled() -> None:
     await ex.on_closed_bar(SYM, flat_bar(0, "100"))
     await ex.create_order(SYM, "BUY", "STOP_MARKET", D("1"), stop_price=D("110"))
 
-    assert await ex.on_closed_bar(SYM, bar(1, "130", "131", "129", "130")) == []
+    (cancel,) = await ex.on_closed_bar(SYM, bar(1, "130", "131", "129", "130"))
 
+    assert (cancel.status, cancel.reason, cancel.side, cancel.price) == (
+        "CANCELLED",
+        "insufficient_balance_on_gap",
+        "BUY",
+        D("130"),
+    )
+    assert (cancel.fee, cancel.fill_seq, cancel.parent_order_id) == (D("0"), 0, None)
+    assert ex.get_fills() == []
     assert ex.get_account_snapshot().open_orders == 0
-    assert await ex.get_balance() == {"USDT": D("115")}
+    assert await ex.fetch_balance() == {"USDT": D("115")}
+
+
+async def test_gap_cancelled_buy_oco_reports_its_parent() -> None:
+    ex = executor("115", fee="0.001")
+    await ex.on_closed_bar(SYM, flat_bar(0, "100"))
+    oco = await ex.create_order(SYM, "BUY", "OCO", D("1"), price=D("90"), stop_price=D("110"))
+
+    (cancel,) = await ex.on_closed_bar(SYM, bar(1, "130", "131", "129", "130"))
+
+    assert cancel.status == "CANCELLED"
+    assert cancel.parent_order_id == oco["id"]
+    assert cancel.order_id == oco["stop_loss_order_id"]
+    assert await ex.fetch_open_orders() == []
+    assert ex.get_account_snapshot().quote_locked == 0
+
+
+async def test_get_balance_plus_position_value_equals_equity() -> None:
+    ex = executor("10000", fee="0")
+    doge = "DOGEUSDT"
+    await ex.on_closed_bar(doge, flat_bar(0, "0.5"))
+    await ex.create_order(doge, "BUY", "MARKET", D("10000"))
+    await ex.create_order(doge, "BUY", "LIMIT", D("1000"), price=D("0.4"))
+
+    assert await ex.get_balance() == {"USDT": D("5000.0")}
+    assert await ex.fetch_balance() == {"USDT": D("4600.0"), "DOGE": D("10000")}
+    state = await build_portfolio_state(ex, [doge], None)
+    assert state.portfolio_value == await ex.get_equity() == D("10000.0")
+
+
+async def test_broken_invariant_halts_entries_but_flatten_still_exits() -> None:
+    ex = executor("1000")
+    await ex.on_closed_bar(SYM, flat_bar(0, "100"))
+    await ex.create_order(SYM, "BUY", "MARKET", D("2"))
+    await ex.create_order(SYM, "BUY", "LIMIT", D("1"), price=D("90"))
+    ex._ledger.credit("ETH", D("1"))
+
+    with pytest.raises(LedgerInvariantError, match="without a lot"):
+        await ex.create_order(SYM, "BUY", "MARKET", D("1"))
+
+    halted = ex.get_account_snapshot().halted
+    assert halted is not None and "without a lot" in halted
+    with pytest.raises(PaperSessionHaltedError):
+        await ex.create_order(SYM, "SELL", "LIMIT", D("1"), price=D("120"))
+    assert await ex.on_closed_bar(SYM, bar(1, "100", "100", "80", "85")) == []
+    (exit_fill,) = await ex.flatten()
+    assert (exit_fill.side, exit_fill.quantity) == ("SELL", D("3"))
+    assert ex.get_account_snapshot().base_totals == {"BTC": D("0")}
 
 
 async def test_market_rules_reject_step_and_min_notional() -> None:
@@ -242,7 +300,7 @@ def _assert_ledger_sound(ex: PaperTradingExecutor, positions: list[Position]) ->
         assert pos.quantity > 0
     snap = ex.get_account_snapshot()
     identity = snap.initial_equity + snap.realized_gross - snap.fees_paid + snap.unrealized
-    assert abs(snap.equity - identity) <= D("1e-12")
+    assert abs(snap.equity - identity) <= D("1e-20")
     assert snap.quote_free >= 0
     assert snap.quote_locked >= 0
 
@@ -262,8 +320,25 @@ async def test_no_negative_balance_invariant_property() -> None:
     i = 1
     rejected = 0
     filled = 0
+    gapped = 0
+    cancelled = 0
     for _ in range(500):
-        action = pick(["buy", "sell", "limit", "stop", "oco", "trail", "cancel", "bar", "bar"])
+        action = pick(
+            [
+                "buy",
+                "sell",
+                "limit",
+                "stop",
+                "stop_limit",
+                "oco",
+                "buy_oco",
+                "trail",
+                "cancel",
+                "bar",
+                "bar",
+                "bar",
+            ]
+        )
         qty = D(randint(1, 400)) / D(100)
         try:
             if action == "buy":
@@ -278,9 +353,21 @@ async def test_no_negative_balance_invariant_property() -> None:
                 offset = D(randint(1, 8))
                 trigger = price + offset if side == "BUY" else price - offset
                 await ex.create_order(SYM, side, "STOP_MARKET", qty, stop_price=trigger)
+            elif action == "stop_limit":
+                side = pick(["BUY", "SELL"])
+                offset = D(randint(1, 8))
+                trigger = price + offset if side == "BUY" else price - offset
+                limit = trigger + D(randint(-3, 3))
+                await ex.create_order(
+                    SYM, side, "STOP_LIMIT", qty, price=max(D(1), limit), stop_price=trigger
+                )
             elif action == "oco":
                 await ex.create_order(
                     SYM, "SELL", "OCO", qty, price=price + D(5), stop_price=price - D(5)
+                )
+            elif action == "buy_oco":
+                await ex.create_order(
+                    SYM, "BUY", "OCO", qty, price=price - D(5), stop_price=price + D(5)
                 )
             elif action == "trail":
                 await ex.create_order(
@@ -295,11 +382,14 @@ async def test_no_negative_balance_invariant_property() -> None:
                 if orders:
                     await ex.cancel_order(orders[randint(0, len(orders) - 1)]["id"], SYM)
             else:
-                o = price
+                o = max(D(50), price + D(randint(-12, 12))) if randint(0, 3) == 0 else price
                 c = max(D(50), o + D(randint(-10, 10)))
                 h = max(o, c) + D(randint(0, 6))
                 low = max(D(1), min(o, c) - D(randint(0, 6)))
-                filled += len(await ex.on_closed_bar(SYM, bar(i, str(o), str(h), str(low), str(c))))
+                for f in await ex.on_closed_bar(SYM, bar(i, str(o), str(h), str(low), str(c))):
+                    gapped += f.price == o
+                    filled += f.status == "FILLED"
+                    cancelled += f.status == "CANCELLED"
                 price = c
                 i += 1
         except (InsufficientBalanceError, OrderRejectedError):
@@ -310,3 +400,5 @@ async def test_no_negative_balance_invariant_property() -> None:
     assert ex.get_account_snapshot().base_totals == {"BTC": D("0")}
     assert rejected > 0
     assert filled > 0
+    assert gapped > 0
+    assert ex.get_account_snapshot().halted is None

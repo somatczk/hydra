@@ -15,13 +15,14 @@ account after a restart.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Protocol, cast, get_args
+from typing import Any, Literal, Protocol, cast, get_args
 
 from hydra.core import metrics
 from hydra.core.types import OHLCV, Direction, ExchangeId, OrderType, Position, Symbol
@@ -62,6 +63,10 @@ class LedgerInvariantError(RuntimeError):
     """A balance, lock or lot broke a ledger invariant; the account must not keep trading."""
 
 
+class PaperSessionHaltedError(RuntimeError):
+    """The account is halted (broken invariant or a second writer); only ``flatten`` still runs."""
+
+
 class PaperStateUnavailableError(RuntimeError):
     """The session's paper state cannot be restored although the DB shows it traded."""
 
@@ -88,12 +93,17 @@ class SpotMarketRules(Protocol):
     def min_notional(self) -> Decimal | None: ...
 
 
+PaperFillStatus = Literal["FILLED", "CANCELLED"]
+
+
 @dataclass(frozen=True, slots=True)
 class PaperFill:
     """One executed paper fill, for the session layer to publish as an ``OrderFillEvent``.
 
     ``gross_pnl`` and ``net_pnl`` are None on opening (BUY) fills; ``net_pnl`` is net of this
     fill's fee and the pro-rata entry fee. ``parent_order_id`` is the OCO id for an OCO leg.
+    ``status="CANCELLED"`` reports a resting BUY dropped on a gap it could not pay for: nothing
+    traded, ``price`` is where it would have filled, ``fee`` is 0 and ``fill_seq`` is 0.
     """
 
     order_id: str
@@ -111,6 +121,7 @@ class PaperFill:
     reason: str
     timestamp: datetime
     fill_seq: int
+    status: PaperFillStatus = "FILLED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +144,7 @@ class PaperAccountSnapshot:
     open_orders: int
     last_bar_ts: dict[str, datetime]
     persist_dirty: bool
+    halted: str | None
 
 
 @dataclass(slots=True)
@@ -315,6 +327,8 @@ class PaperTradingExecutor:
         self._outbox: list[PaperFill] = []
         self._dirty = False
         self._state_version = 0
+        self._unconfirmed: set[str] = set()
+        self._halted: str | None = None
         self._persist_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -385,6 +399,7 @@ class PaperTradingExecutor:
 
         OCO: ``price`` is the take-profit limit, ``stop_price`` the stop-loss trigger.
         """
+        self._require_running()
         canon = self._symbol(symbol)
         s = side.upper()
         otype = order_type.upper()
@@ -588,7 +603,8 @@ class PaperTradingExecutor:
         """Evaluate this symbol's resting orders on one closed bar, then mark to its close.
 
         A bar at or before the last processed timestamp is ignored. Orders placed after the
-        previous bar are eligible; at most one leg of an OCO fills.
+        previous bar are eligible; at most one leg of an OCO fills. The result also carries
+        ``status="CANCELLED"`` records for BUYs dropped on a gap. While halted, only SELLs run.
         """
         canon = self._symbol(symbol)
         last = self._last_bar_ts.get(canon)
@@ -602,6 +618,8 @@ class PaperTradingExecutor:
             if order.oco_id is not None:
                 seen_oco.add(order.oco_id)
             if order.created_after_ts is not None and ohlcv.timestamp <= order.created_after_ts:
+                continue
+            if self._halted is not None and order.side == "BUY":
                 continue
             fill = self._evaluate(order, ohlcv)
             if fill is not None:
@@ -653,7 +671,7 @@ class PaperTradingExecutor:
         order.extreme = trail.extreme
         return None if trail.fill is None else self._fill_resting(order, trail.fill, bar.timestamp)
 
-    def _fill_resting(self, order: _PendingOrder, fp: FillPrice, ts: datetime) -> PaperFill | None:
+    def _fill_resting(self, order: _PendingOrder, fp: FillPrice, ts: datetime) -> PaperFill:
         self._remove_order(order)
         if order.side == "BUY":
             need = order.quantity * fp.price * (_ONE + self._fee_rate(fp.liquidity))
@@ -667,7 +685,24 @@ class PaperTradingExecutor:
                     self._quote,
                     self._ledger.get_free(self._quote),
                 )
-                return None
+                return PaperFill(
+                    order_id=order.order_id,
+                    parent_order_id=order.oco_id,
+                    symbol=self._name(order.symbol),
+                    side=order.side,
+                    order_type=order.order_type,
+                    quantity=order.quantity,
+                    price=fp.price,
+                    fee=_ZERO,
+                    fee_currency=self._quote,
+                    liquidity=fp.liquidity,
+                    gross_pnl=None,
+                    net_pnl=None,
+                    reason="insufficient_balance_on_gap",
+                    timestamp=ts,
+                    fill_seq=0,
+                    status="CANCELLED",
+                )
         parent = order.oco_id
         return self._apply_fill(
             order.symbol,
@@ -775,7 +810,16 @@ class PaperTradingExecutor:
         self._filled.append(fill)
         if self._db_pool is not None:
             self._outbox.append(fill)
-        self._check_invariants()
+        try:
+            self._check_invariants()
+        except LedgerInvariantError as exc:
+            if self._halted is not None:
+                logger.warning(
+                    "Paper session %s exit on a halted ledger: %s", self._session_id, exc
+                )
+            else:
+                self._halt(f"ledger invariant broken: {exc}")
+                raise
         self._update_peak()
         return fill
 
@@ -897,6 +941,7 @@ class PaperTradingExecutor:
             open_orders=len(self._pending),
             last_bar_ts=dict(self._last_bar_ts),
             persist_dirty=self._dirty,
+            halted=self._halted,
         )
 
     # ------------------------------------------------------------------
@@ -907,6 +952,18 @@ class PaperTradingExecutor:
         self._dirty = dirty
         if self._session_id:
             metrics.set_paper_persist_dirty(self._session_id, dirty)
+
+    def _halt(self, reason: str) -> None:
+        if self._halted is None:
+            logger.error("Paper session %s halted: %s", self._session_id, reason)
+            self._halted = reason
+
+    def _require_running(self) -> None:
+        if self._halted is not None:
+            raise PaperSessionHaltedError(
+                f"paper session {self._session_id} is halted ({self._halted}); "
+                "only flatten() still runs"
+            )
 
     async def _require_persisted(self) -> None:
         if not self._dirty:
@@ -929,6 +986,8 @@ class PaperTradingExecutor:
             await self._write(snapshot_at)
 
     async def _write(self, snapshot_at: datetime | None) -> None:
+        if self._halted is not None:
+            return
         version = self._state_version + 1
         account = paper_store.AccountRow(
             session_id=self._session_id,
@@ -948,6 +1007,7 @@ class PaperTradingExecutor:
                 gross_pnl=f.gross_pnl if f.gross_pnl is not None else _ZERO,
                 net_pnl=f.net_pnl,
                 order_id=f.parent_order_id or f.order_id,
+                order_type=f.order_type,
                 fill_seq=f.fill_seq,
                 liquidity=f.liquidity,
                 reason=f.reason,
@@ -984,19 +1044,54 @@ class PaperTradingExecutor:
         try:
             async with self._db_pool.acquire() as conn:
                 await paper_store.save(conn, account, trades, positions, flat, snapshot)
+        except paper_store.StaleStateError:
+            if await self._adopt_landed_write():
+                await self._write(snapshot_at)
+            return
         except Exception:
             logger.exception(
                 "Paper state for session %s not persisted; %d fills held in memory",
                 self._session_id,
                 len(self._outbox),
             )
+            self._unconfirmed.add(_state_digest(account.state))
             self._set_dirty(True)
             return
+        self._unconfirmed.clear()
         self._state_version = version
         written = {t.fill_seq for t in trades}
         self._outbox = [f for f in self._outbox if f.fill_seq not in written]
         if self._dirty and not self._outbox:
             self._set_dirty(False)
+
+    async def _adopt_landed_write(self) -> bool:
+        """After a refused write: adopt the stored version if it is one of our failed writes.
+
+        A commit whose acknowledgement was lost leaves that state in the DB at our next version;
+        any other stored state means a second executor writes this session, so we halt.
+        """
+        try:
+            async with self._db_pool.acquire() as conn:
+                stored = await paper_store.load(conn, self._session_id)
+        except Exception:
+            logger.exception("Paper state for session %s could not be re-read", self._session_id)
+            self._set_dirty(True)
+            return False
+        if (
+            stored is not None
+            and stored.state_version == self._state_version + 1
+            and _state_digest(stored.state) in self._unconfirmed
+        ):
+            self._state_version = stored.state_version
+            self._unconfirmed.clear()
+            return True
+        stored_version = None if stored is None else stored.state_version
+        self._set_dirty(True)
+        self._halt(
+            f"paper_accounts row is at version {stored_version}, written by another executor "
+            f"(ours is {self._state_version})"
+        )
+        return False
 
     def to_state(self) -> dict[str, Any]:
         """The full account as a JSON-ready dict (Decimals as strings)."""
@@ -1155,6 +1250,7 @@ class PaperTradingExecutor:
             async with db_pool.acquire() as conn:
                 stored = await paper_store.load(conn, session_id)
                 orphaned = stored is None and await paper_store.has_open_positions(conn, session_id)
+                trades = [] if stored is None else await paper_store.load_trades(conn, session_id)
         except Exception as exc:
             raise PaperStateUnavailableError(
                 f"paper state for session {session_id!r} could not be read: {exc}"
@@ -1175,7 +1271,29 @@ class PaperTradingExecutor:
             market_rules=market_rules,
         )
         ex._state_version = stored.state_version
+        ex._filled = [ex._restored_fill(t) for t in trades]
         return ex
+
+    def _restored_fill(self, t: paper_store.TradeRow) -> PaperFill:
+        if t.liquidity not in ("maker", "taker"):
+            raise PaperStateCorruptError(f"trade {t.fill_seq} has liquidity {t.liquidity!r}")
+        return PaperFill(
+            order_id=t.order_id,
+            parent_order_id=None,
+            symbol=t.symbol,
+            side=t.side,
+            order_type=t.order_type,
+            quantity=t.quantity,
+            price=t.price,
+            fee=t.fee,
+            fee_currency=self._quote,
+            liquidity=cast(Liquidity, t.liquidity),
+            gross_pnl=None if t.side == "BUY" else t.gross_pnl,
+            net_pnl=t.net_pnl,
+            reason=t.reason,
+            timestamp=t.timestamp,
+            fill_seq=t.fill_seq,
+        )
 
     # ------------------------------------------------------------------
     # Responses and queries
@@ -1214,12 +1332,16 @@ class PaperTradingExecutor:
             "filled": False,
         }
 
-    async def fetch_balance(self) -> dict[str, Decimal]:
-        """Free balance of the quote asset and of every base asset held."""
-        return await self.get_balance()
-
     async def get_balance(self) -> dict[str, Decimal]:
-        """Free balances (ExecutorState protocol); locked funds are excluded, like Binance."""
+        """Quote total, free plus locked (ExecutorState protocol).
+
+        Callers still add this to position value, which then equals ``get_equity()``; they move to
+        ``get_equity()`` / ``get_account_snapshot()`` in P1-C / P1-E.
+        """
+        return {self._quote: self._ledger.total(self._quote)}
+
+    async def fetch_balance(self) -> dict[str, Decimal]:
+        """Free balances of the quote and every base asset held (locked excluded, like ccxt)."""
         out = {self._quote: self._ledger.get_free(self._quote)}
         for asset, amount in sorted(self._ledger.free.items()):
             if asset != self._quote and amount > 0:
@@ -1291,6 +1413,10 @@ class PaperTradingExecutor:
             for o in sorted(self._pending, key=lambda o: o.seq)
             if wanted is None or o.symbol == wanted
         ]
+
+
+def _state_digest(state: dict[str, Any]) -> str:
+    return hashlib.sha256(paper_store.dumps_state(state).encode()).hexdigest()
 
 
 def _exchange_id(value: str) -> ExchangeId:

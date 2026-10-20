@@ -131,7 +131,7 @@ class TestRestingOrders:
         result = await ex.create_order(BTC, "BUY", "LIMIT", D("0.1"), price=D("40000"))
         assert (await ex.cancel_order(result["id"], BTC))["status"] == "CANCELLED"
         assert await ex.fetch_open_orders() == []
-        assert await ex.get_balance() == {"USDT": D("100000.0000")}
+        assert await ex.fetch_balance() == {"USDT": D("100000.0000")}
 
     async def test_cancel_unknown_order_raises(self) -> None:
         with pytest.raises(ValueError, match="not found"):
@@ -191,7 +191,7 @@ class TestClosedBarSemantics:
         oco = await ex.create_order(BTC, "SELL", "OCO", D("1"), price=D("110"), stop_price=D("90"))
         await ex.cancel_order(oco["take_profit_order_id"], BTC)
         assert await ex.fetch_open_orders() == []
-        assert (await ex.get_balance())["BTC"] == D("1")
+        assert (await ex.fetch_balance())["BTC"] == D("1")
 
         oco = await ex.create_order(BTC, "SELL", "OCO", D("1"), price=D("110"), stop_price=D("90"))
         await ex.cancel_order(oco["id"], BTC)
@@ -262,7 +262,7 @@ class TestClosedBarSemantics:
         assert await ex.on_closed_bar(BTC, bar(1, "100", "101", "80", "83")) == []
         (fill,) = await ex.on_closed_bar(BTC, bar(2, "82", "90", "81", "89"))
         assert fill.price == D("84.00")
-        assert await ex.get_balance() == {"USDT": D("916.00"), "BTC": D("1")}
+        assert await ex.fetch_balance() == {"USDT": D("916.00"), "BTC": D("1")}
 
 
 class TestFlatten:
@@ -322,7 +322,7 @@ class TestQueries:
             "unrealizedPnl": 0.0,
             "realizedPnl": 0.0,
         }
-        assert await ex.get_balance() == {"USDT": D("92800.0"), "BTC": D("0.1"), "ETH": D("1")}
+        assert await ex.fetch_balance() == {"USDT": D("92800.0"), "BTC": D("0.1"), "ETH": D("1")}
 
     async def test_filled_orders_history(self) -> None:
         ex = await holding("1", "100")

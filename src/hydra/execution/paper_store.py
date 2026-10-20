@@ -39,6 +39,7 @@ class TradeRow:
     gross_pnl: Decimal
     net_pnl: Decimal | None
     order_id: str
+    order_type: str
     fill_seq: int
     liquidity: str
     reason: str
@@ -88,8 +89,8 @@ _UPSERT_ACCOUNT = """
 _INSERT_TRADE = """
     INSERT INTO trades
         (symbol, side, price, quantity, fee, pnl, net_pnl, strategy_id, exchange_id,
-         timestamp, source, session_id, order_id, fill_seq, liquidity, reason)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'paper', $11, $12, $13, $14, $15)
+         timestamp, source, session_id, order_id, fill_seq, liquidity, reason, order_type)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'paper', $11, $12, $13, $14, $15, $16)
     ON CONFLICT (session_id, fill_seq) WHERE fill_seq IS NOT NULL DO NOTHING
 """
 
@@ -171,6 +172,7 @@ async def save(
                 t.fill_seq,
                 t.liquidity,
                 t.reason,
+                t.order_type,
             )
         for p in positions:
             await conn.execute(
@@ -228,3 +230,31 @@ async def has_open_positions(conn: Any, session_id: str) -> bool:
         session_id,
     )
     return bool(found)
+
+
+async def load_trades(conn: Any, session_id: str) -> list[TradeRow]:
+    """The session's paper trade rows in ``fill_seq`` order."""
+    rows = await conn.fetch(
+        "SELECT symbol, side, price, quantity, fee, pnl, net_pnl, order_id, order_type, fill_seq, "
+        "liquidity, reason, timestamp FROM trades "
+        "WHERE session_id = $1 AND fill_seq IS NOT NULL ORDER BY fill_seq",
+        session_id,
+    )
+    return [
+        TradeRow(
+            symbol=str(r["symbol"]),
+            side=str(r["side"]),
+            price=Decimal(r["price"]),
+            quantity=Decimal(r["quantity"]),
+            fee=Decimal(r["fee"]),
+            gross_pnl=Decimal(r["pnl"]),
+            net_pnl=None if r["net_pnl"] is None else Decimal(r["net_pnl"]),
+            order_id=str(r["order_id"]),
+            order_type=str(r["order_type"] or ""),
+            fill_seq=int(r["fill_seq"]),
+            liquidity=str(r["liquidity"]),
+            reason=str(r["reason"] or ""),
+            timestamp=r["timestamp"],
+        )
+        for r in rows
+    ]

@@ -14,6 +14,7 @@ import pytest
 from hydra.core.types import OHLCV
 from hydra.execution import paper_store
 from hydra.execution.paper_trading import (
+    PaperSessionHaltedError,
     PaperStateCorruptError,
     PaperTradingExecutor,
     PersistenceUnavailableError,
@@ -36,7 +37,10 @@ def bar(i: int, o: str, h: str, low: str, c: str) -> OHLCV:
 
 
 class RecordingConn:
-    """An asyncpg-shaped connection that records statements (the DB boundary only)."""
+    """An asyncpg-shaped connection over an in-memory table set (the DB boundary only).
+
+    It honours the ``state_version`` guard and ``ON CONFLICT (session_id, fill_seq)``.
+    """
 
     def __init__(self, store: RecordingPool) -> None:
         self._store = store
@@ -46,24 +50,82 @@ class RecordingConn:
         staged: list[tuple[str, tuple[Any, ...]]] = []
         self._store.staged = staged
         yield
-        self._store.committed.extend(staged)
+        store = self._store
+        for sql, args in staged:
+            if sql.startswith("INSERT INTO paper_accounts"):
+                store.accounts[args[0]] = args
+            if sql.startswith("INSERT INTO trades") and (args[10], args[12]) in store.trade_keys:
+                continue
+            if sql.startswith("INSERT INTO trades"):
+                store.trade_keys.add((args[10], args[12]))
+            store.committed.append((sql, args))
+        if store.ack_lost:
+            store.ack_lost -= 1
+            raise OSError("connection lost after COMMIT")
 
     async def execute(self, sql: str, *args: Any) -> str:
         if self._store.fail:
             raise OSError("connection refused")
-        self._store.staged.append((" ".join(sql.split()), args))
+        sql = " ".join(sql.split())
+        if sql.startswith("INSERT INTO paper_accounts"):
+            held = self._store.accounts.get(args[0])
+            if held is not None and held[5] >= args[5]:
+                return "INSERT 0 0"
+        self._store.staged.append((sql, args))
         return "INSERT 0 1"
+
+    async def fetchrow(self, sql: str, session_id: str) -> dict[str, Any] | None:
+        held = self._store.accounts.get(session_id)
+        if held is None:
+            return None
+        keys = ("session_id", "strategy_id", "exchange_id", "quote_asset", "state")
+        return {**dict(zip(keys, held[:5], strict=True)), "state_version": held[5]}
+
+    async def fetchval(self, sql: str, session_id: str) -> bool:
+        return False
+
+    async def fetch(self, sql: str, session_id: str) -> list[dict[str, Any]]:
+        names = [
+            "symbol",
+            "side",
+            "price",
+            "quantity",
+            "fee",
+            "pnl",
+            "net_pnl",
+            "strategy_id",
+            "exchange_id",
+            "timestamp",
+            "session_id",
+            "order_id",
+            "fill_seq",
+            "liquidity",
+            "reason",
+            "order_type",
+        ]
+        rows = [
+            dict(zip(names, args, strict=True))
+            for sql, args in self._store.committed
+            if sql.startswith("INSERT INTO trades") and args[10] == session_id
+        ]
+        return sorted(rows, key=lambda r: r["fill_seq"])
 
 
 class RecordingPool:
     def __init__(self) -> None:
         self.fail = False
+        self.ack_lost = 0
         self.committed: list[tuple[str, tuple[Any, ...]]] = []
         self.staged: list[tuple[str, tuple[Any, ...]]] = []
+        self.accounts: dict[str, tuple[Any, ...]] = {}
+        self.trade_keys: set[tuple[str, int]] = set()
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[RecordingConn]:
         yield RecordingConn(self)
+
+    def version(self, session_id: str) -> int:
+        return int(self.accounts[session_id][5])
 
     def trade_seqs(self) -> list[int]:
         return [args[12] for sql, args in self.committed if sql.startswith("INSERT INTO trades")]
@@ -183,19 +245,72 @@ async def test_exit_succeeds_while_persistence_dirty() -> None:
     assert ex._outbox == []
 
 
-async def test_stale_state_version_marks_dirty() -> None:
-    class StaleConn(RecordingConn):
-        async def execute(self, sql: str, *args: Any) -> str:
-            return "INSERT 0 0"
-
-    class StalePool(RecordingPool):
-        @asynccontextmanager
-        async def acquire(self) -> AsyncIterator[RecordingConn]:
-            yield StaleConn(self)
-
-    ex = PaperTradingExecutor(db_pool=StalePool(), session_id="s-stale")
+async def test_lost_commit_ack_is_adopted_and_persistence_resumes() -> None:
+    pool = RecordingPool()
+    ex = PaperTradingExecutor(
+        initial_balances={"USDT": D("1000")}, db_pool=pool, session_id="s-ack"
+    )
     await ex.on_closed_bar(BTC, bar(0, "100", "100", "100", "100"))
+    pool.ack_lost = 1
+    await ex.create_order(BTC, "BUY", "MARKET", D("1"))
     assert ex.get_account_snapshot().persist_dirty is True
+    assert (pool.version("s-ack"), ex._state_version) == (2, 1)
+
+    await ex.on_closed_bar(BTC, bar(1, "100", "101", "99", "100"))
+    await ex.create_order(BTC, "SELL", "MARKET", D("1"))
+
+    snap = ex.get_account_snapshot()
+    assert (snap.persist_dirty, snap.halted) == (False, None)
+    assert pool.version("s-ack") == ex._state_version == 4
+    assert pool.trade_seqs() == [1, 2]
+    assert ex._outbox == []
+    await ex.create_order(BTC, "BUY", "MARKET", D("1"))
+    assert pool.trade_seqs() == [1, 2, 3]
+
+
+async def test_second_writer_halts_the_executor() -> None:
+    pool = RecordingPool()
+    first = PaperTradingExecutor(
+        initial_balances={"USDT": D("1000")}, db_pool=pool, session_id="s-two"
+    )
+    await first.on_closed_bar(BTC, bar(0, "100", "100", "100", "100"))
+    await first.create_order(BTC, "BUY", "MARKET", D("1"))
+    stored = pool.accounts["s-two"]
+
+    fresh = PaperTradingExecutor(
+        initial_balances={"USDT": D("1000")}, db_pool=pool, session_id="s-two"
+    )
+    await fresh.on_closed_bar(BTC, bar(1, "100", "100", "100", "100"))
+
+    halted = fresh.get_account_snapshot().halted
+    assert halted is not None and "another executor" in halted
+    with pytest.raises(PaperSessionHaltedError):
+        await fresh.create_order(BTC, "BUY", "MARKET", D("1"))
+    with pytest.raises(PaperSessionHaltedError):
+        await fresh.create_order(BTC, "SELL", "MARKET", D("1"))
+    await fresh.on_closed_bar(BTC, bar(2, "100", "100", "100", "100"))
+    assert pool.accounts["s-two"] == stored
+    assert pool.trade_seqs() == [1]
+
+
+async def test_restore_rebuilds_the_fill_history() -> None:
+    pool = RecordingPool()
+    a = PaperTradingExecutor(
+        initial_balances={"USDT": D("1000")}, db_pool=pool, session_id="s-hist"
+    )
+    await a.on_closed_bar(BTC, bar(0, "100", "100", "100", "100"))
+    await a.create_order(BTC, "BUY", "MARKET", D("1"))
+    await a.create_order(BTC, "SELL", "LIMIT", D("1"), price=D("110"))
+    await a.on_closed_bar(BTC, bar(1, "100", "112", "99", "111"))
+
+    b = await PaperTradingExecutor.restore(pool, "s-hist")
+
+    assert b is not None
+    assert await b.get_filled_orders() == await a.get_filled_orders()
+    assert [(f.fill_seq, f.order_type, f.gross_pnl, f.net_pnl) for f in b.get_fills()] == [
+        (1, "MARKET", None, None),
+        (2, "LIMIT", D("9.900"), D("9.6899")),
+    ]
 
 
 async def test_concurrent_persists_never_drop_a_fill() -> None:

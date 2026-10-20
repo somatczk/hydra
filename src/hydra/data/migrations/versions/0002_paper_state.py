@@ -34,7 +34,8 @@ _STATEMENTS: tuple[str, ...] = (
         ADD COLUMN IF NOT EXISTS fill_seq BIGINT,
         ADD COLUMN IF NOT EXISTS net_pnl NUMERIC(24,8),
         ADD COLUMN IF NOT EXISTS liquidity TEXT,
-        ADD COLUMN IF NOT EXISTS reason TEXT
+        ADD COLUMN IF NOT EXISTS reason TEXT,
+        ADD COLUMN IF NOT EXISTS order_type TEXT
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_session_fill_seq"
     " ON trades(session_id, fill_seq) WHERE fill_seq IS NOT NULL",

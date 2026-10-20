@@ -4,10 +4,9 @@ Pure functions, Decimal only, no I/O. The paper executor uses them; the backtest
 them (``hydra.backtest`` sits above ``hydra.execution`` in the import layers).
 
 Price path inside a bar: a bullish bar (close > open) is assumed to go open, low, high, close;
-any other bar open, high, low, close. This is the rule ``backtest/fills.py:_fill_oco`` uses to
-decide which OCO leg filled first, and ``tests/unit/test_execution/test_fill_rules.py`` asserts
-both agree on the same bars. A level that the open has already crossed is touched at the open
-(a gap), before anything else on the path.
+any other bar open, high, low, close. A level that the open has already crossed is touched at the
+open (a gap), before anything else on the path. ``backtest/fills.py:_fill_oco`` picks its OCO leg
+with ``oco_stop_first``, so paper and backtest share one rule.
 
 Gap-through stops fill at the worse of the stop and the open; resting limits fill at the better
 of the limit and the open (the backtester's rule). Slippage applies to stop and market fills only.
@@ -116,9 +115,9 @@ def stop_limit_fill(
 ) -> StopLimitOutcome | None:
     """Stop-limit: None until the stop triggers.
 
-    On trigger the limit order is placed. It fills at the limit when the trigger price is already
-    marketable against it (taker), or when the rest of the path after the trigger reaches the
-    limit (maker). Otherwise it converts to a resting limit at ``limit``.
+    On trigger the limit order is placed. When the trigger price is already marketable against the
+    limit it fills at the trigger (taker; the limit is only a cap). Otherwise it fills at the limit
+    when the rest of the path after the trigger reaches it (maker), or converts to a resting limit.
     """
     s = _side(side)
     trigger = stop_trigger_price(s, stop, bar)
@@ -126,7 +125,7 @@ def stop_limit_fill(
         return None
     marketable = trigger >= limit if s == "SELL" else trigger <= limit
     if marketable:
-        return StopLimitOutcome(FillPrice(limit, "taker"), converted_to_limit=False)
+        return StopLimitOutcome(FillPrice(trigger, "taker"), converted_to_limit=False)
     start = touch_index(bar, stop, falling=s == "SELL")
     rest = intrabar_path(bar)[(start or 0) + 1 :]
     reached = any(p >= limit for p in rest) if s == "SELL" else any(p <= limit for p in rest)
