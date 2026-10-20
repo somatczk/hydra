@@ -83,8 +83,8 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   health-pinged; it is not on the trading path.
 - Signal path: ccxt.pro bar → StrategyEngine → OrderManager (pre-trade check by PreTradeRiskManager) →
   PaperTradingExecutor or ExchangeClient. ExchangeClient defaults to `testnet=True`.
-- Persisted: risk config and kill-switch flag, trading sessions, paper trades, positions and balance snapshots,
-  backtest results and trades with data provenance. In memory only: system config, background task state
+- Persisted (only when the engine has a DB pool): risk config and kill-switch flag, trading sessions, paper
+  trades, positions and balance snapshots, backtest results and trades with data provenance. In memory only: system config, background task state
   (backtest, hyperopt, walk-forward). Circuit breakers are not instantiated. Paper state is not reloaded on restart.
 - No exchange-side stops yet (P3). Only Binance is supported in practice; the explicit gate is P1.
 - Errors from dashboard routes use one envelope, `{"detail": {"code", "message", "state", ...}}`, built by
