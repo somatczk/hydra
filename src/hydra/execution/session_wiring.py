@@ -51,6 +51,7 @@ from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import (
     LedgerInvariantError,
+    PaperFill,
     PaperSessionHaltedError,
     PaperTradingExecutor,
     PersistenceUnavailableError,
@@ -108,6 +109,8 @@ class ManualOrderResult:
     price: Decimal | None
     protection: str  # 'armed' | 'pending' | 'none'
     protective_order_id: str | None
+    fill_price: Decimal | None = None
+    mark_source: str | None = None
 
 
 class SessionRuntime:
@@ -383,6 +386,7 @@ class SessionRuntime:
                 "fee": str(event.fee),
                 "realized_pnl": None if event.realized_pnl is None else str(event.realized_pnl),
                 "tag": event.tag,
+                "mark_source": event.mark_source,
                 "timestamp": datetime.now(UTC).isoformat(),
             }
         )
@@ -399,6 +403,7 @@ class SessionRuntime:
                 logger.info("Feed live again: entries resumed for %s", self.session.session_id)
             self.entries_paused = None
             return
+        self.executor.mark_feed_stale()
         reasons = self.feed.stale_reasons(self.exchange_id)
         self.entries_paused = "feed stale: " + ", ".join(
             f"{scope} {'/'.join(r)}" for scope, r in sorted(reasons.items())
@@ -528,6 +533,7 @@ class SessionRuntime:
         filled = status == OrderStatus.FILLED
         if order_id is not None and status not in (OrderStatus.FILLED, OrderStatus.CANCELLED):
             self._manual_orders[order_id] = tag
+        fill = self._market_fill(order_id) if filled else None
         return ManualOrderResult(
             order_id=order_id,
             status=str(status) if status is not None else "NOOP",
@@ -535,6 +541,8 @@ class SessionRuntime:
             price=price,
             protection="armed" if filled and group is not None else "pending",
             protective_order_id=group.order_id if filled and group is not None else None,
+            fill_price=fill.price if fill is not None else None,
+            mark_source=fill.mark_source if fill is not None else None,
         )
 
     async def _manual_exit(
@@ -577,6 +585,7 @@ class SessionRuntime:
         if status != OrderStatus.FILLED:
             await self.protect.rearm(symbol)
         group = self.protect.armed(symbol)
+        fill = self._market_fill(order_id) if status == OrderStatus.FILLED else None
         return ManualOrderResult(
             order_id=order_id,
             status=str(status) if status is not None else "NOOP",
@@ -584,11 +593,18 @@ class SessionRuntime:
             price=None,
             protection="armed" if group is not None else "none",
             protective_order_id=group.order_id if group is not None else None,
+            fill_price=fill.price if fill is not None else None,
+            mark_source=fill.mark_source if fill is not None else None,
         )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _market_fill(self, order_id: str | None) -> PaperFill | None:
+        return next(
+            (f for f in reversed(self.executor.get_fills()) if f.order_id == order_id), None
+        )
 
     async def _holding(self, symbol: str) -> bool:
         if any(p.quantity > 0 for p in await self.executor.get_positions(symbol)):

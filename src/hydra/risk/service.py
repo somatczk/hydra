@@ -65,6 +65,7 @@ ENGINE_ACTOR = "risk_engine"
 SYSTEM_ACTOR = "system"
 RATE_WINDOW = timedelta(minutes=1)
 FLATTEN_RETRY = timedelta(minutes=1)
+_BETWEEN_BARS = frozenset({"live", "stale_live"})
 
 
 class RiskExecutor(Protocol):
@@ -204,6 +205,7 @@ class RiskService:
         self._sessions: dict[str, _Session] = {}
         self._marks: dict[tuple[str, str], Decimal] = {}
         self._mark_ts: dict[tuple[str, str], datetime] = {}
+        self._live_priced: set[tuple[str, str]] = set()
         self._gross = Decimal("0")
 
     # ------------------------------------------------------------------
@@ -390,7 +392,11 @@ class RiskService:
             unmarked += [
                 f"{sid}:{p.symbol}"
                 for p in per[sid][1]
-                if _is_held(p) and str(p.symbol) not in marks
+                if _is_held(p)
+                and (
+                    str(p.symbol) not in marks
+                    or (session.exchange_id, str(p.symbol)) in self._live_priced
+                )
             ]
         return _Snapshot(equity, gross, per, tuple(unmarked))
 
@@ -406,14 +412,21 @@ class RiskService:
             return
         self._marks[key] = price
         self._mark_ts[key] = ts
+        self._live_priced.discard(key)
         await self.evaluate()
 
     def mark(self, exchange_id: str, symbol: str) -> Decimal | None:
         return self._marks.get((exchange_id, str(symbol)))
 
     async def on_fill(self, session_id: str, fill: OrderFillEvent) -> None:
-        """Closing fills (realized_pnl set) drive the consecutive-loss counter."""
+        """Closing fills (realized_pnl set) drive the consecutive-loss counter.
+
+        A fill priced between closed bars leaves its symbol unmarked until the next closed bar:
+        the cash moved at that price while the position is still valued at the last close.
+        """
         async with self._state_lock:
+            if fill.mark_source in _BETWEEN_BARS:
+                self._live_priced.add((fill.exchange_id, str(fill.symbol)))
             now = self._clock()
             transitions = self._cb.expire(now)
             self._apply_counter_resets(transitions)
@@ -434,7 +447,7 @@ class RiskService:
         """Recompute equity, drawdown and daily loss; update breakers; persist; act.
 
         Skipped while recovering, while a paper_capital change is pending and while a held
-        position has no mark.
+        position has no closed-bar mark (none yet, or a fill since the last one).
         """
         if not self._loaded or not self._recovered:
             return []
@@ -448,7 +461,9 @@ class RiskService:
             now = self._clock()
             snap = await self._account()
             if snap.unmarked:
-                logger.info("Breakers not evaluated: no mark yet for %s", ", ".join(snap.unmarked))
+                logger.info(
+                    "Breakers not evaluated: no closed-bar mark for %s", ", ".join(snap.unmarked)
+                )
                 return []
             equity, gross = snap.equity, snap.gross
             st = self._state

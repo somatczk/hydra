@@ -100,6 +100,10 @@ def _dec(value: Any) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _opt_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
 def _realized_pnl(
     resp: dict[str, Any], fee: Decimal, side: Side
 ) -> tuple[Decimal | None, Decimal | None]:
@@ -327,6 +331,7 @@ class OrderManager:
                     reduce_only=order.reduce_only,
                     realized_pnl=realized,
                     gross_pnl=gross,
+                    mark_source=_opt_str(resp.get("mark_source")),
                 )
             )
             try:
@@ -434,6 +439,7 @@ class OrderManager:
             reduce_only=request.reduce_only if request is not None else fill.side == "SELL",
             realized_pnl=fill.net_pnl,
             gross_pnl=fill.gross_pnl,
+            mark_source=fill.mark_source,
         )
         await self._event_bus.publish(event)
         try:

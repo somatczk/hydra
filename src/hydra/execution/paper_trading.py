@@ -8,7 +8,8 @@ fee is taken in base unless paid with BNB).
 
 Market orders fill with slippage at the latest traded price set by ``set_mark`` since the last
 closed bar, else at that bar's close. Resting orders are evaluated only by ``on_closed_bar``
-with the rules in ``hydra.execution.fill_rules``. With a DB pool, every change
+with the rules in ``hydra.execution.fill_rules``; an order placed at a live mark sees only the
+move from that mark to the close of the bar it was placed in. With a DB pool, every change
 is persisted (``hydra.execution.paper_store``) before the call returns; ``restore`` rebuilds the
 account after a restart.
 """
@@ -95,7 +96,7 @@ class SpotMarketRules(Protocol):
 
 
 PaperFillStatus = Literal["FILLED", "CANCELLED"]
-MarkSource = Literal["live", "last_close"]
+MarkSource = Literal["live", "stale_live", "last_close"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +108,8 @@ class PaperFill:
     ``status="CANCELLED"`` reports a resting BUY dropped on a gap it could not pay for: nothing
     traded, ``price`` is where it would have filled, ``fee`` is 0 and ``fill_seq`` is 0.
     ``mark_source`` is set on market fills: ``live`` (a ``set_mark`` price newer than the last
-    closed bar) or ``last_close`` (the fallback); None on bar-priced and restored fills.
+    closed bar), ``stale_live`` (such a price, but the feed went stale after it) or
+    ``last_close`` (the fallback); None on bar-priced and restored fills.
     """
 
     order_id: str
@@ -182,6 +184,7 @@ class _PendingOrder:
     trail_pct: Decimal | None = None
     extreme: Decimal | None = None
     oco_id: str | None = None
+    placed_at: Decimal | None = None
 
 
 @dataclass(slots=True)
@@ -243,6 +246,18 @@ def _opt_d(value: object) -> Decimal | None:
 
 def _opt_s(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
+
+
+def _since_placement(mark: Decimal, bar: OHLCV) -> OHLCV:
+    """The part of ``bar`` known to follow an order placed at ``mark``: mark, then the close."""
+    return OHLCV(
+        open=mark,
+        high=max(mark, bar.close),
+        low=min(mark, bar.close),
+        close=bar.close,
+        volume=bar.volume,
+        timestamp=bar.timestamp,
+    )
 
 
 def _ts(value: datetime) -> str:
@@ -320,6 +335,7 @@ class PaperTradingExecutor:
         self._pending: list[_PendingOrder] = []
         self._marks: dict[str, Decimal] = {}
         self._live_marks: dict[str, Decimal] = {}
+        self._stale_marks: set[str] = set()
         self._last_bar_ts: dict[str, datetime] = {}
         self._names: dict[str, str] = {}
         self._fill_seq = 0
@@ -380,12 +396,18 @@ class PaperTradingExecutor:
     def set_mark(self, symbol: str, price: Decimal) -> None:
         """Latest traded price between closed bars; only market fills use it, until the next bar."""
         if price > 0:
-            self._live_marks[self._symbol(symbol)] = price
+            canon = self._symbol(symbol)
+            self._live_marks[canon] = price
+            self._stale_marks.discard(canon)
+
+    def mark_feed_stale(self) -> None:
+        """The feed went stale: the live marks held now are labelled until a fresh one arrives."""
+        self._stale_marks = set(self._live_marks)
 
     def _market_mark(self, canon: str) -> tuple[Decimal | None, MarkSource]:
         live = self._live_marks.get(canon)
         if live is not None:
-            return live, "live"
+            return live, "stale_live" if canon in self._stale_marks else "live"
         return self._marks.get(canon), "last_close"
 
     # ------------------------------------------------------------------
@@ -509,6 +531,7 @@ class PaperTradingExecutor:
             created_after_ts=self._last_bar_ts.get(canon),
             trail_pct=trail_pct,
             extreme=extreme,
+            placed_at=self._live_marks.get(canon),
         )
 
     def _buy_lock(self, otype: str, quantity: Decimal, ref: Decimal) -> Decimal:
@@ -544,6 +567,7 @@ class PaperTradingExecutor:
                 oco_id, self._quote, self._buy_lock(OrderType.STOP_MARKET, quantity, sl)
             )
         created = self._last_bar_ts.get(canon)
+        placed_at = self._live_marks.get(canon)
         legs: list[_PendingOrder] = []
         for otype, leg_price, leg_stop, reason in (
             (OrderType.LIMIT, tp, None, "take_profit"),
@@ -564,6 +588,7 @@ class PaperTradingExecutor:
                     reason=reason,
                     created_after_ts=created,
                     oco_id=oco_id,
+                    placed_at=placed_at,
                 )
             )
         self._pending.extend(legs)
@@ -610,7 +635,9 @@ class PaperTradingExecutor:
         """Evaluate this symbol's resting orders on one closed bar, then mark to its close.
 
         A bar at or before the last processed timestamp is ignored. Orders placed after the
-        previous bar are eligible; at most one leg of an OCO fills. The result also carries
+        previous bar are eligible; one placed at a live mark sees this bar as the path from that
+        mark to the close (its earlier range came before the order). At most one leg of an OCO
+        fills. The result also carries
         ``status="CANCELLED"`` records for BUYs dropped on a gap. While halted, only SELLs run.
         """
         canon = self._symbol(symbol)
@@ -626,13 +653,20 @@ class PaperTradingExecutor:
                 seen_oco.add(order.oco_id)
             if order.created_after_ts is not None and ohlcv.timestamp <= order.created_after_ts:
                 continue
+            bar = ohlcv
+            if order.placed_at is not None:
+                bar = _since_placement(order.placed_at, ohlcv)
+                for leg in self._pending:
+                    if leg is order or (order.oco_id is not None and leg.oco_id == order.oco_id):
+                        leg.placed_at = None
             if self._halted is not None and order.side == "BUY":
                 continue
-            fill = self._evaluate(order, ohlcv)
+            fill = self._evaluate(order, bar)
             if fill is not None:
                 fills.append(fill)
         self._marks[canon] = ohlcv.close
         self._live_marks.pop(canon, None)
+        self._stale_marks.discard(canon)
         self._last_bar_ts[canon] = ohlcv.timestamp
         self._update_peak()
         await self._persist(snapshot_at=ohlcv.timestamp)
@@ -1157,6 +1191,7 @@ class PaperTradingExecutor:
                     "trail_pct": _opt_s(o.trail_pct),
                     "extreme": _opt_s(o.extreme),
                     "oco_id": o.oco_id,
+                    "placed_at": _opt_s(o.placed_at),
                 }
                 for o in self._pending
             ],
@@ -1235,6 +1270,7 @@ class PaperTradingExecutor:
                     trail_pct=_opt_d(o["trail_pct"]),
                     extreme=_opt_d(o["extreme"]),
                     oco_id=o["oco_id"],
+                    placed_at=_opt_d(o.get("placed_at")),
                 )
                 for o in state["pending"]
             ]

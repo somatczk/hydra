@@ -390,8 +390,38 @@ class TestLiveMark:
         ex.set_mark(BTC, D("110"))
         await ex.create_order(BTC, "SELL", "TRAILING_STOP", D("1"), params={"trail_pct": "0.02"})
 
-        (fill,) = await ex.on_closed_bar(BTC, bar(1, "109", "109", "107.5", "108"))
+        assert await ex.on_closed_bar(BTC, bar(1, "109", "109", "107.5", "108")) == []
+        (fill,) = await ex.on_closed_bar(BTC, bar(2, "108", "108", "107", "107.5"))
         assert (fill.reason, fill.price) == ("trailing_stop", D("107.80"))
+
+    async def test_order_placed_at_a_live_mark_sees_only_mark_to_close_on_its_bar(self) -> None:
+        ex = await holding("1", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("106"))
+        await ex.create_order(BTC, "SELL", "STOP_MARKET", D("1"), stop_price=D("101"))
+
+        assert await ex.on_closed_bar(BTC, bar(1, "100", "106", "99", "104")) == []
+        (fill,) = await ex.on_closed_bar(BTC, bar(2, "104", "104", "100", "100"))
+        assert (fill.reason, fill.price) == ("stop_loss", D("101"))
+
+    async def test_oco_placed_at_a_live_mark_skips_the_pre_placement_range(self) -> None:
+        ex = await holding("1", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("106"))
+        await ex.create_order(BTC, "SELL", "OCO", D("1"), price=D("112"), stop_price=D("101"))
+
+        (fill,) = await ex.on_closed_bar(BTC, bar(1, "100", "113", "99", "112.5"))
+        assert (fill.reason, fill.price) == ("take_profit", D("112"))
+
+    async def test_feed_stale_labels_the_held_mark_until_a_fresh_one(self) -> None:
+        ex = await holding("2", "100", fee="0", slippage="0")
+        ex.set_mark(BTC, D("97"))
+        ex.mark_feed_stale()
+
+        stale = await ex.create_order(BTC, "SELL", "MARKET", D("1"))
+        ex.set_mark(BTC, D("98"))
+        fresh = await ex.create_order(BTC, "SELL", "MARKET", D("1"))
+
+        assert (stale["price"], stale["mark_source"]) == (97.0, "stale_live")
+        assert (fresh["price"], fresh["mark_source"]) == (98.0, "live")
 
     async def test_flatten_sells_at_the_live_mark(self) -> None:
         ex = await holding("1", "100", fee="0", slippage="0")
