@@ -206,35 +206,56 @@ export default function DashboardPage() {
     setLoading(true);
     setFetchErrors({});
 
-    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
-      .catch(() => ({ trading_mode: 'paper' }));
-    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    // No guessed source: without the platform config, source-specific widgets show why
+    let source: 'live' | 'paper' | null = null;
+    let configError: unknown = null;
+    try {
+      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config');
+      source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    } catch (err) {
+      logger.warn('Dashboard', 'Trading mode unknown; portfolio data not requested', err);
+      configError = err ?? true;
+    }
     const qs = `?source=${source}`;
 
     await Promise.all([
-      fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
-        .then(setSummary)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, summary: err ?? true })); }),
-      fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}&limit=5`)
-        .then((data) => {
-          const trades = Array.isArray(data) ? data : (data.trades ?? []);
-          setRecentTrades(mapApiTrades(trades));
-        })
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, trades: err ?? true })); }),
-      fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
-        .then((data) => setPositionCount(data.length))
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
-      fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
-        .then((data) => setEquityCurve(data))
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, equity: err ?? true })); }),
-      fetchApi<LiveMetrics>(`/api/portfolio/live-metrics?source=${source}`)
-        .then(setLiveMetrics)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, liveMetrics: err ?? true })); }),
+      ...(source === null
+        ? []
+        : [
+            fetchApi<PortfolioSummary>(`/api/portfolio/summary${qs}`)
+              .then(setSummary)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, summary: err ?? true })); }),
+            fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}&limit=5`)
+              .then((data) => {
+                const trades = Array.isArray(data) ? data : (data.trades ?? []);
+                setRecentTrades(mapApiTrades(trades));
+              })
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, trades: err ?? true })); }),
+            fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
+              .then((data) => setPositionCount(data.length))
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
+            fetchApi<EquityPoint[]>(`/api/portfolio/equity-curve${qs}`)
+              .then((data) => setEquityCurve(data))
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, equity: err ?? true })); }),
+            fetchApi<LiveMetrics>(`/api/portfolio/live-metrics${qs}`)
+              .then(setLiveMetrics)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, liveMetrics: err ?? true })); }),
+          ]),
       fetchApi<NewsItem[]>('/api/market/news')
         .then((data) => setNews(data.slice(0, 5)))
         .catch((err) => { setFetchErrors((prev) => ({ ...prev, news: err ?? true })); }),
     ]);
 
+    if (configError !== null) {
+      setFetchErrors((prev) => ({
+        ...prev,
+        summary: configError,
+        trades: configError,
+        positions: configError,
+        equity: configError,
+        liveMetrics: configError,
+      }));
+    }
     setLoading(false);
   }, []);
 

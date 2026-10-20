@@ -18,6 +18,7 @@ from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore
 
 from .conftest import TEST_API_TOKEN
+from .system_db import FakeSystemDb
 
 DASHBOARD = "https://trading.romulus.hu"
 EVIL = "https://evil.romulus.hu"
@@ -64,8 +65,11 @@ def session(cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch) -> TradingSession
 
 
 @pytest.fixture()
-def system_config(monkeypatch: pytest.MonkeyPatch) -> None:
+def system_config(monkeypatch: pytest.MonkeyPatch) -> FakeSystemDb:
+    db = FakeSystemDb()
+    monkeypatch.setattr(app.state, "db_pool", db)
     monkeypatch.setattr(app.state, "system_config", {"default_pair": "BTC/USDT"})
+    return db
 
 
 @pytest.fixture()
@@ -134,17 +138,16 @@ class TestKillSwitch:
 
 
 class TestSystemConfig:
-    @pytest.mark.usefixtures("system_config")
     @pytest.mark.parametrize("headers", REFUSED_HEADERS)
     def test_refused_put_leaves_config_unchanged(
-        self, user: TestClient, headers: dict[str, str]
+        self, user: TestClient, system_config: FakeSystemDb, headers: dict[str, str]
     ) -> None:
         resp = user.put("/api/system/config", json={"default_pair": "ETH/USDT"}, headers=headers)
         _assert_csrf_rejected(resp)
         assert app.state.system_config == {"default_pair": "BTC/USDT"}
+        assert system_config.value("default_pair") == "BTC/USDT"
 
-    @pytest.mark.usefixtures("system_config")
-    def test_dashboard_put_is_applied(self, user: TestClient) -> None:
+    def test_dashboard_put_is_applied(self, user: TestClient, system_config: FakeSystemDb) -> None:
         resp = user.put(
             "/api/system/config",
             json={"default_pair": "ETH/USDT"},
@@ -153,7 +156,10 @@ class TestSystemConfig:
         assert resp.status_code == 200
         assert resp.json()["default_pair"] == "ETH/USDT"
         assert app.state.system_config["default_pair"] == "ETH/USDT"
+        assert system_config.value("default_pair") == "ETH/USDT"
+        assert system_config.config["default_pair"]["updated_by"] == "user:soma"
 
+    @pytest.mark.usefixtures("system_config")
     def test_reads_need_no_csrf_header(self, user: TestClient) -> None:
         assert user.get("/api/system/config").status_code == 200
 

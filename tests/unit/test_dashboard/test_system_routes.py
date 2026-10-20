@@ -1,23 +1,38 @@
-"""Tests for system dashboard routes.
+"""System routes: persisted platform config, exchange key checks, health.
 
-Tests cover:
-- Config reads from env vars with defaults
-- Config update persists to app.state
-- Exchanges endpoint reports API key status from env
-- Health endpoint pings DB pool and Redis
-- Health overall status derivation logic
+The database is the in-memory ``FakeSystemDb`` (the DB boundary); the exchange is a fake ccxt
+``binance`` class (the network boundary). Everything between them is the real code: the routes,
+Fernet encryption, P1-E's ``build_readonly_client`` and ``ExchangeClient``, and a real
+``RiskService`` for the paper_capital hand-off.
 """
 
 from __future__ import annotations
 
+import secrets
+from decimal import Decimal
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import ccxt
+import ccxt.async_support
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from hydra.core.encryption import decrypt
+from hydra.dashboard.routes import system
+from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.system import router
+from hydra.risk.service import RiskService
+from hydra.risk.state import InMemoryRiskStateStore, LoadedConfig, RiskStateUnavailableError
+from tests.unit.test_risk.harness import Clock, rules_cache
+
+from .system_db import NOW, FakeSystemDb
+
+HOOK_SECRET = secrets.token_urlsafe(12)
+API_KEY = "key-" + secrets.token_hex(6)
+API_SECRET = secrets.token_hex(12)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -27,9 +42,33 @@ from hydra.dashboard.routes.system import router
 def _make_app(pool: object | None = None) -> FastAPI:
     test_app = FastAPI()
     test_app.include_router(router)
+    install_error_handlers(test_app)
     test_app.state.db_pool = pool
     test_app.state.system_config = None
+    test_app.state.session_manager = None
+    test_app.state.exchange_credentials = {}
+    test_app.state.exchange_credential_errors = {}
     return test_app
+
+
+@pytest.fixture(autouse=True)
+def credential_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
+
+
+@pytest.fixture()
+def db() -> FakeSystemDb:
+    return FakeSystemDb()
+
+
+@pytest.fixture()
+def app(db: FakeSystemDb) -> FastAPI:
+    return _make_app(pool=db)
+
+
+@pytest.fixture()
+def client(app: FastAPI) -> TestClient:
+    return TestClient(app)
 
 
 @pytest.fixture()
@@ -47,178 +86,247 @@ def _make_mock_pool() -> tuple[MagicMock, AsyncMock]:
     return pool, conn
 
 
+def _detail(resp: Any) -> dict[str, Any]:
+    detail: dict[str, Any] = resp.json()["detail"]
+    return detail
+
+
 # ---------------------------------------------------------------------------
-# Config endpoint
+# GET /config
 # ---------------------------------------------------------------------------
 
 
 class TestGetConfig:
-    def test_defaults_without_env(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/system/config")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["trading_mode"] == "paper"
-        assert data["default_pair"] == "BTC/USDT"
-        assert data["default_timeframe"] == "1h"
-        assert data["max_concurrent_strategies"] == 5
-
-    def test_reads_env_vars(self) -> None:
-        env = {
-            "HYDRA_TRADING_MODE": "live",
-            "HYDRA_DEFAULT_PAIR": "ETH/USDT",
-            "HYDRA_DEFAULT_TIMEFRAME": "4h",
-            "HYDRA_MAX_STRATEGIES": "10",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            client = TestClient(_make_app(pool=None))
-            resp = client.get("/api/system/config")
-            assert resp.status_code == 200
-            data = resp.json()
-            assert data["trading_mode"] == "live"
-            assert data["default_pair"] == "ETH/USDT"
-            assert data["default_timeframe"] == "4h"
-            assert data["max_concurrent_strategies"] == 10
-
-    def test_invalid_max_strategies_uses_default(self) -> None:
-        with patch.dict("os.environ", {"HYDRA_MAX_STRATEGIES": "not-a-number"}, clear=False):
-            client = TestClient(_make_app(pool=None))
-            resp = client.get("/api/system/config")
-            assert resp.status_code == 200
-            assert resp.json()["max_concurrent_strategies"] == 5
-
-    def test_persisted_config_takes_precedence(self) -> None:
-        app = _make_app(pool=None)
-        app.state.system_config = {
-            "trading_mode": "live",
-            "default_pair": "SOL/USDT",
-            "default_timeframe": "15m",
-            "max_concurrent_strategies": 3,
-        }
-        client = TestClient(app)
+    def test_reads_the_seeded_rows(self, client: TestClient) -> None:
         resp = client.get("/api/system/config")
         assert resp.status_code == 200
-        data = resp.json()
+        assert resp.json() == {
+            "trading_mode": "paper",
+            "default_pair": "BTC/USDT",
+            "default_timeframe": "1h",
+            "max_concurrent_strategies": 5,
+            "paper_capital": 10000.0,
+            "paper_capital_pending": None,
+            "webhook_secret_set": False,
+            "discord_webhook_url_set": False,
+            "slack_webhook_url_set": False,
+        }
+
+    def test_stored_values_win(self, db: FakeSystemDb, client: TestClient) -> None:
+        db.config["trading_mode"]["value"] = '"live"'
+        db.config["paper_capital"]["value"] = "2500.5"
+        data = client.get("/api/system/config").json()
         assert data["trading_mode"] == "live"
-        assert data["default_pair"] == "SOL/USDT"
+        assert data["paper_capital"] == 2500.5
+
+    def test_no_pool_is_503(self, client_no_pool: TestClient) -> None:
+        resp = client_no_pool.get("/api/system/config")
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "database_unavailable"
+
+    def test_missing_paper_capital_row_is_503_not_10000(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        del db.config["paper_capital"]
+        resp = client.get("/api/system/config")
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "system_config_missing"
+        assert _detail(resp)["missing"] == ["paper_capital"]
+        assert "10000" not in resp.text
+
+    def test_invalid_trading_mode_is_503_not_paper(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        db.config["trading_mode"]["value"] = '"testnet"'
+        resp = client.get("/api/system/config")
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "system_config_invalid"
+        assert _detail(resp)["fields"] == ["trading_mode"]
+
+    def test_db_error_is_503(self, db: FakeSystemDb, client: TestClient) -> None:
+        db.fail = OSError("db went away")
+        resp = client.get("/api/system/config")
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "database_unavailable"
+
+    def test_env_vars_are_not_a_source(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HYDRA_DEFAULT_PAIR", "ETH/USDT")
+        del db.config["default_pair"]
+        assert client.get("/api/system/config").status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# PUT /config
+# ---------------------------------------------------------------------------
 
 
 class TestUpdateConfig:
-    def test_partial_update(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.put(
-            "/api/system/config",
-            json={"trading_mode": "live"},
-        )
+    def test_partial_update_is_persisted_with_actor(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        resp = client.put("/api/system/config", json={"default_pair": "ETH/USDT"})
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["trading_mode"] == "live"
-        # Other fields should retain defaults
-        assert data["default_pair"] == "BTC/USDT"
-        assert data["default_timeframe"] == "1h"
+        assert resp.json()["default_pair"] == "ETH/USDT"
+        assert db.value("default_pair") == "ETH/USDT"
+        assert db.config["default_pair"]["updated_by"] == "anonymous"
+        assert db.value("default_timeframe") == "1h"
+        assert app.state.system_config["default_pair"] == "ETH/USDT"
 
-    def test_full_update(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.put(
-            "/api/system/config",
-            json={
-                "trading_mode": "live",
-                "default_pair": "ETH/BTC",
-                "default_timeframe": "4h",
-                "max_concurrent_strategies": 2,
-            },
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["trading_mode"] == "live"
-        assert data["default_pair"] == "ETH/BTC"
-        assert data["max_concurrent_strategies"] == 2
-
-    def test_update_persists_to_state(self) -> None:
-        """After update, subsequent GET should return updated values."""
-        app = _make_app(pool=None)
-        client = TestClient(app)
-
-        client.put("/api/system/config", json={"trading_mode": "live"})
-        resp = client.get("/api/system/config")
-        assert resp.json()["trading_mode"] == "live"
-
-    def test_update_with_no_fields_returns_current(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.put("/api/system/config", json={})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["trading_mode"] == "paper"
-
-
-# ---------------------------------------------------------------------------
-# Exchanges endpoint
-# ---------------------------------------------------------------------------
-
-
-class TestExchanges:
-    def test_exchanges_no_pool_no_keys(self) -> None:
-        """Without pool and without API keys, all exchanges disconnected."""
-        env_clear = {
-            "BINANCE_API_KEY": "",
-            "BYBIT_API_KEY": "",
-            "KRAKEN_API_KEY": "",
-            "OKX_API_KEY": "",
+    def test_full_update_round_trips(self, db: FakeSystemDb, client: TestClient) -> None:
+        payload = {
+            "trading_mode": "live",
+            "default_pair": "SOL/USDT",
+            "default_timeframe": "4h",
+            "max_concurrent_strategies": 7,
+            "paper_capital": 2500.0,
         }
-        with patch.dict("os.environ", env_clear, clear=False):
-            client = TestClient(_make_app(pool=None))
-            resp = client.get("/api/system/exchanges")
-            assert resp.status_code == 200
-            data = resp.json()
-            assert isinstance(data, list)
-            assert len(data) == 4
-            for exchange in data:
-                assert exchange["connected"] is False
-                assert exchange["api_key_set"] is False
+        assert client.put("/api/system/config", json=payload).status_code == 200
+        assert {k: db.value(k) for k in payload} == payload
+        fresh = TestClient(_make_app(pool=db)).get("/api/system/config").json()
+        assert {k: fresh[k] for k in payload} == payload
 
-    def test_exchanges_api_key_set_but_no_pool(self) -> None:
-        """With API keys but no pool, exchanges show key set but not connected."""
-        env = {"BINANCE_API_KEY": "secret123"}
-        with patch.dict("os.environ", env, clear=False):
-            client = TestClient(_make_app(pool=None))
-            resp = client.get("/api/system/exchanges")
-            assert resp.status_code == 200
-            data = resp.json()
-            binance = next(e for e in data if e["id"] == "binance")
-            assert binance["api_key_set"] is True
-            # No pool means db_connected=False, so connected=False
-            assert binance["connected"] is False
-
-    def test_exchanges_with_healthy_pool_and_key(self) -> None:
-        """With a healthy pool and API key, exchange shows connected."""
-        pool, conn = _make_mock_pool()
-        conn.fetchval = AsyncMock(return_value=1)
-        env = {"BINANCE_API_KEY": "secret123"}
-        with patch.dict("os.environ", env, clear=False):
-            client = TestClient(_make_app(pool=pool))
-            resp = client.get("/api/system/exchanges")
-            assert resp.status_code == 200
-            data = resp.json()
-            binance = next(e for e in data if e["id"] == "binance")
-            assert binance["connected"] is True
-            assert binance["api_key_set"] is True
-            assert binance["last_sync"] == "Active"
-
-    def test_exchanges_pool_ping_fails(self) -> None:
-        """When pool ping fails, exchanges show not connected even with keys."""
-        pool, conn = _make_mock_pool()
-        conn.fetchval = AsyncMock(side_effect=RuntimeError("Ping failed"))
-        env = {"BINANCE_API_KEY": "secret123"}
-        with patch.dict("os.environ", env, clear=False):
-            client = TestClient(_make_app(pool=pool))
-            resp = client.get("/api/system/exchanges")
-            assert resp.status_code == 200
-            data = resp.json()
-            binance = next(e for e in data if e["id"] == "binance")
-            assert binance["connected"] is False
-
-    def test_exchanges_all_four_present(self, client_no_pool: TestClient) -> None:
-        resp = client_no_pool.get("/api/system/exchanges")
+    def test_empty_update_returns_current_without_writing(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        resp = client.put("/api/system/config", json={})
         assert resp.status_code == 200
-        data = resp.json()
-        ids = {e["id"] for e in data}
-        assert ids == {"binance", "bybit", "kraken", "okx"}
+        assert resp.json()["paper_capital"] == 10000.0
+        assert not any(sql.startswith("INSERT") for sql in db.statements)
+
+    def test_secret_is_encrypted_at_rest_and_write_only(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        resp = client.put("/api/system/config", json={"webhook_secret": HOOK_SECRET})
+        assert resp.status_code == 200
+        assert resp.json()["webhook_secret_set"] is True
+        assert HOOK_SECRET not in resp.text
+        raw = db.value("webhook_secret")
+        assert raw != HOOK_SECRET
+        assert decrypt(raw) == HOOK_SECRET
+        assert app.state.system_config["webhook_secret"] == HOOK_SECRET
+        assert HOOK_SECRET not in client.get("/api/system/config").text
+
+    def test_empty_string_clears_a_secret(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        client.put("/api/system/config", json={"webhook_secret": HOOK_SECRET})
+        resp = client.put("/api/system/config", json={"webhook_secret": ""})
+        assert resp.json()["webhook_secret_set"] is False
+        assert "webhook_secret" not in db.config
+        assert "webhook_secret" not in app.state.system_config
+
+    def test_undecryptable_secret_reads_as_unset(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client.put("/api/system/config", json={"webhook_secret": HOOK_SECRET})
+        monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
+        resp = client.get("/api/system/config")
+        assert resp.status_code == 200
+        assert resp.json()["webhook_secret_set"] is False
+
+    def test_save_failure_is_503_and_memory_unchanged(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        db.fail, db.fail_on = OSError("db went away"), "INSERT INTO system_config"
+        resp = client.put("/api/system/config", json={"default_pair": "ETH/USDT"})
+        assert resp.status_code == 503
+        assert db.value("default_pair") == "BTC/USDT"
+        assert app.state.system_config is None
+
+    def test_no_pool_is_503(self, client_no_pool: TestClient) -> None:
+        resp = client_no_pool.put("/api/system/config", json={"default_pair": "ETH/USDT"})
+        assert resp.status_code == 503
+
+
+class _SystemConfigStore(InMemoryRiskStateStore):
+    """The RiskService store, reading paper_capital from the same system_config rows."""
+
+    def __init__(self, db: FakeSystemDb) -> None:
+        super().__init__(paper_capital=Decimal("10000"))
+        self.db = db
+        self.fail = False
+
+    async def load_config(self) -> LoadedConfig:
+        if self.fail:
+            raise RiskStateUnavailableError("store down")
+        self.paper_capital = Decimal(str(self.db.value("paper_capital")))
+        return await super().load_config()
+
+
+class _Manager:
+    def __init__(self, risk: RiskService) -> None:
+        self.risk = risk
+        self.reloads = 0
+
+    async def reload_risk_config(self) -> None:
+        self.reloads += 1
+
+
+async def _risk(db: FakeSystemDb, *, recovered: bool) -> tuple[RiskService, _SystemConfigStore]:
+    clock = Clock()
+    store = _SystemConfigStore(db)
+    svc = RiskService(store, clock=clock, market_rules=rules_cache(clock))
+    await svc.load()
+    if recovered:
+        await svc.recovery_complete()
+    return svc, store
+
+
+class TestPaperCapitalChange:
+    async def test_change_goes_through_the_audited_paper_reset(
+        self, db: FakeSystemDb, app: FastAPI
+    ) -> None:
+        svc, store = await _risk(db, recovered=True)
+        app.state.session_manager = _Manager(svc)
+        resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
+        assert resp.status_code == 200
+        assert resp.json()["paper_capital"] == 25000.0
+        assert resp.json()["paper_capital_pending"] is None
+        assert svc.paper_capital == Decimal("25000")
+        assert [(e.kind, e.actor) for e in store.events] == [("paper_reset", "anonymous")]
+        assert store.events[0].details["old_capital"] == Decimal("10000")
+        assert app.state.session_manager.reloads == 1
+
+    async def test_change_while_recovering_is_reported_pending(
+        self, db: FakeSystemDb, app: FastAPI
+    ) -> None:
+        svc, store = await _risk(db, recovered=False)
+        app.state.session_manager = _Manager(svc)
+        resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
+        assert resp.status_code == 200
+        assert resp.json()["paper_capital"] == 25000.0
+        assert resp.json()["paper_capital_pending"] == 25000.0
+        assert svc.paper_capital == Decimal("10000")
+        assert store.events == []
+
+    async def test_same_capital_does_not_reset(self, db: FakeSystemDb, app: FastAPI) -> None:
+        svc, store = await _risk(db, recovered=True)
+        app.state.session_manager = _Manager(svc)
+        TestClient(app).put("/api/system/config", json={"paper_capital": 10000})
+        assert store.events == []
+        assert app.state.session_manager.reloads == 0
+
+    async def test_reload_failure_is_503_after_the_save(
+        self, db: FakeSystemDb, app: FastAPI
+    ) -> None:
+        svc, store = await _risk(db, recovered=True)
+        app.state.session_manager = _Manager(svc)
+        store.fail = True
+        resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "risk_reload_failed"
+        assert db.value("paper_capital") == 25000
+        assert svc.paper_capital == Decimal("10000")
+
+
+async def test_get_paper_capital_has_no_fallback(db: FakeSystemDb) -> None:
+    assert await system.get_paper_capital(db) == 10000.0
+    del db.config["paper_capital"]
+    with pytest.raises(Exception) as excinfo:
+        await system.get_paper_capital(db)
+    assert getattr(excinfo.value, "status_code", None) == 503
 
 
 # ---------------------------------------------------------------------------
@@ -343,166 +451,266 @@ class TestSystemHealth:
 
 
 # ---------------------------------------------------------------------------
-# Exchange connect / disconnect endpoints
+# Exchanges: state, key check, connect / disconnect
 # ---------------------------------------------------------------------------
 
 
+class FakeBinance:
+    """Stand-in for ``ccxt.async_support.binance``: the network boundary."""
+
+    error: ClassVar[BaseException | None] = None
+    instances: ClassVar[list[FakeBinance]] = []
+
+    def __init__(self, opts: dict[str, Any]) -> None:
+        self.opts = opts
+        self.closed = False
+        self.balance_calls = 0
+        FakeBinance.instances.append(self)
+
+    async def fetch_balance(self) -> dict[str, Any]:
+        self.balance_calls += 1
+        if FakeBinance.error is not None:
+            raise FakeBinance.error
+        return {"free": {"USDT": 12.5, "BTC": 0.0}}
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 @pytest.fixture()
-def credential_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    # encrypt() raises CredentialKeyError when this is unset
-    monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
+def binance(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinance]:
+    FakeBinance.error = None
+    FakeBinance.instances = []
+    monkeypatch.setattr(ccxt.async_support, "binance", FakeBinance)
+    return FakeBinance
 
 
-def _connected_app() -> tuple[FastAPI, AsyncMock]:
-    pool, conn = _make_mock_pool()
-    conn.execute = AsyncMock(return_value="INSERT 0 1")
-    return _make_app(pool=pool), conn
+def _connect(client: TestClient, exchange: str = "binance", **extra: str) -> Any:
+    return client.post(
+        f"/api/system/exchanges/{exchange}/connect",
+        json={"api_key": API_KEY, "api_secret": API_SECRET, **extra},
+    )
 
 
-@pytest.mark.usefixtures("credential_key")
+class TestExchanges:
+    def test_states_without_stored_keys(self, client: TestClient) -> None:
+        data = client.get("/api/system/exchanges").json()
+        assert [e["id"] for e in data] == ["binance", "bybit", "kraken", "okx"]
+        assert [e["supported"] for e in data] == [True, False, False, False]
+        for entry in data:
+            assert entry["credential_state"] == "missing"
+            assert entry["api_key_set"] is False
+            assert entry["connected"] is False
+            assert entry["last_sync"] is None
+
+    def test_env_keys_are_not_a_badge(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BINANCE_API_KEY", "from-env")
+        binance = client.get("/api/system/exchanges").json()[0]
+        assert binance["api_key_set"] is False
+        assert binance["connected"] is False
+
+    def test_validated_keys_are_connected_with_their_check_time(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        db.credentials["binance"] = {"validated_at": NOW}
+        binance = client.get("/api/system/exchanges").json()[0]
+        assert binance["credential_state"] == "ok"
+        assert binance["connected"] is True
+        assert binance["last_sync"] == "2026-10-20T12:00:00+00:00"
+
+    def test_never_validated_keys_are_not_connected(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        db.credentials["binance"] = {"validated_at": None}
+        binance = client.get("/api/system/exchanges").json()[0]
+        assert binance["credential_state"] == "ok"
+        assert binance["api_key_set"] is True
+        assert binance["connected"] is False
+        assert binance["last_sync"] is None
+
+    def test_undecryptable_keys_are_reported(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        db.credentials["bybit"] = {"validated_at": NOW}
+        app.state.exchange_credential_errors = {"bybit": "undecryptable"}
+        bybit = client.get("/api/system/exchanges").json()[1]
+        assert bybit["credential_state"] == "undecryptable"
+        assert bybit["connected"] is False
+
+    def test_db_error_is_503(self, db: FakeSystemDb, client: TestClient) -> None:
+        db.fail = OSError("db went away")
+        resp = client.get("/api/system/exchanges")
+        assert resp.status_code == 503
+
+    def test_no_pool_is_503(self, client_no_pool: TestClient) -> None:
+        assert client_no_pool.get("/api/system/exchanges").status_code == 503
+
+
+@pytest.mark.usefixtures("binance")
 class TestExchangeConnect:
-    def test_connect_exchange_success(self) -> None:
-        """POST connect encrypts, persists and returns success."""
-        app, conn = _connected_app()
-        client = TestClient(app)
-        resp = client.post(
-            "/api/system/exchanges/binance/connect",
-            json={"api_key": "key123", "api_secret": "secret456"},
-        )
+    def test_valid_keys_are_checked_then_stored_encrypted(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        resp = _connect(client)
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["id"] == "binance"
-        assert data["name"] == "Binance"
-        assert data["connected"] is True
-        assert "Successfully connected" in data["message"]
-        args = conn.execute.await_args.args
-        assert args[1] == "binance"
-        assert "key123" not in args[2:]
-        assert app.state.exchange_credentials["binance"]["api_key"] == "key123"
+        assert resp.json() == {
+            "id": "binance",
+            "name": "Binance",
+            "connected": True,
+            "message": "Binance keys verified and stored",
+            "validated_at": "2026-10-20T12:00:00+00:00",
+        }
+        [probe] = FakeBinance.instances
+        assert probe.balance_calls == 1
+        assert probe.closed is True
+        assert probe.opts["apiKey"] == API_KEY
+        assert probe.opts["secret"] == API_SECRET
+        assert probe.opts["sandbox"] is True
+        stored = db.credentials["binance"]
+        assert stored["encrypted_key"] != API_KEY
+        assert decrypt(stored["encrypted_key"]) == API_KEY
+        assert stored["validated_at"] == NOW
+        assert app.state.exchange_credentials["binance"]["api_key"] == API_KEY
 
-    def test_connect_exchange_with_passphrase(self) -> None:
-        """POST connect with optional passphrase."""
-        app, conn = _connected_app()
-        client = TestClient(app)
-        resp = client.post(
-            "/api/system/exchanges/okx/connect",
-            json={"api_key": "key", "api_secret": "secret", "passphrase": "pass123"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["id"] == "okx"
-        assert data["connected"] is True
-        assert conn.execute.await_args.args[4] is not None
+    def test_mainnet_when_testnet_is_off(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = system.current_config().model_copy(deep=True)
+        cfg.trading.testnet = False
+        monkeypatch.setattr(system, "current_config", lambda: cfg)
+        assert _connect(client).status_code == 200
+        assert "sandbox" not in FakeBinance.instances[0].opts
 
-    def test_connect_without_db_is_503_and_stores_nothing(self) -> None:
-        app = _make_app(pool=None)
-        resp = TestClient(app).post(
-            "/api/system/exchanges/binance/connect",
-            json={"api_key": "key", "api_secret": "secret"},
-        )
-        assert resp.status_code == 503
-        assert resp.json()["detail"]["state"] == "unavailable"
-        assert "binance" not in getattr(app.state, "exchange_credentials", {})
+    @pytest.mark.parametrize(
+        "error", [ccxt.AuthenticationError("bad key"), ccxt.PermissionDenied("no read")]
+    )
+    def test_rejected_keys_are_422_and_nothing_is_stored(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient, error: BaseException
+    ) -> None:
+        FakeBinance.error = error
+        resp = _connect(client)
+        assert resp.status_code == 422
+        assert _detail(resp)["code"] == "credentials_rejected"
+        assert _detail(resp)["state"] == "invalid"
+        assert str(error) not in resp.text
+        assert db.credentials == {}
+        assert not any(sql.startswith("INSERT") for sql in db.statements)
+        assert app.state.exchange_credentials == {}
+        assert FakeBinance.instances[0].closed is True
 
-    def test_connect_persist_failure_is_503_and_stores_nothing(self) -> None:
-        app, conn = _connected_app()
-        conn.execute = AsyncMock(side_effect=ConnectionResetError("db went away"))
-        resp = TestClient(app).post(
-            "/api/system/exchanges/binance/connect",
-            json={"api_key": "key", "api_secret": "secret"},
-        )
-        assert resp.status_code == 503
-        assert "Successfully" not in resp.text
-        assert "binance" not in getattr(app.state, "exchange_credentials", {})
+    @pytest.mark.parametrize(
+        "error",
+        [ccxt.NetworkError("dns"), ccxt.ExchangeNotAvailable("maintenance"), TimeoutError()],
+    )
+    def test_unreachable_exchange_is_502_and_nothing_is_stored(
+        self, db: FakeSystemDb, client: TestClient, error: BaseException
+    ) -> None:
+        FakeBinance.error = error
+        resp = _connect(client)
+        assert resp.status_code == 502
+        assert _detail(resp)["code"] == "exchange_unreachable"
+        assert db.credentials == {}
 
-    def test_connect_unknown_exchange_returns_404(self) -> None:
-        """POST connect with unknown exchange ID returns 404."""
-        app = _make_app(pool=None)
-        client = TestClient(app)
-        resp = client.post(
-            "/api/system/exchanges/unknown/connect",
-            json={"api_key": "key", "api_secret": "secret"},
-        )
+    def test_slow_exchange_times_out_as_unreachable(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        async def hang(self: FakeBinance) -> dict[str, Any]:
+            await asyncio.sleep(5)
+            return {}
+
+        monkeypatch.setattr(FakeBinance, "fetch_balance", hang)
+        monkeypatch.setattr(system, "CONNECT_TIMEOUT_S", 0.01)
+        resp = _connect(client)
+        assert resp.status_code == 502
+        assert db.credentials == {}
+
+    @pytest.mark.parametrize("exchange", ["bybit", "kraken", "okx"])
+    def test_other_exchanges_are_400_before_any_call(
+        self, db: FakeSystemDb, client: TestClient, exchange: str
+    ) -> None:
+        resp = _connect(client, exchange, passphrase=API_SECRET)
+        assert resp.status_code == 400
+        assert _detail(resp)["code"] == "unsupported_exchange"
+        assert FakeBinance.instances == []
+        assert db.credentials == {}
+
+    def test_unknown_exchange_is_404(self, client: TestClient) -> None:
+        resp = _connect(client, "unknown")
         assert resp.status_code == 404
-        assert resp.json()["detail"]["state"] == "not_found"
+        assert _detail(resp)["state"] == "not_found"
 
-    def test_disconnect_exchange_success(self) -> None:
-        """DELETE connect removes credentials."""
-        app, _ = _connected_app()
-        client = TestClient(app)
+    def test_no_db_is_503_before_the_exchange_call(self, client_no_pool: TestClient) -> None:
+        resp = _connect(client_no_pool)
+        assert resp.status_code == 503
+        assert FakeBinance.instances == []
+
+    def test_persist_failure_is_503_and_keeps_nothing(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        db.fail, db.fail_on = ConnectionResetError("db went away"), "INSERT"
+        resp = _connect(client)
+        assert resp.status_code == 503
+        assert "verified" not in resp.text
+        assert app.state.exchange_credentials == {}
+
+    def test_reconnect_evicts_the_cached_client(self, app: FastAPI, client: TestClient) -> None:
+        assert _connect(client).status_code == 200
+        assert client.get("/api/system/exchanges/binance/balance").json() == {
+            "exchange_id": "binance",
+            "balances": {"USDT": 12.5},
+        }
+        cached = app.state._exchange_clients["binance"]
         client.post(
             "/api/system/exchanges/binance/connect",
-            json={"api_key": "key", "api_secret": "secret"},
+            json={"api_key": "new-key", "api_secret": "new-secret"},
         )
+        assert "binance" not in app.state._exchange_clients
+        assert client.get("/api/system/exchanges/binance/balance").status_code == 200
+        assert app.state._exchange_clients["binance"] is not cached
+        assert FakeBinance.instances[-1].opts["apiKey"] == "new-key"
+
+    def test_connect_clears_an_undecryptable_report(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        app.state.exchange_credential_errors = {"binance": "undecryptable"}
+        assert _connect(client).status_code == 200
+        binance = client.get("/api/system/exchanges").json()[0]
+        assert binance["credential_state"] == "ok"
+        assert binance["connected"] is True
+
+    def test_disconnect_removes_keys(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        _connect(client)
         resp = client.delete("/api/system/exchanges/binance/connect")
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["connected"] is False
-        assert "Disconnected" in data["message"]
+        assert resp.json()["connected"] is False
+        assert db.credentials == {}
         assert "binance" not in app.state.exchange_credentials
+        binance = client.get("/api/system/exchanges").json()[0]
+        assert binance["credential_state"] == "missing"
 
-    def test_disconnect_delete_failure_is_503_and_keeps_credentials(self) -> None:
-        app, conn = _connected_app()
-        client = TestClient(app)
-        client.post(
-            "/api/system/exchanges/binance/connect",
-            json={"api_key": "key", "api_secret": "secret"},
-        )
-        conn.execute = AsyncMock(side_effect=OSError("db went away"))
+    def test_disconnect_delete_failure_is_503_and_keeps_keys(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        _connect(client)
+        db.fail, db.fail_on = OSError("db went away"), "DELETE"
         resp = client.delete("/api/system/exchanges/binance/connect")
         assert resp.status_code == 503
         assert "binance" in app.state.exchange_credentials
 
-    def test_disconnect_unknown_exchange_returns_404(self) -> None:
-        """DELETE connect with unknown exchange returns 404."""
-        app = _make_app(pool=None)
-        client = TestClient(app)
-        resp = client.delete("/api/system/exchanges/unknown/connect")
+    def test_disconnect_unknown_exchange_is_404(self, client: TestClient) -> None:
+        assert client.delete("/api/system/exchanges/unknown/connect").status_code == 404
+
+    def test_balance_for_unsupported_exchange_is_400(self, client: TestClient) -> None:
+        resp = client.get("/api/system/exchanges/bybit/balance")
+        assert resp.status_code == 400
+
+    def test_balance_without_keys_is_404(self, client: TestClient) -> None:
+        resp = client.get("/api/system/exchanges/binance/balance")
         assert resp.status_code == 404
-
-    def test_connect_reflects_in_exchanges_list(self) -> None:
-        """After connecting, GET exchanges shows the exchange as connected."""
-        env = {
-            "BINANCE_API_KEY": "",
-            "BYBIT_API_KEY": "",
-            "KRAKEN_API_KEY": "",
-            "OKX_API_KEY": "",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            app, conn = _connected_app()
-            conn.fetchval = AsyncMock(return_value=1)
-            client = TestClient(app)
-            client.post(
-                "/api/system/exchanges/binance/connect",
-                json={"api_key": "key", "api_secret": "secret"},
-            )
-            resp = client.get("/api/system/exchanges")
-            assert resp.status_code == 200
-            data = resp.json()
-            binance = next(e for e in data if e["id"] == "binance")
-            assert binance["api_key_set"] is True
-            assert binance["connected"] is True
-
-    def test_disconnect_reflects_in_exchanges_list(self) -> None:
-        """After disconnecting, GET exchanges shows the exchange as disconnected."""
-        env = {
-            "BINANCE_API_KEY": "",
-            "BYBIT_API_KEY": "",
-            "KRAKEN_API_KEY": "",
-            "OKX_API_KEY": "",
-        }
-        with patch.dict("os.environ", env, clear=False):
-            app, conn = _connected_app()
-            conn.fetchval = AsyncMock(return_value=1)
-            client = TestClient(app)
-            client.post(
-                "/api/system/exchanges/binance/connect",
-                json={"api_key": "key", "api_secret": "secret"},
-            )
-            client.delete("/api/system/exchanges/binance/connect")
-            resp = client.get("/api/system/exchanges")
-            assert resp.status_code == 200
-            data = resp.json()
-            binance = next(e for e in data if e["id"] == "binance")
-            assert binance["api_key_set"] is False
-            assert binance["connected"] is False
+        assert _detail(resp)["code"] == "credentials_not_found"

@@ -7,7 +7,6 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
-import { ErrorCard } from '@/components/ui/ErrorCard';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
@@ -19,21 +18,27 @@ import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDial
 
 /* ---------- Types ---------- */
 
+type CredentialState = 'ok' | 'undecryptable' | 'missing';
+
 interface Exchange {
   id: string;
   name: string;
   logo: string;
+  supported: boolean;
   connected: boolean;
   apiKeySet: boolean;
-  lastSync: string;
+  credentialState: CredentialState;
+  validatedAt: string | null;
 }
 
 interface ApiExchange {
   id: string;
   name: string;
+  supported: boolean;
   connected: boolean;
   api_key_set: boolean;
-  last_sync: string;
+  credential_state: CredentialState;
+  last_sync: string | null;
 }
 
 interface PlatformConfig {
@@ -42,6 +47,7 @@ interface PlatformConfig {
   default_timeframe: string;
   max_concurrent_strategies: number;
   paper_capital: number;
+  paper_capital_pending: number | null;
   webhook_secret_set: boolean;
   discord_webhook_url_set: boolean;
   slack_webhook_url_set: boolean;
@@ -108,11 +114,26 @@ function mapApiExchanges(data: ApiExchange[]): Exchange[] {
     id: e.id,
     name: e.name,
     logo: logoMap[e.id] || e.name[0],
+    supported: e.supported,
     connected: e.connected,
     apiKeySet: e.api_key_set,
-    lastSync: e.last_sync,
+    credentialState: e.credential_state,
+    validatedAt: e.last_sync,
   }));
 }
+
+function validationText(exchange: Exchange): string {
+  if (!exchange.supported) return 'Not supported yet (Binance only)';
+  if (exchange.credentialState === 'undecryptable') return 'Stored keys cannot be decrypted';
+  if (!exchange.validatedAt) return exchange.apiKeySet ? 'Never validated' : 'Not connected';
+  return `Validated ${new Date(exchange.validatedAt).toLocaleString()}`;
+}
+
+const CREDENTIAL_LABELS: Record<CredentialState, string> = {
+  ok: 'Stored (encrypted)',
+  undecryptable: 'Undecryptable, enter the keys again',
+  missing: 'Not set',
+};
 
 const BACKOFF_STEPS = [30000, 60000, 120000, 300000];
 
@@ -122,12 +143,14 @@ export default function SettingsPage() {
   const { toast } = useToast();
   const [exchanges, setExchanges] = useState<Exchange[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
+  const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
   const [tradingMode, setTradingMode] = useState('paper');
-  const [defaultPair, setDefaultPair] = useState('btcusdt');
+  const [defaultPair, setDefaultPair] = useState('BTC/USDT');
   const [defaultTimeframe, setDefaultTimeframe] = useState('1h');
   const [maxStrategies, setMaxStrategies] = useState('5');
-  const [paperCapital, setPaperCapital] = useState('10000');
+  const [paperCapital, setPaperCapital] = useState('');
+  const [savedPaperCapital, setSavedPaperCapital] = useState<number | null>(null);
+  const [pendingPaperCapital, setPendingPaperCapital] = useState<number | null>(null);
   // null = unknown: the risk config could not be read
   const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
   const [notifications, setNotifications] = useState<Record<string, boolean> | null>(null);
@@ -175,17 +198,19 @@ export default function SettingsPage() {
     await Promise.all([
       fetchApi<ApiExchange[]>('/api/system/exchanges')
         .then((ex) => setExchanges(mapApiExchanges(ex)))
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, exchanges: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, exchanges: err ?? true })); }),
       fetchApi<PlatformConfig>('/api/system/config')
         .then((cfg) => {
           setTradingMode(cfg.trading_mode);
           setDefaultPair(cfg.default_pair);
           setDefaultTimeframe(cfg.default_timeframe);
           setMaxStrategies(cfg.max_concurrent_strategies.toString());
-          if (cfg.paper_capital) setPaperCapital(cfg.paper_capital.toString());
+          setPaperCapital(cfg.paper_capital.toString());
+          setSavedPaperCapital(cfg.paper_capital);
+          setPendingPaperCapital(cfg.paper_capital_pending);
           applySecretsSet(cfg);
         })
-        .catch(() => { setFetchErrors((prev) => ({ ...prev, config: true })); }),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, config: err ?? true })); }),
       fetchApi<RiskConfig>('/api/risk/config')
         .then((risk) => setKillSwitchActive(risk.kill_switch_active))
         .catch((err) => {
@@ -248,7 +273,7 @@ export default function SettingsPage() {
         [exchangeId]: {
           ...(prev[exchangeId] || { balances: null, orders: null, positions: null }),
           status: 'retrying',
-          error: err instanceof Error ? err.message : 'Connection failed',
+          error: describeApiError(err, 'Connection failed'),
         },
       }));
 
@@ -291,18 +316,36 @@ export default function SettingsPage() {
   };
 
   const handleSaveConfig = async () => {
+    const capital = Number(paperCapital);
+    if (
+      savedPaperCapital !== null &&
+      capital !== savedPaperCapital &&
+      !confirm(
+        `Change paper capital from ${savedPaperCapital} to ${capital} USDT?\n\n` +
+          'The paper account ledger is reset to the new capital (audited): peak, day start and ' +
+          'carried PnL are rebased. Circuit breaker tiers are not cleared.',
+      )
+    ) {
+      return;
+    }
     try {
-      await fetchApi('/api/system/config', {
+      const cfg = await fetchApi<PlatformConfig>('/api/system/config', {
         method: 'PUT',
         body: JSON.stringify({
           trading_mode: tradingMode,
           default_pair: defaultPair,
           default_timeframe: defaultTimeframe,
           max_concurrent_strategies: Number(maxStrategies),
-          paper_capital: Number(paperCapital),
+          paper_capital: capital,
         }),
       });
-      toast('success', 'Platform configuration saved');
+      setSavedPaperCapital(cfg.paper_capital);
+      setPendingPaperCapital(cfg.paper_capital_pending);
+      if (typeof cfg.paper_capital_pending === 'number') {
+        toast('warning', 'Saved. The paper ledger switches to the new capital once every held position has a price');
+      } else {
+        toast('success', 'Platform configuration saved');
+      }
     } catch (err) {
       logger.error('Settings', 'Failed to save config', err);
       toast('error', describeApiError(err, 'Failed to save configuration'));
@@ -363,7 +406,7 @@ export default function SettingsPage() {
       {/* Exchange connections */}
       <DataCard title="Exchange Connections" description="Manage your exchange API connections">
         {fetchErrors.exchanges ? (
-          <ErrorCard message="Failed to load exchange connections" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.exchanges} fallback="Failed to load exchange connections" onRetry={loadData} />
         ) : loading ? (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -402,8 +445,8 @@ export default function SettingsPage() {
                           <h4 className="text-sm font-semibold text-text-primary">
                             {exchange.name}
                           </h4>
-                          <p className="mt-0.5 text-xs text-text-muted">
-                            Last sync: {exchange.lastSync}
+                          <p className="mt-0.5 text-xs text-text-muted" data-testid={`validation-${exchange.id}`}>
+                            {validationText(exchange)}
                           </p>
                         </div>
                       </div>
@@ -417,8 +460,11 @@ export default function SettingsPage() {
                       </div>
                     </div>
                     <div className="mt-3 flex items-center justify-between">
-                      <span className="text-xs text-text-muted">
-                        API Key: {exchange.apiKeySet ? 'Configured' : 'Not set'}
+                      <span className="flex items-center gap-2 text-xs text-text-muted">
+                        API Key: {CREDENTIAL_LABELS[exchange.credentialState]}
+                        {exchange.credentialState === 'undecryptable' && (
+                          <DataStateBadge state="invalid" reason="HYDRA_CREDENTIAL_KEY cannot decrypt the stored keys" />
+                        )}
                       </span>
                       <div className="flex items-center gap-2">
                         {exchange.connected && (
@@ -434,6 +480,7 @@ export default function SettingsPage() {
                         <Button
                           variant={exchange.connected ? 'ghost' : 'outline'}
                           size="sm"
+                          disabled={!exchange.supported}
                           onClick={() => {
                             setSelectedExchange(exchange);
                             setModalOpen(true);
@@ -763,7 +810,7 @@ export default function SettingsPage() {
       {/* Platform config */}
       <DataCard title="Platform Configuration" description="General platform settings">
         {fetchErrors.config ? (
-          <ErrorCard message="Failed to load platform configuration" onRetry={loadData} />
+          <DataStateErrorCard error={fetchErrors.config} fallback="Failed to load platform configuration" onRetry={loadData} />
         ) : loading ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             {Array.from({ length: 5 }).map((_, i) => (
@@ -776,9 +823,8 @@ export default function SettingsPage() {
               <Select
                 label="Default Trading Pair"
                 options={[
-                  { value: 'btcusdt', label: 'BTC/USDT' },
-                  { value: 'ethusdt', label: 'ETH/USDT' },
-                  { value: 'btcusd', label: 'BTC/USD' },
+                  { value: 'BTC/USDT', label: 'BTC/USDT' },
+                  { value: 'ETH/USDT', label: 'ETH/USDT' },
                 ]}
                 value={defaultPair}
                 onChange={(e) => setDefaultPair(e.target.value)}
@@ -814,7 +860,11 @@ export default function SettingsPage() {
                 type="number"
                 value={paperCapital}
                 onChange={(e) => setPaperCapital(e.target.value)}
-                hint="Starting balance for paper trading sessions"
+                hint={
+                  pendingPaperCapital !== null
+                    ? `Pending: the paper ledger moves to ${pendingPaperCapital} USDT once every held position has a price`
+                    : 'Capital of the paper account; changing it resets the paper ledger (audited)'
+                }
               />
             </div>
             <div className="mt-4 flex items-center justify-end gap-3">

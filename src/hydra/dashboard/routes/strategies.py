@@ -627,10 +627,8 @@ async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
                 result["performance"] = _performance_from_row(rows[0] if rows else None)
             return result
 
-    # No YAML: the strategy may only exist in trading-session history
-    pool = _pool_from_request(request)
-    if pool is None:
-        raise _strategy_not_found(strategy_id)
+    # No YAML: the strategy may only exist in trading-session history, which needs the DB
+    pool = require_pool(request)
     async with db_errors_to_503("loading the strategy"), pool.acquire() as conn:
         row = await conn.fetchrow(
             _STRATEGIES_QUERY + " HAVING ts.strategy_id = $1",

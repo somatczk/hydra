@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { ArrowUpDown, Eye, OctagonX, Shield, Zap } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
@@ -83,14 +83,15 @@ interface CircuitBreaker {
   label: string;
   threshold: string;
   current_value: number;
-  status: string;
+  status: 'Normal' | 'Warning' | 'Tripped';
 }
 
 interface RiskStatus {
   current_drawdown: number;
   max_drawdown_limit: number;
-  daily_loss: number;
-  daily_loss_limit: number;
+  /** null until the RiskService has marked the account today */
+  daily_loss: number | null;
+  daily_loss_limit: number | null;
   circuit_breakers: CircuitBreaker[] | null;
 }
 
@@ -105,6 +106,25 @@ interface OrderBook {
 }
 
 const ORDER_BOOK_MAX_AGE_MS = 15_000;
+
+/** Cross-origin TradingView widget: no third-party script runs in this origin (DB-17). */
+export function tradingViewSrc(theme: 'dark' | 'light'): string {
+  const params = new URLSearchParams({
+    symbol: 'BINANCE:BTCUSDT',
+    interval: '60',
+    theme,
+    style: '1',
+    locale: 'en',
+    timezone: 'Etc/UTC',
+  });
+  return `https://s.tradingview.com/widgetembed/?${params.toString()}`;
+}
+
+function bookMid(book: OrderBook | null): number | null {
+  const bid = book?.bids[0]?.[0];
+  const ask = book?.asks[0]?.[0];
+  return bid !== undefined && ask !== undefined ? (bid + ask) / 2 : null;
+}
 
 function fmtTime(d: Date): string {
   return d.toLocaleTimeString('en-GB', { hour12: false });
@@ -246,8 +266,9 @@ export default function TradingPage() {
   const [bookReceivedAt, setBookReceivedAt] = useState<Date | null>(null);
   const [fundingRate, setFundingRate] = useState<FundingRate | null>(null);
 
-  // Quick trade form state
-  const [qtSymbol, setQtSymbol] = useState('BTCUSDT');
+  // Quick trade form state: orders always target one running paper session
+  const [qtSessionId, setQtSessionId] = useState('');
+  const [qtSymbol, setQtSymbol] = useState('');
   const [qtSide, setQtSide] = useState<'buy' | 'sell'>('buy');
   const [qtQuantity, setQtQuantity] = useState('');
   const [qtOrderType, setQtOrderType] = useState('market');
@@ -257,7 +278,6 @@ export default function TradingPage() {
   const [qtSubmitting, setQtSubmitting] = useState(false);
 
   const { resolved: themeResolved } = useTheme();
-  const widgetContainerRef = useRef<HTMLDivElement>(null);
 
   const refreshOrderBook = useCallback(
     () =>
@@ -279,21 +299,35 @@ export default function TradingPage() {
     setLoading(true);
     setFetchErrors({});
 
-    const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config')
-      .catch(() => ({ trading_mode: 'paper' }));
-    const source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    // No guessed source: without the platform config, source-specific widgets show why
+    let source: 'live' | 'paper' | null = null;
+    let configError: unknown = null;
+    try {
+      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config');
+      source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+    } catch (err) {
+      logger.warn('Trading', 'Trading mode unknown; portfolio data not requested', err);
+      configError = err ?? true;
+    }
     const qs = `?source=${source}`;
 
     await Promise.all([
-      fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
-        .then((data) => setOpenPositions(mapApiPositions(data)))
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
-      fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
-        .then((data) => {
-          const trades = Array.isArray(data) ? data : (data.trades ?? []);
-          setRecentTrades(mapApiTrades(trades));
-        })
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, trades: err ?? true })); }),
+      ...(source === null
+        ? []
+        : [
+            fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
+              .then((data) => setOpenPositions(mapApiPositions(data)))
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
+            fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
+              .then((data) => {
+                const trades = Array.isArray(data) ? data : (data.trades ?? []);
+                setRecentTrades(mapApiTrades(trades));
+              })
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, trades: err ?? true })); }),
+            fetchApi<RiskStatus>(`/api/risk/status${qs}`)
+              .then(setRiskStatus)
+              .catch((err) => { setFetchErrors((prev) => ({ ...prev, riskStatus: err ?? true })); }),
+          ]),
       fetchApi<TradingSession[]>('/api/trading/sessions')
         .then((data) => setSessions(data.filter((s) => s.status === 'running')))
         .catch((err) => { setFetchErrors((prev) => ({ ...prev, sessions: err ?? true })); }),
@@ -307,15 +341,20 @@ export default function TradingPage() {
       fetchApi<CircuitBreaker[]>('/api/risk/circuit-breakers')
         .then((data) => { setCircuitBreakers(data); setCbError(null); })
         .catch((err) => { setCircuitBreakers(null); setCbError(err); }),
-      fetchApi<RiskStatus>(`/api/risk/status${qs}`)
-        .then(setRiskStatus)
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, riskStatus: err ?? true })); }),
       refreshOrderBook(),
       fetchApi<FundingRate[]>('/api/market/funding-rates/current?symbol=BTCUSDT')
         .then((arr) => setFundingRate(arr?.[0] ?? null))
         .catch((err) => { setFetchErrors((prev) => ({ ...prev, fundingRate: err ?? true })); }),
     ]);
 
+    if (configError !== null) {
+      setFetchErrors((prev) => ({
+        ...prev,
+        positions: configError,
+        trades: configError,
+        riskStatus: configError,
+      }));
+    }
     setLoading(false);
   }, [refreshOrderBook]);
 
@@ -331,38 +370,26 @@ export default function TradingPage() {
     return () => clearInterval(interval);
   }, [refreshOrderBook]);
 
-  useEffect(() => {
-    const container = widgetContainerRef.current;
-    if (!container) return;
-
-    const script = document.createElement('script');
-    script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
-    script.type = 'text/javascript';
-    script.async = true;
-    script.innerHTML = JSON.stringify({
-      autosize: true,
-      symbol: 'BINANCE:BTCUSDT',
-      interval: '60',
-      timezone: 'Etc/UTC',
-      theme: themeResolved === 'dark' ? 'dark' : 'light',
-      style: '1',
-      locale: 'en',
-      allow_symbol_change: true,
-      support_host: 'https://www.tradingview.com',
-    });
-
-    container.appendChild(script);
-
-    return () => {
-      container.innerHTML = '';
-    };
-  }, [themeResolved]);
-
+  // Unknown state only offers activation: it is the fail-safe direction.
   const handleToggleKillSwitch = async () => {
+    let releaseReason = '';
+    if (killSwitchActive !== true) {
+      if (!confirm('ACTIVATE KILL SWITCH?\n\nThis will immediately stop ALL trading sessions. Are you sure?')) return;
+    } else {
+      if (window.prompt('Type RELEASE to allow trading to resume') !== 'RELEASE') return;
+      releaseReason = (window.prompt('Reason for releasing the kill switch (audited)') ?? '').trim();
+      if (releaseReason.length < 3) {
+        toast('error', 'A reason of at least 3 characters is required to release the kill switch');
+        return;
+      }
+    }
     setKillSwitchLoading(true);
     try {
       if (killSwitchActive === true) {
-        await fetchApi('/api/trading/kill-switch', { method: 'DELETE' });
+        await fetchApi('/api/trading/kill-switch', {
+          method: 'DELETE',
+          body: JSON.stringify({ confirm: 'RELEASE', reason: releaseReason }),
+        });
         setKillSwitchActive(false);
         toast('success', 'Kill switch deactivated');
       } else {
@@ -379,41 +406,67 @@ export default function TradingPage() {
   };
 
   const handleQuickTrade = async () => {
-    if (!qtQuantity) {
-      toast('error', 'Quantity is required');
+    const session = paperSessions.find((s) => s.session_id === qtSessionId);
+    if (!session) {
+      toast('error', 'Select a running paper session');
       return;
     }
+    const symbol = qtSymbol || session.symbols[0];
+    const quantity = Number(qtQuantity);
+    if (!qtQuantity || !(quantity > 0)) {
+      toast('error', 'Quantity must be greater than 0');
+      return;
+    }
+    const price = qtOrderType === 'limit' ? Number(qtPrice) : null;
+    if (qtOrderType === 'limit' && !(price !== null && price > 0)) {
+      toast('error', 'A limit order needs a price greater than 0');
+      return;
+    }
+    const unitPrice = price ?? (symbol === orderBook?.symbol ? bookMid(orderBook) : null);
+    const notional = unitPrice !== null
+      ? `$${(unitPrice * quantity).toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+      : 'unknown';
+    const strategy = session.strategy_name || session.strategy_id;
+    if (!confirm(
+      `PAPER ORDER\n\nSession: ${strategy} (${session.session_id})\n` +
+      `${qtSide.toUpperCase()} ${quantity} ${symbol} ${qtOrderType.toUpperCase()}` +
+      `${price !== null ? ` @ ${price}` : ''}\nEstimated notional: ${notional}` +
+      `${qtStopLoss ? `\nStop loss: ${qtStopLoss}` : ''}${qtTakeProfit ? `\nTake profit: ${qtTakeProfit}` : ''}`,
+    )) return;
+
     setQtSubmitting(true);
     try {
       const payload: Record<string, unknown> = {
-        symbol: qtSymbol,
+        session_id: session.session_id,
+        symbol,
         side: qtSide,
-        quantity: parseFloat(qtQuantity),
+        quantity,
         order_type: qtOrderType,
       };
-      if (qtOrderType === 'limit' && qtPrice) payload.price = parseFloat(qtPrice);
-      if (qtTakeProfit) payload.take_profit = parseFloat(qtTakeProfit);
-      if (qtStopLoss) payload.stop_loss = parseFloat(qtStopLoss);
+      if (price !== null) payload.price = price;
+      if (qtTakeProfit) payload.take_profit = Number(qtTakeProfit);
+      if (qtStopLoss) payload.stop_loss = Number(qtStopLoss);
 
       await fetchApi('/api/trading/quick-trade', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      toast('success', `${qtSide.toUpperCase()} order placed for ${qtQuantity} ${qtSymbol}`);
+      toast('success', `PAPER ${qtSide.toUpperCase()} order placed for ${quantity} ${symbol}`);
       setQtQuantity('');
       setQtPrice('');
       setQtTakeProfit('');
       setQtStopLoss('');
     } catch (err) {
       logger.error('Trading', 'Quick trade failed', err);
-      toast('error', 'Failed to place order');
+      toast('error', describeApiError(err, 'Failed to place order'));
     } finally {
       setQtSubmitting(false);
     }
   };
 
   const runningSessions = sessions.filter((s) => s.status === 'running');
+  const paperSessions = runningSessions.filter((s) => s.trading_mode === 'paper');
+  const qtSession = paperSessions.find((s) => s.session_id === qtSessionId) ?? null;
 
   return (
     <div className="flex flex-col gap-6">
@@ -471,20 +524,26 @@ export default function TradingPage() {
               <div>
                 <p className="text-sm font-medium text-text-primary">Daily PnL vs Limit</p>
                 <p className="text-xs text-text-muted">
-                  Loss: ${Math.abs(riskStatus.daily_loss).toFixed(2)} / Limit: ${riskStatus.daily_loss_limit.toFixed(2)}
+                  {riskStatus.daily_loss !== null && riskStatus.daily_loss_limit !== null
+                    ? `Loss: $${riskStatus.daily_loss.toFixed(2)} / Limit: $${riskStatus.daily_loss_limit.toFixed(2)}`
+                    : 'Not measured yet: the account has no price mark today'}
                 </p>
               </div>
-              <div className="flex items-center gap-2">
-                <div className="w-32 h-2 rounded-full bg-bg-tertiary overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-status-error transition-all"
-                    style={{ width: `${Math.min((Math.abs(riskStatus.daily_loss) / (riskStatus.daily_loss_limit || 1)) * 100, 100)}%` }}
-                  />
+              {riskStatus.daily_loss !== null && riskStatus.daily_loss_limit !== null ? (
+                <div className="flex items-center gap-2">
+                  <div className="w-32 h-2 rounded-full bg-bg-tertiary overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-status-error transition-all"
+                      style={{ width: `${Math.min((riskStatus.daily_loss / (riskStatus.daily_loss_limit || 1)) * 100, 100)}%` }}
+                    />
+                  </div>
+                  <span className="text-xs text-text-muted">
+                    {((riskStatus.daily_loss / (riskStatus.daily_loss_limit || 1)) * 100).toFixed(0)}%
+                  </span>
                 </div>
-                <span className="text-xs text-text-muted">
-                  {((Math.abs(riskStatus.daily_loss) / (riskStatus.daily_loss_limit || 1)) * 100).toFixed(0)}%
-                </span>
-              </div>
+              ) : (
+                <DataStateBadge state="unknown" reason="No price mark yet today" />
+              )}
             </div>
           )}
 
@@ -504,8 +563,8 @@ export default function TradingPage() {
                 <div key={cb.tier} className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
                   <div className="flex items-center gap-3">
                     <StatusBadge
-                      status={cb.status === 'tripped' ? 'Tripped' : 'OK'}
-                      variant={cb.status === 'tripped' ? 'error' : 'success'}
+                      status={cb.status}
+                      variant={cb.status === 'Tripped' ? 'error' : cb.status === 'Warning' ? 'warning' : 'success'}
                       size="sm"
                     />
                     <div>
@@ -584,85 +643,105 @@ export default function TradingPage() {
       )}
 
       {/* Quick Trade */}
-      <DataCard title="Quick Trade">
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <Input
-            label="Symbol"
-            value={qtSymbol}
-            onChange={(e) => setQtSymbol(e.target.value)}
-            placeholder="BTCUSDT"
-          />
-          <div className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-text-secondary">Side</span>
-            <div className="flex gap-2">
+      <DataCard title="Quick Trade" description="Paper only: a manual order inside one running paper session, risk-checked like the strategy's own orders">
+        {paperSessions.length === 0 ? (
+          <p className="text-sm text-text-muted">Start a paper session to place manual orders.</p>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Select
+              label="Session"
+              value={qtSessionId}
+              onChange={(e) => { setQtSessionId(e.target.value); setQtSymbol(''); }}
+              placeholder="Select a paper session"
+              options={paperSessions.map((s) => ({
+                value: s.session_id,
+                label: `PAPER · ${s.strategy_name || s.strategy_id}`,
+              }))}
+            />
+            <Select
+              label="Symbol"
+              value={qtSymbol || qtSession?.symbols[0] || ''}
+              onChange={(e) => setQtSymbol(e.target.value)}
+              disabled={!qtSession}
+              options={(qtSession?.symbols ?? []).map((sym) => ({ value: sym, label: sym }))}
+            />
+            <div className="flex flex-col gap-1.5">
+              <span className="text-sm font-medium text-text-secondary">Side</span>
+              <div className="flex gap-2">
+                <Button
+                  variant={qtSide === 'buy' ? 'primary' : 'outline'}
+                  size="sm"
+                  className={qtSide === 'buy' ? 'bg-status-success hover:bg-status-success/90' : ''}
+                  onClick={() => setQtSide('buy')}
+                >
+                  Buy
+                </Button>
+                <Button
+                  variant={qtSide === 'sell' ? 'danger' : 'outline'}
+                  size="sm"
+                  onClick={() => setQtSide('sell')}
+                >
+                  Sell
+                </Button>
+              </div>
+            </div>
+            <Input
+              label="Quantity"
+              type="number"
+              min="0"
+              value={qtQuantity}
+              onChange={(e) => setQtQuantity(e.target.value)}
+              placeholder="0.001"
+            />
+            <Select
+              label="Order Type"
+              value={qtOrderType}
+              onChange={(e) => setQtOrderType(e.target.value)}
+              options={[
+                { value: 'market', label: 'Market' },
+                { value: 'limit', label: 'Limit' },
+              ]}
+            />
+            {qtOrderType === 'limit' && (
+              <Input
+                label="Price"
+                type="number"
+                min="0"
+                value={qtPrice}
+                onChange={(e) => setQtPrice(e.target.value)}
+                placeholder="65000"
+              />
+            )}
+            <Input
+              label="Take Profit"
+              type="number"
+              min="0"
+              value={qtTakeProfit}
+              onChange={(e) => setQtTakeProfit(e.target.value)}
+              placeholder="Optional"
+            />
+            <Input
+              label="Stop Loss"
+              type="number"
+              min="0"
+              value={qtStopLoss}
+              onChange={(e) => setQtStopLoss(e.target.value)}
+              placeholder="Optional"
+            />
+            <div className="flex items-end">
               <Button
-                variant={qtSide === 'buy' ? 'primary' : 'outline'}
-                size="sm"
-                className={qtSide === 'buy' ? 'bg-status-success hover:bg-status-success/90' : ''}
-                onClick={() => setQtSide('buy')}
+                variant={qtSide === 'buy' ? 'primary' : 'danger'}
+                fullWidth
+                onClick={handleQuickTrade}
+                loading={qtSubmitting}
+                disabled={!qtSession}
               >
-                Buy
-              </Button>
-              <Button
-                variant={qtSide === 'sell' ? 'danger' : 'outline'}
-                size="sm"
-                onClick={() => setQtSide('sell')}
-              >
-                Sell
+                <Zap className="h-4 w-4" />
+                Review {qtSide === 'buy' ? 'Buy' : 'Sell'}
               </Button>
             </div>
           </div>
-          <Input
-            label="Quantity"
-            type="number"
-            value={qtQuantity}
-            onChange={(e) => setQtQuantity(e.target.value)}
-            placeholder="0.001"
-          />
-          <Select
-            label="Order Type"
-            value={qtOrderType}
-            onChange={(e) => setQtOrderType(e.target.value)}
-            options={[
-              { value: 'market', label: 'Market' },
-              { value: 'limit', label: 'Limit' },
-            ]}
-          />
-          {qtOrderType === 'limit' && (
-            <Input
-              label="Price"
-              type="number"
-              value={qtPrice}
-              onChange={(e) => setQtPrice(e.target.value)}
-              placeholder="65000"
-            />
-          )}
-          <Input
-            label="Take Profit"
-            type="number"
-            value={qtTakeProfit}
-            onChange={(e) => setQtTakeProfit(e.target.value)}
-            placeholder="Optional"
-          />
-          <Input
-            label="Stop Loss"
-            type="number"
-            value={qtStopLoss}
-            onChange={(e) => setQtStopLoss(e.target.value)}
-            placeholder="Optional"
-          />
-          <div className="flex items-end">
-            <Button
-              variant={qtSide === 'buy' ? 'primary' : 'danger'}
-              fullWidth
-              onClick={handleQuickTrade}
-              loading={qtSubmitting}
-            >
-              <Zap className="h-4 w-4" />
-              {qtSide === 'buy' ? 'Buy' : 'Sell'} {qtSymbol}
-            </Button>
-          </div>
-        </div>
+        )}
       </DataCard>
 
       {/* Order Book */}
@@ -727,10 +806,16 @@ export default function TradingPage() {
       ) : null}
 
       {/* Candlestick chart */}
-      <DataCard title="BTC/USDT" description="Live price chart">
-        <div className="tradingview-widget-container h-[28rem] md:h-[36rem] w-full" ref={widgetContainerRef}>
-          <div className="tradingview-widget-container__widget h-full w-full" />
-        </div>
+      <DataCard title="BTC/USDT" description="TradingView chart (Binance spot data from TradingView, not Hydra's stored bars)">
+        <iframe
+          key={themeResolved}
+          title="TradingView BTC/USDT chart"
+          src={tradingViewSrc(themeResolved === 'dark' ? 'dark' : 'light')}
+          className="h-[28rem] md:h-[36rem] w-full rounded-lg border-0"
+          sandbox="allow-scripts allow-same-origin allow-popups"
+          referrerPolicy="no-referrer"
+          loading="lazy"
+        />
       </DataCard>
 
       {/* Open positions */}

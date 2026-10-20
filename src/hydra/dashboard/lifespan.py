@@ -11,7 +11,6 @@ exchange clients of every session (the paper smoke test injects its fakes there)
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -141,9 +140,9 @@ async def _load_exchange_credentials(app: FastAPI) -> None:
 
 
 async def _load_system_config(app: FastAPI) -> None:
-    async with app.state.db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT key, value FROM system_config")
-    app.state.system_config = {row["key"]: json.loads(row["value"]) for row in rows}
+    from hydra.dashboard.routes.system import load_system_config
+
+    app.state.system_config = await load_system_config(app.state.db_pool)
 
 
 async def _init_session_manager(

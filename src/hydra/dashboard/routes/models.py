@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 
 from hydra.dashboard.deps import current_config
 from hydra.dashboard.routes._db import api_error
+from hydra.dashboard.security import Principal, audit
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)
@@ -219,53 +222,110 @@ async def get_model(model_id: str) -> dict[str, Any]:
     raise _model_not_found(model_id)
 
 
+MAX_MODEL_BYTES = 200 * 1024 * 1024
+_CHUNK_BYTES = 1024 * 1024
+
+
+def _check_onnx(path: Path) -> None:
+    """Load the file with onnxruntime; 422 when it is not a model it can run."""
+    try:
+        import onnxruntime as ort
+
+        ort.InferenceSession(str(path))
+    except Exception as exc:
+        logger.info("Rejected model upload: %s", exc)
+        raise api_error(
+            422, "invalid_onnx", "The file is not a valid ONNX model", "invalid"
+        ) from exc
+
+
+async def _spool(file: UploadFile, dest: Path) -> int:
+    """Stream the upload to *dest* in chunks; 413 (and nothing kept) above MAX_MODEL_BYTES."""
+    size = 0
+    with dest.open("wb") as out:
+        while chunk := await file.read(_CHUNK_BYTES):
+            size += len(chunk)
+            if size > MAX_MODEL_BYTES:
+                raise api_error(
+                    413,
+                    "model_too_large",
+                    f"Model files are limited to {MAX_MODEL_BYTES // (1024 * 1024)} MiB",
+                    "invalid",
+                    max_bytes=MAX_MODEL_BYTES,
+                )
+            out.write(chunk)
+    return size
+
+
 @router.post("/upload", response_model=ModelUploadResponse, status_code=201)
-async def upload_model(file: UploadFile) -> dict[str, Any]:
-    """Upload an ONNX model file. Validates it can be loaded by onnxruntime."""
+async def upload_model(file: UploadFile, request: Request, replace: bool = False) -> dict[str, Any]:
+    """Upload an ONNX model as Staging; an existing model is replaced only with ``replace=true``.
+
+    A Production model is never replaced by an upload: demote or roll it back first.
+    """
     if not file.filename or not file.filename.endswith(".onnx"):
         raise api_error(422, "invalid_file", "File must have .onnx extension", "invalid")
 
     # Sanitize filename — use only the basename to prevent path traversal
     safe_filename = Path(file.filename).name
-    _validate_model_id(safe_filename.removesuffix(".onnx"))
-
-    content = await file.read()
-    if len(content) == 0:
-        raise api_error(422, "invalid_file", "Empty file", "invalid")
-
-    # Validate ONNX by attempting to create an InferenceSession
-    try:
-        import onnxruntime as ort
-
-        ort.InferenceSession(content)
-    except Exception as exc:
-        raise api_error(422, "invalid_onnx", f"Invalid ONNX model: {exc}", "invalid") from exc
+    model_id = _validate_model_id(safe_filename.removesuffix(".onnx"))
 
     models_path = _models_dir()
-    models_path.mkdir(parents=True, exist_ok=True)
-
     dest = models_path / safe_filename
-    dest.write_bytes(content)
+    if dest.exists():
+        if _read_meta(dest).get("stage") == "Production":
+            raise api_error(
+                409,
+                "model_in_production",
+                f"Model '{model_id}' is in Production; demote or roll it back before replacing it",
+                "invalid",
+            )
+        if not replace:
+            raise api_error(
+                409,
+                "model_exists",
+                f"Model '{model_id}' already exists; upload again with replace=true to replace it",
+                "invalid",
+            )
 
-    model_id = dest.stem
+    models_path.mkdir(parents=True, exist_ok=True)
+    tmp = models_path / f".{safe_filename}.{uuid.uuid4().hex}.upload"
+    try:
+        size = await _spool(file, tmp)
+        if size == 0:
+            raise api_error(422, "invalid_file", "Empty file", "invalid")
+        _check_onnx(tmp)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    name = model_id.replace("_", " ").replace("-", " ").title()
     _write_meta(
         dest,
         {
-            "name": model_id.replace("_", " ").replace("-", " ").title(),
+            "name": name,
             "version": "v1.0.0",
             "stage": "Staging",
             "metrics": {},
             "last_trained": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         },
     )
+    principal = getattr(request.state, "principal", None)
+    audit(
+        principal if isinstance(principal, Principal) else None,
+        "model_uploaded",
+        model_id=model_id,
+        size=size,
+        replaced=replace,
+    )
 
     return {
         "id": model_id,
-        "name": model_id.replace("_", " ").replace("-", " ").title(),
+        "name": name,
         "file_name": file.filename,
-        "file_size": len(content),
+        "file_size": size,
         "stage": "Staging",
-        "message": f"Model '{model_id}' uploaded successfully",
+        "message": f"Model '{model_id}' uploaded",
     }
 
 

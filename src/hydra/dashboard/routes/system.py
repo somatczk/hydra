@@ -1,3 +1,5 @@
+"""Platform config (persisted in ``system_config``), exchange credentials, health, notifications."""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,13 +7,17 @@ import json
 import logging
 import os
 import time
-from typing import Any, Literal
+from datetime import datetime
+from typing import Any, Literal, cast
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
+from hydra.dashboard.deps import current_config
+from hydra.dashboard.routes._db import DB_ERRORS, api_error, db_errors_to_503, require_pool
+from hydra.dashboard.security import Principal, audit
+from hydra.risk.state import RiskStateUnavailableError
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 logger = logging.getLogger(__name__)
@@ -21,18 +27,27 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Exchange definitions: id -> (display name, env var prefix for API key)
-_EXCHANGE_DEFS: list[tuple[str, str, str]] = [
-    ("binance", "Binance", "BINANCE_API_KEY"),
-    ("bybit", "Bybit", "BYBIT_API_KEY"),
-    ("kraken", "Kraken", "KRAKEN_API_KEY"),
-    ("okx", "OKX", "OKX_API_KEY"),
-]
+# Exchange definitions: id -> display name; only Binance can be connected until P4 (decision 4)
+_EXCHANGE_DEFS: dict[str, str] = {
+    "binance": "Binance",
+    "bybit": "Bybit",
+    "kraken": "Kraken",
+    "okx": "OKX",
+}
+_SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance"})
+CONNECT_TIMEOUT_S = 10.0
+_RELOAD_ERRORS: tuple[type[BaseException], ...] = (RiskStateUnavailableError, *DB_ERRORS)
 
 TradingMode = Literal["paper", "live"]
-_TRADING_MODES: frozenset[str] = frozenset({"paper", "live"})
+CredentialState = Literal["ok", "undecryptable", "missing"]
+_SETTING_FIELDS: tuple[str, ...] = (
+    "trading_mode",
+    "default_pair",
+    "default_timeframe",
+    "max_concurrent_strategies",
+    "paper_capital",
+)
 _SECRET_FIELDS: tuple[str, ...] = ("webhook_secret", "discord_webhook_url", "slack_webhook_url")
-_DEFAULT_PAPER_CAPITAL = 10000.0
 
 # allowed host -> required path prefix
 _WEBHOOK_HOSTS: dict[str, str] = {
@@ -46,21 +61,29 @@ def _pool_from_request(request: Request) -> Any:
     return getattr(request.app.state, "db_pool", None)
 
 
-def _get_system_config(request: Request) -> dict[str, Any]:
-    """Return persisted system config from app state, if any."""
-    return getattr(request.app.state, "system_config", None) or {}
+def _principal(request: Request) -> Principal | None:
+    principal = getattr(request.state, "principal", None)
+    return principal if isinstance(principal, Principal) else None
 
 
-def _set_system_config(request: Request, config: dict[str, Any]) -> None:
-    """Persist system config to app state."""
-    request.app.state.system_config = config
+def _actor(request: Request) -> str:
+    principal = _principal(request)
+    return f"{principal.kind}:{principal.name}" if principal is not None else "anonymous"
 
 
 def _get_exchange_credentials(request: Request) -> dict[str, Any]:
     """Return exchange credentials store from app state."""
     if not hasattr(request.app.state, "exchange_credentials"):
         request.app.state.exchange_credentials = {}
-    return request.app.state.exchange_credentials
+    return cast(dict[str, Any], request.app.state.exchange_credentials)
+
+
+def _get_credential_errors(request: Request) -> dict[str, str]:
+    errors = getattr(request.app.state, "exchange_credential_errors", None)
+    if errors is None:
+        errors = {}
+        request.app.state.exchange_credential_errors = errors
+    return cast(dict[str, str], errors)
 
 
 def _validate_webhook_url(url: str, allowed_host: str) -> str:
@@ -85,43 +108,159 @@ def _validate_webhook_url(url: str, allowed_host: str) -> str:
     return url
 
 
-def _coerce_trading_mode(value: Any, origin: str) -> str:
-    if value in _TRADING_MODES:
-        return str(value)
-    logger.warning("Ignoring invalid trading_mode %r from %s; using 'paper'", value, origin)
-    return "paper"
+# ---------------------------------------------------------------------------
+# system_config persistence
+# ---------------------------------------------------------------------------
 
 
-def _env_config() -> dict[str, Any]:
-    max_strategies_raw = os.environ.get("HYDRA_MAX_STRATEGIES", "5")
+class StoredConfig(BaseModel):
+    """The persisted platform config; every non-secret key is a required row."""
+
+    trading_mode: TradingMode
+    default_pair: str = Field(min_length=1)
+    default_timeframe: str = Field(min_length=1)
+    max_concurrent_strategies: int = Field(ge=1, le=100)
+    paper_capital: float = Field(gt=0, allow_inf_nan=False)
+    webhook_secret: str = ""
+    discord_webhook_url: str = ""
+    slack_webhook_url: str = ""
+
+
+async def load_system_config(pool: Any) -> dict[str, Any]:
+    """All system_config rows, JSON-decoded, with the secret rows decrypted.
+
+    A secret the credential key cannot decrypt is left out (so it reads as not set and the
+    webhook fails closed) and logged; it has to be entered again in Settings.
+    """
+    from cryptography.fernet import InvalidToken
+
+    from hydra.core.encryption import decrypt
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM system_config")
+    config: dict[str, Any] = {}
+    for row in rows:
+        key = row["key"]
+        value = json.loads(row["value"]) if isinstance(row["value"], str) else row["value"]
+        if key in _SECRET_FIELDS:
+            try:
+                value = decrypt(str(value))
+            except InvalidToken:
+                logger.error(
+                    "system_config %s cannot be decrypted with HYDRA_CREDENTIAL_KEY; set it again "
+                    "in Settings",
+                    key,
+                )
+                continue
+        config[key] = value
+    return config
+
+
+def _validated(raw: dict[str, Any]) -> StoredConfig:
+    missing = [key for key in _SETTING_FIELDS if key not in raw]
+    if missing:
+        raise api_error(
+            503,
+            "system_config_missing",
+            f"system_config has no row for: {', '.join(missing)}",
+            "unavailable",
+            missing=missing,
+        )
     try:
-        max_strategies = int(max_strategies_raw)
-    except ValueError:
-        max_strategies = 5
-    return {
-        "trading_mode": _coerce_trading_mode(
-            os.environ.get("HYDRA_TRADING_MODE", "paper"), "HYDRA_TRADING_MODE"
-        ),
-        "default_pair": os.environ.get("HYDRA_DEFAULT_PAIR", "BTC/USDT"),
-        "default_timeframe": os.environ.get("HYDRA_DEFAULT_TIMEFRAME", "1h"),
-        "max_concurrent_strategies": max_strategies,
-        "paper_capital": _DEFAULT_PAPER_CAPITAL,
-        **dict.fromkeys(_SECRET_FIELDS, ""),
-    }
+        return StoredConfig.model_validate(raw)
+    except ValidationError as exc:
+        fields = sorted({str(err["loc"][0]) for err in exc.errors() if err.get("loc")})
+        raise api_error(
+            503,
+            "system_config_invalid",
+            f"system_config has invalid values for: {', '.join(fields)}",
+            "unavailable",
+            fields=fields,
+        ) from exc
 
 
-def _load_stored_config(request: Request) -> dict[str, Any]:
-    """Stored config (raw secrets included); env defaults fill missing keys."""
-    stored = {**_env_config(), **_get_system_config(request)}
-    stored["trading_mode"] = _coerce_trading_mode(stored["trading_mode"], "stored config")
-    return stored
+async def read_system_config(pool: Any) -> StoredConfig:
+    """The validated persisted config; 503 when a row is missing, invalid or unreadable."""
+    async with db_errors_to_503("reading system config"):
+        raw = await load_system_config(pool)
+    return _validated(raw)
 
 
-def _to_public(stored: dict[str, Any]) -> dict[str, Any]:
-    public = {k: v for k, v in stored.items() if k not in _SECRET_FIELDS}
+_UPSERT_SETTING = (
+    "INSERT INTO system_config (key, value, updated_at, updated_by) "
+    "VALUES ($1, $2::jsonb, now(), $3) "
+    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now(), "
+    "updated_by = EXCLUDED.updated_by"
+)
+
+
+async def _save_system_config(pool: Any, updates: dict[str, Any], actor: str) -> None:
+    """Upsert the given keys in one transaction; secrets are encrypted, '' deletes a secret."""
+    from hydra.core.encryption import CredentialKeyError, encrypt
+
+    try:
+        values = {
+            key: (encrypt(value) if key in _SECRET_FIELDS and value else value)
+            for key, value in updates.items()
+        }
+    except CredentialKeyError as exc:
+        raise api_error(
+            503,
+            "credential_key_unavailable",
+            "Secrets cannot be stored: HYDRA_CREDENTIAL_KEY is not configured",
+            "unavailable",
+        ) from exc
+    async with (
+        db_errors_to_503("saving system config"),
+        pool.acquire() as conn,
+        conn.transaction(),
+    ):
+        for key, value in values.items():
+            if key in _SECRET_FIELDS and value == "":
+                await conn.execute("DELETE FROM system_config WHERE key = $1", key)
+            else:
+                await conn.execute(_UPSERT_SETTING, key, json.dumps(value), actor)
+
+
+def _risk_service(request: Request) -> Any:
+    from hydra.risk.service import RiskService
+
+    mgr = getattr(request.app.state, "session_manager", None)
+    svc = getattr(mgr, "risk", None) if mgr is not None else None
+    return svc if isinstance(svc, RiskService) else None
+
+
+async def _reload_paper_capital(request: Request) -> None:
+    """Hand a paper_capital change to the engine; RiskService rebases via its audited reset."""
+    mgr = getattr(request.app.state, "session_manager", None)
+    svc = _risk_service(request)
+    try:
+        if mgr is not None:
+            await mgr.reload_risk_config()
+        if svc is not None:
+            await svc.reload_config(actor=_actor(request))
+    except _RELOAD_ERRORS as exc:
+        logger.exception("paper_capital saved but the running engine did not reload it")
+        raise api_error(
+            503,
+            "risk_reload_failed",
+            "paper_capital was saved but the running engine could not apply it",
+            "unavailable",
+        ) from exc
+
+
+def _to_public(stored: StoredConfig, pending: Any = None) -> dict[str, Any]:
+    data = stored.model_dump()
+    public = {k: v for k, v in data.items() if k not in _SECRET_FIELDS}
     for field in _SECRET_FIELDS:
-        public[f"{field}_set"] = bool(stored.get(field))
+        public[f"{field}_set"] = bool(data.get(field))
+    public["paper_capital_pending"] = None if pending is None else float(pending)
     return public
+
+
+def _pending_capital(request: Request) -> Any:
+    svc = _risk_service(request)
+    return svc.pending_paper_capital if svc is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +271,11 @@ def _to_public(stored: dict[str, Any]) -> dict[str, Any]:
 class ExchangeStatus(BaseModel):
     id: str
     name: str
+    supported: bool
     connected: bool
     api_key_set: bool
-    last_sync: str
+    credential_state: CredentialState
+    last_sync: str | None
 
 
 class PlatformConfig(BaseModel):
@@ -145,6 +286,7 @@ class PlatformConfig(BaseModel):
     default_timeframe: str
     max_concurrent_strategies: int
     paper_capital: float
+    paper_capital_pending: float | None = None
     webhook_secret_set: bool
     discord_webhook_url_set: bool
     slack_webhook_url_set: bool
@@ -154,8 +296,8 @@ class PlatformConfigUpdate(BaseModel):
     """Omitted or null fields are unchanged; an empty string clears a secret."""
 
     trading_mode: TradingMode | None = None
-    default_pair: str | None = None
-    default_timeframe: str | None = None
+    default_pair: str | None = Field(None, min_length=1)
+    default_timeframe: str | None = Field(None, min_length=1)
     max_concurrent_strategies: int | None = Field(None, ge=1, le=100)
     paper_capital: float | None = Field(None, gt=0, allow_inf_nan=False)
     webhook_secret: str | None = None
@@ -185,8 +327,8 @@ class SystemHealth(BaseModel):
 
 
 class ExchangeConnectRequest(BaseModel):
-    api_key: str
-    api_secret: str
+    api_key: str = Field(min_length=1)
+    api_secret: str = Field(min_length=1)
     passphrase: str | None = None
 
 
@@ -195,6 +337,7 @@ class ExchangeConnectResponse(BaseModel):
     name: str
     connected: bool
     message: str
+    validated_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -202,129 +345,182 @@ class ExchangeConnectResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def get_paper_capital(request: Request) -> float:
-    """Read the paper_capital from system config (single source of truth).
-
-    Used by portfolio and risk routes for the central-wallet model.
-    """
-    cfg = _get_system_config(request)
-    if cfg and "paper_capital" in cfg:
-        return float(cfg["paper_capital"])
-    return _DEFAULT_PAPER_CAPITAL
+async def get_paper_capital(pool: Any) -> float:
+    """The persisted global paper_capital; 503 when the row is missing or invalid."""
+    async with db_errors_to_503("reading paper capital"), pool.acquire() as conn:
+        raw = await conn.fetchval("SELECT value FROM system_config WHERE key = 'paper_capital'")
+    if raw is None:
+        raise api_error(
+            503,
+            "system_config_missing",
+            "system_config has no row for: paper_capital",
+            "unavailable",
+            missing=["paper_capital"],
+        )
+    try:
+        capital = float(json.loads(raw) if isinstance(raw, str) else raw)
+    except (TypeError, ValueError) as exc:
+        raise api_error(
+            503,
+            "system_config_invalid",
+            "system_config paper_capital is not a number",
+            "unavailable",
+        ) from exc
+    if not capital > 0:
+        raise api_error(
+            503, "system_config_invalid", "system_config paper_capital must be > 0", "unavailable"
+        )
+    return capital
 
 
 @router.get("/config", response_model=PlatformConfig)
 async def get_config(request: Request) -> dict[str, Any]:
-    """Return the platform configuration; secrets are never returned."""
-    return _to_public(_load_stored_config(request))
+    """Return the persisted platform configuration; secrets are never returned."""
+    pool = require_pool(request)
+    return _to_public(await read_system_config(pool), _pending_capital(request))
 
 
 @router.put("/config", response_model=PlatformConfig)
 async def update_config(body: PlatformConfigUpdate, request: Request) -> dict[str, Any]:
-    """Merge the given fields into the stored config (in memory until P1 persistence)."""
-    stored = _load_stored_config(request)
-    stored.update(body.model_dump(exclude_none=True))
-    _set_system_config(request, stored)
-    return _to_public(stored)
+    """Persist the given fields; a paper_capital change goes through the audited paper reset."""
+    pool = require_pool(request)
+    updates = body.model_dump(exclude_none=True)
+    if updates:
+        async with db_errors_to_503("reading system config"):
+            before = await load_system_config(pool)
+        await _save_system_config(pool, updates, _actor(request))
+        async with db_errors_to_503("reading system config"):
+            request.app.state.system_config = await load_system_config(pool)
+        audit(
+            _principal(request),
+            "system_config_updated",
+            keys=sorted(k for k in updates if k not in _SECRET_FIELDS),
+            secrets_set=sorted(k for k in updates if k in _SECRET_FIELDS and updates[k]),
+            secrets_cleared=sorted(k for k in updates if k in _SECRET_FIELDS and not updates[k]),
+        )
+        if "paper_capital" in updates and before.get("paper_capital") != updates["paper_capital"]:
+            await _reload_paper_capital(request)
+    return _to_public(await read_system_config(pool), _pending_capital(request))
 
 
 def _unknown_exchange(exchange_id: str) -> HTTPException:
     return api_error(404, "unknown_exchange", f"Unknown exchange: {exchange_id}", "not_found")
 
 
+def _require_supported(exchange_id: str) -> str:
+    if exchange_id not in _EXCHANGE_DEFS:
+        raise _unknown_exchange(exchange_id)
+    if exchange_id not in _SUPPORTED_EXCHANGES:
+        raise api_error(
+            400,
+            "unsupported_exchange",
+            f"{_EXCHANGE_DEFS[exchange_id]} is not supported yet; only Binance can be connected",
+            "invalid",
+        )
+    return exchange_id
+
+
+def _iso(ts: datetime | None) -> str | None:
+    return ts.isoformat() if ts is not None else None
+
+
 @router.get("/exchanges", response_model=list[ExchangeStatus])
 async def get_exchanges(request: Request) -> list[dict[str, Any]]:
-    """Exchange connection status based on env var API keys and DB pool health."""
-    pool = _pool_from_request(request)
-
-    # Check if the DB pool itself is operational (used as connectivity indicator)
-    db_connected = False
-    if pool is not None:
-        try:
-            async with pool.acquire() as conn:
-                await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=2.0)
-            db_connected = True
-        except Exception:
-            logger.debug("DB connectivity check failed for exchange status")
+    """Stored-credential state per exchange; connected means the keys passed a read-only check."""
+    pool = require_pool(request)
+    async with db_errors_to_503("reading exchange credentials"), pool.acquire() as conn:
+        rows = await conn.fetch("SELECT exchange_id, validated_at FROM exchange_credentials")
+    stored = {row["exchange_id"]: row["validated_at"] for row in rows}
+    errors = _get_credential_errors(request)
 
     results: list[dict[str, Any]] = []
-    for exchange_id, display_name, env_key in _EXCHANGE_DEFS:
-        api_key_set = bool(os.environ.get(env_key))
-        # Also check runtime-stored credentials
-        creds = _get_exchange_credentials(request)
-        if exchange_id in creds:
-            api_key_set = True
-        connected = api_key_set and (db_connected or exchange_id in creds)
-        last_sync = "Active" if connected else ("Not connected" if not api_key_set else "Standby")
-
+    for exchange_id, display_name in _EXCHANGE_DEFS.items():
+        state: CredentialState
+        if exchange_id not in stored:
+            state = "missing"
+        elif exchange_id in errors:
+            state = "undecryptable"
+        else:
+            state = "ok"
+        validated_at = stored.get(exchange_id)
         results.append(
             {
                 "id": exchange_id,
                 "name": display_name,
-                "connected": connected,
-                "api_key_set": api_key_set,
-                "last_sync": last_sync,
+                "supported": exchange_id in _SUPPORTED_EXCHANGES,
+                "connected": state == "ok" and validated_at is not None,
+                "api_key_set": exchange_id in stored,
+                "credential_state": state,
+                "last_sync": _iso(validated_at),
             }
         )
-
     return results
+
+
+async def _evict_client(request: Request, exchange_id: str) -> None:
+    old_client = _get_exchange_clients(request).pop(exchange_id, None)
+    if old_client is not None:
+        try:
+            await old_client.close()
+        except Exception:
+            logger.debug("Failed to close exchange client for %s", exchange_id)
 
 
 @router.post("/exchanges/{exchange_id}/connect", response_model=ExchangeConnectResponse)
 async def connect_exchange(
     exchange_id: str, body: ExchangeConnectRequest, request: Request
 ) -> dict[str, Any]:
-    """Encrypt and persist exchange API credentials; 503 if they cannot be stored."""
-    known_ids = {eid for eid, _, _ in _EXCHANGE_DEFS}
-    if exchange_id not in known_ids:
-        raise _unknown_exchange(exchange_id)
+    """Check the keys with a read-only call, then encrypt and store them; nothing on failure."""
+    exchange = _require_supported(exchange_id)
+    display_name = _EXCHANGE_DEFS[exchange]
+    pool = require_pool(request)
+    creds = {
+        "api_key": body.api_key,
+        "api_secret": body.api_secret,
+        "passphrase": body.passphrase or None,
+    }
+    await _check_credentials(exchange, creds)
 
-    display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
     from hydra.core.encryption import encrypt
 
-    pool = require_pool(request)
     async with db_errors_to_503("storing exchange credentials"), pool.acquire() as conn:
-        await conn.execute(
+        validated_at = await conn.fetchval(
             "INSERT INTO exchange_credentials "
-            "(exchange_id, encrypted_key, encrypted_secret, "
-            "encrypted_passphrase, updated_at) "
-            "VALUES ($1, $2, $3, $4, now()) "
+            "(exchange_id, encrypted_key, encrypted_secret, encrypted_passphrase, updated_at, "
+            "validated_at) "
+            "VALUES ($1, $2, $3, $4, now(), now()) "
             "ON CONFLICT (exchange_id) DO UPDATE SET "
             "encrypted_key = EXCLUDED.encrypted_key, "
             "encrypted_secret = EXCLUDED.encrypted_secret, "
             "encrypted_passphrase = EXCLUDED.encrypted_passphrase, "
-            "updated_at = now()",
-            exchange_id,
+            "updated_at = now(), validated_at = now() "
+            "RETURNING validated_at",
+            exchange,
             encrypt(body.api_key),
             encrypt(body.api_secret),
             encrypt(body.passphrase) if body.passphrase else None,
         )
 
-    # Keep in app state for fast access (plaintext in memory)
-    creds = _get_exchange_credentials(request)
-    creds[exchange_id] = {
-        "api_key": body.api_key,
-        "api_secret": body.api_secret,
-        "passphrase": body.passphrase,
-    }
-    logger.info("Exchange credentials stored for %s", exchange_id)
+    _get_exchange_credentials(request)[exchange] = creds
+    _get_credential_errors(request).pop(exchange, None)
+    await _evict_client(request, exchange)
+    audit(_principal(request), "exchange_connected", exchange_id=exchange)
 
     return {
-        "id": exchange_id,
+        "id": exchange,
         "name": display_name,
         "connected": True,
-        "message": f"Successfully connected to {display_name}",
+        "message": f"{display_name} keys verified and stored",
+        "validated_at": _iso(validated_at),
     }
 
 
 @router.delete("/exchanges/{exchange_id}/connect", response_model=ExchangeConnectResponse)
 async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, Any]:
     """Remove stored exchange credentials; 503 (and no change) if the DB delete fails."""
-    known_ids = {eid for eid, _, _ in _EXCHANGE_DEFS}
-    if exchange_id not in known_ids:
+    if exchange_id not in _EXCHANGE_DEFS:
         raise _unknown_exchange(exchange_id)
-
-    display_name = next(name for eid, name, _ in _EXCHANGE_DEFS if eid == exchange_id)
+    display_name = _EXCHANGE_DEFS[exchange_id]
 
     pool = require_pool(request)
     async with db_errors_to_503("deleting exchange credentials"), pool.acquire() as conn:
@@ -333,17 +529,10 @@ async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, A
             exchange_id,
         )
 
-    creds = _get_exchange_credentials(request)
-    creds.pop(exchange_id, None)
-    # Evict and close cached exchange client
-    clients = _get_exchange_clients(request)
-    old_client = clients.pop(exchange_id, None)
-    if old_client is not None:
-        try:
-            await old_client.close()
-        except Exception:
-            logger.debug("Failed to close exchange client for %s", exchange_id)
-    logger.info("Exchange credentials removed for %s", exchange_id)
+    _get_exchange_credentials(request).pop(exchange_id, None)
+    _get_credential_errors(request).pop(exchange_id, None)
+    await _evict_client(request, exchange_id)
+    audit(_principal(request), "exchange_disconnected", exchange_id=exchange_id)
 
     return {
         "id": exchange_id,
@@ -481,9 +670,11 @@ async def test_notifications(request: Request) -> NotificationTestResponse:
     """
     from hydra.ops.notifications import DiscordWebhookNotifier, SlackWebhookNotifier
 
-    cfg_dict = _get_system_config(request)
-    discord_url: str = cfg_dict.get("discord_webhook_url", "")
-    slack_url: str = cfg_dict.get("slack_webhook_url", "")
+    pool = require_pool(request)
+    async with db_errors_to_503("reading system config"):
+        cfg_dict = await load_system_config(pool)
+    discord_url = str(cfg_dict.get("discord_webhook_url") or "")
+    slack_url = str(cfg_dict.get("slack_webhook_url") or "")
 
     if not discord_url and not slack_url:
         return NotificationTestResponse(
@@ -538,33 +729,69 @@ def _get_exchange_clients(request: Request) -> dict[str, Any]:
     """Return the cached exchange client map from app state."""
     if not hasattr(request.app.state, "_exchange_clients"):
         request.app.state._exchange_clients = {}
-    return request.app.state._exchange_clients
+    return cast(dict[str, Any], request.app.state._exchange_clients)
+
+
+def _readonly_client(exchange_id: str, creds: dict[str, Any]) -> Any:
+    """E's read-only Binance SPOT client; sandbox follows ``trading.testnet``."""
+    from hydra.execution.client_factory import build_readonly_client
+
+    return build_readonly_client(exchange_id, creds, testnet=current_config().trading.testnet)
+
+
+async def _check_credentials(exchange_id: str, creds: dict[str, Any]) -> None:
+    """One read-only balance call; 422 when the exchange rejects the keys, 502 when unreachable."""
+    import ccxt
+
+    name = _EXCHANGE_DEFS[exchange_id]
+    client = _readonly_client(exchange_id, creds)
+    try:
+        await asyncio.wait_for(client.fetch_balance(), CONNECT_TIMEOUT_S)
+    except ccxt.AuthenticationError as exc:
+        logger.info("%s rejected the submitted API keys (%s)", name, type(exc).__name__)
+        raise api_error(
+            422,
+            "credentials_rejected",
+            f"{name} rejected these API keys (key, secret or permissions); nothing was stored",
+            "invalid",
+        ) from exc
+    except (ccxt.NetworkError, TimeoutError) as exc:
+        logger.warning("%s unreachable while checking keys (%s)", name, type(exc).__name__)
+        raise api_error(
+            502,
+            "exchange_unreachable",
+            f"{name} could not be reached to check the keys; nothing was stored",
+            "unavailable",
+        ) from exc
+    except ccxt.ExchangeError as exc:
+        logger.warning("%s refused the key check (%s)", name, type(exc).__name__)
+        raise api_error(
+            502,
+            "exchange_error",
+            f"{name} returned an error while checking the keys; nothing was stored",
+            "unavailable",
+        ) from exc
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            logger.debug("Failed to close the key-check client for %s", exchange_id)
 
 
 async def _get_exchange_client(exchange_id: str, request: Request) -> Any:
-    """Return (or create and cache) an ExchangeClient for the given exchange."""
+    """Return (or create and cache) the read-only client for a connected exchange."""
+    exchange = _require_supported(exchange_id)
     clients = _get_exchange_clients(request)
-    if exchange_id in clients:
-        return clients[exchange_id]
+    if exchange in clients:
+        return clients[exchange]
 
     creds = _get_exchange_credentials(request)
-    if exchange_id not in creds:
+    if exchange not in creds:
         raise api_error(
-            404, "credentials_not_found", f"No credentials stored for {exchange_id}", "not_found"
+            404, "credentials_not_found", f"No credentials stored for {exchange}", "not_found"
         )
-    from hydra.execution.exchange_client import ExchangeClient
-
-    cred = creds[exchange_id]
-    client = ExchangeClient(
-        exchange_id=exchange_id,  # type: ignore[arg-type]
-        config={
-            "apiKey": cred["api_key"],
-            "secret": cred["api_secret"],
-            **({"password": cred["passphrase"]} if cred.get("passphrase") else {}),
-        },
-        testnet=False,
-    )
-    clients[exchange_id] = client
+    client = _readonly_client(exchange, creds[exchange])
+    clients[exchange] = client
     return client
 
 
