@@ -84,7 +84,7 @@ const LATCHED_STATUS = {
   circuit_breakers_state: 'unavailable',
 };
 
-function stoppedSession(id: string, positionsAtStop: number) {
+function stoppedSession(id: string, positionsAtStop: number, flattenIncomplete = positionsAtStop > 0) {
   return {
     session_id: id,
     strategy_id: 'manual',
@@ -94,7 +94,7 @@ function stoppedSession(id: string, positionsAtStop: number) {
     symbols: ['BTCUSDT'],
     timeframe: '1h',
     positions_at_stop: positionsAtStop,
-    flatten_incomplete: positionsAtStop > 0,
+    flatten_incomplete: flattenIncomplete,
   };
 }
 
@@ -288,6 +288,13 @@ describe('RiskPage latched kill switch from server state', () => {
     const text = bannerText(page.container);
     expect(text).toContain('LATCHED — 1 position could not be flattened');
     expect(text).toContain('Those positions are still open: check the sessions.');
+  });
+
+  it('keeps LATCHED after an engine restart, which only persists positions_at_stop', async () => {
+    fetchApi.mockImplementation(routeFetch(latchedRoutes([stoppedSession('s1', 2, false)]), calls));
+    page = await mount(<RiskPage />);
+
+    expect(bannerText(page.container)).toContain('LATCHED — 2 positions could not be flattened');
   });
 
   it('sums the remainder across sessions', async () => {

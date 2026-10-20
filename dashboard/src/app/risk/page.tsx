@@ -145,15 +145,11 @@ function remainderFrom(body: Record<string, unknown>, persisted: boolean): KillS
 
 interface SessionRemainder {
   positions_at_stop: number;
-  flatten_incomplete: boolean;
 }
 
-/** Positions the sessions still hold after a flatten that did not finish (server state). */
+/** Positions left by the sessions' last flatten (persisted, unlike flatten_incomplete). */
 function remainingFromSessions(sessions: SessionRemainder[]): number {
-  return sessions.reduce(
-    (sum, s) => sum + (s.flatten_incomplete ? Math.max(0, Number(s.positions_at_stop) || 0) : 0),
-    0,
-  );
+  return sessions.reduce((sum, s) => sum + Math.max(0, Number(s.positions_at_stop) || 0), 0);
 }
 
 function latchedText(n: number): string {
