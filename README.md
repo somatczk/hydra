@@ -38,7 +38,8 @@ Each PR that changes one of these rows updates the row.
 | Risk | Exchange-side stop-losses | **Planned P3.** `ExchangeSafetyManager` has no caller, and paper stops never trigger. |
 | Risk | Quick-trade TP / SL / trailing stop | **Planned P1 (stops).** An entry that is not filled at once (any LIMIT quick-trade) returns 200 with `exit_orders_deferred: true`, and its TP / SL / trailing orders are never placed: nothing reads the flag, and the UI shows a success toast. On a filled entry, a failed attach logs a warning and still returns 200. Either way the position looks protected when it is not. |
 | Risk | Kill switch | **Partial → P1.** It stops running sessions, and the UI shows active / inactive / unknown. The flag is persisted only when the engine has a DB pool (not the case under `deploy/compose.yml`), yet `POST /api/trading/kill-switch` reports "all trading halted" either way, so a restart forgets it. The flatten step fails and positions stay open. |
-| Paper trading | Per-strategy capital, P&L | **Partial → P1.** Per-strategy paper capital slices work. Unrealized P&L is never updated, P&L is gross of fees, and live P&L is 0. |
+| Paper trading | Per-strategy capital, P&L | **Partial → P1.** Per-strategy paper capital slices work. The executor now keeps a spot ledger (no naked shorts; fees charged in USDT and carried into net P&L, entry fee pro-rata on partial exits) with equity = USDT + base x last close (`tests/unit/test_execution/test_paper_spot_ledger.py`). Sessions do not use it yet: unrealized P&L is marked only once P1-E calls `on_closed_bar` from the bar handler, and session and risk views still sum balances instead of `get_equity()` (P1-C / P1-E). Live P&L is 0. |
+| Paper trading | Stops, OCO and limits fill on closed bars; state survives a restart | **Partial → P1.** `PaperTradingExecutor.on_closed_bar` evaluates resting orders per symbol with the [paper fill rules](#paper-fill-rules) (`tests/unit/test_execution/test_paper_trading.py`, `test_fill_rules.py`), and every change is persisted to `paper_accounts` with trade rows idempotent on `(session_id, fill_seq)` and per-session balance snapshots; `PaperTradingExecutor.restore` rebuilds the account exactly (`tests/integration/test_paper_state_persistence.py`). Not wired yet: sessions still only set marks, so stops never trigger, and recovery still starts fresh until P1-E calls `on_closed_bar`, `restore` and `flatten`. |
 | Paper trading | Testnet + paper by default | **Partial → P1.** The trading mode defaults to `paper`, and session `ExchangeClient`s default to `testnet=True`. `HYDRA_TESTNET` stops startup (use `HYDRA_TRADING__TESTNET`), and `trading.testnet` is never read. The settings page's balance / orders / positions endpoints use stored keys against mainnet (`testnet=False`), read-only. |
 | Data | Redis Streams event bus | **Planned P1** (event-bus isolation decides the transport). Sessions use an in-process `InMemoryEventBus`; `RedisEventBus` is used only in tests. Redis is only health-pinged by `/api/system/health`. |
 | Data | PostgreSQL as source of truth | **Partial → P1.** Backtest results and trades are persisted (P0-B). Live fills are not stored, paper state is not reloaded, and system config lives in memory. |
@@ -92,6 +93,35 @@ graph LR
 - The schema comes only from Alembic revisions in `src/hydra/data/migrations/versions/`. The engine upgrades to head as
   its first database step at startup, under a Postgres advisory lock, and exits if that fails.
 - Backtests load bars through `hydra.backtest.data` from `ts.ohlcv_1m`; nothing is fetched or synthesised on the fly.
+
+## Paper fill rules
+
+The paper executor (`src/hydra/execution/paper_trading.py`) simulates a Binance spot account; the rules live in
+`src/hydra/execution/fill_rules.py`.
+
+- **Spot only.** A SELL needs free base, a BUY needs free USDT for cost plus fee; nothing goes negative or short.
+  Resting orders lock what they may spend (a SELL locks base, a BUY locks USDT, an OCO locks once), so a second
+  full-size SELL next to a stop is rejected, as on Binance. To exit while a stop rests, cancel it first or call
+  `flatten()`. Optional `step_size` / `min_notional` (or per-symbol market rules) reject orders like Binance filters.
+- **Fees** are charged in USDT on both sides (maker 0.1% for resting limits, taker 0.1% for market, stop and trailing
+  fills by default). This is a deliberate deviation: Binance takes a BUY fee in the base asset unless paid with BNB.
+- **Market orders** fill at the last closed-bar close with fixed slippage (default 0.1%).
+- **Closed bars only.** `on_closed_bar(symbol, bar)` evaluates that symbol's resting orders once per bar timestamp
+  (older or repeated bars are ignored), then marks the account to the close.
+- **Intrabar path.** A bullish bar (close > open) is assumed to go open, low, high, close; any other bar open, high, low,
+  close. When both OCO legs are touched, the one reached first on that path fills (the backtester's rule); a level the
+  open has already gapped through is reached first.
+- **Gaps.** A stop that the bar opens through fills at the open (the worse of stop and open), slipped. A resting limit
+  fills at the better of limit and open, like the backtester; that is optimistic for a resting order.
+- **Stop-limit** fills at its limit once triggered when the limit is reachable on the rest of the path, otherwise it
+  becomes a resting limit. **Trailing stops** move their peak (or trough) point by point along the path, so a later
+  high never triggers on an earlier low.
+- A BUY stop that gaps above its locked amount draws the difference from free USDT, or is cancelled if there is not
+  enough. Exits never fail on balance because their base is locked.
+
+Differences from the backtester until the P2 shared execution core: market orders fill at the last close here and at
+the next bar's open there; slippage is a fixed fraction here and a square-root volume model there; the backtester fills
+gap-through stops at the stop and does not apply the gap rule to OCO legs.
 
 ## Planned architecture
 
@@ -208,6 +238,10 @@ Keep that key: credentials stored under it cannot be read with another one. `.en
   empty database and a 2.1.x/2.2.0 one in place, deletes `backtest_results` rows without data provenance (P0-B,
   irreversible) and adds no retention, compression or continuous aggregates. There is no downgrade: roll back from a
   `pg_dump`.
+- `0002_paper_state` adds `paper_accounts` (one row per paper session: the full ledger as JSONB, Decimals as
+  strings, plus `state_version`), `trades.order_id/fill_seq/net_pnl/liquidity/reason` with a unique
+  `(session_id, fill_seq)` index, and `balance_snapshots.session_id`. `trades.pnl` stays gross; `net_pnl` is net of
+  both fees. Forward-only.
 - Before the first deploy of this baseline onto an existing database: take `pg_dump -Fc` and `pg_dump -s`; check
   `SELECT * FROM alembic_version` fails (no table) and `SELECT hypertable_name FROM timescaledb_information.hypertables`
   lists `ohlcv_1m`, `trades` and `funding_rates` (a plain `ts` table with rows would be converted in place); then

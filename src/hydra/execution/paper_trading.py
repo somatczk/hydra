@@ -1,35 +1,152 @@
-"""Paper-trading executor with simulated fills and virtual balance tracking.
+"""Paper executor: a Binance SPOT account simulated on closed bars.
 
-``PaperTradingExecutor`` provides the same interface as ``ExchangeClient`` but
-executes entirely in-memory.  Market orders fill immediately at the current price
-plus configurable slippage; limit / stop orders stay pending until
-``check_pending_orders`` determines they should trigger.
+The account is a per-asset ledger of free and locked balances. A BUY can only spend free quote,
+a SELL can only sell free base, so there are no naked shorts and no balance goes negative.
+Resting orders lock what they may spend (SELL locks base, BUY locks quote, an OCO locks once).
+Fees are always charged in the quote asset (a documented deviation from Binance, where a BUY
+fee is taken in base unless paid with BNB).
+
+Market orders fill at the last closed-bar close with slippage. Resting orders are evaluated by
+``on_closed_bar`` with the rules in ``hydra.execution.fill_rules``. With a DB pool, every change
+is persisted (``hydra.execution.paper_store``) before the call returns; ``restore`` rebuilds the
+account after a restart.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol, cast, get_args
 
-from hydra.core.types import (
-    OHLCV,
-    Direction,
-    ExchangeId,
-    OrderType,
-    Position,
-    Side,
-    Symbol,
-)
+from hydra.core import metrics
+from hydra.core.types import OHLCV, Direction, ExchangeId, OrderType, Position, Symbol
+from hydra.execution import fill_rules, paper_store
+from hydra.execution.fill_rules import FillPrice, Liquidity
 
 logger = logging.getLogger(__name__)
 
+_ZERO = Decimal("0")
+_ONE = Decimal("1")
+_STATE_FORMAT = 1
+_RESTING_TYPES = (
+    OrderType.LIMIT,
+    OrderType.STOP_MARKET,
+    OrderType.STOP_LIMIT,
+    OrderType.TRAILING_STOP,
+)
+
+
 # ---------------------------------------------------------------------------
-# Internal pending order representation
+# Errors
 # ---------------------------------------------------------------------------
+
+
+class InsufficientBalanceError(ValueError):
+    """The order needs more free balance than the account holds (spot: no naked shorts)."""
+
+
+class OrderRejectedError(ValueError):
+    """The order breaks a market rule (step size, minimum notional) or is malformed."""
+
+
+class PersistenceUnavailableError(RuntimeError):
+    """Fills are not yet persisted; new risk-increasing orders are refused until they are."""
+
+
+class LedgerInvariantError(RuntimeError):
+    """A balance, lock or lot broke a ledger invariant; the account must not keep trading."""
+
+
+class PaperStateUnavailableError(RuntimeError):
+    """The session's paper state cannot be restored although the DB shows it traded."""
+
+
+class PaperStateCorruptError(PaperStateUnavailableError):
+    """The stored paper state does not satisfy the ledger invariants."""
+
+
+# ---------------------------------------------------------------------------
+# Value objects
+# ---------------------------------------------------------------------------
+
+
+class SpotMarketRules(Protocol):
+    """Exchange filters for one symbol; ``hydra.risk.market_rules.MarketRules`` satisfies it."""
+
+    @property
+    def amount_step(self) -> Decimal | None: ...
+
+    @property
+    def min_qty(self) -> Decimal | None: ...
+
+    @property
+    def min_notional(self) -> Decimal | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PaperFill:
+    """One executed paper fill, for the session layer to publish as an ``OrderFillEvent``.
+
+    ``gross_pnl`` and ``net_pnl`` are None on opening (BUY) fills; ``net_pnl`` is net of this
+    fill's fee and the pro-rata entry fee. ``parent_order_id`` is the OCO id for an OCO leg.
+    """
+
+    order_id: str
+    parent_order_id: str | None
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal
+    fee_currency: str
+    liquidity: Liquidity
+    gross_pnl: Decimal | None
+    net_pnl: Decimal | None
+    reason: str
+    timestamp: datetime
+    fill_seq: int
+
+
+@dataclass(frozen=True, slots=True)
+class PaperAccountSnapshot:
+    """Account totals in the quote asset; ``drawdown`` is a fraction of ``peak_equity``."""
+
+    quote_asset: str
+    quote_free: Decimal
+    quote_locked: Decimal
+    base_totals: dict[str, Decimal]
+    marks: dict[str, Decimal]
+    equity: Decimal
+    initial_equity: Decimal
+    realized_gross: Decimal
+    fees_paid: Decimal
+    realized_net: Decimal
+    unrealized: Decimal
+    peak_equity: Decimal
+    drawdown: Decimal
+    open_orders: int
+    last_bar_ts: dict[str, datetime]
+    persist_dirty: bool
+
+
+@dataclass(slots=True)
+class _Lock:
+    asset: str
+    amount: Decimal
+
+
+@dataclass(slots=True)
+class _Lot:
+    base_qty: Decimal = _ZERO
+    price_basis: Decimal = _ZERO
+    entry_fees_open: Decimal = _ZERO
+    realized_net: Decimal = _ZERO
 
 
 @dataclass(slots=True)
@@ -41,24 +158,83 @@ class _PendingOrder:
     quantity: Decimal
     price: Decimal | None
     stop_price: Decimal | None
+    lock_id: str
+    seq: int
+    reason: str
+    created_after_ts: datetime | None
     trail_pct: Decimal | None = None
-    peak_price: Decimal | None = None
-    oco_link: str | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-
-# ---------------------------------------------------------------------------
-# Simulated position
-# ---------------------------------------------------------------------------
+    extreme: Decimal | None = None
+    oco_id: str | None = None
 
 
 @dataclass(slots=True)
-class _SimulatedPosition:
-    symbol: str
-    direction: Direction
-    quantity: Decimal
-    avg_entry_price: Decimal
-    unrealized_pnl: Decimal = Decimal("0")
+class _Rules:
+    step: Decimal | None
+    min_qty: Decimal | None
+    min_notional: Decimal | None
+
+
+@dataclass(slots=True)
+class _Ledger:
+    free: dict[str, Decimal] = field(default_factory=dict)
+    locked: dict[str, Decimal] = field(default_factory=dict)
+    locks: dict[str, _Lock] = field(default_factory=dict)
+
+    def get_free(self, asset: str) -> Decimal:
+        return self.free.get(asset, _ZERO)
+
+    def get_locked(self, asset: str) -> Decimal:
+        return self.locked.get(asset, _ZERO)
+
+    def total(self, asset: str) -> Decimal:
+        return self.get_free(asset) + self.get_locked(asset)
+
+    def credit(self, asset: str, amount: Decimal) -> None:
+        self.free[asset] = self.get_free(asset) + amount
+
+    def debit(self, asset: str, amount: Decimal) -> None:
+        if self.get_free(asset) < amount:
+            raise InsufficientBalanceError(
+                f"Insufficient {asset} balance: need {amount}, free {self.get_free(asset)}"
+            )
+        self.free[asset] = self.get_free(asset) - amount
+
+    def lock(self, lock_id: str, asset: str, amount: Decimal) -> None:
+        self.debit(asset, amount)
+        self.locked[asset] = self.get_locked(asset) + amount
+        self.locks[lock_id] = _Lock(asset, amount)
+
+    def release(self, lock_id: str) -> None:
+        held = self.locks.pop(lock_id, None)
+        if held is None:
+            return
+        self.locked[held.asset] = self.get_locked(held.asset) - held.amount
+        self.credit(held.asset, held.amount)
+
+
+def _canon_symbol(symbol: str) -> str:
+    return symbol.split(":", 1)[0].replace("/", "").replace("-", "").upper()
+
+
+def _d(value: object) -> Decimal:
+    return Decimal(str(value))
+
+
+def _opt_d(value: object) -> Decimal | None:
+    return None if value is None else Decimal(str(value))
+
+
+def _opt_s(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _ts(value: datetime) -> str:
+    return value.isoformat()
+
+
+def _parse_ts(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -67,60 +243,132 @@ class _SimulatedPosition:
 
 
 class PaperTradingExecutor:
-    """Simulated exchange executor for paper trading.
+    """Simulated Binance SPOT account for one paper session.
 
-    Parameters
-    ----------
-    exchange_id:
-        Logical exchange this executor simulates.
-    initial_balances:
-        Starting virtual balances, e.g. ``{"USDT": Decimal("10000")}``.
-    slippage_pct:
-        Percentage slippage applied to market-order fills (default 0.1%).
-    fee_pct:
-        Simulated trading fee percentage (default 0.1%).
+    ``fee_pct`` sets both maker and taker fees unless they are given explicitly. ``step_size``
+    and ``min_notional`` apply to every symbol; ``market_rules`` overrides them per symbol.
     """
 
     def __init__(
         self,
         exchange_id: ExchangeId = "binance",
-        initial_balances: dict[str, Decimal] | None = None,
+        initial_balances: Mapping[str, Decimal] | None = None,
         slippage_pct: Decimal = Decimal("0.001"),
-        fee_pct: Decimal = Decimal("0.001"),
+        fee_pct: Decimal | None = None,
         db_pool: Any = None,
         strategy_id: str = "",
         session_id: str = "",
+        *,
+        maker_fee: Decimal | None = None,
+        taker_fee: Decimal | None = None,
+        quote_asset: str = "USDT",
+        step_size: Decimal | None = None,
+        min_notional: Decimal | None = None,
+        market_rules: Mapping[str, SpotMarketRules] | None = None,
     ) -> None:
-        self._exchange_id = exchange_id
-        self._balances: dict[str, Decimal] = dict(initial_balances or {"USDT": Decimal("10000")})
+        default_fee = Decimal("0.001") if fee_pct is None else fee_pct
+        self._maker_fee = default_fee if maker_fee is None else maker_fee
+        self._taker_fee = default_fee if taker_fee is None else taker_fee
         self._slippage_pct = slippage_pct
-        self._fee_pct = fee_pct
+        for name, value in (
+            ("maker_fee", self._maker_fee),
+            ("taker_fee", self._taker_fee),
+            ("slippage_pct", slippage_pct),
+        ):
+            if not _ZERO <= value < _ONE:
+                raise ValueError(f"{name} must be in [0, 1), got {value}")
+        if db_pool is not None and not session_id:
+            raise ValueError("a paper executor with a DB pool needs a session_id")
+        self._exchange_id: ExchangeId = exchange_id
+        self._quote = quote_asset.upper()
         self._db_pool = db_pool
         self._strategy_id = strategy_id
         self._session_id = session_id
+        self._step_size = step_size
+        self._min_notional = min_notional
+        self._market_rules: dict[str, SpotMarketRules] = {
+            _canon_symbol(k): v for k, v in (market_rules or {}).items()
+        }
 
-        # State
-        self._pending_orders: list[_PendingOrder] = []
-        self._filled_orders: list[dict[str, Any]] = []
-        self._positions: dict[str, _SimulatedPosition] = {}
-        self._last_prices: dict[str, Decimal] = {}
+        balances = dict(initial_balances or {self._quote: Decimal("10000")})
+        unknown = sorted(a for a in balances if a.upper() != self._quote)
+        if unknown:
+            raise ValueError(f"paper accounts start with {self._quote} only, got {unknown}")
+        start = _d(balances.get(self._quote, balances.get(self._quote.lower(), _ZERO)))
+        if start < 0:
+            raise ValueError(f"initial {self._quote} balance must be >= 0, got {start}")
+
+        self._ledger = _Ledger(free={self._quote: start})
+        self._lots: dict[str, _Lot] = {}
+        self._pending: list[_PendingOrder] = []
+        self._marks: dict[str, Decimal] = {}
+        self._last_bar_ts: dict[str, datetime] = {}
+        self._names: dict[str, str] = {}
+        self._fill_seq = 0
+        self._order_seq = 0
+        self._initial_equity = start
+        self._peak_equity = start
+        self._realized_gross = _ZERO
+        self._fees_paid = _ZERO
+        self._realized_net = _ZERO
+        self._filled: list[PaperFill] = []
+        self._outbox: list[PaperFill] = []
+        self._dirty = False
+        self._state_version = 0
+        self._persist_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
-    # Price helpers
+    # Symbols, rules, marks
     # ------------------------------------------------------------------
+
+    def _symbol(self, symbol: str) -> str:
+        canon = _canon_symbol(symbol)
+        if not canon.endswith(self._quote) or canon == self._quote:
+            raise OrderRejectedError(f"{symbol} is not a {self._quote}-quoted spot symbol")
+        self._names.setdefault(canon, symbol)
+        return canon
+
+    def _base(self, canon: str) -> str:
+        return canon[: -len(self._quote)]
+
+    def _name(self, canon: str) -> str:
+        return self._names.get(canon, canon)
+
+    def _rules(self, canon: str) -> _Rules:
+        r = self._market_rules.get(canon)
+        if r is None:
+            return _Rules(self._step_size, None, self._min_notional)
+        return _Rules(r.amount_step, r.min_qty, r.min_notional)
+
+    def _check_rules(self, canon: str, quantity: Decimal, price: Decimal) -> None:
+        rules = self._rules(canon)
+        if rules.step is not None and rules.step > 0 and quantity % rules.step != 0:
+            raise OrderRejectedError(f"quantity {quantity} is not a multiple of step {rules.step}")
+        if rules.min_qty is not None and quantity < rules.min_qty:
+            raise OrderRejectedError(f"quantity {quantity} is below the minimum {rules.min_qty}")
+        if rules.min_notional is not None and quantity * price < rules.min_notional:
+            raise OrderRejectedError(
+                f"notional {quantity * price} is below the minimum {rules.min_notional}"
+            )
 
     def set_market_price(self, symbol: str, price: Decimal) -> None:
-        """Update the latest known price for a symbol (for fill simulation)."""
-        self._last_prices[symbol] = price
+        """Deprecated (P1-E deletes it): set the mark without evaluating resting orders."""
+        self._marks[self._symbol(symbol)] = price
 
-    def _apply_slippage(self, price: Decimal, side: str) -> Decimal:
-        """Apply slippage in the direction unfavorable to the trader."""
-        if side.upper() == "BUY":
-            return price * (Decimal("1") + self._slippage_pct)
-        return price * (Decimal("1") - self._slippage_pct)
+    def check_pending_orders(self, current_bar: OHLCV) -> list[dict[str, Any]]:
+        """Deprecated (P1-E deletes it): a bar without a symbol cannot be evaluated safely."""
+        raise TypeError(
+            "check_pending_orders is removed: call `await executor.on_closed_bar(symbol, bar)`"
+        )
+
+    def _fee_rate(self, liquidity: Liquidity) -> Decimal:
+        return self._maker_fee if liquidity == "maker" else self._taker_fee
+
+    def _bar_time(self, canon: str) -> datetime:
+        return self._last_bar_ts.get(canon) or datetime.now(UTC)
 
     # ------------------------------------------------------------------
-    # Order API (matches ExchangeClient interface)
+    # Orders
     # ------------------------------------------------------------------
 
     async def create_order(
@@ -133,575 +381,919 @@ class PaperTradingExecutor:
         stop_price: Decimal | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create an order.  Market orders fill immediately; limit/stop go pending."""
-        order_id = str(uuid.uuid4())
+        """Market orders fill at once at the last mark; other types rest and lock funds.
+
+        OCO: ``price`` is the take-profit limit, ``stop_price`` the stop-loss trigger.
+        """
+        canon = self._symbol(symbol)
+        s = side.upper()
         otype = order_type.upper()
+        if s not in ("BUY", "SELL"):
+            raise OrderRejectedError(f"side must be BUY or SELL, got {side!r}")
+        quantity = _d(quantity)
+        if quantity <= 0:
+            raise OrderRejectedError(f"quantity must be > 0, got {quantity}")
+        if s == "BUY":
+            await self._require_persisted()
 
         if otype == OrderType.MARKET:
-            market_price = self._last_prices.get(symbol, price or Decimal("0"))
-            if market_price == Decimal("0"):
+            mark = self._marks.get(canon)
+            if mark is None or mark <= 0:
                 raise ValueError(f"No market price available for {symbol}")
-            fill_price = self._apply_slippage(market_price, side)
-            return self._execute_fill(order_id, symbol, side, quantity, fill_price)
+            fp = fill_rules.market_fill(s, mark, self._slippage_pct)
+            self._check_rules(canon, quantity, fp.price)
+            fill = self._fill_from_free(
+                canon, s, OrderType.MARKET, quantity, fp, "market", str(uuid.uuid4())
+            )
+            await self._persist(snapshot_at=fill.timestamp)
+            return self._fill_response(fill)
 
         if otype == OrderType.OCO:
-            # OCO requires both a TP limit price and a SL stop price.
-            # The caller passes: price=take_profit_price, stop_price=stop_loss_price.
-            if price is None or stop_price is None:
-                raise ValueError(
-                    "OCO orders require both price (take-profit limit) "
-                    "and stop_price (stop-loss trigger)"
-                )
-            oco_link = str(uuid.uuid4())
-            exit_side = "SELL" if side.upper() == "BUY" else "BUY"
-
-            # Take-profit leg (LIMIT)
-            tp_id = str(uuid.uuid4())
-            tp_order = _PendingOrder(
-                order_id=tp_id,
-                symbol=symbol,
-                side=exit_side,
-                order_type=OrderType.LIMIT,
-                quantity=quantity,
-                price=price,
-                stop_price=None,
-                oco_link=oco_link,
+            return await self._create_oco(canon, s, quantity, price, stop_price)
+        if otype not in _RESTING_TYPES:
+            raise OrderRejectedError(
+                f"order type {order_type} is not supported by the paper executor"
             )
+        order = self._new_resting(canon, s, otype, quantity, price, stop_price, params or {})
+        self._pending.append(order)
+        await self._persist(snapshot_at=None)
+        return self._pending_response(order)
 
-            # Stop-loss leg (STOP_MARKET)
-            sl_id = str(uuid.uuid4())
-            sl_order = _PendingOrder(
-                order_id=sl_id,
-                symbol=symbol,
-                side=exit_side,
-                order_type=OrderType.STOP_MARKET,
-                quantity=quantity,
-                price=None,
-                stop_price=stop_price,
-                oco_link=oco_link,
-            )
-
-            self._pending_orders.extend([tp_order, sl_order])
-            return {
-                "id": order_id,
-                "symbol": symbol,
-                "side": side,
-                "type": otype,
-                "amount": float(quantity),
-                "status": "PENDING",
-                "filled": False,
-                "oco_link": oco_link,
-                "take_profit_order_id": tp_id,
-                "stop_loss_order_id": sl_id,
-            }
-
-        # Trailing stop orders need trail_pct and an initial peak_price
+    def _new_resting(
+        self,
+        canon: str,
+        side: str,
+        otype: str,
+        quantity: Decimal,
+        price: Decimal | None,
+        stop_price: Decimal | None,
+        params: dict[str, Any],
+    ) -> _PendingOrder:
+        price = _opt_d(price)
+        stop_price = _opt_d(stop_price)
         trail_pct: Decimal | None = None
-        peak_price: Decimal | None = None
-        if otype == OrderType.TRAILING_STOP:
-            p = params or {}
-            raw = p.get("trail_pct")
+        extreme: Decimal | None = None
+        if otype == OrderType.LIMIT:
+            if price is None or price <= 0:
+                raise OrderRejectedError("LIMIT orders need a positive price")
+            ref = price
+            reason = "limit"
+        elif otype == OrderType.STOP_MARKET:
+            stop_price = stop_price if stop_price is not None else price
+            price = None
+            if stop_price is None or stop_price <= 0:
+                raise OrderRejectedError("STOP_MARKET orders need a positive stop_price")
+            ref = stop_price
+            reason = "stop_loss" if side == "SELL" else "stop_entry"
+        elif otype == OrderType.STOP_LIMIT:
+            if price is None or stop_price is None or price <= 0 or stop_price <= 0:
+                raise OrderRejectedError("STOP_LIMIT orders need a positive price and stop_price")
+            ref = price
+            reason = "stop_loss" if side == "SELL" else "stop_entry"
+        else:
+            raw = params.get("trail_pct")
             if raw is None:
                 raise ValueError("trail_pct is required for TRAILING_STOP orders")
-            trail_pct = Decimal(str(raw))
-            current_price = self._last_prices.get(symbol)
-            if current_price is None:
-                raise ValueError(f"No market price available for {symbol}")
-            peak_price = current_price
+            trail_pct = _d(raw)
+            if not _ZERO < trail_pct < _ONE:
+                raise OrderRejectedError(f"trail_pct must be in (0, 1), got {trail_pct}")
+            mark = self._marks.get(canon)
+            if mark is None:
+                raise ValueError(f"No market price available for {canon}")
+            extreme = mark
+            ref = mark * (_ONE - trail_pct) if side == "SELL" else mark * (_ONE + trail_pct)
+            price = None
+            stop_price = None
+            reason = "trailing_stop"
+        self._check_rules(canon, quantity, ref)
 
-        # Limit / stop orders go pending
-        pending = _PendingOrder(
+        order_id = str(uuid.uuid4())
+        if side == "SELL":
+            self._ledger.lock(order_id, self._base(canon), quantity)
+        else:
+            self._ledger.lock(order_id, self._quote, self._buy_lock(otype, quantity, ref))
+        self._order_seq += 1
+        return _PendingOrder(
             order_id=order_id,
-            symbol=symbol,
+            symbol=canon,
             side=side,
             order_type=otype,
             quantity=quantity,
             price=price,
             stop_price=stop_price,
+            lock_id=order_id,
+            seq=self._order_seq,
+            reason=reason,
+            created_after_ts=self._last_bar_ts.get(canon),
             trail_pct=trail_pct,
-            peak_price=peak_price,
+            extreme=extreme,
         )
-        self._pending_orders.append(pending)
+
+    def _buy_lock(self, otype: str, quantity: Decimal, ref: Decimal) -> Decimal:
+        fee = max(self._maker_fee, self._taker_fee)
+        if otype in (OrderType.STOP_MARKET, OrderType.TRAILING_STOP):
+            return quantity * ref * (_ONE + self._slippage_pct) * (_ONE + fee)
+        return quantity * ref * (_ONE + fee)
+
+    async def _create_oco(
+        self,
+        canon: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal | None,
+        stop_price: Decimal | None,
+    ) -> dict[str, Any]:
+        if price is None or stop_price is None:
+            raise ValueError(
+                "OCO orders require both price (take-profit limit) "
+                "and stop_price (stop-loss trigger)"
+            )
+        tp, sl = _d(price), _d(stop_price)
+        if side == "SELL" and not sl < tp:
+            raise OrderRejectedError(f"SELL OCO needs stop {sl} below take-profit {tp}")
+        if side == "BUY" and not tp < sl:
+            raise OrderRejectedError(f"BUY OCO needs take-profit {tp} below stop {sl}")
+        self._check_rules(canon, quantity, min(tp, sl))
+        oco_id = str(uuid.uuid4())
+        if side == "SELL":
+            self._ledger.lock(oco_id, self._base(canon), quantity)
+        else:
+            self._ledger.lock(
+                oco_id, self._quote, self._buy_lock(OrderType.STOP_MARKET, quantity, sl)
+            )
+        created = self._last_bar_ts.get(canon)
+        legs: list[_PendingOrder] = []
+        for otype, leg_price, leg_stop, reason in (
+            (OrderType.LIMIT, tp, None, "take_profit"),
+            (OrderType.STOP_MARKET, None, sl, "stop_loss"),
+        ):
+            self._order_seq += 1
+            legs.append(
+                _PendingOrder(
+                    order_id=str(uuid.uuid4()),
+                    symbol=canon,
+                    side=side,
+                    order_type=otype,
+                    quantity=quantity,
+                    price=leg_price,
+                    stop_price=leg_stop,
+                    lock_id=oco_id,
+                    seq=self._order_seq,
+                    reason=reason,
+                    created_after_ts=created,
+                    oco_id=oco_id,
+                )
+            )
+        self._pending.extend(legs)
+        await self._persist(snapshot_at=None)
         return {
-            "id": order_id,
-            "symbol": symbol,
+            "id": oco_id,
+            "symbol": self._name(canon),
             "side": side,
-            "type": otype,
+            "type": OrderType.OCO.value,
             "amount": float(quantity),
-            "price": float(price) if price else None,
+            "price": float(tp),
+            "stop_price": float(sl),
+            "status": "PENDING",
+            "filled": False,
+            "oco_link": oco_id,
+            "take_profit_order_id": legs[0].order_id,
+            "stop_loss_order_id": legs[1].order_id,
+        }
+
+    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
+        """Cancel a resting order (an OCO by its id or either leg) and release its lock."""
+        target = next(
+            (o for o in self._pending if order_id in (o.order_id, o.oco_id)),
+            None,
+        )
+        if target is None:
+            raise ValueError(f"Order {order_id} not found in pending orders")
+        self._remove_order(target)
+        await self._persist(snapshot_at=None)
+        return {"id": order_id, "status": "CANCELLED"}
+
+    def _remove_order(self, order: _PendingOrder) -> None:
+        if order.oco_id is not None:
+            self._pending = [o for o in self._pending if o.oco_id != order.oco_id]
+        else:
+            self._pending = [o for o in self._pending if o.order_id != order.order_id]
+        self._ledger.release(order.lock_id)
+
+    # ------------------------------------------------------------------
+    # Closed bars
+    # ------------------------------------------------------------------
+
+    async def on_closed_bar(self, symbol: str, ohlcv: OHLCV) -> list[PaperFill]:
+        """Evaluate this symbol's resting orders on one closed bar, then mark to its close.
+
+        A bar at or before the last processed timestamp is ignored. Orders placed after the
+        previous bar are eligible; at most one leg of an OCO fills.
+        """
+        canon = self._symbol(symbol)
+        last = self._last_bar_ts.get(canon)
+        if last is not None and ohlcv.timestamp <= last:
+            return []
+        fills: list[PaperFill] = []
+        seen_oco: set[str] = set()
+        for order in sorted((o for o in self._pending if o.symbol == canon), key=lambda o: o.seq):
+            if order not in self._pending or order.oco_id in seen_oco:
+                continue
+            if order.oco_id is not None:
+                seen_oco.add(order.oco_id)
+            if order.created_after_ts is not None and ohlcv.timestamp <= order.created_after_ts:
+                continue
+            fill = self._evaluate(order, ohlcv)
+            if fill is not None:
+                fills.append(fill)
+        self._marks[canon] = ohlcv.close
+        self._last_bar_ts[canon] = ohlcv.timestamp
+        self._update_peak()
+        await self._persist(snapshot_at=ohlcv.timestamp)
+        return fills
+
+    def _evaluate(self, order: _PendingOrder, bar: OHLCV) -> PaperFill | None:
+        slip = self._slippage_pct
+        if order.oco_id is not None:
+            legs = [o for o in self._pending if o.oco_id == order.oco_id]
+            tp = next(o for o in legs if o.order_type == OrderType.LIMIT)
+            sl = next(o for o in legs if o.order_type == OrderType.STOP_MARKET)
+            if tp.price is None or sl.stop_price is None:
+                raise LedgerInvariantError(f"OCO {order.oco_id} is missing a leg price")
+            outcome = fill_rules.oco_fill(order.side, sl.stop_price, tp.price, bar, slip)
+            if outcome is None:
+                return None
+            stop_won, fp = outcome
+            return self._fill_resting(sl if stop_won else tp, fp, bar.timestamp)
+
+        if order.order_type == OrderType.LIMIT:
+            if order.price is None:
+                raise LedgerInvariantError(f"LIMIT {order.order_id} has no price")
+            limit = fill_rules.limit_fill(order.side, order.price, bar)
+            return None if limit is None else self._fill_resting(order, limit, bar.timestamp)
+        if order.order_type == OrderType.STOP_MARKET:
+            if order.stop_price is None:
+                raise LedgerInvariantError(f"STOP_MARKET {order.order_id} has no stop")
+            stop = fill_rules.stop_market_fill(order.side, order.stop_price, bar, slip)
+            return None if stop is None else self._fill_resting(order, stop, bar.timestamp)
+        if order.order_type == OrderType.STOP_LIMIT:
+            if order.stop_price is None or order.price is None:
+                raise LedgerInvariantError(f"STOP_LIMIT {order.order_id} has no prices")
+            sl_outcome = fill_rules.stop_limit_fill(order.side, order.stop_price, order.price, bar)
+            if sl_outcome is None:
+                return None
+            if sl_outcome.fill is not None:
+                return self._fill_resting(order, sl_outcome.fill, bar.timestamp)
+            order.order_type = OrderType.LIMIT
+            order.stop_price = None
+            return None
+        if order.extreme is None or order.trail_pct is None:
+            raise LedgerInvariantError(f"TRAILING_STOP {order.order_id} has no peak")
+        trail = fill_rules.trailing_fill(order.side, order.extreme, order.trail_pct, bar, slip)
+        order.extreme = trail.extreme
+        return None if trail.fill is None else self._fill_resting(order, trail.fill, bar.timestamp)
+
+    def _fill_resting(self, order: _PendingOrder, fp: FillPrice, ts: datetime) -> PaperFill | None:
+        self._remove_order(order)
+        if order.side == "BUY":
+            need = order.quantity * fp.price * (_ONE + self._fee_rate(fp.liquidity))
+            if self._ledger.get_free(self._quote) < need:
+                logger.warning(
+                    "Paper %s %s cancelled: gap fill at %s needs %s %s, free %s",
+                    order.order_type,
+                    order.order_id,
+                    fp.price,
+                    need,
+                    self._quote,
+                    self._ledger.get_free(self._quote),
+                )
+                return None
+        parent = order.oco_id
+        return self._apply_fill(
+            order.symbol,
+            order.side,
+            order.order_type,
+            order.quantity,
+            fp,
+            order.reason,
+            order.order_id,
+            parent,
+            ts,
+        )
+
+    # ------------------------------------------------------------------
+    # Fills and the ledger
+    # ------------------------------------------------------------------
+
+    def _fill_from_free(
+        self,
+        canon: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        fp: FillPrice,
+        reason: str,
+        order_id: str,
+    ) -> PaperFill:
+        if side == "BUY":
+            need = quantity * fp.price * (_ONE + self._fee_rate(fp.liquidity))
+            if self._ledger.get_free(self._quote) < need:
+                raise InsufficientBalanceError(
+                    f"Insufficient {self._quote} balance for buy: need {need}, "
+                    f"free {self._ledger.get_free(self._quote)}"
+                )
+        else:
+            base = self._base(canon)
+            if self._ledger.get_free(base) < quantity:
+                raise InsufficientBalanceError(
+                    f"Insufficient {base} balance for sell: need {quantity}, "
+                    f"free {self._ledger.get_free(base)} (spot cannot sell short)"
+                )
+        return self._apply_fill(
+            canon, side, order_type, quantity, fp, reason, order_id, None, self._bar_time(canon)
+        )
+
+    def _apply_fill(
+        self,
+        canon: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        fp: FillPrice,
+        reason: str,
+        order_id: str,
+        parent_order_id: str | None,
+        ts: datetime,
+    ) -> PaperFill:
+        base = self._base(canon)
+        notional = quantity * fp.price
+        fee = notional * self._fee_rate(fp.liquidity)
+        lot = self._lots.setdefault(canon, _Lot())
+        gross: Decimal | None = None
+        net: Decimal | None = None
+        if side == "BUY":
+            self._ledger.debit(self._quote, notional + fee)
+            self._ledger.credit(base, quantity)
+            lot.base_qty += quantity
+            lot.price_basis += notional
+            lot.entry_fees_open += fee
+        else:
+            self._ledger.debit(base, quantity)
+            self._ledger.credit(self._quote, notional - fee)
+            if quantity == lot.base_qty:
+                basis_out, entry_fee_out = lot.price_basis, lot.entry_fees_open
+            else:
+                basis_out = lot.price_basis * quantity / lot.base_qty
+                entry_fee_out = lot.entry_fees_open * quantity / lot.base_qty
+            lot.base_qty -= quantity
+            lot.price_basis -= basis_out
+            lot.entry_fees_open -= entry_fee_out
+            gross = notional - basis_out
+            net = gross - fee - entry_fee_out
+            lot.realized_net += net
+            self._realized_gross += gross
+            self._realized_net += net
+        self._fees_paid += fee
+        self._fill_seq += 1
+        fill = PaperFill(
+            order_id=order_id,
+            parent_order_id=parent_order_id,
+            symbol=self._name(canon),
+            side=side,
+            order_type=str(order_type),
+            quantity=quantity,
+            price=fp.price,
+            fee=fee,
+            fee_currency=self._quote,
+            liquidity=fp.liquidity,
+            gross_pnl=gross,
+            net_pnl=net,
+            reason=reason,
+            timestamp=ts,
+            fill_seq=self._fill_seq,
+        )
+        self._filled.append(fill)
+        if self._db_pool is not None:
+            self._outbox.append(fill)
+        self._check_invariants()
+        self._update_peak()
+        return fill
+
+    def _check_invariants(self) -> None:
+        ledger = self._ledger
+        for asset in set(ledger.free) | set(ledger.locked):
+            if ledger.get_free(asset) < 0 or ledger.get_locked(asset) < 0:
+                raise LedgerInvariantError(f"negative {asset} balance")
+            held = sum((lk.amount for lk in ledger.locks.values() if lk.asset == asset), _ZERO)
+            if held != ledger.get_locked(asset):
+                raise LedgerInvariantError(f"{asset} locked {ledger.get_locked(asset)} != {held}")
+        for canon, lot in self._lots.items():
+            if lot.base_qty < 0 or lot.price_basis < 0 or lot.entry_fees_open < 0:
+                raise LedgerInvariantError(f"negative lot for {canon}")
+            if lot.base_qty != ledger.total(self._base(canon)):
+                raise LedgerInvariantError(
+                    f"{canon} lot {lot.base_qty} != {self._base(canon)} balance "
+                    f"{ledger.total(self._base(canon))}"
+                )
+        lot_assets = {self._base(c) for c in self._lots}
+        for asset in set(ledger.free) | set(ledger.locked):
+            if asset != self._quote and asset not in lot_assets and ledger.total(asset) != 0:
+                raise LedgerInvariantError(f"{asset} balance without a lot")
+        for order in self._pending:
+            if order.lock_id not in ledger.locks:
+                raise LedgerInvariantError(f"order {order.order_id} has no lock")
+
+    # ------------------------------------------------------------------
+    # Flatten
+    # ------------------------------------------------------------------
+
+    async def flatten(self, symbol: str | None = None, reason: str = "flatten") -> list[PaperFill]:
+        """Cancel resting orders and market-sell all base at the last mark; never risk-gated."""
+        if symbol is not None:
+            targets = {self._symbol(symbol)}
+        else:
+            targets = {o.symbol for o in self._pending} | set(self._lots)
+        fills: list[PaperFill] = []
+        for canon in sorted(targets):
+            for order in [o for o in self._pending if o.symbol == canon]:
+                if order in self._pending:
+                    self._remove_order(order)
+            qty = self._ledger.get_free(self._base(canon))
+            if qty <= 0:
+                continue
+            mark = self._marks.get(canon)
+            if mark is None or mark <= 0:
+                raise ValueError(f"cannot flatten {canon}: no market price for {qty} held")
+            fp = fill_rules.market_fill("SELL", mark, self._slippage_pct)
+            fills.append(
+                self._apply_fill(
+                    canon,
+                    "SELL",
+                    OrderType.MARKET,
+                    qty,
+                    fp,
+                    reason,
+                    str(uuid.uuid4()),
+                    None,
+                    self._bar_time(canon),
+                )
+            )
+        await self._persist(snapshot_at=fills[-1].timestamp if fills else None)
+        return fills
+
+    # ------------------------------------------------------------------
+    # Equity
+    # ------------------------------------------------------------------
+
+    def _mark_value(self, canon: str, lot: _Lot) -> Decimal:
+        mark = self._marks.get(canon)
+        if mark is None:
+            return lot.price_basis
+        return lot.base_qty * mark
+
+    def _equity(self) -> Decimal:
+        total = self._ledger.total(self._quote)
+        for canon, lot in self._lots.items():
+            if lot.base_qty > 0:
+                total += self._mark_value(canon, lot)
+        return total
+
+    def _unrealized(self) -> Decimal:
+        return sum(
+            (self._mark_value(c, lot) - lot.price_basis for c, lot in self._lots.items()),
+            _ZERO,
+        )
+
+    def _update_peak(self) -> None:
+        self._peak_equity = max(self._peak_equity, self._equity())
+
+    def _drawdown(self, equity: Decimal) -> Decimal:
+        if self._peak_equity <= 0:
+            return _ZERO
+        return max(_ZERO, (self._peak_equity - equity) / self._peak_equity)
+
+    async def get_equity(self) -> Decimal:
+        """Quote total plus every base total at its last mark (ExecutorState protocol)."""
+        return self._equity()
+
+    def get_account_snapshot(self) -> PaperAccountSnapshot:
+        equity = self._equity()
+        return PaperAccountSnapshot(
+            quote_asset=self._quote,
+            quote_free=self._ledger.get_free(self._quote),
+            quote_locked=self._ledger.get_locked(self._quote),
+            base_totals={
+                self._base(c): self._ledger.total(self._base(c)) for c in sorted(self._lots)
+            },
+            marks=dict(self._marks),
+            equity=equity,
+            initial_equity=self._initial_equity,
+            realized_gross=self._realized_gross,
+            fees_paid=self._fees_paid,
+            realized_net=self._realized_net,
+            unrealized=self._unrealized(),
+            peak_equity=self._peak_equity,
+            drawdown=self._drawdown(equity),
+            open_orders=len(self._pending),
+            last_bar_ts=dict(self._last_bar_ts),
+            persist_dirty=self._dirty,
+        )
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = dirty
+        if self._session_id:
+            metrics.set_paper_persist_dirty(self._session_id, dirty)
+
+    async def _require_persisted(self) -> None:
+        if not self._dirty:
+            return
+        await self._persist(snapshot_at=None)
+        if self._dirty:
+            raise PersistenceUnavailableError(
+                f"paper session {self._session_id} has {len(self._outbox)} unpersisted fills; "
+                "new entries are refused until the database accepts them"
+            )
+
+    async def checkpoint(self) -> None:
+        """Persist the current state (e.g. right after session start, before any fill)."""
+        await self._persist(snapshot_at=None)
+
+    async def _persist(self, *, snapshot_at: datetime | None) -> None:
+        if self._db_pool is None:
+            return
+        async with self._persist_lock:
+            await self._write(snapshot_at)
+
+    async def _write(self, snapshot_at: datetime | None) -> None:
+        version = self._state_version + 1
+        account = paper_store.AccountRow(
+            session_id=self._session_id,
+            strategy_id=self._strategy_id,
+            exchange_id=self._exchange_id,
+            quote_asset=self._quote,
+            state=self.to_state(),
+            state_version=version,
+        )
+        trades = [
+            paper_store.TradeRow(
+                symbol=f.symbol,
+                side=f.side,
+                price=f.price,
+                quantity=f.quantity,
+                fee=f.fee,
+                gross_pnl=f.gross_pnl if f.gross_pnl is not None else _ZERO,
+                net_pnl=f.net_pnl,
+                order_id=f.parent_order_id or f.order_id,
+                fill_seq=f.fill_seq,
+                liquidity=f.liquidity,
+                reason=f.reason,
+                timestamp=f.timestamp,
+            )
+            for f in self._outbox
+        ]
+        positions = []
+        flat = []
+        for canon, lot in sorted(self._lots.items()):
+            if lot.base_qty > 0:
+                positions.append(
+                    paper_store.PositionRow(
+                        symbol=self._name(canon),
+                        quantity=lot.base_qty,
+                        avg_entry_price=lot.price_basis / lot.base_qty,
+                        unrealized_pnl=self._mark_value(canon, lot) - lot.price_basis,
+                        realized_pnl=lot.realized_net,
+                    )
+                )
+            else:
+                flat.append(self._name(canon))
+        snapshot = None
+        if snapshot_at is not None:
+            equity = self._equity()
+            snapshot = paper_store.SnapshotRow(
+                timestamp=snapshot_at,
+                total_value=equity,
+                unrealized_pnl=self._unrealized(),
+                realized_pnl=self._realized_net,
+                drawdown_pct=self._drawdown(equity),
+                peak_value=self._peak_equity,
+            )
+        try:
+            async with self._db_pool.acquire() as conn:
+                await paper_store.save(conn, account, trades, positions, flat, snapshot)
+        except Exception:
+            logger.exception(
+                "Paper state for session %s not persisted; %d fills held in memory",
+                self._session_id,
+                len(self._outbox),
+            )
+            self._set_dirty(True)
+            return
+        self._state_version = version
+        written = {t.fill_seq for t in trades}
+        self._outbox = [f for f in self._outbox if f.fill_seq not in written]
+        if self._dirty and not self._outbox:
+            self._set_dirty(False)
+
+    def to_state(self) -> dict[str, Any]:
+        """The full account as a JSON-ready dict (Decimals as strings)."""
+        return {
+            "format": _STATE_FORMAT,
+            "quote_asset": self._quote,
+            "maker_fee": str(self._maker_fee),
+            "taker_fee": str(self._taker_fee),
+            "slippage_pct": str(self._slippage_pct),
+            "step_size": _opt_s(self._step_size),
+            "min_notional": _opt_s(self._min_notional),
+            "free": {a: str(v) for a, v in sorted(self._ledger.free.items())},
+            "locked": {a: str(v) for a, v in sorted(self._ledger.locked.items())},
+            "locks": {
+                k: {"asset": v.asset, "amount": str(v.amount)}
+                for k, v in sorted(self._ledger.locks.items())
+            },
+            "lots": {
+                c: {
+                    "base_qty": str(lot.base_qty),
+                    "price_basis": str(lot.price_basis),
+                    "entry_fees_open": str(lot.entry_fees_open),
+                    "realized_net": str(lot.realized_net),
+                }
+                for c, lot in sorted(self._lots.items())
+            },
+            "pending": [
+                {
+                    "order_id": o.order_id,
+                    "symbol": o.symbol,
+                    "side": o.side,
+                    "order_type": o.order_type,
+                    "quantity": str(o.quantity),
+                    "price": _opt_s(o.price),
+                    "stop_price": _opt_s(o.stop_price),
+                    "lock_id": o.lock_id,
+                    "seq": o.seq,
+                    "reason": o.reason,
+                    "created_after_ts": (
+                        None if o.created_after_ts is None else _ts(o.created_after_ts)
+                    ),
+                    "trail_pct": _opt_s(o.trail_pct),
+                    "extreme": _opt_s(o.extreme),
+                    "oco_id": o.oco_id,
+                }
+                for o in self._pending
+            ],
+            "marks": {c: str(v) for c, v in sorted(self._marks.items())},
+            "last_bar_ts": {c: _ts(v) for c, v in sorted(self._last_bar_ts.items())},
+            "names": dict(sorted(self._names.items())),
+            "fill_seq": self._fill_seq,
+            "order_seq": self._order_seq,
+            "initial_equity": str(self._initial_equity),
+            "peak_equity": str(self._peak_equity),
+            "realized_gross": str(self._realized_gross),
+            "fees_paid": str(self._fees_paid),
+            "realized_net": str(self._realized_net),
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: Mapping[str, Any],
+        *,
+        exchange_id: ExchangeId = "binance",
+        db_pool: Any = None,
+        strategy_id: str = "",
+        session_id: str = "",
+        market_rules: Mapping[str, SpotMarketRules] | None = None,
+    ) -> PaperTradingExecutor:
+        """Rebuild an executor from ``to_state``; raises PaperStateCorruptError if invalid."""
+        try:
+            if state.get("format") != _STATE_FORMAT:
+                raise ValueError(f"unknown paper state format {state.get('format')!r}")
+            ex = cls(
+                exchange_id=exchange_id,
+                initial_balances={str(state["quote_asset"]): _ZERO},
+                slippage_pct=_d(state["slippage_pct"]),
+                db_pool=db_pool,
+                strategy_id=strategy_id,
+                session_id=session_id,
+                maker_fee=_d(state["maker_fee"]),
+                taker_fee=_d(state["taker_fee"]),
+                quote_asset=str(state["quote_asset"]),
+                step_size=_opt_d(state["step_size"]),
+                min_notional=_opt_d(state["min_notional"]),
+                market_rules=market_rules,
+            )
+            ex._ledger = _Ledger(
+                free={a: _d(v) for a, v in state["free"].items()},
+                locked={a: _d(v) for a, v in state["locked"].items()},
+                locks={
+                    k: _Lock(str(v["asset"]), _d(v["amount"])) for k, v in state["locks"].items()
+                },
+            )
+            ex._lots = {
+                c: _Lot(
+                    base_qty=_d(v["base_qty"]),
+                    price_basis=_d(v["price_basis"]),
+                    entry_fees_open=_d(v["entry_fees_open"]),
+                    realized_net=_d(v["realized_net"]),
+                )
+                for c, v in state["lots"].items()
+            }
+            ex._pending = [
+                _PendingOrder(
+                    order_id=str(o["order_id"]),
+                    symbol=str(o["symbol"]),
+                    side=str(o["side"]),
+                    order_type=str(o["order_type"]),
+                    quantity=_d(o["quantity"]),
+                    price=_opt_d(o["price"]),
+                    stop_price=_opt_d(o["stop_price"]),
+                    lock_id=str(o["lock_id"]),
+                    seq=int(o["seq"]),
+                    reason=str(o["reason"]),
+                    created_after_ts=(
+                        None if o["created_after_ts"] is None else _parse_ts(o["created_after_ts"])
+                    ),
+                    trail_pct=_opt_d(o["trail_pct"]),
+                    extreme=_opt_d(o["extreme"]),
+                    oco_id=o["oco_id"],
+                )
+                for o in state["pending"]
+            ]
+            ex._marks = {c: _d(v) for c, v in state["marks"].items()}
+            ex._last_bar_ts = {c: _parse_ts(v) for c, v in state["last_bar_ts"].items()}
+            ex._names = {str(k): str(v) for k, v in state["names"].items()}
+            ex._fill_seq = int(state["fill_seq"])
+            ex._order_seq = int(state["order_seq"])
+            ex._initial_equity = _d(state["initial_equity"])
+            ex._peak_equity = _d(state["peak_equity"])
+            ex._realized_gross = _d(state["realized_gross"])
+            ex._fees_paid = _d(state["fees_paid"])
+            ex._realized_net = _d(state["realized_net"])
+            ex._check_invariants()
+        except (KeyError, TypeError, ValueError, ArithmeticError, LedgerInvariantError) as exc:
+            raise PaperStateCorruptError(f"paper state for session {session_id!r}: {exc}") from exc
+        return ex
+
+    @classmethod
+    async def restore(
+        cls,
+        db_pool: Any,
+        session_id: str,
+        *,
+        market_rules: Mapping[str, SpotMarketRules] | None = None,
+    ) -> PaperTradingExecutor | None:
+        """Rebuild the session's account from ``paper_accounts``.
+
+        Returns None when the session has neither saved state nor open positions (start fresh).
+        Raises PaperStateUnavailableError when positions exist without saved state or the DB cannot
+        be read, and PaperStateCorruptError when the saved state fails the ledger invariants.
+        """
+        try:
+            async with db_pool.acquire() as conn:
+                stored = await paper_store.load(conn, session_id)
+                orphaned = stored is None and await paper_store.has_open_positions(conn, session_id)
+        except Exception as exc:
+            raise PaperStateUnavailableError(
+                f"paper state for session {session_id!r} could not be read: {exc}"
+            ) from exc
+        if stored is None:
+            if orphaned:
+                raise PaperStateUnavailableError(
+                    f"paper state unavailable (pre-P1 session) for {session_id!r}: "
+                    "open positions exist without saved paper state"
+                )
+            return None
+        ex = cls.from_state(
+            stored.state,
+            exchange_id=_exchange_id(stored.exchange_id),
+            db_pool=db_pool,
+            strategy_id=stored.strategy_id,
+            session_id=stored.session_id,
+            market_rules=market_rules,
+        )
+        ex._state_version = stored.state_version
+        return ex
+
+    # ------------------------------------------------------------------
+    # Responses and queries
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fill_response(fill: PaperFill) -> dict[str, Any]:
+        return {
+            "id": fill.order_id,
+            "symbol": fill.symbol,
+            "side": fill.side,
+            "type": fill.order_type,
+            "amount": float(fill.quantity),
+            "price": float(fill.price),
+            "cost": float(fill.quantity * fill.price),
+            "fee": {"cost": float(fill.fee), "currency": fill.fee_currency},
+            "pnl": float(fill.gross_pnl or _ZERO),
+            "net_pnl": None if fill.net_pnl is None else float(fill.net_pnl),
+            "liquidity": fill.liquidity,
+            "fill_seq": fill.fill_seq,
+            "timestamp": fill.timestamp.isoformat(),
+            "status": "FILLED",
+            "filled": True,
+        }
+
+    def _pending_response(self, order: _PendingOrder) -> dict[str, Any]:
+        return {
+            "id": order.order_id,
+            "symbol": self._name(order.symbol),
+            "side": order.side,
+            "type": order.order_type,
+            "amount": float(order.quantity),
+            "price": None if order.price is None else float(order.price),
+            "stop_price": None if order.stop_price is None else float(order.stop_price),
             "status": "PENDING",
             "filled": False,
         }
 
-    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        """Cancel a pending order."""
-        for i, pending in enumerate(self._pending_orders):
-            if pending.order_id == order_id:
-                self._pending_orders.pop(i)
-                return {"id": order_id, "status": "CANCELLED"}
-        raise ValueError(f"Order {order_id} not found in pending orders")
-
-    # ------------------------------------------------------------------
-    # Pending order checks
-    # ------------------------------------------------------------------
-
-    def check_pending_orders(self, current_bar: OHLCV) -> list[dict[str, Any]]:
-        """Check whether any pending limit/stop orders should fill on this bar.
-
-        Returns a list of fill dicts for orders that triggered.
-        """
-        fills: list[dict[str, Any]] = []
-        remaining: list[_PendingOrder] = []
-
-        for pending in self._pending_orders:
-            bar_symbol = pending.symbol
-            # Update last known price
-            self._last_prices[bar_symbol] = current_bar.close
-
-            # Update peak_price for trailing stop orders
-            if pending.order_type == OrderType.TRAILING_STOP and pending.peak_price is not None:
-                if pending.side.upper() == "SELL":
-                    # Protecting a long: track the highest high
-                    pending.peak_price = max(pending.peak_price, current_bar.high)
-                else:
-                    # Protecting a short: track the lowest low
-                    pending.peak_price = min(pending.peak_price, current_bar.low)
-
-            triggered = self._should_trigger(pending, current_bar)
-            if triggered:
-                fill_price = self._determine_fill_price(pending, current_bar)
-                fill = self._execute_fill(
-                    pending.order_id,
-                    pending.symbol,
-                    pending.side,
-                    pending.quantity,
-                    fill_price,
-                    oco_link=pending.oco_link,
-                )
-                fills.append(fill)
-            else:
-                remaining.append(pending)
-
-        self._pending_orders = remaining
-
-        # Cancel any pending orders that share an oco_link with a filled order.
-        # _execute_fill embeds "_oco_link" on the fill dict when one is present.
-        if fills:
-            oco_links_to_cancel: set[str] = {
-                link for fill in fills if (link := fill.get("_oco_link")) is not None
-            }
-            if oco_links_to_cancel:
-                self._pending_orders = [
-                    o for o in self._pending_orders if o.oco_link not in oco_links_to_cancel
-                ]
-
-        return fills
-
-    def _should_trigger(self, order: _PendingOrder, bar: OHLCV) -> bool:
-        """Determine whether a pending order should trigger on this bar."""
-        otype = order.order_type.upper()
-
-        if otype in (OrderType.LIMIT, "LIMIT"):
-            if order.price is None:
-                return False
-            if order.side.upper() == "BUY":
-                return bar.low <= order.price
-            return bar.high >= order.price
-
-        if otype in (OrderType.STOP_MARKET, "STOP_MARKET", OrderType.STOP_LIMIT, "STOP_LIMIT"):
-            trigger = order.stop_price or order.price
-            if trigger is None:
-                return False
-            if order.side.upper() == "BUY":
-                return bar.high >= trigger
-            return bar.low <= trigger
-
-        if otype in (OrderType.TRAILING_STOP, "TRAILING_STOP"):
-            if order.peak_price is None or order.trail_pct is None:
-                return False
-            if order.side.upper() == "SELL":
-                # Long protection: trigger when price drops trail_pct from peak
-                trigger_price = order.peak_price * (Decimal("1") - order.trail_pct)
-                return bar.low <= trigger_price
-            else:
-                # Short protection: trigger when price rises trail_pct from trough
-                trigger_price = order.peak_price * (Decimal("1") + order.trail_pct)
-                return bar.high >= trigger_price
-
-        return False
-
-    def _determine_fill_price(self, order: _PendingOrder, bar: OHLCV) -> Decimal:
-        """Determine the simulated fill price for a triggered order."""
-        otype = order.order_type.upper()
-
-        if otype in (OrderType.LIMIT, "LIMIT") and order.price is not None:
-            return order.price
-
-        if otype in (OrderType.STOP_MARKET, "STOP_MARKET"):
-            trigger = order.stop_price or order.price or bar.close
-            return self._apply_slippage(trigger, order.side)
-
-        if otype in (OrderType.STOP_LIMIT, "STOP_LIMIT") and order.price is not None:
-            return order.price
-
-        if (
-            otype in (OrderType.TRAILING_STOP, "TRAILING_STOP")
-            and order.peak_price is not None
-            and order.trail_pct is not None
-        ):
-            if order.side.upper() == "SELL":
-                trigger = order.peak_price * (Decimal("1") - order.trail_pct)
-            else:
-                trigger = order.peak_price * (Decimal("1") + order.trail_pct)
-            return self._apply_slippage(trigger, order.side)
-
-        return self._apply_slippage(bar.close, order.side)
-
-    # ------------------------------------------------------------------
-    # Fill execution
-    # ------------------------------------------------------------------
-
-    def _compute_close_pnl(
-        self, symbol: str, side: str, quantity: Decimal, fill_price: Decimal
-    ) -> Decimal:
-        """Compute realized PnL when reducing/closing a position."""
-        pos = self._positions.get(symbol)
-        if pos is None:
-            return Decimal("0")
-        # Only closing trades generate PnL
-        is_closing = (pos.direction == Direction.LONG and side.upper() == "SELL") or (
-            pos.direction == Direction.SHORT and side.upper() == "BUY"
-        )
-        if not is_closing:
-            return Decimal("0")
-        closed_qty = min(quantity, pos.quantity)
-        if pos.direction == Direction.LONG:
-            return (fill_price - pos.avg_entry_price) * closed_qty
-        return (pos.avg_entry_price - fill_price) * closed_qty
-
-    def _execute_fill(
-        self,
-        order_id: str,
-        symbol: str,
-        side: str,
-        quantity: Decimal,
-        fill_price: Decimal,
-        *,
-        oco_link: str | None = None,
-    ) -> dict[str, Any]:
-        """Execute a simulated fill: update balances and positions."""
-        cost = fill_price * quantity
-        fee = cost * self._fee_pct
-
-        # Compute PnL before updating position (needs old entry price)
-        pnl = self._compute_close_pnl(symbol, side, quantity, fill_price)
-
-        # Update balances (simplified: assume quote currency is USDT)
-        quote = "USDT"
-        if side.upper() == "BUY":
-            required = cost + fee
-            if self._balances.get(quote, Decimal("0")) < required:
-                raise ValueError(f"Insufficient {quote} balance for buy order")
-            self._balances[quote] = self._balances.get(quote, Decimal("0")) - required
-            # Update position
-            self._update_position(symbol, Side.BUY, quantity, fill_price)
-        else:
-            self._balances[quote] = self._balances.get(quote, Decimal("0")) + cost - fee
-            self._update_position(symbol, Side.SELL, quantity, fill_price)
-
-        fill_dict: dict[str, Any] = {
-            "id": order_id,
-            "symbol": symbol,
-            "side": side,
-            "amount": float(quantity),
-            "price": float(fill_price),
-            "cost": float(cost),
-            "fee": {"cost": float(fee), "currency": quote},
-            "pnl": float(pnl),
-            "status": "FILLED",
-            "filled": True,
-        }
-        if oco_link is not None:
-            fill_dict["_oco_link"] = oco_link
-        self._filled_orders.append(fill_dict)
-
-        try:
-            from hydra.core.metrics import record_trade
-
-            record_trade(symbol, side, self._strategy_id, self._exchange_id, pnl=float(pnl))
-        except Exception:
-            pass
-
-        # Persist trade, position, and balance snapshot to DB (fire-and-forget)
-        if self._db_pool is not None:
-            import asyncio
-
-            _task = asyncio.ensure_future(
-                self._persist_fill_and_state(symbol, side, quantity, fill_price, fee, pnl)
-            )
-
-            def _log_persist_error(t: asyncio.Task[None]) -> None:
-                if not t.cancelled() and t.exception():
-                    logger.error("Failed to persist fill: %s", t.exception())
-
-            _task.add_done_callback(_log_persist_error)
-
-        return fill_dict
-
-    async def _persist_fill_and_state(
-        self,
-        symbol: str,
-        side: str,
-        quantity: Decimal,
-        price: Decimal,
-        fee: Decimal,
-        pnl: Decimal,
-    ) -> None:
-        """Persist trade, position state, and balance snapshot to DB."""
-        try:
-            now = datetime.now(UTC)
-            async with self._db_pool.acquire() as conn:
-                # 1) Trade
-                await conn.execute(
-                    """
-                    INSERT INTO trades
-                        (symbol, side, price, quantity, fee, pnl,
-                         strategy_id, exchange_id, timestamp, source, session_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'paper', $10)
-                    """,
-                    symbol,
-                    side.upper(),
-                    price,
-                    quantity,
-                    fee,
-                    pnl,
-                    self._strategy_id,
-                    self._exchange_id,
-                    now,
-                    self._session_id or None,
-                )
-
-                # 2) Position upsert
-                pos = self._positions.get(symbol)
-                if pos and pos.direction != Direction.FLAT and pos.quantity > 0:
-                    await conn.execute(
-                        """
-                        INSERT INTO positions
-                            (strategy_id, session_id, exchange_id, symbol,
-                             direction, quantity, avg_entry_price,
-                             unrealized_pnl, realized_pnl, source, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 'paper', $8)
-                        ON CONFLICT (session_id, symbol) DO UPDATE SET
-                            direction = EXCLUDED.direction,
-                            quantity = EXCLUDED.quantity,
-                            avg_entry_price = EXCLUDED.avg_entry_price,
-                            updated_at = EXCLUDED.updated_at
-                        """,
-                        self._strategy_id,
-                        self._session_id or None,
-                        self._exchange_id,
-                        symbol,
-                        pos.direction.value,
-                        pos.quantity,
-                        pos.avg_entry_price,
-                        now,
-                    )
-                elif pos and (pos.direction == Direction.FLAT or pos.quantity <= 0):
-                    # Position closed — remove from DB
-                    await conn.execute(
-                        "DELETE FROM positions WHERE session_id = $1 AND symbol = $2",
-                        self._session_id or None,
-                        symbol,
-                    )
-
-                # 3) Balance snapshot — compute real PnL values
-                total_value = self._balances.get("USDT", Decimal("0"))
-                unrealized = Decimal("0")
-                for sym, p in self._positions.items():
-                    if p.direction == Direction.FLAT or p.quantity <= 0:
-                        continue
-                    mark = self._last_prices.get(sym, p.avg_entry_price)
-                    pos_value = mark * p.quantity
-                    total_value += pos_value
-                    if p.direction == Direction.LONG:
-                        unrealized += (mark - p.avg_entry_price) * p.quantity
-                    else:
-                        unrealized += (p.avg_entry_price - mark) * p.quantity
-
-                # Realized PnL = cumulative PnL from all closed trades
-                realized_row = await conn.fetchrow(
-                    "SELECT COALESCE(SUM(pnl), 0) AS total "
-                    "FROM trades WHERE session_id = $1 AND source = 'paper'",
-                    self._session_id or None,
-                )
-                realized = Decimal(str(realized_row["total"])) if realized_row else Decimal("0")
-
-                await conn.execute(
-                    """
-                    INSERT INTO balance_snapshots
-                        (timestamp, total_value, unrealized_pnl,
-                         realized_pnl, drawdown_pct, peak_value, source)
-                    VALUES ($1, $2, $3, $4, 0, $2, 'paper')
-                    """,
-                    now,
-                    total_value,
-                    unrealized,
-                    realized,
-                )
-        except Exception:
-            logger.exception("Failed to persist paper state for %s", symbol)
-
-    def _update_position(
-        self,
-        symbol: str,
-        side: Side,
-        quantity: Decimal,
-        price: Decimal,
-    ) -> None:
-        """Update or create a simulated position."""
-        pos = self._positions.get(symbol)
-
-        if pos is None:
-            direction = Direction.LONG if side == Side.BUY else Direction.SHORT
-            self._positions[symbol] = _SimulatedPosition(
-                symbol=symbol,
-                direction=direction,
-                quantity=quantity,
-                avg_entry_price=price,
-            )
-            try:
-                from hydra.core.metrics import update_position
-
-                update_position(str(symbol), self._exchange_id, float(quantity))
-            except Exception:
-                pass
-            return
-
-        if (pos.direction == Direction.LONG and side == Side.BUY) or (
-            pos.direction == Direction.SHORT and side == Side.SELL
-        ):
-            # Adding to position: weighted average entry price
-            total_qty = pos.quantity + quantity
-            if total_qty > Decimal("0"):
-                pos.avg_entry_price = (
-                    pos.avg_entry_price * pos.quantity + price * quantity
-                ) / total_qty
-            pos.quantity = total_qty
-        else:
-            # Reducing / closing / reversing position
-            if quantity >= pos.quantity:
-                remaining = quantity - pos.quantity
-                if remaining > Decimal("0"):
-                    # Reversal
-                    direction = Direction.LONG if side == Side.BUY else Direction.SHORT
-                    pos.direction = direction
-                    pos.quantity = remaining
-                    pos.avg_entry_price = price
-                else:
-                    # Flat
-                    pos.direction = Direction.FLAT
-                    pos.quantity = Decimal("0")
-                    pos.avg_entry_price = Decimal("0")
-            else:
-                pos.quantity -= quantity
-
-        try:
-            from hydra.core.metrics import update_position
-
-            pos_now = self._positions.get(symbol)
-            is_open = pos_now is not None and pos_now.direction != Direction.FLAT
-            size = float(pos_now.quantity) if pos_now is not None and is_open else 0.0
-            update_position(str(symbol), self._exchange_id, size)
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Account queries (match ExchangeClient interface)
-    # ------------------------------------------------------------------
-
     async def fetch_balance(self) -> dict[str, Decimal]:
-        """Return virtual balances."""
-        return dict(self._balances)
-
-    async def fetch_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Return simulated positions."""
-        results: list[dict[str, Any]] = []
-        for sym, pos in self._positions.items():
-            if pos.direction == Direction.FLAT:
-                continue
-            if symbol is not None and sym != symbol:
-                continue
-            results.append(
-                {
-                    "symbol": pos.symbol,
-                    "side": pos.direction.value.lower(),
-                    "contracts": float(pos.quantity),
-                    "entryPrice": float(pos.avg_entry_price),
-                    "unrealizedPnl": float(pos.unrealized_pnl),
-                }
-            )
-        return results
-
-    # ------------------------------------------------------------------
-    # ExecutorState protocol implementation
-    # ------------------------------------------------------------------
+        """Free balance of the quote asset and of every base asset held."""
+        return await self.get_balance()
 
     async def get_balance(self) -> dict[str, Decimal]:
-        """Return virtual balances (ExecutorState protocol)."""
-        return dict(self._balances)
+        """Free balances (ExecutorState protocol); locked funds are excluded, like Binance."""
+        out = {self._quote: self._ledger.get_free(self._quote)}
+        for asset, amount in sorted(self._ledger.free.items()):
+            if asset != self._quote and amount > 0:
+                out[asset] = amount
+        return out
+
+    def _open_lots(self, symbol: str | None) -> list[tuple[str, _Lot]]:
+        wanted = None if symbol is None else _canon_symbol(symbol)
+        return [
+            (c, lot)
+            for c, lot in sorted(self._lots.items())
+            if lot.base_qty > 0 and (wanted is None or c == wanted)
+        ]
+
+    async def fetch_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Open spot holdings in ccxt position shape (always long)."""
+        return [
+            {
+                "symbol": self._name(c),
+                "side": "long",
+                "contracts": float(lot.base_qty),
+                "entryPrice": float(lot.price_basis / lot.base_qty),
+                "unrealizedPnl": float(self._mark_value(c, lot) - lot.price_basis),
+                "realizedPnl": float(lot.realized_net),
+            }
+            for c, lot in self._open_lots(symbol)
+        ]
 
     async def get_positions(self, symbol: str | None = None) -> list[Position]:
-        """Return simulated positions as Position objects (ExecutorState protocol)."""
-        results: list[Position] = []
-        for sym, pos in self._positions.items():
-            if pos.direction == Direction.FLAT:
-                continue
-            if symbol is not None and sym != symbol:
-                continue
-            results.append(
-                Position(
-                    symbol=Symbol(pos.symbol),
-                    direction=pos.direction,
-                    quantity=pos.quantity,
-                    avg_entry_price=pos.avg_entry_price,
-                    unrealized_pnl=pos.unrealized_pnl,
-                    realized_pnl=Decimal("0"),
-                    strategy_id=self._strategy_id,
-                    exchange_id=self._exchange_id,
-                )
+        """Open holdings as Position objects (ExecutorState protocol); realized is net."""
+        return [
+            Position(
+                symbol=Symbol(self._name(c)),
+                direction=Direction.LONG,
+                quantity=lot.base_qty,
+                avg_entry_price=lot.price_basis / lot.base_qty,
+                unrealized_pnl=self._mark_value(c, lot) - lot.price_basis,
+                realized_pnl=lot.realized_net,
+                strategy_id=self._strategy_id,
+                exchange_id=self._exchange_id,
             )
-        return results
+            for c, lot in self._open_lots(symbol)
+        ]
 
     async def get_last_price(self, symbol: str) -> Decimal:
-        """Return the last known price for a symbol (ExecutorState protocol)."""
-        price = self._last_prices.get(symbol, Decimal("0"))
+        """The last mark for a symbol (ExecutorState protocol)."""
+        price = self._marks.get(_canon_symbol(symbol), _ZERO)
         if price <= 0:
             raise ValueError(f"No market price available for {symbol}")
         return price
 
-    # ------------------------------------------------------------------
-    # Account queries (match ExchangeClient interface)
-    # ------------------------------------------------------------------
-
     async def get_filled_orders(self) -> list[dict[str, Any]]:
-        """Return a copy of all filled orders."""
-        return list(self._filled_orders)
+        """Every fill so far, as response dicts."""
+        return [self._fill_response(f) for f in self._filled]
+
+    def get_fills(self) -> list[PaperFill]:
+        return list(self._filled)
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Return pending orders."""
-        results: list[dict[str, Any]] = []
-        for pending in self._pending_orders:
-            if symbol is not None and pending.symbol != symbol:
-                continue
-            results.append(
-                {
-                    "id": pending.order_id,
-                    "symbol": pending.symbol,
-                    "side": pending.side,
-                    "type": pending.order_type,
-                    "amount": float(pending.quantity),
-                    "price": float(pending.price) if pending.price else None,
-                    "status": "PENDING",
-                }
-            )
-        return results
+        """Resting orders, including each stop's trigger, reason and OCO id."""
+        wanted = None if symbol is None else _canon_symbol(symbol)
+        return [
+            {
+                **self._pending_response(o),
+                "reason": o.reason,
+                "oco_id": o.oco_id,
+                "trail_pct": None if o.trail_pct is None else float(o.trail_pct),
+            }
+            for o in sorted(self._pending, key=lambda o: o.seq)
+            if wanted is None or o.symbol == wanted
+        ]
+
+
+def _exchange_id(value: str) -> ExchangeId:
+    if value not in get_args(ExchangeId):
+        raise PaperStateCorruptError(f"unknown exchange_id {value!r} in paper state")
+    return cast(ExchangeId, value)
