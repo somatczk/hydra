@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -27,6 +28,7 @@ from hydra.core.time import BacktestClock
 from hydra.core.types import (
     OHLCV,
     Direction,
+    MarketType,
     OrderFill,
     OrderRequest,
     OrderType,
@@ -35,6 +37,9 @@ from hydra.core.types import (
     Symbol,
     Timeframe,
 )
+from hydra.execution.fill_rules import trailing_fill
+from hydra.execution.order_manager import PROTECTIVE_TAG
+from hydra.execution.protective_orders import spec_from_policy
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
@@ -271,8 +276,9 @@ class BacktestRunner:
             total_vol = sum((b.volume for b in bars), Decimal("0"))
             avg_volume = total_vol / Decimal(str(len(bars))) if len(bars) > 0 else Decimal("0")
 
-        # Pending orders (placed by signals, filled on next bar)
+        # Pending orders (placed by signals, filled on next bar); protective exits first
         pending_orders: list[OrderRequest] = []
+        trailing_peaks: dict[str, Decimal] = {}
         stopped_reason: str | None = None
 
         # Transaction tracking (individual fills linked by trade_id)
@@ -355,19 +361,34 @@ class BacktestRunner:
             filled_orders: list[OrderRequest] = []
             next_bar = bars[i + 1] if i + 1 < len(bars) else None
 
-            for order in pending_orders:
-                fill = fill_sim.simulate_fill(
-                    order=order,
-                    current_bar=bar,
-                    next_bar=next_bar,
-                    commission=comm,
-                    avg_volume=avg_volume,
+            pending_orders.sort(key=lambda o: o.tag != PROTECTIVE_TAG)
+            for order in list(pending_orders):
+                if order in filled_orders:
+                    continue
+                if order.reduce_only and str(order.symbol) not in tracker.positions:
+                    filled_orders.append(order)
+                    continue
+                fill = self._simulate(
+                    fill_sim, order, bar, next_bar, comm, avg_volume, trailing_peaks
                 )
                 if fill is not None:
                     sym_key = str(fill.symbol)
                     had_position = sym_key in tracker.positions
 
                     trade = tracker.apply_fill(fill)
+                    if had_position and sym_key not in tracker.positions:
+                        filled_orders.extend(
+                            o
+                            for o in pending_orders
+                            if o is not order and o.reduce_only and str(o.symbol) == sym_key
+                        )
+                    elif not had_position and sym_key in tracker.positions:
+                        protective = self._protective_order(
+                            strategy_config, fill, context, symbol, timeframe
+                        )
+                        if protective.order_type == OrderType.TRAILING_STOP:
+                            trailing_peaks[protective.request_id] = fill.price
+                        pending_orders.append(protective)
 
                     if trade is not None:
                         trades.append(trade)
@@ -415,9 +436,10 @@ class BacktestRunner:
                     await strategy.on_fill(fill_event)
                     filled_orders.append(order)
 
-            # Remove filled orders from pending
+            # Remove filled (or cancelled) orders from pending
             for fo in filled_orders:
-                pending_orders.remove(fo)
+                if fo in pending_orders:
+                    pending_orders.remove(fo)
 
             # Feed bar to strategy context (no lookahead: only current bar)
             context.add_bar(symbol, timeframe, bar)
@@ -443,9 +465,11 @@ class BacktestRunner:
             for sig in signals:
                 await event_bus.publish(sig)
 
-            # Convert signals to orders
+            # Convert signals to orders (paper rules: no pyramiding, no spot shorts)
             for sig in signals:
-                maybe_order = self._signal_to_order(sig, sym, strategy_config, bar, tracker)
+                maybe_order = self._signal_to_order(
+                    sig, sym, strategy_config, bar, tracker, pending_orders
+                )
                 if maybe_order is not None:
                     pending_orders.append(maybe_order)
 
@@ -523,6 +547,79 @@ class BacktestRunner:
         result.transactions = transactions
         return result
 
+    def _simulate(
+        self,
+        fill_sim: FillSimulator,
+        order: OrderRequest,
+        bar: OHLCV,
+        next_bar: OHLCV | None,
+        comm: CommissionConfig,
+        avg_volume: Decimal,
+        trailing_peaks: dict[str, Decimal],
+    ) -> OrderFill | None:
+        if order.order_type != OrderType.TRAILING_STOP:
+            return fill_sim.simulate_fill(
+                order=order,
+                current_bar=bar,
+                next_bar=next_bar,
+                commission=comm,
+                avg_volume=avg_volume,
+            )
+        if order.price is None:
+            return None
+        peak = trailing_peaks.get(order.request_id, bar.open)
+        out = trailing_fill(order.side.value, peak, order.price, bar, Decimal("0"))
+        trailing_peaks[order.request_id] = out.extreme
+        if out.fill is None:
+            return None
+        trailing_peaks.pop(order.request_id, None)
+        fee_rate = comm.fee_rate(order.market_type, is_maker=False)
+        return OrderFill(
+            order_id=order.request_id,
+            symbol=order.symbol,
+            side=order.side,
+            quantity=order.quantity,
+            price=out.fill.price,
+            fee=FillSimulator.calculate_fee(order.quantity, out.fill.price, fee_rate),
+            fee_currency="USDT",
+            timestamp=bar.timestamp,
+            exchange_id=order.exchange_id,
+        )
+
+    @staticmethod
+    def _protective_order(
+        config: StrategyConfig,
+        fill: OrderFill,
+        context: StrategyContext,
+        symbol: str,
+        timeframe: Timeframe,
+    ) -> OrderRequest:
+        """The paper session's mandatory exit for a new long (decision 17/18)."""
+        atr_values = context.indicator("atr", symbol, timeframe, period=config.risk.atr_period)
+        atr = None
+        if len(atr_values) and not math.isnan(float(atr_values[-1])):
+            atr = Decimal(str(float(atr_values[-1])))
+        spec = spec_from_policy(config.risk, fill.price, atr)
+        if spec.trailing_pct is not None:
+            order_type, price, stop = OrderType.TRAILING_STOP, spec.trailing_pct, None
+        elif spec.take_profit is not None:
+            order_type, price, stop = OrderType.OCO, spec.take_profit, spec.stop_loss
+        else:
+            order_type, price, stop = OrderType.STOP_MARKET, None, spec.stop_loss
+        return OrderRequest(
+            symbol=fill.symbol,
+            side=Side.SELL,
+            order_type=order_type,
+            quantity=fill.quantity,
+            strategy_id=config.id,
+            exchange_id=fill.exchange_id,
+            market_type=config.exchange.market_type,
+            price=price,
+            stop_price=stop,
+            reduce_only=True,
+            tag=PROTECTIVE_TAG,
+        )
+
     @staticmethod
     def _signal_to_order(
         signal: EntrySignal | ExitSignal,
@@ -530,9 +627,23 @@ class BacktestRunner:
         config: StrategyConfig,
         current_bar: OHLCV,
         tracker: _SimplePositionTracker,
+        pending: list[OrderRequest] | None = None,
     ) -> OrderRequest | None:
-        """Convert a signal into an OrderRequest with equity-based position sizing."""
+        """Convert a signal into an OrderRequest with equity-based position sizing.
+
+        Paper rules: no entry while the symbol is held or an entry is pending, no short entry
+        on spot, exits are reduce-only.
+        """
         if isinstance(signal, EntrySignal):
+            if str(symbol) in tracker.positions or any(
+                not o.reduce_only and str(o.symbol) == str(symbol) for o in pending or []
+            ):
+                return None
+            if (
+                signal.direction == Direction.SHORT
+                and config.exchange.market_type == MarketType.SPOT
+            ):
+                return None
             # Risk 10% of equity per trade
             available = max(tracker.equity, Decimal("0"))
             risk_fraction = Decimal("0.1")
@@ -569,6 +680,8 @@ class BacktestRunner:
                 strategy_id=signal.strategy_id,
                 exchange_id=signal.exchange_id,
                 market_type=config.exchange.market_type,
+                reduce_only=True,
+                tag="exit",
             )
         return None
 

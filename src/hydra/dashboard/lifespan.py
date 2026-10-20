@@ -1,9 +1,11 @@
 """Engine startup and shutdown.
 
 Startup order: config, logging, credential key, DB pool, Alembic migrations, stored credentials,
-system config, SessionManager, backtest cache. Any startup error propagates, so uvicorn exits
-non-zero instead of serving without a schema or a key. Without DATABASE_URL (dev only) there is no
-pool, no migration and no key requirement.
+system config, SessionManager (``startup()``: risk state, recovery, display rows), backtest cache.
+Any startup error propagates, so uvicorn exits non-zero instead of serving without a schema or a
+key. Without DATABASE_URL (dev only) there is no pool, no migration and no key requirement.
+``app.state.session_clients`` (a ``ClientFactory``), when set before startup, replaces the public
+exchange clients of every session (the paper smoke test injects its fakes there).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from fastapi import FastAPI
 from hydra.core.config import HydraConfig, load_config
 from hydra.dashboard.deps import bind_config
 from hydra.dashboard.routes import market_data
+from hydra.execution.client_factory import ClientFactory
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     app.state.exchange_credential_errors = {}
     app.state.system_config = None
     app.state.session_manager = None
+    clients: ClientFactory | None = getattr(app.state, "session_clients", None)
     try:
         await _init_logging(cfg)
         dsn = cfg.database_url.get_secret_value() if cfg.database_url is not None else None
@@ -48,7 +52,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             await _run_migrations(dsn)
             await _load_exchange_credentials(app)
             await _load_system_config(app)
-        await _init_session_manager(app, cfg)
+        await _init_session_manager(app, cfg, clients)
         await _populate_backtest_cache(app)
         yield
     finally:
@@ -142,16 +146,14 @@ async def _load_system_config(app: FastAPI) -> None:
     app.state.system_config = {row["key"]: json.loads(row["value"]) for row in rows}
 
 
-async def _init_session_manager(app: FastAPI, cfg: HydraConfig) -> None:
+async def _init_session_manager(
+    app: FastAPI, cfg: HydraConfig, clients: ClientFactory | None = None
+) -> None:
+    """RiskService, recovery and display rows (``SessionManager.startup``); errors propagate."""
     from hydra.execution.session_manager import SessionManager
 
-    pool = app.state.db_pool
-    mgr = SessionManager(db_pool=pool, config=cfg)
-    if pool is not None:
-        await mgr.load_recent_sessions()
-        await mgr.recover_running_sessions()
-        if mgr._init_task is not None:
-            await mgr._init_task
+    mgr = SessionManager(db_pool=app.state.db_pool, config=cfg, clients=clients)
+    await mgr.startup()
     app.state.session_manager = mgr
 
 

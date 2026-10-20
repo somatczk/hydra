@@ -75,16 +75,6 @@ class TestMarketOrders:
         with pytest.raises(ValueError, match="No market price"):
             await executor().create_order("UNKNOWNUSDT", "BUY", "MARKET", D("1"))
 
-    async def test_set_market_price_shim_sets_the_mark(self) -> None:
-        ex = executor(fee="0", slippage="0")
-        ex.set_market_price(BTC, D("50000"))
-        await ex.create_order(BTC, "BUY", "MARKET", D("1"))
-        assert (await ex.fetch_balance())["USDT"] == D("50000")
-
-    def test_check_pending_orders_shim_points_to_on_closed_bar(self) -> None:
-        with pytest.raises(TypeError, match="on_closed_bar"):
-            executor().check_pending_orders(flat_bar(0, "1"))
-
     async def test_unsupported_type_rejected(self) -> None:
         with pytest.raises(OrderRejectedError, match="not supported"):
             await executor().create_order(

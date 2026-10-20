@@ -154,7 +154,7 @@ class TestSignalToOrderPipeline:
 
         for bar in bars:
             context.add_bar(symbol, tf, bar)
-            paper_executor.set_market_price(symbol, bar.close)
+            await paper_executor.on_closed_bar(symbol, bar)
 
             bar_event = BarEvent(
                 symbol=sym,
@@ -295,7 +295,7 @@ class TestSignalToOrderPipeline:
         bars = _generate_bars(20, start_price=40000.0)
         for _i, bar in enumerate(bars):
             context.add_bar(symbol, Timeframe.H1, bar)
-            paper_executor.set_market_price(symbol, bar.close)
+            await paper_executor.on_closed_bar(symbol, bar)
 
             bar_event = BarEvent(
                 symbol=sym,
@@ -364,7 +364,9 @@ class TestSignalToOrderPipeline:
         risk_manager: PreTradeRiskManager,
     ) -> None:
         """OrderManager wires risk check + executor + event bus together."""
-        paper_executor.set_market_price("BTCUSDT", Decimal("42000"))
+        await paper_executor.on_closed_bar(
+            "BTCUSDT", make_bar(42000.0, datetime(2024, 1, 1, tzinfo=UTC))
+        )
 
         portfolio_state = PortfolioState(
             positions=[],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
@@ -10,6 +11,7 @@ import pytest
 
 from hydra.core.events import OrderCancelEvent, OrderFillEvent, RiskCheckResult
 from hydra.core.types import (
+    OHLCV,
     MarketType,
     OrderRequest,
     OrderStatus,
@@ -17,7 +19,8 @@ from hydra.core.types import (
     Side,
     Symbol,
 )
-from hydra.execution.order_manager import OrderManager
+from hydra.execution.order_manager import PROTECTIVE_TAG, OrderManager
+from hydra.execution.paper_trading import PaperTradingExecutor
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -238,3 +241,89 @@ class TestStaleCleanup:
         await mgr.submit_order(_make_order())
         cancelled = await mgr.cleanup_stale_orders()
         assert len(cancelled) == 0
+
+
+# ---------------------------------------------------------------------------
+# External fills (paper resting orders) and the protective cleanup exemption
+# ---------------------------------------------------------------------------
+
+
+class _Bus:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def publish(self, event: Any) -> None:
+        self.events.append(event)
+
+
+def _flat(price: str, hour: int) -> OHLCV:
+    p = Decimal(price)
+    return OHLCV(
+        open=p,
+        high=p,
+        low=p,
+        close=p,
+        volume=Decimal("1"),
+        timestamp=datetime(2026, 10, 20, hour, tzinfo=UTC),
+    )
+
+
+class TestExternalFills:
+    async def _long_with_stop(self) -> tuple[OrderManager, _Bus, PaperTradingExecutor, str]:
+        ex = PaperTradingExecutor(initial_balances={"USDT": Decimal("1000")})
+        bus = _Bus()
+        om = OrderManager(ex, bus, session_id="s1")
+        await ex.on_closed_bar("BTCUSDT", _flat("100", 1))
+        await om.submit_order(_make_order(quantity=Decimal("1")))
+        stop_id = await om.submit_order(
+            _make_order(
+                side=Side.SELL,
+                order_type=OrderType.STOP_MARKET,
+                quantity=Decimal("1"),
+                stop_price=Decimal("95"),
+                reduce_only=True,
+                tag=PROTECTIVE_TAG,
+            )
+        )
+        assert stop_id is not None
+        return om, bus, ex, stop_id
+
+    async def test_resting_fill_is_published_with_net_pnl_and_marked_filled(self) -> None:
+        om, bus, ex, stop_id = await self._long_with_stop()
+        fills = await ex.on_closed_bar("BTCUSDT", _flat("90", 2))
+        (event,) = [e for f in fills if (e := await om.on_external_fill(f)) is not None]
+        assert om.get_order_status(stop_id) == OrderStatus.FILLED
+        assert (event.order_id, event.side, event.price) == (stop_id, Side.SELL, Decimal("89.910"))
+        assert event.session_id == "s1" and event.tag == PROTECTIVE_TAG and event.reduce_only
+        # 89.91 - 100.1 gross, minus exit fee 0.08991 and entry fee 0.1001
+        assert event.gross_pnl == Decimal("-10.190")
+        assert event.realized_pnl == Decimal("-10.38001")
+        assert bus.events[-1] is event
+
+    async def test_cancelled_record_publishes_nothing(self) -> None:
+        ex = PaperTradingExecutor(initial_balances={"USDT": Decimal("100")})
+        bus = _Bus()
+        om = OrderManager(ex, bus, session_id="s1")
+        await ex.on_closed_bar("BTCUSDT", _flat("100", 1))
+        oid = await om.submit_order(
+            _make_order(
+                order_type=OrderType.STOP_MARKET, quantity=Decimal("0.9"), stop_price=Decimal("105")
+            )
+        )
+        assert oid is not None
+        # gaps to 200: the resting BUY cannot be paid for and is dropped
+        fills = await ex.on_closed_bar("BTCUSDT", _flat("200", 2))
+        assert [f.status for f in fills] == ["CANCELLED"]
+        assert await om.on_external_fill(fills[0]) is None
+        assert om.get_order_status(oid) == OrderStatus.CANCELLED
+        assert not [e for e in bus.events if isinstance(e, OrderFillEvent) and e.order_id == oid]
+
+    async def test_stale_cleanup_skips_protective_orders(self) -> None:
+        om, _, ex, stop_id = await self._long_with_stop()
+        limit_id = await om.submit_order(
+            _make_order(order_type=OrderType.LIMIT, quantity=Decimal("2"), price=Decimal("50"))
+        )
+        om._stale_order_timeout = 0.0
+        assert await om.cleanup_stale_orders() == [limit_id]
+        assert om.get_order_status(stop_id) == OrderStatus.SUBMITTED
+        assert [o["id"] for o in await ex.fetch_open_orders()] == [stop_id]

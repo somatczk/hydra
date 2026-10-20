@@ -195,7 +195,7 @@ class TestOcoParityWithBacktest:
         outcome = fill_rules.oco_fill(side.value, D(sl), D(tp), b, D("0"))
         assert outcome is not None
         assert outcome[0] is bt_stop_won
-        if not name.startswith(("gap", "buy_gap")):
+        if bt_stop_won or not name.startswith(("gap", "buy_gap")):
             assert outcome[1].price == bt.price
 
     def test_oco_both_legs_hit_bullish_bar_stop_wins(self) -> None:

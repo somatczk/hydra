@@ -1,310 +1,606 @@
-"""Build and wire the per-session runtime: bus, engine, executor, OrderManager and feed."""
+"""SessionRuntime: one paper session's bus, context, engine, executor, OrderManager and feed.
+
+Wiring order (fixed): the session's closed-bar handler is subscribed before the engine, so the
+paper executor evaluates resting orders and marks to a bar before any strategy sees that bar;
+every fill is published before the strategy runs. Then signals, fills and feed status.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+import math
+import uuid
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
+from hydra.core import metrics
+from hydra.core.config import HydraConfig
 from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import BarEvent, EntrySignal, Event, ExitSignal, OrderFillEvent
+from hydra.core.events import (
+    BarEvent,
+    EntrySignal,
+    Event,
+    ExitSignal,
+    FeedStatusEvent,
+    OrderFillEvent,
+)
 from hydra.core.types import (
+    OHLCV,
     Direction,
     ExchangeId,
     MarketType,
     OrderRequest,
+    OrderStatus,
     OrderType,
     Side,
     Symbol,
     Timeframe,
 )
 from hydra.data.ingestion import ExchangeFeedManager
-from hydra.execution import client_factory
-from hydra.execution.order_manager import OrderManager
-from hydra.risk.pretrade import PortfolioState, PreTradeRiskManager
+from hydra.execution.client_factory import ClientFactory
+from hydra.execution.errors import SessionNotRunningError, SpotShortError
+from hydra.execution.flatten import FlattenResult, flatten_session
+from hydra.execution.order_manager import OrderManager, RiskRejectedError
+from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
+from hydra.risk.service import RiskService
+from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
 
 if TYPE_CHECKING:
-    from hydra.core.config import HydraConfig
     from hydra.execution.session_manager import TradingSession
 
 logger = logging.getLogger(__name__)
 
+ENTRY_TAG = "entry"
+EXIT_TAG = "exit"
+MANUAL_TAG_PREFIX = "manual:"
+_HUNDRED = Decimal("100")
 
-def collect_timeframes(cfg: StrategyConfig) -> list[Timeframe]:
-    """Return all timeframes a strategy uses (primary + confirmation + entry)."""
-    tfs = [cfg.timeframes.primary]
-    if cfg.timeframes.confirmation is not None:
-        tfs.append(cfg.timeframes.confirmation)
-    if cfg.timeframes.entry is not None:
-        tfs.append(cfg.timeframes.entry)
-    return tfs
+FailureCallback = Callable[["TradingSession", str], Coroutine[Any, Any, None]]
+WarmBars = dict[tuple[str, Timeframe], list[OHLCV]]
 
 
-async def build_engine(
-    cfg: StrategyConfig, hydra_config: HydraConfig
-) -> tuple[InMemoryEventBus, StrategyEngine]:
-    """Create the session's event bus, context and engine, and load the strategy."""
-    event_bus = InMemoryEventBus()
-    context = StrategyContext()
-    engine = StrategyEngine(config=hydra_config, event_bus=event_bus, context=context)
-    await engine.load_strategy_from_config(cfg)
-    return event_bus, engine
+@dataclass(frozen=True, slots=True)
+class StrategyProbe:
+    """What a strategy needs before its session is built."""
+
+    order_management: bool
+    required_history: int
 
 
-async def attach_order_path(
-    session: TradingSession,
-    cfg: StrategyConfig,
-    engine: StrategyEngine,
-    event_bus: InMemoryEventBus,
-    executor: Any,
-    risk_manager: PreTradeRiskManager | None,
-    build_state: Callable[[TradingSession], Awaitable[PortfolioState]],
-) -> None:
-    """Attach executor, OrderManager and feed to *session*."""
-    session._executor = executor
-    session._event_bus = event_bus
-
-    portfolio_state = await build_state(session)
-
-    async def _state_builder() -> PortfolioState:
-        return await build_state(session)
-
-    order_manager = OrderManager(
-        executor=executor,
-        event_bus=event_bus,
-        risk_checker=risk_manager,
-        portfolio_state=portfolio_state,
-        portfolio_state_builder=_state_builder,
+async def probe_strategy(cfg: StrategyConfig, hydra_config: HydraConfig) -> StrategyProbe:
+    """Instantiate the strategy against a throwaway context to read its class and history."""
+    engine = StrategyEngine(
+        config=hydra_config, event_bus=InMemoryEventBus(), context=StrategyContext()
     )
-    feed = ExchangeFeedManager(event_bus=event_bus)
+    await engine.load_strategy_from_config(cfg)
+    history = [
+        int(s.required_history)
+        for s in engine.get_all_strategies().values()
+        if isinstance(s, BaseStrategy)
+    ]
+    return StrategyProbe(engine.is_order_management, max(history, default=1))
 
-    session._engine = engine
-    session._order_manager = order_manager
-    session._feed = feed
-    session._all_timeframes = collect_timeframes(cfg)
+
+@dataclass(frozen=True, slots=True)
+class ManualOrderResult:
+    order_id: str | None
+    status: str
+    quantity: Decimal
+    price: Decimal | None
+    protection: str  # 'armed' | 'pending' | 'none'
+    protective_order_id: str | None
 
 
-async def start_session_runtime(
-    session: TradingSession,
-    get_risk_manager: Callable[[], PreTradeRiskManager | None],
-    get_risk_config: Callable[[], dict[str, Any]],
-) -> None:
-    """Start the engine, subscribe the session handlers and connect the feed."""
-    if session._engine is None:
-        return
-    await session._engine.start()
+class SessionRuntime:
+    """Owns one running paper session's components; built by ``SessionManager``."""
 
-    # Wire signal->order bridge
-    if session._event_bus and session._order_manager and session._executor:
-        om = session._order_manager  # capture for closure
-
-        async def on_bar_price(event: Event) -> None:
-            if (
-                isinstance(event, BarEvent)
-                and event.ohlcv
-                and hasattr(session._executor, "set_market_price")
-            ):
-                session._executor.set_market_price(
-                    str(event.symbol),
-                    event.ohlcv.close,
-                )
-
-        async def on_signal(event: Event) -> None:
-            order = await signal_to_order(event, session, get_risk_config)
-            if order is not None:
-                try:
-                    await om.submit_order(order)
-                except ValueError as exc:
-                    logger.warning("Skipped order from signal: %s", exc)
-                except Exception:
-                    logger.exception("Failed to submit order from signal")
-
-        await session._event_bus.subscribe("bar", on_bar_price)
-        await session._event_bus.subscribe("entry_signal", on_signal)
-        await session._event_bus.subscribe("exit_signal", on_signal)
-
-        # Forward fill events to risk manager
-        async def on_fill(event: Event) -> None:
-            if get_risk_manager() and session.status == "running":
-                pnl = Decimal(str(getattr(event, "pnl", 0) or 0))
-                balance = await session._executor.get_balance()
-                portfolio_val = sum(balance.values(), Decimal("0"))
-                await cast(PreTradeRiskManager, get_risk_manager()).record_fill(pnl, portfolio_val)
-
-        await session._event_bus.subscribe("order_fill", on_fill)
-
-        # Publish fills to WebSocket ConnectionManager
-        async def on_fill_ws(event: Event) -> None:
-            try:
-                from hydra.core.websocket import manager
-
-                fill_data = {
-                    "event": "order_fill",
-                    "session_id": session.session_id,
-                    "order_id": getattr(event, "order_id", ""),
-                    "symbol": str(getattr(event, "symbol", "")),
-                    "side": str(getattr(event, "side", "")),
-                    "quantity": str(getattr(event, "quantity", "0")),
-                    "price": str(getattr(event, "price", "0")),
-                    "fee": str(getattr(event, "fee", "0")),
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-                await manager.broadcast(f"trades:{session.session_id}", fill_data)
-            except Exception:
-                logger.debug("Could not broadcast fill to WebSocket")
-
-        await session._event_bus.subscribe("order_fill", on_fill_ws)
-
-    # Wire OrderManagementStrategy if applicable
-    if (
-        session._engine is not None
-        and session._engine.is_order_management
-        and session._executor is not None
-        and session._event_bus is not None
-    ):
-        from hydra.strategy.base import OrderManagementStrategy
-
-        for strategy in session._engine.get_all_strategies().values():
-            if isinstance(strategy, OrderManagementStrategy):
-                oms = strategy
-                ex = session._executor
-
-                # Execute on_start actions
-                start_actions = await oms.on_start()
-                if start_actions:
-                    await execute_order_actions(start_actions, ex, session)
-
-                # On bar events: call strategy's on_bar -> execute actions
-                async def on_bar_oms(
-                    event: Event,
-                    _oms: Any = oms,
-                    _ex: Any = ex,
-                ) -> None:
-                    if isinstance(event, BarEvent):
-                        actions = await _oms.on_bar(event)
-                        if actions:
-                            await execute_order_actions(actions, _ex, session)
-
-                await session._event_bus.subscribe("bar", on_bar_oms)
-
-                # On fill events: call strategy's on_fill -> execute follow-ups
-                async def on_fill_oms(
-                    event: Event,
-                    _oms: Any = oms,
-                    _ex: Any = ex,
-                ) -> None:
-                    if isinstance(event, OrderFillEvent):
-                        actions = await _oms.on_fill(event)
-                        if actions:
-                            await execute_order_actions(actions, _ex, session)
-
-                await session._event_bus.subscribe("order_fill", on_fill_oms)
-
-    # Start market data feed
-    if session._feed is not None:
-        eid = cast(ExchangeId, session.exchange_id)
-        session._feed._exchange_factories[eid] = client_factory.feed_exchange_factory(
-            session.exchange_id
+    def __init__(
+        self,
+        session: TradingSession,
+        cfg: StrategyConfig,
+        *,
+        executor: PaperTradingExecutor,
+        risk: RiskService,
+        clients: ClientFactory,
+        hydra_config: HydraConfig,
+        db_pool: Any,
+        required_history: int,
+        on_failure: FailureCallback,
+    ) -> None:
+        self.session = session
+        self.cfg = cfg
+        self.executor = executor
+        self.risk = risk
+        self.exchange_id: ExchangeId = cfg.exchange.exchange_id
+        self.market_type: MarketType = cfg.exchange.market_type
+        self.primary: Timeframe = cfg.timeframes.primary
+        self.required_history = required_history
+        self.bus = InMemoryEventBus()
+        self.feed = ExchangeFeedManager(
+            event_bus=self.bus,
+            exchange_factories={self.exchange_id: clients.ws_factory(self.exchange_id)},
+            repository=clients.repository_factory(db_pool),
+            rest_factory=clients.rest_factory,
+            history_window=clients.history_window,
+            publish_replay=True,
         )
-        await session._feed.connect(
-            exchange_id=eid,
-            symbols=session.symbols,
-            timeframes=session._all_timeframes or [Timeframe(session.timeframe)],
+        self.context = StrategyContext(max_bars=self.feed.window_for(required_history))
+        self.engine = StrategyEngine(config=hydra_config, event_bus=self.bus, context=self.context)
+        self.om = OrderManager(executor, self.bus, risk=risk, session_id=session.session_id)
+        self.protect = ProtectiveOrderManager(
+            self.om,
+            executor,
+            strategy_id=cfg.id,
+            exchange_id=self.exchange_id,
+            market_type=self.market_type,
+            policy=cfg.risk,
+            atr=self._atr,
         )
+        self._on_failure = on_failure
+        self._done = asyncio.Event()
+        self.closing = False
+        self.entries_paused: str | None = None
+        self.spot_shorts_ignored = 0
 
+    # ------------------------------------------------------------------
+    # Build, warm up, wire, connect
+    # ------------------------------------------------------------------
 
-async def execute_order_actions(actions: list[Any], executor: Any, session: TradingSession) -> None:
-    """Dispatch OrderAction items (PlaceOrder/CancelOrder/ModifyOrder) to the executor."""
-    from hydra.strategy.base import CancelOrder, ModifyOrder, PlaceOrder
+    async def build(self) -> None:
+        """Load the strategy into the session engine and expose the parts on the session."""
+        await self.engine.load_strategy_from_config(self.cfg)
+        s = self.session
+        s._runtime = self
+        s._engine = self.engine
+        s._event_bus = self.bus
+        s._order_manager = self.om
+        s._executor = self.executor
+        s._feed = self.feed
+        s._all_timeframes = self.cfg.all_timeframes()
 
-    for action in actions:
+    async def warm_up(self) -> WarmBars:
+        """Stored + REST history into the context (raises InsufficientHistoryError)."""
+        warm = await self.feed.warm_up(
+            self.cfg.symbols,
+            self.cfg.all_timeframes(),
+            min_bars=self.required_history,
+            exchange_id=self.exchange_id,
+        )
+        await self.engine.warm_up(warm)
+        return warm
+
+    async def seed_context(self) -> None:
+        """Positions and equity into the strategy context (a restored session may hold some)."""
+        for symbol in self.cfg.symbols:
+            positions = [p for p in await self.executor.get_positions(symbol) if p.quantity > 0]
+            self.context.set_position(symbol, positions[0] if positions else None)
+        self.context.set_portfolio_value(await self.executor.get_equity())
+
+    async def wire(self) -> None:
+        """Subscribe in order: closed bars, engine, signals, fills, feed status."""
+        await self.bus.subscribe("bar", self._on_bar)
+        await self.engine.start()
+        await self.bus.subscribe("entry_signal", self._on_signal)
+        await self.bus.subscribe("exit_signal", self._on_signal)
+        await self.bus.subscribe("order_fill", self._on_fill)
+        await self.bus.subscribe("feed_status", self._on_feed_status)
+
+    async def prime(self, warm: WarmBars) -> None:
+        """Treat each symbol's newest warm-up bar as the first closed bar: marks, resting orders."""
+        for symbol in self.cfg.symbols:
+            bars = warm.get((symbol, self.primary)) or []
+            if bars:
+                await self._process_closed_bar(symbol, bars[-1])
+
+    async def connect(self) -> None:
+        """Start the live feed (ValueError: a symbol is not exactly one active spot market)."""
+        await self.feed.connect(self.exchange_id, self.cfg.symbols, self.cfg.all_timeframes())
+
+    async def run(self) -> None:
+        """The session task: alive while the session runs."""
+        await self._done.wait()
+
+    async def shutdown(self) -> None:
+        """Stop the feed and the engine and end the task; positions are left to the caller."""
+        self._done.set()
         try:
-            if isinstance(action, PlaceOrder):
-                await executor.create_order(
-                    symbol=action.symbol,
-                    side=action.side,
-                    order_type=action.order_type,
-                    quantity=action.quantity,
-                    price=action.price,
-                    stop_price=action.stop_price,
-                    params=action.params or {},
-                )
-            elif isinstance(action, CancelOrder):
-                await executor.cancel_order(action.order_id, action.symbol)
-            elif isinstance(action, ModifyOrder):
-                await executor.cancel_order(action.order_id, action.symbol)
-                if action.new_price is not None or action.new_quantity is not None:
-                    await executor.create_order(
-                        symbol=action.symbol,
-                        side="BUY",
-                        order_type="LIMIT",
-                        quantity=action.new_quantity or Decimal("0"),
-                        price=action.new_price,
-                    )
+            await self.feed.disconnect_all()
         except Exception:
-            logger.exception(
-                "Failed to execute order action %s in session %s",
-                type(action).__name__,
-                session.session_id,
-            )
+            logger.exception("Feed disconnect failed for %s", self.session.session_id)
+        try:
+            await self.engine.stop()
+        except Exception:
+            logger.exception("Engine stop failed for %s", self.session.session_id)
 
+    async def flatten(self) -> FlattenResult:
+        return await flatten_session(self)
 
-async def signal_to_order(
-    event: Event, session: TradingSession, get_risk_config: Callable[[], dict[str, Any]]
-) -> OrderRequest | None:
-    """Convert a signal event into an OrderRequest for the live context."""
-    if isinstance(event, EntrySignal):
-        balance = await session._executor.get_balance()
-        capital = balance.get("USDT", Decimal("0"))
-        if capital <= 0:
+    # ------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------
+
+    async def _on_bar(self, event: Event) -> None:
+        if (
+            not isinstance(event, BarEvent)
+            or event.ohlcv is None
+            or event.replay
+            or event.exchange_id != self.exchange_id
+            or event.timeframe != self.primary
+            or str(event.symbol) not in self.cfg.symbols
+        ):
+            return
+        await self._process_closed_bar(str(event.symbol), event.ohlcv)
+
+    async def _process_closed_bar(self, symbol: str, bar: OHLCV) -> None:
+        try:
+            fills = await self.executor.on_closed_bar(symbol, bar)
+        except Exception as exc:
+            logger.exception("Paper on_closed_bar failed for %s", self.session.session_id)
+            fills = []
+            if self.executor.get_account_snapshot().halted is None:
+                await self._fail(f"paper executor failed on a closed bar: {exc}")
+                return
+        for fill in fills:
+            try:
+                await self.om.on_external_fill(fill)
+            except Exception:
+                logger.exception("Publishing paper fill %s failed", fill.order_id)
+        self.session.last_bar_at = datetime.now(UTC)
+        try:
+            await self.risk.on_mark(self.exchange_id, symbol, bar.close, bar.timestamp)
+        except Exception:
+            logger.exception("Risk mark failed for %s", symbol)
+        halted = self.executor.get_account_snapshot().halted
+        if halted is not None and not self.closing:
+            await self._fail(f"paper ledger halted: {halted}")
+
+    async def _on_signal(self, event: Event) -> None:
+        try:
+            if isinstance(event, ExitSignal):
+                await self._exit(event)
+            elif isinstance(event, EntrySignal):
+                order = await self.entry_order(event)
+                if order is not None:
+                    await self.om.submit_order(order)
+        except (RiskRejectedError, ValueError) as exc:
+            logger.warning("Skipped order from signal in %s: %s", self.session.session_id, exc)
+        except Exception:
+            logger.exception("Failed to submit order from signal in %s", self.session.session_id)
+
+    async def _exit(self, event: ExitSignal) -> None:
+        order = await self.exit_order(event)
+        if order is None:
+            return
+        symbol = str(order.symbol)
+        await self.protect.disarm(symbol)
+        try:
+            order_id = await self.om.submit_order(order)
+        except BaseException:
+            await self.protect.rearm(symbol)
+            raise
+        if order_id is None or self.om.get_order_status(order_id) != OrderStatus.FILLED:
+            await self.protect.rearm(symbol)
+
+    async def _on_fill(self, event: Event) -> None:
+        if not isinstance(event, OrderFillEvent):
+            return
+        symbol = str(event.symbol)
+        position = None
+        try:
+            positions = [p for p in await self.executor.get_positions(symbol) if p.quantity > 0]
+            position = positions[0] if positions else None
+            self.context.set_position(symbol, position)
+            self.context.set_portfolio_value(await self.executor.get_equity())
+        except Exception:
+            logger.exception("Position feedback failed for %s", self.session.session_id)
+        for strategy in self.engine.get_all_strategies().values():
+            if isinstance(strategy, BaseStrategy):
+                try:
+                    await strategy.on_fill(event)
+                except Exception:
+                    logger.exception("Strategy %s on_fill failed", strategy.strategy_id)
+        if not self.closing:
+            try:
+                await self.protect.on_fill(event)
+            except Exception:
+                logger.exception("Protective orders not updated for %s", self.session.session_id)
+        self.session.last_fill_at = datetime.now(UTC)
+        metrics.set_session_position(
+            self.session.session_id,
+            self.cfg.id,
+            self.exchange_id,
+            symbol,
+            float(position.quantity) if position is not None else 0.0,
+        )
+        await self._broadcast(
+            {
+                "event": "order_fill",
+                "session_id": self.session.session_id,
+                "order_id": event.order_id,
+                "symbol": symbol,
+                "side": str(event.side),
+                "quantity": str(event.quantity),
+                "price": str(event.price),
+                "fee": str(event.fee),
+                "realized_pnl": None if event.realized_pnl is None else str(event.realized_pnl),
+                "tag": event.tag,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+        try:
+            await self.risk.on_fill(self.session.session_id, event)
+        except Exception:
+            logger.exception("Risk fill feedback failed for %s", self.session.session_id)
+
+    async def _on_feed_status(self, event: Event) -> None:
+        if not isinstance(event, FeedStatusEvent) or event.exchange_id != self.exchange_id:
+            return
+        if self.feed.is_live(self.exchange_id):
+            if self.entries_paused is not None:
+                logger.info("Feed live again: entries resumed for %s", self.session.session_id)
+            self.entries_paused = None
+            return
+        reasons = self.feed.stale_reasons(self.exchange_id)
+        self.entries_paused = "feed stale: " + ", ".join(
+            f"{scope} {'/'.join(r)}" for scope, r in sorted(reasons.items())
+        )
+        logger.warning("Entries paused for %s (%s)", self.session.session_id, self.entries_paused)
+
+    # ------------------------------------------------------------------
+    # Signals -> orders
+    # ------------------------------------------------------------------
+
+    async def entry_order(self, event: EntrySignal) -> OrderRequest | None:
+        """An opening order, or None: wrong symbol, spot short, paused, held, or no size."""
+        symbol = str(event.symbol)
+        if symbol not in self.cfg.symbols or self.closing:
             return None
-
-        # Load max_risk_per_trade from risk config
-        max_risk_per_trade = Decimal(str(get_risk_config().get("max_risk_per_trade", "0.02")))
-
-        price = await session._executor.get_last_price(str(event.symbol))
-        if price <= 0:
+        if event.direction == Direction.SHORT and self.market_type == MarketType.SPOT:
+            await self._spot_short_ignored("entry_short", symbol)
             return None
-
-        # Compute portfolio value from balance for sizing
-        portfolio_value = capital
-        quantity = (portfolio_value * max_risk_per_trade) / price
-        quantity = quantity.quantize(Decimal("0.00000001"))
-        if quantity <= 0:
+        if self.entries_paused is not None:
+            logger.info("Entry on %s skipped: %s", symbol, self.entries_paused)
             return None
-
-        side = Side.BUY if event.direction == Direction.LONG else Side.SELL
+        if await self._holding(symbol):
+            return None
+        fraction = Decimal(str(self.cfg.position_sizing.max_position_pct)) / _HUNDRED
+        quantity = await self.risk.size_entry(self.session.session_id, symbol, fraction)
+        if quantity is None:
+            logger.info("Entry on %s skipped: no tradable size", symbol)
+            return None
+        mark = self.risk.mark(self.exchange_id, symbol)
         return OrderRequest(
-            symbol=Symbol(str(event.symbol)),
-            side=side,
+            symbol=Symbol(symbol),
+            side=Side.BUY,
             order_type=OrderType.MARKET,
             quantity=quantity,
-            strategy_id=event.strategy_id,
-            exchange_id=event.exchange_id,
-            market_type=event.market_type,
+            strategy_id=self.cfg.id,
+            exchange_id=self.exchange_id,
+            market_type=self.market_type,
+            stop_price=self.protect.planned_stop(symbol, mark) if mark is not None else None,
+            tag=ENTRY_TAG,
         )
 
-    if isinstance(event, ExitSignal):
-        positions = await session._executor.get_positions(str(event.symbol))
+    async def exit_order(self, event: ExitSignal) -> OrderRequest | None:
+        """A reduce-only SELL of ``close_pct`` of the long, floored to the lot step."""
+        symbol = str(event.symbol)
+        if symbol not in self.cfg.symbols:
+            return None
+        positions = [p for p in await self.executor.get_positions(symbol) if p.quantity > 0]
         if not positions:
             return None
         pos = positions[0]
-        side = Side.SELL if pos.direction == Direction.LONG else Side.BUY
-        close_pct = getattr(event, "close_pct", 1.0)
-        quantity = pos.quantity * Decimal(str(min(max(close_pct, 0.0), 1.0)))
+        if pos.direction != Direction.LONG:
+            await self._spot_short_ignored("exit_short", symbol)
+            return None
+        close_pct = Decimal(str(min(max(event.close_pct, 0.0), 1.0)))
+        quantity = pos.quantity if close_pct == 1 else self._floor(symbol, pos.quantity * close_pct)
+        if quantity <= 0:
+            return None
         return OrderRequest(
-            symbol=Symbol(str(event.symbol)),
-            side=side,
+            symbol=Symbol(symbol),
+            side=Side.SELL,
             order_type=OrderType.MARKET,
             quantity=quantity,
-            strategy_id=event.strategy_id,
-            exchange_id=event.exchange_id,
-            market_type=MarketType.SPOT,
+            strategy_id=self.cfg.id,
+            exchange_id=self.exchange_id,
+            market_type=self.market_type,
+            reduce_only=True,
+            tag=EXIT_TAG,
         )
 
-    return None
+    # ------------------------------------------------------------------
+    # Manual orders (quick-trade, webhook)
+    # ------------------------------------------------------------------
+
+    async def submit_manual(
+        self,
+        symbol: str,
+        side: Side,
+        order_type: OrderType,
+        quantity: Decimal | None,
+        price: Decimal | None,
+        protection: ProtectionSpec | None,
+    ) -> ManualOrderResult:
+        """A BUY opens (sized by size_entry when no quantity); a SELL only reduces the long."""
+        if self.closing or self.session.status != "running":
+            raise SessionNotRunningError(f"session {self.session.session_id} is not running")
+        if symbol not in self.cfg.symbols:
+            raise ValueError(f"{symbol} is not traded by session {self.session.session_id}")
+        if side == Side.SELL:
+            return await self._manual_exit(symbol, order_type, quantity, protection)
+        if self.entries_paused is not None:
+            raise ValueError(f"entries are paused ({self.entries_paused})")
+        if quantity is None:
+            fraction = Decimal(str(self.cfg.position_sizing.max_position_pct)) / _HUNDRED
+            quantity = await self.risk.size_entry(self.session.session_id, symbol, fraction)
+            if quantity is None:
+                raise ValueError(f"no tradable entry size for {symbol}")
+        tag = f"{MANUAL_TAG_PREFIX}{uuid.uuid4()}"
+        self.protect.register_manual(tag, protection)
+        reference = price if price is not None else self.risk.mark(self.exchange_id, symbol)
+        stop = None
+        if protection is not None and protection.stop_loss is not None:
+            stop = protection.stop_loss
+        elif reference is not None and (protection is None or protection.trailing_pct is None):
+            stop = self.protect.planned_stop(symbol, reference)
+        order = OrderRequest(
+            symbol=Symbol(symbol),
+            side=Side.BUY,
+            order_type=order_type,
+            quantity=quantity,
+            strategy_id=self.cfg.id,
+            exchange_id=self.exchange_id,
+            market_type=self.market_type,
+            price=price,
+            stop_price=stop if order_type == OrderType.MARKET else None,
+            tag=tag,
+        )
+        try:
+            order_id = await self.om.submit_order(order)
+        except BaseException:
+            self.protect.discard_manual(tag)
+            raise
+        status = self.om.get_order_status(order_id) if order_id is not None else None
+        group = self.protect.armed(symbol)
+        filled = status == OrderStatus.FILLED
+        return ManualOrderResult(
+            order_id=order_id,
+            status=str(status) if status is not None else "NOOP",
+            quantity=quantity,
+            price=price,
+            protection="armed" if filled and group is not None else "pending",
+            protective_order_id=group.order_id if filled and group is not None else None,
+        )
+
+    async def _manual_exit(
+        self,
+        symbol: str,
+        order_type: OrderType,
+        quantity: Decimal | None,
+        protection: ProtectionSpec | None,
+    ) -> ManualOrderResult:
+        if protection is not None:
+            raise ValueError("stop-loss / take-profit apply to entries only")
+        if order_type != OrderType.MARKET:
+            raise ValueError("manual exits are MARKET orders (a resting SELL would unprotect)")
+        positions = [p for p in await self.executor.get_positions(symbol) if p.quantity > 0]
+        if not positions:
+            raise SpotShortError(f"no {symbol} held: a spot SELL cannot open a short")
+        held = positions[0].quantity
+        qty = held if quantity is None else min(quantity, held)
+        order = OrderRequest(
+            symbol=Symbol(symbol),
+            side=Side.SELL,
+            order_type=OrderType.MARKET,
+            quantity=qty,
+            strategy_id=self.cfg.id,
+            exchange_id=self.exchange_id,
+            market_type=self.market_type,
+            reduce_only=True,
+            tag=f"{MANUAL_TAG_PREFIX}exit",
+        )
+        await self.protect.disarm(symbol)
+        try:
+            order_id = await self.om.submit_order(order)
+        except BaseException:
+            await self.protect.rearm(symbol)
+            raise
+        status = self.om.get_order_status(order_id) if order_id is not None else None
+        if status != OrderStatus.FILLED:
+            await self.protect.rearm(symbol)
+        group = self.protect.armed(symbol)
+        return ManualOrderResult(
+            order_id=order_id,
+            status=str(status) if status is not None else "NOOP",
+            quantity=qty,
+            price=None,
+            protection="armed" if group is not None else "none",
+            protective_order_id=group.order_id if group is not None else None,
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _holding(self, symbol: str) -> bool:
+        if any(p.quantity > 0 for p in await self.executor.get_positions(symbol)):
+            return True
+        return any(o.get("side") == "BUY" for o in await self.executor.fetch_open_orders(symbol))
+
+    def _floor(self, symbol: str, quantity: Decimal) -> Decimal:
+        try:
+            rules = self.risk.market_rules(self.session.session_id).get(symbol)
+        except KeyError:
+            rules = None
+        return rules.floor_qty(quantity) if rules is not None else quantity
+
+    def _atr(self, symbol: str) -> Decimal | None:
+        values = self.context.indicator(
+            "atr", symbol, self.primary, period=self.cfg.risk.atr_period
+        )
+        if len(values) == 0:
+            return None
+        last = float(values[-1])
+        return None if math.isnan(last) else Decimal(str(last))
+
+    async def _spot_short_ignored(self, signal_type: str, symbol: str) -> None:
+        self.spot_shorts_ignored += 1
+        metrics.record_spot_short_ignored(self.cfg.id, signal_type)
+        logger.warning(
+            "spot_short_ignored: %s %s dropped in spot session %s",
+            signal_type,
+            symbol,
+            self.session.session_id,
+        )
+        await self._broadcast(
+            {
+                "event": "spot_short_ignored",
+                "session_id": self.session.session_id,
+                "symbol": symbol,
+                "signal_type": signal_type,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    async def _broadcast(self, payload: dict[str, Any]) -> None:
+        try:
+            from hydra.core.websocket import manager
+
+            await manager.broadcast(f"trades:{self.session.session_id}", payload)
+        except Exception:
+            logger.debug("Could not broadcast to WebSocket", exc_info=True)
+
+    async def broadcast_status(self) -> None:
+        s = self.session
+        await self._broadcast(
+            {
+                "event": "session_status",
+                "session_id": s.session_id,
+                "status": s.status,
+                "positions_remaining": s.positions_at_stop,
+                "flatten_incomplete": s.flatten_incomplete,
+                "error_message": s.error_message,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    async def _fail(self, reason: str) -> None:
+        """Hand the failure to the manager in its own task (it stops this session's feed)."""
+        if self.closing:
+            return
+        self.closing = True
+        task: asyncio.Task[None] = asyncio.create_task(self._on_failure(self.session, reason))
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
+
+
+_BACKGROUND: set[asyncio.Task[None]] = set()

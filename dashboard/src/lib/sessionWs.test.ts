@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { classifySessionWsMessage, debounce } from './sessionWs';
 
-// Exact shape published by session_manager.on_fill_ws (all numbers are strings)
+// Shape published by session_wiring.SessionRuntime._on_fill (all numbers are strings)
 const orderFill = {
   event: 'order_fill',
   session_id: 's1',
@@ -25,6 +25,23 @@ describe('classifySessionWsMessage', () => {
 
   it('ignores fills for other sessions', () => {
     expect(classifySessionWsMessage({ ...orderFill, session_id: 's2' }, 's1')).toBe('ignore');
+  });
+
+  it('refetches on a status change for this session (stop, error, incomplete flatten)', () => {
+    const status = {
+      event: 'session_status',
+      session_id: 's1',
+      status: 'stopped',
+      positions_remaining: 1,
+      flatten_incomplete: true,
+    };
+    expect(classifySessionWsMessage(status, 's1')).toBe('refetch');
+    expect(classifySessionWsMessage({ ...status, session_id: 's2' }, 's1')).toBe('ignore');
+  });
+
+  it('ignores informational events', () => {
+    const ignored = { event: 'spot_short_ignored', session_id: 's1', symbol: 'BTCUSDT' };
+    expect(classifySessionWsMessage(ignored, 's1')).toBe('ignore');
   });
 
   it('ignores malformed messages', () => {

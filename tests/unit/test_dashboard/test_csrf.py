@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -12,6 +13,9 @@ from starlette.testclient import WebSocketDenialResponse
 from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
 from hydra.execution.session_manager import SessionManager, TradingSession
+from hydra.risk.market_rules import MarketRulesCache
+from hydra.risk.service import RiskService
+from hydra.risk.state import InMemoryRiskStateStore
 
 from .conftest import TEST_API_TOKEN
 
@@ -41,7 +45,10 @@ def cfg(bind_api_config: Bind) -> HydraConfig:
 
 @pytest.fixture()
 def session(cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch) -> TradingSession:
-    mgr = SessionManager(db_pool=None, config=cfg)
+    risk = RiskService(
+        InMemoryRiskStateStore(paper_capital=Decimal("1000")), market_rules=MarketRulesCache()
+    )
+    mgr = SessionManager(db_pool=None, config=cfg, risk=risk)
     running = TradingSession(
         session_id="sess-1",
         strategy_id="momentum",

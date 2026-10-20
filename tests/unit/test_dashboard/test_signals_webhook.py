@@ -1,52 +1,46 @@
 """Signal webhook: fail-closed secret, constant-time compare, one strategy's session only.
 
-Sessions hold real PaperTradingExecutors; only the engine's session table is set up by hand.
+Sessions are real paper sessions (SessionManager, OrderManager, RiskService, PaperTradingExecutor);
+only the ccxt boundary is faked by the session harness. Orders go through submit_manual_order.
 """
 
 from __future__ import annotations
 
 import hmac
 import secrets
+from collections.abc import AsyncIterator
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
 from hydra.dashboard.routes import signals
 from hydra.execution.paper_trading import PaperTradingExecutor
-from hydra.execution.session_manager import SessionManager, TradingSession
+from tests.unit.test_execution.session_harness import Harness, executor, write_strategy
+
+from .conftest import TEST_API_TOKEN
 
 SECRET = secrets.token_hex(16)
-START = Decimal("10000")
-
-
-def _session(session_id: str, strategy_id: str) -> TradingSession:
-    executor = PaperTradingExecutor(initial_balances={"USDT": START}, strategy_id=strategy_id)
-    executor.set_market_price("BTCUSDT", Decimal("60000"))
-    session = TradingSession(
-        session_id=session_id,
-        strategy_id=strategy_id,
-        trading_mode="paper",
-        status="running",
-        exchange_id="binance",
-        symbols=["BTCUSDT"],
-        timeframe="1h",
-    )
-    session._executor = executor
-    return session
+START = Decimal("500")
 
 
 @pytest.fixture()
-def sessions(hydra_config: HydraConfig, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    mgr = SessionManager(db_pool=None, config=hydra_config)
-    made = {"momentum": _session("s-mom", "momentum"), "breakout": _session("s-brk", "breakout")}
-    for s in made.values():
-        mgr._sessions[s.session_id] = s
+async def sessions(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[dict[str, PaperTradingExecutor]]:
+    h = Harness(strategies_dir)
+    mgr = await h.start()
+    made = {}
+    for sid in ("momentum", "breakout"):
+        write_strategy(strategies_dir, sid)
+        made[sid] = executor(await h.session(sid, str(START)))
     monkeypatch.setattr(app.state, "session_manager", mgr)
-    return {k: s._executor for k, s in made.items()}
+    yield made
+    await h.close()
 
 
 def _secret(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
@@ -57,14 +51,19 @@ def _secret(monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
 MISSING = object()
 
 
-def _post(**body: Any) -> Any:
+async def _post(**body: Any) -> httpx.Response:
     payload = {"symbol": "BTCUSDT", "side": "buy", "strategy_id": "momentum", **body}
     payload = {k: v for k, v in payload.items() if v is not MISSING}
-    return TestClient(app).post("/api/signals/webhook", json=payload)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://engine",
+        headers={"Authorization": f"Bearer {TEST_API_TOKEN}"},
+    ) as client:
+        return await client.post("/api/signals/webhook", json=payload)
 
 
-async def _untouched(executor: PaperTradingExecutor) -> bool:
-    return (await executor.get_balance())["USDT"] == START and not await executor.fetch_positions()
+async def _untouched(ex: PaperTradingExecutor) -> bool:
+    return (await ex.get_balance())["USDT"] == START and not await ex.fetch_positions()
 
 
 class TestSecret:
@@ -73,7 +72,7 @@ class TestSecret:
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch, configured: str | None
     ) -> None:
         _secret(monkeypatch, configured)
-        resp = _post(secret="", quantity="0.01")
+        resp = await _post(secret="", quantity="0.01")
         assert resp.status_code == 503
         assert resp.json()["detail"]["code"] == "webhook_disabled"
         assert resp.json()["detail"]["state"] == "unavailable"
@@ -84,7 +83,7 @@ class TestSecret:
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch, presented: str
     ) -> None:
         _secret(monkeypatch, SECRET)
-        resp = _post(secret=presented, quantity="0.01")
+        resp = await _post(secret=presented, quantity="0.01")
         assert resp.status_code == 401
         assert resp.json()["detail"] == {
             "code": "invalid_webhook_secret",
@@ -104,7 +103,11 @@ class TestSecret:
         monkeypatch.setattr(signals.hmac, "compare_digest", spy)
         _secret(monkeypatch, SECRET)
         wrong = secrets.token_hex(16)
-        assert _post(secret=wrong, quantity="0.01").status_code == 401
+        resp = TestClient(app).post(
+            "/api/signals/webhook",
+            json={"side": "buy", "strategy_id": "momentum", "secret": wrong, "quantity": "0.01"},
+        )
+        assert resp.status_code == 401
         assert (wrong.encode(), SECRET.encode()) in calls
 
 
@@ -113,18 +116,23 @@ class TestTargeting:
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _secret(monkeypatch, SECRET)
-        resp = _post(secret=SECRET, quantity="0.01")
+        resp = await _post(secret=SECRET, quantity="0.01")
         assert resp.status_code == 200, resp.text
         positions = await sessions["momentum"].fetch_positions("BTCUSDT")
         assert [(p["side"], p["contracts"]) for p in positions] == [("long", 0.01)]
-        assert (await sessions["momentum"].get_balance())["USDT"] < START
+        # BUY 0.01 at 100 x 1.001 = 100.1, fee 0.1%: 500 - 1.001 - 0.001001
+        assert (await sessions["momentum"].get_balance())["USDT"] == Decimal("498.997999")
+        stops = await sessions["momentum"].fetch_open_orders("BTCUSDT")
+        assert [(o["type"], o["amount"], o["stop_price"]) for o in stops] == [
+            ("STOP_MARKET", 0.01, 95.095)
+        ]
         assert await _untouched(sessions["breakout"])
 
     async def test_unknown_strategy_is_404_and_trades_nothing(
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _secret(monkeypatch, SECRET)
-        resp = _post(secret=SECRET, quantity="0.01", strategy_id="nope")
+        resp = await _post(secret=SECRET, quantity="0.01", strategy_id="nope")
         assert resp.status_code == 404
         assert resp.json()["detail"]["code"] == "session_not_found"
         assert await _untouched(sessions["momentum"])
@@ -140,7 +148,7 @@ class TestValidation:
             pytest.param({"quantity": "0"}, id="zero-qty"),
             pytest.param({"quantity": "-1"}, id="negative-qty"),
             pytest.param({"side": "banana"}, id="bad-side"),
-            pytest.param({"quantity": MISSING}, id="entry-without-qty"),
+            pytest.param({"side": "sell"}, id="spot-short-entry"),
             pytest.param({"quantity": "1e400"}, id="huge-qty"),
             pytest.param({"quantity": "0.0000000000000000000001"}, id="dust-qty"),
         ],
@@ -149,7 +157,7 @@ class TestValidation:
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
     ) -> None:
         _secret(monkeypatch, SECRET)
-        resp = _post(**{"secret": SECRET, "quantity": "0.01", **body})
+        resp = await _post(**{"secret": SECRET, "quantity": "0.01", **body})
         assert resp.status_code == 422
         assert resp.json()["detail"]["state"] == "invalid"
         assert await _untouched(sessions["momentum"])
@@ -161,8 +169,8 @@ class TestExecutionOutcome:
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _secret(monkeypatch, SECRET)
-        assert _post(secret=SECRET, quantity="0.01").status_code == 200
-        resp = _post(secret=SECRET, side="sell", action="exit")
+        assert (await _post(secret=SECRET, quantity="0.01")).status_code == 200
+        resp = await _post(secret=SECRET, side="sell", action="exit")
         assert resp.status_code == 200, resp.text
         assert await sessions["momentum"].fetch_positions("BTCUSDT") == []
 
@@ -170,10 +178,30 @@ class TestExecutionOutcome:
         self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _secret(monkeypatch, SECRET)
-        resp = _post(secret=SECRET, side="sell", action="exit")
+        resp = await _post(secret=SECRET, side="sell", action="exit")
         assert resp.status_code == 409
         detail = resp.json()["detail"]
         assert (detail["code"], detail["state"]) == ("no_position", "no_data")
+        assert await _untouched(sessions["momentum"])
+
+    async def test_entry_without_quantity_is_sized_like_a_strategy_entry(
+        self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        resp = await _post(secret=SECRET, quantity=MISSING)
+        assert resp.status_code == 200, resp.text
+        # sleeve 500 x max_position_pct 10 % = 50 USDT at mark 100 -> 0.5 BTC
+        positions = await sessions["momentum"].fetch_positions("BTCUSDT")
+        assert [p["contracts"] for p in positions] == [0.5]
+
+    async def test_risk_rejection_is_422(
+        self, sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        resp = await _post(secret=SECRET, quantity="3")
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert (detail["code"], detail["check"]) == ("risk_rejected", "position_size")
         assert await _untouched(sessions["momentum"])
 
     async def test_executor_failure_is_502_not_a_validation_error(
@@ -184,7 +212,7 @@ class TestExecutionOutcome:
 
         _secret(monkeypatch, SECRET)
         monkeypatch.setattr(sessions["momentum"], "create_order", exchange_down)
-        resp = _post(secret=SECRET, quantity="0.01")
+        resp = await _post(secret=SECRET, quantity="0.01")
         assert resp.status_code == 502
         detail = resp.json()["detail"]
         assert (detail["code"], detail["state"]) == ("execution_failed", "unavailable")

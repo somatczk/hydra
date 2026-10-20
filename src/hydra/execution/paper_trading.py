@@ -365,16 +365,6 @@ class PaperTradingExecutor:
                 f"notional {quantity * price} is below the minimum {rules.min_notional}"
             )
 
-    def set_market_price(self, symbol: str, price: Decimal) -> None:
-        """Deprecated (P1-E deletes it): set the mark without evaluating resting orders."""
-        self._marks[self._symbol(symbol)] = price
-
-    def check_pending_orders(self, current_bar: OHLCV) -> list[dict[str, Any]]:
-        """Deprecated (P1-E deletes it): a bar without a symbol cannot be evaluated safely."""
-        raise TypeError(
-            "check_pending_orders is removed: call `await executor.on_closed_bar(symbol, bar)`"
-        )
-
     def _fee_rate(self, liquidity: Liquidity) -> Decimal:
         return self._maker_fee if liquidity == "maker" else self._taker_fee
 

@@ -5,12 +5,13 @@ P1 accepts Binance SPOT only (D10); live executors are refused until P3.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from hydra.core.types import ExchangeId, MarketType
-from hydra.execution import session_store
+from hydra.data.storage import MarketDataRepository
 from hydra.execution.errors import LiveTradingDisabledError, UnsupportedVenueError
 from hydra.execution.paper_trading import PaperTradingExecutor, SpotMarketRules
 
@@ -99,29 +100,6 @@ def build_live_executor(exchange_id: str, config: Mapping[str, Any] | None = Non
     )
 
 
-async def load_live_credentials(db_pool: Any, exchange_id: str) -> dict[str, Any]:
-    """Load and decrypt stored credentials into a CCXT config dict."""
-    creds: dict[str, Any] = {}
-    try:
-        from hydra.core.encryption import decrypt
-
-        cred_row = await session_store.fetch_exchange_credentials(db_pool, exchange_id)
-        if cred_row:
-            creds = {
-                "apiKey": decrypt(cred_row["encrypted_key"]),
-                "secret": decrypt(cred_row["encrypted_secret"]),
-            }
-            if cred_row.get("encrypted_passphrase"):
-                creds["password"] = decrypt(cred_row["encrypted_passphrase"])
-        else:
-            raise ValueError(f"No credentials found for exchange {exchange_id}")
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(f"Failed to load credentials for exchange {exchange_id}") from exc
-    return creds
-
-
 def feed_exchange_factory(exchange_id: str) -> Callable[[], Any]:
     """Factory for the ccxt.pro spot client of a session's market-data feed."""
     cls_name = ccxt_class_for(exchange_id, MarketType.SPOT)
@@ -151,3 +129,26 @@ async def public_markets_loader(exchange_id: str) -> list[Mapping[str, Any]]:
     finally:
         await client.close()
     return list(markets.values())
+
+
+def bars_repository(db_pool: Any) -> MarketDataRepository | None:
+    """Where the feed persists closed bars and reads warm-up history (``ts.ohlcv_1m``)."""
+    return MarketDataRepository.from_pool(db_pool) if db_pool is not None else None
+
+
+MarketsLoader = Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]]
+
+
+@dataclass(frozen=True, slots=True)
+class ClientFactory:
+    """The exchange seams of a session: WebSocket feed, REST warm-up/gap fill, market rules.
+
+    Production uses the public Binance spot clients and the ``ts.ohlcv_1m`` repository; tests and
+    the paper smoke inject fakes.
+    """
+
+    ws_factory: Callable[[str], Callable[[], Any]] = feed_exchange_factory
+    rest_factory: Callable[[str], Any] = rest_exchange_factory
+    markets_loader: MarketsLoader = public_markets_loader
+    repository_factory: Callable[[Any], MarketDataRepository | None] = bars_repository
+    history_window: int = 1000

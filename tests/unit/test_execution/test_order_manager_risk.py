@@ -18,7 +18,16 @@ from hydra.execution.portfolio_state import build_portfolio_state
 from hydra.risk.circuit_breakers import CircuitBreakerState
 from hydra.risk.pretrade import PreTradeRiskManager, RiskConfig
 from hydra.risk.state import RiskState
-from tests.unit.test_risk.harness import BTC, T0, Account, FillBus, make_account, order, permissive
+from tests.unit.test_risk.harness import (
+    BTC,
+    T0,
+    Account,
+    FillBus,
+    flat_bar,
+    make_account,
+    order,
+    permissive,
+)
 
 BUY, SELL = Side.BUY, Side.SELL
 
@@ -278,9 +287,9 @@ class TestLegacyPath:
             slippage_pct=Decimal("0"),
             fee_pct=Decimal("0"),
         )
-        ex.set_market_price(BTC, Decimal("60000"))
+        await ex.on_closed_bar(BTC, flat_bar(Decimal("60000"), T0))
         await ex.create_order(BTC, "BUY", "MARKET", Decimal("0.01"))
-        ex.set_market_price(BTC, Decimal("50000"))
+        await ex.on_closed_bar(BTC, flat_bar(Decimal("50000"), T0 + timedelta(hours=1)))
 
         async def build() -> object:
             return await build_portfolio_state(ex, [BTC], None)

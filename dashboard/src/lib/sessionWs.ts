@@ -1,11 +1,18 @@
-/** The server is the single source of session PnL, so a fill only triggers a re-fetch. */
+/**
+ * The server is the single source of session state, so a fill or a status change (stop, error,
+ * incomplete flatten) only triggers a re-fetch.
+ */
 
 export type SessionWsAction = 'refetch' | 'ignore';
+
+const REFETCH_EVENTS = new Set(['order_fill', 'session_status']);
 
 export function classifySessionWsMessage(msg: unknown, sessionId: string): SessionWsAction {
   if (typeof msg !== 'object' || msg === null) return 'ignore';
   const m = msg as Record<string, unknown>;
-  return m.event === 'order_fill' && m.session_id === sessionId ? 'refetch' : 'ignore';
+  return typeof m.event === 'string' && REFETCH_EVENTS.has(m.event) && m.session_id === sessionId
+    ? 'refetch'
+    : 'ignore';
 }
 
 export interface Debounced {

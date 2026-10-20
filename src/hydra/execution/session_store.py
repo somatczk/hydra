@@ -1,4 +1,4 @@
-"""SQL persistence for trading sessions and the global kill-switch flag."""
+"""SQL persistence for trading_sessions rows (the kill switch lives in RiskService's store)."""
 
 from __future__ import annotations
 
@@ -11,31 +11,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def read_kill_switch(db_pool: Any) -> Any:
-    """Return the global ``kill_switch_active`` value."""
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT kill_switch_active FROM risk_config WHERE scope = 'global'"
-        )
-
-
-async def set_kill_switch(db_pool: Any, active: bool) -> None:
-    """Set or clear the global kill-switch flag."""
-    async with db_pool.acquire() as conn:
-        if active:
-            await conn.execute(
-                "UPDATE risk_config SET kill_switch_active = TRUE, "
-                "updated_at = now() WHERE scope = 'global'"
-            )
-        else:
-            await conn.execute(
-                "UPDATE risk_config SET kill_switch_active = FALSE, "
-                "updated_at = now() WHERE scope = 'global'"
-            )
-
-
 async def persist_session(db_pool: Any, session: TradingSession) -> None:
-    """Upsert session row to DB."""
+    """Upsert session row to DB; a failure is logged (the in-memory registry stays truthful)."""
     if db_pool is None:
         return
     try:
@@ -80,7 +57,7 @@ async def load_session_trades(db_pool: Any, session: TradingSession) -> list[dic
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, symbol, side, quantity, price, fee, pnl, timestamp
+                SELECT id, symbol, side, quantity, price, fee, pnl, net_pnl, timestamp
                 FROM trades
                 WHERE session_id = $1 AND source = $2
                 ORDER BY timestamp ASC
@@ -97,6 +74,7 @@ async def load_session_trades(db_pool: Any, session: TradingSession) -> list[dic
                     "price": float(row["price"]) if row["price"] else 0,
                     "fee": float(row["fee"]) if row["fee"] else 0,
                     "pnl": float(row["pnl"]) if row["pnl"] else 0,
+                    "net_pnl": float(row["net_pnl"]) if row["net_pnl"] is not None else None,
                     "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
                 }
                 for row in rows
@@ -110,7 +88,7 @@ async def load_running(db_pool: Any) -> list[Any]:
     """Return every session row whose status is 'running'."""
     async with db_pool.acquire() as conn:
         rows: list[Any] = await conn.fetch(
-            "SELECT * FROM trading_sessions WHERE status = 'running'"
+            "SELECT * FROM trading_sessions WHERE status = 'running' ORDER BY created_at"
         )
     return rows
 
@@ -124,23 +102,8 @@ async def load_recent(db_pool: Any) -> list[Any]:
     return rows
 
 
-async def mark_recovery_failed(db_pool: Any, session_id: str) -> None:
-    """Mark a session row as errored after a failed recovery."""
+async def running_ids(db_pool: Any) -> set[str]:
+    """Ids of the rows the database says should be running (health snapshot)."""
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE trading_sessions SET status = 'error', "
-            "error_message = 'Recovery failed' WHERE id = $1",
-            session_id,
-        )
-
-
-async def fetch_exchange_credentials(db_pool: Any, exchange_id: str) -> Any:
-    """Return the encrypted credential row for *exchange_id*, or None."""
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT encrypted_key, encrypted_secret, "
-            "encrypted_passphrase "
-            "FROM exchange_credentials "
-            "WHERE exchange_id = $1",
-            exchange_id,
-        )
+        rows = await conn.fetch("SELECT id FROM trading_sessions WHERE status = 'running'")
+    return {str(r["id"]) for r in rows}

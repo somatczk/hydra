@@ -5,9 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from collections.abc import Iterator
-from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -353,41 +351,6 @@ class TestReconciliation:
         metrics.update_reconciliation("binance", "BTC/USDT", mismatch=True)
         assert not [s for s in _hydra_samples() if "reconciliation" in s[0]]
         assert "hydra_reconciliation_mismatch" not in {s.name for s in metrics.CONTRACT}
-
-    async def test_live_reconciliation_pass_exports_no_reconciliation_or_position(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from hydra.execution import session_manager as sm
-
-        class _Executor:
-            calls = 0
-
-            async def get_balance(self) -> dict[str, Decimal]:
-                return {"USDT": Decimal("1000")}
-
-            async def get_positions(self, symbol: str) -> list[SimpleNamespace]:
-                _Executor.calls += 1
-                return [SimpleNamespace(symbol=symbol, quantity=Decimal("0.5"))]
-
-        session = sm.TradingSession(
-            session_id="s1", strategy_id="sma", trading_mode="live", status="running"
-        )
-        session._executor = _Executor()
-        sleeps: list[float] = []
-
-        async def _sleep(seconds: float) -> None:
-            sleeps.append(seconds)
-            if len(sleeps) > 1:
-                session.status = "stopped"
-
-        monkeypatch.setattr(sm.asyncio, "sleep", _sleep)
-        await sm.SessionManager(db_pool=None)._reconciliation_loop(session)
-
-        assert sleeps == [300, 300]
-        assert _Executor.calls == 1
-        exported = {name for name, _, _ in _hydra_samples()}
-        assert "hydra_reconciliation_mismatch" not in exported
-        assert "hydra_position_size" not in exported
 
 
 class TestReset:
