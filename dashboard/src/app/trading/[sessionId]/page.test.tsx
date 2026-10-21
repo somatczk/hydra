@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
-import { buttonByText, click, dialogPolyfill, inputByLabel, mount, routeFetch, typeInto, type Mounted, type Mutations, type Routes } from '@/test/pageHarness';
+import { buttonByText, click, dialogPolyfill, flush, inputByLabel, mount, routeFetch, typeInto, type Mounted, type Mutations, type Routes } from '@/test/pageHarness';
 import { detail, liveStatus, paperFill, platformConfig, session } from '@/test/fixtures';
 
 const ID = 'a1b2c3d4-0000-4000-8000-000000000001';
@@ -64,12 +64,13 @@ describe('session detail', () => {
     expect(text()).toContain('UNKNOWN');
   });
 
-  it('never claims a stop is armed and has no Reason or Mark column', async () => {
-    setup(detail({ positions: [HELD], trades: [paperFill()] }));
+  it('never claims a stop is armed, shows the fill Reason and has no Mark column', async () => {
+    setup(detail({ positions: [HELD], trades: [paperFill({ reason: 'signal' })] }));
     m = await page();
     const headers = Array.from(m.container.querySelectorAll('th')).map((h) => h.textContent);
     expect(text()).not.toMatch(/stop armed/i);
-    expect(headers).not.toContain('Reason');
+    expect(headers).toContain('Reason');
+    expect(text()).toContain('signal');
     expect(headers.some((h) => /mark/i.test(h ?? ''))).toBe(false);
     expect(headers).toContain('Avg entry');
   });
@@ -85,6 +86,32 @@ describe('session detail', () => {
     expect(text()).toContain('1 stop failure since start. Last: x');
     expect(text()).toContain('Stop at 64,256.00 (BTCUSDT)');
     expect(text()).toContain('Polling every 15 s');
+  });
+
+  it('shows unsaved ledger changes and a dead feed from the shell session row', async () => {
+    setup(detail(), {}, { '/api/trading/sessions': [session({ persist_dirty: true, feed_live: false })] });
+    m = await page();
+    expect(text()).toContain('Session status saved: yes · Unsaved ledger changes');
+    expect(text()).toContain('Feed not live');
+  });
+
+  it('shows no feed warning and a clean save when the shell row is healthy', async () => {
+    setup(detail(), {}, { '/api/trading/sessions': [session({ persist_dirty: false, feed_live: true })] });
+    m = await page();
+    expect(text()).not.toContain('Feed not live');
+    expect(text()).not.toContain('Unsaved ledger changes');
+  });
+
+  it('sends one DELETE for a double click on Try closing again', async () => {
+    setup(detail({ status: 'stopped', positions: [], positions_at_stop: 1, flatten_incomplete: true }), {
+      [`DELETE /api/trading/sessions/${ID}`]: session({ status: 'stopped', positions_at_stop: 1, flatten_incomplete: true }),
+    });
+    m = await page();
+    const btn = buttonByText(m.container, 'Try closing again');
+    btn.click();
+    btn.click();
+    await flush();
+    expect(calls.filter((c) => c.init?.method === 'DELETE')).toHaveLength(1);
   });
 
   it('says a stopped session still holds when its position list is empty', async () => {

@@ -90,6 +90,36 @@ describe('Sessions list', () => {
     expect(buttonByText(m.container, 'Retry')).toBeTruthy();
   });
 
+  it('treats a stop as destructive when the session detail cannot be read', async () => {
+    setup([RUN], { '/api/trading/sessions/run-1/detail': new Error('boom') });
+    m = await page();
+    await click(Array.from(m.container.querySelectorAll('button')).find((b) => b.textContent === 'Stop session…') as HTMLButtonElement);
+    const dialog = m.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.textContent).toContain('Open positions: unknown');
+    expect(buttonByText(dialog, 'Stop and close any positions')).toBeTruthy();
+  });
+
+  it('treats a stop as destructive above the detail cap of 10 running sessions', async () => {
+    const many = Array.from({ length: 11 }, (_, i) => session({ session_id: `run-${i}`, strategy_name: `S${i}` }));
+    setup(many);
+    m = await page();
+    expect(calls.some((c) => c.path.endsWith('/detail'))).toBe(false);
+    await click(Array.from(m.container.querySelectorAll('button')).find((b) => b.textContent === 'Stop session…') as HTMLButtonElement);
+    expect(buttonByText(m.container.querySelector('dialog') as HTMLDialogElement, 'Stop and close any positions')).toBeTruthy();
+  });
+
+  it('words Try closing again for a stopped holder and sends one DELETE', async () => {
+    setup([HOLDER], {}, { 'DELETE /api/trading/sessions/held-1': session({ session_id: 'held-1', status: 'stopped' }) });
+    m = await page();
+    await click(Array.from(m.container.querySelectorAll('button')).find((b) => b.textContent === 'Try closing again…') as HTMLButtonElement);
+    const dialog = m.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.textContent).toContain('Try closing Momentum 4h again?');
+    expect(dialog.textContent).toContain('still holds 1 position');
+    expect(dialog.textContent).not.toContain('Open positions: unknown');
+    await click(buttonByText(dialog, 'Try closing again'));
+    expect(calls.filter((c) => c.init?.method === 'DELETE').map((c) => c.path)).toEqual(['/api/trading/sessions/held-1']);
+  });
+
   it('confirms a stop from the table row and sends one DELETE for that session', async () => {
     setup([RUN], {}, { 'DELETE /api/trading/sessions/run-1': session({ session_id: 'run-1', status: 'stopped' }) });
     m = await page();

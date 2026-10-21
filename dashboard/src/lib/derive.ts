@@ -25,7 +25,7 @@ export interface SessionResponse {
   feed_live?: boolean | null;
 }
 
-/** A fill: the TradeItem model plus the paper extras (`amount`); `quantity` is 0 until the A9 fix. */
+/** A fill: the TradeItem model plus the paper extras (`amount`); `quantity` is 0 on older fills, so read it with `fillQty`. */
 export interface TradeItem {
   id?: string | null;
   symbol?: string | null;
@@ -37,6 +37,7 @@ export interface TradeItem {
   pnl?: number;
   net_pnl?: number | null;
   timestamp?: string | null;
+  reason?: string | null;
 }
 
 export interface PositionItem {

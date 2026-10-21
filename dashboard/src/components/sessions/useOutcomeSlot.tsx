@@ -22,6 +22,7 @@ export function useOutcomeSlot(nameOf: (id: string) => string, onChange: () => v
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [busy, setBusy] = useState<OutcomeAction['kind'] | null>(null);
   const lastStop = useRef<string | null>(null);
+  const inFlight = useRef(false);
 
   const stop = async (id: string) => {
     lastStop.current = id;
@@ -31,13 +32,15 @@ export function useOutcomeSlot(nameOf: (id: string) => string, onChange: () => v
 
   const again = async (action: OutcomeAction) => {
     const ids = action.sessionIds ?? (lastStop.current ? [lastStop.current] : []);
-    if (busy || ids.length === 0) return;
+    if (inFlight.current || ids.length === 0) return;
+    inFlight.current = true;
     setBusy(action.kind);
     try {
       const results = await Promise.all(ids.map(async (id) => ({ id, name: nameOf(id), result: await deleteSession(id) })));
       setOutcome(tryClosingOutcome(results));
       onChange();
     } finally {
+      inFlight.current = false;
       setBusy(null);
     }
   };
@@ -45,5 +48,5 @@ export function useOutcomeSlot(nameOf: (id: string) => string, onChange: () => v
   const panel: ReactNode = (
     <OutcomePanel outcome={outcome} busy={busy} onAction={(a) => void again(a)} onDismiss={() => setOutcome(null)} />
   );
-  return { outcome, setOutcome, stop, panel };
+  return { outcome, setOutcome, stop, again, busy, panel };
 }

@@ -72,6 +72,18 @@ describe('QuickTrade', () => {
     expect(body.stop_loss).toBeUndefined();
   });
 
+  it('rejects trailing distances in exponent form or beyond 8 decimals', async () => {
+    m = await show();
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
+    await click(radio('Trailing stop (%)'));
+    for (const bad of ['1e1', '5.123456789']) {
+      await typeInto(inputByLabel(m.container, 'Trailing distance (%)'), bad);
+      expect(primary().disabled).toBe(true);
+    }
+    await typeInto(inputByLabel(m.container, 'Trailing distance (%)'), '5.12345678');
+    expect(primary().disabled).toBe(false);
+  });
+
   it('refuses a sell when nothing is held', async () => {
     m = await show([]);
     await click(side('Sell'));

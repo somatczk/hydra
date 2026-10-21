@@ -132,6 +132,7 @@ function Fills({ d }: { d: SessionDetail }) {
         { key: 'price', header: 'Price', render: (t) => price(t.price) ?? '—' },
         { key: 'fee', header: 'Fee', render: (t) => money(t.fee) ?? '—' },
         { key: 'net_pnl', header: 'Net P&L', render: (t) => signed(t.net_pnl) ?? '—' },
+        { key: 'reason', header: 'Reason', render: (t) => t.reason ?? '—' },
       ]}
       data={d.trades}
       keyExtractor={(t) => t.id ?? `${t.timestamp}-${t.price}`}
@@ -148,6 +149,8 @@ export default function SessionDetailPage() {
   const [stopping, setStopping] = useState(false);
   const [copied, setCopied] = useState(false);
   const running = d?.status === 'running';
+  const row = shell.sessions.data?.find((s) => s.session_id === sessionId);
+  const listed = { persist_dirty: row?.persist_dirty ?? null, feed_live: row?.feed_live ?? null };
   const { refetchAll } = shell;
 
   const slot = useOutcomeSlot(
@@ -238,7 +241,7 @@ export default function SessionDetailPage() {
       {slot.panel}
 
       <Section id="health-heading" title="Health">
-        <SessionHealth detail={d} push={push} now={shell.now} />
+        <SessionHealth detail={{ ...d, ...listed }} push={push} now={shell.now} />
       </Section>
 
       <Section id="account-heading" title="Account">
@@ -250,7 +253,11 @@ export default function SessionDetailPage() {
           <Positions d={d} />
           {holds && (
             <div>
-              <Button variant="secondary" onClick={() => void slot.stop(d.session_id)}>
+              <Button
+                variant="secondary"
+                disabled={slot.busy !== null}
+                onClick={() => void slot.again({ kind: 'try_closing', label: 'Try closing again', sessionIds: [d.session_id] })}
+              >
                 Try closing again
               </Button>
             </div>

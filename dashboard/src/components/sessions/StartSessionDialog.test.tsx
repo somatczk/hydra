@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
-import { buttonByText, click, dialogPolyfill, inputByLabel, mount, routeFetch, typeInto, type Mounted, type Mutations } from '@/test/pageHarness';
+import { buttonByText, click, dialogPolyfill, inputByLabel, mount, routeFetch, typeInto, unavailable, type Mounted, type Mutations } from '@/test/pageHarness';
 import { liveStatus, platformConfig, session } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
@@ -17,7 +17,7 @@ const { ShellStatusProvider } = await import('@/components/shell/ShellStatusProv
 let m: Mounted;
 let calls: Array<{ path: string; init?: RequestInit }>;
 
-function show(live = liveStatus(), mutations: Mutations = {}) {
+function show(live: unknown = liveStatus(), mutations: Mutations = {}) {
   fetchApi.mockImplementation(
     routeFetch(
       {
@@ -56,6 +56,11 @@ describe('StartSessionDialog', () => {
     const body = JSON.parse(calls.find((c) => c.init?.method === 'POST')?.init?.body as string);
     expect(body).toEqual({ strategy_id: 'sma-cross-btc-1h', trading_mode: 'paper', paper_capital: '8000' });
     expect(push).toHaveBeenCalledWith('/trading/new-1');
+  });
+
+  it('says the kill switch state is unknown when live status cannot be read', async () => {
+    m = await show(unavailable());
+    expect(text()).toContain('Kill switch state unknown. The server will refuse the start if it is on.');
   });
 
   it('disables the primary and points to Risk while the kill switch is on', async () => {

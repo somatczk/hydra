@@ -106,7 +106,7 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
         ? 'Stop price must be below take-profit price.'
         : null,
     trailing:
-      !buy || protection !== 'trailing' ? null : Number(trailing) > 0 && Number(trailing) < 100 ? null : 'Trailing stop must be above 0 and below 100.',
+      !buy || protection !== 'trailing' ? null : DECIMAL.test(trailing) && Number(trailing) > 0 && Number(trailing) < 100 ? null : 'Trailing stop must be above 0 and below 100.',
   };
   const valid = positive(quantity) && Object.values(errors).every((e) => e === null);
 

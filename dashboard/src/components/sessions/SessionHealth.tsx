@@ -60,8 +60,18 @@ export function SessionHealth({ detail: d, push, now }: SessionHealthProps) {
           {stops.map((o) => `Stop at ${price(o.stop_price)} (${o.symbol})`).join(' · ')}
         </Row>
       )}
-      <Row label="Saved" tone={d.persist_error ? 'caution' : 'none'}>
-        {d.persist_error ? `Session status saved: no. ${d.persist_error}` : 'Session status saved: yes'}
+      {running && d.feed_live === false && (
+        <Row label="Feed" tone="caution">
+          Feed not live
+        </Row>
+      )}
+      <Row label="Saved" tone={d.persist_error || d.persist_dirty ? 'caution' : 'none'}>
+        {[
+          d.persist_error ? `Session status saved: no. ${d.persist_error}` : 'Session status saved: yes',
+          d.persist_dirty ? 'Unsaved ledger changes' : null,
+        ]
+          .filter(Boolean)
+          .join(' · ')}
       </Row>
       {d.error_message && (
         <Row label="Error" tone="danger">

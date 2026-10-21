@@ -129,6 +129,9 @@ export function StartSessionDialog({ strategyId, onClose }: StartSessionDialogPr
           </Link>
         </p>
       )}
+      {live.data === null && live.state !== 'loading' && (
+        <p className="text-caution">Kill switch state unknown. The server will refuse the start if it is on.</p>
+      )}
       {tier >= 2 && (
         <p className="text-caution">Breaker tier {tier} is active. The session will start but can&apos;t open entries until it clears.</p>
       )}

@@ -16,15 +16,24 @@ interface StopSessionDialogProps {
 
 /** C-STOP-1: names what the stop closes before it is sent. */
 export function StopSessionDialog({ session, positions, open, onClose, onStop }: StopSessionDialogProps) {
+  const retry = session.status !== 'running';
   const held = positions?.length ?? 0;
   const worth = (positions ?? []).reduce((sum, p) => sum + p.quantity * p.avg_entry_price + p.unrealized_pnl, 0);
   return (
     <ConfirmDialog
       open={open}
-      destructive={held > 0}
-      title={`Stop ${sessionName(session)}?`}
-      primaryLabel={held > 0 ? `Stop and close ${plural(held, 'position')}` : 'Stop session'}
-      secondaryLabel="Keep running"
+      destructive={retry || positions === null || held > 0}
+      title={`${retry ? 'Try closing' : 'Stop'} ${sessionName(session)}${retry ? ' again' : ''}?`}
+      primaryLabel={
+        retry
+          ? 'Try closing again'
+          : held > 0
+            ? `Stop and close ${plural(held, 'position')}`
+            : positions === null
+              ? 'Stop and close any positions'
+              : 'Stop session'
+      }
+      secondaryLabel={retry ? 'Cancel' : 'Keep running'}
       pendingLabel="Stopping…"
       pendingHint="Closing this won't cancel the stop."
       onClose={onClose}
@@ -33,7 +42,12 @@ export function StopSessionDialog({ session, positions, open, onClose, onStop }:
         onClose();
       }}
     >
-      {positions === null ? (
+      {retry ? (
+        <p>
+          This session is stopped but still holds{' '}
+          {session.positions_at_stop > 0 ? plural(session.positions_at_stop, 'position') : 'positions'}. It tries to close them at market (paper) again.
+        </p>
+      ) : positions === null ? (
         <p>It closes whatever this session holds at market (paper), then stops. Open positions: unknown.</p>
       ) : held > 0 ? (
         <p>
