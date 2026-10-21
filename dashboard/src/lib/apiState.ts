@@ -1,5 +1,7 @@
 /** Shared reading of the dashboard API error envelope; no `@/` imports so it stays testable. */
 
+import { age, utc } from './format';
+
 export type ServerErrorState =
   | 'unavailable'
   | 'no_data'
@@ -10,6 +12,9 @@ export type ServerErrorState =
   | 'forbidden';
 
 export type DataState = 'ok' | 'stale' | 'unknown' | ServerErrorState;
+
+/** A polled source: DataState plus the in-flight states (`usePoll`). */
+export type PollState = 'loading' | 'refreshing' | DataState;
 
 export interface ApiErrorDetail {
   code: string;
@@ -126,4 +131,21 @@ export function isStale(
   const ts = Date.parse(tsIso);
   if (Number.isNaN(ts)) return true;
   return now - ts > maxAgeMs;
+}
+
+/** Signed out: a 401, including the one an Authelia redirect is mapped to (R-P2-13). */
+export function isSignedOut(err: unknown): boolean {
+  return isHttpError(err) && err.status === 401;
+}
+
+/** Card-header age (C-AGE): fetch age, never data age (R-P1-6). */
+export function fetchAgeLabel(
+  fetchedAt: number | null,
+  state: PollState,
+  now: number = Date.now(),
+): string | { stale: true; asOf: string } | null {
+  if (state === 'loading' || state === 'refreshing') return 'Fetching…';
+  if (fetchedAt === null) return null;
+  if (state === 'stale') return { stale: true, asOf: `${utc(fetchedAt, now)} (${age(now - fetchedAt, now)})` };
+  return `Fetched ${age(now - fetchedAt, now)}`;
 }

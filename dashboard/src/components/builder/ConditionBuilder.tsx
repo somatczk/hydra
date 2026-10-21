@@ -44,7 +44,7 @@ export function ConditionBuilder({
             type="button"
             className={`px-3 py-1 text-xs font-medium transition-colors ${
               group.operator === 'AND'
-                ? 'bg-accent-primary text-white'
+                ? 'bg-accent-primary text-on-accent'
                 : 'bg-bg-primary text-text-secondary hover:bg-bg-hover'
             }`}
             onClick={() => onSetOperator('AND')}
@@ -55,7 +55,7 @@ export function ConditionBuilder({
             type="button"
             className={`px-3 py-1 text-xs font-medium transition-colors ${
               group.operator === 'OR'
-                ? 'bg-accent-primary text-white'
+                ? 'bg-accent-primary text-on-accent'
                 : 'bg-bg-primary text-text-secondary hover:bg-bg-hover'
             }`}
             onClick={() => onSetOperator('OR')}

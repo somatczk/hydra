@@ -28,7 +28,7 @@ export function DataCard({
   return (
     <div
       className={cn(
-        'rounded-xl border border-border-default bg-bg-elevated',
+        'rounded-lg border border-line bg-surface',
         paddingStyles[padding],
         className,
       )}
@@ -36,10 +36,10 @@ export function DataCard({
       {(title || description) && (
         <div className="mb-3">
           {title && (
-            <h3 className="text-sm font-semibold text-text-primary">{title}</h3>
+            <h3 className="text-sm font-semibold text-ink-1">{title}</h3>
           )}
           {description && (
-            <p className="mt-0.5 text-xs text-text-muted">{description}</p>
+            <p className="mt-0.5 text-xs text-ink-2">{description}</p>
           )}
         </div>
       )}
@@ -62,9 +62,9 @@ interface StatCardProps {
 }
 
 const changeStyles: Record<ChangeType, string> = {
-  increase: 'text-status-success',
-  decrease: 'text-status-error',
-  neutral: 'text-text-muted',
+  increase: 'text-ink-2',
+  decrease: 'text-ink-2',
+  neutral: 'text-ink-2',
 };
 
 const ChangeIcon: Record<ChangeType, LucideIcon> = {
@@ -86,13 +86,13 @@ export function StatCard({
   return (
     <div
       className={cn(
-        'rounded-xl border border-border-default bg-bg-elevated p-4 md:p-5',
+        'rounded-lg border border-line bg-surface p-4 md:p-5',
         className,
       )}
     >
       <div className="flex items-center justify-between">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-bg-tertiary">
-          <Icon className="h-4 w-4 text-text-muted" aria-hidden="true" />
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-raised">
+          <Icon className="h-4 w-4 text-ink-2" aria-hidden="true" />
         </div>
         {change !== undefined && (
           <div
@@ -107,8 +107,8 @@ export function StatCard({
         )}
       </div>
       <div className="mt-3">
-        <p className="text-xs font-medium text-text-muted">{label}</p>
-        <p className="mt-0.5 text-xl font-bold text-text-primary font-display">
+        <p className="text-xs font-medium text-ink-2">{label}</p>
+        <p className="mt-0.5 text-xl font-bold text-ink-1 font-display">
           {value}
         </p>
       </div>

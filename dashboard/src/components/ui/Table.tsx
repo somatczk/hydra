@@ -29,7 +29,7 @@ function SkeletonRow({ cols }: { cols: number }) {
     <tr>
       {Array.from({ length: cols }).map((_, i) => (
         <td key={i} className="px-4 py-3">
-          <div className="h-4 w-3/4 animate-pulse rounded bg-bg-tertiary" />
+          <div className="h-4 w-3/4 animate-pulse rounded bg-raised" />
         </td>
       ))}
     </tr>
@@ -56,8 +56,8 @@ function MobileCard<T>({
     <button
       type="button"
       className={cn(
-        'w-full rounded-xl border border-border-default bg-bg-elevated p-4 text-left',
-        onClick && 'cursor-pointer hover:bg-bg-hover transition-colors',
+        'w-full rounded-lg border border-line bg-surface p-4 text-left',
+        onClick && 'cursor-pointer hover:bg-hover transition-colors',
       )}
       onClick={() => onClick?.(row)}
       disabled={!onClick}
@@ -65,10 +65,10 @@ function MobileCard<T>({
       <div className="space-y-2">
         {columns.map((col) => (
           <div key={col.key} className="flex items-center justify-between gap-4">
-            <span className="text-xs font-medium text-text-muted">
+            <span className="text-xs font-medium text-ink-2">
               {col.mobileLabel ?? col.header}
             </span>
-            <span className="text-sm text-text-primary text-right">
+            <span className="text-sm text-ink-1 text-right">
               {getValue(col)}
             </span>
           </div>
@@ -98,7 +98,7 @@ export function Table<T>({
   if (!loading && data.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-12 text-center">
-        <p className="text-sm text-text-muted">{emptyMessage}</p>
+        <p className="text-sm text-ink-2">{emptyMessage}</p>
       </div>
     );
   }
@@ -111,7 +111,7 @@ export function Table<T>({
           ? Array.from({ length: 3 }).map((_, i) => (
               <div
                 key={i}
-                className="h-28 animate-pulse rounded-xl border border-border-default bg-bg-tertiary"
+                className="h-28 animate-pulse rounded-lg border border-line bg-raised"
               />
             ))
           : data.map((row) => (
@@ -128,20 +128,20 @@ export function Table<T>({
       <div className={cn('hidden md:block overflow-x-auto', className)}>
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-border-default">
+            <tr className="border-b border-line">
               {columns
                 .filter((c) => !c.hideOnMobile)
                 .map((col) => (
                   <th
                     key={col.key}
-                    className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-text-muted"
+                    className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-ink-2"
                   >
                     {col.header}
                   </th>
                 ))}
             </tr>
           </thead>
-          <tbody className="divide-y divide-border-default">
+          <tbody className="divide-y divide-line">
             {loading
               ? Array.from({ length: 5 }).map((_, i) => (
                   <SkeletonRow
@@ -155,7 +155,7 @@ export function Table<T>({
                     className={cn(
                       'transition-colors',
                       onRowClick &&
-                        'cursor-pointer hover:bg-bg-hover',
+                        'cursor-pointer hover:bg-hover',
                     )}
                     onClick={() => onRowClick?.(row)}
                   >
@@ -164,7 +164,7 @@ export function Table<T>({
                       .map((col) => (
                         <td
                           key={col.key}
-                          className="px-4 py-3 text-text-primary"
+                          className="px-4 py-3 text-ink-1"
                         >
                           {getValue(col, row)}
                         </td>

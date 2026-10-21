@@ -4,16 +4,12 @@ import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from 'react';
 import { cn } from './cn';
 
 const variantStyles = {
-  primary:
-    'bg-accent-primary text-white hover:bg-accent-primary-hover focus:ring-accent-primary/30',
-  secondary:
-    'bg-bg-tertiary text-text-primary hover:bg-bg-active focus:ring-border-focus/30',
-  outline:
-    'border border-border-default text-text-primary hover:border-border-hover hover:bg-bg-hover focus:ring-border-focus/30',
-  ghost:
-    'text-text-secondary hover:bg-bg-hover hover:text-text-primary focus:ring-border-focus/30',
-  danger:
-    'bg-status-error text-white hover:bg-status-error/90 focus:ring-status-error/30',
+  primary: 'bg-accent text-on-accent hover:opacity-90',
+  secondary: 'border border-line-strong bg-surface text-ink-1 hover:bg-hover',
+  outline: 'border border-line-strong bg-surface text-ink-1 hover:bg-hover',
+  ghost: 'text-ink-2 hover:bg-hover hover:text-ink-1',
+  // No danger fill (07 P3-6): the consequence is in the label.
+  danger: 'border border-line-strong bg-surface text-ink-1 hover:bg-hover',
 } as const;
 
 const sizeStyles = {
@@ -77,11 +73,11 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
       <button
         ref={ref}
         className={cn(
-          'inline-flex items-center justify-center rounded-lg font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1',
+          'inline-flex items-center justify-center rounded font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent',
           variantStyles[variant],
           sizeStyles[size],
           fullWidth && 'w-full',
-          isDisabled && 'pointer-events-none opacity-50',
+          isDisabled && 'pointer-events-none border border-line bg-surface text-ink-3',
           className,
         )}
         disabled={isDisabled}

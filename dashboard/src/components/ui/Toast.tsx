@@ -48,10 +48,10 @@ const iconMap: Record<ToastType, typeof CheckCircle> = {
 };
 
 const typeStyles: Record<ToastType, string> = {
-  success: 'border-status-success/30 text-status-success',
-  error: 'border-status-error/30 text-status-error',
-  warning: 'border-status-warning/30 text-status-warning',
-  info: 'border-status-info/30 text-status-info',
+  success: 'border-line text-ink-2',
+  error: 'border-danger text-danger',
+  warning: 'border-caution text-caution',
+  info: 'border-line text-ink-2',
 };
 
 /* ---------- ToastItem ---------- */
@@ -85,20 +85,20 @@ function ToastItem({
     <div
       role="alert"
       className={cn(
-        'flex items-start gap-3 rounded-lg border bg-bg-elevated p-4 shadow-lg transition-all duration-200',
+        'flex items-start gap-3 rounded-lg border bg-surface p-4 transition-all duration-200',
         typeStyles[t.type],
         visible ? 'translate-x-0 opacity-100' : 'translate-x-4 opacity-0',
       )}
     >
       <Icon className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-      <p className="flex-1 text-sm text-text-primary">{t.message}</p>
+      <p className="flex-1 text-sm text-ink-1">{t.message}</p>
       <button
         type="button"
         onClick={() => {
           setVisible(false);
           setTimeout(() => onDismiss(t.id), 200);
         }}
-        className="shrink-0 rounded p-0.5 text-text-muted hover:text-text-primary transition-colors"
+        className="shrink-0 rounded p-0.5 text-ink-2 hover:text-ink-1 transition-colors"
         aria-label="Dismiss notification"
       >
         <X className="h-4 w-4" />

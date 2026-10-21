@@ -10,32 +10,13 @@ interface StatusBadgeProps {
   className?: string;
 }
 
+// Chip tones (05 §3): success/info/neutral are quiet; only caution and danger take colour.
 const variantStyles: Record<BadgeVariant, { dot: string; text: string; bg: string }> = {
-  success: {
-    dot: 'bg-status-success',
-    text: 'text-status-success',
-    bg: 'bg-status-success/10',
-  },
-  warning: {
-    dot: 'bg-status-warning',
-    text: 'text-status-warning',
-    bg: 'bg-status-warning/10',
-  },
-  error: {
-    dot: 'bg-status-error',
-    text: 'text-status-error',
-    bg: 'bg-status-error/10',
-  },
-  info: {
-    dot: 'bg-status-info',
-    text: 'text-status-info',
-    bg: 'bg-status-info/10',
-  },
-  neutral: {
-    dot: 'bg-text-muted',
-    text: 'text-text-muted',
-    bg: 'bg-bg-tertiary',
-  },
+  success: { dot: 'bg-ink-2', text: 'text-ink-1', bg: 'border border-line bg-surface' },
+  warning: { dot: 'bg-caution', text: 'text-caution', bg: 'bg-caution-soft' },
+  error: { dot: 'bg-danger', text: 'text-danger', bg: 'bg-danger-soft' },
+  info: { dot: 'bg-ink-2', text: 'text-ink-2', bg: 'border border-line bg-surface' },
+  neutral: { dot: 'bg-ink-2', text: 'text-ink-2', bg: 'bg-raised border border-line' },
 };
 
 const sizeStyles: Record<BadgeSize, { wrapper: string; dot: string; text: string }> = {
@@ -56,7 +37,7 @@ export function StatusBadge({
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded-full font-medium',
+        'inline-flex items-center rounded font-medium',
         v.bg,
         s.wrapper,
         className,

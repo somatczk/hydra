@@ -862,7 +862,7 @@ export default function PortfolioPage() {
                         <td key={mi} className="px-1 py-1">
                           {val !== undefined ? (
                             <div
-                              className={`rounded px-1.5 py-1 text-center text-xs font-medium text-white ${getReturnColor(val)}`}
+                              className={`rounded px-1.5 py-1 text-center text-xs font-medium text-bg-primary ${getReturnColor(val)}`}
                               title={`${MONTH_LABELS[mi]} ${year}: ${val >= 0 ? '+' : ''}${val.toFixed(1)}%`}
                             >
                               {val >= 0 ? '+' : ''}{val.toFixed(1)}%
