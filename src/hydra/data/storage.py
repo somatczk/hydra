@@ -6,7 +6,7 @@ TimescaleDB with connection pooling and ON CONFLICT deduplication.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -332,21 +332,22 @@ class MarketDataRepository:
         memory is O(gaps), not O(bars); an empty range returns ``[(start, end)]``.
         """
         pool = self._ensure_pool()
-        step = timedelta(seconds=timeframe_seconds(timeframe))
+        step = timeframe_seconds(timeframe)
 
         query = """
             WITH present AS (
                 SELECT timestamp AS ts FROM ts.ohlcv_1m
                 WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
                   AND timestamp BETWEEN $4::timestamptz AND $5::timestamptz
-                UNION ALL SELECT $4::timestamptz - $6::interval
-                UNION ALL SELECT $5::timestamptz + $6::interval
+                UNION ALL SELECT $4::timestamptz - make_interval(secs => $6)
+                UNION ALL SELECT $5::timestamptz + make_interval(secs => $6)
             ), steps AS (
                 SELECT ts, lead(ts) OVER (ORDER BY ts) AS nxt FROM present
             )
-            SELECT ts + $6::interval AS gap_start, nxt - $6::interval AS gap_end
+            SELECT ts + make_interval(secs => $6) AS gap_start,
+                   nxt - make_interval(secs => $6) AS gap_end
             FROM steps
-            WHERE nxt - ts > $6::interval
+            WHERE nxt - ts > make_interval(secs => $6)
             ORDER BY ts
         """
 
