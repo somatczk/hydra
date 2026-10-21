@@ -7,12 +7,12 @@ import { Button } from '@/components/ui/Button';
 import { DataStateBadge } from '@/components/ui/DataStateBadge';
 import { fetchApi } from '@/lib/api';
 import { parseErrorDetail } from '@/lib/apiState';
-import { ksTargets, plural, sessionName, stoppedHolders, type SessionDetail, type SessionResponse, type Tone } from '@/lib/derive';
+import { ksTargets, plural, sessionName, stoppedHolders, type SessionDetail, type SessionResponse } from '@/lib/derive';
 import { utc } from '@/lib/format';
 import {
   killSwitchOutcome,
   saveAgainOutcome,
-  stopOutcome,
+  tryClosingOutcome,
   type KillSwitchResponse,
   type Outcome,
   type OutcomeAction,
@@ -23,7 +23,6 @@ import { OutcomePanel } from './OutcomePanel';
 import { useShellStatus } from './ShellStatusProvider';
 
 const KS_PATH = '/api/trading/kill-switch';
-const RANK: Record<Tone, number> = { none: 0, caution: 1, danger: 2 };
 
 async function settle<T>(p: Promise<T>): Promise<Result<T>> {
   try {
@@ -34,6 +33,12 @@ async function settle<T>(p: Promise<T>): Promise<Result<T>> {
 }
 
 const notPersisted = (r: Result<unknown>) => 'err' in r && parseErrorDetail(r.err)?.code === 'kill_switch_not_persisted';
+
+/** Point a generic "Try again" at the request that produced it. */
+const retryAs = (o: Outcome, kind: OutcomeAction['kind']): Outcome => ({
+  ...o,
+  actions: o.actions.map((a) => (a.kind === 'retry' ? { ...a, kind } : a)),
+});
 
 /** The kill-switch mutations; their outcomes land in the shell outcome slot. */
 function useKillSwitchActions() {
@@ -47,7 +52,7 @@ function useKillSwitchActions() {
     );
     const on = 'ok' in result || notPersisted(result);
     if (on) setKsNotSaved(!('ok' in result));
-    setOutcome(killSwitchOutcome(result, fresh), on);
+    setOutcome(retryAs(killSwitchOutcome(result, fresh), 'kill_switch'), on);
     void refetchAll();
   };
 
@@ -55,41 +60,28 @@ function useKillSwitchActions() {
     const result = await settle(fetchApi<KillSwitchResponse>(KS_PATH, { method: 'POST' }));
     const on = 'ok' in result || notPersisted(result);
     if (on) setKsNotSaved(!('ok' in result));
-    setOutcome(saveAgainOutcome(result), on);
+    setOutcome(retryAs(saveAgainOutcome(result), 'save_again'), on);
     void refetchAll();
   };
 
   /** C-KS-2b/3 "Try closing again": DELETE per holder, never the kill switch again. */
   const tryClosing = async (ids: string[]) => {
-    const outs = await Promise.all(
-      ids.map(async (id) =>
-        stopOutcome(await settle(fetchApi<SessionResponse>(`/api/trading/sessions/${id}`, { method: 'DELETE' }))),
-      ),
-    );
-    const again = (o: Outcome, id: string): OutcomeAction[] =>
-      o.actions.map((a) => (a.kind === 'retry' ? { kind: 'try_closing', label: 'Try closing again', sessionIds: [id] } : a));
-    if (outs.length === 1) {
-      setOutcome({ ...outs[0], actions: again(outs[0], ids[0]) });
-    } else {
-      const name = (id: string) => {
+    const results = await Promise.all(
+      ids.map(async (id) => {
         const s = shell.sessions.data?.find((x) => x.session_id === id);
-        return s ? sessionName(s) : id;
-      };
-      const retryIds = ids.filter((id, i) => again(outs[i], id).some((a) => a.kind === 'try_closing'));
-      setOutcome({
-        tone: outs.reduce<Tone>((t, o) => (RANK[o.tone] > RANK[t] ? o.tone : t), 'none'),
-        title: `Tried closing ${plural(ids.length, 'session')} again.`,
-        lines: outs.map((o, i) => `${name(ids[i])}: ${[o.title, ...o.lines].join(' ')}`),
-        actions: retryIds.length ? [{ kind: 'try_closing', label: 'Try closing again', sessionIds: retryIds }] : [],
-      });
-    }
+        const result = await settle(fetchApi<SessionResponse>(`/api/trading/sessions/${id}`, { method: 'DELETE' }));
+        return { id, name: s ? sessionName(s) : id, result };
+      }),
+    );
+    setOutcome(tryClosingOutcome(results));
     void refetchAll();
   };
 
   const run = (action: OutcomeAction): Promise<void> => {
     if (action.kind === 'save_again') return saveAgain();
     if (action.kind === 'try_closing') return tryClosing(action.sessionIds ?? []);
-    return activate();
+    if (action.kind === 'kill_switch') return activate();
+    return Promise.resolve();
   };
 
   return { activate, run };
@@ -192,9 +184,11 @@ export function KillSwitchControl() {
   };
 
   const state = live.data?.kill_switch_state ?? (live.state === 'loading' ? 'loading' : 'unknown');
-  // After Stop all the button is replaced by the chip; keep keyboard focus on the control.
+  // Once the switch is on, the sheet has nothing to confirm; after Stop all keep keyboard focus on the chip.
   useEffect(() => {
-    if (state !== 'active' || !refocus.current) return;
+    if (state !== 'active') return;
+    setOpen(false);
+    if (!refocus.current) return;
     refocus.current = false;
     if (document.activeElement === document.body || !document.activeElement) chip.current?.focus();
   }, [state]);

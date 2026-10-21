@@ -77,7 +77,8 @@ export async function fetchApi<T>(
 
   let res: Response;
   try {
-    res = await fetch(url, { ...options, method, headers });
+    // A cross-origin redirect to the sign-in portal would reject as a CORS TypeError; keep it readable instead.
+    res = await fetch(url, { redirect: 'manual', ...options, method, headers });
   } catch (err) {
     const ms = Math.round(performance.now() - t0);
     logger.error('API', `${method} ${path} NETWORK_ERROR (${ms}ms)`, err);
@@ -87,7 +88,7 @@ export async function fetchApi<T>(
   const ms = Math.round(performance.now() - t0);
 
   const loginPage = res.ok && (res.headers.get('content-type') ?? '').includes('text/html');
-  if (loginPage || (res.redirected && new URL(res.url).origin !== new URL(url).origin)) {
+  if (loginPage || res.type === 'opaqueredirect') {
     logger.error('API', `${method} ${path} -> redirected to sign-in (${ms}ms)`);
     throw new ApiError(401, SIGNED_OUT_BODY);
   }

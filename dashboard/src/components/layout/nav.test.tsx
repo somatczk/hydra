@@ -47,6 +47,7 @@ describe('navigation', () => {
     const { rail, tabs } = await bars('/');
     expect(topLabels(rail)).toEqual(LABELS);
     expect(topLabels(tabs)).toEqual(LABELS);
+    for (const a of tabs.querySelectorAll('a')) expect(a.className).toContain('min-h-14');
     expect(m.container.textContent).not.toMatch(/More|Models/);
   });
 

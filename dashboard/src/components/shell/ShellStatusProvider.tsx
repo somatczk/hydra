@@ -41,6 +41,18 @@ const DISAGREE: Outcome = {
   actions: [{ kind: 'open', label: 'Open activity log', href: '/risk#activity' }],
 };
 
+const NOT_SAVED_KEY = 'hydra-ks-not-saved';
+
+/** C-KS-4 is known only from this browser's last POST, so it outlives a reload (D-4). */
+function storeNotSaved(since: number | null) {
+  try {
+    if (since === null) localStorage.removeItem(NOT_SAVED_KEY);
+    else localStorage.setItem(NOT_SAVED_KEY, String(since));
+  } catch {
+    // Storage blocked: the flag lasts as long as this tab.
+  }
+}
+
 /** The only place live-status, the session list and the system config are polled. */
 export function ShellStatusProvider({ children }: { children: ReactNode }) {
   const live = usePoll<LiveStatus>('/api/risk/live-status', 10_000);
@@ -49,6 +61,15 @@ export function ShellStatusProvider({ children }: { children: ReactNode }) {
   const [notSavedSince, setNotSavedSince] = useState<number | null>(null);
   const [outcome, setOutcomeState] = useState<ShellOutcome | null>(null);
   const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    try {
+      const since = Number(localStorage.getItem(NOT_SAVED_KEY));
+      if (since > 0) setNotSavedSince(since);
+    } catch {
+      // Storage blocked: nothing to restore.
+    }
+  }, []);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 10_000);
@@ -60,12 +81,17 @@ export function ShellStatusProvider({ children }: { children: ReactNode }) {
   // Only a live-status read taken after the outcome may overrule it.
   if (notSavedSince !== null && liveAt !== null && liveAt > notSavedSince && ksState !== 'active') {
     setNotSavedSince(null);
+    storeNotSaved(null);
   }
   if (outcome?.ksOn && liveAt !== null && liveAt > outcome.at && ksState === 'inactive') {
     setOutcomeState({ outcome: DISAGREE, at: liveAt, ksOn: false });
   }
 
-  const setKsNotSaved = useCallback((notSaved: boolean) => setNotSavedSince(notSaved ? Date.now() : null), []);
+  const setKsNotSaved = useCallback((notSaved: boolean) => {
+    const since = notSaved ? Date.now() : null;
+    setNotSavedSince(since);
+    storeNotSaved(since);
+  }, []);
   const setOutcome = useCallback(
     (o: Outcome | null, ksOn = false) => setOutcomeState(o ? { outcome: o, at: Date.now(), ksOn } : null),
     [],

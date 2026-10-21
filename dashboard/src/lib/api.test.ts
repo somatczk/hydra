@@ -83,14 +83,12 @@ describe('fetchApi signed-out detection (E-1)', () => {
     expect(sentHeaders().get('accept')).toBe('application/json');
   });
 
-  it('maps a fetch that was redirected to another origin to a signed-out 401', async () => {
-    const res = new Response('<html>Sign in</html>', { status: 200, headers: { 'content-type': 'text/plain' } });
-    Object.defineProperties(res, {
-      redirected: { value: true },
-      url: { value: 'https://auth.romulus.hu/?rd=https%3A%2F%2Ftrading.romulus.hu%2Fapi%2Ftrading%2Fkill-switch' },
-    });
+  it('does not follow redirects, and maps one (the sign-in portal) to a signed-out 401', async () => {
+    const res = new Response(null, { status: 200 });
+    Object.defineProperties(res, { type: { value: 'opaqueredirect' }, status: { value: 0 }, ok: { value: false } });
     fetchMock.mockResolvedValueOnce(res);
     const err = await caught(fetchApi('/api/trading/kill-switch', { method: 'POST' }));
+    expect((fetchMock.mock.calls[0][1] as RequestInit).redirect).toBe('manual');
     expect(err).toBeInstanceOf(ApiError);
     expect(isSignedOut(err)).toBe(true);
     expect(stateFromError(err)).toBe('unauthenticated');
@@ -99,13 +97,6 @@ describe('fetchApi signed-out detection (E-1)', () => {
   it('maps a 2xx HTML page (the login portal) to a signed-out 401', async () => {
     fetchMock.mockResolvedValueOnce(new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }));
     expect(isSignedOut(await caught(fetchApi('/api/risk/live-status')))).toBe(true);
-  });
-
-  it('keeps a same-origin redirect to JSON as data', async () => {
-    const res = new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
-    Object.defineProperties(res, { redirected: { value: true }, url: { value: `${window.location.origin}/api/x/` } });
-    fetchMock.mockResolvedValueOnce(res);
-    await expect(fetchApi('/api/x')).resolves.toEqual({ ok: true });
   });
 });
 

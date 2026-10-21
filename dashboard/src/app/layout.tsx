@@ -5,7 +5,7 @@ import { AppLayout } from '@/components/layout/AppLayout';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: { template: '%s · Hydra', default: 'Status · Hydra' },
+  title: { template: '%s · Hydra', default: 'Hydra' },
   description:
     'Bitcoin auto-trading platform with ML-assisted signals, multi-exchange support, backtesting, and production monitoring.',
 };

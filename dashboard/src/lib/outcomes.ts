@@ -5,7 +5,7 @@ import { heldAfter, plural, sessionName, type CircuitBreaker, type SessionRespon
 import { money, pct, price, qty, utc } from './format';
 
 export interface OutcomeAction {
-  kind: 'open' | 'retry' | 'try_closing' | 'save_again';
+  kind: 'open' | 'retry' | 'try_closing' | 'save_again' | 'kill_switch';
   label: string;
   href?: string;
   /** For try_closing: the sessions to re-send DELETE to (never the kill switch). */
@@ -280,6 +280,28 @@ export function stopOutcome(result: Result<SessionResponse>, now: number = Date.
     return { tone: 'caution', title: 'This session no longer exists.', lines: [], actions: [{ kind: 'open', label: 'Open Sessions', href: '/trading' }] };
   }
   return notConfirmed('the session stopped', err);
+}
+
+const RANK: Record<Tone, number> = { none: 0, caution: 1, danger: 2 };
+
+/** C-KS-2b/3 "Try closing again": one C-STOP result per holder; a retry re-sends only that holder's DELETE. */
+export function tryClosingOutcome(
+  results: Array<{ id: string; name: string; result: Result<SessionResponse> }>,
+  now: number = Date.now(),
+): Outcome {
+  const outs = results.map(({ id, result }) => {
+    const o = stopOutcome(result, now);
+    const actions = o.actions.map((a): OutcomeAction => (a.kind === 'retry' ? { kind: 'try_closing', label: 'Try closing again', sessionIds: [id] } : a));
+    return { ...o, actions };
+  });
+  if (outs.length === 1) return outs[0];
+  const retryIds = results.filter((_, i) => outs[i].actions.some((a) => a.kind === 'try_closing')).map((r) => r.id);
+  return {
+    tone: outs.reduce<Tone>((t, o) => (RANK[o.tone] > RANK[t] ? o.tone : t), 'none'),
+    title: `Tried closing ${plural(results.length, 'session')} again.`,
+    lines: outs.map((o, i) => `${results[i].name}: ${[o.title, ...o.lines].join(' ')}`),
+    actions: retryIds.length ? [{ kind: 'try_closing', label: 'Try closing again', sessionIds: retryIds }] : [],
+  };
 }
 
 /** OrderStatus (core/types.py:73-82) values that leave a live order; NOOP (session_wiring.py:539,591) placed nothing. */

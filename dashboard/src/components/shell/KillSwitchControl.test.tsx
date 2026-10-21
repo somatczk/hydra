@@ -24,6 +24,13 @@ const HOLDER = session({
   positions_at_stop: 1,
 });
 
+const NOT_SAVED = new ApiError(
+  503,
+  JSON.stringify({
+    detail: { code: 'kill_switch_not_persisted', message: 'Kill switch is on in memory but could not be saved', state: 'unavailable', sessions_stopped: 0, positions_remaining: 0, flatten_failures: [], persisted: false },
+  }),
+);
+
 let m: Mounted;
 let calls: Array<{ path: string; init?: RequestInit }>;
 let ksOn: boolean;
@@ -73,7 +80,15 @@ async function confirmStop() {
   await flush();
 }
 
+async function refetch() {
+  await act(async () => {
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await flush();
+}
+
 beforeEach(() => {
+  localStorage.clear();
   dialogPolyfill();
   calls = [];
   ksOn = false;
@@ -101,6 +116,7 @@ describe('KillSwitchControl', () => {
     m = await shell();
     const chip = Array.from(m.container.querySelectorAll('a')).find((a) => a.textContent?.startsWith('Kill switch ON'));
     expect(chip?.getAttribute('href')).toBe('/risk#kill-switch');
+    expect(chip?.className).toContain('max-lg:h-11');
     expect(stopAll()).toBeNull();
   });
 
@@ -117,16 +133,28 @@ describe('KillSwitchControl', () => {
     expect(body).toContain("Still held in 1 stopped session: Momentum 4h. The kill switch won't close these");
     expect(buttonByText(dialog(), 'Stop all trading and close 3 positions')).toBeTruthy();
 
-    await act(async () => {
-      dialog().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    });
-    expect(posts()).toHaveLength(0);
+    expect(document.activeElement?.tagName).not.toBe('BUTTON');
 
     await act(async () => {
       dialog().dispatchEvent(new Event('cancel', { cancelable: true }));
     });
     expect(dialog().open).toBe(false);
     expect(document.activeElement).toBe(trigger);
+  });
+
+  it('closes the sheet when the switch turns on elsewhere, and does not reopen it when it turns off', async () => {
+    setup();
+    m = await shell();
+    await click(stopAll());
+    expect(dialog().open).toBe(true);
+    ksOn = true;
+    await refetch();
+    expect(text()).toContain('Kill switch ON');
+    ksOn = false;
+    await refetch();
+    expect(stopAll()).not.toBeNull();
+    expect(m.container.querySelector('dialog[open]')).toBeNull();
+    expect(posts()).toHaveLength(0);
   });
 
   it('keeps the primary enabled while positions are still being counted', async () => {
@@ -231,6 +259,49 @@ describe('KillSwitchControl', () => {
     expect(outcome).not.toMatch(/position/i);
     expect(alert()).toBe('');
     expect(text()).toContain('Nothing needs you');
+  });
+
+  it('keeps the not-saved flag across a reload until live-status reads off', async () => {
+    setup({}, {
+      'POST /api/trading/kill-switch': NOT_SAVED,
+    });
+    list = [];
+    m = await shell();
+    ksOn = true;
+    await confirmStop();
+    expect(text()).toContain('Needs you: 1');
+
+    m.unmount();
+    m = await shell();
+    await flush();
+    expect(text()).toContain('Needs you: 1');
+
+    ksOn = false;
+    await refetch();
+    expect(text()).toContain('Nothing needs you');
+    expect(localStorage.getItem('hydra-ks-not-saved')).toBeNull();
+  });
+
+  it('retries a failed Save again as Save again, not as a new Stop all', async () => {
+    const saved = { active: true, message: 'ok', sessions_stopped: 0, positions_remaining: 0, persisted: true, flatten_failures: [] };
+    setup({}, {
+      'POST /api/trading/kill-switch': (n: number) => (n === 1 ? NOT_SAVED : n === 2 ? new TypeError('Failed to fetch') : saved),
+    });
+    list = [];
+    m = await shell();
+    ksOn = true;
+    await confirmStop();
+    await click(buttonByText(m.container, 'Save again'));
+    expect(text()).toContain("we don't know whether the kill switch was saved");
+
+    const before = calls.length;
+    await click(buttonByText(m.container, 'Try again'));
+    await flush();
+    expect(posts()).toHaveLength(3);
+    expect(calls.slice(before).filter((c) => c.path === '/api/trading/sessions')).toHaveLength(1);
+    const outcome = m.container.querySelector('[aria-label="Outcome"]')?.textContent ?? '';
+    expect(outcome).toContain('Kill switch saved.');
+    expect(outcome).not.toMatch(/position/i);
   });
 
   it('says signed out, not unconfirmed, when the POST meets the sign-in wall (C-KS-7)', async () => {

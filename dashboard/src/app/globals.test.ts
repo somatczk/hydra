@@ -49,6 +49,7 @@ const PAIRS: Array<[fg: string, bg: string, min: number]> = [
   ['ink-2', 'hover', 4.5],
   ['on-accent', 'accent', 4.5],
   ['caution', 'caution-soft', 4.5],
+  ['ink-1', 'caution-soft', 4.5],
   ['danger', 'danger-soft', 4.5],
   ['canvas', 'danger', 4.5],
   ['ink-1', 'line', 3],
