@@ -55,6 +55,8 @@ class StrategyEngine:
         self._strategies: dict[str, BaseStrategy] = {}
         self._strategy_configs: dict[str, StrategyConfig] = {}
         self._running = False
+        self.errors = 0
+        self.last_error: str | None = None
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -67,16 +69,25 @@ class StrategyEngine:
                 continue
             await self._instantiate_strategy(cfg)
 
-    async def load_strategy_from_config(self, cfg: StrategyConfig) -> None:
-        """Load a single strategy from an already-parsed config object."""
+    async def load_strategy_from_config(
+        self,
+        cfg: StrategyConfig,
+        cls: type[BaseStrategy] | None = None,
+    ) -> None:
+        """Load a single strategy from an already-parsed config object (``cls``: skip import)."""
         if not cfg.enabled:
             logger.info("Skipping disabled strategy: %s", cfg.id)
             return
-        await self._instantiate_strategy(cfg)
+        await self._instantiate_strategy(cfg, cls)
 
-    async def _instantiate_strategy(self, cfg: StrategyConfig) -> None:
+    async def _instantiate_strategy(
+        self,
+        cfg: StrategyConfig,
+        cls: type[BaseStrategy] | None = None,
+    ) -> None:
         """Import, instantiate, and register a strategy."""
-        cls = _import_strategy_class(cfg.strategy_class)
+        if cls is None:
+            cls = _import_strategy_class(cfg.strategy_class)
         strategy = cls(config=cfg, context=self._context)
         self._strategies[cfg.id] = strategy
         self._strategy_configs[cfg.id] = cfg
@@ -153,8 +164,10 @@ class StrategyEngine:
                 continue
             try:
                 signals = await strategy.on_bar(bar)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error in strategy %s on_bar", sid)
+                self.errors += 1
+                self.last_error = f"{sid}: {exc!r}"
                 continue
             for signal in signals:
                 await self._event_bus.publish(signal)

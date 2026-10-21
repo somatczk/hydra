@@ -1,4 +1,4 @@
-"""Intrabar fill rules, including parity with the backtester's OCO leg choice."""
+"""Intrabar fill rules: the path heuristic, gaps, limits, stops and the OCO leg choice."""
 
 from __future__ import annotations
 
@@ -8,8 +8,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
-from hydra.backtest.fills import CommissionConfig, FillSimulator, SlippageModel
-from hydra.core.types import OHLCV, MarketType, OrderRequest, OrderType, Side, Symbol
+from hydra.core.types import OHLCV
 from hydra.execution import fill_rules
 from hydra.execution.fill_rules import FillPrice
 
@@ -151,52 +150,30 @@ class TestTrailing:
         assert hit.fill == FillPrice(D("84.00"), "taker")
 
 
-def _oco_request(side: Side, tp: str, sl: str) -> OrderRequest:
-    return OrderRequest(
-        symbol=Symbol("BTCUSDT"),
-        side=side,
-        order_type=OrderType.OCO,
-        quantity=D("1"),
-        strategy_id="parity",
-        exchange_id="binance",
-        market_type=MarketType.SPOT,
-        price=D(tp),
-        stop_price=D(sl),
-    )
-
-
-_PARITY_BARS = [
-    ("gap_below_stop_bearish", bar("85", "112", "80", "84"), Side.SELL, "110", "90"),
-    ("gap_above_tp_bullish", bar("120", "130", "80", "125"), Side.SELL, "110", "90"),
-    ("buy_gap_above_stop_bullish", bar("115", "120", "80", "118"), Side.BUY, "90", "110"),
-    ("buy_gap_below_tp_bearish", bar("85", "120", "80", "84"), Side.BUY, "90", "110"),
-    ("bullish_both", bar("100", "120", "80", "110"), Side.SELL, "110", "90"),
-    ("bearish_both", bar("100", "120", "80", "95"), Side.SELL, "110", "90"),
-    ("flat_both", bar("100", "120", "80", "100"), Side.SELL, "110", "90"),
-    ("only_tp", bar("100", "115", "95", "112"), Side.SELL, "110", "90"),
-    ("only_stop", bar("100", "105", "85", "88"), Side.SELL, "110", "90"),
-    ("buy_bullish_both", bar("100", "120", "80", "110"), Side.BUY, "90", "110"),
-    ("buy_bearish_both", bar("100", "120", "80", "95"), Side.BUY, "90", "110"),
+_OCO_BARS = [
+    ("gap_below_stop_bearish", bar("85", "112", "80", "84"), "SELL", "110", "90", True),
+    ("gap_above_tp_bullish", bar("120", "130", "80", "125"), "SELL", "110", "90", False),
+    ("buy_gap_above_stop_bullish", bar("115", "120", "80", "118"), "BUY", "90", "110", True),
+    ("buy_gap_below_tp_bearish", bar("85", "120", "80", "84"), "BUY", "90", "110", False),
+    ("bullish_both", bar("100", "120", "80", "110"), "SELL", "110", "90", True),
+    ("bearish_both", bar("100", "120", "80", "95"), "SELL", "110", "90", False),
+    ("flat_both", bar("100", "120", "80", "100"), "SELL", "110", "90", False),
+    ("only_tp", bar("100", "115", "95", "112"), "SELL", "110", "90", False),
+    ("only_stop", bar("100", "105", "85", "88"), "SELL", "110", "90", True),
+    ("buy_bullish_both", bar("100", "120", "80", "110"), "BUY", "90", "110", False),
+    ("buy_bearish_both", bar("100", "120", "80", "95"), "BUY", "90", "110", True),
 ]
 
 
-class TestOcoParityWithBacktest:
-    @pytest.mark.parametrize(("name", "b", "side", "tp", "sl"), _PARITY_BARS)
-    def test_same_leg_as_fill_simulator(
-        self, name: str, b: OHLCV, side: Side, tp: str, sl: str
+class TestOcoLegChoice:
+    @pytest.mark.parametrize(("name", "b", "side", "tp", "sl", "stop_wins"), _OCO_BARS)
+    def test_leg_follows_the_intrabar_path(
+        self, name: str, b: OHLCV, side: str, tp: str, sl: str, stop_wins: bool
     ) -> None:
-        sim = FillSimulator(SlippageModel(spread_factor=D("0"), volume_impact_factor=D("0")))
-        bt = sim.simulate_fill(_oco_request(side, tp, sl), b, None, CommissionConfig())
-        assert bt is not None
-        bt_stop_won = bt.price != D(tp)
-
-        stop_first = fill_rules.oco_stop_first(side.value, D(sl), D(tp), b)
-        assert stop_first is bt_stop_won, name
-        outcome = fill_rules.oco_fill(side.value, D(sl), D(tp), b, D("0"))
+        assert fill_rules.oco_stop_first(side, D(sl), D(tp), b) is stop_wins, name
+        outcome = fill_rules.oco_fill(side, D(sl), D(tp), b, D("0"))
         assert outcome is not None
-        assert outcome[0] is bt_stop_won
-        if bt_stop_won or not name.startswith(("gap", "buy_gap")):
-            assert outcome[1].price == bt.price
+        assert outcome[0] is stop_wins
 
     def test_oco_both_legs_hit_bullish_bar_stop_wins(self) -> None:
         assert fill_rules.oco_stop_first("SELL", D("90"), D("110"), bar("100", "120", "80", "110"))

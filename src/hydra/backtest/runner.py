@@ -1,205 +1,58 @@
-"""BacktestRunner: orchestrates a full event-driven backtest.
+"""BacktestRunner: replays stored bars through a paper session's own components.
 
-Replays bars chronologically through InMemoryEventBus + BacktestClock,
-feeding BarEvents to a strategy via the engine. Collects signals, simulates
-fills via FillSimulator, and tracks portfolio state.
+Each bar is published on a ``SessionRuntime`` bus exactly as the live feed publishes a closed
+bar, so fills (market orders at the signal bar's close plus slippage, resting stops and OCOs on
+later bars), sizing, pre-trade checks, protective exits, fees and the spot ledger are the paper
+session's code. Breakers run on bar time with the drawdown tiers off (decision 2); daily-loss
+halt and loss-streak pause stay on. Metric writes are muted for the whole run.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import math
+import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import datetime, timedelta
 from decimal import Decimal
 
-from hydra.backtest.fills import CommissionConfig, FillSimulator, SlippageModel
-from hydra.backtest.metrics import BacktestResult, Trade, calculate_metrics
-from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import (
-    BarEvent,
-    EntrySignal,
-    Event,
-    ExitSignal,
-    OrderFillEvent,
-)
-from hydra.core.time import BacktestClock
-from hydra.core.types import (
-    OHLCV,
-    Direction,
-    MarketType,
-    OrderFill,
-    OrderRequest,
-    OrderType,
-    Position,
-    Side,
-    Symbol,
-    Timeframe,
-)
-from hydra.execution.fill_rules import trailing_fill
-from hydra.execution.order_manager import PROTECTIVE_TAG
-from hydra.execution.protective_orders import spec_from_policy
+from hydra.backtest.fills import CommissionConfig
+from hydra.backtest.metrics import BacktestResult, Trade, TransactionRecord, calculate_metrics
+from hydra.core import metrics
+from hydra.core.config import HydraConfig
+from hydra.core.events import BarEvent
+from hydra.core.types import OHLCV, Direction, MarketType, Symbol, Timeframe
+from hydra.data.bars import timeframe_seconds
+from hydra.execution.client_factory import ClientFactory, validate_venue
+from hydra.execution.paper_trading import PaperFill, PaperTradingExecutor
+from hydra.execution.session_manager import TradingSession
+from hydra.execution.session_wiring import SessionRuntime
+from hydra.risk.market_rules import MarketRulesCache
+from hydra.risk.pretrade import RiskConfig
+from hydra.risk.service import RiskService
+from hydra.risk.state import InMemoryRiskStateStore
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Internal position tracking
-# ---------------------------------------------------------------------------
-
-
-class _SimplePositionTracker:
-    """Simplified position tracker that correctly handles cash accounting."""
-
-    def __init__(self, initial_capital: Decimal) -> None:
-        self.cash = initial_capital
-        self.initial_capital = initial_capital
-        self.positions: dict[str, dict] = {}
-
-    @property
-    def equity(self) -> Decimal:
-        total = self.cash
-        for pos in self.positions.values():
-            mark = pos.get("mark_price", pos["avg_entry_price"])
-            qty = pos["quantity"]
-            entry = pos["avg_entry_price"]
-            if pos["direction"] == Direction.LONG:
-                total += qty * mark
-            elif pos["direction"] == Direction.SHORT:
-                # Short P&L = (entry - mark) * qty; notional is already in cash
-                total += (entry - mark) * qty
-        return total
-
-    def mark_price(self, symbol: str, price: Decimal) -> None:
-        if symbol in self.positions:
-            self.positions[symbol]["mark_price"] = price
-
-    def open_position(
-        self,
-        symbol: str,
-        direction: Direction,
-        quantity: Decimal,
-        price: Decimal,
-        fee: Decimal,
-        timestamp: datetime | None = None,
-    ) -> None:
-        """Open or add to a position."""
-        pos = self.positions.get(symbol)
-        if pos is not None:
-            # Adding to existing position
-            old_qty = pos["quantity"]
-            new_qty = old_qty + quantity
-            pos["avg_entry_price"] = (pos["avg_entry_price"] * old_qty + price * quantity) / new_qty
-            pos["quantity"] = new_qty
-            pos["mark_price"] = price
-        else:
-            self.positions[symbol] = {
-                "direction": direction,
-                "quantity": quantity,
-                "avg_entry_price": price,
-                "entry_time": timestamp,
-                "mark_price": price,
-            }
-
-        # Cash accounting
-        self.cash -= fee
-        if direction == Direction.LONG:
-            self.cash -= quantity * price
-
-    def close_position(
-        self,
-        symbol: str,
-        quantity: Decimal,
-        price: Decimal,
-        fee: Decimal,
-        timestamp: datetime | None = None,
-    ) -> Trade | None:
-        """Close (fully or partially) a position. Returns Trade if closed."""
-        pos = self.positions.get(symbol)
-        if pos is None:
-            return None
-
-        close_qty = min(quantity, pos["quantity"])
-        entry_price = pos["avg_entry_price"]
-        direction = pos["direction"]
-
-        if direction == Direction.LONG:
-            pnl = (price - entry_price) * close_qty - fee
-            self.cash += close_qty * price - fee
-        else:
-            pnl = (entry_price - price) * close_qty - fee
-            # Short close: receive PnL (no notional was exchanged on open)
-            self.cash += (entry_price - price) * close_qty - fee
-
-        trade = Trade(
-            entry_time=pos["entry_time"],
-            exit_time=timestamp or datetime.now(UTC),
-            symbol=symbol,
-            direction=str(direction),
-            entry_price=entry_price,
-            exit_price=price,
-            quantity=close_qty,
-            pnl=pnl,
-            fees=fee,
-        )
-
-        remaining = pos["quantity"] - close_qty
-        if remaining <= 0:
-            del self.positions[symbol]
-        else:
-            pos["quantity"] = remaining
-
-        return trade
-
-    def apply_fill(self, fill: OrderFill) -> Trade | None:
-        """Apply an OrderFill — open or close depending on current position."""
-        symbol = str(fill.symbol)
-        pos = self.positions.get(symbol)
-
-        if pos is None:
-            # New position
-            direction = Direction.LONG if fill.side == Side.BUY else Direction.SHORT
-            self.open_position(
-                symbol, direction, fill.quantity, fill.price, fill.fee, fill.timestamp
-            )
-            return None
-
-        # Existing position — is this closing?
-        is_closing = (pos["direction"] == Direction.LONG and fill.side == Side.SELL) or (
-            pos["direction"] == Direction.SHORT and fill.side == Side.BUY
-        )
-
-        if is_closing:
-            return self.close_position(symbol, fill.quantity, fill.price, fill.fee, fill.timestamp)
-
-        # Same direction — add to position
-        self.open_position(
-            symbol, pos["direction"], fill.quantity, fill.price, fill.fee, fill.timestamp
-        )
-        return None
+_MARKET_RULES = MarketRulesCache()
+_ENGINE_CONFIG = HydraConfig.model_construct()
+_NO_DRAWDOWN_TIERS = Decimal(1000)  # tier 1 needs a 200x drawdown: unreachable on spot
+_YIELD_EVERY = 100
 
 
-# ---------------------------------------------------------------------------
-# BacktestRunner
-# ---------------------------------------------------------------------------
+class StrategyError(RuntimeError):
+    """The strategy raised during the run; the backtest has no result."""
 
 
 class BacktestRunner:
-    """Orchestrates a full backtest run.
+    """Runs one strategy over stored bars on the paper session core."""
 
-    Replays bars chronologically, advances the BacktestClock, feeds BarEvents
-    to the strategy, collects signals, simulates fills, and tracks portfolio.
-    """
-
-    def __init__(
-        self,
-        slippage_model: SlippageModel | None = None,
-    ) -> None:
-        self._slippage_model = slippage_model
+    def __init__(self, market_rules: MarketRulesCache | None = None) -> None:
+        self._market_rules = market_rules or _MARKET_RULES
 
     async def run(
         self,
@@ -211,479 +64,193 @@ class BacktestRunner:
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
         on_progress: Callable[[float], None] | None = None,
+        *,
+        warmup_bars: int = 0,
+        slippage_pct: Decimal = Decimal("0.001"),
+        risk_config: RiskConfig | None = None,
     ) -> BacktestResult:
-        """Run a complete backtest.
+        """Replay ``bars[warmup_bars:]``; the first ``warmup_bars`` only seed the context.
 
-        Parameters
-        ----------
-        strategy_class:
-            The concrete BaseStrategy subclass to instantiate.
-        strategy_config:
-            Configuration for the strategy.
-        bars:
-            Chronologically sorted OHLCV bars to replay.
-        initial_capital:
-            Starting cash.
-        commission:
-            Fee configuration. Defaults to standard rates.
-        symbol:
-            Trading symbol.
-        timeframe:
-            Bar timeframe.
-        on_progress:
-            Optional callback invoked with progress 0.0-1.0.
+        Equity has one point per traded bar (the last after the end-of-data close-out) and
+        ``Trade.pnl`` is net of both fees. Raises StrategyError when the strategy raises,
+        UnsupportedVenueError for anything but Binance SPOT.
         """
-        if not bars:
+        cfg = strategy_config.model_copy(
+            update={
+                "symbols": [symbol],
+                "enabled": True,
+                "timeframes": strategy_config.timeframes.model_copy(update={"primary": timeframe}),
+            }
+        )
+        exchange_id = validate_venue(cfg.exchange.exchange_id, cfg.exchange.market_type)
+        traded = bars[warmup_bars:]
+        if not traded:
             return calculate_metrics(equity_curve=[initial_capital], trades=[], timeframe=timeframe)
-
         comm = commission or CommissionConfig()
-        fill_sim = FillSimulator(self._slippage_model)
+        step = timedelta(seconds=timeframe_seconds(timeframe))
+        now = [traded[0].timestamp]
 
-        # Infrastructure
-        event_bus = InMemoryEventBus()
-        clock = BacktestClock(start=bars[0].timestamp)
-        # shortcut: bounded like a live session's 1000-bar window until P2-A's replay replaces this
-        history = strategy_class(config=strategy_config, context=StrategyContext()).required_history
-        context = StrategyContext(max_bars=max(1000, history))
-        context.set_portfolio_value(initial_capital)
-
-        # Instantiate strategy
-        strategy = strategy_class(config=strategy_config, context=context)
-
-        # Portfolio tracking
-        tracker = _SimplePositionTracker(initial_capital)
-        trades: list[Trade] = []
-        equity_curve: list[Decimal] = [initial_capital]
-        timestamps: list[datetime] = [bars[0].timestamp]
-
-        # Signal collector
-        collected_signals: list[EntrySignal | ExitSignal] = []
-
-        async def _signal_collector(event: Event) -> None:
-            if isinstance(event, (EntrySignal, ExitSignal)):
-                collected_signals.append(event)
-
-        await event_bus.subscribe("entry_signal", _signal_collector)
-        await event_bus.subscribe("exit_signal", _signal_collector)
-
-        # Strategy startup
-        await strategy.on_start()
-
-        # Compute average volume for slippage
-        avg_volume = Decimal("0")
-        if bars:
-            total_vol = sum((b.volume for b in bars), Decimal("0"))
-            avg_volume = total_vol / Decimal(str(len(bars))) if len(bars) > 0 else Decimal("0")
-
-        # Pending orders (placed by signals, filled on next bar); protective exits first
-        pending_orders: list[OrderRequest] = []
-        trailing_peaks: dict[str, Decimal] = {}
-        stopped_reason: str | None = None
-
-        # Transaction tracking (individual fills linked by trade_id)
-        transactions: list[dict] = []
-        _trade_counter = 0
-        _position_trade_ids: dict[str, int] = {}
-
-        def _next_trade_id() -> int:
-            nonlocal _trade_counter
-            _trade_counter += 1
-            return _trade_counter
-
-        def _fill_side_str(side: Side) -> str:
-            return "Buy" if side == Side.BUY else "Sell"
-
-        def _record_entry_txn(fill: OrderFill, sym_key: str, *, is_new: bool) -> None:
-            if is_new:
-                tid = _next_trade_id()
-                _position_trade_ids[sym_key] = tid
-            else:
-                tid = _position_trade_ids.get(sym_key, _next_trade_id())
-            transactions.append(
-                {
-                    "trade_id": tid,
-                    "type": "entry",
-                    "time": fill.timestamp.isoformat() if fill.timestamp else "",
-                    "side": _fill_side_str(fill.side),
-                    "price": float(fill.price),
-                    "quantity": float(fill.quantity),
-                    "fee": float(fill.fee),
-                    "pnl": None,
-                }
-            )
-
-        def _record_exit_txn(
-            fill_or_bar: OrderFill | OHLCV,
-            sym_key: str,
-            *,
-            side: Side,
-            quantity: Decimal,
-            fee: Decimal,
-            pnl: Decimal,
-            timestamp: datetime | None = None,
-        ) -> None:
-            tid = _position_trade_ids.pop(sym_key, 0)
-            ts = timestamp or (fill_or_bar.timestamp if hasattr(fill_or_bar, "timestamp") else None)
-            transactions.append(
-                {
-                    "trade_id": tid,
-                    "type": "exit",
-                    "time": ts.isoformat() if ts else "",
-                    "side": _fill_side_str(side),
-                    "price": float(
-                        fill_or_bar.price if hasattr(fill_or_bar, "price") else fill_or_bar.close
+        with metrics.muted():
+            session_id = f"backtest-{uuid.uuid4()}"
+            risk = RiskService(
+                InMemoryRiskStateStore(
+                    paper_capital=initial_capital,
+                    config=replace(
+                        risk_config or RiskConfig(), max_drawdown_pct=_NO_DRAWDOWN_TIERS
                     ),
-                    "quantity": float(quantity),
-                    "fee": float(fee),
-                    "pnl": float(pnl),
-                }
+                ),
+                scope="backtest",
+                market_rules=self._market_rules,
+                clock=lambda: now[0],
             )
-
-        # Main replay loop
-        total_bars = len(bars)
-        sym = Symbol(symbol)
-        for i, bar in enumerate(bars):
-            # Yield to event loop periodically so API stays responsive
-            if i % 100 == 0:
-                await asyncio.sleep(0)
-                if on_progress is not None:
-                    on_progress(i / total_bars)
-
-            # Advance clock
-            clock.advance_to(bar.timestamp)
-
-            # Mark existing positions to current bar close
-            for s in list(tracker.positions.keys()):
-                tracker.mark_price(s, bar.close)
-
-            # Try to fill pending orders against current bar
-            filled_orders: list[OrderRequest] = []
-            next_bar = bars[i + 1] if i + 1 < len(bars) else None
-
-            pending_orders.sort(key=lambda o: o.tag != PROTECTIVE_TAG)
-            for order in list(pending_orders):
-                if order in filled_orders:
-                    continue
-                if order.reduce_only and str(order.symbol) not in tracker.positions:
-                    filled_orders.append(order)
-                    continue
-                fill = self._simulate(
-                    fill_sim, order, bar, next_bar, comm, avg_volume, trailing_peaks
-                )
-                if fill is not None:
-                    sym_key = str(fill.symbol)
-                    had_position = sym_key in tracker.positions
-
-                    trade = tracker.apply_fill(fill)
-                    if had_position and sym_key not in tracker.positions:
-                        filled_orders.extend(
-                            o
-                            for o in pending_orders
-                            if o is not order and o.reduce_only and str(o.symbol) == sym_key
-                        )
-                    elif not had_position and sym_key in tracker.positions:
-                        protective = self._protective_order(
-                            strategy_config, fill, context, symbol, timeframe
-                        )
-                        if protective.order_type == OrderType.TRAILING_STOP:
-                            trailing_peaks[protective.request_id] = fill.price
-                        pending_orders.append(protective)
-
-                    if trade is not None:
-                        trades.append(trade)
-                        _record_exit_txn(
-                            fill,
-                            sym_key,
-                            side=fill.side,
-                            quantity=fill.quantity,
-                            fee=fill.fee,
-                            pnl=trade.pnl,
-                        )
-                    else:
-                        _record_entry_txn(fill, sym_key, is_new=not had_position)
-
-                    # Sync position state to strategy context
-                    pos_data = tracker.positions.get(sym_key)
-                    if pos_data is not None:
-                        context.set_position(
-                            symbol,
-                            Position(
-                                symbol=sym,
-                                direction=pos_data["direction"],
-                                quantity=pos_data["quantity"],
-                                avg_entry_price=pos_data["avg_entry_price"],
-                                unrealized_pnl=Decimal("0"),
-                                realized_pnl=Decimal("0"),
-                                strategy_id=strategy_config.id,
-                                exchange_id=strategy_config.exchange.exchange_id,
-                            ),
-                        )
-                    else:
-                        context.set_position(symbol, None)
-
-                    # Notify strategy of fill
-                    fill_event = OrderFillEvent(
-                        order_id=fill.order_id,
-                        symbol=fill.symbol,
-                        side=fill.side,
-                        quantity=fill.quantity,
-                        price=fill.price,
-                        fee=fill.fee,
-                        fee_currency=fill.fee_currency,
-                        exchange_id=fill.exchange_id,
-                    )
-                    await strategy.on_fill(fill_event)
-                    filled_orders.append(order)
-
-            # Remove filled (or cancelled) orders from pending
-            for fo in filled_orders:
-                if fo in pending_orders:
-                    pending_orders.remove(fo)
-
-            # Feed bar to strategy context (no lookahead: only current bar)
-            context.add_bar(symbol, timeframe, bar)
-            context.set_portfolio_value(tracker.equity)
-
-            # Create and dispatch BarEvent
-            bar_event = BarEvent(
-                symbol=sym,
-                timeframe=timeframe,
-                ohlcv=bar,
-                exchange_id=strategy_config.exchange.exchange_id,
+            await risk.load()
+            await risk.recovery_complete()
+            executor = PaperTradingExecutor(
+                exchange_id=exchange_id,
+                initial_balances={"USDT": initial_capital},
+                slippage_pct=slippage_pct,
+                strategy_id=cfg.id,
+                session_id=session_id,
+                maker_fee=comm.fee_rate(MarketType.SPOT, is_maker=True),
+                taker_fee=comm.fee_rate(MarketType.SPOT, is_maker=False),
+                market_rules=await self._market_rules.get(exchange_id, [symbol]),
             )
+            failures: list[str] = []
 
-            # Collect signals from strategy
-            collected_signals.clear()
-            try:
-                signals = await strategy.on_bar(bar_event)
-            except Exception:
-                logger.exception("Error in strategy on_bar at bar %d", i)
-                signals = []
+            async def on_failure(_session: TradingSession, reason: str) -> None:
+                failures.append(reason)
 
-            # Also publish so subscribers can see
-            for sig in signals:
-                await event_bus.publish(sig)
+            runtime = SessionRuntime(
+                TradingSession(
+                    session_id=session_id,
+                    strategy_id=cfg.id,
+                    trading_mode="paper",
+                    exchange_id=exchange_id,
+                    symbols=[symbol],
+                    timeframe=str(timeframe),
+                    paper_capital=initial_capital,
+                ),
+                cfg,
+                executor=executor,
+                risk=risk,
+                clients=ClientFactory(),
+                hydra_config=_ENGINE_CONFIG,
+                db_pool=None,
+                required_history=int(
+                    strategy_class(config=cfg, context=StrategyContext()).required_history
+                ),
+                on_failure=on_failure,
+                clock=lambda: now[0].timestamp(),
+            )
+            await runtime.build(strategy_class)
+            warm = bars[:warmup_bars][-(runtime.context.max_bars or warmup_bars) :]
+            await runtime.engine.warm_up({(symbol, timeframe): warm} if warm else {})
+            await risk.register_session(
+                session_id,
+                executor,
+                allocated=initial_capital,
+                symbols=[symbol],
+                exchange_id=exchange_id,
+                strategy_id=cfg.id,
+            )
+            await runtime.seed_context()
+            await runtime.wire()
+            if warm:
+                now[0] = warm[-1].timestamp + step
+                await runtime.prime({(symbol, timeframe): warm})
 
-            # Convert signals to orders (paper rules: no pyramiding, no spot shorts)
-            for sig in signals:
-                maybe_order = self._signal_to_order(
-                    sig, sym, strategy_config, bar, tracker, pending_orders
-                )
-                if maybe_order is not None:
-                    pending_orders.append(maybe_order)
-
-            # Record equity
-            equity_curve.append(tracker.equity)
-            timestamps.append(bar.timestamp)
-
-            # Check for margin call — equity depleted
-            if tracker.equity <= Decimal("0"):
-                for sym_key in list(tracker.positions.keys()):
-                    pos = tracker.positions[sym_key]
-                    close_side = Side.SELL if pos["direction"] == Direction.LONG else Side.BUY
-                    trade = tracker.close_position(
-                        sym_key,
-                        pos["quantity"],
-                        bar.close,
-                        Decimal("0"),
-                        bar.timestamp,
+            equity: list[Decimal] = []
+            timestamps: list[datetime] = []
+            stopped_reason: str | None = None
+            for i, bar in enumerate(traded):
+                if i % _YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
+                    if on_progress is not None:
+                        on_progress(i / len(traded))
+                now[0] = bar.timestamp + step
+                await runtime.bus.publish(
+                    BarEvent(
+                        symbol=Symbol(symbol),
+                        timeframe=timeframe,
+                        ohlcv=bar,
+                        exchange_id=exchange_id,
                     )
-                    if trade:
-                        trades.append(trade)
-                        _record_exit_txn(
-                            bar,
-                            sym_key,
-                            side=close_side,
-                            quantity=trade.quantity,
-                            fee=Decimal("0"),
-                            pnl=trade.pnl,
-                            timestamp=bar.timestamp,
-                        )
-                    context.set_position(symbol, None)
-                equity_curve.append(tracker.equity)
+                )
+                if runtime.engine.errors:
+                    await runtime.shutdown()
+                    raise StrategyError(runtime.engine.last_error)
+                equity.append(await executor.get_equity())
                 timestamps.append(bar.timestamp)
-                stopped_reason = "margin_call"
-                break
+                if runtime.closing:
+                    await asyncio.sleep(0)
+                    stopped_reason = failures[0] if failures else "session_failed"
+                    break
 
-        # Strategy shutdown
-        await strategy.on_stop()
+            await runtime.flatten()
+            await runtime.shutdown()
+            equity[-1] = await executor.get_equity()
 
-        # Force-close any remaining open positions at final bar price
-        if bars and tracker.positions:
-            last_bar = bars[-1]
-            for sym_key in list(tracker.positions.keys()):
-                pos = tracker.positions[sym_key]
-                close_side = Side.SELL if pos["direction"] == Direction.LONG else Side.BUY
-                trade = tracker.close_position(
-                    sym_key,
-                    pos["quantity"],
-                    last_bar.close,
-                    Decimal("0"),
-                    last_bar.timestamp,
-                )
-                if trade:
-                    trades.append(trade)
-                    _record_exit_txn(
-                        last_bar,
-                        sym_key,
-                        side=close_side,
-                        quantity=trade.quantity,
-                        fee=Decimal("0"),
-                        pnl=trade.pnl,
-                        timestamp=last_bar.timestamp,
-                    )
-                context.set_position(symbol, None)
-
-        close_at = {bar.timestamp: bar.close for bar in bars}
+        trades, transactions = _trades(executor.get_fills())
         result = calculate_metrics(
-            equity_curve=equity_curve,
+            equity_curve=equity,
             trades=trades,
             timeframe=timeframe,
             timestamps=timestamps,
-            benchmark_prices=[close_at[t] for t in timestamps],
+            benchmark_prices=[b.close for b in traded[: len(equity)]],
             initial_capital=initial_capital,
         )
         result.stopped_reason = stopped_reason
         result.transactions = transactions
         return result
 
-    def _simulate(
-        self,
-        fill_sim: FillSimulator,
-        order: OrderRequest,
-        bar: OHLCV,
-        next_bar: OHLCV | None,
-        comm: CommissionConfig,
-        avg_volume: Decimal,
-        trailing_peaks: dict[str, Decimal],
-    ) -> OrderFill | None:
-        if order.order_type != OrderType.TRAILING_STOP:
-            return fill_sim.simulate_fill(
-                order=order,
-                current_bar=bar,
-                next_bar=next_bar,
-                commission=comm,
-                avg_volume=avg_volume,
-            )
-        if order.price is None:
-            return None
-        peak = trailing_peaks.get(order.request_id, bar.open)
-        out = trailing_fill(order.side.value, peak, order.price, bar, Decimal("0"))
-        trailing_peaks[order.request_id] = out.extreme
-        if out.fill is None:
-            return None
-        trailing_peaks.pop(order.request_id, None)
-        fee_rate = comm.fee_rate(order.market_type, is_maker=False)
-        return OrderFill(
-            order_id=order.request_id,
-            symbol=order.symbol,
-            side=order.side,
-            quantity=order.quantity,
-            price=out.fill.price,
-            fee=FillSimulator.calculate_fee(order.quantity, out.fill.price, fee_rate),
-            fee_currency="USDT",
-            timestamp=bar.timestamp,
-            exchange_id=order.exchange_id,
-        )
 
-    @staticmethod
-    def _protective_order(
-        config: StrategyConfig,
-        fill: OrderFill,
-        context: StrategyContext,
-        symbol: str,
-        timeframe: Timeframe,
-    ) -> OrderRequest:
-        """The paper session's mandatory exit for a new long (decision 17/18)."""
-        atr_values = context.indicator("atr", symbol, timeframe, period=config.risk.atr_period)
-        atr = None
-        if len(atr_values) and not math.isnan(float(atr_values[-1])):
-            atr = Decimal(str(float(atr_values[-1])))
-        spec = spec_from_policy(config.risk, fill.price, atr)
-        if spec.trailing_pct is not None:
-            order_type, price, stop = OrderType.TRAILING_STOP, spec.trailing_pct, None
-        elif spec.take_profit is not None:
-            order_type, price, stop = OrderType.OCO, spec.take_profit, spec.stop_loss
+def _trades(fills: list[PaperFill]) -> tuple[list[Trade], list[TransactionRecord]]:
+    """Round trips and per-fill transactions; a trade is one SELL against the open lot."""
+    trades: list[Trade] = []
+    transactions: list[TransactionRecord] = []
+    held = Decimal("0")
+    entry_time: datetime | None = None
+    trade_id = 0
+    for f in fills:
+        if f.status != "FILLED":
+            continue
+        if f.side == "BUY":
+            if held == 0:
+                trade_id += 1
+                entry_time = f.timestamp
+            held += f.quantity
         else:
-            order_type, price, stop = OrderType.STOP_MARKET, None, spec.stop_loss
-        return OrderRequest(
-            symbol=fill.symbol,
-            side=Side.SELL,
-            order_type=order_type,
-            quantity=fill.quantity,
-            strategy_id=config.id,
-            exchange_id=fill.exchange_id,
-            market_type=config.exchange.market_type,
-            price=price,
-            stop_price=stop,
-            reduce_only=True,
-            tag=PROTECTIVE_TAG,
+            held -= f.quantity
+            gross = f.gross_pnl or Decimal("0")
+            net = f.net_pnl if f.net_pnl is not None else gross - f.fee
+            trades.append(
+                Trade(
+                    entry_time=entry_time or f.timestamp,
+                    exit_time=f.timestamp,
+                    symbol=f.symbol,
+                    direction=str(Direction.LONG),
+                    entry_price=f.price - gross / f.quantity,
+                    exit_price=f.price,
+                    quantity=f.quantity,
+                    pnl=net,
+                    fees=gross - net,
+                )
+            )
+        transactions.append(
+            {
+                "trade_id": trade_id,
+                "type": "entry" if f.side == "BUY" else "exit",
+                "time": f.timestamp.isoformat(),
+                "side": "Buy" if f.side == "BUY" else "Sell",
+                "price": float(f.price),
+                "quantity": float(f.quantity),
+                "fee": float(f.fee),
+                "pnl": None if f.side == "BUY" else float(trades[-1].pnl),
+            }
         )
-
-    @staticmethod
-    def _signal_to_order(
-        signal: EntrySignal | ExitSignal,
-        symbol: Symbol,
-        config: StrategyConfig,
-        current_bar: OHLCV,
-        tracker: _SimplePositionTracker,
-        pending: list[OrderRequest] | None = None,
-    ) -> OrderRequest | None:
-        """Convert a signal into an OrderRequest with equity-based position sizing.
-
-        Paper rules: no entry while the symbol is held or an entry is pending, no short entry
-        on spot, exits are reduce-only.
-        """
-        if isinstance(signal, EntrySignal):
-            if str(symbol) in tracker.positions or any(
-                not o.reduce_only and str(o.symbol) == str(symbol) for o in pending or []
-            ):
-                return None
-            if (
-                signal.direction == Direction.SHORT
-                and config.exchange.market_type == MarketType.SPOT
-            ):
-                return None
-            # Risk 10% of equity per trade
-            available = max(tracker.equity, Decimal("0"))
-            risk_fraction = Decimal("0.1")
-            notional = available * risk_fraction
-            price = current_bar.close
-            if price <= 0:
-                return None
-            quantity = (notional / price).quantize(Decimal("0.00000001"))
-            if quantity <= 0:
-                return None
-
-            side = Side.BUY if signal.direction == Direction.LONG else Side.SELL
-            return OrderRequest(
-                symbol=symbol,
-                side=side,
-                order_type=OrderType.MARKET,
-                quantity=quantity,
-                strategy_id=signal.strategy_id,
-                exchange_id=signal.exchange_id,
-                market_type=signal.market_type,
-            )
-        if isinstance(signal, ExitSignal):
-            pos = tracker.positions.get(str(symbol))
-            if pos is None:
-                return None  # No position to close
-            quantity = pos["quantity"]
-            # Determine side from position direction, not signal direction
-            side = Side.SELL if pos["direction"] == Direction.LONG else Side.BUY
-            return OrderRequest(
-                symbol=symbol,
-                side=side,
-                order_type=OrderType.MARKET,
-                quantity=quantity,
-                strategy_id=signal.strategy_id,
-                exchange_id=signal.exchange_id,
-                market_type=config.exchange.market_type,
-                reduce_only=True,
-                tag="exit",
-            )
-        return None
+        if held == 0:
+            entry_time = None
+    return trades, transactions
 
 
 if __name__ == "__main__":

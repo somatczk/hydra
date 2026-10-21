@@ -96,11 +96,11 @@ def test_10k_bar_backtest_under_30s() -> None:
         )
 
     start = time.perf_counter()
-    result = asyncio.get_event_loop().run_until_complete(_run())
+    result = asyncio.run(_run())
     elapsed = time.perf_counter() - start
 
     assert result.total_trades >= 0
-    assert len(result.equity_curve) == len(bars) + 1
+    assert len(result.equity_curve) == len(bars)
     assert elapsed < 30, f"10k bar backtest took {elapsed:.1f}s (limit: 30s)"
 
 
@@ -124,9 +124,9 @@ def test_50k_bar_backtest_under_120s() -> None:
         )
 
     start = time.perf_counter()
-    result = asyncio.get_event_loop().run_until_complete(_run())
+    result = asyncio.run(_run())
     elapsed = time.perf_counter() - start
 
     assert result.total_trades >= 0
-    assert len(result.equity_curve) == len(bars) + 1
+    assert len(result.equity_curve) == len(bars)
     assert elapsed < 120, f"50k bar backtest took {elapsed:.1f}s (limit: 120s)"

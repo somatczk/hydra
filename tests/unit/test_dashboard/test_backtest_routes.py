@@ -578,8 +578,8 @@ class TestWalkForwardMonths:
         # 57 bars over 392 days: 4 months = 17 weekly bars, 2 months = 8, stepping 8.
         assert len(result.folds) == 5
         for fold in result.folds:
-            assert len(fold.in_sample_metrics.equity_curve) == 17 + 1
-            assert len(fold.out_of_sample_metrics.equity_curve) == 8 + 1
+            assert len(fold.in_sample_metrics.equity_curve) == 17
+            assert len(fold.out_of_sample_metrics.equity_curve) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -748,7 +748,7 @@ def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
         "calmar_ratio": None,
         "profit_factor": 0.5,
         "max_drawdown_duration_s": 7200,
-        "stopped_reason": "margin_call",
+        "stopped_reason": "paper ledger halted",
         "strategy_id": "saw",
         "initial_capital": 1000.0,
         "data_source": "db",
@@ -772,7 +772,7 @@ def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
 class TestPersistedDetail:
     def test_stopped_reason_benchmark_and_extended_metrics_round_trip(self) -> None:
         detail = BacktestResultDetail(**detail_from_row(_db_row(), []))
-        assert detail.stopped_reason == "margin_call"
+        assert detail.stopped_reason == "paper ledger halted"
         assert detail.benchmark_equity == [
             {"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}
         ]
