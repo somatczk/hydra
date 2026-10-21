@@ -207,12 +207,15 @@ async def fetch_fresh_bars(task: dict[str, Any], pf: Preflight, body: BacktestRu
         task["fetch_error"] = str(exc)
 
 
-def _timestamped(values: list[Decimal], bars: list[OHLCV]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for idx, value in enumerate(values):
-        bar = bars[idx] if idx < len(bars) else bars[-1]
-        out.append({"timestamp": bar.timestamp.isoformat(), "value": float(value)})
-    return out
+def _timestamped(values: list[Decimal], timestamps: list[datetime]) -> list[dict[str, Any]]:
+    return [
+        {"timestamp": ts.isoformat(), "value": float(v)}
+        for v, ts in zip(values, timestamps, strict=False)
+    ]
+
+
+def _round_or_none(value: float | Decimal | None) -> float | None:
+    return None if value is None else round(float(value), 2)
 
 
 def result_record(
@@ -220,7 +223,6 @@ def result_record(
     body: BacktestRunRequest,
     pf: Preflight,
     result: BacktestResult,
-    bars: list[OHLCV],
     provenance: DataProvenance,
 ) -> dict[str, Any]:
     """The stored result: what is persisted and what the result detail returns."""
@@ -248,9 +250,15 @@ def result_record(
             "max_consecutive_wins": result.max_consecutive_wins,
             "max_consecutive_losses": result.max_consecutive_losses,
             "expectancy": round(float(result.expectancy), 2),
+            "total_return": round(float(result.total_return) * 100, 2),
+            "annualized_return": round(float(result.annualized_return) * 100, 2),
+            "sortino_ratio": _round_or_none(result.sortino_ratio),
+            "calmar_ratio": _round_or_none(result.calmar_ratio),
+            "profit_factor": _round_or_none(result.profit_factor),
+            "max_drawdown_duration_s": int(result.max_drawdown_duration.total_seconds()),
         },
-        "equity_curve": _timestamped(result.equity_curve, bars),
-        "benchmark_equity": _timestamped(result.benchmark_equity, bars),
+        "equity_curve": _timestamped(result.equity_curve, result.timestamps),
+        "benchmark_equity": _timestamped(result.benchmark_equity, result.timestamps),
         "trades": [
             {
                 "entry_time": t.entry_time.isoformat(),
@@ -277,12 +285,19 @@ _EXTENDED_METRICS = (
     "max_consecutive_wins",
     "max_consecutive_losses",
     "expectancy",
+    "total_return",
+    "annualized_return",
+    "sortino_ratio",
+    "calmar_ratio",
+    "profit_factor",
+    "max_drawdown_duration_s",
 )
 LIST_SUMMARIES_SQL = (
     "SELECT "
     "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
     "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
-    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
+    "max_consecutive_losses, expectancy, total_return, annualized_return, sortino_ratio, "
+    "calmar_ratio, profit_factor, max_drawdown_duration_s, name, strategy_id, initial_capital, "
     "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
     "last_ts, gap_count, requested_start, requested_end "
     "FROM backtest_results ORDER BY created_at DESC"
@@ -291,7 +306,8 @@ LIST_DETAILS_SQL = (
     "SELECT "
     "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
     "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
-    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
+    "max_consecutive_losses, expectancy, total_return, annualized_return, sortino_ratio, "
+    "calmar_ratio, profit_factor, max_drawdown_duration_s, name, strategy_id, initial_capital, "
     "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
     "last_ts, gap_count, requested_start, requested_end, "
     "stopped_reason, equity_curve, benchmark_equity, transactions "
@@ -301,7 +317,8 @@ ONE_RESULT_SQL = (
     "SELECT "
     "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
     "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
-    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
+    "max_consecutive_losses, expectancy, total_return, annualized_return, sortino_ratio, "
+    "calmar_ratio, profit_factor, max_drawdown_duration_s, name, strategy_id, initial_capital, "
     "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
     "last_ts, gap_count, requested_start, requested_end, "
     "stopped_reason, equity_curve, benchmark_equity, transactions "
@@ -311,7 +328,8 @@ RENAME_SQL = (
     "UPDATE backtest_results SET name = $1 WHERE id = $2 RETURNING "
     "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
     "sharpe_ratio, benchmark_return, alpha, beta, max_consecutive_wins, "
-    "max_consecutive_losses, expectancy, name, strategy_id, initial_capital, "
+    "max_consecutive_losses, expectancy, total_return, annualized_return, sortino_ratio, "
+    "calmar_ratio, profit_factor, max_drawdown_duration_s, name, strategy_id, initial_capital, "
     "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
     "last_ts, gap_count, requested_start, requested_end"
 )
@@ -334,10 +352,13 @@ async def persist_result(
                     data_exchange, data_symbol, data_timeframe, bar_count,
                     first_ts, last_ts, gap_count, requested_start, requested_end,
                     stopped_reason, benchmark_equity, benchmark_return, alpha, beta,
-                    max_consecutive_wins, max_consecutive_losses, expectancy)
+                    max_consecutive_wins, max_consecutive_losses, expectancy,
+                    total_return, annualized_return, sortino_ratio, calmar_ratio,
+                    profit_factor, max_drawdown_duration_s)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11,
                        $12::jsonb, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                       $22, $23, $24, $25, $26::jsonb, $27, $28, $29, $30, $31, $32)
+                       $22, $23, $24, $25, $26::jsonb, $27, $28, $29, $30, $31, $32,
+                       $33, $34, $35, $36, $37, $38)
                ON CONFLICT (id) DO UPDATE SET
                    status = EXCLUDED.status,
                    total_trades = EXCLUDED.total_trades,
@@ -367,7 +388,13 @@ async def persist_result(
                    beta = EXCLUDED.beta,
                    max_consecutive_wins = EXCLUDED.max_consecutive_wins,
                    max_consecutive_losses = EXCLUDED.max_consecutive_losses,
-                   expectancy = EXCLUDED.expectancy""",
+                   expectancy = EXCLUDED.expectancy,
+                   total_return = EXCLUDED.total_return,
+                   annualized_return = EXCLUDED.annualized_return,
+                   sortino_ratio = EXCLUDED.sortino_ratio,
+                   calmar_ratio = EXCLUDED.calmar_ratio,
+                   profit_factor = EXCLUDED.profit_factor,
+                   max_drawdown_duration_s = EXCLUDED.max_drawdown_duration_s""",
             result["id"],
             result["strategy"],
             result["period"],

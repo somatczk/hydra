@@ -181,6 +181,7 @@ class WalkForwardAnalyzer:
             agg_metrics = calculate_metrics(
                 equity_curve=all_oos_equity,
                 trades=all_oos_trades,
+                timeframe=timeframe,
             )
         else:
             agg_metrics = None

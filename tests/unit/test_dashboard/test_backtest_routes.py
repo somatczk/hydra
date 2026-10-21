@@ -7,6 +7,7 @@ tests/integration/test_backtest_real_data.py.
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -19,7 +20,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from hydra.backtest.jobs import BacktestRunRequest, detail_from_row
+from hydra.backtest.jobs import BacktestRunRequest, detail_from_row, summary_from_row
 from hydra.backtest.walkforward import WalkForwardAnalyzer
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Timeframe
@@ -658,6 +659,66 @@ async def test_persistence_failure_fails_the_task(strategies_dir: Path) -> None:
     assert _RESULTS == {}
 
 
+class _BarsThenRecordedWrites(_BarsThenFailingWrites):
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        super().__init__(rows)
+        self.inserts: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.inserts.append((query, args))
+        return "OK"
+
+    async def executemany(self, query: str, args: Any) -> None:
+        return None
+
+
+async def test_curves_carry_their_own_timestamps_and_metrics_persist_as_cached(
+    strategies_dir: Path,
+) -> None:
+    _write_strategy(strategies_dir, "saw")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    closes = [Decimal(1000 + (i % 20) * 5) for i in range(60)]
+    rows = [
+        {
+            "open": c,
+            "high": c,
+            "low": c,
+            "close": c,
+            "volume": 10,
+            "timestamp": start + timedelta(hours=i),
+        }
+        for i, c in enumerate(closes)
+    ]
+    conn = _BarsThenRecordedWrites(rows)
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    pf = await _preflight(
+        _Pool(conn), "saw", None, body.start_date, body.end_date, require_data=False
+    )
+    _TASKS["task-t"] = {"task_id": "task-t", "status": "queued", "progress": 0.0}
+
+    await _run_backtest_task("task-t", body, pf)
+
+    assert _TASKS["task-t"]["status"] == "completed", _TASKS["task-t"]
+    cached = _RESULTS["bt-task-t"]
+    equity, bench = cached["equity_curve"], cached["benchmark_equity"]
+    labels = [p["timestamp"] for p in equity]
+    assert labels[-len(rows) :] == [r["timestamp"].isoformat() for r in rows]
+    assert [p["timestamp"] for p in bench] == labels
+    close_at = {r["timestamp"].isoformat(): r["close"] for r in rows}
+    for point in bench:
+        assert point["value"] == float(10000 * close_at[point["timestamp"]] / closes[0])
+
+    query, args = conn.inserts[0]
+    columns = re.search(r"INSERT INTO backtest_results\s*\(([^)]*)\)", query)
+    assert columns is not None
+    row = dict(zip([c.strip() for c in columns.group(1).split(",")], args, strict=True))
+    assert summary_from_row(row)["metrics"] == cached["metrics"]
+    assert cached["metrics"]["total_return"] == round(
+        (equity[-1]["value"] / equity[0]["value"] - 1) * 100, 2
+    )
+    assert isinstance(cached["metrics"]["max_drawdown_duration_s"], int)
+
+
 # ---------------------------------------------------------------------------
 # Persisted detail: every field round-trips, nothing missing is shown as zero
 # ---------------------------------------------------------------------------
@@ -681,6 +742,12 @@ def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
         "max_consecutive_wins": 1,
         "max_consecutive_losses": 2,
         "expectancy": -316.67,
+        "total_return": -95.0,
+        "annualized_return": -100.0,
+        "sortino_ratio": -3.1,
+        "calmar_ratio": None,
+        "profit_factor": 0.5,
+        "max_drawdown_duration_s": 7200,
         "stopped_reason": "margin_call",
         "strategy_id": "saw",
         "initial_capital": 1000.0,
@@ -713,6 +780,9 @@ class TestPersistedDetail:
         assert (m.benchmark_return, m.alpha, m.beta) == (4.2, -0.31, 1.7)
         assert (m.max_consecutive_wins, m.max_consecutive_losses) == (1, 2)
         assert m.expectancy == -316.67
+        assert (m.total_return, m.annualized_return) == (-95.0, -100.0)
+        assert (m.sortino_ratio, m.calmar_ratio, m.profit_factor) == (-3.1, None, 0.5)
+        assert m.max_drawdown_duration_s == 7200
 
     def test_unrecorded_extended_metrics_are_null_not_zero(self) -> None:
         row = _db_row(
