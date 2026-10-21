@@ -18,12 +18,10 @@ import pytest
 import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile
 
-from hydra.dashboard.routes.strategies import (
-    _row_to_strategy,
-    _status_from_enabled,
-    router,
-)
+from hydra.dashboard.routes.strategies import router
+from hydra.services.strategies import _row_to_strategy, _status_from_enabled
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -165,7 +163,7 @@ class TestStrategiesFallback:
         yaml_file = tmp_path / "test_strat.yaml"
         yaml_file.write_text(yaml_content)
 
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=None))
             resp = client.put(
                 "/api/strategies/test_strat_001",
@@ -215,7 +213,7 @@ class TestStrategiesFallback:
         assert written["timeframes"]["primary"] == "4h"
 
     def test_update_unknown_strategy_returns_404(self, tmp_path: Path) -> None:
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=None))
             resp = client.put(
                 "/api/strategies/nonexistent",
@@ -316,7 +314,7 @@ class TestStrategiesFallback:
         )
         (tmp_path / "rule_strat.yaml").write_text(yaml_content)
 
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=None))
             resp = client.get("/api/strategies/rule_strat_1")
         assert resp.status_code == 200
@@ -377,7 +375,7 @@ class TestStrategiesFallback:
         )
         (tmp_path / "ml_strat.yaml").write_text(yaml_content)
 
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=None))
             resp = client.get("/api/strategies/ml_strat_1")
         assert resp.status_code == 200
@@ -386,7 +384,7 @@ class TestStrategiesFallback:
         assert data["ml_overlay"] == {"model_name": "lstm_btc", "confidence_threshold": 0.7}
 
     def test_save_strategy_with_ml_overlay(self, tmp_path: Path) -> None:
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=None))
             resp = client.post(
                 "/api/strategies/save",
@@ -442,7 +440,7 @@ class TestStrategiesFallback:
         )
         (tmp_path / "lstm.yaml").write_text(yaml_content)
 
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=None))
             resp = client.put(
                 "/api/strategies/lstm_strat",
@@ -508,7 +506,7 @@ class TestStrategiesFallback:
         yaml_file = tmp_path / "original.yaml"
         yaml_file.write_text(yaml_content)
 
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=None))
             resp = client.put(
                 "/api/strategies/original_id_123",
@@ -554,6 +552,31 @@ class TestStrategiesFallback:
         # Verify required_history preserved from original
         assert written["parameters"]["required_history"] == 75
 
+    def test_import_rejects_wrong_extension_without_reading_upload(
+        self, client_no_pool: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads: list[str | None] = []
+        real_read = UploadFile.read
+
+        async def spy_read(self: UploadFile, size: int = -1) -> bytes:
+            reads.append(self.filename)
+            return await real_read(self, size)
+
+        monkeypatch.setattr(UploadFile, "read", spy_read)
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            rejected = client_no_pool.post(
+                "/api/strategies/import", files={"file": ("x.txt", b"a" * 2_000_000)}
+            )
+            accepted = client_no_pool.post(
+                "/api/strategies/import",
+                files={"file": ("ok.yaml", yaml.safe_dump({"name": "Up"}).encode())},
+            )
+        assert rejected.status_code == 422
+        assert rejected.json() == {"detail": "File must be .yaml or .yml"}
+        assert accepted.status_code == 201
+        assert reads == ["ok.yaml"]
+        assert [f.name for f in tmp_path.glob("*.yaml")] == [f"{accepted.json()['id']}.yaml"]
+
 
 # ---------------------------------------------------------------------------
 # DB path (mock pool)
@@ -583,7 +606,7 @@ class TestStrategiesWithPool:
             ]
         )
 
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=pool))
             resp = client.get("/api/strategies")
         assert resp.status_code == 200
@@ -720,7 +743,7 @@ def _share_app(pool: object | None) -> FastAPI:
 
 class TestBacktestShare:
     def test_share_without_db_is_503_and_issues_no_token(self) -> None:
-        from hydra.dashboard.routes.backtest import _SHARED_TOKENS
+        from hydra.services.backtest import _SHARED_TOKENS
 
         before = dict(_SHARED_TOKENS)
         resp = TestClient(_share_app(None)).post("/api/backtest/results/bt-x/share")

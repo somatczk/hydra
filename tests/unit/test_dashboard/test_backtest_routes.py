@@ -11,33 +11,34 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import asyncpg
 import pytest
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from hydra.backtest.jobs import BacktestRunRequest, detail_from_row
 from hydra.backtest.walkforward import WalkForwardAnalyzer
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes._db import install_error_handlers
-from hydra.dashboard.routes.backtest import (
-    _HYPEROPT_TASKS,
+from hydra.dashboard.routes.backtest import router
+from hydra.services.backtest import (
     _RESULTS,
     _TASKS,
-    _WALKFORWARD_TASKS,
     BacktestResultDetail,
-    BacktestRunRequest,
-    _detail_from_row,
     _load_backtest_strategy,
     _preflight,
     _run_backtest_task,
+)
+from hydra.services.errors import ServiceError
+from hydra.services.research import (
+    _HYPEROPT_TASKS,
+    _WALKFORWARD_TASKS,
     _walkforward_months,
     _window_fits,
-    router,
 )
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
@@ -84,12 +85,6 @@ def _write_strategy(directory: Path, strategy_id: str, **overrides: Any) -> Path
     path = directory / f"{strategy_id}.yaml"
     path.write_text(yaml.safe_dump(data))
     return path
-
-
-def _request_with_pool(pool: object) -> Request:
-    return cast(
-        "Request", SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_pool=pool)))
-    )
 
 
 def _make_app(pool: object | None = None) -> FastAPI:
@@ -142,7 +137,11 @@ def _hyperopt_body(strategy_id: str = "saw", **overrides: Any) -> dict[str, Any]
 
 def test_dashboard_has_no_synthetic_bar_generator() -> None:
     offenders: list[str] = []
-    for path in (SRC / "dashboard").rglob("*.py"):
+    for path in [
+        *(SRC / "dashboard").rglob("*.py"),
+        *(SRC / "services").rglob("*.py"),
+        SRC / "backtest" / "jobs.py",
+    ]:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "_generate_sample_bars":
@@ -157,7 +156,10 @@ def test_dashboard_has_no_synthetic_bar_generator() -> None:
 
 
 def test_no_seeded_placeholder_results() -> None:
-    source = (SRC / "dashboard" / "routes" / "backtest.py").read_text()
+    source = "".join(
+        (SRC / rel).read_text()
+        for rel in ("services/backtest.py", "services/research.py", "backtest/jobs.py")
+    )
     assert not any(f'"bt-{n}"' in source for n in (1, 2, 3))
     assert "LSTM Momentum" not in source
 
@@ -189,7 +191,7 @@ class TestLoadBacktestStrategy:
         assert config.parameters["required_history"] == 10
 
     def test_unknown_strategy_is_404(self) -> None:
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ServiceError) as exc:
             _load_backtest_strategy("does_not_exist_xyz")
         assert exc.value.status_code == 404
         assert exc.value.detail["state"] == "not_found"
@@ -198,7 +200,7 @@ class TestLoadBacktestStrategy:
         _write_strategy(
             strategies_dir, "grid", strategy_class="hydra.strategy.builtin.grid.GridStrategy"
         )
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ServiceError) as exc:
             _load_backtest_strategy("grid")
         assert exc.value.status_code == 422
         assert "cannot import strategy class" in exc.value.detail["message"]
@@ -207,7 +209,7 @@ class TestLoadBacktestStrategy:
         _write_strategy(
             strategies_dir, "ctx", strategy_class="hydra.strategy.context.StrategyContext"
         )
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ServiceError) as exc:
             _load_backtest_strategy("ctx")
         assert exc.value.status_code == 422
         assert "not supported by the backtester" in exc.value.detail["message"]
@@ -216,27 +218,27 @@ class TestLoadBacktestStrategy:
         _write_strategy(
             strategies_dir, "perp", exchange={"exchange_id": "binance", "market_type": "FUTURES"}
         )
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ServiceError) as exc:
             _load_backtest_strategy("perp")
         assert exc.value.status_code == 422
         assert "futures" in exc.value.detail["message"]
 
     def test_malformed_config_is_422(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "broken", symbols=5)
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ServiceError) as exc:
             _load_backtest_strategy("broken")
         assert exc.value.status_code == 422
         assert exc.value.detail["code"] == "invalid_strategy"
 
     def test_class_outside_strategy_package_is_not_imported(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "evil", strategy_class="os.system")
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ServiceError) as exc:
             _load_backtest_strategy("evil")
         assert exc.value.status_code == 422
         assert "must live under hydra.strategy." in exc.value.detail["message"]
 
     def test_strategy_files_are_read_at_call_time(self, strategies_dir: Path) -> None:
-        with pytest.raises(HTTPException):
+        with pytest.raises(ServiceError):
             _load_backtest_strategy("late")
         _write_strategy(strategies_dir, "late")
         _, config = _load_backtest_strategy("late")
@@ -358,12 +360,12 @@ class TestPreflightErrors:
     async def test_request_timeframe_overrides_strategy_primary(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "saw", timeframes={"primary": "4h"})
 
-        req = _request_with_pool(object())
+        pool = object()
         start, end = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 2, 1, tzinfo=UTC)
-        pf = await _preflight(req, "saw", Timeframe.D1, start, end, require_data=False)
+        pf = await _preflight(pool, "saw", Timeframe.D1, start, end, require_data=False)
         assert pf.timeframe == Timeframe.D1
         assert pf.config.timeframes.primary == Timeframe.D1
-        default = await _preflight(req, "saw", None, start, end, require_data=False)
+        default = await _preflight(pool, "saw", None, start, end, require_data=False)
         assert default.timeframe == Timeframe.H4
 
 
@@ -645,9 +647,7 @@ async def test_persistence_failure_fails_the_task(strategies_dir: Path) -> None:
     pool = _Pool(_BarsThenFailingWrites(rows))
 
     body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
-    pf = await _preflight(
-        _request_with_pool(pool), "saw", None, body.start_date, body.end_date, require_data=False
-    )
+    pf = await _preflight(pool, "saw", None, body.start_date, body.end_date, require_data=False)
     _TASKS["task-p"] = {"task_id": "task-p", "status": "queued", "progress": 0.0}
 
     await _run_backtest_task("task-p", body, pf)
@@ -704,7 +704,7 @@ def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
 
 class TestPersistedDetail:
     def test_stopped_reason_benchmark_and_extended_metrics_round_trip(self) -> None:
-        detail = BacktestResultDetail(**_detail_from_row(_db_row(), []))
+        detail = BacktestResultDetail(**detail_from_row(_db_row(), []))
         assert detail.stopped_reason == "margin_call"
         assert detail.benchmark_equity == [
             {"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}
@@ -724,7 +724,7 @@ class TestPersistedDetail:
             expectancy=None,
             stopped_reason=None,
         )
-        metrics = BacktestResultDetail(**_detail_from_row(row, [])).model_dump()["metrics"]
+        metrics = BacktestResultDetail(**detail_from_row(row, [])).model_dump()["metrics"]
         for name in ("benchmark_return", "alpha", "beta", "expectancy"):
             assert metrics[name] is None
         assert metrics["max_consecutive_losses"] is None

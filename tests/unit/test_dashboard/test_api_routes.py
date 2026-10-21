@@ -73,7 +73,7 @@ class TestStrategies:
             "          comparator: less_than\n"
             "          value: 30\n"
         )
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(app)
             resp = client.put(
                 "/api/strategies/test_strat_api",

@@ -52,7 +52,7 @@ not duplicate it here; update that table in the PR that changes a row.
 - **ML**: onnxruntime, plus xgboost/torch/mlflow in the `ml-training` extra. Not wired into trading (P5).
 
 ## Project structure
-- `src/hydra/`: 11 modules.
+- `src/hydra/`: 12 modules.
   - `core`: config, domain types, events, event buses, WebSocket manager, the Prometheus metric contract
     (`metrics.py`).
   - `data`: ingestion, bar storage, backfill, news and sentiment.
@@ -64,6 +64,7 @@ not duplicate it here; update that table in the PR that changes a row.
   - `portfolio`: P&L, positions, reconciliation.
   - `ml`: features, serving, export, registry, drift, training.
   - `dashboard`: the FastAPI app, `routes/`.
+  - `services`: backtest, research and strategy operations the routes (and later MCP) call; no FastAPI.
   - `ops`: Discord/Slack webhook notifier.
 - `dashboard/`: Next.js app (see `dashboard/README.md`).
 - `config/`: `base.yaml`, `strategies/`, `templates/`.
@@ -119,7 +120,9 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   `PUBLIC_PATHS` and `tests/unit/test_dashboard/test_auth_coverage.py`. Dashboard unit tests call the real app as
   the bearer-token service (`default_api_auth` in their conftest); auth tests override that fixture.
 - Errors from dashboard routes use one envelope, `{"detail": {"code", "message", "state", ...}}`, built by
-  `src/hydra/dashboard/routes/_db.py`; the frontend reads it with `dashboard/src/lib/apiState.ts`. Reuse both.
+  `src/hydra/dashboard/routes/_db.py`; services raise `hydra.services.errors.ServiceError` with the same detail and
+  `ServiceErrorRoute` turns it into the HTTP error. The frontend reads it with `dashboard/src/lib/apiState.ts`.
+  Reuse both.
 - Backtests run only on stored bars (`hydra.backtest.data`); no data means 422, never a synthetic fallback.
 - The app version comes from `importlib.metadata.version("hydra")`, so `pyproject.toml` is the single source.
 

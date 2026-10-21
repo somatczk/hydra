@@ -3,39 +3,22 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any
 
-import asyncpg
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+
+from hydra.services.errors import DB_ERRORS as DB_ERRORS
+from hydra.services.errors import ErrorState as ErrorState
+from hydra.services.errors import ServiceError
+from hydra.services.errors import error_detail as error_detail
 
 logger = logging.getLogger(__name__)
-
-ErrorState = Literal[
-    "unavailable",
-    "no_data",
-    "not_found",
-    "invalid",
-    "not_implemented",
-    "unauthenticated",
-    "forbidden",
-]
-
-DB_ERRORS: tuple[type[BaseException], ...] = (
-    OSError,
-    TimeoutError,
-    asyncpg.PostgresError,
-    asyncpg.InterfaceError,
-)
-
-
-def error_detail(code: str, message: str, state: ErrorState, **extra: Any) -> dict[str, Any]:
-    """The envelope's ``detail`` object; raw ASGI responses (security.py) use it directly."""
-    return {"code": code, "message": message, "state": state, **extra}
 
 
 def api_error(
@@ -115,3 +98,23 @@ async def _validation_error_handler(_request: Request, exc: Exception) -> JSONRe
 def install_error_handlers(app: FastAPI) -> None:
     """Make request-validation 422s use the shared envelope (submitted values are not echoed)."""
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
+
+
+class ServiceErrorRoute(APIRoute):
+    """A route calling hydra.services: a ServiceError answers exactly as the same HTTPException."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def route_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except ServiceError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+        return route_handler
+
+
+def request_pool(request: Request) -> Any:
+    """The app's asyncpg pool, or None; services raise the 503 where they need it."""
+    return getattr(request.app.state, "db_pool", None)

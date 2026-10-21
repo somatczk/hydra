@@ -164,6 +164,7 @@ name = "Module boundaries"
 type = "layers"
 layers = [
     "hydra.dashboard",
+    "hydra.services",
     "hydra.portfolio | hydra.backtest",
     "hydra.execution",
     "hydra.risk | hydra.ml",

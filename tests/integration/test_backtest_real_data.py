@@ -24,6 +24,8 @@ from hydra.dashboard.routes import backtest, strategies
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.data.storage import MarketDataRepository
+from hydra.services import backtest as backtest_svc
+from hydra.services import research
 
 pytestmark = pytest.mark.integration
 
@@ -115,12 +117,12 @@ async def pool(database_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AsyncItera
 @pytest.fixture(autouse=True)
 def _clean_route_state() -> Iterator[None]:
     stores: list[dict[str, Any]] = [
-        backtest._TASKS,
-        backtest._RESULTS,
-        backtest._HYPEROPT_TASKS,
-        backtest._HYPEROPT_RESULTS,
-        backtest._WALKFORWARD_TASKS,
-        backtest._WALKFORWARD_RESULTS,
+        backtest_svc._TASKS,
+        backtest_svc._RESULTS,
+        research._HYPEROPT_TASKS,
+        research._HYPEROPT_RESULTS,
+        research._WALKFORWARD_TASKS,
+        research._WALKFORWARD_RESULTS,
     ]
     for s in stores:
         s.clear()
@@ -199,7 +201,7 @@ def _write_strategy(directory: Path, strategy_id: str, **overrides: Any) -> None
 
 
 async def _drain() -> None:
-    await asyncio.gather(*list(backtest._BACKGROUND_TASKS))
+    await asyncio.gather(*list(backtest_svc._BACKGROUND_TASKS))
 
 
 async def _run(client: httpx.AsyncClient, **body: Any) -> dict[str, Any]:
@@ -289,19 +291,19 @@ async def test_results_survive_a_restart(
     assert before["metrics"]["max_consecutive_wins"] is not None
     assert before["metrics"]["expectancy"] is not None
 
-    backtest._RESULTS.clear()
+    backtest_svc._RESULTS.clear()
     uncached = (await client.get(f"/api/backtest/results/{result_id}")).json()
     assert uncached == before
 
-    await backtest.populate_cache_from_db(pool)
-    assert set(backtest._RESULTS) == {result_id}
+    await backtest_svc.populate_cache_from_db(pool)
+    assert set(backtest_svc._RESULTS) == {result_id}
     after = (await client.get(f"/api/backtest/results/{result_id}")).json()
     assert after == before
 
     listed = (await client.get("/api/backtest/results")).json()
     assert listed[0]["metrics"] == before["metrics"]
 
-    backtest._RESULTS.clear()
+    backtest_svc._RESULTS.clear()
     renamed = await client.patch(f"/api/backtest/results/{result_id}", json={"name": "kept"})
     assert renamed.status_code == 200
     assert renamed.json()["provenance"] == before["provenance"]
@@ -330,7 +332,7 @@ async def test_no_stored_bars_is_422_with_available_range(
     assert detail["available_first_ts"] == _iso(seed[0].timestamp)
     assert detail["available_last_ts"] == _iso(seed[-1].timestamp)
     assert "available: 2026-01-01T00:00:00+00:00 to 2026-01-13T11:00:00+00:00" in detail["message"]
-    assert backtest._TASKS == {}
+    assert backtest_svc._TASKS == {}
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT count(*) FROM backtest_results") == 0
 
@@ -464,10 +466,10 @@ async def test_walkforward_uses_the_real_span(
     assert result["provenance"]["bar_count"] == D1_COUNT
     assert result["provenance"]["first_ts"] == _iso(daily[0].timestamp)
     assert result["provenance"]["last_ts"] == _iso(daily[-1].timestamp)
-    task = backtest._WALKFORWARD_TASKS[task_id]
+    task = research._WALKFORWARD_TASKS[task_id]
     assert (task["in_sample_months"], task["out_of_sample_months"]) == (5, 2)
     # 400 daily bars over 399 days: 150 IS + 60 OOS bars per window, stepping 60 bars.
-    folds = backtest._WALKFORWARD_RESULTS[task_id].folds
+    folds = research._WALKFORWARD_RESULTS[task_id].folds
     assert len(result["folds"]) == len(folds) == 4
     for k, fold in enumerate(folds):
         window = daily[150 + 60 * k : 210 + 60 * k]
