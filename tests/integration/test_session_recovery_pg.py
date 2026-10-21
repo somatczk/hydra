@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import asyncpg
+import yaml
 from fastapi import FastAPI
 
 from hydra.core.config import HydraConfig
@@ -19,6 +20,8 @@ from hydra.data.migrations.runner import upgrade_to_head
 from hydra.execution.client_factory import ClientFactory, bars_repository
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.execution.session_manager import LIVE_NOT_RESUMED, SessionManager
+from hydra.services import strategies as svc
+from hydra.strategy.config import StrategyConfig, config_hash
 from tests.unit.test_execution.session_harness import (
     Harness,
     executor,
@@ -127,3 +130,107 @@ async def test_restart_resumes_paper_and_stops_live(
 ) -> None:
     await asyncio.to_thread(upgrade_to_head, fresh_database)
     await restart_scenario(fresh_database, strategies_dir)
+
+
+async def test_recovery_uses_snapshot(fresh_database: str, strategies_dir: Path) -> None:
+    """A redeploy after a YAML edit resumes the version the session started with, not the file."""
+    await asyncio.to_thread(upgrade_to_head, fresh_database)
+    pool = await asyncpg.create_pool(fresh_database, min_size=1, max_size=4)
+    try:
+        h = Harness(strategies_dir)
+        sid = write_strategy(strategies_dir, "pg-snap", entry_long=rule(("less_than", 0.0)))
+        path = strategies_dir / f"{sid}.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["rsi_period"] = 14
+        path.write_text(yaml.safe_dump(data))
+        v1_hash = config_hash(StrategyConfig.model_validate({**data, "enabled": True}))
+
+        first = SessionManager(db_pool=pool, config=HydraConfig(), clients=_clients(h))
+        await first.startup()
+        session_id = await first.start_session(sid, "paper", D("1000"))
+        session = first.get_session(session_id)
+        assert session is not None and session.config_hash == v1_hash
+        await first.graceful_shutdown()
+
+        # Edit the file after shutdown: a running session must not pick this up on restart.
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["rsi_period"] = 21
+        path.write_text(yaml.safe_dump(data))
+        v2_hash = config_hash(StrategyConfig.model_validate({**data, "enabled": True}))
+        assert v2_hash != v1_hash
+
+        app = FastAPI()
+        app.state.db_pool = pool
+        await lifespan._init_session_manager(app, HydraConfig(), _clients(h))
+        second: SessionManager = app.state.session_manager
+        await settle()
+        try:
+            recovered = second.get_session(session_id)
+            assert recovered is not None and recovered.status == "running"
+            assert recovered.config_hash == v1_hash
+            runtime = recovered._runtime
+            assert runtime is not None
+            assert runtime.cfg.parameters["rsi_period"] == 14
+
+            detail = await svc.get_strategy(pool, sid, second)
+            (running,) = detail["running_sessions"]
+            assert running["session_id"] == session_id
+            assert running["stale"] is True
+            assert detail["config_hash"] == v2_hash
+
+            result = await second.reload_config(sid)
+            assert (result.from_hash, result.to_hash) == (v1_hash, v2_hash)
+            await h.bar(recovered, "100")
+            row_hash = await pool.fetchval(
+                "SELECT config_hash FROM trading_sessions WHERE id = $1", session_id
+            )
+            assert row_hash == v2_hash
+            assert runtime.cfg.parameters["rsi_period"] == 21
+        finally:
+            await second.graceful_shutdown()
+
+        # A second restart recovers 21: the snapshot was updated by the reload.
+        app3 = FastAPI()
+        app3.state.db_pool = pool
+        await lifespan._init_session_manager(app3, HydraConfig(), _clients(h))
+        third: SessionManager = app3.state.session_manager
+        await settle()
+        try:
+            resumed_again = third.get_session(session_id)
+            assert resumed_again is not None and resumed_again.config_hash == v2_hash
+            runtime3 = resumed_again._runtime
+            assert runtime3 is not None and runtime3.cfg.parameters["rsi_period"] == 21
+        finally:
+            await third.graceful_shutdown()
+    finally:
+        await pool.close()
+
+
+async def test_recovery_of_pre_snapshot_row_falls_back_to_the_file(
+    fresh_database: str, strategies_dir: Path
+) -> None:
+    """A NULL ``strategy_config`` row (pre-P2) recovers from the YAML file, as before."""
+    await asyncio.to_thread(upgrade_to_head, fresh_database)
+    pool = await asyncpg.create_pool(fresh_database, min_size=1, max_size=4)
+    try:
+        h = Harness(strategies_dir)
+        sid = write_strategy(strategies_dir, "pg-presnap", entry_long=rule(("less_than", 0.0)))
+        await pool.execute(
+            "INSERT INTO trading_sessions (id, strategy_id, trading_mode, status, exchange_id,"
+            " symbols, timeframe, paper_capital) VALUES"
+            " ('pre-snap-1', $1, 'paper', 'running', 'binance', ARRAY['BTCUSDT'], '1h', 1000)",
+            sid,
+        )
+        app = FastAPI()
+        app.state.db_pool = pool
+        await lifespan._init_session_manager(app, HydraConfig(), _clients(h))
+        mgr: SessionManager = app.state.session_manager
+        await settle()
+        try:
+            recovered = mgr.get_session("pre-snap-1")
+            assert recovered is not None and recovered.status == "running"
+            assert recovered.strategy_config is not None  # backfilled on recovery
+        finally:
+            await mgr.graceful_shutdown()
+    finally:
+        await pool.close()

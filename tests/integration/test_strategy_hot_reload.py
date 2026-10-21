@@ -1,121 +1,84 @@
-"""Integration: Strategy hot reload via StrategyEngine.
+"""Integration: StrategyEngine.replace_strategy swaps a running strategy's parameters.
 
-Tests that changing strategy configuration and triggering a reload causes
-the engine to use updated parameters without restarting.
+The engine is real; only the strategy is a test double that records what it saw. Session-level
+bar-boundary enforcement (never mid-bar) is covered by test_execution/test_session_wiring.py.
 """
 
 from __future__ import annotations
 
-import tempfile
+from datetime import UTC, datetime
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
-import yaml
 
 from hydra.core.config import HydraConfig
 from hydra.core.event_bus import InMemoryEventBus
+from hydra.core.events import BarEvent, EntrySignal, ExitSignal
+from hydra.core.types import OHLCV, Symbol, Timeframe
+from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+pytestmark = pytest.mark.integration
 
 
-@pytest.mark.integration
-class TestStrategyHotReload:
-    """Engine reloads strategy when config changes."""
+class _RecordingStrategy(BaseStrategy):
+    """Records the ``rsi_period`` parameter it saw on every bar."""
 
-    async def test_config_change_reloads_strategy(self) -> None:
-        """Change strategy parameters -> engine reloads -> new params take effect."""
-        event_bus = InMemoryEventBus()
-        context = StrategyContext()
-        context.set_portfolio_value(Decimal("100000"))
-        hydra_config = HydraConfig()
+    seen: list[int]
 
-        engine = StrategyEngine(
-            config=hydra_config,
-            event_bus=event_bus,
-            context=context,
-        )
+    def __init__(self, config: StrategyConfig, context: StrategyContext) -> None:
+        super().__init__(config, context)
+        self.seen = []
 
-        # Load a strategy with initial parameters
-        config_v1 = StrategyConfig(
-            id="reload_test",
-            name="Reload Test",
-            strategy_class="hydra.strategy.builtin.momentum.MomentumRSIMACDStrategy",
-            symbols=["BTCUSDT"],
-            parameters={
-                "rsi_period": 14,
-                "required_history": 50,
-            },
-        )
+    @property
+    def required_history(self) -> int:
+        return 1
 
-        await engine.load_strategy_from_config(config_v1)
-        await engine.start()
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        self.seen.append(self._config.parameters["rsi_period"])
+        return []
 
-        # Verify strategy is loaded
-        strategy_v1 = engine.get_strategy("reload_test")
-        assert strategy_v1 is not None
-        assert strategy_v1.config.parameters["rsi_period"] == 14
 
-        # Reload the strategy (simulates hot reload)
-        await engine.reload_strategy("reload_test")
+def _bar(i: int) -> BarEvent:
+    c = Decimal(100 + i)
+    ts = datetime(2026, 1, 1 + i, tzinfo=UTC)
+    ohlcv = OHLCV(open=c, high=c, low=c, close=c, volume=Decimal(1), timestamp=ts)
+    return BarEvent(symbol=Symbol("BTCUSDT"), timeframe=Timeframe.H1, ohlcv=ohlcv)
 
-        # Verify strategy was reloaded (new instance)
-        strategy_v2 = engine.get_strategy("reload_test")
-        assert strategy_v2 is not None
-        # The reloaded strategy should still have the same config
-        assert strategy_v2.config.parameters["rsi_period"] == 14
 
-        await engine.stop()
+def _cfg(rsi_period: int) -> StrategyConfig:
+    return StrategyConfig(
+        id="reload_test",
+        name="Reload Test",
+        strategy_class=f"{__name__}._RecordingStrategy",
+        symbols=["BTCUSDT"],
+        parameters={"rsi_period": rsi_period},
+    )
 
-    async def test_reload_unknown_strategy_is_noop(self) -> None:
-        """Reloading a non-existent strategy ID does not raise."""
-        event_bus = InMemoryEventBus()
-        context = StrategyContext()
-        hydra_config = HydraConfig()
 
-        engine = StrategyEngine(
-            config=hydra_config,
-            event_bus=event_bus,
-            context=context,
-        )
+async def test_replace_strategy_applies_between_bars() -> None:
+    """A config change between bars takes effect on the next bar, not the current one."""
+    bus = InMemoryEventBus()
+    ctx = StrategyContext()
+    engine = StrategyEngine(config=HydraConfig(), event_bus=bus, context=ctx)
 
-        # Should not raise
-        await engine.reload_strategy("nonexistent_strategy")
+    await engine.load_strategy_from_config(_cfg(14), cls=_RecordingStrategy)
+    await engine.start()
 
-    async def test_engine_loads_from_config_dir(self) -> None:
-        """Engine loads strategies from a directory of YAML files."""
-        event_bus = InMemoryEventBus()
-        context = StrategyContext()
-        context.set_portfolio_value(Decimal("100000"))
-        hydra_config = HydraConfig()
+    await bus.publish(_bar(0))
+    strategy = engine.get_strategy("reload_test")
+    assert isinstance(strategy, _RecordingStrategy)
+    assert strategy.seen == [14]
 
-        engine = StrategyEngine(
-            config=hydra_config,
-            event_bus=event_bus,
-            context=context,
-        )
+    await engine.replace_strategy(_cfg(21))
 
-        # Create a temporary config directory with one strategy YAML
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_data = {
-                "id": "dir_test",
-                "name": "Dir Load Test",
-                "strategy_class": "hydra.strategy.builtin.momentum.MomentumRSIMACDStrategy",
-                "enabled": True,
-                "symbols": ["BTCUSDT"],
-                "parameters": {"rsi_period": 14, "required_history": 50},
-            }
-            config_path = Path(tmpdir) / "test_strategy.yaml"
-            with config_path.open("w") as f:
-                yaml.dump(config_data, f)
+    await bus.publish(_bar(1))
+    new_strategy = engine.get_strategy("reload_test")
+    assert isinstance(new_strategy, _RecordingStrategy)
+    assert new_strategy is not strategy
+    assert strategy.seen == [14]
+    assert new_strategy.seen == [21]
 
-            await engine.load_strategies(Path(tmpdir))
-
-        strategy = engine.get_strategy("dir_test")
-        assert strategy is not None
-        assert strategy.strategy_id == "dir_test"
+    await engine.stop()

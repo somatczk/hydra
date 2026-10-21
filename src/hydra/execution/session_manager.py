@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -17,12 +18,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import yaml
+
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
 from hydra.core.types import ExchangeId, OrderType, Side, Timeframe
 from hydra.execution import client_factory, session_store
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import (
+    ConfigReloadRefusedError,
     DuplicateSessionError,
     KillSwitchActiveError,
     LiveTradingDisabledError,
@@ -36,7 +40,8 @@ from hydra.execution.session_wiring import ManualOrderResult, SessionRuntime, pr
 from hydra.risk.market_rules import MarketRulesCache
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore, PgRiskStateStore, RiskStateStore
-from hydra.strategy.config import StrategyConfig, load_strategy_config
+from hydra.strategy.config import StrategyConfig, config_hash, load_strategy_config
+from hydra.strategy.engine import validate_strategy_config
 
 if TYPE_CHECKING:
     from hydra.core.event_bus import InMemoryEventBus
@@ -74,6 +79,8 @@ class TradingSession:
     last_fill_at: datetime | None = None
     flatten_incomplete: bool = False
     persist_error: str | None = None
+    strategy_config: dict[str, Any] | None = None
+    config_hash: str | None = None
 
     # Runtime components (not persisted)
     _runtime: SessionRuntime | None = field(default=None, repr=False)
@@ -96,6 +103,13 @@ class TradingSession:
         if not isinstance(ex, PaperTradingExecutor):
             return 0
         return sum(1 for q in ex.get_account_snapshot().base_totals.values() if q > 0)
+
+
+@dataclass(frozen=True, slots=True)
+class ReloadResult:
+    session_id: str
+    from_hash: str | None
+    to_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +150,22 @@ class HealthSnapshot:
     desired_from_db: bool
     kill_switch: bool
     risk_available: bool
+
+
+def _snapshot(raw: Any) -> dict[str, Any] | None:
+    """The stored config snapshot (asyncpg returns jsonb as text); NULL for pre-snapshot rows."""
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def _non_parameter_changes(old: StrategyConfig, new: StrategyConfig) -> list[str]:
+    """Top-level fields that differ beyond ``parameters`` (``enabled``/``name`` ignored).
+
+    A rule change lives inside ``parameters`` and is allowed: the endpoint's response and the
+    risks section both say exit-rule changes apply to an already open position by design.
+    """
+    a = old.model_dump(mode="json", exclude={"enabled", "name", "parameters"})
+    b = new.model_dump(mode="json", exclude={"enabled", "name", "parameters"})
+    return sorted(k for k in a if a[k] != b[k])
 
 
 class SessionManager:
@@ -252,6 +282,8 @@ class SessionManager:
                 symbols=list(cfg.symbols),
                 timeframe=str(cfg.timeframes.primary),
                 paper_capital=capital,
+                strategy_config=cfg.model_dump(mode="json"),
+                config_hash=config_hash(cfg),
             )
             rules = await self._market_rules.get(exchange_id, cfg.symbols)
             executor = client_factory.build_paper_executor(
@@ -272,6 +304,32 @@ class SessionManager:
             await session_store.persist_session(self._db_pool, session)
         logger.info("Started paper session %s for strategy %s", session_id, strategy_id)
         return session_id
+
+    async def reload_config(self, strategy_id: str) -> ReloadResult:
+        """Queue the strategy file's ``parameters`` for the running session's next closed bar.
+
+        Raises ``SessionNotRunningError`` (no running session), ``ValueError`` (invalid file) or
+        ``ConfigReloadRefusedError`` (anything beyond ``parameters`` changed: restart instead).
+        """
+        session = next(
+            (
+                s
+                for s in self._sessions.values()
+                if s.strategy_id == strategy_id and s.status == "running" and s._runtime
+            ),
+            None,
+        )
+        runtime = session._runtime if session is not None else None
+        if session is None or runtime is None:
+            raise SessionNotRunningError(f"Strategy {strategy_id} has no running session")
+        new = self._strict_strategy_config(strategy_id)
+        changed = _non_parameter_changes(runtime.cfg, new)
+        if await probe_strategy(new, self._config) > runtime.required_history:
+            changed.append("parameters.required_history")
+        if changed:
+            raise ConfigReloadRefusedError(changed)
+        runtime.request_reload(new)
+        return ReloadResult(session.session_id, session.config_hash, config_hash(new))
 
     async def stop_session(self, session_id: str) -> None:
         """Flatten (reduce-only) and stop a session."""
@@ -538,14 +596,47 @@ class SessionManager:
 
     # -- Internal: build and run ----------------------------------------------
 
-    def _find_strategy_config(self, strategy_id: str) -> StrategyConfig:
-        """Locate and load a strategy config by ID from the strategies dir."""
+    def _strict_strategy_config(self, strategy_id: str) -> StrategyConfig:
+        """Locate the file for *strategy_id* and validate it strictly (reload's 422 path).
+
+        Raises ``KeyError`` when no file has the id (unreadable files are skipped, consistent
+        with ``_find_strategy_config``), ``ValueError``/``TypeError`` when the matching file is
+        invalid.
+        """
         if not _STRATEGY_DIR.exists():
             raise FileNotFoundError(f"Strategy directory not found: {_STRATEGY_DIR}")
         for path in sorted(_STRATEGY_DIR.iterdir()):
             if path.suffix not in (".yaml", ".yml"):
                 continue
-            cfg = load_strategy_config(path)
+            try:
+                raw = yaml.safe_load(path.read_text())
+            except (OSError, yaml.YAMLError) as exc:
+                logger.error("Skipping unreadable strategy file %s: %s", path.name, exc)
+                continue
+            if not isinstance(raw, dict) or raw.get("id") != strategy_id:
+                continue
+            cfg = validate_strategy_config(raw)
+            cfg.enabled = True
+            return cfg
+        raise KeyError(f"Strategy config not found: {strategy_id}")
+
+    def _find_strategy_config(self, strategy_id: str) -> StrategyConfig:
+        """Locate and load a strategy config by ID; other bad files are skipped and logged (SM-15).
+
+        Raises ``KeyError`` only when no valid file has the id. A loadable file with an invalid
+        strategy_class or rules still surfaces later (``probe_strategy``), so callers keep their
+        existing error types for that.
+        """
+        if not _STRATEGY_DIR.exists():
+            raise FileNotFoundError(f"Strategy directory not found: {_STRATEGY_DIR}")
+        for path in sorted(_STRATEGY_DIR.iterdir()):
+            if path.suffix not in (".yaml", ".yml"):
+                continue
+            try:
+                cfg = load_strategy_config(path)
+            except (ValueError, yaml.YAMLError) as exc:
+                logger.error("Skipping invalid strategy config %s: %s", path.name, exc)
+                continue
             if cfg.id == strategy_id:
                 cfg.enabled = True
                 return cfg
@@ -778,6 +869,7 @@ class SessionManager:
                 timeframe=row["timeframe"],
                 paper_capital=row["paper_capital"],
                 started_at=row["started_at"],
+                strategy_config=_snapshot(row.get("strategy_config")),
             )
             self._sessions[sid] = session
             try:
@@ -819,7 +911,7 @@ class SessionManager:
         try:
             if rules_error is not None:
                 raise rules_error
-            cfg = self._find_strategy_config(session.strategy_id)
+            cfg = self._recovery_config(session)
             client_factory.validate_venue(session.exchange_id, cfg.exchange.market_type)
             required_history = await probe_strategy(cfg, self._config)
             if session.paper_capital is None or session.paper_capital <= 0:
@@ -831,6 +923,17 @@ class SessionManager:
             await self._close_restored(session, "recovery_failed", f"recovery failed: {exc}")
             return
         logger.info("Recovered session %s for strategy %s", session.session_id, session.strategy_id)
+
+    def _recovery_config(self, session: TradingSession) -> StrategyConfig:
+        """The config the session started with; rows from before the snapshot use the file."""
+        if session.strategy_config is not None:
+            cfg = StrategyConfig.model_validate(session.strategy_config)
+            cfg.enabled = True
+        else:
+            cfg = self._find_strategy_config(session.strategy_id)
+            session.strategy_config = cfg.model_dump(mode="json")
+        session.config_hash = config_hash(cfg)
+        return cfg
 
     async def _close_restored(
         self, session: TradingSession, reason: str, failure: str | None

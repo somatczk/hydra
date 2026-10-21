@@ -18,7 +18,7 @@ from hydra.data.bars import timeframe_seconds
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
-from hydra.strategy.engine import StrategyEngine
+from hydra.strategy.engine import StrategyEngine, validate_strategy_config, write_strategy_config
 
 
 def _make_bar(
@@ -166,27 +166,67 @@ class TestStrategyEngine:
         await engine._on_bar_event(bar)
         await engine.stop()
 
-    async def test_hot_reload(self) -> None:
-        """Hot reload should re-instantiate the strategy."""
+    async def test_replace_strategy(self) -> None:
+        """replace_strategy swaps in a new instance built from the new config, same class."""
         config = HydraConfig()
         bus = InMemoryEventBus()
         ctx = StrategyContext()
         engine = StrategyEngine(config=config, event_bus=bus, context=ctx)
 
-        cfg = StrategyConfig(
+        cfg_v1 = StrategyConfig(
             id="reload_test",
             name="Reload Test",
             strategy_class="hydra.strategy.builtin.momentum.MomentumRSIMACDStrategy",
+            parameters={"rsi_period": 14},
         )
-        await engine.load_strategy_from_config(cfg)
+        await engine.load_strategy_from_config(cfg_v1)
+        await engine.start()
         old_strategy = engine.get_strategy("reload_test")
         assert old_strategy is not None
 
-        await engine.reload_strategy("reload_test")
+        stopped: list[str] = []
+        orig_on_stop = old_strategy.on_stop
+
+        async def _recording_on_stop() -> None:
+            stopped.append("stopped")
+            await orig_on_stop()
+
+        old_strategy.on_stop = _recording_on_stop  # type: ignore[method-assign]
+
+        cfg_v2 = cfg_v1.model_copy(update={"parameters": {"rsi_period": 21}})
+        await engine.replace_strategy(cfg_v2)
+
         new_strategy = engine.get_strategy("reload_test")
         assert new_strategy is not None
-        # Should be a different instance
-        assert old_strategy is not new_strategy
+        assert new_strategy is not old_strategy
+        assert new_strategy.config.parameters["rsi_period"] == 21
+        assert stopped == ["stopped"]
+        assert type(new_strategy) is type(old_strategy)
+        assert engine._strategy_configs["reload_test"] is cfg_v2
+
+        with pytest.raises(KeyError):
+            await engine.replace_strategy(cfg_v2.model_copy(update={"id": "no-such-id"}))
+        with pytest.raises(ValueError, match="Cannot change strategy_class"):
+            await engine.replace_strategy(
+                cfg_v2.model_copy(
+                    update={
+                        "strategy_class": "hydra.strategy.builtin.trend_following."
+                        "TrendFollowingSupertrend"
+                    }
+                )
+            )
+        await engine.stop()
+
+    async def test_import_allowlist(self) -> None:
+        """A non-builtin module path is refused before import, and never imported."""
+        import sys
+
+        from hydra.strategy.engine import _import_strategy_class
+
+        assert "antigravity" not in sys.modules
+        with pytest.raises(ValueError, match="must be under"):
+            _import_strategy_class("antigravity.Foo")
+        assert "antigravity" not in sys.modules
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +276,7 @@ async def _engine(
     ctx = StrategyContext(max_bars=max_bars)
     engine = StrategyEngine(config=HydraConfig(), event_bus=bus, context=ctx)
     for cfg in cfgs:
-        await engine.load_strategy_from_config(cfg)
+        await engine.load_strategy_from_config(cfg, cls=RecordingStrategy)
     await engine.start()
     return bus, ctx, engine
 
@@ -320,3 +360,94 @@ class TestClosedBarRouting:
         stamps = [b.timestamp for b in ctx.bars("BTCUSDT", Timeframe.H1, 100)]
         assert stamps == [_T0 + timedelta(hours=h) for h in range(4)]
         assert [c[1] for c in _CALLS["late"]] == [_T0 + timedelta(hours=h) for h in (0, 1, 3)]
+
+
+# ---------------------------------------------------------------------------
+# validate_strategy_config / write_strategy_config (P2-E2)
+# ---------------------------------------------------------------------------
+
+_VALID_RULE_BASED: dict[str, object] = {
+    "id": "v1",
+    "name": "Valid",
+    "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+    "symbols": ["BTCUSDT"],
+    "parameters": {
+        "required_history": 20,
+        "rules": {
+            "entry_long": {
+                "operator": "AND",
+                "conditions": [
+                    {
+                        "indicator": "rsi",
+                        "params": {"period": 14},
+                        "comparator": "less_than",
+                        "value": 30,
+                    }
+                ],
+            },
+        },
+    },
+}
+
+
+class TestValidateStrategyConfig:
+    def test_valid_config_round_trips(self) -> None:
+        cfg = validate_strategy_config(_VALID_RULE_BASED)
+        assert cfg.id == "v1"
+
+    def test_disallowed_class_raises(self) -> None:
+        data = {**_VALID_RULE_BASED, "strategy_class": "antigravity.Foo"}
+        with pytest.raises(ValueError, match="must be under"):
+            validate_strategy_config(data)
+
+    def test_bad_schema_raises_validation_error(self) -> None:
+        data = dict(_VALID_RULE_BASED)
+        del data["strategy_class"]
+        with pytest.raises(ValueError):
+            validate_strategy_config(data)
+
+    def test_invalid_rule_indicator_raises_at_construction(self) -> None:
+        data = {
+            **_VALID_RULE_BASED,
+            "parameters": {
+                "required_history": 20,
+                "rules": {
+                    "entry_long": {
+                        "operator": "AND",
+                        "conditions": [
+                            {
+                                "indicator": "rsii",
+                                "params": {"period": 14},
+                                "comparator": "less_than",
+                                "value": 30,
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+        with pytest.raises(ValueError):
+            validate_strategy_config(data)
+
+
+class TestWriteStrategyConfig:
+    def test_writes_atomically(self, tmp_path: Path) -> None:
+        path = tmp_path / "strategy.yaml"
+        write_strategy_config(path, _VALID_RULE_BASED)
+        assert path.is_file()
+        written = yaml.safe_load(path.read_text())
+        assert written["id"] == "v1"
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    def test_invalid_config_writes_nothing(self, tmp_path: Path) -> None:
+        path = tmp_path / "strategy.yaml"
+        data = {**_VALID_RULE_BASED, "strategy_class": "antigravity.Foo"}
+        with pytest.raises(ValueError):
+            write_strategy_config(path, data)
+        assert not path.exists()
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    def test_creates_parent_directory(self, tmp_path: Path) -> None:
+        path = tmp_path / "nested" / "strategy.yaml"
+        write_strategy_config(path, _VALID_RULE_BASED)
+        assert path.is_file()

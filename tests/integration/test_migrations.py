@@ -105,6 +105,16 @@ async def test_fresh_db_upgrade(fresh_database: str) -> None:
         "WHERE table_name = 'backtest_results' AND column_name = 'data_source'",
     )
     assert [r["is_nullable"] for r in nullable] == ["NO"]
+    session_cols = await _fetch(
+        fresh_database,
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_name = 'trading_sessions' AND column_name IN "
+        "('strategy_config', 'config_hash') ORDER BY column_name",
+    )
+    assert [tuple(r) for r in session_cols] == [
+        ("config_hash", "text", "YES"),
+        ("strategy_config", "jsonb", "YES"),
+    ]
 
 
 async def test_legacy_2_1_10_schema_upgrades_in_place(fresh_database: str) -> None:

@@ -19,6 +19,7 @@ from prometheus_client import REGISTRY
 from hydra.core.events import BarEvent, FeedStatusEvent, OrderFillEvent
 from hydra.core.types import OHLCV, Direction, Symbol, Timeframe
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
+from hydra.strategy.config import config_hash
 from tests.unit.test_execution.session_harness import (
     Harness,
     executor,
@@ -217,3 +218,39 @@ class TestBarRouting:
         assert REGISTRY.get_sample_value("hydra_position_size", labels) == 1.0
         await h.bar(session, "110")
         assert REGISTRY.get_sample_value("hydra_position_size", labels) == 0.0
+
+
+class TestHotReload:
+    async def test_reload_never_mid_bar(self, h: Harness, strategies_dir: Path) -> None:
+        """A reload queued inside on_bar applies before the *next* bar, never the current one."""
+        sid = write_strategy(strategies_dir, "reload-wire", entry_long=ALWAYS)
+        session = await h.session(sid)
+        runtime = session._runtime
+        assert runtime is not None
+        protect_policy_before = runtime.protect._policy
+
+        v2 = runtime.cfg.model_copy(
+            update={"parameters": {**runtime.cfg.parameters, "rsi_period": 99}}
+        )
+        strategy = runtime.engine.get_strategy(sid)
+        assert strategy is not None
+        real_on_bar = strategy.on_bar
+        seen_before_reload: dict[str, object] = {}
+
+        async def recording_on_bar(bar: BarEvent) -> list[Any]:
+            seen_before_reload.update(runtime.cfg.parameters)
+            runtime.request_reload(v2)
+            return await real_on_bar(bar)
+
+        strategy.on_bar = recording_on_bar  # type: ignore[method-assign]
+
+        await h.bar(session, "100")
+        assert "rsi_period" not in seen_before_reload
+        assert runtime.cfg.parameters.get("rsi_period") is None
+        assert session.config_hash != config_hash(v2)
+
+        await h.bar(session, "101")
+        assert runtime.cfg.parameters["rsi_period"] == 99
+        assert session.config_hash == config_hash(v2)
+        assert runtime.protect._policy is protect_policy_before
+        assert type(runtime.engine.get_strategy(sid)) is type(strategy)

@@ -177,7 +177,7 @@ async def _run_live(bars: list[OHLCV]) -> tuple[list[Observation], StrategyConte
     context = StrategyContext(max_bars=1000)
     engine = StrategyEngine(config=HydraConfig(), event_bus=bus, context=context)
     cfg = _config("live")
-    await engine.load_strategy_from_config(cfg)
+    await engine.load_strategy_from_config(cfg, cls=IndicatorParityStrategy)
 
     warm = await feed.warm_up(cfg.symbols, cfg.all_timeframes(), min_bars=60)
     assert [b.timestamp for b in warm[("BTCUSDT", Timeframe.H1)]] == [

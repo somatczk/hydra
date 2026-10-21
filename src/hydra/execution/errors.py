@@ -58,3 +58,13 @@ class SessionPersistError(RuntimeError):
     """The session stopped, but its terminal status could not be written (retried in background)."""
 
     code = "session_stop_not_persisted"
+
+
+class ConfigReloadRefusedError(ValueError):
+    """A config change touches more than ``parameters``; the session must be restarted."""
+
+    code = "restart_required"
+
+    def __init__(self, changed_fields: list[str]) -> None:
+        super().__init__(f"restart required to change: {', '.join(changed_fields)}")
+        self.changed_fields = changed_fields

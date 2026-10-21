@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -127,7 +128,7 @@ def test_import_linter_contracts_kept(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_injected_config_reaches_the_engine_and_load_config_is_never_called(
     strategies_dir: Path,
 ) -> None:
-    assert "load_config" not in Path(session_manager.__file__).read_text()
+    assert not re.search(r"(?<!\w)load_config(?!\w)", Path(session_manager.__file__).read_text())
     config = inspect.signature(SessionManager).parameters["config"]
     assert (config.kind, config.default) == (
         inspect.Parameter.KEYWORD_ONLY,

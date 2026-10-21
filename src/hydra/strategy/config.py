@@ -5,6 +5,9 @@ Supports loading from YAML files in ``config/strategies/``.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 from pathlib import Path
 from typing import Any, Literal
 
@@ -12,6 +15,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from hydra.core.types import ExchangeId, MarketType, Timeframe
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Nested config sections
@@ -140,11 +145,21 @@ def load_strategy_config(path: Path) -> StrategyConfig:
 
 
 def load_all_strategy_configs(config_dir: Path) -> list[StrategyConfig]:
-    """Load all ``*.yaml`` / ``*.yml`` strategy configs from a directory."""
+    """Load all ``*.yaml`` / ``*.yml`` strategy configs; a bad file is skipped and logged."""
     configs: list[StrategyConfig] = []
     if not config_dir.exists():
         return configs
     for path in sorted(config_dir.iterdir()):
-        if path.suffix in (".yaml", ".yml"):
+        if path.suffix not in (".yaml", ".yml"):
+            continue
+        try:
             configs.append(load_strategy_config(path))
+        except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+            logger.error("Skipping invalid strategy config %s: %s", path, exc)
     return configs
+
+
+def config_hash(cfg: StrategyConfig) -> str:
+    """Short digest of a config; ``enabled`` and ``name`` are excluded (start forces enabled)."""
+    payload = json.dumps(cfg.model_dump(mode="json", exclude={"enabled", "name"}), sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]

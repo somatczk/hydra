@@ -47,6 +47,7 @@ from hydra.core.types import (
 )
 from hydra.data.bars import timeframe_seconds
 from hydra.data.ingestion import ExchangeFeedManager
+from hydra.execution import session_store
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import SessionNotRunningError, SpotShortError, UnsupportedStrategyError
 from hydra.execution.flatten import FlattenResult, flatten_session
@@ -61,7 +62,7 @@ from hydra.execution.paper_trading import (
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.risk.service import RiskService
 from hydra.strategy.base import BaseStrategy
-from hydra.strategy.config import StrategyConfig
+from hydra.strategy.config import StrategyConfig, config_hash
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine, _import_strategy_class
 
@@ -90,7 +91,7 @@ async def probe_strategy(cfg: StrategyConfig, hydra_config: HydraConfig) -> int:
         cls = _import_strategy_class(cfg.strategy_class)
         if inspect.isabstract(cls):
             raise TypeError("abstract class")
-    except (ImportError, AttributeError, TypeError) as exc:
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
         raise UnsupportedStrategyError(
             f"cannot load strategy class {cfg.strategy_class}: {exc}"
         ) from exc
@@ -133,6 +134,8 @@ class SessionRuntime:
     ) -> None:
         self.session = session
         self.cfg = cfg
+        self._db_pool = db_pool
+        self._pending_cfg: StrategyConfig | None = None
         self.executor = executor
         self.risk = risk
         self.exchange_id: ExchangeId = cfg.exchange.exchange_id
@@ -249,6 +252,27 @@ class SessionRuntime:
     async def flatten(self) -> FlattenResult:
         return await flatten_session(self)
 
+    def request_reload(self, cfg: StrategyConfig) -> None:
+        """Queue a parameters-only config; ``_on_bar`` applies it before the next closed bar."""
+        self._pending_cfg = cfg
+
+    async def _apply_pending_reload(self) -> None:
+        cfg, self._pending_cfg = self._pending_cfg, None
+        if cfg is None:
+            return
+        try:
+            await self.engine.replace_strategy(cfg)
+        except Exception:
+            logger.exception(
+                "Reload failed for %s; keeping the running config", self.session.session_id
+            )
+            return
+        self.cfg = cfg
+        self.session.strategy_config = cfg.model_dump(mode="json")
+        self.session.config_hash = config_hash(cfg)
+        if not await session_store.persist_session(self._db_pool, self.session, attempts=3):
+            logger.error("Reloaded config of %s is not persisted", self.session.session_id)
+
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
@@ -263,6 +287,7 @@ class SessionRuntime:
             or str(event.symbol) not in self.cfg.symbols
         ):
             return
+        await self._apply_pending_reload()
         await self._process_closed_bar(str(event.symbol), event.ohlcv)
 
     async def _process_closed_bar(self, symbol: str, bar: OHLCV) -> None:

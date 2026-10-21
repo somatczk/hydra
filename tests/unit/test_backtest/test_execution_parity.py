@@ -21,6 +21,7 @@ import pytest
 import yaml
 
 import hydra.backtest.runner as runner_module
+import hydra.strategy.engine as engine_module
 from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.runner import BacktestRunner
 from hydra.core.config import HydraConfig
@@ -242,6 +243,11 @@ async def _assert_parity(
     strategies_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[PaperFill]:
+    # P2-E2's class allowlist refuses anything outside hydra.strategy.builtin.*; this fixture's
+    # test-double strategies are the one legitimate exception (real parity harness, not user input).
+    monkeypatch.setattr(
+        engine_module, "ALLOWED_CLASS_PREFIX", (engine_module.ALLOWED_CLASS_PREFIX, __name__)
+    )
     config = {**CONFIG, "strategy_class": f"{__name__}.{cls.__name__}"}
     paper, paper_equity = await _paper(bars, strategies_dir, config)
 
