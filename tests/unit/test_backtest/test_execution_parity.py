@@ -1,6 +1,6 @@
 """Execution parity: a real paper session and BacktestRunner on the same bars agree exactly.
 
-The paper side is the real SessionManager (no DB) with a RiskService on bar time, warmed up over
+The paper side is the real SessionManager (no DB) with its RiskService and OrderManager on bar time,
 the fake REST client and fed closed bars on its session bus exactly as the feed publishes them.
 The backtest side is ``BacktestRunner.run`` on the same bars with the same risk config. Fills,
 bar-by-bar equity, balances and realized PnL must be identical, and the fixture must hit a
@@ -107,6 +107,36 @@ class ParityStrategy(BaseStrategy):
         )
 
 
+class FlipStrategy(BaseStrategy):
+    """Buys when flat and sells everything when holding: same-size orders two bars apart."""
+
+    @property
+    def required_history(self) -> int:
+        return 20
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        if self.context.position(str(bar.symbol)) is not None:
+            return [
+                ExitSignal(symbol=bar.symbol, strategy_id=self.strategy_id, exchange_id="binance")
+            ]
+        return [
+            EntrySignal(
+                symbol=bar.symbol,
+                direction=Direction.LONG,
+                strength=D("1"),
+                strategy_id=self.strategy_id,
+                exchange_id="binance",
+                market_type=MarketType.SPOT,
+            )
+        ]
+
+
+def _flat_bars(end: datetime, count: int) -> list[OHLCV]:
+    p = D("99950")
+    start = end - (WARM - 1) * H
+    return [OHLCV(p, p, p, p, D("100"), start + i * H) for i in range(count)]
+
+
 def _bars(end: datetime) -> list[OHLCV]:
     """Random walk with a 4 % gap down every 23rd bar and a wide range every 31st."""
     rng = np.random.default_rng(7)
@@ -152,8 +182,10 @@ def _key(f: PaperFill) -> tuple[object, ...]:
     )
 
 
-async def _paper(bars: list[OHLCV], strategies_dir: Path) -> tuple[PaperTradingExecutor, list[D]]:
-    (strategies_dir / "parity.yaml").write_text(yaml.safe_dump(CONFIG))
+async def _paper(
+    bars: list[OHLCV], strategies_dir: Path, config: dict[str, Any]
+) -> tuple[PaperTradingExecutor, list[D]]:
+    (strategies_dir / "parity.yaml").write_text(yaml.safe_dump(config))
     rows = [
         [
             int(b.timestamp.timestamp() * 1000),
@@ -183,6 +215,7 @@ async def _paper(bars: list[OHLCV], strategies_dir: Path) -> tuple[PaperTradingE
     session = mgr.get_session(sid)
     assert session is not None and session._event_bus is not None
     assert session._runtime is not None
+    session._runtime.om._clock = lambda: now[0].timestamp()  # the runner's bar clock
     warm = session._runtime.context.bars("BTCUSDT", Timeframe.H1, 1000)
     assert warm == bars[:WARM]
     executor = session._executor
@@ -203,11 +236,14 @@ async def _paper(bars: list[OHLCV], strategies_dir: Path) -> tuple[PaperTradingE
     return executor, equity
 
 
-async def test_backtest_equals_paper_session_on_the_same_bars(
-    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    bars = _bars(last_closed_open(datetime.now(UTC), Timeframe.H1))
-    paper, paper_equity = await _paper(bars, strategies_dir)
+async def _assert_parity(
+    bars: list[OHLCV],
+    cls: type[BaseStrategy],
+    strategies_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[PaperFill]:
+    config = {**CONFIG, "strategy_class": f"{__name__}.{cls.__name__}"}
+    paper, paper_equity = await _paper(bars, strategies_dir, config)
 
     built: list[PaperTradingExecutor] = []
 
@@ -218,8 +254,8 @@ async def test_backtest_equals_paper_session_on_the_same_bars(
 
     monkeypatch.setattr(runner_module, "PaperTradingExecutor", Recording)
     result = await BacktestRunner().run(
-        ParityStrategy,
-        StrategyConfig(**CONFIG),
+        cls,
+        StrategyConfig(**config),
         bars,
         initial_capital=CAPITAL,
         commission=CommissionConfig(),
@@ -240,8 +276,30 @@ async def test_backtest_equals_paper_session_on_the_same_bars(
     )
     assert b.realized_net == p.realized_net
     assert CAPITAL + sum((t.pnl for t in result.trades), D("0")) == result.equity_curve[-1]
+    return paper.get_fills()
 
-    _assert_fixture_hits_every_case(paper.get_fills(), {b.timestamp: b for b in bars})
+
+async def test_backtest_equals_paper_session_on_the_same_bars(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bars = _bars(last_closed_open(datetime.now(UTC), Timeframe.H1))
+    fills = await _assert_parity(bars, ParityStrategy, strategies_dir, monkeypatch)
+    _assert_fixture_hits_every_case(fills, {b.timestamp: b for b in bars})
+
+
+async def test_same_size_reentries_are_not_deduplicated_on_either_side(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bars = _flat_bars(last_closed_open(datetime.now(UTC), Timeframe.H1), WARM + 12)
+    fills = await _assert_parity(bars, FlipStrategy, strategies_dir, monkeypatch)
+    # the fifth losing round trip trips the loss-streak pause
+    assert [f.quantity for f in fills if f.side == "BUY"] == [
+        D("0.01000"),
+        D("0.01000"),
+        D("0.00999"),
+        D("0.00999"),
+        D("0.00998"),
+    ]
 
 
 def _assert_fixture_hits_every_case(fills: list[PaperFill], by_ts: dict[datetime, OHLCV]) -> None:

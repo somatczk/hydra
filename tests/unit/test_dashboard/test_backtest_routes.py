@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import re
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -656,6 +657,47 @@ async def test_persistence_failure_fails_the_task(strategies_dir: Path) -> None:
     assert _TASKS["task-p"]["status"] == "failed"
     assert _TASKS["task-p"]["error"].startswith("result not persisted")
     assert "result_id" not in _TASKS["task-p"]
+    assert _RESULTS == {}
+
+
+class _Boom(BaseStrategy):
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        raise ZeroDivisionError("division by zero")
+
+
+async def test_strategy_exception_fails_the_task_with_its_message(strategies_dir: Path) -> None:
+    _write_strategy(strategies_dir, "saw")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        {
+            "open": 1000,
+            "high": 1000,
+            "low": 1000,
+            "close": 1000,
+            "volume": 10,
+            "timestamp": start + timedelta(hours=i),
+        }
+        for i in range(60)
+    ]
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    pf = await _preflight(
+        _Pool(_BarsThenFailingWrites(rows)),
+        "saw",
+        None,
+        body.start_date,
+        body.end_date,
+        require_data=False,
+    )
+    _TASKS["task-s"] = {"task_id": "task-s", "status": "queued", "progress": 0.0}
+
+    await _run_backtest_task("task-s", body, replace(pf, strategy_cls=_Boom))
+
+    assert _TASKS["task-s"]["status"] == "failed"
+    assert _TASKS["task-s"]["error"] == "saw: ZeroDivisionError('division by zero')"
     assert _RESULTS == {}
 
 

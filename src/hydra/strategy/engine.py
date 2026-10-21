@@ -105,8 +105,13 @@ class StrategyEngine:
         """Stop the engine and all strategies."""
         self._running = False
         await self._event_bus.unsubscribe("bar", self._on_bar_event)
-        for strategy in self._strategies.values():
-            await strategy.on_stop()
+        for sid, strategy in self._strategies.items():
+            try:
+                await strategy.on_stop()
+            except Exception as exc:
+                logger.exception("Error in strategy %s on_stop", sid)
+                self.errors += 1
+                self.last_error = f"{sid}: {exc!r}"
         logger.info("Strategy engine stopped")
 
     # -- Event routing -------------------------------------------------------

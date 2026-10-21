@@ -9,6 +9,7 @@ worse of stop and open, slipped; sizing is ``risk.sizing.size_entry`` floored to
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, ClassVar
@@ -16,12 +17,14 @@ from typing import Any, ClassVar
 import pytest
 from prometheus_client import REGISTRY
 
+import hydra.backtest.runner as runner_module
 from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.metrics import BacktestResult
 from hydra.backtest.runner import BacktestRunner, StrategyError
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal, OrderFillEvent
-from hydra.core.types import OHLCV, Direction, MarketType, Position
+from hydra.core.types import OHLCV, Direction, MarketType, Position, Side
 from hydra.execution.errors import UnsupportedVenueError
+from hydra.execution.paper_trading import PaperFill, PaperTradingExecutor
 from hydra.risk.pretrade import RiskConfig
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
@@ -197,6 +200,99 @@ async def test_on_fill_exception_fails_the_run() -> None:
     _Recorder.seen = []
     with pytest.raises(StrategyError, match="rules: ValueError"):
         await _run(cls=_FillCrashes)
+
+
+class _HookCrashes(_Recorder):
+    hook: ClassVar[str] = ""
+
+    async def on_start(self) -> None:
+        if self.hook == "start":
+            raise RuntimeError("boom")
+
+    async def on_fill(self, fill: OrderFillEvent) -> None:
+        if self.hook == "close_out" and fill.side == Side.SELL:
+            raise ValueError("bad close-out fill")
+
+    async def on_stop(self) -> None:
+        if self.hook == "stop":
+            raise KeyError("boom")
+
+
+@pytest.mark.parametrize(
+    ("hook", "error"),
+    [("start", "RuntimeError"), ("close_out", "ValueError"), ("stop", "KeyError")],
+)
+async def test_exception_in_any_strategy_hook_fails_the_run(hook: str, error: str) -> None:
+    _Recorder.seen = []
+    _HookCrashes.hook = hook
+    with pytest.raises(StrategyError, match=f"rules: {error}"):
+        await _run(BARS[:3], cls=_HookCrashes)
+
+
+class _AlwaysLong(BaseStrategy):
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        if self.context.position(str(bar.symbol)) is not None:
+            return []
+        return [
+            EntrySignal(
+                symbol=bar.symbol,
+                direction=Direction.LONG,
+                strength=D("1"),
+                strategy_id=self.strategy_id,
+                exchange_id="binance",
+                market_type=MarketType.SPOT,
+            )
+        ]
+
+
+async def test_daily_loss_halt_runs_on_bar_time_and_stays_out_of_live_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    bars = [_flat(0), _bar(1, "90", "90", "90", "90")] + [_flat(i, "90") for i in range(2, 30)]
+    result = await _run(
+        bars,
+        cls=_AlwaysLong,
+        config=_config(position_sizing={"max_position_pct": 90.0}),
+        warmup_bars=0,
+        risk_config=RiskConfig(
+            max_position_pct=D("0.9"), max_risk_per_trade=D("0.5"), max_portfolio_heat=D("5")
+        ),
+    )
+
+    # a ~9 % gap-stop loss at 01:00 halts entries until the bar whose close is the next 00:00 UTC
+    sides = [(t["time"], t["side"]) for t in result.transactions]
+    assert sides[:3] == [
+        (bars[0].timestamp.isoformat(), "Buy"),
+        (bars[1].timestamp.isoformat(), "Sell"),
+        (bars[23].timestamp.isoformat(), "Buy"),
+    ]
+    assert result.trades[0].pnl < D("-300")
+    assert not [r for r in caplog.records if r.name == "hydra.audit"]
+    assert not [
+        r for r in caplog.records if r.name.startswith("hydra.") and r.levelno == logging.WARNING
+    ]
+
+
+async def test_session_failure_stops_the_run_and_flattens(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FailsOnBar3(PaperTradingExecutor):
+        async def on_closed_bar(self, symbol: str, bar: OHLCV) -> list[PaperFill]:
+            if bar.timestamp == BARS[3].timestamp:
+                raise OSError("disk gone")
+            return await super().on_closed_bar(symbol, bar)
+
+    monkeypatch.setattr(runner_module, "PaperTradingExecutor", _FailsOnBar3)
+    result = await _run()
+
+    assert result.stopped_reason == "paper executor failed on a closed bar: disk gone"
+    assert result.timestamps == [BARS[2].timestamp, BARS[3].timestamp]
+    assert len(result.equity_curve) == len(result.benchmark_equity) == 2
+    assert [t["side"] for t in result.transactions] == ["Buy", "Sell"]
+    assert D("10000") + sum((t.pnl for t in result.trades), D("0")) == result.equity_curve[-1]
 
 
 async def test_entry_on_last_bar_is_closed_out_with_fees() -> None:

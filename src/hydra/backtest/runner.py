@@ -44,6 +44,22 @@ _NO_DRAWDOWN_TIERS = Decimal(1000)  # tier 1 needs a 200x drawdown: unreachable 
 _YIELD_EVERY = 100
 
 
+class _QuietWhileMuted(logging.Filter):
+    """Per-bar rejections and breaker transitions of a backtest stay out of the engine's logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.ERROR or not metrics.is_muted()
+
+
+for _name in (
+    "hydra.execution.order_manager",
+    "hydra.execution.session_wiring",
+    "hydra.risk.circuit_breakers",
+    "hydra.strategy.engine",
+):
+    logging.getLogger(_name).addFilter(_QuietWhileMuted())
+
+
 class StrategyError(RuntimeError):
     """The strategy raised during the run; the backtest has no result."""
 
@@ -155,7 +171,11 @@ class BacktestRunner:
                 strategy_id=cfg.id,
             )
             await runtime.seed_context()
-            await runtime.wire()
+            try:
+                await runtime.wire()
+            except Exception as exc:
+                await runtime.shutdown()
+                raise StrategyError(f"{cfg.id}: {exc!r}") from exc
             if warm:
                 now[0] = warm[-1].timestamp + step
                 await runtime.prime({(symbol, timeframe): warm})
@@ -178,8 +198,9 @@ class BacktestRunner:
                     )
                 )
                 if runtime.engine.errors:
+                    error = runtime.engine.last_error
                     await runtime.shutdown()
-                    raise StrategyError(runtime.engine.last_error)
+                    raise StrategyError(error)
                 equity.append(await executor.get_equity())
                 timestamps.append(bar.timestamp)
                 if runtime.closing:
@@ -189,6 +210,8 @@ class BacktestRunner:
 
             await runtime.flatten()
             await runtime.shutdown()
+            if runtime.engine.errors:
+                raise StrategyError(runtime.engine.last_error)
             equity[-1] = await executor.get_equity()
 
         trades, transactions = _trades(executor.get_fills())

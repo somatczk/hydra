@@ -536,6 +536,10 @@ def muted() -> Iterator[None]:
         _muted.reset(token)
 
 
+def is_muted() -> bool:
+    return _muted.get()
+
+
 def _collector(name: str) -> Counter | Gauge | Histogram:
     _ensure_initialized()
     collector = _collectors.get(name)
