@@ -46,7 +46,7 @@ from hydra.core.types import (
 from hydra.data.bars import timeframe_seconds
 from hydra.data.ingestion import ExchangeFeedManager
 from hydra.execution.client_factory import ClientFactory
-from hydra.execution.errors import SessionNotRunningError, SpotShortError
+from hydra.execution.errors import SessionNotRunningError, SpotShortError, UnsupportedStrategyError
 from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import (
@@ -58,7 +58,6 @@ from hydra.execution.paper_trading import (
 )
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.risk.service import RiskService
-from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
@@ -79,26 +78,19 @@ FailureCallback = Callable[["TradingSession", str], Coroutine[Any, Any, None]]
 WarmBars = dict[tuple[str, Timeframe], list[OHLCV]]
 
 
-@dataclass(frozen=True, slots=True)
-class StrategyProbe:
-    """What a strategy needs before its session is built."""
-
-    order_management: bool
-    required_history: int
-
-
-async def probe_strategy(cfg: StrategyConfig, hydra_config: HydraConfig) -> StrategyProbe:
-    """Instantiate the strategy against a throwaway context to read its class and history."""
+async def probe_strategy(cfg: StrategyConfig, hydra_config: HydraConfig) -> int:
+    """Instantiate the strategy against a throwaway context and return its required history."""
     engine = StrategyEngine(
         config=hydra_config, event_bus=InMemoryEventBus(), context=StrategyContext()
     )
-    await engine.load_strategy_from_config(cfg)
-    history = [
-        int(s.required_history)
-        for s in engine.get_all_strategies().values()
-        if isinstance(s, BaseStrategy)
-    ]
-    return StrategyProbe(engine.is_order_management, max(history, default=1))
+    try:
+        await engine.load_strategy_from_config(cfg)
+    except (ImportError, AttributeError, TypeError) as exc:
+        raise UnsupportedStrategyError(
+            f"cannot load strategy class {cfg.strategy_class}: {exc}"
+        ) from exc
+    history = [int(s.required_history) for s in engine.get_all_strategies().values()]
+    return max(history, default=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,11 +341,10 @@ class SessionRuntime:
         except Exception:
             logger.exception("Position feedback failed for %s", self.session.session_id)
         for strategy in self.engine.get_all_strategies().values():
-            if isinstance(strategy, BaseStrategy):
-                try:
-                    await strategy.on_fill(event)
-                except Exception:
-                    logger.exception("Strategy %s on_fill failed", strategy.strategy_id)
+            try:
+                await strategy.on_fill(event)
+            except Exception:
+                logger.exception("Strategy %s on_fill failed", strategy.strategy_id)
         self._manual_orders.pop(event.order_id, None)
         if not self.closing:
             try:

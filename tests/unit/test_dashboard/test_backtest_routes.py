@@ -194,12 +194,21 @@ class TestLoadBacktestStrategy:
         assert exc.value.status_code == 404
         assert exc.value.detail["state"] == "not_found"
 
-    def test_order_management_class_is_422(self, strategies_dir: Path) -> None:
+    def test_unimportable_class_is_422(self, strategies_dir: Path) -> None:
         _write_strategy(
             strategies_dir, "grid", strategy_class="hydra.strategy.builtin.grid.GridStrategy"
         )
         with pytest.raises(HTTPException) as exc:
             _load_backtest_strategy("grid")
+        assert exc.value.status_code == 422
+        assert "cannot import strategy class" in exc.value.detail["message"]
+
+    def test_non_strategy_class_is_422(self, strategies_dir: Path) -> None:
+        _write_strategy(
+            strategies_dir, "ctx", strategy_class="hydra.strategy.context.StrategyContext"
+        )
+        with pytest.raises(HTTPException) as exc:
+            _load_backtest_strategy("ctx")
         assert exc.value.status_code == 422
         assert "not supported by the backtester" in exc.value.detail["message"]
 
