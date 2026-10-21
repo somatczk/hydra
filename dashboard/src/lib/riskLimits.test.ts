@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildRiskLimitsUpdate, fractionToPercentInput, riskLimitsToForm } from './riskLimits';
+import { buildRiskLimitsUpdate, fractionToPercentInput, limitChanges, limitText, riskLimitsToForm } from './riskLimits';
 
 const CFG = {
   max_position_pct: 0.1,
@@ -8,6 +8,7 @@ const CFG = {
   max_daily_loss_pct: 0.0075,
   max_drawdown_pct: 0.15,
   max_concurrent_positions: 3,
+  max_consecutive_losses: 5,
 };
 
 describe('fractionToPercentInput', () => {
@@ -56,8 +57,32 @@ describe('buildRiskLimitsUpdate', () => {
     ['max_drawdown_pct', ''],
     ['max_drawdown_pct', 'abc'],
     ['max_concurrent_positions', '2.5'],
+    ['max_consecutive_losses', '1.5'],
   ] as const)('rejects %s = %j', (field, value) => {
     const base = riskLimitsToForm(CFG);
     expect(buildRiskLimitsUpdate(base, { ...base, [field]: value })).toEqual({ ok: false, field });
+  });
+});
+
+describe('limitText', () => {
+  it('shows a fraction as its exact percent and a count as an integer', () => {
+    expect(limitText('max_risk_per_trade', 0.005)).toBe('0.5%');
+    expect(limitText('max_portfolio_heat', 0.125)).toBe('12.5%');
+    expect(limitText('max_consecutive_losses', 5)).toBe('5');
+  });
+});
+
+describe('limitChanges', () => {
+  it('flags a higher ceiling as looser and a lower one as tighter, and skips unchanged fields', () => {
+    expect(
+      limitChanges(CFG, { max_drawdown_pct: 0.25, max_daily_loss_pct: 0.005, max_concurrent_positions: 3 }),
+    ).toEqual([
+      { field: 'max_daily_loss_pct', from: 0.0075, to: 0.005, looser: false },
+      { field: 'max_drawdown_pct', from: 0.15, to: 0.25, looser: true },
+    ]);
+  });
+
+  it('is empty for an empty update', () => {
+    expect(limitChanges(CFG, {})).toEqual([]);
   });
 });
