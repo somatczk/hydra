@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import logging
 import math
+import time
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ from hydra.execution.paper_trading import (
 )
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.risk.service import RiskService
+from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine, _import_strategy_class
@@ -127,6 +129,7 @@ class SessionRuntime:
         db_pool: Any,
         required_history: int,
         on_failure: FailureCallback,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.session = session
         self.cfg = cfg
@@ -153,6 +156,7 @@ class SessionRuntime:
             stale_order_timeout=max(300.0, 2.0 * timeframe_seconds(self.primary)),
             risk=risk,
             session_id=session.session_id,
+            clock=clock,
         )
         self.protect = ProtectiveOrderManager(
             self.om,
@@ -174,9 +178,9 @@ class SessionRuntime:
     # Build, warm up, wire, connect
     # ------------------------------------------------------------------
 
-    async def build(self) -> None:
+    async def build(self, strategy_class: type[BaseStrategy] | None = None) -> None:
         """Load the strategy into the session engine and expose the parts on the session."""
-        await self.engine.load_strategy_from_config(self.cfg)
+        await self.engine.load_strategy_from_config(self.cfg, strategy_class)
         s = self.session
         s._runtime = self
         s._engine = self.engine
@@ -350,8 +354,10 @@ class SessionRuntime:
         for strategy in self.engine.get_all_strategies().values():
             try:
                 await strategy.on_fill(event)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Strategy %s on_fill failed", strategy.strategy_id)
+                self.engine.errors += 1
+                self.engine.last_error = f"{strategy.strategy_id}: {exc!r}"
         self._manual_orders.pop(event.order_id, None)
         if not self.closing:
             try:

@@ -353,6 +353,35 @@ class TestReconciliation:
         assert "hydra_reconciliation_mismatch" not in {s.name for s in metrics.CONTRACT}
 
 
+class TestMuted:
+    def _write_everything(self) -> None:
+        metrics.record_trade("BTCUSDT", "BUY", "s1", "binance", pnl=-1.0)
+        metrics.set_session_position("backtest-1", "s1", "binance", "BTCUSDT", 0.5)
+        metrics.update_portfolio(9000.0, 0.1, -50.0)
+        metrics.set_portfolio_heat(0.2)
+        metrics.set_circuit_breaker_tier("backtest", 2)
+        metrics.set_kill_switch_active(True)
+        metrics.record_signal("s1", "entry_signal")
+        metrics.record_risk_rejection("duplicate", "open")
+        metrics.observe_event_bus_latency(0.01)
+
+    def test_writes_inside_muted_are_dropped(self) -> None:
+        before = _hydra_samples()
+        with metrics.muted():
+            self._write_everything()
+            metrics.forget_session("backtest-1", "s1", "paper")
+        assert _hydra_samples() == before
+        assert "backtest-1" not in metrics._session_positions
+
+    def test_writes_outside_muted_land(self) -> None:
+        with metrics.muted():
+            pass
+        self._write_everything()
+        assert _value("hydra_portfolio_value") == 9000.0
+        assert _value("hydra_circuit_breaker_active_tier", {"scope": "backtest"}) == 2.0
+        assert "backtest-1" in metrics._session_positions
+
+
 class TestReset:
     def test_reset_unregisters_and_reinitializes(self) -> None:
         metrics._ensure_initialized()

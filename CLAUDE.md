@@ -124,6 +124,8 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   `ServiceErrorRoute` turns it into the HTTP error. The frontend reads it with `dashboard/src/lib/apiState.ts`.
   Reuse both.
 - Backtests run only on stored bars (`hydra.backtest.data`); no data means 422, never a synthetic fallback.
+  `BacktestRunner` publishes them on a paper `SessionRuntime` bus (in-memory RiskService on bar time, drawdown tiers
+  off, metrics muted), so backtest and paper share one execution path; `test_execution_parity.py` keeps them equal.
 - The app version comes from `importlib.metadata.version("hydra")`, so `pyproject.toml` is the single source.
 
 ## Code conventions

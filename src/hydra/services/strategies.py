@@ -21,6 +21,8 @@ from hydra.backtest.data import (
 )
 from hydra.core.types import ExchangeId, Timeframe
 from hydra.data.storage import MarketDataRepository
+from hydra.execution.client_factory import validate_venue
+from hydra.execution.errors import UnsupportedVenueError
 from hydra.services.errors import (
     DB_ERRORS,
     ServiceError,
@@ -656,6 +658,10 @@ async def preview_signals(pool: Any, body: PreviewRequest) -> PreviewResponse:
         rule_set = _validate_rules(body.rules)
     except (ValueError, KeyError) as exc:
         raise service_error(422, "invalid_rules", f"Invalid rules: {exc}", "invalid") from exc
+    try:
+        validate_venue(body.exchange_id)
+    except UnsupportedVenueError as exc:
+        raise service_error(422, exc.code, str(exc), "invalid") from exc
 
     pool = require_pool(pool)
     repo = MarketDataRepository.from_pool(pool)

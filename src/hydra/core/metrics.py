@@ -131,6 +131,7 @@ from __future__ import annotations
 import contextlib
 import time
 from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal
 
@@ -499,6 +500,46 @@ def _ensure_initialized() -> None:
             _collector(spec.name)
 
 
+class _Muted:
+    """Stands in for every collector inside ``muted()``: each write is dropped."""
+
+    def labels(self, *values: str, **labels: str) -> _Muted:
+        return self
+
+    def inc(self, amount: float = 1) -> None:
+        return None
+
+    def dec(self, amount: float = 1) -> None:
+        return None
+
+    def set(self, value: float) -> None:
+        return None
+
+    def observe(self, amount: float) -> None:
+        return None
+
+    def remove(self, *values: str) -> None:
+        return None
+
+
+_MUTED = _Muted()
+_muted: ContextVar[bool] = ContextVar("hydra_metrics_muted", default=False)
+
+
+@contextlib.contextmanager
+def muted() -> Iterator[None]:
+    """Drop every metric write made in this context (task and thread local): backtests."""
+    token = _muted.set(True)
+    try:
+        yield
+    finally:
+        _muted.reset(token)
+
+
+def is_muted() -> bool:
+    return _muted.get()
+
+
 def _collector(name: str) -> Counter | Gauge | Histogram:
     _ensure_initialized()
     collector = _collectors.get(name)
@@ -507,21 +548,27 @@ def _collector(name: str) -> Counter | Gauge | Histogram:
     return collector
 
 
-def _counter(name: str) -> Counter:
+def _counter(name: str) -> Counter | _Muted:
+    if _muted.get():
+        return _MUTED
     collector = _collector(name)
     if not isinstance(collector, Counter):
         raise TypeError(f"{name} is not a counter")
     return collector
 
 
-def _gauge(name: str) -> Gauge:
+def _gauge(name: str) -> Gauge | _Muted:
+    if _muted.get():
+        return _MUTED
     collector = _collector(name)
     if not isinstance(collector, Gauge):
         raise TypeError(f"{name} is not a gauge")
     return collector
 
 
-def _histogram(name: str) -> Histogram:
+def _histogram(name: str) -> Histogram | _Muted:
+    if _muted.get():
+        return _MUTED
     collector = _collector(name)
     if not isinstance(collector, Histogram):
         raise TypeError(f"{name} is not a histogram")
@@ -574,7 +621,8 @@ def set_session_position(
     _gauge("hydra_position_size").labels(
         session_id=session_id, strategy_id=strategy_id, exchange_id=exchange_id, symbol=symbol
     ).set(size)
-    _session_positions.setdefault(session_id, set()).add((strategy_id, exchange_id, symbol))
+    if not _muted.get():
+        _session_positions.setdefault(session_id, set()).add((strategy_id, exchange_id, symbol))
 
 
 def update_portfolio(value: float, drawdown_ratio: float, daily_pnl: float) -> None:

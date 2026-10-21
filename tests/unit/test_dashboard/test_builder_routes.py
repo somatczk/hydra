@@ -305,6 +305,13 @@ class TestPreviewSignals:
         response = client.post("/api/strategies/preview", json=request)
         assert response.status_code == 422
 
+    def test_preview_on_a_venue_backtests_refuse_is_422(self, client: TestClient) -> None:
+        request = self._valid_preview_request()
+        request["exchange_id"] = "kraken"
+        response = client.post("/api/strategies/preview", json=request)
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "unsupported_venue"
+
     def test_preview_invalid_comparator_returns_422(self, client: TestClient) -> None:
         """Invalid comparator in preview returns 422."""
         request = self._valid_preview_request()

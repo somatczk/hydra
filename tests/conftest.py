@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -85,3 +86,15 @@ def strategies_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr("hydra.execution.session_manager._STRATEGY_DIR", path)
     monkeypatch.setenv("HYDRA_ML__MODELS_DIR", str(tmp_path / "models"))
     return path
+
+
+@pytest.fixture(autouse=True)
+def offline_market_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Backtests load the fixture's spot markets (lot step 0.00001), never public Binance."""
+    from hydra.risk.market_rules import MarketRulesCache
+    from tests.fixtures.binance_kline import binance_markets
+
+    async def loader(exchange_id: str) -> list[dict[str, Any]]:
+        return list(binance_markets().values())
+
+    monkeypatch.setattr("hydra.backtest.runner._MARKET_RULES", MarketRulesCache(loader=loader))

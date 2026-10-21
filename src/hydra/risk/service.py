@@ -878,6 +878,8 @@ class RiskService:
                 raise
             metrics.record_risk_state_persist_failure()
             logger.exception("risk_events write failed for %s", kind)
+        if self._scope == "backtest":
+            return
         audit_logger.info(
             json.dumps(
                 {

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NoReturn, Protocol, cast, runtime_checkable
@@ -137,11 +138,11 @@ class _TrackedOrder:
 
     __slots__ = ("order_id", "request", "status", "submitted_at")
 
-    def __init__(self, request: OrderRequest, order_id: str) -> None:
+    def __init__(self, request: OrderRequest, order_id: str, submitted_at: float) -> None:
         self.request = request
         self.order_id = order_id
         self.status: OrderStatus = OrderStatus.SUBMITTED
-        self.submitted_at: float = time.monotonic()
+        self.submitted_at = submitted_at
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +154,8 @@ class OrderManager:
     """Signal -> OrderRequest -> risk check -> submit -> track -> emit fill.
 
     With ``risk`` (a RiskService) every order is risk-checked for ``session_id``; without it
-    orders go straight to the executor (tests and tools only).
+    orders go straight to the executor (tests and tools only). ``clock`` (seconds) drives dedup
+    and stale-order age; a replay passes bar time.
     """
 
     def __init__(
@@ -165,8 +167,10 @@ class OrderManager:
         *,
         risk: RiskService | None = None,
         session_id: str = "",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._executor = executor
+        self._clock = clock
         self._event_bus = event_bus
         self._risk = risk
         self._session_id = session_id
@@ -211,7 +215,7 @@ class OrderManager:
             return None
         order, intent = resolved
         if intent == OPEN:
-            self._dedup(order, now)
+            self._dedup(order)
         resp = await self._create(order)
         return await self._track_and_publish(order, intent, resp, now)
 
@@ -228,7 +232,7 @@ class OrderManager:
                     return None
                 order, intent = resolved
                 if intent == OPEN:
-                    self._dedup(order, now)
+                    self._dedup(order)
                 decision = await risk.check(order, self._session_id, intent)
                 if not decision.approved:
                     self._reject(decision)
@@ -261,8 +265,9 @@ class OrderManager:
                 order = replace(order, quantity=held.quantity)
         return order, classify_intent(order)
 
-    def _dedup(self, order: OrderRequest, now: float) -> None:
+    def _dedup(self, order: OrderRequest) -> None:
         key = _dedup_key(order)
+        now = self._clock()
         if key in self._dedup_cache and now - self._dedup_cache[key] < self._dedup_window:
             self._reject(
                 RiskDecision(
@@ -296,7 +301,7 @@ class OrderManager:
         self, order: OrderRequest, intent: Intent, resp: dict[str, Any], started: float
     ) -> str:
         order_id = str(resp.get("id", str(uuid.uuid4())))
-        tracked = _TrackedOrder(request=order, order_id=order_id)
+        tracked = _TrackedOrder(request=order, order_id=order_id, submitted_at=self._clock())
         self._orders[order_id] = tracked
 
         status_str = str(resp.get("status", "")).upper()
@@ -464,7 +469,7 @@ class OrderManager:
 
         Protective orders (stops, OCOs) rest until the position closes and are never stale.
         """
-        now = time.monotonic()
+        now = self._clock()
         cancelled: list[str] = []
         for order_id, tracked in list(self._orders.items()):
             if tracked.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED):

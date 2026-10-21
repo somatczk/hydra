@@ -7,6 +7,8 @@ from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from hydra.core.events import OrderCancelEvent, OrderFillEvent
 from hydra.core.types import (
     OHLCV,
@@ -17,7 +19,7 @@ from hydra.core.types import (
     Side,
     Symbol,
 )
-from hydra.execution.order_manager import PROTECTIVE_TAG, OrderManager
+from hydra.execution.order_manager import PROTECTIVE_TAG, OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import PaperTradingExecutor
 
 # ---------------------------------------------------------------------------
@@ -179,6 +181,21 @@ class TestGetOpenOrders:
         btc_orders = mgr.get_open_orders(symbol="BTCUSDT")
         assert len(btc_orders) == 1
         assert btc_orders[0].symbol == Symbol("BTCUSDT")
+
+
+class TestDedupClock:
+    async def test_bar_clock_dedups_on_bar_time_not_wall_time(self) -> None:
+        now = [0.0]
+        executor = _mock_executor(fill_immediately=False)
+        mgr = OrderManager(executor=executor, event_bus=_mock_event_bus(), clock=lambda: now[0])
+        await mgr.submit_order(_make_order())
+        now[0] = 3600.0
+        await mgr.submit_order(_make_order())
+        now[0] = 3600.5
+        with pytest.raises(RiskRejectedError) as exc:
+            await mgr.submit_order(_make_order())
+        assert exc.value.check == "duplicate"
+        assert executor.create_order.await_count == 2
 
 
 class TestStaleCleanup:

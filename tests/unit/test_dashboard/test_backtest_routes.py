@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import re
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -578,8 +579,8 @@ class TestWalkForwardMonths:
         # 57 bars over 392 days: 4 months = 17 weekly bars, 2 months = 8, stepping 8.
         assert len(result.folds) == 5
         for fold in result.folds:
-            assert len(fold.in_sample_metrics.equity_curve) == 17 + 1
-            assert len(fold.out_of_sample_metrics.equity_curve) == 8 + 1
+            assert len(fold.in_sample_metrics.equity_curve) == 17
+            assert len(fold.out_of_sample_metrics.equity_curve) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +657,47 @@ async def test_persistence_failure_fails_the_task(strategies_dir: Path) -> None:
     assert _TASKS["task-p"]["status"] == "failed"
     assert _TASKS["task-p"]["error"].startswith("result not persisted")
     assert "result_id" not in _TASKS["task-p"]
+    assert _RESULTS == {}
+
+
+class _Boom(BaseStrategy):
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        raise ZeroDivisionError("division by zero")
+
+
+async def test_strategy_exception_fails_the_task_with_its_message(strategies_dir: Path) -> None:
+    _write_strategy(strategies_dir, "saw")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    rows = [
+        {
+            "open": 1000,
+            "high": 1000,
+            "low": 1000,
+            "close": 1000,
+            "volume": 10,
+            "timestamp": start + timedelta(hours=i),
+        }
+        for i in range(60)
+    ]
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    pf = await _preflight(
+        _Pool(_BarsThenFailingWrites(rows)),
+        "saw",
+        None,
+        body.start_date,
+        body.end_date,
+        require_data=False,
+    )
+    _TASKS["task-s"] = {"task_id": "task-s", "status": "queued", "progress": 0.0}
+
+    await _run_backtest_task("task-s", body, replace(pf, strategy_cls=_Boom))
+
+    assert _TASKS["task-s"]["status"] == "failed"
+    assert _TASKS["task-s"]["error"] == "saw: ZeroDivisionError('division by zero')"
     assert _RESULTS == {}
 
 
@@ -748,7 +790,7 @@ def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
         "calmar_ratio": None,
         "profit_factor": 0.5,
         "max_drawdown_duration_s": 7200,
-        "stopped_reason": "margin_call",
+        "stopped_reason": "paper ledger halted",
         "strategy_id": "saw",
         "initial_capital": 1000.0,
         "data_source": "db",
@@ -772,7 +814,7 @@ def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
 class TestPersistedDetail:
     def test_stopped_reason_benchmark_and_extended_metrics_round_trip(self) -> None:
         detail = BacktestResultDetail(**detail_from_row(_db_row(), []))
-        assert detail.stopped_reason == "margin_call"
+        assert detail.stopped_reason == "paper ledger halted"
         assert detail.benchmark_equity == [
             {"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}
         ]

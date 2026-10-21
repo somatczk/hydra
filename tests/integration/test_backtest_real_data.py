@@ -361,13 +361,16 @@ async def test_bars_are_filtered_by_exchange(
         strategies_dir, "saw_okx", exchange={"exchange_id": "okx", "market_type": "SPOT"}
     )
 
-    status = await _run(
-        client, strategy_id="saw_kraken", start_date="2026-01-01", end_date="2026-01-31"
+    # kraken bars are found, but the paper execution core trades Binance SPOT only
+    resp = await client.post(
+        "/api/backtest/run",
+        json={"strategy_id": "saw_kraken", "start_date": "2026-01-01", "end_date": "2026-01-31"},
     )
-    detail = (await client.get(f"/api/backtest/results/{status['result_id']}")).json()
-    assert detail["provenance"]["exchange"] == "kraken"
-    assert detail["provenance"]["bar_count"] == H1_COUNT
-    assert all(t["entry_price"] < 10 for t in detail["trades"])
+    assert resp.status_code == 202, resp.text
+    await _drain()
+    status = (await client.get(f"/api/backtest/status/{resp.json()['task_id']}")).json()
+    assert status["status"] == "failed"
+    assert "kraken SPOT is not supported" in status["error"]
 
     resp = await client.post(
         "/api/backtest/run",

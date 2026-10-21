@@ -1,8 +1,9 @@
-"""Decision 18: the backtester applies the paper session's rules.
+"""Decision 18: the backtester runs the paper session's rules (it is the paper session core).
 
 No pyramiding, no short entries on spot, a protective exit from the strategy's ``risk`` block on
 every entry (default 5 % stop), gap-through stops at the worse of stop and open (``fill_rules``),
-and the protective order cancelled by an exit. Zero slippage, so prices are exact.
+and the protective order cancelled by an exit. Market orders fill at the signal bar's close.
+Zero slippage and fees, so prices are exact.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, ClassVar
 
-from hydra.backtest.fills import CommissionConfig, SlippageModel
+from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.metrics import BacktestResult
 from hydra.backtest.runner import BacktestRunner
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
@@ -103,11 +104,10 @@ async def _run(cls: type, bars: list[OHLCV], risk: dict[str, Any] | None = None)
         symbols=["BTCUSDT"],
         **({"risk": risk} if risk is not None else {}),
     )
-    runner = BacktestRunner(
-        slippage_model=SlippageModel(spread_factor=D("0"), volume_impact_factor=D("0"))
-    )
     commission = CommissionConfig(spot_maker=D("0"), spot_taker=D("0"))
-    return await runner.run(cls, cfg, bars, initial_capital=D("10000"), commission=commission)
+    return await BacktestRunner().run(
+        cls, cfg, bars, initial_capital=D("10000"), commission=commission, slippage_pct=D("0")
+    )
 
 
 def _kinds(result: BacktestResult) -> list[tuple[str, str, float]]:
@@ -128,7 +128,7 @@ async def test_short_entries_on_spot_are_dropped() -> None:
 
 
 async def test_default_stop_gaps_at_the_open_like_paper() -> None:
-    # entry signal on bar 0 -> market fill at bar 2's open (100); default stop 95
+    # entry signal on bar 0 -> market fill at its close (100); default stop 95
     bars = _seq(*_flat(4), ("90", "91", "89", "90.5"), *_flat(3, "90"))
     result = await _run(_strategy({0}), bars)
     assert _kinds(result) == [("entry", "Buy", 100.0), ("exit", "Sell", 90.0)]
@@ -152,7 +152,7 @@ async def test_risk_block_stop_and_take_profit_as_oco() -> None:
 async def test_strategy_exit_cancels_the_stop_and_no_short_follows() -> None:
     bars = _seq(*_flat(6), ("100", "100", "50", "60"), *_flat(3, "60"))
     result = await _run(_strategy({0}, exits={3}), bars)
-    # exit signalled on bar 3 fills at bar 5's open; the crash on bar 6 finds no position
+    # exit signalled on bar 3 fills at its close; the crash on bar 6 finds no position
     assert _kinds(result) == [("entry", "Buy", 100.0), ("exit", "Sell", 100.0)]
     assert result.total_trades == 1
 
