@@ -18,7 +18,6 @@ interface ConfirmDialogProps {
   primaryDisabled?: boolean;
   /** Focus the title on open so a stray Enter can't confirm (R-P2-11). */
   destructive?: boolean;
-  primaryDisabled?: boolean;
 }
 
 /** L2 confirm: a centred dialog at ≥1024 px, a bottom sheet below. */
@@ -34,7 +33,6 @@ export function ConfirmDialog({
   onClose,
   primaryDisabled = false,
   destructive = false,
-  primaryDisabled = false,
 }: ConfirmDialogProps) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
