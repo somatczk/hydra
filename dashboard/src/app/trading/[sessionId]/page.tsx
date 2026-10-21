@@ -1,458 +1,298 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
-import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Square, AlertTriangle } from 'lucide-react';
+import { useEffect, useState, type ReactNode } from 'react';
+import Link from 'next/link';
+import { useParams } from 'next/navigation';
+import { Copy } from 'lucide-react';
+import { QuickTrade } from '@/components/sessions/QuickTrade';
+import { SessionHealth } from '@/components/sessions/SessionHealth';
+import { StopSessionDialog } from '@/components/sessions/StopSessionDialog';
+import { useOutcomeSlot } from '@/components/sessions/useOutcomeSlot';
+import { useShellStatus } from '@/components/shell/ShellStatusProvider';
+import { ChartAndBook } from '@/components/trading/ChartAndBook';
 import { Button } from '@/components/ui/Button';
-import { DataCard } from '@/components/ui/DataCard';
-import { Table } from '@/components/ui/Table';
+import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { StatusBadge } from '@/components/ui/StatusBadge';
-import { ErrorCard } from '@/components/ui/ErrorCard';
-import { fetchApi, connectWebSocket } from '@/lib/api';
-import { useToast } from '@/components/ui/Toast';
-import { logger } from '@/lib/logger';
+import { Table } from '@/components/ui/Table';
+import { usePoll } from '@/hooks/usePoll';
+import { connectWebSocket } from '@/lib/api';
+import { stateFromError } from '@/lib/apiState';
+import { fillQty, plural, sessionName, sideLabel, winRate, type PositionItem, type SessionDetail, type TradeItem } from '@/lib/derive';
+import { money, pct, price, qty, signed, utc } from '@/lib/format';
+import { baseAsset } from '@/lib/outcomes';
 import { classifySessionWsMessage, debounce } from '@/lib/sessionWs';
 
 const FILL_REFETCH_DEBOUNCE_MS = 500;
 
-/* ---------- Types ---------- */
-
-interface PositionItem {
-  symbol: string;
-  direction: string;
-  quantity: number;
-  avg_entry_price: number;
-  unrealized_pnl: number;
+function Section({ id, title, children }: { id: string; title: string; children: ReactNode }) {
+  return (
+    <section aria-labelledby={id} className="flex flex-col gap-3">
+      <h2 id={id} className="text-base font-semibold text-ink-1">
+        {title}
+      </h2>
+      {children}
+    </section>
+  );
 }
 
-interface TradeItem {
-  id?: string;
-  symbol?: string;
-  side?: string;
-  quantity: number;
-  price: number;
-  fee: number;
-  pnl: number;
-  timestamp?: string;
+function Stat({ label, value, note }: { label: string; value: string | null; note?: string }) {
+  return (
+    <div className="rounded border border-line bg-surface p-3">
+      <dt className="text-sm text-ink-2">{label}</dt>
+      <dd className="mt-1 text-lg font-semibold text-ink-1">
+        {value ?? (
+          <>
+            <span aria-hidden="true">—</span> <DataStateBadge state="unavailable" reason={`${label} isn't reported yet`} />
+          </>
+        )}
+      </dd>
+      {note && <p className="mt-0.5 text-xs text-ink-2">{note}</p>}
+    </div>
+  );
 }
 
-interface SessionMetrics {
-  balance: Record<string, number>;
-  total_pnl: number;
-  win_rate: number;
-  total_trades: number;
-  open_positions: number;
-}
-
-interface SessionDetail {
-  session_id: string;
-  strategy_id: string;
-  strategy_name: string | null;
-  trading_mode: string;
-  status: string;
-  exchange_id: string;
-  symbols: string[];
-  timeframe: string;
-  paper_capital: number | null;
-  started_at: string | null;
-  stopped_at: string | null;
-  error_message: string | null;
-  positions_at_stop: number;
-  metrics: SessionMetrics;
-  positions: PositionItem[];
-  trades: TradeItem[];
-}
-
-/* ---------- Helpers ---------- */
-
-function fmtUsd(v: number): string {
-  const sign = v >= 0 ? '+' : '-';
-  return `${sign}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
-}
-
-function fmtPrice(v: number): string {
-  return `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
-}
-
-/* ---------- Position table ---------- */
-
-interface PosRow {
-  id: string;
-  symbol: string;
-  direction: string;
-  quantity: string;
-  avg_entry_price: string;
-  unrealized_pnl: number;
-  unrealized_pnl_fmt: string;
-}
-
-const positionColumns = [
-  { key: 'symbol', header: 'Symbol' },
-  {
-    key: 'direction',
-    header: 'Direction',
-    render: (row: PosRow) => (
-      <StatusBadge
-        status={row.direction}
-        variant={row.direction === 'long' ? 'success' : 'error'}
-        size="sm"
+function Account({ d }: { d: SessionDetail }) {
+  const m = d.metrics;
+  const win = winRate(d.trades);
+  return (
+    <dl className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+      <Stat label="Equity (USDT)" value={money(m.equity)} />
+      <Stat label="Realised (USDT)" value={signed(m.realized_pnl)} />
+      <Stat
+        label="Unrealised (USDT)"
+        value={signed(m.unrealized_pnl)}
+        note={`Marked at the last closed ${d.timeframe} bar${d.last_bar_at ? ` (processed ${utc(d.last_bar_at)})` : ''}`}
       />
-    ),
-  },
-  { key: 'quantity', header: 'Quantity' },
-  { key: 'avg_entry_price', header: 'Entry Price' },
-  {
-    key: 'unrealized_pnl',
-    header: 'Unrealized PnL',
-    render: (row: PosRow) => (
-      <span className={row.unrealized_pnl >= 0 ? 'text-status-success font-medium' : 'text-status-error font-medium'}>
-        {row.unrealized_pnl_fmt}
-      </span>
-    ),
-  },
-];
-
-/* ---------- Trade table ---------- */
-
-interface TradeRow {
-  id: string;
-  side: string;
-  symbol: string;
-  price: string;
-  quantity: string;
-  fee: string;
-  pnl: number;
-  pnl_fmt: string;
-  time: string;
+      <Stat label="Fees (USDT)" value={money(m.fees)} />
+      <Stat label="Drawdown" value={pct(m.drawdown === null ? null : m.drawdown * 100)} />
+      <div className="rounded border border-line bg-surface p-3">
+        <dt className="text-sm text-ink-2">Win rate</dt>
+        <dd className="mt-1 text-lg font-semibold text-ink-1">
+          {win === null ? (
+            <>
+              <DataStateBadge state="no_data" reason="No closed trades yet" /> <span className="text-sm font-normal text-ink-2">No closed trades yet</span>
+            </>
+          ) : (
+            pct(win)
+          )}
+        </dd>
+      </div>
+    </dl>
+  );
 }
 
-const tradeColumns = [
-  { key: 'id', header: '#', render: (row: TradeRow) => <span className="text-text-muted">{row.id}</span> },
-  {
-    key: 'side',
-    header: 'Side',
-    render: (row: TradeRow) => (
-      <StatusBadge
-        status={row.side}
-        variant={row.side.toLowerCase() === 'buy' ? 'success' : 'error'}
-        size="sm"
+function Positions({ d }: { d: SessionDetail }) {
+  const base = baseAsset(d.symbols[0] ?? '');
+  if (d.positions.length > 0) {
+    return (
+      <Table<PositionItem>
+        columns={[
+          { key: 'symbol', header: 'Symbol' },
+          { key: 'direction', header: 'Side', render: (p) => sideLabel(p.direction).text },
+          { key: 'quantity', header: `Qty (${base})`, render: (p) => qty(p.quantity) },
+          { key: 'avg_entry_price', header: 'Avg entry', render: (p) => price(p.avg_entry_price) },
+          { key: 'unrealized_pnl', header: 'Unrealised (USDT)', render: (p) => signed(p.unrealized_pnl) },
+        ]}
+        data={d.positions}
+        keyExtractor={(p) => p.symbol}
       />
-    ),
-  },
-  { key: 'symbol', header: 'Symbol' },
-  { key: 'price', header: 'Price' },
-  { key: 'quantity', header: 'Qty', hideOnMobile: true },
-  { key: 'fee', header: 'Fee', hideOnMobile: true },
-  {
-    key: 'pnl',
-    header: 'PnL',
-    render: (row: TradeRow) => (
-      <span className={row.pnl >= 0 ? 'text-status-success font-medium' : 'text-status-error font-medium'}>
-        {row.pnl_fmt}
-      </span>
-    ),
-  },
-  { key: 'time', header: 'Time' },
-];
+    );
+  }
+  if (d.status !== 'running' && (d.positions_at_stop > 0 || d.flatten_incomplete)) {
+    const held = d.positions_at_stop > 0 ? plural(d.positions_at_stop, 'position') : 'Positions';
+    return <p className="text-sm text-danger">{held} still held; details aren&apos;t available for a stopped session.</p>;
+  }
+  return <p className="text-sm text-ink-2">No open positions. This session holds only USDT.</p>;
+}
 
-/* ---------- Page ---------- */
+function Fills({ d }: { d: SessionDetail }) {
+  if (d.trades.length === 0) {
+    return <p className="text-sm text-ink-2">No fills yet. The strategy trades on closed {d.timeframe} bars.</p>;
+  }
+  return (
+    <Table<TradeItem>
+      columns={[
+        { key: 'timestamp', header: 'Time (UTC)', render: (t) => utc(t.timestamp) ?? '—' },
+        { key: 'side', header: 'Side', render: (t) => sideLabel(t.side).text },
+        {
+          key: 'quantity',
+          header: 'Qty',
+          render: (t) => {
+            const q = fillQty(t);
+            return q === null ? (
+              <>
+                <span aria-hidden="true">—</span> <span className="sr-only">quantity not reported</span>
+                <DataStateBadge state="unknown" />
+              </>
+            ) : (
+              qty(q)
+            );
+          },
+        },
+        { key: 'price', header: 'Price', render: (t) => price(t.price) ?? '—' },
+        { key: 'fee', header: 'Fee', render: (t) => money(t.fee) ?? '—' },
+        { key: 'net_pnl', header: 'Net P&L', render: (t) => signed(t.net_pnl) ?? '—' },
+        { key: 'reason', header: 'Reason', render: (t) => t.reason ?? '—' },
+      ]}
+      data={d.trades}
+      keyExtractor={(t) => t.id ?? `${t.timestamp}-${t.price}`}
+    />
+  );
+}
 
 export default function SessionDetailPage() {
-  const params = useParams();
-  const router = useRouter();
-  const { toast } = useToast();
-  const sessionId = params.sessionId as string;
-
-  const [detail, setDetail] = useState<SessionDetail | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [fetchError, setFetchError] = useState(false);
+  const { sessionId } = useParams<{ sessionId: string }>();
+  const shell = useShellStatus();
+  const poll = usePoll<SessionDetail>(`/api/trading/sessions/${sessionId}/detail`, 15_000);
+  const { data: d, refetch } = poll;
+  const [push, setPush] = useState(false);
   const [stopping, setStopping] = useState(false);
-  const [wsConnected, setWsConnected] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const statusRef = useRef<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const running = d?.status === 'running';
+  const row = shell.sessions.data?.find((s) => s.session_id === sessionId);
+  const listed = { persist_dirty: row?.persist_dirty ?? null, feed_live: row?.feed_live ?? null };
+  const { refetchAll } = shell;
 
-  const fetchDetail = useCallback(async () => {
-    try {
-      const d = await fetchApi<SessionDetail>(`/api/trading/sessions/${sessionId}/detail`);
-      setDetail(d);
-      setFetchError(false);
-    } catch (err) {
-      logger.warn('SessionDetail', 'Failed to fetch session detail', err);
-      setFetchError(true);
-    } finally {
-      setLoading(false);
-    }
-  }, [sessionId]);
+  const slot = useOutcomeSlot(
+    () => (d ? sessionName(d) : sessionId),
+    () => {
+      void refetch();
+      void refetchAll();
+    },
+  );
 
   useEffect(() => {
-    fetchDetail();
-  }, [fetchDetail]);
+    if (d) document.title = `Session ${sessionName(d)} · Hydra`;
+  }, [d]);
 
-  // Keep status ref in sync
   useEffect(() => {
-    if (detail) statusRef.current = detail.status;
-  }, [detail?.status]);
-
-  // WebSocket for live trade updates, with polling fallback
-  useEffect(() => {
-    if (!detail || detail.status !== 'running') return;
-
-    const startPolling = () => {
-      if (!intervalRef.current) {
-        intervalRef.current = setInterval(fetchDetail, 5000);
-      }
-    };
-
-    // Fills only trigger a re-fetch: the server's detail endpoint owns PnL and win rate
-    const refetchOnFill = debounce(fetchDetail, FILL_REFETCH_DEBOUNCE_MS);
-    const ws = connectWebSocket(
-      `/ws/trades?session_id=${sessionId}`,
-      (data) => {
-        if (classifySessionWsMessage(data, sessionId) === 'refetch') refetchOnFill.trigger();
-      },
-    );
-
+    if (!running) return;
+    const refetchOnFill = debounce(() => void refetch(), FILL_REFETCH_DEBOUNCE_MS);
+    const ws = connectWebSocket(`/ws/trades?session_id=${sessionId}`, (msg) => {
+      if (classifySessionWsMessage(msg, sessionId) === 'refetch') refetchOnFill.trigger();
+    });
     if (ws) {
-      wsRef.current = ws;
-      ws.onopen = () => {
-        setWsConnected(true);
-        logger.info('SessionDetail', 'WebSocket connected');
-        // Clear polling if active
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
-      };
-      ws.onclose = () => {
-        setWsConnected(false);
-        logger.info('SessionDetail', 'WebSocket disconnected, falling back to polling');
-        startPolling();
-      };
-      ws.onerror = () => {
-        setWsConnected(false);
-        logger.warn('SessionDetail', 'WebSocket error, falling back to polling');
-        startPolling();
-      };
-    } else {
-      // WebSocket failed to connect, use polling
-      logger.info('SessionDetail', 'WebSocket unavailable, using polling');
-      startPolling();
+      ws.onopen = () => setPush(true);
+      ws.onclose = () => setPush(false);
+      ws.onerror = () => setPush(false);
     }
-
     return () => {
       refetchOnFill.cancel();
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
+      ws?.close();
+      setPush(false);
     };
-  }, [sessionId, fetchDetail, detail?.status]);
+  }, [running, sessionId, refetch]);
 
-  const handleStop = async () => {
-    setStopping(true);
-    try {
-      await fetchApi(`/api/trading/sessions/${sessionId}`, { method: 'DELETE' });
-      toast('success', 'Session stopped');
-      fetchDetail();
-    } catch (err) {
-      logger.error('SessionDetail', 'Failed to stop session', err);
-      toast('error', 'Failed to stop session');
-    } finally {
-      setStopping(false);
-    }
-  };
-
-  if (loading) {
+  if (d === null) {
+    if (poll.state === 'loading') return <div className="h-48 animate-pulse rounded border border-line bg-surface" aria-label="Loading session" />;
     return (
-      <div className="flex flex-col gap-6">
-        <div className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <div key={i} className="h-20 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
-          ))}
-        </div>
-        <div className="h-48 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
+      <div className="flex flex-col gap-4">
+        <h1 className="text-xl font-semibold">{stateFromError(poll.error) === 'not_found' ? 'Session not found' : 'Session'}</h1>
+        <DataStateErrorCard error={poll.error} fallback="Failed to load the session" onRetry={() => void refetch()} />
+        <Link href="/trading" className="text-sm underline">
+          Back to Sessions
+        </Link>
       </div>
     );
   }
 
-  if (fetchError && !detail) {
-    return (
-      <div className="flex flex-col items-center justify-center gap-4 py-20">
-        <ErrorCard message="Failed to load session details" onRetry={fetchDetail} />
-        <Button variant="outline" onClick={() => router.push('/strategies')}>
-          <ArrowLeft className="h-4 w-4" /> Back to Strategies
-        </Button>
-      </div>
-    );
-  }
-
-  if (!detail) {
-    return (
-      <div className="flex flex-col items-center justify-center gap-4 py-20">
-        <p className="text-sm text-text-muted">Session not found</p>
-        <Button variant="outline" onClick={() => router.push('/strategies')}>
-          <ArrowLeft className="h-4 w-4" /> Back to Strategies
-        </Button>
-      </div>
-    );
-  }
-
-  const modeBadge = detail.trading_mode === 'paper' ? 'Paper' : 'Live';
-  const modeVariant = detail.trading_mode === 'paper' ? 'info' : 'warning';
-  const statusVariant = detail.status === 'running' ? 'success' : detail.status === 'error' ? 'error' : 'neutral';
-
-  const posRows: PosRow[] = detail.positions.map((p, i) => ({
-    id: String(i),
-    symbol: p.symbol,
-    direction: p.direction,
-    quantity: p.quantity.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''),
-    avg_entry_price: fmtPrice(p.avg_entry_price),
-    unrealized_pnl: p.unrealized_pnl,
-    unrealized_pnl_fmt: fmtUsd(p.unrealized_pnl),
-  }));
-
-  const tradeRows: TradeRow[] = detail.trades.map((t, i) => ({
-    id: t.id ?? String(i + 1),
-    side: t.side ?? 'unknown',
-    symbol: t.symbol ?? detail.symbols[0] ?? '',
-    price: fmtPrice(t.price),
-    quantity: t.quantity.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''),
-    fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '\u2014',
-    pnl: t.pnl,
-    pnl_fmt: fmtUsd(t.pnl),
-    time: t.timestamp ? new Date(t.timestamp).toLocaleString() : '\u2014',
-  }));
-
-  const balanceDisplay = Object.entries(detail.metrics.balance)
-    .map(([k, v]) => `${v.toLocaleString('en-US', { minimumFractionDigits: 2 })} ${k}`)
-    .join(', ') || '\u2014';
+  const name = sessionName(d);
+  const id8 = d.session_id.slice(0, 8);
+  const holds = d.status !== 'running' && (d.positions_at_stop > 0 || d.flatten_incomplete);
+  const copy = () =>
+    navigator.clipboard
+      .writeText(d.session_id)
+      .then(() => setCopied(true))
+      .catch(() => setCopied(false));
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Error banner */}
-      {detail.status === 'error' && detail.error_message && (
-        <div className="flex items-center gap-3 rounded-xl border border-status-error/30 bg-status-error/10 px-4 py-3">
-          <AlertTriangle className="h-5 w-5 shrink-0 text-status-error" />
-          <div>
-            <p className="text-sm font-medium text-text-primary">Session Error</p>
-            <p className="text-xs text-text-muted">{detail.error_message}</p>
-          </div>
-        </div>
-      )}
-
-      {detail.status === 'stopped' && detail.positions_at_stop > 0 && (
-        <div className="flex items-center gap-3 rounded-xl border border-status-warning/30 bg-status-warning/10 px-4 py-3">
-          <AlertTriangle className="h-5 w-5 shrink-0 text-status-warning" />
-          <div>
-            <p className="text-sm font-medium text-text-primary">Positions Not Fully Closed</p>
-            <p className="text-xs text-text-muted">
-              {detail.positions_at_stop} position{detail.positions_at_stop > 1 ? 's' : ''} remained open when this session was stopped. Check the exchange manually.
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-center gap-3">
-          <Button variant="ghost" size="sm" onClick={() => router.push('/strategies')}>
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div>
-            <h1 className="text-lg font-semibold text-text-primary">
-              {detail.strategy_name || detail.strategy_id}
-            </h1>
-            <p className="text-xs text-text-muted">
-              {detail.exchange_id} &middot; {detail.symbols.join(', ')} &middot; {detail.timeframe}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {detail.status === 'running' && (
-            <StatusBadge
-              status={wsConnected ? 'Live' : 'Polling'}
-              variant={wsConnected ? 'success' : 'info'}
-              size="sm"
-            />
-          )}
-          <StatusBadge status={modeBadge} variant={modeVariant} />
-          <StatusBadge status={detail.status.charAt(0).toUpperCase() + detail.status.slice(1)} variant={statusVariant} />
-          {detail.status === 'running' && (
-            <Button variant="danger" size="sm" onClick={handleStop} loading={stopping}>
-              <Square className="h-3 w-3" /> Stop
+      <header className="flex flex-col gap-2">
+        <nav aria-label="Breadcrumb" className="text-sm text-ink-2 max-lg:hidden">
+          <Link href="/trading" className="underline">
+            Sessions
+          </Link>{' '}
+          / {name} · <span className="font-mono">{id8}</span>
+        </nav>
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="text-xl font-semibold text-ink-1">{name}</h1>
+          <StatusBadge status={d.status} variant={d.status === 'error' ? 'error' : d.status === 'running' ? 'info' : 'neutral'} />
+          {poll.state === 'stale' && poll.fetchedAt !== null && <DataStateBadge state="stale" reason={`Session as of ${utc(poll.fetchedAt)}`} />}
+          {running && (
+            <Button variant="secondary" onClick={() => setStopping(true)}>
+              Stop session…
             </Button>
           )}
         </div>
+        <p className="flex items-center gap-2 text-sm text-ink-2">
+          <span className="font-mono">{id8}</span>
+          <button
+            type="button"
+            aria-label={`Copy session id ${d.session_id}`}
+            onClick={() => void copy()}
+            className="inline-flex h-8 w-8 items-center justify-center rounded hover:bg-hover max-lg:h-11 max-lg:w-11"
+          >
+            <Copy className="h-4 w-4" aria-hidden="true" />
+          </button>
+          {copied && <span role="status">Copied</span>}
+        </p>
+      </header>
+
+      {slot.panel}
+
+      <Section id="health-heading" title="Health">
+        <SessionHealth detail={{ ...d, ...listed }} push={push} now={shell.now} />
+      </Section>
+
+      <Section id="account-heading" title="Account">
+        <Account d={d} />
+      </Section>
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        <Section id="positions-heading" title="Positions">
+          <Positions d={d} />
+          {holds && (
+            <div>
+              <Button
+                variant="secondary"
+                disabled={slot.busy !== null}
+                onClick={() => void slot.again({ kind: 'try_closing', label: 'Try closing again', sessionIds: [d.session_id] })}
+              >
+                Try closing again
+              </Button>
+            </div>
+          )}
+        </Section>
+        <ChartAndBook symbol={d.symbols[0] ?? 'BTCUSDT'} />
       </div>
 
-      {/* Metrics row */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
-        {detail.paper_capital != null && detail.paper_capital > 0 && (
-          <DataCard padding="sm">
-            <p className="text-xs text-text-muted">Starting Capital</p>
-            <p className="text-lg font-bold text-text-primary">{fmtPrice(detail.paper_capital)}</p>
-          </DataCard>
-        )}
-        <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Balance</p>
-          <p className="text-lg font-bold text-text-primary">{balanceDisplay}</p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Total PnL</p>
-          <p className={`text-lg font-bold ${detail.metrics.total_pnl >= 0 ? 'text-status-success' : 'text-status-error'}`}>
-            {fmtUsd(detail.metrics.total_pnl)}
-            {detail.paper_capital != null && detail.paper_capital > 0 && (
-              <span className="text-xs font-normal ml-1">
-                ({(detail.metrics.total_pnl / detail.paper_capital * 100).toFixed(1)}%)
-              </span>
-            )}
-          </p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Win Rate</p>
-          <p className="text-lg font-bold text-text-primary">{detail.metrics.win_rate.toFixed(1)}%</p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Total Trades</p>
-          <p className="text-lg font-bold text-text-primary">{detail.metrics.total_trades}</p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Open Positions</p>
-          <p className="text-lg font-bold text-text-primary">{detail.metrics.open_positions}</p>
-        </DataCard>
-      </div>
-
-      {/* Open Positions */}
-      {posRows.length > 0 && (
-        <DataCard title="Open Positions" description={`${posRows.length} active`}>
-          <Table
-            columns={positionColumns}
-            data={posRows}
-            keyExtractor={(row) => row.id}
-            emptyMessage="No open positions"
+      {running && (
+        <Section id="quick-trade-heading" title="Trade in this session">
+          <QuickTrade
+            session={d}
+            positions={d.positions}
+            onOutcome={slot.setOutcome}
+            onSent={() => {
+              void refetch();
+              void refetchAll();
+            }}
           />
-        </DataCard>
+        </Section>
       )}
 
-      {/* Trade History */}
-      <DataCard title="Trade History" description={`${tradeRows.length} fills`}>
-        {tradeRows.length > 0 ? (
-          <Table
-            columns={tradeColumns}
-            data={tradeRows}
-            keyExtractor={(row) => row.id}
-            emptyMessage="No trades recorded"
-          />
-        ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
-        )}
-      </DataCard>
+      <Section id="fills-heading" title="Fills">
+        <Fills d={d} />
+      </Section>
+
+      {stopping && (
+        <StopSessionDialog
+          session={d}
+          positions={d.positions}
+          open
+          onClose={() => setStopping(false)}
+          onStop={() => slot.stop(d.session_id)}
+        />
+      )}
     </div>
   );
 }

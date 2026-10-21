@@ -15,6 +15,7 @@ interface ConfirmDialogProps {
   pendingHint: string;
   onConfirm: () => Promise<void>;
   onClose: () => void;
+  primaryDisabled?: boolean;
   /** Focus the title on open so a stray Enter can't confirm (R-P2-11). */
   destructive?: boolean;
   primaryDisabled?: boolean;
@@ -31,6 +32,7 @@ export function ConfirmDialog({
   pendingHint,
   onConfirm,
   onClose,
+  primaryDisabled = false,
   destructive = false,
   primaryDisabled = false,
 }: ConfirmDialogProps) {

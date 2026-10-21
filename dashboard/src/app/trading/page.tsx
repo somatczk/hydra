@@ -1,877 +1,287 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
-import { ArrowUpDown, Eye, OctagonX, Shield, Zap } from 'lucide-react';
-import { DataCard } from '@/components/ui/DataCard';
-import { Table } from '@/components/ui/Table';
-import { StatusBadge } from '@/components/ui/StatusBadge';
+import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
+import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
+import { StopSessionDialog } from '@/components/sessions/StopSessionDialog';
+import { useOutcomeSlot } from '@/components/sessions/useOutcomeSlot';
+import { useShellStatus } from '@/components/shell/ShellStatusProvider';
 import { Button } from '@/components/ui/Button';
-import { Input } from '@/components/ui/Input';
-import { Select } from '@/components/ui/Select';
+import { cn } from '@/components/ui/cn';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { fetchApi } from '@/lib/api';
-import { describeApiError, isStale, stateFromError } from '@/lib/apiState';
-import { useToast } from '@/components/ui/Toast';
-import { useTheme } from '@/components/layout/ThemeProvider';
-import { logger } from '@/lib/logger';
+import { heldAfter, isOverdue, plural, sessionName, type SessionDetail, type SessionResponse } from '@/lib/derive';
+import { signed, utc } from '@/lib/format';
 
-/* ---------- Types ---------- */
+const DETAIL_POLL_MS = 15_000;
+/** E-4: above this many running sessions the list stops fetching per-session detail. */
+const MAX_DETAIL_SESSIONS = 10;
 
-interface Position {
-  id: string;
-  pair: string;
-  side: 'Long' | 'Short';
-  size: string;
-  entry: string;
-  current: string;
-  pnl: string;
-  pnlPercent: string;
-}
+type Details = Map<string, SessionDetail | Error>;
 
-interface RecentTrade {
-  id: string;
-  pair: string;
-  side: 'Long' | 'Short';
-  size: string;
-  price: string;
-  fee: string;
-  pnl: number;
-  pnlFmt: string;
-  time: string;
-}
-
-interface ApiPosition {
-  id: string;
-  pair: string;
-  side: string;
-  size: number;
-  entry_price: number;
-  current_price: number;
-  unrealized_pnl: number;
-  pnl_pct: number;
-}
-
-interface ApiRecentTrade {
-  id: string;
-  symbol: string;
-  side: string;
-  price: number;
-  quantity: number;
-  fee: number;
-  pnl: number;
-  timestamp: string;
-}
-
-interface TradingSession {
-  session_id: string;
-  strategy_id: string;
-  strategy_name: string | null;
-  trading_mode: string;
-  status: string;
-  symbols: string[];
-  timeframe: string;
-  started_at: string | null;
-}
-
-interface RiskConfig {
-  kill_switch_active: boolean;
-}
-
-interface CircuitBreaker {
-  tier: number;
-  label: string;
-  threshold: string;
-  current_value: number;
-  status: 'Normal' | 'Warning' | 'Tripped';
-}
-
-interface RiskStatus {
-  current_drawdown: number;
-  max_drawdown_limit: number;
-  /** null until the RiskService has marked the account today */
-  daily_loss: number | null;
-  daily_loss_limit: number | null;
-  circuit_breakers: CircuitBreaker[] | null;
-}
-
-interface OrderBook {
-  symbol: string;
-  exchange: string;
-  bids: [number, number][];
-  asks: [number, number][];
-  spread: number;
-  timestamp: string | null;
-  fetched_at: string;
-}
-
-const ORDER_BOOK_MAX_AGE_MS = 15_000;
-
-/** Cross-origin TradingView widget: no third-party script runs in this origin (DB-17). */
-export function tradingViewSrc(theme: 'dark' | 'light'): string {
-  const params = new URLSearchParams({
-    symbol: 'BINANCE:BTCUSDT',
-    interval: '60',
-    theme,
-    style: '1',
-    locale: 'en',
-    timezone: 'Etc/UTC',
-  });
-  return `https://s.tradingview.com/widgetembed/?${params.toString()}`;
-}
-
-function bookMid(book: OrderBook | null): number | null {
-  const bid = book?.bids[0]?.[0];
-  const ask = book?.asks[0]?.[0];
-  return bid !== undefined && ask !== undefined ? (bid + ask) / 2 : null;
-}
-
-function fmtTime(d: Date): string {
-  return d.toLocaleTimeString('en-GB', { hour12: false });
-}
-
-interface FundingRate {
-  symbol: string;
-  rate: number;
-  next_funding_time: string | null;
-  annualized_rate: number;
-}
-
-/* ---------- Helpers ---------- */
-
-function mapApiPositions(data: ApiPosition[]): Position[] {
-  const fmt = (v: number) => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
-  return data.map((p) => ({
-    id: p.id,
-    pair: p.pair,
-    side: p.side as 'Long' | 'Short',
-    size: `${p.size} BTC`,
-    entry: fmt(p.entry_price),
-    current: fmt(p.current_price),
-    pnl: `${p.unrealized_pnl >= 0 ? '+' : ''}${fmt(p.unrealized_pnl)}`,
-    pnlPercent: `${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%`,
-  }));
-}
-
-function formatSymbol(symbol: string): string {
-  const match = symbol.match(/^([A-Z]{3,4})(USDT|USD|BUSD|USDC)$/);
-  if (match) return `${match[1]}/${match[2]}`;
-  return symbol;
-}
-
-function mapApiTrades(data: ApiRecentTrade[]): RecentTrade[] {
-  return data.map((t) => ({
-    id: t.id,
-    pair: formatSymbol(t.symbol),
-    side: t.side === 'BUY' ? 'Long' as const : 'Short' as const,
-    size: `${t.quantity.toLocaleString('en-US')} BTC`,
-    price: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-    fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '\u2014',
-    pnl: t.pnl,
-    pnlFmt: `${t.pnl >= 0 ? '+' : ''}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-    time: new Date(t.timestamp).toLocaleString('en-US', { dateStyle: 'short', timeStyle: 'medium' }),
-  }));
-}
-
-const positionColumns = [
-  { key: 'pair', header: 'Pair' },
-  {
-    key: 'side',
-    header: 'Side',
-    render: (row: Position) => (
-      <StatusBadge
-        status={row.side}
-        variant={row.side === 'Long' ? 'success' : 'error'}
-        size="sm"
-      />
-    ),
-  },
-  { key: 'size', header: 'Size' },
-  { key: 'entry', header: 'Entry', hideOnMobile: true },
-  { key: 'current', header: 'Current', hideOnMobile: true },
-  {
-    key: 'pnl',
-    header: 'PnL',
-    render: (row: Position) => (
-      <div>
-        <span
-          className={
-            row.pnl.startsWith('+')
-              ? 'text-status-success font-medium'
-              : 'text-status-error font-medium'
-          }
-        >
-          {row.pnl}
-        </span>
-        <span className="ml-1 text-xs text-text-muted">{row.pnlPercent}</span>
-      </div>
-    ),
-  },
-];
-
-const tradeHistoryColumns = [
-  { key: 'pair', header: 'Pair' },
-  {
-    key: 'side',
-    header: 'Side',
-    render: (row: RecentTrade) => (
-      <StatusBadge
-        status={row.side}
-        variant={row.side === 'Long' ? 'success' : 'error'}
-        size="sm"
-      />
-    ),
-  },
-  { key: 'size', header: 'Size' },
-  { key: 'price', header: 'Price' },
-  { key: 'fee', header: 'Fee', hideOnMobile: true },
-  {
-    key: 'pnl',
-    header: 'PnL',
-    render: (row: RecentTrade) => (
-      <span
-        className={
-          row.pnl >= 0
-            ? 'text-status-success font-medium'
-            : 'text-status-error font-medium'
+/** Per-running-session detail (positions, stop failures) every 15 s; empty above the cap. */
+function useRunningDetails(ids: string[]) {
+  const key = ids.length > MAX_DETAIL_SESSIONS ? '' : ids.join(',');
+  const [details, setDetails] = useState<Details>(new Map());
+  const load = useCallback(async () => {
+    const wanted = key ? key.split(',') : [];
+    const entries = await Promise.all(
+      wanted.map(async (id): Promise<[string, SessionDetail | Error]> => {
+        try {
+          return [id, await fetchApi<SessionDetail>(`/api/trading/sessions/${id}/detail`)];
+        } catch (e) {
+          return [id, e instanceof Error ? e : new Error(String(e))];
         }
-      >
-        {row.pnlFmt}
-      </span>
-    ),
-  },
-  { key: 'time', header: 'Time', hideOnMobile: true },
-];
+      }),
+    );
+    return new Map(entries);
+  }, [key]);
+  const reload = useCallback(() => void load().then(setDetails), [load]);
+  useEffect(() => {
+    let alive = true;
+    const run = () => void load().then((m) => alive && setDetails(m));
+    run();
+    const timer = setInterval(run, DETAIL_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [load]);
+  return { details, reload, capped: ids.length > MAX_DETAIL_SESSIONS };
+}
 
-/* ---------- Page ---------- */
+interface Cell {
+  text: string;
+  caution?: boolean;
+}
 
-export default function TradingPage() {
-  const router = useRouter();
-  const { toast } = useToast();
-  useEffect(() => { logger.info('Trading', 'Page mounted'); }, []);
-  const [openPositions, setOpenPositions] = useState<Position[] | null>(null);
-  const [recentTrades, setRecentTrades] = useState<RecentTrade[] | null>(null);
-  const [sessions, setSessions] = useState<TradingSession[]>([]);
-  // null = unknown (risk config unreadable); activation stays available as the fail-safe
-  const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
-  const [killSwitchLoading, setKillSwitchLoading] = useState(false);
-  const [circuitBreakers, setCircuitBreakers] = useState<CircuitBreaker[] | null>(null);
-  const [cbError, setCbError] = useState<unknown>(null);
-  const [riskStatus, setRiskStatus] = useState<RiskStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
-  const [orderBook, setOrderBook] = useState<OrderBook | null>(null);
-  const [bookError, setBookError] = useState<unknown>(null);
-  const [bookTimestampStale, setBookTimestampStale] = useState(false);
-  const [bookReceivedAt, setBookReceivedAt] = useState<Date | null>(null);
-  const [fundingRate, setFundingRate] = useState<FundingRate | null>(null);
+interface RowData {
+  session: SessionResponse;
+  market: string;
+  since: string;
+  health: Cell[];
+  positions: string;
+  holds: string | null;
+}
 
-  // Quick trade form state: orders always target one running paper session
-  const [qtSessionId, setQtSessionId] = useState('');
-  const [qtSymbol, setQtSymbol] = useState('');
-  const [qtSide, setQtSide] = useState<'buy' | 'sell'>('buy');
-  const [qtQuantity, setQtQuantity] = useState('');
-  const [qtOrderType, setQtOrderType] = useState('market');
-  const [qtPrice, setQtPrice] = useState('');
-  const [qtTakeProfit, setQtTakeProfit] = useState('');
-  const [qtStopLoss, setQtStopLoss] = useState('');
-  const [qtSubmitting, setQtSubmitting] = useState(false);
+function rowData(s: SessionResponse, d: SessionDetail | Error | undefined, capped: boolean, now: number): RowData {
+  const detail = d && !(d instanceof Error) ? d : null;
+  const lastBarAt = detail?.last_bar_at ?? s.last_bar_at ?? null;
+  const paused = detail?.entries_paused ?? s.entries_paused ?? null;
+  const overdue = isOverdue(lastBarAt, s.timeframe, now);
+  const failures = detail?.protection_failures.length;
+  const health: Cell[] = [
+    { text: `Last bar ${overdue === null ? 'warming up' : overdue ? 'overdue' : 'on time'}`, caution: overdue === true },
+    { text: paused ? `Entries ${paused}` : 'Entries allowed', caution: !!paused },
+    capped
+      ? { text: 'Open for health' }
+      : { text: `Stop failures ${failures === undefined ? '—' : failures === 0 ? 'none' : failures}`, caution: !!failures },
+  ];
+  if (s.feed_live === false) health.push({ text: 'Feed not live', caution: true });
+  if (s.persist_dirty) health.push({ text: 'Unsaved ledger changes', caution: true });
+  if (s.persist_error) health.push({ text: `Not saved: ${s.persist_error}`, caution: true });
+  const unrealised = signed(detail?.metrics.unrealized_pnl);
+  return {
+    session: s,
+    market: `${s.symbols.join(', ')} · ${s.timeframe}`,
+    since: s.status === 'running' ? `since ${utc(s.started_at, now) ?? '—'}` : `stopped ${utc(s.stopped_at, now) ?? '—'}`,
+    health,
+    positions: detail ? `${plural(detail.positions.length, 'position')}${unrealised ? ` · ${unrealised} USDT` : ''}` : '—',
+    holds: s.status !== 'running' && (s.positions_at_stop > 0 || s.flatten_incomplete)
+      ? s.positions_at_stop > 0 ? `still holds ${s.positions_at_stop}` : 'still holds positions'
+      : null,
+  };
+}
 
-  const { resolved: themeResolved } = useTheme();
+const HeldChip = ({ text }: { text: string }) => (
+  <span className="rounded bg-danger-soft px-2 py-0.5 text-xs font-medium text-danger">{text}</span>
+);
 
-  const refreshOrderBook = useCallback(
-    () =>
-      fetchApi<OrderBook>('/api/market/orderbook?symbol=BTCUSDT')
-        .then((ob) => {
-          setOrderBook(ob);
-          setBookError(null);
-          setBookTimestampStale(ob.timestamp !== null && isStale(ob.timestamp, ORDER_BOOK_MAX_AGE_MS));
-          setBookReceivedAt(new Date());
-        })
-        .catch((err) => {
-          logger.warn('Trading', 'Order book refresh failed', err);
-          setBookError(err);
-        }),
-    [],
+function PhoneList({ rows }: { rows: RowData[] }) {
+  return (
+    <ul className="flex flex-col gap-2 lg:hidden">
+      {rows.map((r) => (
+        <li key={r.session.session_id}>
+          <Link
+            href={`/trading/${r.session.session_id}`}
+            className="flex min-h-12 flex-col gap-1 rounded border border-line bg-surface p-4 hover:bg-hover"
+          >
+            <span className="flex items-center gap-2 font-semibold text-ink-1">
+              {sessionName(r.session)}
+              {r.holds && <HeldChip text={r.holds} />}
+            </span>
+            <span className="text-sm text-ink-2">
+              {r.market} · {r.since}
+            </span>
+            <span className="text-sm">
+              {r.health.map((c, i) => (
+                <span key={c.text} className={c.caution ? 'text-caution' : 'text-ink-1'}>
+                  {i > 0 && ' · '}
+                  {c.text}
+                </span>
+              ))}
+            </span>
+            <span className="text-sm text-ink-1">{r.positions}</span>
+          </Link>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function DesktopTable({ rows, onStop }: { rows: RowData[]; onStop: (s: SessionResponse) => void }) {
+  return (
+    <div className="hidden overflow-x-auto lg:block">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-line text-left text-xs font-semibold uppercase tracking-wider text-ink-2">
+            <th className="px-3 py-2">Session</th>
+            <th className="px-3 py-2">Market</th>
+            <th className="px-3 py-2">Health</th>
+            <th className="px-3 py-2">Positions</th>
+            <th className="px-3 py-2">
+              <span className="sr-only">Actions</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.session.session_id} className="border-b border-line">
+              <td className="px-3 py-2">
+                <Link href={`/trading/${r.session.session_id}`} className="font-semibold underline">
+                  {sessionName(r.session)}
+                </Link>{' '}
+                {r.holds && <HeldChip text={r.holds} />}
+              </td>
+              <td className="px-3 py-2 text-ink-2">
+                {r.market} · {r.since}
+              </td>
+              <td className="px-3 py-2">
+                {r.health.map((c, i) => (
+                  <span key={c.text} className={c.caution ? 'text-caution' : 'text-ink-1'}>
+                    {i > 0 && ' · '}
+                    {c.text}
+                  </span>
+                ))}
+              </td>
+              <td className="px-3 py-2">{r.positions}</td>
+              <td className="px-3 py-2 text-right">
+                <Button variant="secondary" size="sm" onClick={() => onStop(r.session)}>
+                  {r.session.status === 'running' ? 'Stop session…' : 'Try closing again…'}
+                </Button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SessionRows({ rows, onStop }: { rows: RowData[]; onStop: (s: SessionResponse) => void }) {
+  return (
+    <>
+      <PhoneList rows={rows} />
+      <DesktopTable rows={rows} onStop={onStop} />
+    </>
+  );
+}
+
+export default function SessionsPage() {
+  const { sessions, now, refetchAll } = useShellStatus();
+  const list = sessions.data;
+  const running = (list ?? []).filter((s) => s.status === 'running');
+  const holders = list ? heldAfter(list) : [];
+  const quiet = (list ?? []).filter((s) => s.status !== 'running' && !holders.includes(s));
+  const { details, reload, capped } = useRunningDetails(running.map((s) => s.session_id));
+  const [starting, setStarting] = useState(false);
+  const [target, setTarget] = useState<SessionResponse | null>(null);
+  const [showStopped, setShowStopped] = useState(false);
+
+  const slot = useOutcomeSlot(
+    (id) => {
+      const s = list?.find((x) => x.session_id === id);
+      return s ? sessionName(s) : id;
+    },
+    () => {
+      reload();
+      void refetchAll();
+    },
   );
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
-    setFetchErrors({});
-
-    // No guessed source: without the platform config, source-specific widgets show why
-    let source: 'live' | 'paper' | null = null;
-    let configError: unknown = null;
-    try {
-      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config');
-      source = cfg.trading_mode === 'live' ? 'live' : 'paper';
-    } catch (err) {
-      logger.warn('Trading', 'Trading mode unknown; portfolio data not requested', err);
-      configError = err ?? true;
-    }
-    const qs = `?source=${source}`;
-
-    await Promise.all([
-      ...(source === null
-        ? []
-        : [
-            fetchApi<ApiPosition[]>(`/api/portfolio/positions${qs}`)
-              .then((data) => setOpenPositions(mapApiPositions(data)))
-              .catch((err) => { setFetchErrors((prev) => ({ ...prev, positions: err ?? true })); }),
-            fetchApi<{ trades: ApiRecentTrade[] } | ApiRecentTrade[]>(`/api/portfolio/trades${qs}`)
-              .then((data) => {
-                const trades = Array.isArray(data) ? data : (data.trades ?? []);
-                setRecentTrades(mapApiTrades(trades));
-              })
-              .catch((err) => { setFetchErrors((prev) => ({ ...prev, trades: err ?? true })); }),
-            fetchApi<RiskStatus>(`/api/risk/status${qs}`)
-              .then(setRiskStatus)
-              .catch((err) => { setFetchErrors((prev) => ({ ...prev, riskStatus: err ?? true })); }),
-          ]),
-      fetchApi<TradingSession[]>('/api/trading/sessions')
-        .then((data) => setSessions(data.filter((s) => s.status === 'running')))
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, sessions: err ?? true })); }),
-      fetchApi<RiskConfig>('/api/risk/config')
-        .then((cfg) => setKillSwitchActive(cfg.kill_switch_active))
-        .catch((err) => {
-          logger.warn('Trading', 'Kill switch state unknown', err);
-          setKillSwitchActive(null);
-          setFetchErrors((prev) => ({ ...prev, riskConfig: true }));
-        }),
-      fetchApi<CircuitBreaker[]>('/api/risk/circuit-breakers')
-        .then((data) => { setCircuitBreakers(data); setCbError(null); })
-        .catch((err) => { setCircuitBreakers(null); setCbError(err); }),
-      refreshOrderBook(),
-      fetchApi<FundingRate[]>('/api/market/funding-rates/current?symbol=BTCUSDT')
-        .then((arr) => setFundingRate(arr?.[0] ?? null))
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, fundingRate: err ?? true })); }),
-    ]);
-
-    if (configError !== null) {
-      setFetchErrors((prev) => ({
-        ...prev,
-        positions: configError,
-        trades: configError,
-        riskStatus: configError,
-      }));
-    }
-    setLoading(false);
-  }, [refreshOrderBook]);
-
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 15_000);
-    return () => clearInterval(interval);
-  }, [loadData]);
-
-  // Order book auto-refresh every 5s; a failed poll keeps the last book and marks it stale
-  useEffect(() => {
-    const interval = setInterval(refreshOrderBook, 5_000);
-    return () => clearInterval(interval);
-  }, [refreshOrderBook]);
-
-  // Unknown state only offers activation: it is the fail-safe direction.
-  const handleToggleKillSwitch = async () => {
-    let releaseReason = '';
-    if (killSwitchActive !== true) {
-      if (!confirm('ACTIVATE KILL SWITCH?\n\nThis will immediately stop ALL trading sessions. Are you sure?')) return;
-    } else {
-      if (window.prompt('Type RELEASE to allow trading to resume') !== 'RELEASE') return;
-      releaseReason = (window.prompt('Reason for releasing the kill switch (audited)') ?? '').trim();
-      if (releaseReason.length < 3) {
-        toast('error', 'A reason of at least 3 characters is required to release the kill switch');
-        return;
-      }
-    }
-    setKillSwitchLoading(true);
-    try {
-      if (killSwitchActive === true) {
-        await fetchApi('/api/trading/kill-switch', {
-          method: 'DELETE',
-          body: JSON.stringify({ confirm: 'RELEASE', reason: releaseReason }),
-        });
-        setKillSwitchActive(false);
-        toast('success', 'Kill switch deactivated');
-      } else {
-        await fetchApi('/api/trading/kill-switch', { method: 'POST' });
-        setKillSwitchActive(true);
-        toast('warning', 'Kill switch activated — all trading halted');
-      }
-    } catch (err) {
-      logger.error('Trading', 'Failed to toggle kill switch', err);
-      toast('error', describeApiError(err, 'Failed to toggle kill switch'));
-    } finally {
-      setKillSwitchLoading(false);
-    }
-  };
-
-  const handleQuickTrade = async () => {
-    const session = paperSessions.find((s) => s.session_id === qtSessionId);
-    if (!session) {
-      toast('error', 'Select a running paper session');
-      return;
-    }
-    const symbol = qtSymbol || session.symbols[0];
-    const quantity = Number(qtQuantity);
-    if (!qtQuantity || !(quantity > 0)) {
-      toast('error', 'Quantity must be greater than 0');
-      return;
-    }
-    const price = qtOrderType === 'limit' ? Number(qtPrice) : null;
-    if (qtOrderType === 'limit' && !(price !== null && price > 0)) {
-      toast('error', 'A limit order needs a price greater than 0');
-      return;
-    }
-    const unitPrice = price ?? (symbol === orderBook?.symbol ? bookMid(orderBook) : null);
-    const notional = unitPrice !== null
-      ? `$${(unitPrice * quantity).toLocaleString('en-US', { maximumFractionDigits: 2 })}`
-      : 'unknown';
-    const strategy = session.strategy_name || session.strategy_id;
-    if (!confirm(
-      `PAPER ORDER\n\nSession: ${strategy} (${session.session_id})\n` +
-      `${qtSide.toUpperCase()} ${quantity} ${symbol} ${qtOrderType.toUpperCase()}` +
-      `${price !== null ? ` @ ${price}` : ''}\nEstimated notional: ${notional}` +
-      `${qtStopLoss ? `\nStop loss: ${qtStopLoss}` : ''}${qtTakeProfit ? `\nTake profit: ${qtTakeProfit}` : ''}`,
-    )) return;
-
-    setQtSubmitting(true);
-    try {
-      const payload: Record<string, unknown> = {
-        session_id: session.session_id,
-        symbol,
-        side: qtSide,
-        quantity,
-        order_type: qtOrderType,
-      };
-      if (price !== null) payload.price = price;
-      if (qtTakeProfit) payload.take_profit = Number(qtTakeProfit);
-      if (qtStopLoss) payload.stop_loss = Number(qtStopLoss);
-
-      const placed = await fetchApi<{ session_id?: string }>('/api/trading/quick-trade', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      if (placed?.session_id !== session.session_id) {
-        toast(
-          'error',
-          `The order was placed on session ${placed?.session_id ?? 'unknown'}, not ${session.session_id}; check both sessions now`,
-        );
-        return;
-      }
-      toast('success', `PAPER ${qtSide.toUpperCase()} order placed for ${quantity} ${symbol}`);
-      setQtQuantity('');
-      setQtPrice('');
-      setQtTakeProfit('');
-      setQtStopLoss('');
-    } catch (err) {
-      logger.error('Trading', 'Quick trade failed', err);
-      toast('error', describeApiError(err, 'Failed to place order'));
-    } finally {
-      setQtSubmitting(false);
-    }
-  };
-
-  const runningSessions = sessions.filter((s) => s.status === 'running');
-  const paperSessions = runningSessions.filter((s) => s.trading_mode === 'paper');
-  const qtSession = paperSessions.find((s) => s.session_id === qtSessionId) ?? null;
+  const rows = (ss: SessionResponse[]) => ss.map((s) => rowData(s, details.get(s.session_id), capped, now));
+  const targetDetail = target ? details.get(target.session_id) : undefined;
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Kill switch banner */}
-      {killSwitchActive === true && (
-        <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center gap-3">
-          <OctagonX className="h-6 w-6 text-status-error shrink-0" />
-          <div>
-            <p className="text-sm font-semibold text-status-error">Kill Switch Active</p>
-            <p className="text-xs text-text-muted">
-              All trading is halted. Release the kill switch to resume.
-            </p>
-          </div>
-        </div>
-      )}
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="text-xl font-semibold text-ink-1">Sessions</h1>
+        {sessions.state === 'stale' && sessions.fetchedAt !== null && (
+          <DataStateBadge state="stale" reason={`Sessions as of ${utc(sessions.fetchedAt, now)}`} />
+        )}
+        <Button size="lg" className="max-lg:w-full lg:ml-auto" onClick={() => setStarting(true)}>
+          Start paper session
+        </Button>
+      </div>
 
-      {/* Risk Controls */}
-      <DataCard title="Risk Controls" description="Kill switch, circuit breakers, and daily PnL">
-        <div className="space-y-4">
-          {/* Kill switch toggle */}
-          <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
-            <div className="flex items-center gap-3">
-              <Shield className="h-4 w-4 text-text-muted shrink-0" />
-              <div>
-                <p className="flex items-center gap-2 text-sm font-medium text-text-primary">
-                  Kill Switch
-                  {killSwitchActive === null && (
-                    <DataStateBadge state="unknown" reason="Risk config could not be read" />
-                  )}
-                </p>
-                <p className="text-xs text-text-muted">Immediately halt all trading activity</p>
-              </div>
-            </div>
-            <Button
-              variant={killSwitchActive === true ? 'primary' : 'danger'}
-              size="sm"
-              onClick={handleToggleKillSwitch}
-              loading={killSwitchLoading}
-            >
-              {killSwitchActive === true ? 'Deactivate' : 'Activate'}
-            </Button>
-          </div>
+      {slot.panel}
 
-          {/* Daily PnL vs limit */}
-          {fetchErrors.riskStatus ? (
-            <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
-              <div>
-                <p className="text-sm font-medium text-text-primary">Daily PnL vs Limit</p>
-                <p className="text-xs text-text-muted">{describeApiError(fetchErrors.riskStatus, 'Risk status could not be loaded')}</p>
-              </div>
-              <DataStateBadge state={stateFromError(fetchErrors.riskStatus)} />
-            </div>
-          ) : riskStatus && (
-            <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
-              <div>
-                <p className="text-sm font-medium text-text-primary">Daily PnL vs Limit</p>
-                <p className="text-xs text-text-muted">
-                  {riskStatus.daily_loss !== null && riskStatus.daily_loss_limit !== null
-                    ? `Loss: $${riskStatus.daily_loss.toFixed(2)} / Limit: $${riskStatus.daily_loss_limit.toFixed(2)}`
-                    : 'Not measured yet: the account has no price mark today'}
-                </p>
-              </div>
-              {riskStatus.daily_loss !== null && riskStatus.daily_loss_limit !== null ? (
-                <div className="flex items-center gap-2">
-                  <div className="w-32 h-2 rounded-full bg-bg-tertiary overflow-hidden">
-                    <div
-                      className="h-full rounded-full bg-status-error transition-all"
-                      style={{ width: `${Math.min((riskStatus.daily_loss / (riskStatus.daily_loss_limit || 1)) * 100, 100)}%` }}
-                    />
-                  </div>
-                  <span className="text-xs text-text-muted">
-                    {((riskStatus.daily_loss / (riskStatus.daily_loss_limit || 1)) * 100).toFixed(0)}%
-                  </span>
-                </div>
-              ) : (
-                <DataStateBadge state="unknown" reason="No price mark yet today" />
-              )}
-            </div>
-          )}
-
-          {/* Circuit breakers */}
-          {cbError !== null ? (
-            <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
-              <div>
-                <p className="text-sm font-medium text-text-primary">Circuit breakers</p>
-                <p className="text-xs text-text-muted">{describeApiError(cbError, 'Circuit breaker state unavailable')}</p>
-              </div>
-              <DataStateBadge state={stateFromError(cbError)} />
-            </div>
-          ) : circuitBreakers && circuitBreakers.length > 0 ? (
-            <div className="space-y-2">
-              <p className="text-xs font-semibold uppercase tracking-wider text-text-muted">Circuit Breakers</p>
-              {circuitBreakers.map((cb) => (
-                <div key={cb.tier} className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
-                  <div className="flex items-center gap-3">
-                    <StatusBadge
-                      status={cb.status}
-                      variant={cb.status === 'Tripped' ? 'error' : cb.status === 'Warning' ? 'warning' : 'success'}
-                      size="sm"
-                    />
-                    <div>
-                      <p className="text-sm font-medium text-text-primary">Tier {cb.tier}: {cb.label}</p>
-                      <p className="text-xs text-text-muted">Threshold: {cb.threshold} | Current: {cb.current_value}</p>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : null}
-
-          {/* Funding rate */}
-          {fetchErrors.fundingRate ? (
-            <DataStateErrorCard error={fetchErrors.fundingRate} fallback="Failed to load funding rate" onRetry={loadData} />
-          ) : fundingRate ? (
-            <div className="space-y-2">
-              <p className="text-xs font-semibold uppercase tracking-wider text-text-muted">Funding Rate</p>
-              <div className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3">
-                <div>
-                  <p className="text-sm font-medium text-text-primary">{fundingRate.symbol}</p>
-                  <p className="text-xs text-text-muted">
-                    Next: {fundingRate.next_funding_time ? new Date(fundingRate.next_funding_time).toLocaleTimeString() : 'N/A'}
-                  </p>
-                </div>
-                <div className="text-right">
-                  <p className={`text-sm font-semibold ${fundingRate.rate >= 0 ? 'text-status-success' : 'text-status-error'}`}>
-                    {fundingRate.rate >= 0 ? '+' : ''}{(fundingRate.rate * 100).toFixed(4)}%
-                  </p>
-                  <p className="text-xs text-text-muted">
-                    {(fundingRate.annualized_rate).toFixed(2)}% ann.
-                  </p>
-                </div>
-              </div>
-            </div>
-          ) : null}
-        </div>
-      </DataCard>
-
-      {/* Active sessions */}
-      {fetchErrors.sessions ? (
-        <DataCard title="Running Sessions" description="Currently active trading sessions">
-          <DataStateErrorCard error={fetchErrors.sessions} fallback="Failed to load trading sessions" onRetry={loadData} />
-        </DataCard>
-      ) : runningSessions.length > 0 && (
-        <DataCard title="Running Sessions" description="Currently active trading sessions">
-          <div className="space-y-2">
-            {runningSessions.map((session) => (
-              <div
-                key={session.session_id}
-                className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3 cursor-pointer hover:border-border-hover transition-colors"
-                onClick={() => router.push(`/trading/${session.session_id}`)}
-              >
-                <div className="flex items-center gap-3">
-                  <StatusBadge
-                    status={session.trading_mode === 'paper' ? 'Paper' : 'Live'}
-                    variant={session.trading_mode === 'paper' ? 'info' : 'warning'}
-                    size="sm"
-                  />
-                  <div>
-                    <p className="text-sm font-medium text-text-primary">{session.strategy_name || session.strategy_id}</p>
-                    <p className="text-xs text-text-muted">
-                      {session.symbols.join(', ')} &middot; {session.timeframe}
-                      {session.started_at && ` &middot; Started ${new Date(session.started_at).toLocaleString()}`}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <StatusBadge status="Running" variant="success" size="sm" />
-                  <Eye className="h-4 w-4 text-text-muted" />
-                </div>
-              </div>
-            ))}
-          </div>
-        </DataCard>
-      )}
-
-      {/* Quick Trade */}
-      <DataCard title="Quick Trade" description="Paper only: a manual order inside one running paper session, risk-checked like the strategy's own orders">
-        {paperSessions.length === 0 ? (
-          <p className="text-sm text-text-muted">Start a paper session to place manual orders.</p>
+      {list === null ? (
+        sessions.state === 'loading' ? (
+          <div className="h-32 animate-pulse rounded border border-line bg-surface" aria-label="Loading sessions" />
         ) : (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <Select
-              label="Session"
-              value={qtSessionId}
-              onChange={(e) => { setQtSessionId(e.target.value); setQtSymbol(''); }}
-              placeholder="Select a paper session"
-              options={paperSessions.map((s) => ({
-                value: s.session_id,
-                label: `PAPER · ${s.strategy_name || s.strategy_id}`,
-              }))}
-            />
-            <Select
-              label="Symbol"
-              value={qtSymbol || qtSession?.symbols[0] || ''}
-              onChange={(e) => setQtSymbol(e.target.value)}
-              disabled={!qtSession}
-              options={(qtSession?.symbols ?? []).map((sym) => ({ value: sym, label: sym }))}
-            />
-            <div className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium text-text-secondary">Side</span>
-              <div className="flex gap-2">
-                <Button
-                  variant={qtSide === 'buy' ? 'primary' : 'outline'}
-                  size="sm"
-                  className={qtSide === 'buy' ? 'bg-status-success hover:bg-status-success/90' : ''}
-                  onClick={() => setQtSide('buy')}
-                >
-                  Buy
-                </Button>
-                <Button
-                  variant={qtSide === 'sell' ? 'danger' : 'outline'}
-                  size="sm"
-                  onClick={() => setQtSide('sell')}
-                >
-                  Sell
-                </Button>
-              </div>
-            </div>
-            <Input
-              label="Quantity"
-              type="number"
-              min="0"
-              value={qtQuantity}
-              onChange={(e) => setQtQuantity(e.target.value)}
-              placeholder="0.001"
-            />
-            <Select
-              label="Order Type"
-              value={qtOrderType}
-              onChange={(e) => setQtOrderType(e.target.value)}
-              options={[
-                { value: 'market', label: 'Market' },
-                { value: 'limit', label: 'Limit' },
-              ]}
-            />
-            {qtOrderType === 'limit' && (
-              <Input
-                label="Price"
-                type="number"
-                min="0"
-                value={qtPrice}
-                onChange={(e) => setQtPrice(e.target.value)}
-                placeholder="65000"
-              />
+          <DataStateErrorCard error={sessions.error} fallback="Failed to load sessions" onRetry={() => void sessions.refetch()} />
+        )
+      ) : (
+        <>
+          <section aria-labelledby="running-heading" className="flex flex-col gap-3">
+            <h2 id="running-heading" className="text-base font-semibold text-ink-1">
+              Running ({running.length})
+            </h2>
+            {running.length === 0 ? (
+              <p className="text-sm text-ink-2">Nothing is running. Start a paper session from a strategy.</p>
+            ) : (
+              <SessionRows rows={rows(running)} onStop={setTarget} />
             )}
-            <Input
-              label="Take Profit"
-              type="number"
-              min="0"
-              value={qtTakeProfit}
-              onChange={(e) => setQtTakeProfit(e.target.value)}
-              placeholder="Optional"
-            />
-            <Input
-              label="Stop Loss"
-              type="number"
-              min="0"
-              value={qtStopLoss}
-              onChange={(e) => setQtStopLoss(e.target.value)}
-              placeholder="Optional"
-            />
-            <div className="flex items-end">
-              <Button
-                variant={qtSide === 'buy' ? 'primary' : 'danger'}
-                fullWidth
-                onClick={handleQuickTrade}
-                loading={qtSubmitting}
-                disabled={!qtSession}
-              >
-                <Zap className="h-4 w-4" />
-                Review {qtSide === 'buy' ? 'Buy' : 'Sell'}
-              </Button>
-            </div>
-          </div>
-        )}
-      </DataCard>
+          </section>
 
-      {/* Order Book */}
-      {orderBook ? (
-        <DataCard
-          title="Order Book"
-          description={`${orderBook.exchange} ${orderBook.symbol}${bookReceivedAt ? ` · last update ${fmtTime(bookReceivedAt)}` : ''}`}
-        >
-          {(bookError !== null || bookTimestampStale) && (
-            <div className="mb-3 flex items-center gap-2">
-              <DataStateBadge
-                state="stale"
-                reason={bookError !== null ? describeApiError(bookError, 'Order book refresh failed') : 'Exchange timestamp is older than 15s'}
-              />
-              <span className="text-xs text-text-muted">
-                {orderBook.timestamp !== null
-                  ? `Exchange time ${fmtTime(new Date(orderBook.timestamp))}`
-                  : `Fetched ${fmtTime(new Date(orderBook.fetched_at))}`}
-              </span>
-            </div>
+          {holders.length > 0 && (
+            <section aria-labelledby="holders-heading" className="flex flex-col gap-3">
+              <h2 id="holders-heading" className="text-base font-semibold text-ink-1">
+                Stopped, still holding ({holders.length})
+              </h2>
+              <SessionRows rows={rows(holders)} onStop={setTarget} />
+            </section>
           )}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-status-success">Bids</p>
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs text-text-muted border-b border-border-default pb-1">
-                  <span>Price</span>
-                  <span>Qty</span>
-                </div>
-                {orderBook.bids.slice(0, 10).map(([price, qty], i) => (
-                  <div key={i} className="flex justify-between text-xs">
-                    <span className="text-status-success font-mono">${price.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
-                    <span className="text-text-secondary font-mono">{qty.toFixed(4)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div>
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-status-error">Asks</p>
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs text-text-muted border-b border-border-default pb-1">
-                  <span>Price</span>
-                  <span>Qty</span>
-                </div>
-                {orderBook.asks.slice(0, 10).map(([price, qty], i) => (
-                  <div key={i} className="flex justify-between text-xs">
-                    <span className="text-status-error font-mono">${price.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
-                    <span className="text-text-secondary font-mono">{qty.toFixed(4)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </DataCard>
-      ) : bookError !== null ? (
-        <DataCard title="Order Book">
-          <div className="flex items-center gap-3">
-            <DataStateBadge state={stateFromError(bookError)} />
-            <p className="text-sm text-text-muted">{describeApiError(bookError, 'Order book unavailable')}</p>
-          </div>
-        </DataCard>
-      ) : null}
 
-      {/* Candlestick chart */}
-      <DataCard title="BTC/USDT" description="TradingView chart (Binance spot data from TradingView, not Hydra's stored bars)">
-        <iframe
-          key={themeResolved}
-          title="TradingView BTC/USDT chart"
-          src={tradingViewSrc(themeResolved === 'dark' ? 'dark' : 'light')}
-          className="h-[28rem] md:h-[36rem] w-full rounded-lg border-0"
-          sandbox="allow-scripts allow-same-origin allow-popups"
-          referrerPolicy="no-referrer"
-          loading="lazy"
+          {quiet.length > 0 && (
+            <section aria-labelledby="stopped-heading" className="flex flex-col gap-3">
+              <h2 id="stopped-heading" className="text-base font-semibold text-ink-1">
+                <button
+                  type="button"
+                  aria-expanded={showStopped}
+                  onClick={() => setShowStopped(!showStopped)}
+                  className={cn('inline-flex h-11 items-center rounded px-1 hover:bg-hover')}
+                >
+                  Stopped ({quiet.length})
+                </button>
+              </h2>
+              {showStopped && <SessionRows rows={rows(quiet)} onStop={setTarget} />}
+            </section>
+          )}
+        </>
+      )}
+
+      {starting && <StartSessionDialog onClose={() => setStarting(false)} />}
+      {target && (
+        <StopSessionDialog
+          session={target}
+          positions={targetDetail && !(targetDetail instanceof Error) ? targetDetail.positions : null}
+          open
+          onClose={() => setTarget(null)}
+          onStop={() => slot.stop(target.session_id)}
         />
-      </DataCard>
-
-      {/* Open positions */}
-      <DataCard title="Open Positions" description="Currently active positions">
-        {fetchErrors.positions ? (
-          <DataStateErrorCard error={fetchErrors.positions} fallback="Failed to load positions" onRetry={loadData} />
-        ) : loading ? (
-          <div className="space-y-3">
-            {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
-            ))}
-          </div>
-        ) : openPositions && openPositions.length > 0 ? (
-          <Table
-            columns={positionColumns}
-            data={openPositions}
-            keyExtractor={(row) => row.id}
-          />
-        ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
-        )}
-      </DataCard>
-
-      {/* Recent trades */}
-      <DataCard title="Recent Trades">
-        {fetchErrors.trades ? (
-          <DataStateErrorCard error={fetchErrors.trades} fallback="Failed to load recent trades" onRetry={loadData} />
-        ) : loading ? (
-          <div className="space-y-3">
-            {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
-            ))}
-          </div>
-        ) : recentTrades && recentTrades.length > 0 ? (
-          <>
-            <div className="flex items-center gap-2 mb-3">
-              <ArrowUpDown className="h-4 w-4 text-text-muted" />
-              <span className="text-xs text-text-muted">Sorted by most recent</span>
-            </div>
-            <Table
-              columns={tradeHistoryColumns}
-              data={recentTrades}
-              keyExtractor={(row) => row.id}
-            />
-          </>
-        ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
-        )}
-      </DataCard>
+      )}
     </div>
   );
 }

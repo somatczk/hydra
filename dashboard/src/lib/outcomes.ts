@@ -308,7 +308,7 @@ export function tryClosingOutcome(
 const PLACED: ReadonlySet<string> = new Set(['PENDING', 'SUBMITTED', 'PARTIALLY_FILLED']);
 const FALLBACK_LINE = "If the engine rejected it, the strategy default stop is in place instead; the session's protection failures say so.";
 
-const baseAsset = (symbol: string) => symbol.replace(/\/?USDT$/, '') || symbol;
+export const baseAsset = (symbol: string) => symbol.replace(/\/?USDT$/, '') || symbol;
 
 /** C-QT-2/3/4, the protection:none sell and the session mismatch (trading.py:499-563). */
 export function quickTradeOutcome(
