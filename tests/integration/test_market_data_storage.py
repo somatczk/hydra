@@ -230,3 +230,37 @@ async def test_detect_gaps_finds_history_before_stored_data(pool: Any) -> None:
         "binance", "BTCUSDT", Timeframe.D1, datetime(2020, 1, 1, tzinfo=UTC), first + day
     )
     assert gaps == [GapRange(datetime(2020, 1, 1, tzinfo=UTC), datetime(2023, 12, 31, tzinfo=UTC))]
+
+
+async def test_missing_ranges_across_dst_in_a_non_utc_session(fresh_database: str) -> None:
+    await asyncio.to_thread(upgrade_to_head, fresh_database)
+    pool = await asyncpg.create_pool(
+        fresh_database, min_size=1, max_size=1, server_settings={"timezone": "Europe/Budapest"}
+    )
+    try:
+        repo = MarketDataRepository.from_pool(pool)
+        await repo.store_bars(
+            [
+                (
+                    "binance",
+                    "BTCUSDT",
+                    Timeframe.D1,
+                    _bar(datetime(2026, m, d, tzinfo=UTC), "1", "1"),
+                )
+                for m, d in [(3, 29), (10, 24), (10, 26)]
+            ]
+        )
+        gaps = await repo.missing_ranges(
+            "binance",
+            "BTCUSDT",
+            Timeframe.D1,
+            datetime(2026, 3, 29, tzinfo=UTC),
+            datetime(2026, 10, 26, tzinfo=UTC),
+        )
+        oct25 = datetime(2026, 10, 25, tzinfo=UTC)
+        assert gaps == [
+            (datetime(2026, 3, 30, tzinfo=UTC), datetime(2026, 10, 23, tzinfo=UTC)),
+            (oct25, oct25),
+        ]
+    finally:
+        await pool.close()

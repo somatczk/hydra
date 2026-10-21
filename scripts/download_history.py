@@ -1,7 +1,7 @@
 """Fill every missing OHLCV range in TimescaleDB from Binance spot REST; safe to re-run.
 
 Gaps are found with one SQL query over ``ts.ohlcv_1m`` and only those ranges are fetched
-(retry with backoff, forming candle never stored, existing rows corrected by upsert).
+(retry with backoff, forming candle never stored).
 
 Usage::
 
@@ -42,7 +42,7 @@ def _parse_date(date_str: str) -> datetime:
 
 
 async def _download(args: argparse.Namespace) -> int:
-    """Print the missing ranges, fill them unless ``--dry-run``; return the bars fetched."""
+    """With ``--dry-run`` print the missing ranges, else fill them; return the bars fetched."""
     from hydra.core.types import Timeframe
     from hydra.data.backfill import ExchangeBackfillService
     from hydra.data.bars import last_closed_open, timeframe_seconds
