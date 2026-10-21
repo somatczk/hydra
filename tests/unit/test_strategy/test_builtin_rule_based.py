@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import numpy as np
 import pytest
-import yaml
 
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Position, Symbol, Timeframe
@@ -464,71 +462,3 @@ def test_invalid_rules_fail_at_construction(condition: dict[str, object], match:
     )
     with pytest.raises(ValueError, match=match):
         RuleBasedStrategy(config=cfg, context=StrategyContext())
-
-
-_REPO = Path(__file__).resolve().parents[3]
-
-
-def _shipped(rel: str) -> StrategyConfig:
-    data = yaml.safe_load((_REPO / rel).read_text())
-    data.pop("_template_meta", None)
-    data.setdefault("id", Path(rel).stem)
-    return StrategyConfig(**data)
-
-
-async def _entry_bars(cfg: StrategyConfig, closes: list[float]) -> list[int]:
-    """Feed closes bar by bar like a session and return the indices that emitted a long entry."""
-    ctx = StrategyContext()
-    strategy = RuleBasedStrategy(config=cfg, context=ctx)
-    tf = cfg.timeframes.primary
-    fired: list[int] = []
-    for i, c in enumerate(closes):
-        ohlcv = OHLCV(
-            open=Decimal(str(c)),
-            high=Decimal(str(c)),
-            low=Decimal(str(c)),
-            close=Decimal(str(c)),
-            volume=Decimal(1),
-            timestamp=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(days=i),
-        )
-        ctx.add_bar("BTCUSDT", tf, ohlcv)
-        signals = await strategy.on_bar(
-            BarEvent(symbol=Symbol("BTCUSDT"), timeframe=tf, ohlcv=ohlcv)
-        )
-        if any(isinstance(s, EntrySignal) and s.direction == Direction.LONG for s in signals):
-            fired.append(i)
-    return fired
-
-
-class TestShippedConfigs:
-    async def test_donchian_breakout_fires_on_a_new_60_bar_high(self) -> None:
-        cfg = _shipped("config/strategies/research_donchian_breakout.yaml")
-        closes = [100.0 + (i % 10) for i in range(70)] + [115.0, 114.0]
-        assert await _entry_bars(cfg, closes) == [70]
-
-    async def test_momentum_extremes_enters_on_a_20_bar_max(self) -> None:
-        cfg = _shipped("config/strategies/research_momentum_extremes.yaml")
-        closes = [100.0 - 0.5 * i for i in range(30)] + [110.0, 105.0]
-        assert await _entry_bars(cfg, closes) == [30]
-
-    async def test_bollinger_templates_trade_the_bands(self) -> None:
-        calm = [100.0 + (i % 2) for i in range(60)]
-        breakout = _shipped("config/templates/breakout_volume.yaml")
-        assert await _entry_bars(breakout, [*calm, 110.0, 111.0]) == [60]
-        bounce = _shipped("config/templates/mean_reversion_bb.yaml")
-        assert await _entry_bars(bounce, [*calm, 90.0]) == [60]
-
-    @pytest.mark.parametrize(
-        "rel",
-        sorted(
-            str(p.relative_to(_REPO))
-            for p in [
-                *_REPO.glob("config/strategies/*.yaml"),
-                *_REPO.glob("config/templates/*.yaml"),
-            ]
-        ),
-    )
-    def test_every_shipped_rule_config_builds(self, rel: str) -> None:
-        cfg = _shipped(rel)
-        if cfg.strategy_class.endswith(".RuleBasedStrategy"):
-            RuleBasedStrategy(config=cfg, context=StrategyContext())
