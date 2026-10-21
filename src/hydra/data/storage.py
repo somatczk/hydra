@@ -1,4 +1,4 @@
-"""asyncpg-based market data repository for OHLCV bars and funding rates.
+"""asyncpg-based market data repository for OHLCV bars.
 
 Provides high-performance bulk insert and query operations against
 TimescaleDB with connection pooling and ON CONFLICT deduplication.
@@ -6,12 +6,13 @@ TimescaleDB with connection pooling and ON CONFLICT deduplication.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
+from hydra.data.bars import timeframe_seconds
 
 logger = get_logger(__name__)
 
@@ -85,7 +86,7 @@ def _columns(bars: list[tuple[str, str, Timeframe, OHLCV]]) -> list[list[Any]]:
 
 
 class MarketDataRepository:
-    """Async repository for OHLCV bars and funding-rate data.
+    """Async repository for OHLCV bars.
 
     Uses ``asyncpg`` connection pooling for high throughput.
 
@@ -219,65 +220,21 @@ class MarketDataRepository:
         timeframe: Timeframe,
         start: datetime | None = None,
         end: datetime | None = None,
-        limit: int | None = None,
     ) -> list[OHLCV]:
-        """Query OHLCV bars with optional date range and limit.
-
-        Parameters
-        ----------
-        exchange_id:
-            Exchange identifier.
-        symbol:
-            Trading pair symbol.
-        timeframe:
-            Bar timeframe.
-        start:
-            Inclusive start timestamp (UTC).
-        end:
-            Inclusive end timestamp (UTC).
-        limit:
-            Maximum number of bars to return (most recent first when used
-            without a date range).
-
-        Returns
-        -------
-        list[OHLCV]
-            Bars in ascending timestamp order.
-        """
+        """Bars with open time in ``[start, end]`` (either bound optional), in ascending order."""
         pool = self._ensure_pool()
 
-        conditions = [
-            "exchange = $1",
-            "symbol = $2",
-            "timeframe = $3",
-        ]
-        params: list[Any] = [exchange_id, symbol, str(timeframe)]
-        idx = 4
-
-        if start is not None:
-            conditions.append(f"timestamp >= ${idx}")
-            params.append(start)
-            idx += 1
-
-        if end is not None:
-            conditions.append(f"timestamp <= ${idx}")
-            params.append(end)
-            idx += 1
-
-        where = " AND ".join(conditions)
-        query = f"""
+        query = """
             SELECT open, high, low, close, volume, timestamp
             FROM ts.ohlcv_1m
-            WHERE {where}
+            WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
+              AND ($4::timestamptz IS NULL OR timestamp >= $4::timestamptz)
+              AND ($5::timestamptz IS NULL OR timestamp <= $5::timestamptz)
             ORDER BY timestamp ASC
-        """  # noqa: S608
-
-        if limit is not None:
-            query += f" LIMIT ${idx}"
-            params.append(limit)
+        """
 
         async with pool.acquire() as conn:
-            records = await conn.fetch(query, *params)
+            records = await conn.fetch(query, exchange_id, symbol, str(timeframe), start, end)
 
         return [
             OHLCV(
@@ -292,77 +249,6 @@ class MarketDataRepository:
             )
             for r in records
         ]
-
-    async def get_latest_bar(
-        self,
-        exchange_id: str,
-        symbol: str,
-        timeframe: Timeframe,
-    ) -> OHLCV | None:
-        """Return the most recent bar, or ``None`` if no data exists."""
-        pool = self._ensure_pool()
-
-        query = """
-            SELECT open, high, low, close, volume, timestamp
-            FROM ts.ohlcv_1m
-            WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
-            ORDER BY timestamp DESC
-            LIMIT 1
-        """
-
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(query, exchange_id, symbol, str(timeframe))
-
-        if row is None:
-            return None
-
-        return OHLCV(
-            open=Decimal(str(row["open"])),
-            high=Decimal(str(row["high"])),
-            low=Decimal(str(row["low"])),
-            close=Decimal(str(row["close"])),
-            volume=Decimal(str(row["volume"])),
-            timestamp=row["timestamp"].replace(tzinfo=UTC)
-            if row["timestamp"].tzinfo is None
-            else row["timestamp"],
-        )
-
-    async def get_bar_count(
-        self,
-        exchange_id: str,
-        symbol: str,
-        timeframe: Timeframe,
-        start: datetime | None = None,
-        end: datetime | None = None,
-    ) -> int:
-        """Count bars in range."""
-        pool = self._ensure_pool()
-
-        conditions = [
-            "exchange = $1",
-            "symbol = $2",
-            "timeframe = $3",
-        ]
-        params: list[Any] = [exchange_id, symbol, str(timeframe)]
-        idx = 4
-
-        if start is not None:
-            conditions.append(f"timestamp >= ${idx}")
-            params.append(start)
-            idx += 1
-
-        if end is not None:
-            conditions.append(f"timestamp <= ${idx}")
-            params.append(end)
-            idx += 1
-
-        where = " AND ".join(conditions)
-        query = f"SELECT COUNT(*) FROM ts.ohlcv_1m WHERE {where}"  # noqa: S608
-
-        async with pool.acquire() as conn:
-            count = await conn.fetchval(query, *params)
-
-        return int(count) if count else 0
 
     async def get_latest_bars(
         self,
@@ -432,96 +318,47 @@ class MarketDataRepository:
             int(row["n"]),
         )
 
-    # ------------------------------------------------------------------
-    # Funding rates
-    # ------------------------------------------------------------------
-
-    async def store_funding_rates(self, rates: list[dict[str, Any]]) -> int:
-        """Store funding rate records.
-
-        Each dict must have keys: ``exchange``, ``symbol``, ``rate``,
-        ``next_funding_time``, ``timestamp``.
-
-        Returns
-        -------
-        int
-            Number of rows attempted to insert.
-        """
-        if not rates:
-            return 0
-
-        pool = self._ensure_pool()
-
-        rows = [
-            (
-                r["exchange"],
-                r["symbol"],
-                Decimal(str(r["rate"])),
-                r["next_funding_time"],
-                r["timestamp"],
-            )
-            for r in rates
-        ]
-
-        query = """
-            INSERT INTO ts.funding_rates (
-                exchange, symbol, rate, next_funding_time, timestamp
-            )
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT DO NOTHING
-        """
-
-        async with pool.acquire() as conn:
-            await conn.executemany(query, rows)
-
-        logger.info("store_funding_rates", count=len(rows))
-        return len(rows)
-
-    async def get_funding_rates(
+    async def missing_ranges(
         self,
         exchange_id: str,
         symbol: str,
-        start: datetime | None = None,
-        end: datetime | None = None,
-    ) -> list[dict[str, Any]]:
-        """Query funding rates with optional date range."""
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime,
+    ) -> list[tuple[datetime, datetime]]:
+        """Inclusive ``(first, last)`` open times of every hole in ``[start, end]``.
+
+        ``start`` and ``end`` must be on the bar grid. Only the holes leave the database, so
+        memory is O(gaps), not O(bars); an empty range returns ``[(start, end)]``.
+        """
         pool = self._ensure_pool()
+        step = timedelta(seconds=timeframe_seconds(timeframe))
 
-        conditions = [
-            "exchange = $1",
-            "symbol = $2",
-        ]
-        params: list[Any] = [exchange_id, symbol]
-        idx = 3
-
-        if start is not None:
-            conditions.append(f"timestamp >= ${idx}")
-            params.append(start)
-            idx += 1
-
-        if end is not None:
-            conditions.append(f"timestamp <= ${idx}")
-            params.append(end)
-            idx += 1
-
-        where = " AND ".join(conditions)
-        query = f"""
-            SELECT exchange, symbol, rate, next_funding_time, timestamp
-            FROM ts.funding_rates
-            WHERE {where}
-            ORDER BY timestamp ASC
-        """  # noqa: S608
+        query = """
+            WITH present AS (
+                SELECT timestamp AS ts FROM ts.ohlcv_1m
+                WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
+                  AND timestamp BETWEEN $4::timestamptz AND $5::timestamptz
+                UNION ALL SELECT $4::timestamptz - $6::interval
+                UNION ALL SELECT $5::timestamptz + $6::interval
+            ), steps AS (
+                SELECT ts, lead(ts) OVER (ORDER BY ts) AS nxt FROM present
+            )
+            SELECT ts + $6::interval AS gap_start, nxt - $6::interval AS gap_end
+            FROM steps
+            WHERE nxt - ts > $6::interval
+            ORDER BY ts
+        """
 
         async with pool.acquire() as conn:
-            records = await conn.fetch(query, *params)
+            records = await conn.fetch(query, exchange_id, symbol, str(timeframe), start, end, step)
 
         return [
-            {
-                "exchange": r["exchange"],
-                "symbol": r["symbol"],
-                "rate": Decimal(str(r["rate"])),
-                "next_funding_time": r["next_funding_time"],
-                "timestamp": r["timestamp"],
-            }
+            (
+                r["gap_start"].replace(tzinfo=UTC)
+                if r["gap_start"].tzinfo is None
+                else r["gap_start"],
+                r["gap_end"].replace(tzinfo=UTC) if r["gap_end"].tzinfo is None else r["gap_end"],
+            )
             for r in records
         ]

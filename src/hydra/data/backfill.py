@@ -223,66 +223,17 @@ class ExchangeBackfillService:
         start: datetime,
         end: datetime,
     ) -> list[GapRange]:
-        """Query storage and return ranges of missing bars.
+        """Return the missing bar ranges in ``[start, end]``, oldest first.
 
-        Compares the expected number of bars between *start* and *end*
-        against what is actually stored, and returns contiguous gap ranges.
-
-        Parameters
-        ----------
-        exchange_id:
-            Exchange to check.
-        symbol:
-            Trading pair.
-        timeframe:
-            Bar timeframe.
-        start:
-            Inclusive start of the range (UTC), rounded up to the bar grid.
-        end:
-            Inclusive end of the range (UTC), rounded down to the bar grid.
-
-        Returns
-        -------
-        list[GapRange]
-            Sorted list of gap ranges (ascending by start time).
+        ``start`` is rounded up and ``end`` down to the bar grid; the holes are computed in SQL,
+        so a multi-year 1m range is never loaded into memory.
         """
-        tf_seconds = timeframe_seconds(timeframe)
         start = ceil_to_tf(start, timeframe)
         end = floor_to_tf(end, timeframe)
         if start > end:
             return []
-
-        bars = await self._repo.get_bars(
-            exchange_id=exchange_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-        )
-
-        existing_timestamps = {bar.timestamp for bar in bars}
-
-        # Generate expected timestamps
-        tf_delta = timedelta(seconds=tf_seconds)
-        gaps: list[GapRange] = []
-        current = start
-        gap_start: datetime | None = None
-
-        while current <= end:
-            if current not in existing_timestamps:
-                if gap_start is None:
-                    gap_start = current
-            else:
-                if gap_start is not None:
-                    gaps.append(GapRange(start=gap_start, end=current - tf_delta))
-                    gap_start = None
-            current += tf_delta
-
-        # Close trailing gap
-        if gap_start is not None:
-            gaps.append(GapRange(start=gap_start, end=end))
-
-        return gaps
+        ranges = await self._repo.missing_ranges(exchange_id, symbol, timeframe, start, end)
+        return [GapRange(start=s, end=e) for s, e in ranges]
 
     # ------------------------------------------------------------------
     # Backfill
@@ -361,7 +312,7 @@ class ExchangeBackfillService:
         timeframe: Timeframe,
         start: datetime,
         end: datetime,
-        page_size: int = 500,
+        page_size: int = MAX_PAGE_SIZE,
         *,
         now: datetime | None = None,
         max_retries: int = 5,

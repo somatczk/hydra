@@ -1,16 +1,15 @@
-"""Tests for hydra.data.backfill — gap detection and backfill service."""
+"""Tests for hydra.data.backfill — paginated download (gap detection: tests/integration)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import ccxt
 import pytest
 
 from hydra.core.types import OHLCV, Timeframe
-from hydra.data.backfill import ExchangeBackfillService, GapRange
+from hydra.data.backfill import ExchangeBackfillService
 from tests.fixtures.binance_kline import FakeRestExchange
 
 # ---------------------------------------------------------------------------
@@ -18,188 +17,9 @@ from tests.fixtures.binance_kline import FakeRestExchange
 # ---------------------------------------------------------------------------
 
 
-def _make_bar(ts: datetime) -> OHLCV:
-    """Build a simple OHLCV bar at the given timestamp."""
-    return OHLCV(
-        open=Decimal("42000"),
-        high=Decimal("42500"),
-        low=Decimal("41800"),
-        close=Decimal("42100"),
-        volume=Decimal("100"),
-        timestamp=ts,
-    )
-
-
 def _ts(minute: int) -> datetime:
     """Shortcut to create a UTC datetime at a specific minute on 2024-01-01."""
     return datetime(2024, 1, 1, 0, minute, tzinfo=UTC)
-
-
-# ---------------------------------------------------------------------------
-# detect_gaps
-# ---------------------------------------------------------------------------
-
-
-class TestDetectGaps:
-    """Tests for ExchangeBackfillService.detect_gaps()."""
-
-    @pytest.fixture
-    def mock_repo(self) -> AsyncMock:
-        return AsyncMock()
-
-    @pytest.fixture
-    def service(self, mock_repo: AsyncMock) -> ExchangeBackfillService:
-        return ExchangeBackfillService(repository=mock_repo)
-
-    async def test_unaligned_start_no_false_gap(
-        self, service: ExchangeBackfillService, mock_repo: AsyncMock
-    ) -> None:
-        """Complete aligned data with start+17s gives no gap (DA-9)."""
-        start = datetime(2026, 1, 1, tzinfo=UTC)
-        mock_repo.get_bars.return_value = [
-            _make_bar(start + timedelta(hours=h)) for h in range(1, 25)
-        ]
-
-        gaps = await service.detect_gaps(
-            exchange_id="binance",
-            symbol="BTCUSDT",
-            timeframe=Timeframe.H1,
-            start=start + timedelta(seconds=17),
-            end=start + timedelta(hours=24, seconds=17),
-        )
-
-        assert gaps == []
-        kwargs = mock_repo.get_bars.call_args.kwargs
-        assert kwargs["start"] == start + timedelta(hours=1)
-        assert kwargs["end"] == start + timedelta(hours=24)
-
-    async def test_finds_gap_in_middle(
-        self, service: ExchangeBackfillService, mock_repo: AsyncMock
-    ) -> None:
-        """A gap in the middle of a sequence is detected."""
-        # Return bars for minutes 0, 1, 4 (missing 2, 3)
-        mock_repo.get_bars.return_value = [
-            _make_bar(_ts(0)),
-            _make_bar(_ts(1)),
-            _make_bar(_ts(4)),
-        ]
-
-        gaps = await service.detect_gaps(
-            exchange_id="binance",
-            symbol="BTCUSDT",
-            timeframe=Timeframe.M1,
-            start=_ts(0),
-            end=_ts(4),
-        )
-
-        assert len(gaps) == 1
-        assert gaps[0].start == _ts(2)
-        assert gaps[0].end == _ts(3)
-
-    async def test_finds_gap_at_start(
-        self, service: ExchangeBackfillService, mock_repo: AsyncMock
-    ) -> None:
-        """A gap at the beginning of the range is detected."""
-        mock_repo.get_bars.return_value = [
-            _make_bar(_ts(3)),
-            _make_bar(_ts(4)),
-        ]
-
-        gaps = await service.detect_gaps(
-            exchange_id="binance",
-            symbol="BTCUSDT",
-            timeframe=Timeframe.M1,
-            start=_ts(0),
-            end=_ts(4),
-        )
-
-        assert len(gaps) == 1
-        assert gaps[0].start == _ts(0)
-        assert gaps[0].end == _ts(2)
-
-    async def test_finds_gap_at_end(
-        self, service: ExchangeBackfillService, mock_repo: AsyncMock
-    ) -> None:
-        """A gap at the end of the range is detected."""
-        mock_repo.get_bars.return_value = [
-            _make_bar(_ts(0)),
-            _make_bar(_ts(1)),
-        ]
-
-        gaps = await service.detect_gaps(
-            exchange_id="binance",
-            symbol="BTCUSDT",
-            timeframe=Timeframe.M1,
-            start=_ts(0),
-            end=_ts(4),
-        )
-
-        assert len(gaps) == 1
-        assert gaps[0].start == _ts(2)
-        assert gaps[0].end == _ts(4)
-
-    async def test_returns_empty_for_complete_data(
-        self, service: ExchangeBackfillService, mock_repo: AsyncMock
-    ) -> None:
-        """No gaps when all bars are present."""
-        mock_repo.get_bars.return_value = [
-            _make_bar(_ts(0)),
-            _make_bar(_ts(1)),
-            _make_bar(_ts(2)),
-            _make_bar(_ts(3)),
-            _make_bar(_ts(4)),
-        ]
-
-        gaps = await service.detect_gaps(
-            exchange_id="binance",
-            symbol="BTCUSDT",
-            timeframe=Timeframe.M1,
-            start=_ts(0),
-            end=_ts(4),
-        )
-
-        assert gaps == []
-
-    async def test_entirely_missing_range(
-        self, service: ExchangeBackfillService, mock_repo: AsyncMock
-    ) -> None:
-        """An entirely empty range returns one big gap."""
-        mock_repo.get_bars.return_value = []
-
-        gaps = await service.detect_gaps(
-            exchange_id="binance",
-            symbol="BTCUSDT",
-            timeframe=Timeframe.M1,
-            start=_ts(0),
-            end=_ts(4),
-        )
-
-        assert len(gaps) == 1
-        assert gaps[0].start == _ts(0)
-        assert gaps[0].end == _ts(4)
-
-    async def test_multiple_gaps(
-        self, service: ExchangeBackfillService, mock_repo: AsyncMock
-    ) -> None:
-        """Multiple disjoint gaps are detected."""
-        # Present: 0, 2, 4 — missing: 1, 3
-        mock_repo.get_bars.return_value = [
-            _make_bar(_ts(0)),
-            _make_bar(_ts(2)),
-            _make_bar(_ts(4)),
-        ]
-
-        gaps = await service.detect_gaps(
-            exchange_id="binance",
-            symbol="BTCUSDT",
-            timeframe=Timeframe.M1,
-            start=_ts(0),
-            end=_ts(4),
-        )
-
-        assert len(gaps) == 2
-        assert gaps[0] == GapRange(start=_ts(1), end=_ts(1))
-        assert gaps[1] == GapRange(start=_ts(3), end=_ts(3))
 
 
 # ---------------------------------------------------------------------------

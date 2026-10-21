@@ -244,23 +244,10 @@ class TestGetBars:
 
         await repo.get_bars("binance", "BTCUSDT", Timeframe.M1, start=start, end=end)
 
-        call_args = conn.fetch.call_args
-        query = call_args[0][0]
-        assert "timestamp >=" in query
-        assert "timestamp <=" in query
-
-    async def test_get_bars_with_limit(
-        self, repo: MarketDataRepository, mock_pool: MagicMock
-    ) -> None:
-        """get_bars includes LIMIT clause when specified."""
-        conn = mock_pool._conn
-        conn.fetch = AsyncMock(return_value=[])
-
-        await repo.get_bars("binance", "BTCUSDT", Timeframe.M1, limit=100)
-
-        call_args = conn.fetch.call_args
-        query = call_args[0][0]
-        assert "LIMIT" in query
+        query, *params = conn.fetch.call_args[0]
+        assert "timestamp >= $4" in query
+        assert "timestamp <= $5" in query
+        assert params == ["binance", "BTCUSDT", "1m", start, end]
 
     async def test_get_bars_empty_result(
         self, repo: MarketDataRepository, mock_pool: MagicMock
@@ -271,93 +258,6 @@ class TestGetBars:
 
         bars = await repo.get_bars("binance", "BTCUSDT", Timeframe.M1)
         assert bars == []
-
-
-# ---------------------------------------------------------------------------
-# get_latest_bar
-# ---------------------------------------------------------------------------
-
-
-class TestGetLatestBar:
-    """Tests for MarketDataRepository.get_latest_bar()."""
-
-    async def test_returns_most_recent(
-        self, repo: MarketDataRepository, mock_pool: MagicMock
-    ) -> None:
-        """get_latest_bar returns the most recent bar."""
-        conn = mock_pool._conn
-        conn.fetchrow = AsyncMock(return_value=_fake_record(_make_record(5)))
-
-        bar = await repo.get_latest_bar("binance", "BTCUSDT", Timeframe.M1)
-
-        assert bar is not None
-        assert isinstance(bar, OHLCV)
-        assert bar.timestamp == datetime(2024, 1, 1, 0, 5, tzinfo=UTC)
-
-    async def test_returns_none_when_empty(
-        self, repo: MarketDataRepository, mock_pool: MagicMock
-    ) -> None:
-        """get_latest_bar returns None when no data exists."""
-        conn = mock_pool._conn
-        conn.fetchrow = AsyncMock(return_value=None)
-
-        bar = await repo.get_latest_bar("binance", "BTCUSDT", Timeframe.M1)
-        assert bar is None
-
-    async def test_query_orders_desc(
-        self, repo: MarketDataRepository, mock_pool: MagicMock
-    ) -> None:
-        """get_latest_bar query orders by timestamp DESC LIMIT 1."""
-        conn = mock_pool._conn
-        conn.fetchrow = AsyncMock(return_value=None)
-
-        await repo.get_latest_bar("binance", "BTCUSDT", Timeframe.M1)
-
-        query = conn.fetchrow.call_args[0][0]
-        assert "ORDER BY timestamp DESC" in query
-        assert "LIMIT 1" in query
-
-
-# ---------------------------------------------------------------------------
-# get_bar_count
-# ---------------------------------------------------------------------------
-
-
-class TestGetBarCount:
-    """Tests for MarketDataRepository.get_bar_count()."""
-
-    async def test_returns_count(self, repo: MarketDataRepository, mock_pool: MagicMock) -> None:
-        """get_bar_count returns integer count."""
-        conn = mock_pool._conn
-        conn.fetchval = AsyncMock(return_value=42)
-
-        count = await repo.get_bar_count("binance", "BTCUSDT", Timeframe.M1)
-        assert count == 42
-
-    async def test_returns_zero_when_empty(
-        self, repo: MarketDataRepository, mock_pool: MagicMock
-    ) -> None:
-        """get_bar_count returns 0 when no data matches."""
-        conn = mock_pool._conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        count = await repo.get_bar_count("binance", "BTCUSDT", Timeframe.M1)
-        assert count == 0
-
-    async def test_with_date_range(self, repo: MarketDataRepository, mock_pool: MagicMock) -> None:
-        """get_bar_count passes start/end to the query."""
-        conn = mock_pool._conn
-        conn.fetchval = AsyncMock(return_value=10)
-
-        start = datetime(2024, 1, 1, tzinfo=UTC)
-        end = datetime(2024, 1, 2, tzinfo=UTC)
-
-        count = await repo.get_bar_count("binance", "BTCUSDT", Timeframe.M1, start=start, end=end)
-
-        query = conn.fetchval.call_args[0][0]
-        assert "timestamp >=" in query
-        assert "timestamp <=" in query
-        assert count == 10
 
 
 # ---------------------------------------------------------------------------
