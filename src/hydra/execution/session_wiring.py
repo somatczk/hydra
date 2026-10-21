@@ -9,6 +9,7 @@ prices (the executor's market-fill mark only; risk marks and resting orders stay
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import uuid
@@ -60,7 +61,7 @@ from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderMan
 from hydra.risk.service import RiskService
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
-from hydra.strategy.engine import StrategyEngine
+from hydra.strategy.engine import StrategyEngine, _import_strategy_class
 
 if TYPE_CHECKING:
     from hydra.execution.session_manager import TradingSession
@@ -84,11 +85,17 @@ async def probe_strategy(cfg: StrategyConfig, hydra_config: HydraConfig) -> int:
         config=hydra_config, event_bus=InMemoryEventBus(), context=StrategyContext()
     )
     try:
-        await engine.load_strategy_from_config(cfg)
+        cls = _import_strategy_class(cfg.strategy_class)
+        if inspect.isabstract(cls):
+            raise TypeError("abstract class")
     except (ImportError, AttributeError, TypeError) as exc:
         raise UnsupportedStrategyError(
             f"cannot load strategy class {cfg.strategy_class}: {exc}"
         ) from exc
+    try:
+        await engine.load_strategy_from_config(cfg)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError(f"invalid strategy config for {cfg.id}: {exc}") from exc
     history = [int(s.required_history) for s in engine.get_all_strategies().values()]
     return max(history, default=1)
 

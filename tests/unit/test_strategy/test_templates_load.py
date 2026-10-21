@@ -1,4 +1,4 @@
-"""Every shipped template loads into a real strategy instance."""
+"""Every shipped template loads as a rule-based strategy; every shipped config uses that class."""
 
 from __future__ import annotations
 
@@ -9,12 +9,14 @@ import yaml
 
 from hydra.core.config import HydraConfig
 from hydra.core.event_bus import InMemoryEventBus
-from hydra.strategy.base import BaseStrategy
+from hydra.strategy.builtin.rule_based import RuleBasedStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine
 
-TEMPLATES = sorted((Path(__file__).resolve().parents[3] / "config" / "templates").glob("*.yaml"))
+CONFIG = Path(__file__).resolve().parents[3] / "config"
+TEMPLATES = sorted((CONFIG / "templates").glob("*.yaml"))
+SHIPPED = sorted((CONFIG / "strategies").glob("*.yaml"))
 
 
 def test_five_templates_ship() -> None:
@@ -34,4 +36,11 @@ async def test_template_instantiates(path: Path) -> None:
     cfg = StrategyConfig(**{**data, "id": path.stem, "enabled": True})
     engine = StrategyEngine(HydraConfig(), InMemoryEventBus(), StrategyContext())
     await engine.load_strategy_from_config(cfg)
-    assert isinstance(engine.get_strategy(path.stem), BaseStrategy)
+    assert type(engine.get_strategy(path.stem)) is RuleBasedStrategy
+
+
+@pytest.mark.parametrize("path", SHIPPED, ids=lambda p: p.stem)
+def test_shipped_strategy_config_is_rule_based(path: Path) -> None:
+    assert yaml.safe_load(path.read_text())["strategy_class"] == (
+        "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
+    )
