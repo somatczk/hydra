@@ -181,8 +181,12 @@ describe('isSignedOut', () => {
     expect(isSignedOut(err)).toBe(true);
   });
 
-  it('is true for a 401 whose body is the Authelia HTML sign-in page', () => {
+  it('is true for any 401, whatever its body', () => {
     expect(isSignedOut(new ApiError(401, '<!DOCTYPE html><title>Login - Authelia</title>'))).toBe(true);
+  });
+
+  it('known limit until E-1: a redirect to the sign-in page reaches us as a JSON SyntaxError, not a 401', () => {
+    expect(isSignedOut(new SyntaxError('Unexpected token < in JSON'))).toBe(false);
   });
 
   it('is false for a 403, a 503 and a network TypeError', () => {
@@ -203,6 +207,10 @@ describe('fetchAgeLabel', () => {
   it('gives the fetch age when ok and the as-of time when stale', () => {
     expect(fetchAgeLabel(now - 6_000, 'ok', now)).toBe('Fetched 6 s ago');
     expect(fetchAgeLabel(now - 120_000, 'stale', now)).toEqual({ stale: true, asOf: '14:02:10 UTC (2 min ago)' });
+  });
+
+  it('names a stale time 24 h or more old once, not twice', () => {
+    expect(fetchAgeLabel(now - 3 * 86_400_000, 'stale', now)).toEqual({ stale: true, asOf: '18 Oct 14:04 UTC' });
   });
 
   it('has nothing to say when nothing was ever fetched', () => {

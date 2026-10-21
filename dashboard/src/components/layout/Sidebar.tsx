@@ -80,7 +80,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             onClick={onClose}
           >
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-primary">
-              <HydraLogo className="h-5 w-5 text-white" />
+              <HydraLogo className="h-5 w-5 text-on-accent" />
             </div>
             <span className="text-lg font-bold tracking-tight text-text-primary font-display">
               Hydra

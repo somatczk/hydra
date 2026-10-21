@@ -658,8 +658,8 @@ export default function SettingsPage() {
                   >
                     <div
                       className={cn(
-                        'absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform',
-                        enabled ? 'translate-x-[22px]' : 'translate-x-1',
+                        'absolute top-1 h-4 w-4 rounded-full shadow transition-transform',
+                        enabled ? 'translate-x-[22px] bg-on-accent' : 'translate-x-1 bg-ink-1',
                       )}
                     />
                   </div>

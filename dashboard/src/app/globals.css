@@ -50,7 +50,7 @@
   --text-primary: var(--ink-1);
   --text-secondary: var(--ink-2);
   --text-muted: var(--ink-2);
-  --text-light: var(--ink-3);
+  --text-light: var(--ink-2);
   --border-default: var(--line);
   --border-hover: var(--line-strong);
   --border-focus: var(--accent);

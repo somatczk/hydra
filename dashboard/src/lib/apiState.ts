@@ -133,7 +133,7 @@ export function isStale(
   return now - ts > maxAgeMs;
 }
 
-/** Signed out: a 401, including the one an Authelia redirect is mapped to (R-P2-13). */
+/** Signed out (R-P2-13). shortcut: a direct 401 only, upgrade when fetchApi maps Authelia redirects to 401 (E-1). */
 export function isSignedOut(err: unknown): boolean {
   return isHttpError(err) && err.status === 401;
 }
@@ -146,6 +146,10 @@ export function fetchAgeLabel(
 ): string | { stale: true; asOf: string } | null {
   if (state === 'loading' || state === 'refreshing') return 'Fetching…';
   if (fetchedAt === null) return null;
-  if (state === 'stale') return { stale: true, asOf: `${utc(fetchedAt, now)} (${age(now - fetchedAt, now)})` };
+  if (state === 'stale') {
+    const at = utc(fetchedAt, now);
+    const ago = age(now - fetchedAt, now);
+    return { stale: true, asOf: ago === at ? `${at}` : `${at} (${ago})` };
+  }
   return `Fetched ${age(now - fetchedAt, now)}`;
 }

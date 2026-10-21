@@ -30,29 +30,50 @@ const initial = <T,>(path: string | null): Snap<T> => ({
   misses: 0,
 });
 
-/** One polled source: keeps the last value and turns STALE after 2 missed polls (05 §4). A null path pauses. */
+/** One polled source: STALE after 2 missed polls (05 §4), a poll unanswered by the next tick is a miss, older answers are dropped, null pauses. */
 export function usePoll<T>(path: string | null, intervalMs: number): Poll<T> {
   const [snap, setSnap] = useState<Snap<T>>(() => initial<T>(path));
   const current = useRef(path);
+  const seq = useRef(0);
+  const inflight = useRef<AbortController | null>(null);
 
-  const refetch = useCallback(async () => {
-    if (path === null) return;
-    setSnap((s) =>
-      s.path !== path ? initial<T>(path) : s.data !== null && s.state === 'ok' ? { ...s, state: 'refreshing' } : s,
-    );
-    try {
-      const data = await fetchApi<T>(path);
-      if (current.current !== path) return;
-      setSnap({ path, data, error: null, state: 'ok', fetchedAt: Date.now(), misses: 0 });
-    } catch (error) {
-      if (current.current !== path) return;
+  const miss = useCallback(
+    (error: unknown) =>
       setSnap((s) => {
         if (s.path !== path || s.data === null) return { ...initial<T>(path), error, state: stateFromError(error) };
         const misses = s.misses + 1;
         return { ...s, error, misses, state: misses >= 2 ? 'stale' : 'ok' };
-      });
-    }
-  }, [path]);
+      }),
+    [path],
+  );
+
+  const load = useCallback(
+    async (tick: boolean) => {
+      if (path === null) return;
+      const prev = inflight.current;
+      if (prev && tick) miss(new Error('No answer within the poll interval'));
+      prev?.abort();
+      const mine = ++seq.current;
+      const ctrl = new AbortController();
+      inflight.current = ctrl;
+      setSnap((s) =>
+        s.path !== path ? initial<T>(path) : s.data !== null && s.state === 'ok' ? { ...s, state: 'refreshing' } : s,
+      );
+      try {
+        const data = await fetchApi<T>(path, { signal: ctrl.signal });
+        if (mine !== seq.current || current.current !== path) return;
+        inflight.current = null;
+        setSnap({ path, data, error: null, state: 'ok', fetchedAt: Date.now(), misses: 0 });
+      } catch (error) {
+        if (mine !== seq.current || current.current !== path) return;
+        inflight.current = null;
+        miss(error);
+      }
+    },
+    [path, miss],
+  );
+
+  const refetch = useCallback(() => load(false), [load]);
 
   useEffect(() => {
     current.current = path;
@@ -60,7 +81,7 @@ export function usePoll<T>(path: string | null, intervalMs: number): Poll<T> {
     let timer: ReturnType<typeof setInterval> | undefined;
     const start = () => {
       clearInterval(timer);
-      timer = setInterval(() => void refetch(), intervalMs);
+      timer = setInterval(() => void load(true), intervalMs);
     };
     const onVisibility = () => {
       if (document.hidden) {
@@ -76,8 +97,11 @@ export function usePoll<T>(path: string | null, intervalMs: number): Poll<T> {
     return () => {
       clearInterval(timer);
       document.removeEventListener('visibilitychange', onVisibility);
+      seq.current += 1;
+      inflight.current?.abort();
+      inflight.current = null;
     };
-  }, [path, intervalMs, refetch]);
+  }, [path, intervalMs, load, refetch]);
 
   const s = snap.path === path ? snap : initial<T>(path);
   return { data: s.data, error: s.error, state: s.state, fetchedAt: s.fetchedAt, refetch };

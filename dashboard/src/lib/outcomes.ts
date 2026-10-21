@@ -130,7 +130,7 @@ function positionsPart(
   fresh: SessionResponse[] | Error,
   at: string,
 ): { tone: Tone; headline: string | null; lines: string[]; actions: OutcomeAction[] } {
-  const stoppedLine = `${plural(stopped, 'session')} stopped at ${at}`;
+  const stoppedLine = stopped > 0 ? `${plural(stopped, 'session')} stopped at ${at}` : `No running session to stop at ${at}`;
   const holders = fresh instanceof Error ? [] : heldAfter(fresh);
   const names = holders.map(sessionName).join(', ');
   const holderActions: OutcomeAction[] = holders.length
@@ -163,7 +163,7 @@ function positionsPart(
       tone: 'caution',
       headline: null,
       lines: [
-        `${stoppedLine}; they closed all their positions.`,
+        stopped > 0 ? `${stoppedLine}; they closed all their positions.` : `${stoppedLine}.`,
         `Still held in ${plural(holders.length, 'stopped session')}: ${names}. It still counts toward drawdown.`,
       ],
       actions: holderActions,
@@ -282,6 +282,10 @@ export function stopOutcome(result: Result<SessionResponse>, now: number = Date.
   return notConfirmed('the session stopped', err);
 }
 
+/** OrderStatus (core/types.py:73-82) values that leave a live order; NOOP (session_wiring.py:539,591) placed nothing. */
+const PLACED: ReadonlySet<string> = new Set(['PENDING', 'SUBMITTED', 'PARTIALLY_FILLED']);
+const FALLBACK_LINE = "If the engine rejected it, the strategy default stop is in place instead; the session's protection failures say so.";
+
 const baseAsset = (symbol: string) => symbol.replace(/\/?USDT$/, '') || symbol;
 
 /** C-QT-2/3/4, the protection:none sell and the session mismatch (trading.py:453-517). */
@@ -304,9 +308,13 @@ export function quickTradeOutcome(
     const amount = `${qty(r.quantity)} ${base}`;
     const fill = price(r.fill_price ?? r.price);
     const order = r.order_id ? [`Order ${r.order_id.slice(0, 8)}.`] : [];
-    if (r.status !== 'FILLED') {
+    if (PLACED.has(r.status)) {
       const kind = r.order_type === 'LIMIT' ? 'Limit' : 'Market';
       return ok(`${kind} order placed (paper).`, [...(r.exit_orders_deferred ? ['The stop will be placed when it fills.'] : []), ...order]);
+    }
+    if (r.status !== 'FILLED') {
+      const why = r.status === 'NOOP' ? ['No position was left to reduce.'] : [];
+      return { tone: 'caution', title: `No order was placed (${r.status}).`, lines: why, actions: [] };
     }
     const mark =
       r.mark_source === 'stale_live'
@@ -319,18 +327,24 @@ export function quickTradeOutcome(
       const rest = r.protection === 'none' ? 'This reduces the held position; no stop is needed.' : 'The rest of the position keeps its stop.';
       return { tone: caution ? 'caution' : 'none', title: `Sold ${amount} at ${fill} (paper).`, lines: [mark, rest, ...order], actions: [] };
     }
-    const stop =
-      r.protection !== 'armed'
-        ? 'No stop is placed yet.'
-        : req.stop_loss
-          ? `Stop placed at ${price(Number(req.stop_loss))}.`
-          : req.trailing_stop_pct
-            ? `Trailing stop placed (${req.trailing_stop_pct}%).`
-            : 'Stop placed (strategy default).';
+    if (r.protection !== 'armed') {
+      return {
+        tone: 'danger',
+        title: `Bought ${amount} at ${fill} (paper), but no stop could be placed.`,
+        lines: [mark, "The engine closes an unprotected position, or stops the session if it cannot. Check this session's positions and fills.", ...order],
+        actions: [{ kind: 'open', label: 'Open session', href: `/trading/${r.session_id}` }],
+      };
+    }
+    const typed = req.stop_loss
+      ? `Stop requested at ${price(Number(req.stop_loss))}.`
+      : req.trailing_stop_pct
+        ? `Trailing stop requested (${req.trailing_stop_pct}%).`
+        : null;
+    const stop = typed ? [typed, FALLBACK_LINE] : ['Stop placed (strategy default).'];
     return {
-      tone: caution || r.protection !== 'armed' ? 'caution' : 'none',
+      tone: caution ? 'caution' : 'none',
       title: `Bought ${amount} at ${fill} (paper).`,
-      lines: [mark, stop, ...order],
+      lines: [mark, ...stop, ...order],
       actions: [],
     };
   }

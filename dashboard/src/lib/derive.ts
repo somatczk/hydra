@@ -119,7 +119,8 @@ export function isOverdue(lastBarAt: string | null, tf: string, now: number): bo
 export type DataAnswer =
   | { kind: 'none' }
   | { kind: 'late'; late: number; total: number; worst: { name: string; tf: string; overdueMs: number; paused: string | null } }
-  | { kind: 'warming'; name: string; tf: string }
+  | { kind: 'unknown'; total: number }
+  | { kind: 'warming'; name: string; tf: string; total: number; unreadable: number; paused: string[] }
   | { kind: 'ok'; total: number; unreadable: number; paused: string[] };
 
 /** Worst-of over running sessions; an unreadable detail is never counted as on time. */
@@ -158,7 +159,8 @@ export function dataAnswer(
     const worst = late.reduce((a, b) => (b.overdueMs > a.overdueMs ? b : a));
     return { kind: 'late', late: late.length, total: running.length, worst };
   }
-  if (warming) return { kind: 'warming', ...warming };
+  if (unreadable === running.length) return { kind: 'unknown', total: running.length };
+  if (warming) return { kind: 'warming', ...warming, total: running.length, unreadable, paused };
   return { kind: 'ok', total: running.length, unreadable, paused };
 }
 
@@ -202,12 +204,13 @@ export function needsYou(src: {
   const sessions = src.sessions ?? [];
   if (!src.sessions) unavailable.push('sessions');
   const at = (s: SessionResponse) => `/trading/${s.session_id}`;
+  const what = (s: SessionResponse) => (s.positions_at_stop > 0 ? plural(s.positions_at_stop, 'position') : 'positions');
   for (const s of sessions.filter((x) => x.status === 'error')) {
-    items.push({ kind: 'error', text: `${sessionName(s)} stopped with an error: ${s.error_message ?? 'no message'}`, href: at(s) });
+    const held = holds(s) ? `; it still holds ${what(s)}` : '';
+    items.push({ kind: 'error', text: `${sessionName(s)} stopped with an error: ${s.error_message ?? 'no message'}${held}`, href: at(s) });
   }
-  for (const s of heldAfter(sessions)) {
-    const what = s.positions_at_stop > 0 ? plural(s.positions_at_stop, 'position') : 'positions';
-    items.push({ kind: 'held', text: `${sessionName(s)} still holds ${what} after stopping`, href: at(s) });
+  for (const s of heldAfter(sessions).filter((x) => x.status !== 'error')) {
+    items.push({ kind: 'held', text: `${sessionName(s)} still holds ${what(s)} after stopping`, href: at(s) });
   }
   for (const s of sessions.filter((x) => x.persist_error)) {
     items.push({ kind: 'persist_error', text: `${sessionName(s)} isn't being saved: ${s.persist_error}`, href: at(s) });

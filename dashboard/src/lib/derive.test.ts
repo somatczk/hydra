@@ -65,12 +65,34 @@ describe('dataAnswer', () => {
   it('uses A3+ list fields when the detail is missing, and only when the list carries them', () => {
     const withA3 = session({ session_id: 's15', timeframe: '15m', last_bar_at: ago(5 * MIN), entries_paused: null });
     expect(dataAnswer([withA3], new Map(), NOW)).toEqual({ kind: 'ok', total: 1, unreadable: 0, paused: [] });
-    expect(dataAnswer([s15], new Map(), NOW)).toEqual({ kind: 'ok', total: 1, unreadable: 1, paused: [] });
+  });
+
+  it('keeps the unreadable count and paused reasons when a session is warming up', () => {
+    const s5 = session({ session_id: 's5', strategy_name: 'Breakout', timeframe: '5m' });
+    const details = new Map<string, SessionDetail | Error>([
+      ['s1h', detail({ session_id: 's1h', last_bar_at: null })],
+      ['s15', new Error('503')],
+      ['s5', detail({ session_id: 's5', timeframe: '5m', last_bar_at: ago(2 * MIN), entries_paused: 'feed stale: BTCUSDT 5m' })],
+    ]);
+    expect(dataAnswer([s1h, s15, s5], details, NOW)).toEqual({
+      kind: 'warming',
+      name: 'SMA cross',
+      tf: '1h',
+      total: 3,
+      unreadable: 1,
+      paused: ['feed stale: BTCUSDT 5m'],
+    });
+  });
+
+  it('is unknown, never ok, when no running session could be read', () => {
+    const details = new Map<string, SessionDetail | Error>([['s1h', new Error('503')]]);
+    expect(dataAnswer([s1h], details, NOW)).toEqual({ kind: 'unknown', total: 1 });
+    expect(dataAnswer([s15], new Map(), NOW)).toEqual({ kind: 'unknown', total: 1 });
   });
 
   it('reports warming up, paused-but-on-time and nothing running', () => {
     const warm = new Map<string, SessionDetail | Error>([['s1h', detail({ session_id: 's1h', last_bar_at: null })]]);
-    expect(dataAnswer([s1h], warm, NOW)).toEqual({ kind: 'warming', name: 'SMA cross', tf: '1h' });
+    expect(dataAnswer([s1h], warm, NOW)).toEqual({ kind: 'warming', name: 'SMA cross', tf: '1h', total: 1, unreadable: 0, paused: [] });
     const paused = new Map<string, SessionDetail | Error>([
       ['s1h', detail({ session_id: 's1h', last_bar_at: ago(10 * MIN), entries_paused: 'feed stale: BTCUSDT 1h' })],
     ]);
@@ -129,6 +151,12 @@ describe('needsYou', () => {
     expect(r.items).toEqual([
       { kind: 'error', text: 'SMA cross stopped with an error: feed died', href: '/trading/a1b2c3d4-0000-4000-8000-000000000001' },
     ]);
+  });
+
+  it('lists an errored session that still holds positions once, saying so', () => {
+    const r = needsYou({ ...base, sessions: [session({ status: 'error', error_message: 'feed died', positions_at_stop: 2 })] });
+    expect(r.count).toBe(1);
+    expect(r.items.map((i) => i.text)).toEqual(['SMA cross stopped with an error: feed died; it still holds 2 positions']);
   });
 
   it('returns a null count when any source is unreadable', () => {

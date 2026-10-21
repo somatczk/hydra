@@ -49,7 +49,10 @@ describe('killSwitchOutcome', () => {
   it('R-P0-1: a clean response with a stopped holder in the fresh list is C-KS-2b, never "all closed" (case 2)', () => {
     const o = killSwitchOutcome({ ok: ks({ sessions_stopped: 0 }) }, [session({ status: 'stopped' }), stoppedHolder], NOW);
     expect(o.title).toBe('Kill switch on.');
-    expect(text(o)).toContain('Still held in 1 stopped session: RSI mean-revert 15m.');
+    expect(o.lines).toEqual([
+      'No running session to stop at 14:03:00 UTC.',
+      'Still held in 1 stopped session: RSI mean-revert 15m. It still counts toward drawdown.',
+    ]);
     expect(text(o)).not.toContain('No positions are held');
     expect(text(o)).not.toContain('All positions closed');
     expect(o.actions).toEqual([
@@ -96,7 +99,7 @@ describe('killSwitchOutcome', () => {
     expect(o.actions[0]).toEqual({ kind: 'save_again', label: 'Save again' });
   });
 
-  it('C-KS-7 on a 401, C-KS-5 on a network error, a 502 and engine_not_ready', () => {
+  it('C-KS-7 on a direct 401, C-KS-5 on a network error, a 502 and engine_not_ready', () => {
     expect(killSwitchOutcome({ err: new ApiError(401, '<html>Authelia</html>') }, [], NOW).title).toBe(
       "Not sent: you're signed out.",
     );
@@ -181,10 +184,32 @@ describe('quickTradeOutcome', () => {
     expect(stopLine).not.toMatch(/\d/);
   });
 
-  it('a typed stop is named, and the quantity is the response quantity', () => {
+  it('a typed stop is named as requested, since a rejected one falls back to the default (protective_orders.py:255-275)', () => {
     const o = quickTradeOutcome({ ...req, stop_loss: '64256' }, { ok: res({ quantity: 0.001 }) }, SID);
     expect(o.title).toBe('Bought 0.00100 BTC at 67,612.40 (paper).');
-    expect(o.lines).toContain('Stop placed at 64,256.00.');
+    expect(o.lines.slice(1, 3)).toEqual([
+      'Stop requested at 64,256.00.',
+      "If the engine rejected it, the strategy default stop is in place instead; the session's protection failures say so.",
+    ]);
+    expect(text(o)).not.toContain('Stop placed');
+    const trailing = quickTradeOutcome({ ...req, trailing_stop_pct: '2.5' }, { ok: res() }, SID);
+    expect(trailing.lines[1]).toBe('Trailing stop requested (2.5%).');
+  });
+
+  it('a filled buy whose stop could not be armed is danger, never "yet" (session_wiring.py:365-368)', () => {
+    const o = quickTradeOutcome(req, { ok: res({ protection: 'pending', protective_order_id: null, exit_orders_deferred: true }) }, SID);
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe('Bought 0.00150 BTC at 67,612.40 (paper), but no stop could be placed.');
+    expect(text(o)).not.toContain('yet');
+    expect(o.actions).toEqual([{ kind: 'open', label: 'Open session', href: `/trading/${SID}` }]);
+  });
+
+  it('NOOP and terminal statuses say no order was placed (session_wiring.py:591, core/types.py:73-82)', () => {
+    const noop = quickTradeOutcome({ ...req, side: 'sell' }, { ok: res({ order_id: null, side: 'SELL', status: 'NOOP', protection: 'none', fill_price: null }) }, SID);
+    expect(noop).toEqual({ tone: 'caution', title: 'No order was placed (NOOP).', lines: ['No position was left to reduce.'], actions: [] });
+    expect(quickTradeOutcome(req, { ok: res({ status: 'REJECTED' }) }, SID).title).toBe('No order was placed (REJECTED).');
+    const partial = quickTradeOutcome(req, { ok: res({ status: 'PARTIALLY_FILLED', order_type: 'LIMIT' }) }, SID);
+    expect(partial.title).toBe('Limit order placed (paper).');
   });
 
   it('flags a session mismatch', () => {

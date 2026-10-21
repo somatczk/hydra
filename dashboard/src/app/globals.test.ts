@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const here = join(process.cwd(), 'src/app');
@@ -28,6 +28,16 @@ function contrast(a: string, b: string): number {
 }
 
 const [light, aliases] = blocks(':root');
+
+const sources: Array<{ path: string; text: string }> = [];
+const walk = (dir: string) => {
+  for (const f of readdirSync(dir)) {
+    const p = join(dir, f);
+    if (statSync(p).isDirectory()) walk(p);
+    else if (/\.tsx?$/.test(f) && !/\.test\.tsx?$/.test(f)) sources.push({ path: p, text: readFileSync(p, 'utf8') });
+  }
+};
+walk(join(here, '..'));
 const THEMES = { light, dark: blocks('.dark')[0] };
 
 /** 05 §2.1 claims: text roles ≥ 4.5:1 (1.4.3), control outlines ≥ 3:1 (1.4.11). */
@@ -40,6 +50,8 @@ const PAIRS: Array<[fg: string, bg: string, min: number]> = [
   ['on-accent', 'accent', 4.5],
   ['caution', 'caution-soft', 4.5],
   ['danger', 'danger-soft', 4.5],
+  ['canvas', 'danger', 4.5],
+  ['ink-1', 'line', 3],
   ['line-strong', 'surface', 3],
   ['line-strong', 'canvas', 3],
 ];
@@ -61,23 +73,33 @@ describe('design tokens', () => {
   });
 
   it('every old-token utility used in src still resolves through an alias', () => {
-    const files: string[] = [];
-    const walk = (dir: string) => {
-      for (const f of readdirSync(dir)) {
-        const p = join(dir, f);
-        if (statSync(p).isDirectory()) walk(p);
-        else if (/\.tsx?$/.test(f) && !/\.test\.tsx?$/.test(f)) files.push(p);
-      }
-    };
-    walk(join(here, '..'));
     const used = new Set<string>();
     const re = /[a-z]+(?:-[lrtbxy])?-((?:bg|text|border|status|accent)-[a-z]+(?:-[a-z]+)?)(?=[\s'"`/]|$)/g;
-    for (const f of files) for (const m of readFileSync(f, 'utf8').matchAll(re)) used.add(m[1]);
+    for (const f of sources) for (const m of f.text.matchAll(re)) used.add(m[1]);
     expect(used.has('text-muted')).toBe(true);
     for (const name of used) {
       expect(css, name).toContain(`--color-${name}: var(--${name});`);
       expect(aliases[name], name).toMatch(/^var\(--[a-z0-9-]+\)$/);
     }
     expect(css).toContain('--font-display: var(--font-sans);');
+  });
+
+  it('every alias used as text colour resolves to a token ≥ 4.5:1 on canvas, surface and raised', () => {
+    const used = new Set<string>();
+    for (const f of sources) for (const m of f.text.matchAll(/\btext-((?:bg|text|border|status|accent)-[a-z]+(?:-[a-z]+)?)\b/g)) used.add(m[1]);
+    expect(used.has('text-light')).toBe(true);
+    for (const name of used) {
+      const token = aliases[name].slice(6, -1);
+      for (const [theme, t] of Object.entries(THEMES)) {
+        for (const bg of ['canvas', 'surface', 'raised']) {
+          expect(contrast(t[token], t[bg]), `${theme} text-${name} (${token}) on ${bg}`).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    }
+  });
+
+  it('no hard-coded white outside the sentiment needle: it is illegible on the dark accent and ink fills', () => {
+    const hits = sources.flatMap((f) => [...f.text.matchAll(/\b(?:bg|text)-white\b/g)].map(() => relative(here, f.path)));
+    expect(hits).toEqual(['portfolio/page.tsx']);
   });
 });
