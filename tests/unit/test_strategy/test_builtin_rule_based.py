@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import numpy as np
+import pytest
 
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Position, Symbol, Timeframe
@@ -434,3 +435,34 @@ class TestRuleBasedStrategy:
         exit_signals = [s for s in signals if isinstance(s, ExitSignal)]
         assert len(exit_signals) > 0
         assert exit_signals[0].reason == "Rule-based exit (long)"
+
+
+@pytest.mark.parametrize(
+    ("condition", "match"),
+    [
+        ({"indicator": "rsii", "params": {"period": 14}, "value": 30.0}, "Unknown indicator"),
+        ({"indicator": "rsi", "params": {"period": "abc"}, "value": 30.0}, "must be a number"),
+        ({"indicator": "bollinger_bands", "params": {}, "value": 0.0}, "bollinger_lower"),
+        (
+            {"indicator": "close", "params": {}, "value": "bollinger_lowr:period=20"},
+            "Unknown indicator",
+        ),
+        ({"indicator": "close", "params": {}, "value": "rsi:periodd=14"}, "periodd"),
+        ({"indicator": "close", "params": {}, "value": "rolling_max:period=2.5"}, "integer"),
+        ({"indicator": "sma", "params": {"period": 0}, "value": 30.0}, "must be in"),
+        ({"indicator": "rsi", "params": {"period": 0}, "value": 30.0}, "must be in"),
+        ({"indicator": "close", "params": {}, "value": "ema:period=100000000"}, "must be in"),
+    ],
+)
+def test_invalid_rules_fail_at_construction(condition: dict[str, object], match: str) -> None:
+    rules = {
+        "entry_long": {"operator": "AND", "conditions": [{"comparator": "less_than", **condition}]}
+    }
+    cfg = StrategyConfig(
+        id="bad",
+        name="Bad",
+        strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        parameters={"rules": rules},
+    )
+    with pytest.raises(ValueError, match=match):
+        RuleBasedStrategy(config=cfg, context=StrategyContext())

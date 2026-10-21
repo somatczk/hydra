@@ -32,7 +32,7 @@ parameters:
     entry_short: null
     exit_short: null
   required_history: 65
-  description: "Zarattini et al. 2025 single-horizon (60d) approximation. Full ensemble: CAGR ~30%, Sharpe ~1.58, max DD ~19%. Donchian on closes, not highs/lows. Mid-channel trailing stop."
+  description: "Zarattini et al. 2025 single-horizon (60d) approximation. Donchian on closes, not highs/lows. Mid-channel trailing stop."
 position_sizing:
   method: fixed_fractional
   risk_per_trade_pct: 2.0

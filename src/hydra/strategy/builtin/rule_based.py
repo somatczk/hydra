@@ -14,7 +14,8 @@ from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import Direction, Symbol
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.condition_schema import ConditionGroup, RuleSet
-from hydra.strategy.rule_engine import evaluate_condition_group
+from hydra.strategy.context import resolve_indicator
+from hydra.strategy.rule_engine import evaluate_condition_group, parse_indicator_ref
 
 
 def _apply_value_ref_overrides(
@@ -57,6 +58,7 @@ class RuleBasedStrategy(BaseStrategy):
         super().__init__(*args, **kwargs)
         self._rules = self._parse_rules()
         self._apply_param_overrides()
+        self._validate_indicators()
 
     def _parse_rules(self) -> RuleSet:
         """Parse the ``rules`` dict from strategy parameters into a RuleSet."""
@@ -130,6 +132,20 @@ class RuleBasedStrategy(BaseStrategy):
                         cond.value = _apply_value_ref_overrides(
                             value_str, auto_overrides, top_params
                         )
+
+    def _validate_indicators(self) -> None:
+        """Raise ValueError now for a rule that would raise on every bar (unknown or
+        multi-output indicator, bad parameters, unparsable value reference)."""
+        for group in (
+            self._rules.entry_long,
+            self._rules.exit_long,
+            self._rules.entry_short,
+            self._rules.exit_short,
+        ):
+            for cond in group.conditions if group else []:
+                resolve_indicator(cond.indicator, cond.params)
+                if isinstance(cond.value, str):
+                    resolve_indicator(*parse_indicator_ref(cond.value))
 
     @property
     def required_history(self) -> int:

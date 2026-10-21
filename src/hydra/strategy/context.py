@@ -7,9 +7,10 @@ do not redundantly recompute indicators.
 
 from __future__ import annotations
 
-import hashlib
+import inspect
 import logging
 from bisect import bisect_left
+from collections.abc import Callable, Mapping
 from decimal import Decimal
 from typing import Any
 
@@ -20,6 +21,58 @@ from hydra.core.types import OHLCV, OrderRequest, Position, Timeframe
 from hydra.indicators import library as ind_lib
 
 logger = logging.getLogger(__name__)
+
+# Rules read one array per name, so multi-output functions are refused with their alternatives.
+MULTI_OUTPUT: dict[str, str] = {
+    "bollinger_bands": "use bollinger_upper, bollinger_middle or bollinger_lower",
+    "keltner_channels": "use keltner_upper, ema or keltner_lower",
+    "ichimoku": "not available to rules (its chikou span reads future bars)",
+}
+DATA_PARAMS = frozenset({"data", "close", "high", "low", "volume"})
+# Inclusive (min, max) per parameter name; the registry and the hyperopt ranges show the same.
+PARAM_LIMITS: dict[str, tuple[float, float]] = {
+    "period": (2, 200),
+    "fast": (2, 100),
+    "slow": (2, 200),
+    "signal": (2, 100),
+    "multiplier": (0.1, 10.0),
+    "std_dev": (0.1, 5.0),
+    "k_period": (2, 100),
+    "d_period": (2, 100),
+    "ema_period": (2, 200),
+    "atr_period": (2, 200),
+}
+
+
+def resolve_indicator(name: str, params: Mapping[str, object]) -> Callable[..., Any]:
+    """Return the library function for *name*, or raise ValueError if it cannot take *params*."""
+    if name in MULTI_OUTPUT:
+        msg = f"Indicator {name!r} has several outputs: {MULTI_OUTPUT[name]}"
+        raise ValueError(msg)
+    func = getattr(ind_lib, name, None)
+    if name.startswith("_") or not inspect.isfunction(func) or func.__module__ != ind_lib.__name__:
+        msg = f"Unknown indicator: {name}"
+        raise ValueError(msg)
+    sig = inspect.signature(func)
+    for key, value in params.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            msg = f"Indicator {name!r} parameter {key!r} must be a number, got {value!r}"
+            raise ValueError(msg)
+        param = sig.parameters.get(key)
+        if param is not None and param.annotation in (int, "int") and not isinstance(value, int):
+            msg = f"Indicator {name!r} parameter {key!r} must be an integer, got {value!r}"
+            raise ValueError(msg)
+        lo, hi = PARAM_LIMITS.get(key, (value, value))
+        if not lo <= value <= hi:
+            msg = f"Indicator {name!r} parameter {key!r} must be in [{lo}, {hi}], got {value!r}"
+            raise ValueError(msg)
+    data_args = dict.fromkeys(DATA_PARAMS.intersection(sig.parameters))
+    try:
+        sig.bind(**data_args, **params)
+    except TypeError as exc:
+        msg = f"Indicator {name!r}: {exc}"
+        raise ValueError(msg) from None
+    return func
 
 
 class StrategyContext:
@@ -36,8 +89,8 @@ class StrategyContext:
         self._max_bars = max_bars
         # symbol -> timeframe -> list of OHLCV bars (newest last, one per timestamp)
         self._bars: dict[str, dict[str, list[OHLCV]]] = {}
-        # Indicator cache: key -> ndarray
-        self._indicator_cache: dict[str, ndarray] = {}
+        # Indicator cache: (symbol, timeframe, name, params) -> ndarray
+        self._indicator_cache: dict[tuple[str, str, str, tuple[tuple[str, Any], ...]], ndarray] = {}
         # symbol -> Position | None
         self._positions: dict[str, Position | None] = {}
         # symbol -> list of open orders
@@ -72,8 +125,8 @@ class StrategyContext:
                 series.insert(i, bar)
         if self._max_bars is not None and len(series) > self._max_bars:
             del series[: len(series) - self._max_bars]
-        prefix = f"{symbol}:{timeframe}:"
-        keys_to_drop = [k for k in self._indicator_cache if k.startswith(prefix)]
+        tf = str(timeframe)
+        keys_to_drop = [k for k in self._indicator_cache if k[0] == symbol and k[1] == tf]
         for k in keys_to_drop:
             del self._indicator_cache[k]
 
@@ -89,65 +142,35 @@ class StrategyContext:
 
     # -- Indicator computation (cached) --------------------------------------
 
-    def _cache_key(self, name: str, symbol: str, timeframe: Timeframe, **params: Any) -> str:
-        param_str = hashlib.md5(  # noqa: S324
-            str(sorted(params.items())).encode()
-        ).hexdigest()
-        return f"{symbol}:{timeframe}:{name}:{param_str}"
-
     def indicator(self, name: str, symbol: str, timeframe: Timeframe, **params: Any) -> ndarray:
-        """Compute (or return cached) indicator values.
+        """Compute (or return cached) indicator values over every stored bar.
 
-        The *name* must match a function in ``hydra.indicators.library``.
+        *name* is a single-output function in ``hydra.indicators.library``; it gets the
+        close/high/low/volume arrays its signature names. For a function returning a tuple
+        (``macd``, ``stochastic``, ``supertrend``) this is the first output.
         """
-        key = self._cache_key(name, symbol, timeframe, **params)
+        key = (symbol, str(timeframe), name, tuple(sorted(params.items())))
         if key in self._indicator_cache:
             return self._indicator_cache[key]
 
+        func = resolve_indicator(name, params)
         all_bars = self._bars.get(symbol, {}).get(str(timeframe), [])
         if not all_bars:
-            result = np.array([], dtype=np.float64)
-            self._indicator_cache[key] = result
-            return result
+            empty = np.array([], dtype=np.float64)
+            self._indicator_cache[key] = empty
+            return empty
 
         close = np.array([float(b.close) for b in all_bars], dtype=np.float64)
-        high = np.array([float(b.high) for b in all_bars], dtype=np.float64)
-        low = np.array([float(b.low) for b in all_bars], dtype=np.float64)
-        volume = np.array([float(b.volume) for b in all_bars], dtype=np.float64)
-
-        func = getattr(ind_lib, name, None)
-        if func is None:
-            msg = f"Unknown indicator: {name}"
-            raise ValueError(msg)
-
-        # Determine which arrays the indicator needs based on its name
-        volume_indicators = {"obv", "vwap", "mfi"}
-        hlc_indicators = {
-            "atr",
-            "stochastic",
-            "cci",
-            "williams_r",
-            "supertrend",
-            "ichimoku",
-            "keltner_channels",
+        arrays = {
+            "data": close,
+            "close": close,
+            "high": np.array([float(b.high) for b in all_bars], dtype=np.float64),
+            "low": np.array([float(b.low) for b in all_bars], dtype=np.float64),
+            "volume": np.array([float(b.volume) for b in all_bars], dtype=np.float64),
         }
-
-        if name in volume_indicators:
-            if name == "obv":
-                result = func(close, volume, **params)
-            else:
-                result = func(high, low, close, volume, **params)
-        elif name in hlc_indicators:
-            result = func(high, low, close, **params)
-        else:
-            result = func(close, **params)
-
-        # Handle tuple returns (store only the first element for simple caching)
-        if isinstance(result, tuple):
-            result = result[0]
-        elif isinstance(result, dict):
-            # For ichimoku, return the first value — caller can use params to select
-            result = next(iter(result.values()))
+        data = {p: arrays[p] for p in inspect.signature(func).parameters if p in arrays}
+        out = func(**data, **params)
+        result: ndarray = out[0] if isinstance(out, tuple) else out
 
         self._indicator_cache[key] = result
         return result

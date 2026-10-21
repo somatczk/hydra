@@ -1,25 +1,16 @@
-"""Full technical indicator library (numpy-based, TA-Lib optional).
+"""Technical indicator library (TA-Lib where it has the indicator, numpy otherwise).
 
 All functions take numpy arrays and return numpy arrays.
 Insufficient data positions are filled with NaN, never raising exceptions.
+A function returning a tuple is reachable from rules by its first output only; the other
+outputs have their own single-output function (``macd_hist``, ``bollinger_lower``, ...).
 """
 
 from __future__ import annotations
 
 import numpy as np
+import talib
 from numpy import ndarray
-
-# ---------------------------------------------------------------------------
-# Optional TA-Lib import
-# ---------------------------------------------------------------------------
-
-try:
-    import talib
-
-    _HAS_TALIB = True
-except ImportError:
-    _HAS_TALIB = False
-
 
 # ===========================================================================
 # Trend indicators
@@ -34,15 +25,7 @@ def sma(data: ndarray, period: int) -> ndarray:
     """
     if period <= 0:
         return np.full_like(data, np.nan, dtype=np.float64)
-    if _HAS_TALIB:
-        return talib.SMA(data.astype(np.float64), timeperiod=period)
-    result = np.full(len(data), np.nan, dtype=np.float64)
-    if len(data) < period:
-        return result
-    cumsum = np.cumsum(data, dtype=np.float64)
-    cumsum[period:] = cumsum[period:] - cumsum[:-period]
-    result[period - 1 :] = cumsum[period - 1 :] / period
-    return result
+    return talib.SMA(data.astype(np.float64), timeperiod=period)
 
 
 def ema(data: ndarray, period: int) -> ndarray:
@@ -53,18 +36,7 @@ def ema(data: ndarray, period: int) -> ndarray:
     """
     if period <= 0:
         return np.full_like(data, np.nan, dtype=np.float64)
-    if _HAS_TALIB:
-        return talib.EMA(data.astype(np.float64), timeperiod=period)
-    data = data.astype(np.float64)
-    result = np.full(len(data), np.nan, dtype=np.float64)
-    if len(data) < period:
-        return result
-    multiplier = 2.0 / (period + 1)
-    # Seed with SMA
-    result[period - 1] = np.mean(data[:period])
-    for i in range(period, len(data)):
-        result[i] = (data[i] - result[i - 1]) * multiplier + result[i - 1]
-    return result
+    return talib.EMA(data.astype(np.float64), timeperiod=period)
 
 
 def macd(
@@ -75,29 +47,25 @@ def macd(
 ) -> tuple[ndarray, ndarray, ndarray]:
     """MACD: Moving Average Convergence Divergence.
 
-    Returns ``(macd_line, signal_line, histogram)``.
+    Returns ``(macd_line, signal_line, histogram)``; the rule name ``macd`` is the MACD line.
     """
-    if _HAS_TALIB:
-        m, s, h = talib.MACD(
-            data.astype(np.float64),
-            fastperiod=fast,
-            slowperiod=slow,
-            signalperiod=signal,
-        )
-        return m, s, h
-    fast_ema = ema(data, fast)
-    slow_ema = ema(data, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = ema(macd_line[~np.isnan(macd_line)], signal)
-    # Pad signal_line to same length as macd_line
-    full_signal = np.full(len(data), np.nan, dtype=np.float64)
-    # Find first valid macd index
-    first_valid = int(np.argmax(~np.isnan(macd_line)))
-    valid_count = len(macd_line) - first_valid
-    if len(signal_line) == valid_count:
-        full_signal[first_valid:] = signal_line
-    histogram = macd_line - full_signal
-    return macd_line, full_signal, histogram
+    m, s, h = talib.MACD(
+        data.astype(np.float64),
+        fastperiod=fast,
+        slowperiod=slow,
+        signalperiod=signal,
+    )
+    return m, s, h
+
+
+def macd_signal(data: ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> ndarray:
+    """MACD signal line (EMA of the MACD line)."""
+    return macd(data, fast, slow, signal)[1]
+
+
+def macd_hist(data: ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> ndarray:
+    """MACD histogram (MACD line minus signal line)."""
+    return macd(data, fast, slow, signal)[2]
 
 
 def supertrend(
@@ -126,11 +94,11 @@ def supertrend(
     st = np.full(n, np.nan, dtype=np.float64)
     direction = np.full(n, np.nan, dtype=np.float64)
 
-    if n < period:
+    if n <= period:
         return st, direction
 
     # Initialize at first valid ATR index
-    start = period - 1
+    start = period
     st[start] = upper_band[start]
     direction[start] = -1.0
 
@@ -160,6 +128,17 @@ def supertrend(
                 st[i] = upper_band[i]
 
     return st, direction
+
+
+def supertrend_direction(
+    high: ndarray,
+    low: ndarray,
+    close: ndarray,
+    period: int = 10,
+    multiplier: float = 3.0,
+) -> ndarray:
+    """Supertrend direction: +1 bullish, -1 bearish."""
+    return supertrend(high, low, close, period, multiplier)[1]
 
 
 def ichimoku(
@@ -230,37 +209,7 @@ def rsi(data: ndarray, period: int = 14) -> ndarray:
     """
     if period <= 0:
         return np.full_like(data, np.nan, dtype=np.float64)
-    if _HAS_TALIB:
-        return talib.RSI(data.astype(np.float64), timeperiod=period)
-    data = data.astype(np.float64)
-    n = len(data)
-    result = np.full(n, np.nan, dtype=np.float64)
-    if n < period + 1:
-        return result
-
-    deltas = np.diff(data)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-
-    if avg_loss == 0:
-        result[period] = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        result[period] = 100.0 - 100.0 / (1.0 + rs)
-
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
-            result[i + 1] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            result[i + 1] = 100.0 - 100.0 / (1.0 + rs)
-
-    return result
+    return talib.RSI(data.astype(np.float64), timeperiod=period)
 
 
 def stochastic(
@@ -270,27 +219,30 @@ def stochastic(
     k_period: int = 14,
     d_period: int = 3,
 ) -> tuple[ndarray, ndarray]:
-    """Stochastic Oscillator (%K, %D).
+    """Fast stochastic (%K, %D), TA-Lib ``STOCHF`` (TradingView's Stoch 14,1,3).
 
-    %K measures where the close is relative to the period's range.
-    %D is the SMA of %K.
+    %K is where the close sits in the ``k_period`` high-low range (0 on a zero range);
+    %D is the SMA of %K over ``d_period``.
     """
-    high = high.astype(np.float64)
-    low = low.astype(np.float64)
-    close = close.astype(np.float64)
-    n = len(close)
-    k = np.full(n, np.nan, dtype=np.float64)
-
-    for i in range(k_period - 1, n):
-        hh = np.max(high[i - k_period + 1 : i + 1])
-        ll = np.min(low[i - k_period + 1 : i + 1])
-        if hh == ll:
-            k[i] = 50.0  # no range
-        else:
-            k[i] = 100.0 * (close[i] - ll) / (hh - ll)
-
-    d = sma(k, d_period)
+    k, d = talib.STOCHF(
+        high.astype(np.float64),
+        low.astype(np.float64),
+        close.astype(np.float64),
+        fastk_period=k_period,
+        fastd_period=d_period,
+    )
     return k, d
+
+
+def stochastic_d(
+    high: ndarray,
+    low: ndarray,
+    close: ndarray,
+    k_period: int = 14,
+    d_period: int = 3,
+) -> ndarray:
+    """Fast stochastic %D (SMA of %K)."""
+    return stochastic(high, low, close, k_period, d_period)[1]
 
 
 def cci(
@@ -347,32 +299,15 @@ def atr(
     close: ndarray,
     period: int = 14,
 ) -> ndarray:
-    """Average True Range (Wilder smoothing)."""
-    high = high.astype(np.float64)
-    low = low.astype(np.float64)
-    close = close.astype(np.float64)
-    n = len(close)
-    result = np.full(n, np.nan, dtype=np.float64)
-    if n < 2:
-        return result
-
-    tr = np.full(n, np.nan, dtype=np.float64)
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        tr[i] = max(
-            high[i] - low[i],
-            abs(high[i] - close[i - 1]),
-            abs(low[i] - close[i - 1]),
-        )
-
-    if n < period:
-        return result
-
-    result[period - 1] = np.mean(tr[:period])
-    for i in range(period, n):
-        result[i] = (result[i - 1] * (period - 1) + tr[i]) / period
-
-    return result
+    """Average True Range, Wilder's (TA-Lib ``ATR``): first value at index ``period``,
+    the mean of TR[1..period], then Wilder smoothing.
+    """
+    return talib.ATR(
+        high.astype(np.float64),
+        low.astype(np.float64),
+        close.astype(np.float64),
+        timeperiod=period,
+    )
 
 
 def bollinger_bands(
@@ -411,46 +346,41 @@ def bollinger_lower(data: ndarray, period: int = 20, std_dev: float = 2.0) -> nd
 
 
 def rolling_max(data: ndarray, period: int) -> ndarray:
-    """Rolling maximum over the last *period* values.
+    """Rolling maximum of the *period* values before the current one, window [t-period, t-1].
 
-    Equivalent to the upper Donchian channel computed on closes.
-    NaN for the first ``period - 1`` elements.
+    The upper Donchian channel on closes: ``close crosses_above`` it on a new high.
+    NaN for the first ``period`` elements.
     """
     if period <= 0:
         return np.full_like(data, np.nan, dtype=np.float64)
     data_f = data.astype(np.float64)
     n = len(data_f)
     result = np.full(n, np.nan, dtype=np.float64)
-    if n < period:
-        return result
-    for i in range(period - 1, n):
-        result[i] = np.max(data_f[i - period + 1 : i + 1])
+    for i in range(period, n):
+        result[i] = np.max(data_f[i - period : i])
     return result
 
 
 def rolling_min(data: ndarray, period: int) -> ndarray:
-    """Rolling minimum over the last *period* values.
+    """Rolling minimum of the *period* values before the current one, window [t-period, t-1].
 
-    Equivalent to the lower Donchian channel computed on closes.
-    NaN for the first ``period - 1`` elements.
+    The lower Donchian channel on closes: ``close crosses_below`` it on a new low.
+    NaN for the first ``period`` elements.
     """
     if period <= 0:
         return np.full_like(data, np.nan, dtype=np.float64)
     data_f = data.astype(np.float64)
     n = len(data_f)
     result = np.full(n, np.nan, dtype=np.float64)
-    if n < period:
-        return result
-    for i in range(period - 1, n):
-        result[i] = np.min(data_f[i - period + 1 : i + 1])
+    for i in range(period, n):
+        result[i] = np.min(data_f[i - period : i])
     return result
 
 
 def rolling_mid(data: ndarray, period: int) -> ndarray:
-    """Rolling midpoint: (rolling_max + rolling_min) / 2.
+    """Rolling midpoint: (rolling_max + rolling_min) / 2, over the same [t-period, t-1] window.
 
-    Equivalent to the Donchian channel midline on closes.
-    NaN for the first ``period - 1`` elements.
+    The Donchian channel midline on closes. NaN for the first ``period`` elements.
     """
     result: ndarray = (rolling_max(data, period) + rolling_min(data, period)) / 2.0
     return result
@@ -475,6 +405,30 @@ def keltner_channels(
     upper = middle + multiplier * atr_vals
     lower = middle - multiplier * atr_vals
     return upper, middle, lower
+
+
+def keltner_upper(
+    high: ndarray,
+    low: ndarray,
+    close: ndarray,
+    ema_period: int = 20,
+    atr_period: int = 10,
+    multiplier: float = 1.5,
+) -> ndarray:
+    """Upper Keltner Channel (the middle line is ``ema``)."""
+    return keltner_channels(high, low, close, ema_period, atr_period, multiplier)[0]
+
+
+def keltner_lower(
+    high: ndarray,
+    low: ndarray,
+    close: ndarray,
+    ema_period: int = 20,
+    atr_period: int = 10,
+    multiplier: float = 1.5,
+) -> ndarray:
+    """Lower Keltner Channel."""
+    return keltner_channels(high, low, close, ema_period, atr_period, multiplier)[2]
 
 
 # ===========================================================================

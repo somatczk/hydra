@@ -15,10 +15,10 @@ parameters:
     entry_long:
       operator: AND
       conditions:
-        - indicator: bollinger_bands
-          params: {period: 20, std_dev: 2.0}
+        - indicator: close
+          params: {}
           comparator: less_than
-          value: 0
+          value: "bollinger_lower:period=20,std_dev=2.0"
         - indicator: rsi
           params: {period: 14}
           comparator: less_than
@@ -26,10 +26,10 @@ parameters:
     exit_long:
       operator: AND
       conditions:
-        - indicator: bollinger_bands
-          params: {period: 20, std_dev: 2.0}
+        - indicator: close
+          params: {}
           comparator: greater_than
-          value: 0.5
+          value: "bollinger_middle:period=20,std_dev=2.0"
     entry_short: null
     exit_short: null
 position_sizing:
@@ -37,9 +37,7 @@ position_sizing:
   risk_per_trade_pct: 1.0
   max_position_pct: 8.0
 _template_meta:
-  description: Mean reversion with Bollinger Bands + RSI confirmation. Buys at lower band, exits at middle band. Good in ranging markets.
+  description: Mean reversion with Bollinger Bands + RSI confirmation. Buys at lower band, exits at middle band.
   type: rule_based
   risk_level: moderate
-  expected_sharpe: 1.1
-  expected_max_drawdown: 12.0
   recommended_capital: 5000

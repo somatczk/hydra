@@ -242,7 +242,9 @@ class BacktestRunner:
         # Infrastructure
         event_bus = InMemoryEventBus()
         clock = BacktestClock(start=bars[0].timestamp)
-        context = StrategyContext()
+        # shortcut: bounded like a live session's 1000-bar window until P2-A's replay replaces this
+        history = strategy_class(config=strategy_config, context=StrategyContext()).required_history
+        context = StrategyContext(max_bars=max(1000, history))
         context.set_portfolio_value(initial_capital)
 
         # Instantiate strategy

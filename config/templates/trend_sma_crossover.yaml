@@ -18,14 +18,16 @@ parameters:
         - indicator: sma
           params: {period: 20}
           comparator: crosses_above
-          value: sma_50
+          value: "sma:period=50"
+          value_ref_overrides: {slow_sma_period: period}
     exit_long:
       operator: AND
       conditions:
         - indicator: sma
           params: {period: 20}
           comparator: crosses_below
-          value: sma_50
+          value: "sma:period=50"
+          value_ref_overrides: {slow_sma_period: period}
     entry_short: null
     exit_short: null
 position_sizing:
@@ -33,9 +35,7 @@ position_sizing:
   risk_per_trade_pct: 1.5
   max_position_pct: 15.0
 _template_meta:
-  description: Classic SMA golden/death cross on 4h timeframe. Trend-following with wide stops. Best in trending markets.
+  description: Classic SMA 20/50 golden/death cross on the 4h timeframe. sma_period sets the fast SMA, slow_sma_period the slow one.
   type: rule_based
   risk_level: moderate
-  expected_sharpe: 0.9
-  expected_max_drawdown: 18.0
   recommended_capital: 10000

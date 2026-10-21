@@ -34,6 +34,20 @@ def _get_indicator_values(
     return ctx.indicator(indicator_name, symbol, timeframe, **params)
 
 
+def parse_indicator_ref(value: str) -> tuple[str, dict[str, int | float]]:
+    """Parse an indicator reference ``"name:param1=val1,param2=val2"``."""
+    parts = value.split(":")
+    params: dict[str, int | float] = {}
+    if len(parts) > 1:
+        for kv in parts[1].split(","):
+            k, _, v = kv.partition("=")
+            try:
+                params[k.strip()] = int(v.strip())
+            except ValueError:
+                params[k.strip()] = float(v.strip())
+    return parts[0], params
+
+
 def _resolve_value(
     value: float | str,
     ctx: StrategyContext,
@@ -49,17 +63,7 @@ def _resolve_value(
     """
     if isinstance(value, (int, float)):
         return float(value)
-    # Parse indicator reference: "indicator_name:param1=val1,param2=val2"
-    parts = str(value).split(":")
-    ind_name = parts[0]
-    params: dict[str, int | float] = {}
-    if len(parts) > 1:
-        for kv in parts[1].split(","):
-            k, _, v = kv.partition("=")
-            try:
-                params[k.strip()] = int(v.strip())
-            except ValueError:
-                params[k.strip()] = float(v.strip())
+    ind_name, params = parse_indicator_ref(str(value))
     vals = _get_indicator_values(ctx, symbol, timeframe, ind_name, params)
     if index < len(vals):
         return float(vals[index])
