@@ -64,6 +64,7 @@ def test_every_operation_needs_credentials() -> None:
     client = TestClient(app, client=("10.10.16.2", 41000))
     ops = _operations()
     assert len({path for _, path in ops}) >= 70, "route enumeration found too few paths"
+    assert ("GET", "/api/system/readiness") in ops
     unprotected = []
     for method, path in ops:
         resp = client.request(method, path, headers={"X-Hydra-Request": "1"})

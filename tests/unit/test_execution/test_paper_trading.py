@@ -314,10 +314,15 @@ class TestQueries:
         }
         assert await ex.fetch_balance() == {"USDT": D("92800.0"), "BTC": D("0.1"), "ETH": D("1")}
 
-    async def test_filled_orders_history(self) -> None:
-        ex = await holding("1", "100")
+    async def test_filled_orders_history_reports_quantity_and_reason(self) -> None:
+        ex = await holding("0.3", "100")
+        await ex.create_order(BTC, "SELL", "STOP_MARKET", D("0.3"), stop_price=D("90"))
+        await ex.on_closed_bar(BTC, bar(1, "95", "96", "85", "88"))
         history = await ex.get_filled_orders()
-        assert [h["side"] for h in history] == ["BUY"]
+        assert [(h["side"], h["quantity"], h["amount"], h["reason"]) for h in history] == [
+            ("BUY", 0.3, 0.3, "market"),
+            ("SELL", 0.3, 0.3, "stop_loss"),
+        ]
 
     async def test_snapshot_tracks_peak_and_drawdown(self) -> None:
         ex = await holding("1", "100", fee="0", slippage="0", capital="1000")

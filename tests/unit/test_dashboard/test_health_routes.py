@@ -31,6 +31,7 @@ from hydra.dashboard.health import (
     closed_bar_max_age,
 )
 from hydra.dashboard.routes import health as health_routes
+from hydra.dashboard.routes import system as system_routes
 from hydra.data.bars import last_closed_open
 from hydra.data.migrations.runner import head_revision
 from hydra.execution.client_factory import ClientFactory
@@ -465,6 +466,32 @@ async def test_errored_session_holding_base_keeps_its_position_and_dirty_series(
     assert _gauge("hydra_session_desired", **labels) is None
 
 
+class TestReadinessApi:
+    async def test_serves_the_last_result_without_running_a_check(self, probe: Probe) -> None:
+        probe.app.include_router(system_routes.router)
+        probe.clock.now += CACHE_INTERVALS * probe.monitor.interval_s + 1
+        pings = probe.pool.pings
+
+        resp = await probe.client.get("/api/system/readiness")
+
+        assert resp.status_code == 200
+        last = probe.monitor.last
+        assert last is not None
+        assert resp.json() == {
+            **last.body(),
+            "checked_at": datetime.fromtimestamp(last.checked_at, UTC).isoformat(),
+        }
+        assert probe.pool.pings == pings
+        await probe.client.get("/readyz")
+        assert probe.pool.pings == pings + 1
+
+    async def test_no_result_yet_is_503(self, probe: Probe) -> None:
+        probe.app.include_router(system_routes.router)
+        probe.monitor.last = None
+        resp = await probe.client.get("/api/system/readiness")
+        assert (resp.status_code, resp.json()["detail"]["code"]) == (503, "readiness_unavailable")
+
+
 class TestLiveness:
     async def test_livez_needs_a_recent_monitor_run(self, probe: Probe) -> None:
         resp = await probe.client.get("/livez")
@@ -507,3 +534,14 @@ class TestRealApp:
         with TestClient(real_app) as client:
             pass
         assert client.get("/livez").status_code == 503
+
+    def test_readiness_api_needs_credentials_and_mirrors_readyz(self) -> None:
+        with TestClient(real_app) as client:
+            anonymous = client.get("/api/system/readiness", headers={"Authorization": ""})
+            readyz = client.get("/readyz").json()
+            readiness = client.get("/api/system/readiness")
+        assert anonymous.status_code == 401
+        assert readiness.status_code == 200
+        body = readiness.json()
+        assert body.pop("checked_at")
+        assert (body, body["status"]) == (readyz, "not_ready")

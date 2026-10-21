@@ -6,6 +6,7 @@ paper executor). Errors use the ``_db.py`` envelope.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Any, Literal, Self
@@ -14,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hydra.core.types import OrderType, Side
+from hydra.dashboard.health import SNAPSHOT_TIMEOUT_S
 from hydra.dashboard.routes._db import api_error, require_pool
 from hydra.dashboard.routes.strategies import build_strategy_name_map
 from hydra.dashboard.security import audit
@@ -30,7 +32,11 @@ from hydra.execution.errors import (
     UnsupportedVenueError,
 )
 from hydra.execution.order_manager import RiskRejectedError
-from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
+from hydra.execution.paper_trading import (
+    PaperSessionHaltedError,
+    PaperTradingExecutor,
+    PersistenceUnavailableError,
+)
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.risk.market_rules import MarketRulesUnavailableError
 
@@ -65,6 +71,10 @@ class SessionResponse(BaseModel):
     positions_at_stop: int = 0
     flatten_incomplete: bool = False
     persist_error: str | None = None
+    last_bar_at: str | None = None
+    entries_paused: str | None = None
+    persist_dirty: bool | None = None
+    feed_live: bool | None = None
 
 
 class PositionItem(BaseModel):
@@ -92,6 +102,18 @@ class TradeItem(BaseModel, extra="allow"):
         if isinstance(v, dict):
             return float(v.get("cost", 0))
         return float(v) if v is not None else 0.0
+
+
+class OpenOrderItem(BaseModel, extra="allow"):
+    id: str
+    symbol: str
+    side: str
+    type: str
+    amount: float
+    price: float | None
+    stop_price: float | None
+    reason: str
+    protective: bool | None
 
 
 class SessionMetrics(BaseModel):
@@ -129,6 +151,7 @@ class SessionDetailResponse(BaseModel):
     metrics: SessionMetrics = Field(default_factory=SessionMetrics)
     positions: list[PositionItem] = Field(default_factory=list)
     trades: list[TradeItem] = Field(default_factory=list)
+    open_orders: list[OpenOrderItem] = Field(default_factory=list)
 
 
 class KillSwitchResponse(BaseModel):
@@ -354,13 +377,25 @@ async def stop_session(session_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/sessions", response_model=list[SessionResponse])
 async def list_sessions(request: Request) -> list[dict[str, Any]]:
-    """List all trading sessions (running + recent stopped)."""
+    """List all trading sessions (running + recent stopped) with each one's health."""
     mgr = _get_session_manager(request)
     name_map = build_strategy_name_map()
+    try:
+        snap = await asyncio.wait_for(mgr.health_snapshot(), SNAPSHOT_TIMEOUT_S)
+        health = {h.session_id: h for h in snap.sessions}
+    except Exception:
+        logger.warning("Session list: health snapshot failed", exc_info=True)
+        health = {}
     results = []
     for s in mgr.list_sessions():
         d = _session_to_dict(s)
         d["strategy_name"] = name_map.get(s.strategy_id)
+        h = health.get(s.session_id)
+        if h is not None:
+            d["last_bar_at"] = h.last_bar_at.isoformat() if h.last_bar_at else None
+            d["entries_paused"] = h.entries_paused
+            d["persist_dirty"] = h.persist_dirty
+            d["feed_live"] = h.feed_live
         results.append(d)
     return results
 
@@ -376,6 +411,14 @@ async def get_session_detail(session_id: str, request: Request) -> dict[str, Any
             404, "session_not_found", f"Session {session_id} not found", "not_found"
         ) from exc
     detail["strategy_name"] = build_strategy_name_map().get(detail.get("strategy_id", ""))
+    session = mgr.get_session(session_id)
+    executor = getattr(session, "_executor", None)
+    if isinstance(executor, PaperTradingExecutor):
+        rt = session._runtime
+        detail["open_orders"] = [
+            {**o, "protective": rt.protect.is_protective(o["oco_id"] or o["id"]) if rt else None}
+            for o in await executor.fetch_open_orders()
+        ]
     return dict(detail)
 
 

@@ -539,6 +539,11 @@ class TestStopAndDetail:
         assert (resp.json()["status"], resp.json()["positions_at_stop"]) == ("stopped", 0)
         detail = (await api.get(f"/api/trading/sessions/{session.session_id}/detail")).json()
         assert detail["metrics"]["total_trades"] == 2
+        assert [(t["side"], t["quantity"], t["reason"]) for t in detail["trades"]] == [
+            ("BUY", 0.5, "market"),
+            ("SELL", 0.5, "market"),
+        ]
+        assert detail["open_orders"] == []
         assert detail["metrics"]["total_pnl"] == pytest.approx(
             float(executor(session).get_account_snapshot().realized_net)
         )
@@ -562,3 +567,88 @@ class TestStopAndDetail:
     async def test_unknown_session_is_404(self, h: Harness, api: httpx.AsyncClient) -> None:
         resp = await api.delete("/api/trading/sessions/nope")
         assert (resp.status_code, _detail(resp)["code"]) == (404, "session_not_found")
+
+    async def test_detail_lists_resting_orders_and_which_are_protective(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "orders"))
+        await h.bar(session, "100")
+        await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "side": "buy",
+                "quantity": "0.3",
+                "stop_loss": "92",
+                "take_profit": "110",
+            },
+        )
+        await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "side": "buy",
+                "quantity": "0.1",
+                "order_type": "limit",
+                "price": "95",
+            },
+        )
+        detail = (await api.get(f"/api/trading/sessions/{session.session_id}/detail")).json()
+        assert [
+            tuple(
+                o[k]
+                for k in ("side", "type", "amount", "price", "stop_price", "reason", "protective")
+            )
+            for o in detail["open_orders"]
+        ] == [
+            ("SELL", "LIMIT", 0.3, 110.0, None, "take_profit", True),
+            ("SELL", "STOP_MARKET", 0.3, None, 92.0, "stop_loss", True),
+            ("BUY", "LIMIT", 0.1, 95.0, 90.25, "limit", False),
+        ]
+
+
+class TestSessionListHealth:
+    async def test_list_reports_bar_feed_and_ledger_health(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "health"))
+        await h.bar(session, "100")
+        assert session.last_bar_at is not None
+        (row,) = (await api.get("/api/trading/sessions")).json()
+        assert (row["last_bar_at"], row["entries_paused"], row["persist_dirty"]) == (
+            session.last_bar_at.isoformat(),
+            None,
+            False,
+        )
+        assert row["feed_live"] is True
+
+        await api.delete(f"/api/trading/sessions/{session.session_id}")
+        (row,) = (await api.get("/api/trading/sessions")).json()
+        assert (row["status"], row["feed_live"], row["entries_paused"]) == (
+            "stopped",
+            False,
+            None,
+        )
+
+    async def test_failed_health_snapshot_leaves_the_fields_unknown(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path, monkeypatch: Any
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "nosnap"))
+        await h.bar(session, "100")
+
+        async def broken() -> None:
+            raise RuntimeError("snapshot failed")
+
+        monkeypatch.setattr(h.mgr, "health_snapshot", broken)
+        resp = await api.get("/api/trading/sessions")
+        assert resp.status_code == 200
+        (row,) = resp.json()
+        assert row["status"] == "running"
+        assert [
+            row[k] for k in ("last_bar_at", "entries_paused", "persist_dirty", "feed_live")
+        ] == [
+            None,
+            None,
+            None,
+            None,
+        ]

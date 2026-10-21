@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, cast
 from urllib.parse import unquote, urlsplit
@@ -643,6 +643,17 @@ async def get_system_health(request: Request) -> dict[str, Any]:
         overall = "degraded"
 
     return {"overall": overall, "services": services}
+
+
+@router.get("/readiness")
+async def get_readiness(request: Request) -> dict[str, Any]:
+    """The health monitor's last ``/readyz`` result and when it ran; never runs a check."""
+    last = getattr(getattr(request.app.state, "health_monitor", None), "last", None)
+    if last is None:
+        raise api_error(
+            503, "readiness_unavailable", "No readiness check has run yet", "unavailable"
+        )
+    return {**last.body(), "checked_at": datetime.fromtimestamp(last.checked_at, UTC).isoformat()}
 
 
 # ---------------------------------------------------------------------------
