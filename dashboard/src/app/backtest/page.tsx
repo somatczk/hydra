@@ -1,10 +1,10 @@
 'use client';
 
 import { useEffect, useState, useRef, Suspense } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { useSearchParams } from 'next/navigation';
 import { Play, Download, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { DataCard } from '@/components/ui/DataCard';
+import { Section } from '@/components/ui/Section';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Table } from '@/components/ui/Table';
@@ -16,6 +16,9 @@ import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { ProvenanceBadge, type DataProvenance } from '@/components/backtest/DataProvenance';
 import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
+import { signed } from '@/lib/format';
+import { ResearchNav } from '@/components/research/ResearchNav';
+import Link from 'next/link';
 
 /* ---------- Types ---------- */
 
@@ -25,10 +28,11 @@ interface BacktestRun {
   period: string;
   name: string;
   totalTrades: number;
-  winRate: string;
-  pnl: string;
-  maxDrawdown: string;
-  sharpe: string;
+  winRate: string | null;
+  pnl: string | null;
+  pnlNegative: boolean;
+  maxDrawdown: string | null;
+  sharpe: string | null;
   status: string;
   statusVariant: 'success' | 'warning' | 'info' | 'neutral' | 'error';
   provenance: DataProvenance | null;
@@ -44,10 +48,10 @@ interface ApiBacktestResult {
   provenance?: DataProvenance | null;
   metrics: {
     total_trades: number;
-    win_rate: number;
-    total_pnl: number;
-    max_drawdown: number;
-    sharpe_ratio: number;
+    win_rate: number | null;
+    total_pnl: number | null;
+    max_drawdown: number | null;
+    sharpe_ratio: number | null;
   };
 }
 
@@ -82,22 +86,23 @@ function statusDisplay(status: string): Pick<BacktestRun, 'status' | 'statusVari
 
 /* ---------- Helpers ---------- */
 
+/** A missing metric is NO DATA; a real zero or a loss is shown as it is. */
+const metric = (v: string | null) => v ?? <span className="text-ink-2">— NO DATA</span>;
+
 function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
   return data.map((r) => {
     const m = r.metrics;
-    const pnlStr = m.total_pnl !== 0
-      ? `${m.total_pnl >= 0 ? '+' : '-'}$${Math.abs(m.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
-      : 'N/A';
     return {
       id: r.id,
       strategy: r.strategy,
       period: r.period,
       name: r.name || '',
       totalTrades: m.total_trades,
-      winRate: m.win_rate > 0 ? `${m.win_rate}%` : 'N/A',
-      pnl: pnlStr,
-      maxDrawdown: m.max_drawdown > 0 ? `${m.max_drawdown}%` : 'N/A',
-      sharpe: m.sharpe_ratio > 0 ? m.sharpe_ratio.toFixed(2) : 'N/A',
+      winRate: m.win_rate === null ? null : `${m.win_rate}%`,
+      pnl: signed(m.total_pnl),
+      pnlNegative: m.total_pnl !== null && m.total_pnl < 0,
+      maxDrawdown: m.max_drawdown === null ? null : `${m.max_drawdown}%`,
+      sharpe: m.sharpe_ratio === null ? null : m.sharpe_ratio.toFixed(2),
       ...statusDisplay(r.status),
       provenance: r.provenance ?? null,
     };
@@ -107,7 +112,6 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
 /* ---------- Page ---------- */
 
 function BacktestPageContent() {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const { toast } = useToast();
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([]);
@@ -285,24 +289,21 @@ function BacktestPageContent() {
       key: 'name',
       header: 'Name',
       render: (row: BacktestRun) => (
-        <span className="text-text-primary">{row.name || row.strategy}</span>
+        <span className="text-ink-1">{row.name || row.strategy}</span>
       ),
     },
     { key: 'strategy', header: 'Strategy', hideOnMobile: true },
     { key: 'period', header: 'Period', hideOnMobile: true },
-    { key: 'totalTrades', header: 'Trades', render: (row: BacktestRun) => <span>{row.totalTrades}</span> },
-    { key: 'winRate', header: 'Win Rate' },
+    { key: 'totalTrades', header: 'Trades', numeric: true, render: (row: BacktestRun) => <span>{row.totalTrades}</span> },
+    { key: 'winRate', header: 'Win rate', numeric: true, render: (row: BacktestRun) => metric(row.winRate) },
     {
       key: 'pnl',
       header: 'PnL',
-      render: (row: BacktestRun) => (
-        <span className={row.pnl.startsWith('+') ? 'text-status-success font-medium' : row.pnl.startsWith('-') ? 'text-status-error font-medium' : 'text-text-muted'}>
-          {row.pnl}
-        </span>
-      ),
+      numeric: true,
+      render: (row: BacktestRun) => (row.pnl === null ? metric(null) : <span className={row.pnlNegative ? 'font-medium text-danger' : 'font-medium'}>{row.pnl}</span>),
     },
-    { key: 'maxDrawdown', header: 'Max DD', hideOnMobile: true },
-    { key: 'sharpe', header: 'Sharpe', hideOnMobile: true },
+    { key: 'maxDrawdown', header: 'Max DD', numeric: true, hideOnMobile: true, render: (row: BacktestRun) => metric(row.maxDrawdown) },
+    { key: 'sharpe', header: 'Sharpe', numeric: true, hideOnMobile: true, render: (row: BacktestRun) => metric(row.sharpe) },
     {
       key: 'data',
       header: 'Data',
@@ -317,28 +318,26 @@ function BacktestPageContent() {
     },
     {
       key: 'actions',
-      header: '',
+      header: 'Actions',
       render: (row: BacktestRun) => (
         <div className="flex items-center gap-2">
           {row.status === 'Completed' && (
-            <button
-              onClick={(e) => { e.stopPropagation(); router.push(`/backtest/${row.id}`); }}
-              className="text-xs text-text-muted hover:underline"
-            >
+            <Link href={`/backtest/${row.id}`} className="inline-flex min-h-8 items-center text-xs text-ink-1 underline underline-offset-2">
               View
-            </button>
+            </Link>
           )}
           {deletingId === row.id ? (
             <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-              <button onClick={() => handleDelete(row.id)} className="text-xs text-status-error hover:underline">Confirm</button>
-              <button onClick={() => setDeletingId(null)} className="text-xs text-text-muted hover:underline">Cancel</button>
+              <button onClick={() => handleDelete(row.id)} className="text-xs text-danger hover:underline">Confirm</button>
+              <button onClick={() => setDeletingId(null)} className="text-xs text-ink-2 hover:underline">Cancel</button>
             </div>
           ) : (
             <button
+              aria-label={`Delete backtest ${row.name || row.strategy}`}
               onClick={(e) => { e.stopPropagation(); setDeletingId(row.id); }}
-              className="text-text-muted hover:text-status-error transition-colors"
+              className="inline-flex h-8 w-8 items-center justify-center text-ink-2 hover:text-danger transition-colors"
             >
-              <Trash2 className="h-3.5 w-3.5" />
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           )}
         </div>
@@ -348,8 +347,10 @@ function BacktestPageContent() {
 
   return (
     <div className="flex flex-col gap-6">
+      <ResearchNav current="/backtest" />
+      <h1 className="text-xl font-semibold text-ink-1">Backtests</h1>
       {/* Runner form */}
-      <DataCard title="Run Backtest" description="Configure and execute a new backtest run">
+      <Section title="Run Backtest">
         {strategiesError && (
           <div className="mb-4">
             <ErrorCard message="Failed to load strategies" onRetry={fetchStrategies} />
@@ -385,7 +386,7 @@ function BacktestPageContent() {
           </div>
         )}
         <div className="mt-4 flex flex-col gap-3">
-          <div className="flex gap-3 sm:flex-row">
+          <div className="flex flex-wrap gap-3">
             <Button variant="primary" onClick={handleRunBacktest} disabled={running}>
               <Play className="h-4 w-4" />
               {running ? `Running${progress > 0 ? ` (${progress}%)` : '...'}` : 'Run Backtest'}
@@ -409,20 +410,20 @@ function BacktestPageContent() {
           </div>
           {running && (
             <div className="flex items-center gap-3">
-              <div className="flex-1 h-2 rounded-full bg-bg-tertiary overflow-hidden">
+              <div className="flex-1 h-2 rounded-full bg-raised overflow-hidden">
                 <div
-                  className="h-full rounded-full bg-accent-primary transition-all duration-500 ease-out"
+                  className="h-full rounded-full bg-accent transition-all duration-500 ease-out"
                   style={{ width: `${progress}%` }}
                 />
               </div>
-              <span className="text-xs text-text-muted w-10 text-right">{progress}%</span>
+              <span className="text-xs text-ink-2 w-10 text-right">{progress}%</span>
             </div>
           )}
         </div>
-      </DataCard>
+      </Section>
 
       {/* Results table */}
-      <DataCard title="Backtest History" description="Previous backtest runs">
+      <Section title="Backtest History">
         {resultsError !== null ? (
           <DataStateErrorCard error={resultsError} fallback="Failed to load backtest results" onRetry={fetchResults} />
         ) : (
@@ -433,7 +434,7 @@ function BacktestPageContent() {
           loading={loading}
         />
         )}
-      </DataCard>
+      </Section>
     </div>
   );
 }

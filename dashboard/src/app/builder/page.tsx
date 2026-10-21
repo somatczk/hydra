@@ -1,12 +1,8 @@
 'use client';
 
 import { useReducer, useEffect, useState, useCallback, useRef, Suspense } from 'react';
-import { Save, Plus, Brain, ChevronDown, ChevronUp, FlaskConical } from 'lucide-react';
+import { Save, Plus, FlaskConical } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { Select } from '@/components/ui/Select';
-import { Input } from '@/components/ui/Input';
-import { DataCard } from '@/components/ui/DataCard';
-import { cn } from '@/components/ui/cn';
 import { RuleSection } from '@/components/builder/RuleSection';
 import { TimeframeSelector } from '@/components/builder/TimeframeSelector';
 import { RiskConfigurator } from '@/components/builder/RiskConfigurator';
@@ -30,7 +26,6 @@ import type {
   TakeProfitConfig,
   SizingConfig,
   TimeframeConfig,
-  MlOverlay,
   RuleSection as RuleSectionKey,
   StrategyDetail,
   SerializedConditionGroup,
@@ -247,25 +242,25 @@ const RULE_SECTIONS: RuleSectionConfig[] = [
     key: 'entryLong',
     title: 'Entry Long',
     description: 'Conditions for opening a long (buy) position',
-    colorClass: 'bg-status-success',
+    colorClass: 'bg-ink-2',
   },
   {
     key: 'exitLong',
     title: 'Exit Long',
     description: 'Conditions for closing a long position',
-    colorClass: 'bg-status-warning',
+    colorClass: 'bg-caution',
   },
   {
     key: 'entryShort',
     title: 'Entry Short',
     description: 'Conditions for opening a short (sell) position',
-    colorClass: 'bg-status-error',
+    colorClass: 'bg-danger',
   },
   {
     key: 'exitShort',
     title: 'Exit Short',
     description: 'Conditions for closing a short position',
-    colorClass: 'bg-status-info',
+    colorClass: 'bg-ink-2',
   },
 ];
 
@@ -332,46 +327,22 @@ function BuilderPageContent() {
   const [indicators, setIndicators] = useState<IndicatorSchema[]>(DEFAULT_INDICATORS);
   const [comparators, setComparators] = useState<ComparatorSchema[]>(DEFAULT_COMPARATORS);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
-  const [availableModels, setAvailableModels] = useState<{ id: string; name: string }[]>([]);
   const [loadError, setLoadError] = useState<unknown>(null);
-  const [mlOverlayOpen, setMlOverlayOpen] = useState(false);
-  const [strategyType, setStrategyType] = useState<'rule' | 'dca' | 'grid'>('rule');
-  const [dcaConfig, setDcaConfig] = useState({
-    base_order_size: 100,
-    safety_order_size: 50,
-    safety_order_count: 5,
-    price_deviation_pct: 1.0,
-    volume_scale: 1.5,
-    take_profit_pct: 1.5,
-  });
-  const [gridConfig, setGridConfig] = useState({
-    upper_price: 0,
-    lower_price: 0,
-    grid_count: 10,
-    total_investment: 1000,
-    grid_type: 'arithmetic' as 'arithmetic' | 'geometric',
-  });
   const searchParams = useSearchParams();
   const router = useRouter();
   const { toast } = useToast();
   const saveAndBacktestRef = useRef(false);
 
-  /* Fetch indicators, comparators, and available models from API */
+  /* Fetch indicators and comparators from API */
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [indResult, compResult, modelsResult] = await Promise.allSettled([
+        const [indResult, compResult] = await Promise.allSettled([
           fetchApi<IndicatorSchema[]>('/api/strategies/indicators'),
           fetchApi<ComparatorSchema[]>('/api/strategies/comparators'),
-          fetchApi<{ id: string; name: string; stage?: string }[]>('/api/models'),
         ]);
         if (indResult.status === 'fulfilled' && indResult.value.length > 0) setIndicators(indResult.value);
         if (compResult.status === 'fulfilled' && compResult.value.length > 0) setComparators(compResult.value);
-        if (modelsResult.status === 'fulfilled') {
-          setAvailableModels(
-            modelsResult.value.filter((m) => !m.stage || (m.stage !== 'Archived' && m.stage !== 'Training')),
-          );
-        }
         const failed = [
           indResult.status === 'rejected' ? ['indicators', indResult.reason] : null,
           compResult.status === 'rejected' ? ['comparators', compResult.reason] : null,
@@ -380,9 +351,6 @@ function BuilderPageContent() {
           const detail = failed.map(([what, err]) => `${what}: ${describeApiError(err, 'unavailable')}`).join('; ');
           logger.warn('Builder', 'Builder catalogue unavailable', detail);
           toast('warning', `Using built-in indicator list; server catalogue unavailable (${detail})`);
-        }
-        if (modelsResult.status === 'rejected') {
-          toast('warning', `ML models unavailable: ${describeApiError(modelsResult.reason, 'request failed')}`);
         }
       } catch (err) {
         logger.warn('Builder', 'Failed to fetch indicators/comparators', err);
@@ -430,8 +398,8 @@ function BuilderPageContent() {
     <div className="flex flex-col gap-6">
       {/* Page header */}
       <div>
-        <h2 className="text-xl font-bold text-text-primary font-display">Strategy Builder</h2>
-        <p className="text-sm text-text-muted mt-1">
+        <h1 className="text-xl font-semibold text-ink-1">Strategy builder</h1>
+        <p className="text-sm text-ink-2 mt-1">
           Build trading strategies visually using indicators and conditions
         </p>
       </div>
@@ -442,178 +410,31 @@ function BuilderPageContent() {
         </div>
       )}
 
-      {/* Strategy type tabs */}
-      <div className="flex gap-1 rounded-lg border border-border-default bg-bg-secondary p-1">
-        {([
-          { value: 'rule', label: 'Rule-Based' },
-          { value: 'dca', label: 'DCA Bot' },
-          { value: 'grid', label: 'Grid Bot' },
-        ] as const).map((tab) => (
-          <button
-            key={tab.value}
-            onClick={() => setStrategyType(tab.value)}
-            className={cn(
-              'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-              strategyType === tab.value
-                ? 'bg-bg-elevated text-text-primary shadow-sm'
-                : 'text-text-muted hover:text-text-primary',
-            )}
-          >
-            {tab.label}
-          </button>
+      <div className="flex flex-col gap-4">
+        {RULE_SECTIONS.map((section) => (
+          <RuleSection
+            key={section.key}
+            title={section.title}
+            description={section.description}
+            group={state[section.key]}
+            indicators={indicators}
+            comparators={comparators}
+            colorClass={section.colorClass}
+            onAddCondition={() => dispatch({ type: 'ADD_CONDITION', section: section.key })}
+            onRemoveCondition={(conditionId: string) =>
+              dispatch({ type: 'REMOVE_CONDITION', section: section.key, conditionId })
+            }
+            onUpdateCondition={(
+              conditionId: string,
+              field: keyof BuilderCondition,
+              value: string | number | ConditionParams,
+            ) => dispatch({ type: 'UPDATE_CONDITION', section: section.key, conditionId, field, value })}
+            onSetOperator={(operator: 'AND' | 'OR') =>
+              dispatch({ type: 'SET_OPERATOR', section: section.key, operator })
+            }
+          />
         ))}
       </div>
-
-      {/* Rule sections (only for rule-based) */}
-      {strategyType === 'rule' && (
-        <div className="flex flex-col gap-4">
-          {RULE_SECTIONS.map((section) => (
-            <RuleSection
-              key={section.key}
-              title={section.title}
-              description={section.description}
-              group={state[section.key]}
-              indicators={indicators}
-              comparators={comparators}
-              colorClass={section.colorClass}
-              onAddCondition={() =>
-                dispatch({ type: 'ADD_CONDITION', section: section.key })
-              }
-              onRemoveCondition={(conditionId: string) =>
-                dispatch({
-                  type: 'REMOVE_CONDITION',
-                  section: section.key,
-                  conditionId,
-                })
-              }
-              onUpdateCondition={(
-                conditionId: string,
-                field: keyof BuilderCondition,
-                value: string | number | ConditionParams,
-              ) =>
-                dispatch({
-                  type: 'UPDATE_CONDITION',
-                  section: section.key,
-                  conditionId,
-                  field,
-                  value,
-                })
-              }
-              onSetOperator={(operator: 'AND' | 'OR') =>
-                dispatch({ type: 'SET_OPERATOR', section: section.key, operator })
-              }
-            />
-          ))}
-        </div>
-      )}
-
-      {/* DCA Bot Configuration */}
-      {strategyType === 'dca' && (
-        <DataCard title="DCA Bot Configuration" description="Configure Dollar Cost Averaging bot parameters">
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <Input
-              label="Base Order Size (USDT)"
-              type="number"
-              value={dcaConfig.base_order_size}
-              onChange={(e) => setDcaConfig((prev) => ({ ...prev, base_order_size: parseFloat(e.target.value) || 0 }))}
-              hint="Initial order size when starting a new deal"
-            />
-            <Input
-              label="Safety Order Size (USDT)"
-              type="number"
-              value={dcaConfig.safety_order_size}
-              onChange={(e) => setDcaConfig((prev) => ({ ...prev, safety_order_size: parseFloat(e.target.value) || 0 }))}
-              hint="Size of each safety order to average down"
-            />
-            <Input
-              label="Safety Order Count"
-              type="number"
-              value={dcaConfig.safety_order_count}
-              onChange={(e) => setDcaConfig((prev) => ({ ...prev, safety_order_count: parseInt(e.target.value) || 0 }))}
-              hint="Maximum number of safety orders per deal"
-            />
-            <Input
-              label="Price Deviation (%)"
-              type="number"
-              value={dcaConfig.price_deviation_pct}
-              step={0.1}
-              onChange={(e) => setDcaConfig((prev) => ({ ...prev, price_deviation_pct: parseFloat(e.target.value) || 0 }))}
-              hint="Price drop to trigger each safety order"
-            />
-            <Input
-              label="Volume Scale"
-              type="number"
-              value={dcaConfig.volume_scale}
-              step={0.1}
-              onChange={(e) => setDcaConfig((prev) => ({ ...prev, volume_scale: parseFloat(e.target.value) || 0 }))}
-              hint="Multiplier for each subsequent safety order"
-            />
-            <Input
-              label="Take Profit (%)"
-              type="number"
-              value={dcaConfig.take_profit_pct}
-              step={0.1}
-              onChange={(e) => setDcaConfig((prev) => ({ ...prev, take_profit_pct: parseFloat(e.target.value) || 0 }))}
-              hint="Target profit to close the deal"
-            />
-          </div>
-        </DataCard>
-      )}
-
-      {/* Grid Bot Configuration */}
-      {strategyType === 'grid' && (
-        <DataCard title="Grid Bot Configuration" description="Configure Grid trading bot parameters">
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <Input
-              label="Upper Price"
-              type="number"
-              value={gridConfig.upper_price}
-              onChange={(e) => setGridConfig((prev) => ({ ...prev, upper_price: parseFloat(e.target.value) || 0 }))}
-              hint="Upper boundary of the grid range"
-            />
-            <Input
-              label="Lower Price"
-              type="number"
-              value={gridConfig.lower_price}
-              onChange={(e) => setGridConfig((prev) => ({ ...prev, lower_price: parseFloat(e.target.value) || 0 }))}
-              hint="Lower boundary of the grid range"
-            />
-            <Input
-              label="Grid Count"
-              type="number"
-              value={gridConfig.grid_count}
-              onChange={(e) => setGridConfig((prev) => ({ ...prev, grid_count: parseInt(e.target.value) || 0 }))}
-              hint="Number of grid levels between upper and lower"
-            />
-            <Input
-              label="Total Investment (USDT)"
-              type="number"
-              value={gridConfig.total_investment}
-              onChange={(e) => setGridConfig((prev) => ({ ...prev, total_investment: parseFloat(e.target.value) || 0 }))}
-              hint="Total capital allocated to the grid"
-            />
-            <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-text-secondary mb-1">Grid Type</label>
-              <div className="flex gap-1 rounded-lg border border-border-default bg-bg-secondary p-1">
-                {(['arithmetic', 'geometric'] as const).map((type) => (
-                  <button
-                    key={type}
-                    onClick={() => setGridConfig((prev) => ({ ...prev, grid_type: type }))}
-                    className={cn(
-                      'flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors',
-                      gridConfig.grid_type === type
-                        ? 'bg-bg-elevated text-text-primary shadow-sm'
-                        : 'text-text-muted hover:text-text-primary',
-                    )}
-                  >
-                    {type.charAt(0).toUpperCase() + type.slice(1)}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        </DataCard>
-      )}
 
       {/* Timeframe selector */}
       <TimeframeSelector
@@ -637,86 +458,11 @@ function BuilderPageContent() {
         }
       />
 
-      {/* ML Model Overlay */}
-      <DataCard>
-        <button
-          onClick={() => setMlOverlayOpen(!mlOverlayOpen)}
-          className="flex w-full items-center justify-between"
-        >
-          <div className="flex items-center gap-2">
-            <Brain className="h-4 w-4 text-text-muted" />
-            <div className="text-left">
-              <p className="text-sm font-semibold text-text-primary">ML Model Overlay</p>
-              <p className="text-xs text-text-muted">Attach an ML model to filter signals</p>
-            </div>
-          </div>
-          {mlOverlayOpen ? <ChevronUp className="h-4 w-4 text-text-muted" /> : <ChevronDown className="h-4 w-4 text-text-muted" />}
-        </button>
-        {mlOverlayOpen && (
-          <div className="mt-4 space-y-4 border-t border-border-default pt-4">
-            <div className="flex items-center gap-3">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={state.mlOverlay !== null}
-                  onChange={(e) => {
-                    if (e.target.checked) {
-                      dispatch({
-                        type: 'SET_ML_OVERLAY',
-                        mlOverlay: { modelName: availableModels[0]?.id || '', confidenceThreshold: 0.5 },
-                      });
-                    } else {
-                      dispatch({ type: 'SET_ML_OVERLAY', mlOverlay: null });
-                    }
-                  }}
-                  className="h-4 w-4 rounded border-border-default text-accent-primary focus:ring-accent-primary"
-                />
-                <span className="text-sm text-text-secondary">Enable ML overlay</span>
-              </label>
-            </div>
-            {state.mlOverlay && (
-              <div className="grid grid-cols-2 gap-4">
-                <Select
-                  label="Model"
-                  options={availableModels.map((m) => ({ value: m.id, label: m.name }))}
-                  value={state.mlOverlay.modelName}
-                  onChange={(e) =>
-                    dispatch({
-                      type: 'SET_ML_OVERLAY',
-                      mlOverlay: { ...state.mlOverlay!, modelName: e.target.value },
-                    })
-                  }
-                />
-                <div>
-                  <label className="block text-xs font-medium text-text-secondary mb-1">
-                    Confidence Threshold: {state.mlOverlay.confidenceThreshold.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={state.mlOverlay.confidenceThreshold}
-                    onChange={(e) =>
-                      dispatch({
-                        type: 'SET_ML_OVERLAY',
-                        mlOverlay: { ...state.mlOverlay!, confidenceThreshold: parseFloat(e.target.value) },
-                      })
-                    }
-                    className="w-full accent-accent-primary"
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </DataCard>
-
       {/* Signal preview */}
       <SignalPreview state={state} />
 
       {/* Action buttons */}
-      <div className="flex justify-end gap-3">
+      <div className="flex flex-wrap justify-end gap-3">
         {state.editingId && (
           <Button
             variant="outline"

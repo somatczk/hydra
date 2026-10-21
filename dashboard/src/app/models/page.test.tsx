@@ -101,3 +101,14 @@ describe('ModelsPage upload', () => {
     expect(JSON.stringify(toast.mock.calls)).not.toContain('[object Object]');
   });
 });
+
+describe('ModelsPage banner', () => {
+  it('says models are not used for trading and has one h1', async () => {
+    page = await mount(<ModelsPage />);
+
+    expect(page.container.querySelectorAll('h1')).toHaveLength(1);
+    expect(page.container.querySelector('[role="note"]')?.textContent).toBe(
+      "Models aren't used for trading until a later release. Promoting a model here has no effect on sessions.",
+    );
+  });
+});

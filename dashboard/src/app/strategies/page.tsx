@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Square, Eye, Shield, ChevronDown, ChevronUp, Download, Upload, LayoutTemplate } from 'lucide-react';
+import { Zap, Plus, Edit2, Trash2, BarChart3, Play, Eye, Download, Upload, LayoutTemplate } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { Input } from '@/components/ui/Input';
@@ -12,6 +12,7 @@ import { useToast } from '@/components/ui/Toast';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { describeApiError, stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
+import { ResearchNav } from '@/components/research/ResearchNav';
 
 /* ---------- Types ---------- */
 
@@ -52,15 +53,6 @@ interface BuilderStrategy {
   enabled: boolean;
   filename: string;
   editable: boolean;
-}
-
-interface RiskOverrides {
-  max_position_pct: number;
-  max_risk_per_trade: number;
-  max_portfolio_heat: number;
-  max_daily_loss_pct: number;
-  max_drawdown_pct: number;
-  max_concurrent_positions: number;
 }
 
 /* ---------- Helpers ---------- */
@@ -112,9 +104,9 @@ function fmtPnl(v: number): string {
 }
 
 function sharpeClass(v: number | null): string {
-  if (v === null) return 'text-text-muted';
-  if (v >= 1) return 'text-status-success';
-  return v >= 0 ? 'text-text-primary' : 'text-status-error';
+  if (v === null) return 'text-ink-2';
+  if (v >= 1) return 'text-ink-1';
+  return v >= 0 ? 'text-ink-1' : 'text-danger';
 }
 
 /* ---------- Page ---------- */
@@ -126,16 +118,12 @@ export default function StrategiesPage() {
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [startingId, setStartingId] = useState<string | null>(null);
-  const [stoppingId, setStoppingId] = useState<string | null>(null);
   const [tradingMode, setTradingMode] = useState<string | null>(null);
   const [paperCapital, setPaperCapital] = useState<number | null>(null);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [sessionsError, setSessionsError] = useState<unknown>(null);
   const [configError, setConfigError] = useState<unknown>(null);
   const [capitalMap, setCapitalMap] = useState<Record<string, string>>({});
-  const [riskOverridesOpen, setRiskOverridesOpen] = useState<string | null>(null);
-  const [riskOverrides, setRiskOverrides] = useState<Record<string, RiskOverrides>>({});
-  const [savingRisk, setSavingRisk] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const fetchData = useCallback(async (silent = false) => {
@@ -250,87 +238,6 @@ export default function StrategiesPage() {
     }
   };
 
-  const handleStartLive = async (strategyId: string) => {
-    if (!confirm('Start LIVE trading? Real funds will be used.')) return;
-    setStartingId(strategyId);
-    try {
-      await fetchApi('/api/trading/sessions', {
-        method: 'POST',
-        body: JSON.stringify({
-          strategy_id: strategyId,
-          trading_mode: 'live',
-        }),
-      });
-      toast('success', 'Live session started');
-      fetchData(true);
-    } catch (err) {
-      logger.error('Strategies', 'Failed to start live session', err);
-      toast('error', `Failed to start: ${describeApiError(err, 'unknown error')}`);
-    } finally {
-      setStartingId(null);
-    }
-  };
-
-  const handleStop = async (sessionId: string) => {
-    setStoppingId(sessionId);
-    try {
-      await fetchApi(`/api/trading/sessions/${sessionId}`, { method: 'DELETE' });
-      toast('success', 'Session stopped');
-      fetchData(true);
-    } catch (err) {
-      logger.error('Strategies', 'Failed to stop session', err);
-      toast('error', `Failed to stop: ${describeApiError(err, 'unknown error')}`);
-    } finally {
-      setStoppingId(null);
-    }
-  };
-
-  const toggleRiskOverrides = async (strategyId: string) => {
-    if (riskOverridesOpen === strategyId) {
-      setRiskOverridesOpen(null);
-      return;
-    }
-    setRiskOverridesOpen(strategyId);
-    // Load existing overrides if not cached
-    if (!riskOverrides[strategyId]) {
-      try {
-        const cfg = await fetchApi<RiskOverrides>(`/api/risk/config/${strategyId}`);
-        setRiskOverrides((prev) => ({ ...prev, [strategyId]: cfg }));
-      } catch (err) {
-        logger.warn('Strategies', 'Failed to load risk overrides', err);
-        toast('error', describeApiError(err, 'Failed to load risk overrides'));
-        setRiskOverridesOpen(null);
-      }
-    }
-  };
-
-  const updateRiskField = (strategyId: string, field: keyof RiskOverrides, value: string) => {
-    setRiskOverrides((prev) => ({
-      ...prev,
-      [strategyId]: {
-        ...prev[strategyId],
-        [field]: field === 'max_concurrent_positions' ? parseInt(value, 10) || 0 : parseFloat(value) / 100 || 0,
-      },
-    }));
-  };
-
-  const handleSaveRiskOverrides = async (strategyId: string) => {
-    setSavingRisk(strategyId);
-    try {
-      const overrides = riskOverrides[strategyId];
-      await fetchApi(`/api/risk/config/${strategyId}`, {
-        method: 'PUT',
-        body: JSON.stringify(overrides),
-      });
-      toast('success', 'Risk overrides saved');
-    } catch (err) {
-      logger.error('Strategies', 'Failed to save risk overrides', err);
-      toast('error', describeApiError(err, 'Failed to save risk overrides'));
-    } finally {
-      setSavingRisk(null);
-    }
-  };
-
   const handleExport = async (id: string, name: string) => {
     try {
       const yaml = await fetchApi<string>(`/api/strategies/${id}/export`);
@@ -367,10 +274,11 @@ export default function StrategiesPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+      <ResearchNav current="/strategies" />
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p className="text-sm text-text-muted">
+          <h1 className="text-xl font-semibold text-ink-1">Strategies</h1>
+          <p className="mt-1 text-sm text-ink-2">
             {loading
               ? 'Loading...'
               : loadError !== null
@@ -378,7 +286,7 @@ export default function StrategiesPage() {
                 : `${strategies.filter((s) => s.status === 'Active').length} active strategies`}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" onClick={() => router.push('/templates')}>
             <LayoutTemplate className="h-4 w-4" />
             Browse Templates
@@ -394,6 +302,7 @@ export default function StrategiesPage() {
             ref={fileInputRef}
             type="file"
             accept=".yaml,.yml"
+            aria-label="Import strategy YAML file"
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0];
@@ -422,24 +331,40 @@ export default function StrategiesPage() {
         </div>
       )}
 
+      {!loading && loadError === null && strategies.length === 0 && (
+        <div className="flex flex-col items-center gap-3 rounded-lg border border-line bg-surface py-12 text-center">
+          <p className="text-sm text-ink-2">No strategies yet. Build one or start from a template.</p>
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button variant="primary" onClick={() => router.push('/builder')}>
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              New strategy
+            </Button>
+            <Button variant="outline" onClick={() => router.push('/templates')}>
+              <LayoutTemplate className="h-4 w-4" aria-hidden="true" />
+              New from template
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Strategy cards grid */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {strategies.map((strategy) => (
           <div
             key={strategy.id}
-            className="rounded-xl border border-border-default bg-bg-elevated p-5 transition-colors hover:border-border-hover"
+            className="rounded-xl border border-line bg-surface p-5 transition-colors hover:border-line-strong"
           >
             {/* Card header */}
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-bg-tertiary">
-                  <Zap className="h-5 w-5 text-accent-primary" aria-hidden="true" />
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-raised">
+                  <Zap className="h-5 w-5 text-accent" aria-hidden="true" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-semibold text-text-primary">
+                  <h2 className="text-sm font-semibold text-ink-1">
                     {strategy.name}
-                  </h3>
-                  <p className="mt-0.5 text-xs text-text-muted line-clamp-1">
+                  </h2>
+                  <p className="mt-0.5 text-xs text-ink-2 line-clamp-1">
                     {strategy.description}
                   </p>
                 </div>
@@ -467,7 +392,7 @@ export default function StrategiesPage() {
 
             {/* Performance metrics */}
             {strategy.performanceError !== null && (
-              <div className="mt-3 flex items-center gap-2 text-xs text-text-muted" data-testid="performance-error">
+              <div className="mt-3 flex items-center gap-2 text-xs text-ink-2" data-testid="performance-error">
                 <DataStateBadge
                   state={stateFromError(strategy.performanceError)}
                   reason={describeApiError(strategy.performanceError, 'Performance unavailable')}
@@ -476,27 +401,27 @@ export default function StrategiesPage() {
               </div>
             )}
             {strategy.performance && (
-              <div className="mt-3 grid grid-cols-5 gap-2 rounded-lg border border-border-default bg-bg-secondary p-2.5">
+              <div className="mt-3 grid grid-cols-5 gap-2 rounded-lg border border-line bg-surface p-2.5">
                 <div className="text-center">
                   <p className={cn(
                     'text-sm font-bold',
-                    strategy.performance.total_pnl >= 0 ? 'text-status-success' : 'text-status-error',
+                    strategy.performance.total_pnl >= 0 ? 'text-ink-1' : 'text-danger',
                   )}>
                     {fmtPnl(strategy.performance.total_pnl)}
                   </p>
-                  <p className="text-[10px] text-text-muted">PnL</p>
+                  <p className="text-[10px] text-ink-2">PnL</p>
                 </div>
                 <div className="text-center">
-                  <p className="text-sm font-bold text-text-primary">
+                  <p className="text-sm font-bold text-ink-1">
                     {strategy.performance.win_rate.toFixed(1)}%
                   </p>
-                  <p className="text-[10px] text-text-muted">Win Rate</p>
+                  <p className="text-[10px] text-ink-2">Win Rate</p>
                 </div>
                 <div className="text-center">
-                  <p className="text-sm font-bold text-text-primary">
+                  <p className="text-sm font-bold text-ink-1">
                     {strategy.performance.total_trades}
                   </p>
-                  <p className="text-[10px] text-text-muted">Trades</p>
+                  <p className="text-[10px] text-ink-2">Trades</p>
                 </div>
                 <div className="text-center">
                   <p className={cn(
@@ -505,16 +430,16 @@ export default function StrategiesPage() {
                   )}>
                     {strategy.performance.sharpe_ratio === null ? '—' : strategy.performance.sharpe_ratio.toFixed(2)}
                   </p>
-                  <p className="text-[10px] text-text-muted">Sharpe</p>
+                  <p className="text-[10px] text-ink-2">Sharpe</p>
                 </div>
                 <div className="text-center">
                   <p className={cn(
                     'text-sm font-bold',
-                    strategy.performance.max_drawdown === null ? 'text-text-muted' : 'text-status-error',
+                    strategy.performance.max_drawdown === null ? 'text-ink-2' : 'text-danger',
                   )}>
                     {strategy.performance.max_drawdown === null ? '—' : `${strategy.performance.max_drawdown.toFixed(1)}%`}
                   </p>
-                  <p className="text-[10px] text-text-muted">Max DD</p>
+                  <p className="text-[10px] text-ink-2">Max DD</p>
                 </div>
               </div>
             )}
@@ -522,7 +447,7 @@ export default function StrategiesPage() {
             {/* Per-strategy capital — only when no session is running */}
             {!strategy.session && strategy.status === 'Active' && tradingMode === 'paper' && (
               <div className="mt-3 flex items-center gap-2">
-                <label className="text-xs text-text-muted whitespace-nowrap">Capital:</label>
+                <label className="text-xs text-ink-2 whitespace-nowrap">Capital:</label>
                 <Input
                   type="number"
                   value={capitalMap[strategy.id] ?? (paperCapital !== null ? String(paperCapital) : '')}
@@ -538,136 +463,37 @@ export default function StrategiesPage() {
             {sessionsError === null && (strategy.status === 'Active' || strategy.session) && (
               <div className="mt-3 flex items-center gap-2">
                 {strategy.session ? (
-                  <>
-                    <Button
-                      variant="danger"
-                      size="sm"
-                      onClick={() => handleStop(strategy.session!.session_id)}
-                      loading={stoppingId === strategy.session.session_id}
-                    >
-                      <Square className="h-3 w-3" />
-                      Stop
-                    </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => router.push(`/trading/${strategy.session!.session_id}`)}
+                  >
+                    <Eye className="h-3 w-3" aria-hidden="true" />
+                    View session
+                  </Button>
+                ) : (
+                  (tradingMode === 'paper' || tradingMode === 'testnet') && (
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => router.push(`/trading/${strategy.session!.session_id}`)}
+                      onClick={() => handleStartPaper(strategy.id)}
+                      loading={startingId === strategy.id}
                     >
-                      <Eye className="h-3 w-3" />
-                      View
+                      <Play className="h-3 w-3" aria-hidden="true" />
+                      Start paper session
                     </Button>
-                  </>
-                ) : (
-                  <>
-                    {tradingMode === 'paper' && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => handleStartPaper(strategy.id)}
-                        loading={startingId === strategy.id}
-                      >
-                        <Play className="h-3 w-3" />
-                        Start Paper
-                      </Button>
-                    )}
-                    {tradingMode === 'live' && (
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={() => handleStartLive(strategy.id)}
-                        loading={startingId === strategy.id}
-                      >
-                        <Play className="h-3 w-3" />
-                        Start Live
-                      </Button>
-                    )}
-                    {tradingMode === 'testnet' && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => handleStartPaper(strategy.id)}
-                        loading={startingId === strategy.id}
-                      >
-                        <Play className="h-3 w-3" />
-                        Start Testnet
-                      </Button>
-                    )}
-                  </>
+                  )
                 )}
               </div>
             )}
 
-            {/* Risk overrides */}
-            <div className="mt-3 border-t border-border-default pt-3">
-              <button
-                onClick={() => toggleRiskOverrides(strategy.id)}
-                className="inline-flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors"
-              >
-                <Shield className="h-3 w-3" />
-                Risk Overrides
-                {riskOverridesOpen === strategy.id ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-              </button>
-              {riskOverridesOpen === strategy.id && riskOverrides[strategy.id] && (
-                <div className="mt-3 space-y-3 rounded-lg border border-border-default bg-bg-secondary p-3">
-                  <div className="grid grid-cols-2 gap-3">
-                    <Input
-                      label="Max Position %"
-                      type="number"
-                      value={(riskOverrides[strategy.id].max_position_pct * 100).toFixed(0)}
-                      onChange={(e) => updateRiskField(strategy.id, 'max_position_pct', e.target.value)}
-                    />
-                    <Input
-                      label="Max Risk/Trade %"
-                      type="number"
-                      value={(riskOverrides[strategy.id].max_risk_per_trade * 100).toFixed(0)}
-                      onChange={(e) => updateRiskField(strategy.id, 'max_risk_per_trade', e.target.value)}
-                    />
-                    <Input
-                      label="Portfolio Heat %"
-                      type="number"
-                      value={(riskOverrides[strategy.id].max_portfolio_heat * 100).toFixed(0)}
-                      onChange={(e) => updateRiskField(strategy.id, 'max_portfolio_heat', e.target.value)}
-                    />
-                    <Input
-                      label="Max Daily Loss %"
-                      type="number"
-                      value={(riskOverrides[strategy.id].max_daily_loss_pct * 100).toFixed(0)}
-                      onChange={(e) => updateRiskField(strategy.id, 'max_daily_loss_pct', e.target.value)}
-                    />
-                    <Input
-                      label="Max Drawdown %"
-                      type="number"
-                      value={(riskOverrides[strategy.id].max_drawdown_pct * 100).toFixed(0)}
-                      onChange={(e) => updateRiskField(strategy.id, 'max_drawdown_pct', e.target.value)}
-                    />
-                    <Input
-                      label="Max Concurrent Positions"
-                      type="number"
-                      value={riskOverrides[strategy.id].max_concurrent_positions.toString()}
-                      onChange={(e) => updateRiskField(strategy.id, 'max_concurrent_positions', e.target.value)}
-                    />
-                  </div>
-                  <div className="flex justify-end">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleSaveRiskOverrides(strategy.id)}
-                      loading={savingRisk === strategy.id}
-                    >
-                      Save Overrides
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </div>
-
             {/* Action buttons */}
-            <div className="mt-3 flex items-center justify-between border-t border-border-default pt-3">
-              <div className="flex items-center gap-2">
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3">
+              <div className="flex flex-wrap items-center gap-2">
                 {strategy.editable && (
                   <button
                     onClick={() => router.push(`/builder?strategy=${strategy.id}`)}
-                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors"
                   >
                     <Edit2 className="h-3 w-3" />
                     Edit
@@ -675,14 +501,14 @@ export default function StrategiesPage() {
                 )}
                 <button
                   onClick={() => router.push(`/backtest?strategy=${strategy.id}`)}
-                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors"
                 >
                   <BarChart3 className="h-3 w-3" />
                   Backtest
                 </button>
                 <button
                   onClick={() => handleExport(strategy.id, strategy.name)}
-                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-bg-hover hover:text-text-primary transition-colors"
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors"
                 >
                   <Download className="h-3 w-3" />
                   Export
@@ -690,7 +516,7 @@ export default function StrategiesPage() {
                 <button
                   onClick={() => handleDelete(strategy.id, strategy.name)}
                   disabled={deletingId === strategy.id}
-                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted hover:bg-status-error/10 hover:text-status-error transition-colors disabled:opacity-50"
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-danger-soft hover:text-danger transition-colors disabled:opacity-50"
                 >
                   <Trash2 className="h-3 w-3" />
                   {deletingId === strategy.id ? 'Deleting...' : 'Delete'}
@@ -703,8 +529,8 @@ export default function StrategiesPage() {
                     ? 'cursor-not-allowed opacity-50'
                     : 'cursor-pointer',
                   strategy.status === 'Active'
-                    ? 'bg-status-success'
-                    : 'bg-bg-active',
+                    ? 'bg-ink-2'
+                    : 'bg-line',
                 )}
                 role="switch"
                 aria-checked={strategy.status === 'Active'}

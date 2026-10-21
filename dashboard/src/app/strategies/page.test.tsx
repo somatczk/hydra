@@ -109,7 +109,7 @@ describe('StrategiesPage error states', () => {
 
     expect(page.container.querySelector('[data-testid="config-error"]')).not.toBeNull();
     expect(page.container.innerHTML).not.toContain('10000');
-    expect(page.container.textContent).not.toContain('Start Paper');
+    expect(page.container.textContent).not.toContain('Start paper session');
   });
 
   it('hides session controls when sessions are unknown', async () => {
@@ -119,6 +119,51 @@ describe('StrategiesPage error states', () => {
     page = await mount(<StrategiesPage />);
 
     expect(page.container.querySelector('[data-testid="sessions-error"]')).not.toBeNull();
-    expect(page.container.textContent).not.toContain('Start Paper');
+    expect(page.container.textContent).not.toContain('Start paper session');
+  });
+});
+
+describe('StrategiesPage research hygiene', () => {
+  it('has one h1, the phone Research nav, and no Start Live, Risk Overrides or Stop', async () => {
+    const routes = baseRoutes();
+    routes['/api/system/config'] = { trading_mode: 'live', paper_capital: 2500 };
+    routes['/api/trading/sessions'] = [
+      { session_id: 's1', strategy_id: 'saw', trading_mode: 'paper', status: 'running', started_at: null, stopped_at: null },
+    ];
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    expect(page.container.querySelectorAll('h1')).toHaveLength(1);
+    expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Strategies');
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('Start Live');
+    expect(text).not.toContain('Risk Overrides');
+    expect(Array.from(page.container.querySelectorAll('button')).map((b) => b.textContent?.trim())).not.toContain('Stop');
+    expect(calls.some((c) => c.path.startsWith('/api/risk/config'))).toBe(false);
+  });
+
+  it('offers a paper session only in paper mode', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
+    page = await mount(<StrategiesPage />);
+    expect(page.container.textContent).toContain('Start paper session');
+    page.unmount();
+
+    const routes = baseRoutes();
+    routes['/api/system/config'] = { trading_mode: 'live', paper_capital: 2500 };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+    expect(page.container.textContent).not.toContain('Start paper session');
+  });
+
+  it('says what to do when there are no strategies', async () => {
+    const routes = baseRoutes();
+    routes['/api/strategies'] = [];
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    expect(page.container.textContent).toContain('No strategies yet. Build one or start from a template.');
+    const labels = Array.from(page.container.querySelectorAll('button')).map((b) => b.textContent?.trim());
+    expect(labels).toContain('New strategy');
+    expect(labels).toContain('New from template');
   });
 });

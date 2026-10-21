@@ -6,7 +6,7 @@ import { usePathname } from 'next/navigation';
 import { Moon, Sun } from 'lucide-react';
 import { useTheme } from './ThemeProvider';
 import { ConditionBar, breakerPhrase } from './ConditionBar';
-import { activeItem } from './navItems';
+import { pageTitle } from './navItems';
 import { KillSwitchControl } from '@/components/shell/KillSwitchControl';
 import { ModeBadge } from '@/components/shell/ModeBadge';
 import { useShellStatus } from '@/components/shell/ShellStatusProvider';
@@ -100,7 +100,7 @@ export function Header() {
   return (
     <header className="sticky top-0 z-30 border-b border-line bg-canvas lg:pl-56">
       <div className="flex min-h-14 items-center gap-2 px-4 py-1.5 lg:flex-wrap lg:gap-x-4 lg:px-6">
-        <span className="min-w-0 flex-1 truncate text-base font-semibold lg:hidden">{activeItem(pathname)?.label ?? 'Hydra'}</span>
+        <span className="min-w-0 flex-1 truncate text-base font-semibold lg:hidden">{pageTitle(pathname) ?? 'Hydra'}</span>
         <ModeBadge storedMode={config.data?.trading_mode} />
         <KillSwitchControl />
         {breaker}

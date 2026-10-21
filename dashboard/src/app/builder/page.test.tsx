@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
-import { mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
+import { click, mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
 const toast = vi.fn();
@@ -26,7 +26,6 @@ function routes(): Routes {
   return {
     '/api/strategies/indicators': [],
     '/api/strategies/comparators': [],
-    '/api/models': [],
     '/api/strategies/strat-1': new ApiError(
       404,
       JSON.stringify({
@@ -68,5 +67,51 @@ describe('BuilderPage error paths', () => {
       'warning',
       'Using built-in indicator list; server catalogue unavailable (indicators: Database is not available)',
     );
+  });
+});
+
+describe('BuilderPage scope', () => {
+  it('has one h1 and no DCA, Grid or ML overlay controls', async () => {
+    fetchApi.mockImplementation(routeFetch(routes(), calls));
+    page = await mount(<BuilderPage />);
+
+    expect(page.container.querySelectorAll('h1')).toHaveLength(1);
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('DCA');
+    expect(text).not.toContain('Grid Bot');
+    expect(text).not.toContain('ML Model Overlay');
+    expect(calls.some((c) => c.path === '/api/models')).toBe(false);
+  });
+
+  it('keeps ml_overlay when a strategy that has one is saved', async () => {
+    const r = routes();
+    r['/api/strategies/strat-1'] = {
+      id: 'strat-1',
+      name: 'Saw',
+      description: 'd',
+      enabled: false,
+      exchange_id: 'binance',
+      symbol: 'BTCUSDT',
+      rules: { entry_long: null, exit_long: null, entry_short: null, exit_short: null },
+      timeframes: { primary: '1h' },
+      risk: {
+        stop_loss_method: 'atr',
+        stop_loss_value: 2,
+        take_profit_method: 'atr',
+        take_profit_value: 3,
+        sizing_method: 'fixed_fractional',
+        sizing_params: {},
+      },
+      ml_overlay: { model_name: 'm1', confidence_threshold: 0.6 },
+    };
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    const update = () => Array.from(page!.container.querySelectorAll('button')).filter((b) => b.textContent?.trim() === 'Update Strategy');
+    await click(update()[0]);
+    await click(update()[update().length - 1]);
+
+    const put = calls.find((c) => c.init?.method === 'PUT');
+    expect(JSON.parse(String(put?.init?.body)).ml_overlay).toEqual({ model_name: 'm1', confidence_threshold: 0.6 });
   });
 });

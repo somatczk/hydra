@@ -29,7 +29,8 @@ import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
-import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { ResearchNav } from '@/components/research/ResearchNav';
 import { ProvenanceBadge, ProvenancePanel, type DataProvenance } from '@/components/backtest/DataProvenance';
 import { describeApiError, stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
@@ -129,7 +130,7 @@ export default function BacktestDetailPage() {
   const resultId = params.id as string;
 
   const [detail, setDetail] = useState<ApiBacktestDetail | null>(null);
-  const [verification, setVerification] = useState<Verification | null>(null);
+  const [verification, setVerification] = useState<Verification | 'unavailable' | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [resolution, setResolution] = useState<TimeResolution>('days');
@@ -154,7 +155,7 @@ export default function BacktestDetailPage() {
       try {
         const [d, v] = await Promise.all([
           fetchApi<ApiBacktestDetail>(`/api/backtest/results/${resultId}`),
-          fetchApi<Verification>(`/api/backtest/results/${resultId}/verify`).catch(() => null),
+          fetchApi<Verification>(`/api/backtest/results/${resultId}/verify`).catch(() => 'unavailable' as const),
         ]);
         setDetail(d);
         setEditName(d.name || '');
@@ -234,10 +235,10 @@ export default function BacktestDetailPage() {
   const renderTooltip = useCallback(({ active, payload, label }: TooltipContentProps<TooltipValueType, string | number>) => {
     if (!active || !payload?.length) return null;
     return (
-      <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
-        <p className="text-xs text-text-muted">{label != null ? formatXTick(String(label), resolution) : ''}</p>
+      <div className="rounded-lg border border-line bg-surface px-3 py-2 shadow-lg">
+        <p className="text-xs text-ink-2">{label != null ? formatXTick(String(label), resolution) : ''}</p>
         {payload.map((entry) => (
-          <p key={String(entry.dataKey)} className="text-sm font-medium text-text-primary">
+          <p key={String(entry.dataKey)} className="text-sm font-medium text-ink-1">
             {entry.dataKey === 'benchmark' ? 'Benchmark' : 'Strategy'}: ${Number(entry.value).toLocaleString('en-US', { minimumFractionDigits: 2 })}
           </p>
         ))}
@@ -271,7 +272,7 @@ export default function BacktestDetailPage() {
     {
       key: 'tradeId',
       header: '#',
-      render: (row: TxnRow) => <span className="text-text-muted">#{row.tradeId}</span>,
+      render: (row: TxnRow) => <span className="text-ink-2">#{row.tradeId}</span>,
     },
     {
       key: 'type',
@@ -303,17 +304,17 @@ export default function BacktestDetailPage() {
       key: 'pnl',
       header: 'PnL',
       render: (row: TxnRow) => row.pnl != null ? (
-        <span className={row.pnl >= 0 ? 'text-status-success font-medium' : 'text-status-error font-medium'}>
+        <span className={row.pnl >= 0 ? 'text-ink-1 font-medium' : 'text-danger font-medium'}>
           {row.pnlFormatted}
         </span>
-      ) : <span className="text-text-muted">{'\u2014'}</span>,
+      ) : <span className="text-ink-2">{'\u2014'}</span>,
     },
   ];
 
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
-        <p className="text-sm text-text-muted">Loading backtest details...</p>
+        <p className="text-sm text-ink-2">Loading backtest details...</p>
       </div>
     );
   }
@@ -323,7 +324,7 @@ export default function BacktestDetailPage() {
     return (
       <div className="flex flex-col items-center justify-center gap-4 py-20">
         {missing ? (
-          <p className="text-sm text-text-muted">Backtest not found</p>
+          <p className="text-sm text-ink-2">Backtest not found</p>
         ) : (
           <DataStateErrorCard error={loadError} fallback="Failed to load backtest" />
         )}
@@ -338,13 +339,14 @@ export default function BacktestDetailPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      <ResearchNav current="/backtest" />
       {/* Stopped reason banner */}
       {detail.stopped_reason && (
-        <div className="flex items-center gap-3 rounded-xl border border-status-warning/30 bg-status-warning/10 px-4 py-3">
-          <AlertTriangle className="h-5 w-5 shrink-0 text-status-warning" />
+        <div className="flex items-center gap-3 rounded-xl border border-status-warning/30 bg-caution/10 px-4 py-3">
+          <AlertTriangle className="h-5 w-5 shrink-0 text-caution" />
           <div>
-            <p className="text-sm font-medium text-text-primary">Backtest stopped early</p>
-            <p className="text-xs text-text-muted">
+            <p className="text-sm font-medium text-ink-1">Backtest stopped early</p>
+            <p className="text-xs text-ink-2">
               {detail.stopped_reason === 'margin_call'
                 ? 'Margin call \u2014 equity reached zero'
                 : detail.stopped_reason}
@@ -374,15 +376,15 @@ export default function BacktestDetailPage() {
               </div>
             ) : (
               <div className="flex items-center gap-2">
-                <h1 className="text-lg font-semibold text-text-primary">
+                <h1 className="text-lg font-semibold text-ink-1">
                   {detail.name || detail.strategy}
                 </h1>
-                <button onClick={() => { setEditName(detail.name || detail.strategy); setEditing(true); }} className="text-text-muted hover:text-text-primary">
+                <button onClick={() => { setEditName(detail.name || detail.strategy); setEditing(true); }} className="text-ink-2 hover:text-ink-1">
                   <Pencil className="h-3.5 w-3.5" />
                 </button>
               </div>
             )}
-            <p className="text-xs text-text-muted">{detail.strategy} &middot; {detail.period}</p>
+            <p className="text-xs text-ink-2">{detail.strategy} &middot; {detail.period}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -392,8 +394,8 @@ export default function BacktestDetailPage() {
             <Share2 className="h-4 w-4" /> Share
           </Button>
           {confirmDelete ? (
-            <div className="flex items-center gap-2 rounded-lg border border-status-error/30 bg-status-error/5 px-3 py-1.5">
-              <span className="text-xs text-text-primary">Delete this backtest?</span>
+            <div className="flex items-center gap-2 rounded-lg border border-danger bg-danger-soft px-3 py-1.5">
+              <span className="text-xs text-ink-1">Delete this backtest?</span>
               <Button variant="danger" size="sm" onClick={handleDelete}>Confirm</Button>
               <Button variant="ghost" size="sm" onClick={() => setConfirmDelete(false)}>Cancel</Button>
             </div>
@@ -410,26 +412,26 @@ export default function BacktestDetailPage() {
       {/* Metrics row */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Total PnL</p>
-          <p className={`text-lg font-bold ${metrics.total_pnl >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+          <p className="text-xs text-ink-2">Total PnL</p>
+          <p className={`text-lg font-bold ${metrics.total_pnl >= 0 ? 'text-ink-1' : 'text-danger'}`}>
             {metrics.total_pnl >= 0 ? '+' : '-'}${Math.abs(metrics.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}
           </p>
         </DataCard>
         <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Win Rate</p>
-          <p className="text-lg font-bold text-text-primary">{metrics.win_rate.toFixed(1)}%</p>
+          <p className="text-xs text-ink-2">Win Rate</p>
+          <p className="text-lg font-bold text-ink-1">{metrics.win_rate.toFixed(1)}%</p>
         </DataCard>
         <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Sharpe Ratio</p>
-          <p className="text-lg font-bold text-text-primary">{metrics.sharpe_ratio.toFixed(2)}</p>
+          <p className="text-xs text-ink-2">Sharpe Ratio</p>
+          <p className="text-lg font-bold text-ink-1">{metrics.sharpe_ratio.toFixed(2)}</p>
         </DataCard>
         <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Max Drawdown</p>
-          <p className="text-lg font-bold text-status-error">{metrics.max_drawdown.toFixed(1)}%</p>
+          <p className="text-xs text-ink-2">Max Drawdown</p>
+          <p className="text-lg font-bold text-danger">{metrics.max_drawdown.toFixed(1)}%</p>
         </DataCard>
         <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Total Trades</p>
-          <p className="text-lg font-bold text-text-primary">{metrics.total_trades}</p>
+          <p className="text-xs text-ink-2">Total Trades</p>
+          <p className="text-lg font-bold text-ink-1">{metrics.total_trades}</p>
         </DataCard>
       </div>
 
@@ -438,34 +440,34 @@ export default function BacktestDetailPage() {
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
           {metrics.alpha != null && (
             <DataCard padding="sm">
-              <p className="text-xs text-text-muted">Alpha</p>
-              <p className={`text-lg font-bold ${metrics.alpha >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+              <p className="text-xs text-ink-2">Alpha</p>
+              <p className={`text-lg font-bold ${metrics.alpha >= 0 ? 'text-ink-1' : 'text-danger'}`}>
                 {metrics.alpha >= 0 ? '+' : ''}{metrics.alpha.toFixed(2)}
               </p>
             </DataCard>
           )}
           {metrics.beta != null && (
             <DataCard padding="sm">
-              <p className="text-xs text-text-muted">Beta</p>
-              <p className="text-lg font-bold text-text-primary">{metrics.beta.toFixed(2)}</p>
+              <p className="text-xs text-ink-2">Beta</p>
+              <p className="text-lg font-bold text-ink-1">{metrics.beta.toFixed(2)}</p>
             </DataCard>
           )}
           {metrics.max_consecutive_wins != null && (
             <DataCard padding="sm">
-              <p className="text-xs text-text-muted">Max Consec. Wins</p>
-              <p className="text-lg font-bold text-status-success">{metrics.max_consecutive_wins}</p>
+              <p className="text-xs text-ink-2">Max Consec. Wins</p>
+              <p className="text-lg font-bold text-ink-1">{metrics.max_consecutive_wins}</p>
             </DataCard>
           )}
           {metrics.max_consecutive_losses != null && (
             <DataCard padding="sm">
-              <p className="text-xs text-text-muted">Max Consec. Losses</p>
-              <p className="text-lg font-bold text-status-error">{metrics.max_consecutive_losses}</p>
+              <p className="text-xs text-ink-2">Max Consec. Losses</p>
+              <p className="text-lg font-bold text-danger">{metrics.max_consecutive_losses}</p>
             </DataCard>
           )}
           {metrics.expectancy != null && (
             <DataCard padding="sm">
-              <p className="text-xs text-text-muted">Expectancy</p>
-              <p className={`text-lg font-bold ${metrics.expectancy >= 0 ? 'text-status-success' : 'text-status-error'}`}>
+              <p className="text-xs text-ink-2">Expectancy</p>
+              <p className={`text-lg font-bold ${metrics.expectancy >= 0 ? 'text-ink-1' : 'text-danger'}`}>
                 {metrics.expectancy >= 0 ? '+' : ''}${metrics.expectancy.toFixed(2)}
               </p>
             </DataCard>
@@ -543,15 +545,23 @@ export default function BacktestDetailPage() {
       </DataCard>
 
       {/* Verification panel */}
-      {verification && (
+      {verification === 'unavailable' && (
+        <DataCard title="Result Verification">
+          <div className="flex items-center gap-2 text-sm text-ink-2">
+            <DataStateBadge state="unavailable" reason="The stored trades could not be re-read to verify the metrics" />
+            Verification UNAVAILABLE: the metrics above are not confirmed against the stored trades.
+          </div>
+        </DataCard>
+      )}
+      {verification && verification !== 'unavailable' && (
         <DataCard title="Result Verification">
           <div className="flex flex-col gap-3">
             <div className="mb-2">
               {verification.all_passed ? (
-                <StatusBadge status="All Checks Passed" variant="success" size="md" />
+                <StatusBadge status={`Metrics recomputed from ${verification.computed_trade_count} stored trades: match`} variant="success" size="md" />
               ) : (
                 <StatusBadge
-                  status={`${[verification.trade_count_match, verification.win_rate_match, verification.total_pnl_match].filter(v => !v).length} of 3 Checks Failed`}
+                  status={`Metrics recomputed from ${verification.computed_trade_count} stored trades: mismatch: ${[['trade count', verification.trade_count_match], ['win rate', verification.win_rate_match], ['total PnL', verification.total_pnl_match]].filter(([, ok]) => !ok).map(([name]) => name).join(', ')}`}
                   variant="error"
                   size="md"
                 />
@@ -563,15 +573,15 @@ export default function BacktestDetailPage() {
                 { label: 'Win Rate', reported: `${verification.reported_win_rate.toFixed(1)}%`, computed: `${verification.computed_win_rate.toFixed(1)}%`, match: verification.win_rate_match },
                 { label: 'Total PnL', reported: `$${verification.reported_total_pnl.toFixed(2)}`, computed: `$${verification.computed_total_pnl.toFixed(2)}`, match: verification.total_pnl_match },
               ] as const).map((row) => (
-                <div key={row.label} className="flex items-center justify-between rounded-lg bg-bg-secondary px-3 py-2">
-                  <span className="text-text-muted">{row.label}</span>
+                <div key={row.label} className="flex items-center justify-between rounded-lg bg-surface px-3 py-2">
+                  <span className="text-ink-2">{row.label}</span>
                   <div className="flex items-center gap-4">
-                    <span className="text-text-primary">Reported: <span className="font-medium">{row.reported}</span></span>
-                    <span className="text-text-primary">Computed: <span className="font-medium">{row.computed}</span></span>
+                    <span className="text-ink-1">Reported: <span className="font-medium">{row.reported}</span></span>
+                    <span className="text-ink-1">Computed: <span className="font-medium">{row.computed}</span></span>
                     {row.match ? (
-                      <CheckCircle className="h-4 w-4 text-status-success" />
+                      <CheckCircle className="h-4 w-4 text-ink-1" />
                     ) : (
-                      <XCircle className="h-4 w-4 text-status-error" />
+                      <XCircle className="h-4 w-4 text-danger" />
                     )}
                   </div>
                 </div>

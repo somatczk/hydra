@@ -147,7 +147,7 @@ export function SignalPreview({ state }: SignalPreviewProps) {
 
             {/* Signal chart placeholder */}
             <div className="rounded-lg border border-border-default bg-bg-primary p-4">
-              <h4 className="text-sm font-semibold text-text-primary mb-3">Signal Timeline</h4>
+              <h3 className="text-sm font-semibold text-text-primary mb-3">Signal Timeline</h3>
               {preview.signals.length === 0 ? (
                 <p className="text-sm text-text-muted text-center py-4">
                   No signals generated. Try adjusting your conditions.

@@ -16,7 +16,7 @@ const { Sidebar } = await import('./Sidebar');
 const { BottomTabBar } = await import('./BottomTabBar');
 const { AppLayout } = await import('./AppLayout');
 const { ThemeProvider } = await import('./ThemeProvider');
-const { isActive, navItems } = await import('./navItems');
+const { isActive, navItems, pageTitle } = await import('./navItems');
 
 const LABELS = ['Status', 'Sessions', 'Risk', 'Research', 'Settings'];
 const SRC = path.join(process.cwd(), 'src');
@@ -133,4 +133,13 @@ describe('shell tab order', () => {
       expect(m.container.querySelector('main#main')).not.toBeNull();
     },
   );
+});
+
+describe('pageTitle', () => {
+  it('names /portfolio Performance while it stays under Status, and otherwise uses the destination label', () => {
+    expect(pageTitle('/portfolio')).toBe('Performance');
+    expect(isActive('/portfolio', navItems[0])).toBe(true);
+    expect(pageTitle('/')).toBe('Status');
+    expect(pageTitle('/backtest/abc')).toBe('Research');
+  });
 });

@@ -207,10 +207,10 @@ export default function ModelsPage() {
       header: 'Model',
       render: (row: Model) => (
         <div className="flex items-center gap-2">
-          <Brain className="h-4 w-4 text-text-muted shrink-0" aria-hidden="true" />
+          <Brain className="h-4 w-4 text-ink-2 shrink-0" aria-hidden="true" />
           <div>
-            <p className="text-sm font-medium text-text-primary">{row.name}</p>
-            <p className="text-xs text-text-muted">{row.version}</p>
+            <p className="text-sm font-medium text-ink-1">{row.name}</p>
+            <p className="text-xs text-ink-2">{row.version}</p>
           </div>
         </div>
       ),
@@ -230,7 +230,7 @@ export default function ModelsPage() {
       header: 'Drift',
       render: (row: Model) => (
         <div className="flex items-center gap-2">
-          <span className="text-sm text-text-primary">{row.drift}</span>
+          <span className="text-sm text-ink-1">{row.drift}</span>
           <StatusBadge
             status={driftLabels[row.driftStatus]}
             variant={row.driftStatus}
@@ -282,6 +282,10 @@ export default function ModelsPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      <h1 className="text-xl font-semibold text-ink-1">Models</h1>
+      <p role="note" className="rounded-lg border border-caution bg-caution-soft p-3 text-sm text-ink-1">
+        Models aren&apos;t used for trading until a later release. Promoting a model here has no effect on sessions.
+      </p>
       {/* Header with upload */}
       <div className="flex items-center justify-between">
         <div />
@@ -290,6 +294,7 @@ export default function ModelsPage() {
             ref={fileInputRef}
             type="file"
             accept=".onnx"
+            aria-label="Upload ONNX model file"
             className="hidden"
             onChange={handleUpload}
           />
@@ -309,7 +314,7 @@ export default function ModelsPage() {
         {fetchErrors.models ? (
           <ErrorCard message="Failed to load model data" onRetry={loadData} />
         ) : loading ? (
-          <div className="h-56 animate-pulse rounded-lg bg-bg-tertiary" />
+          <div className="h-56 animate-pulse rounded-lg bg-raised" />
         ) : accuracyChartData.length > 0 ? (
           <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
@@ -354,7 +359,7 @@ export default function ModelsPage() {
             </ResponsiveContainer>
           </div>
         ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
         )}
       </DataCard>
 
@@ -365,7 +370,7 @@ export default function ModelsPage() {
         ) : loading ? (
           <div className="space-y-3">
             {Array.from({ length: 5 }).map((_, i) => (
-              <div key={i} className="h-12 animate-pulse rounded-lg bg-bg-tertiary" />
+              <div key={i} className="h-12 animate-pulse rounded-lg bg-raised" />
             ))}
           </div>
         ) : models && models.length > 0 ? (
@@ -375,7 +380,7 @@ export default function ModelsPage() {
             keyExtractor={(row) => row.id}
           />
         ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
         )}
       </DataCard>
     </div>

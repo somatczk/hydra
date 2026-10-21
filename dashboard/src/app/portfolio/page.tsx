@@ -1,16 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import {
-  Wallet,
-  TrendingUp,
-  TrendingDown,
-  Receipt,
-  Download,
-  Search,
-  Plus,
-  X,
-} from 'lucide-react';
+import { Download, Search, Plus, X } from 'lucide-react';
 import {
   AreaChart,
   Area,
@@ -23,8 +14,8 @@ import {
   CartesianGrid,
   Cell,
 } from 'recharts';
-import { StatCard } from '@/components/ui/DataCard';
-import { DataCard } from '@/components/ui/DataCard';
+import { Readout } from '@/components/ui/Readout';
+import { Section } from '@/components/ui/Section';
 import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
@@ -33,6 +24,8 @@ import { Table } from '@/components/ui/Table';
 import { useToast } from '@/components/ui/Toast';
 import { ApiError, fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
+import { sideLabel } from '@/lib/derive';
+import { money, price, qty, signed, signedLabel, utc } from '@/lib/format';
 import { logger } from '@/lib/logger';
 
 /* ---------- Types ---------- */
@@ -80,13 +73,12 @@ interface StrategyOption {
 
 interface Trade {
   id: string;
-  strategy: string;
+  strategy_id: string;
   symbol: string;
   side: string;
-  entry_time: string;
-  exit_time: string;
-  entry_price: number;
-  exit_price: number;
+  timestamp: string;
+  price: number;
+  quantity: number;
   pnl: number;
   notes: string;
   tags: string[];
@@ -98,12 +90,6 @@ interface TradesResponse {
   page: number;
   limit: number;
   pages: number;
-}
-
-interface SentimentData {
-  value: number;
-  classification: string;
-  timestamp: string;
 }
 
 /* ---------- Utilities ---------- */
@@ -140,35 +126,17 @@ function getReturnColor(pct: number): string {
   return 'bg-danger text-canvas';
 }
 
-function getSentimentLabel(value: number): string {
-  if (value <= 24) return 'Extreme Fear';
-  if (value <= 44) return 'Fear';
-  if (value <= 55) return 'Neutral';
-  if (value <= 74) return 'Greed';
-  return 'Extreme Greed';
-}
-
-function getSentimentColor(value: number): string {
-  if (value <= 24) return '#ef4444';
-  if (value <= 44) return '#f97316';
-  if (value <= 55) return '#eab308';
-  if (value <= 74) return '#84cc16';
-  return '#22c55e';
-}
-
 /* ---------- Trade Table Row ---------- */
 
-interface TradeRow {
-  id: string;
-  strategy: string;
-  symbol: string;
-  side: string;
-  entry_time: string;
-  exit_time: string;
-  pnl: number;
-  pnlFormatted: string;
-  notes: string;
-  tags: string[];
+type TradeRow = Trade;
+
+function SignedValue({ value }: { value: number }) {
+  return (
+    <>
+      <span aria-hidden="true">{signed(value) ?? '—'}</span>
+      <span className="sr-only">{signedLabel(value) ?? 'not available'}</span>
+    </>
+  );
 }
 
 /* ---------- Page ---------- */
@@ -183,11 +151,9 @@ export default function PortfolioPage() {
   const [monthlyReturns, setMonthlyReturns] = useState<MonthlyReturn[] | null>(null);
   const [attribution, setAttribution] = useState<AttributionItem[] | null>(null);
   const [loading, setLoading] = useState(true);
+  const [source, setSource] = useState<'live' | 'paper' | null>(null);
   const [isDark, setIsDark] = useState(false);
   const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
-
-  // Sentiment state
-  const [sentiment, setSentiment] = useState<SentimentData | null>(null);
 
   // Trade journal state
   const [strategies, setStrategies] = useState<StrategyOption[]>([]);
@@ -233,6 +199,7 @@ export default function PortfolioPage() {
       logger.warn('Portfolio', 'Trading mode unknown; portfolio data not requested', err);
       configError = err ?? true;
     }
+    setSource(source);
     const qs = `?source=${source}`;
 
     await Promise.all([
@@ -258,9 +225,6 @@ export default function PortfolioPage() {
               .then(setAttribution)
               .catch((err) => { setFetchErrors((prev) => ({ ...prev, attribution: err ?? true })); }),
           ]),
-      fetchApi<SentimentData[]>('/api/market/sentiment')
-        .then((arr) => setSentiment(arr?.[0] ?? null))
-        .catch((err) => { setFetchErrors((prev) => ({ ...prev, sentiment: err ?? true })); }),
       fetchApi<StrategyOption[]>('/api/strategies')
         .then((data) => setStrategies(data.map((s) => ({ id: s.id, name: s.name }))))
         .catch(() => {}),
@@ -291,6 +255,7 @@ export default function PortfolioPage() {
     setTradesLoading(true);
     const params = new URLSearchParams();
     params.set('page', String(page));
+    if (source) params.set('source', source);
     if (filterStrategy) params.set('strategy_id', filterStrategy);
     if (filterSymbol) params.set('symbol', filterSymbol);
     if (filterFromDate) params.set('from_date', filterFromDate);
@@ -308,7 +273,7 @@ export default function PortfolioPage() {
     } finally {
       setTradesLoading(false);
     }
-  }, [filterStrategy, filterSymbol, filterFromDate, filterToDate, filterMinPnl, filterMaxPnl, toast]);
+  }, [source, filterStrategy, filterSymbol, filterFromDate, filterToDate, filterMinPnl, filterMaxPnl, toast]);
 
   const handleApplyFilters = () => {
     loadTrades(1);
@@ -409,7 +374,7 @@ export default function PortfolioPage() {
   const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
   const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
 
-  const fmt = (v: number) => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+  const usdt = (v: number | null | undefined) => `${money(v) ?? '—'} USDT`;
 
   // Group monthly returns by year
   const monthlyByYear: Record<number, Record<number, number>> = {};
@@ -422,21 +387,27 @@ export default function PortfolioPage() {
   }
   const years = Object.keys(monthlyByYear).map(Number).sort();
 
-  // Trade table columns
+  const strategyName = (id: string) => strategies.find((st) => st.id === id)?.name ?? (id || '—');
+
   const tradeColumns = [
+    { key: 'timestamp', header: 'Time', render: (row: TradeRow) => utc(row.timestamp) ?? '—' },
     { key: 'symbol', header: 'Symbol' },
-    { key: 'strategy', header: 'Strategy', hideOnMobile: true },
-    { key: 'side', header: 'Side' },
-    { key: 'entry_time', header: 'Entry', render: (row: TradeRow) => new Date(row.entry_time).toLocaleDateString() },
-    { key: 'exit_time', header: 'Exit', hideOnMobile: true, render: (row: TradeRow) => new Date(row.exit_time).toLocaleDateString() },
+    { key: 'strategy_id', header: 'Strategy', hideOnMobile: true, render: (row: TradeRow) => strategyName(row.strategy_id) },
+    {
+      key: 'side',
+      header: 'Side',
+      render: (row: TradeRow) => {
+        const side = sideLabel(row.side);
+        return <span className={side.caution ? 'text-caution' : undefined}>{side.text}</span>;
+      },
+    },
+    { key: 'price', header: 'Price', numeric: true, hideOnMobile: true, render: (row: TradeRow) => price(row.price) ?? '—' },
+    { key: 'quantity', header: 'Qty', numeric: true, hideOnMobile: true, render: (row: TradeRow) => (row.quantity > 0 ? qty(row.quantity) : '—') },
     {
       key: 'pnl',
-      header: 'PnL',
-      render: (row: TradeRow) => (
-        <span className={row.pnl >= 0 ? 'text-status-success font-medium' : 'text-status-error font-medium'}>
-          {row.pnlFormatted}
-        </span>
-      ),
+      header: 'PnL (USDT)',
+      numeric: true,
+      render: (row: TradeRow) => <SignedValue value={row.pnl} />,
     },
     {
       key: 'notes',
@@ -444,7 +415,8 @@ export default function PortfolioPage() {
       render: (row: TradeRow) => (
         editingNoteId === row.id ? (
           <input
-            className="h-7 w-32 rounded border border-border-default bg-bg-primary px-2 text-xs text-text-primary focus:outline-none focus:ring-1 focus:ring-border-focus"
+            aria-label="Note"
+            className="h-8 w-32 rounded border border-line bg-canvas px-2 text-xs text-ink-1 focus:outline-none focus:ring-1 focus:ring-accent"
             value={editingNoteValue}
             onChange={(e) => setEditingNoteValue(e.target.value)}
             onBlur={() => handleNoteSave(row.id)}
@@ -453,10 +425,10 @@ export default function PortfolioPage() {
           />
         ) : (
           <button
-            className="text-xs text-text-muted hover:text-text-primary cursor-pointer min-w-[60px] text-left"
+            className="min-h-8 min-w-[60px] cursor-pointer text-left text-xs text-ink-2 hover:text-ink-1"
             onClick={() => { setEditingNoteId(row.id); setEditingNoteValue(row.notes); }}
           >
-            {row.notes || 'Add note...'}
+            {row.notes || 'Add note'}
           </button>
         )
       ),
@@ -465,18 +437,19 @@ export default function PortfolioPage() {
       key: 'tags',
       header: 'Tags',
       render: (row: TradeRow) => (
-        <div className="flex items-center gap-1 flex-wrap">
+        <div className="flex flex-wrap items-center gap-1">
           {row.tags.map((tag, i) => (
-            <span key={i} className="inline-flex items-center gap-0.5 rounded-full bg-accent-primary/10 px-2 py-0.5 text-xs text-accent-primary">
+            <span key={i} className="inline-flex items-center gap-0.5 rounded-full bg-raised px-2 py-0.5 text-xs text-ink-1">
               {tag}
-              <button onClick={() => handleRemoveTag(row.id, i)} className="hover:text-status-error">
-                <X className="h-3 w-3" />
+              <button aria-label={`Remove tag ${tag}`} onClick={() => handleRemoveTag(row.id, i)} className="hover:text-danger">
+                <X className="h-3 w-3" aria-hidden="true" />
               </button>
             </span>
           ))}
           {addingTagId === row.id ? (
             <input
-              className="h-6 w-20 rounded border border-border-default bg-bg-primary px-1.5 text-xs text-text-primary focus:outline-none focus:ring-1 focus:ring-border-focus"
+              aria-label="New tag"
+              className="h-8 w-20 rounded border border-line bg-canvas px-1.5 text-xs text-ink-1 focus:outline-none focus:ring-1 focus:ring-accent"
               value={newTagValue}
               onChange={(e) => setNewTagValue(e.target.value)}
               onBlur={() => { if (newTagValue.trim()) handleAddTag(row.id); else setAddingTagId(null); }}
@@ -486,10 +459,11 @@ export default function PortfolioPage() {
             />
           ) : (
             <button
-              className="inline-flex items-center justify-center h-5 w-5 rounded-full border border-dashed border-border-default text-text-muted hover:text-text-primary hover:border-border-hover"
+              aria-label="Add tag"
+              className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-dashed border-line-strong text-ink-2 hover:text-ink-1"
               onClick={() => { setAddingTagId(row.id); setNewTagValue(''); }}
             >
-              <Plus className="h-3 w-3" />
+              <Plus className="h-3 w-3" aria-hidden="true" />
             </button>
           )}
         </div>
@@ -497,23 +471,56 @@ export default function PortfolioPage() {
     },
   ];
 
-  const tradeRows: TradeRow[] = trades.map((t) => ({
-    id: t.id,
-    strategy: t.strategy,
-    symbol: t.symbol,
-    side: t.side,
-    entry_time: t.entry_time,
-    exit_time: t.exit_time,
-    pnl: t.pnl,
-    pnlFormatted: `${t.pnl >= 0 ? '+' : '-'}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-    notes: t.notes,
-    tags: t.tags,
-  }));
+  const positionColumns = [
+    { key: 'pair', header: 'Pair' },
+    {
+      key: 'side',
+      header: 'Side',
+      render: (row: Position) => {
+        const side = sideLabel(row.side);
+        return <span className={side.caution ? 'text-caution' : undefined}>{side.text}</span>;
+      },
+    },
+    { key: 'size', header: 'Size', numeric: true, render: (row: Position) => qty(row.size) ?? '—' },
+    { key: 'entry_price', header: 'Entry', numeric: true, hideOnMobile: true, render: (row: Position) => price(row.entry_price) ?? '—' },
+    { key: 'current_price', header: 'Last stored close', numeric: true, render: (row: Position) => price(row.current_price) ?? '—' },
+    { key: 'unrealized_pnl', header: 'Unrealised (USDT)', numeric: true, render: (row: Position) => <SignedValue value={row.unrealized_pnl} /> },
+  ];
+
+  const tradeRows: TradeRow[] = trades;
+
+  const summaryNode = fetchErrors.summary ? (
+    <DataStateErrorCard error={fetchErrors.summary} fallback="Failed to load portfolio summary" onRetry={loadData} />
+  ) : loading ? (
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div key={i} className="h-24 animate-pulse rounded-lg border border-line bg-raised" />
+      ))}
+    </div>
+  ) : summary ? (
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <Readout label="Total value" value={usdt(summary.total_value)} />
+      <Readout label="Unrealised PnL" value={<SignedValue value={summary.unrealized_pnl} />} note="USDT" />
+      <Readout label="Realised PnL" value={<SignedValue value={summary.realized_pnl} />} note="USDT" />
+      <Readout label="Total fees" value={usdt(summary.total_fees)} />
+    </div>
+  ) : (
+    <p className="py-8 text-center text-sm text-ink-2">NO DATA</p>
+  );
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Export section */}
-      <DataCard title="Export Trades" description="Download trade history for tax reporting">
+      <h1 className="text-xl font-semibold text-ink-1">Performance</h1>
+
+      {summary?.paper_capital_pending != null && (
+        <p className="rounded-lg border border-caution/30 bg-caution-soft p-3 text-xs text-ink-1" data-testid="capital-pending">
+          Paper capital change to {summary.paper_capital_pending.toLocaleString('en-US')} USDT is pending: the
+          ledger rebases once every held position has a mark. Values below use the capital in force.
+        </p>
+      )}
+      {summaryNode}
+
+      <Section title="Export trades">
         <div className="flex flex-wrap items-end gap-3">
           <Select
             label="Format"
@@ -524,153 +531,53 @@ export default function PortfolioPage() {
             ]}
             value={exportFormat}
             onChange={(e) => setExportFormat(e.target.value)}
-            className="w-40"
+            className="w-40 max-lg:w-full"
           />
-          <Input
-            label="From"
-            type="date"
-            value={exportFromDate}
-            onChange={(e) => setExportFromDate(e.target.value)}
-            className="w-40"
-          />
-          <Input
-            label="To"
-            type="date"
-            value={exportToDate}
-            onChange={(e) => setExportToDate(e.target.value)}
-            className="w-40"
-          />
+          <Input label="From" type="date" value={exportFromDate} onChange={(e) => setExportFromDate(e.target.value)} className="w-40 max-lg:w-full" />
+          <Input label="To" type="date" value={exportToDate} onChange={(e) => setExportToDate(e.target.value)} className="w-40 max-lg:w-full" />
           <Button variant="primary" size="md" onClick={handleExport} loading={exporting}>
-            <Download className="h-4 w-4" /> Export
+            <Download className="h-4 w-4" aria-hidden="true" /> Export
           </Button>
         </div>
-      </DataCard>
+      </Section>
 
-      {summary?.paper_capital_pending != null && (
-        <p className="rounded-lg border border-status-warning/30 bg-status-warning/5 p-3 text-xs text-text-primary" data-testid="capital-pending">
-          Paper capital change to ${summary.paper_capital_pending.toLocaleString('en-US')} is pending: the
-          ledger rebases once every held position has a mark. Values below use the capital in force.
-        </p>
-      )}
-      {/* Stat cards + Sentiment */}
-      {fetchErrors.summary ? (
-        <DataStateErrorCard error={fetchErrors.summary} fallback="Failed to load portfolio summary" onRetry={loadData} />
-      ) : loading ? (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <div key={i} className="h-28 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
-          ))}
-        </div>
-      ) : summary ? (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
-          <StatCard
-            icon={Wallet}
-            label="Total Value"
-            value={fmt(summary.total_value)}
-            change={summary.change_pct}
-            changeType={summary.change_pct >= 0 ? 'increase' : 'decrease'}
+      <Section
+        title="Positions"
+        action={<span className="text-xs text-ink-2">Mark time not reported</span>}
+      >
+        {fetchErrors.positions ? (
+          <DataStateErrorCard error={fetchErrors.positions} fallback="Failed to load positions" onRetry={loadData} />
+        ) : (
+          <Table
+            columns={positionColumns}
+            data={positions}
+            keyExtractor={(row) => row.id}
+            loading={loading}
+            emptyMessage="No open positions."
           />
-          <StatCard
-            icon={TrendingUp}
-            label="Unrealized PnL"
-            value={`${summary.unrealized_pnl >= 0 ? '+' : ''}${fmt(summary.unrealized_pnl)}`}
-            changeType={summary.unrealized_pnl >= 0 ? 'increase' : 'decrease'}
-          />
-          <StatCard
-            icon={TrendingDown}
-            label="Realized PnL"
-            value={`${summary.realized_pnl >= 0 ? '+' : ''}${fmt(summary.realized_pnl)}`}
-            changeType={summary.realized_pnl >= 0 ? 'increase' : 'decrease'}
-          />
-          <StatCard
-            icon={Receipt}
-            label="Total Fees"
-            value={fmt(summary.total_fees)}
-          />
-          {/* Sentiment widget */}
-          {!fetchErrors.sentiment && sentiment ? (
-            <DataCard padding="sm" className="flex flex-col justify-between">
-              <p className="text-xs font-medium text-text-muted">Market Sentiment</p>
-              <div className="mt-2">
-                <div className="relative h-3 w-full rounded-full overflow-hidden bg-gradient-to-r from-red-500 via-yellow-500 to-green-500">
-                  <div
-                    className="absolute top-0 h-full w-1 bg-white rounded-full shadow-md"
-                    style={{ left: `${sentiment.value}%` }}
-                  />
-                </div>
-                <div className="mt-1.5 flex items-center justify-between">
-                  <span className="text-lg font-bold" style={{ color: getSentimentColor(sentiment.value) }}>
-                    {sentiment.value}
-                  </span>
-                  <span className="text-xs font-medium" style={{ color: getSentimentColor(sentiment.value) }}>
-                    {getSentimentLabel(sentiment.value)}
-                  </span>
-                </div>
-              </div>
-            </DataCard>
-          ) : !fetchErrors.sentiment && loading ? (
-            <div className="h-28 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
-          ) : null}
-        </div>
-      ) : (
-        <p className="text-sm text-text-muted text-center py-8">No data yet</p>
-      )}
+        )}
+      </Section>
 
-      {/* Trade Journal */}
-      <DataCard title="Trade Journal" description="Filter and review your trades">
-        {/* Filter bar */}
-        <div className="flex flex-wrap items-end gap-3 mb-4">
+      <Section title="Trade journal">
+        <div className="mb-4 flex flex-wrap items-end gap-3">
           <Select
             label="Strategy"
             placeholder="All strategies"
-            options={strategies.map((s) => ({ value: s.id, label: s.name }))}
+            options={strategies.map((st) => ({ value: st.id, label: st.name }))}
             value={filterStrategy}
             onChange={(e) => setFilterStrategy(e.target.value)}
-            className="w-44"
+            className="w-44 max-lg:w-full"
           />
-          <Input
-            label="Symbol"
-            placeholder="e.g. BTCUSDT"
-            value={filterSymbol}
-            onChange={(e) => setFilterSymbol(e.target.value)}
-            className="w-36"
-          />
-          <Input
-            label="From"
-            type="date"
-            value={filterFromDate}
-            onChange={(e) => setFilterFromDate(e.target.value)}
-            className="w-40"
-          />
-          <Input
-            label="To"
-            type="date"
-            value={filterToDate}
-            onChange={(e) => setFilterToDate(e.target.value)}
-            className="w-40"
-          />
-          <Input
-            label="Min PnL"
-            type="number"
-            placeholder="0"
-            value={filterMinPnl}
-            onChange={(e) => setFilterMinPnl(e.target.value)}
-            className="w-28"
-          />
-          <Input
-            label="Max PnL"
-            type="number"
-            placeholder="0"
-            value={filterMaxPnl}
-            onChange={(e) => setFilterMaxPnl(e.target.value)}
-            className="w-28"
-          />
+          <Input label="Symbol" placeholder="e.g. BTCUSDT" value={filterSymbol} onChange={(e) => setFilterSymbol(e.target.value)} className="w-36 max-lg:w-full" />
+          <Input label="From" type="date" value={filterFromDate} onChange={(e) => setFilterFromDate(e.target.value)} className="w-40 max-lg:w-full" />
+          <Input label="To" type="date" value={filterToDate} onChange={(e) => setFilterToDate(e.target.value)} className="w-40 max-lg:w-full" />
+          <Input label="Min PnL" type="number" placeholder="0" value={filterMinPnl} onChange={(e) => setFilterMinPnl(e.target.value)} className="w-28 max-lg:w-full" />
+          <Input label="Max PnL" type="number" placeholder="0" value={filterMaxPnl} onChange={(e) => setFilterMaxPnl(e.target.value)} className="w-28 max-lg:w-full" />
           <Button variant="primary" size="md" onClick={handleApplyFilters}>
-            <Search className="h-4 w-4" /> Apply Filters
+            <Search className="h-4 w-4" aria-hidden="true" /> Apply filters
           </Button>
         </div>
 
-        {/* Trades table */}
         <Table
           columns={tradeColumns}
           data={tradeRows}
@@ -679,44 +586,33 @@ export default function PortfolioPage() {
           emptyMessage="No trades found. Apply filters and click Apply."
         />
 
-        {/* Pagination */}
         {tradesPages > 1 && (
-          <div className="flex items-center justify-between mt-4 pt-3 border-t border-border-default">
-            <p className="text-xs text-text-muted">
+          <div className="mt-4 flex items-center justify-between border-t border-line pt-3">
+            <p className="text-xs text-ink-2">
               Page {tradesPage} of {tradesPages} ({tradesTotal} trades)
             </p>
             <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={tradesPage <= 1}
-                onClick={() => loadTrades(tradesPage - 1)}
-              >
+              <Button variant="outline" size="sm" disabled={tradesPage <= 1} onClick={() => loadTrades(tradesPage - 1)}>
                 Prev
               </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={tradesPage >= tradesPages}
-                onClick={() => loadTrades(tradesPage + 1)}
-              >
+              <Button variant="outline" size="sm" disabled={tradesPage >= tradesPages} onClick={() => loadTrades(tradesPage + 1)}>
                 Next
               </Button>
             </div>
           </div>
         )}
-      </DataCard>
+      </Section>
 
       {/* Charts row */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {/* Equity Curve */}
-        <DataCard title="Equity Curve" description="Portfolio value over time">
+        <Section title="Equity Curve">
           {fetchErrors.equity ? (
             <DataStateErrorCard error={fetchErrors.equity} fallback="Failed to load equity curve" onRetry={loadData} />
           ) : loading ? (
-            <div className="h-64 animate-pulse rounded-lg bg-bg-tertiary" />
+            <div className="h-64 animate-pulse rounded-lg bg-raised" />
           ) : equityCurve && equityCurve.length > 0 ? (
-            <div className="h-64">
+            <div className="h-64" role="img" aria-label={`Equity curve, ${equityCurve.length} points, last value ${usdt(equityCurve[equityCurve.length - 1].value)}`}>
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={equityCurve} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
                   <defs>
@@ -764,20 +660,20 @@ export default function PortfolioPage() {
               </ResponsiveContainer>
             </div>
           ) : (
-            <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-              <p className="text-sm text-text-muted">No data yet</p>
+            <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-line bg-surface">
+              <p className="text-sm text-ink-2">No data yet</p>
             </div>
           )}
-        </DataCard>
+        </Section>
 
         {/* Drawdown Chart */}
-        <DataCard title="Drawdown" description="Maximum drawdown over time">
+        <Section title="Drawdown">
           {fetchErrors.equity ? (
             <DataStateErrorCard error={fetchErrors.equity} fallback="Failed to load drawdown data" onRetry={loadData} />
           ) : loading ? (
-            <div className="h-64 animate-pulse rounded-lg bg-bg-tertiary" />
+            <div className="h-64 animate-pulse rounded-lg bg-raised" />
           ) : equityCurve && equityCurve.length > 0 ? (
-            <div className="h-64">
+            <div className="h-64" role="img" aria-label={`Drawdown, worst ${Math.max(...drawdownData.map((d) => d.drawdown)).toFixed(2)}%`}>
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={drawdownData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
                   <defs>
@@ -826,34 +722,34 @@ export default function PortfolioPage() {
               </ResponsiveContainer>
             </div>
           ) : (
-            <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-border-default bg-bg-secondary">
-              <p className="text-sm text-text-muted">No data yet</p>
+            <div className="flex h-64 items-center justify-center rounded-lg border border-dashed border-line bg-surface">
+              <p className="text-sm text-ink-2">No data yet</p>
             </div>
           )}
-        </DataCard>
+        </Section>
       </div>
 
       {/* Monthly returns heatmap */}
-      <DataCard title="Monthly Returns" description="Calendar heatmap of monthly performance">
+      <Section title="Monthly Returns">
         {fetchErrors.monthlyReturns ? (
           <DataStateErrorCard error={fetchErrors.monthlyReturns} fallback="Failed to load monthly returns" onRetry={loadData} />
         ) : loading ? (
-          <div className="h-32 animate-pulse rounded-lg bg-bg-tertiary" />
+          <div className="h-32 animate-pulse rounded-lg bg-raised" />
         ) : monthlyReturns && monthlyReturns.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
                 <tr>
-                  <th className="px-2 py-1 text-left text-text-muted font-semibold">Year</th>
+                  <th className="px-2 py-1 text-left text-ink-2 font-semibold">Year</th>
                   {MONTH_LABELS.map((m) => (
-                    <th key={m} className="px-1 py-1 text-center text-text-muted font-medium">{m}</th>
+                    <th key={m} className="px-1 py-1 text-center text-ink-2 font-medium">{m}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {years.map((year) => (
                   <tr key={year}>
-                    <td className="px-2 py-1 text-text-primary font-medium">{year}</td>
+                    <td className="px-2 py-1 text-ink-1 font-medium">{year}</td>
                     {Array.from({ length: 12 }).map((_, mi) => {
                       const val = monthlyByYear[year]?.[mi + 1];
                       return (
@@ -866,7 +762,7 @@ export default function PortfolioPage() {
                               {val >= 0 ? '+' : ''}{val.toFixed(1)}%
                             </div>
                           ) : (
-                            <div className="rounded px-1.5 py-1 text-center text-xs text-text-light bg-bg-secondary">
+                            <div className="rounded px-1.5 py-1 text-center text-xs text-ink-2 bg-surface">
                               -
                             </div>
                           )}
@@ -879,16 +775,16 @@ export default function PortfolioPage() {
             </table>
           </div>
         ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
         )}
-      </DataCard>
+      </Section>
 
       {/* Attribution bar chart */}
-      <DataCard title="Strategy Attribution" description="PnL contribution per strategy">
+      <Section title="Strategy Attribution">
         {fetchErrors.attribution ? (
           <DataStateErrorCard error={fetchErrors.attribution} fallback="Failed to load attribution data" onRetry={loadData} />
         ) : loading ? (
-          <div className="h-56 animate-pulse rounded-lg bg-bg-tertiary" />
+          <div className="h-56 animate-pulse rounded-lg bg-raised" />
         ) : attribution && attribution.length > 0 ? (
           <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
@@ -934,18 +830,18 @@ export default function PortfolioPage() {
             </ResponsiveContainer>
           </div>
         ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
         )}
-      </DataCard>
+      </Section>
 
       {/* Allocation breakdown */}
-      <DataCard title="Position Allocation" description="Current portfolio breakdown">
+      <Section title="Position Allocation">
         {fetchErrors.positions ? (
           <DataStateErrorCard error={fetchErrors.positions} fallback="Failed to load positions" onRetry={loadData} />
         ) : loading ? (
           <div className="space-y-3">
             {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="h-8 animate-pulse rounded-lg bg-bg-tertiary" />
+              <div key={i} className="h-8 animate-pulse rounded-lg bg-raised" />
             ))}
           </div>
         ) : allocationItems.length > 0 ? (
@@ -953,15 +849,15 @@ export default function PortfolioPage() {
             {allocationItems.map((item) => (
               <div key={item.label}>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-sm text-text-primary">{item.label}</span>
+                  <span className="text-sm text-ink-1">{item.label}</span>
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-text-primary">{item.value}</span>
-                    <span className="text-xs text-text-muted">{item.allocation}%</span>
+                    <span className="text-sm font-medium text-ink-1">{item.value}</span>
+                    <span className="text-xs text-ink-2">{item.allocation}%</span>
                   </div>
                 </div>
-                <div className="h-2 rounded-full bg-bg-tertiary overflow-hidden">
+                <div className="h-2 rounded-full bg-raised overflow-hidden">
                   <div
-                    className="h-full rounded-full bg-accent-primary transition-all"
+                    className="h-full rounded-full bg-accent transition-all"
                     style={{ width: `${item.allocation}%` }}
                   />
                 </div>
@@ -969,9 +865,9 @@ export default function PortfolioPage() {
             ))}
           </div>
         ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
         )}
-      </DataCard>
+      </Section>
     </div>
   );
 }
