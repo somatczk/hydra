@@ -66,6 +66,7 @@ class BacktestRunner:
         on_progress: Callable[[float], None] | None = None,
         *,
         warmup_bars: int = 0,
+        # shortcut: fixed slippage, no participation cap or partials; revisit with P3 live fills
         slippage_pct: Decimal = Decimal("0.001"),
         risk_config: RiskConfig | None = None,
     ) -> BacktestResult:
