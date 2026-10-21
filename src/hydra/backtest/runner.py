@@ -234,10 +234,7 @@ class BacktestRunner:
             Optional callback invoked with progress 0.0-1.0.
         """
         if not bars:
-            return calculate_metrics(
-                equity_curve=[initial_capital],
-                trades=[],
-            )
+            return calculate_metrics(equity_curve=[initial_capital], trades=[], timeframe=timeframe)
 
         comm = commission or CommissionConfig()
         fill_sim = FillSimulator(self._slippage_model)
@@ -535,12 +532,13 @@ class BacktestRunner:
                     )
                 context.set_position(symbol, None)
 
-        # Calculate metrics
+        close_at = {bar.timestamp: bar.close for bar in bars}
         result = calculate_metrics(
             equity_curve=equity_curve,
             trades=trades,
+            timeframe=timeframe,
             timestamps=timestamps,
-            bar_closes=[bar.close for bar in bars],
+            benchmark_prices=[close_at[t] for t in timestamps],
             initial_capital=initial_capital,
         )
         result.stopped_reason = stopped_reason

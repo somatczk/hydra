@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import math
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import numpy as np
@@ -21,6 +22,7 @@ from hydra.backtest.metrics import (
     _compute_total_return,
     calculate_metrics,
 )
+from hydra.core.types import Timeframe
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -88,7 +90,7 @@ class TestTotalReturn:
             Decimal("110"),
             Decimal("120"),
         ]
-        result = calculate_metrics(equity_curve=equity, trades=[])
+        result = calculate_metrics(equity_curve=equity, trades=[], timeframe=Timeframe.D1)
         assert result.total_return == Decimal("0.2")
 
 
@@ -131,7 +133,7 @@ class TestMaxDrawdown:
             Decimal("90"),
             Decimal("95"),
         ]
-        result = calculate_metrics(equity_curve=equity, trades=[])
+        result = calculate_metrics(equity_curve=equity, trades=[], timeframe=Timeframe.D1)
         assert float(result.max_drawdown) == pytest.approx(0.181818, abs=0.001)
 
 
@@ -142,27 +144,27 @@ class TestMaxDrawdown:
 
 class TestSharpeRatio:
     def test_constant_positive_returns(self) -> None:
-        """Constant positive returns -> effectively infinite Sharpe."""
+        """Zero dispersion -> 0.0, never inf (the API field is a non-null float)."""
         returns = np.array([0.01, 0.01, 0.01, 0.01, 0.01], dtype=np.float64)
-        sharpe = _compute_sharpe(returns, risk_free_rate=0.0)
-        assert sharpe == float("inf")
+        sharpe = _compute_sharpe(returns, 365)
+        assert sharpe == 0.0
 
     def test_zero_returns(self) -> None:
         """Zero returns -> Sharpe = 0."""
         returns = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        sharpe = _compute_sharpe(returns, risk_free_rate=0.0)
+        sharpe = _compute_sharpe(returns, 365)
         assert sharpe == 0.0
 
     def test_positive_sharpe(self) -> None:
         """Mix of positive and negative returns with net positive -> positive Sharpe."""
         returns = np.array([0.02, -0.01, 0.03, -0.005, 0.01], dtype=np.float64)
-        sharpe = _compute_sharpe(returns, risk_free_rate=0.0)
+        sharpe = _compute_sharpe(returns, 365)
         assert sharpe > 0
 
     def test_negative_sharpe(self) -> None:
         """Net negative returns -> negative Sharpe."""
         returns = np.array([-0.02, -0.01, 0.005, -0.03, -0.01], dtype=np.float64)
-        sharpe = _compute_sharpe(returns, risk_free_rate=0.0)
+        sharpe = _compute_sharpe(returns, 365)
         assert sharpe < 0
 
 
@@ -173,24 +175,23 @@ class TestSharpeRatio:
 
 class TestSortinoRatio:
     def test_only_positive_returns(self) -> None:
-        """All positive returns -> infinite Sortino (no downside deviation)."""
+        """No downside -> undefined (None), not inf."""
         returns = np.array([0.01, 0.02, 0.015, 0.005, 0.03], dtype=np.float64)
-        sortino = _compute_sortino(returns, risk_free_rate=0.0)
-        assert sortino == float("inf")
+        assert _compute_sortino(returns, 365) is None
 
     def test_only_penalizes_downside(self) -> None:
         """Sortino should be higher than Sharpe when upside volatility is large."""
         # Large upside swings, small downside
         returns = np.array([0.05, -0.001, 0.08, -0.002, 0.1], dtype=np.float64)
-        sharpe = _compute_sharpe(returns, risk_free_rate=0.0)
-        sortino = _compute_sortino(returns, risk_free_rate=0.0)
+        sharpe = _compute_sharpe(returns, 365)
+        sortino = _compute_sortino(returns, 365)
         # Sortino should be higher because upside vol doesn't penalize
+        assert sortino is not None
         assert sortino > sharpe
 
     def test_zero_returns(self) -> None:
         returns = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-        sortino = _compute_sortino(returns, risk_free_rate=0.0)
-        assert sortino == 0.0
+        assert _compute_sortino(returns, 365) is None
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +212,7 @@ class TestWinRate:
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("130")],
             trades=trades,
+            timeframe=Timeframe.D1,
         )
         expected = Decimal("3") / Decimal("5")
         assert result.win_rate == expected
@@ -220,6 +222,7 @@ class TestWinRate:
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("135")],
             trades=trades,
+            timeframe=Timeframe.D1,
         )
         assert result.win_rate == Decimal("1")
 
@@ -228,6 +231,7 @@ class TestWinRate:
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("85")],
             trades=trades,
+            timeframe=Timeframe.D1,
         )
         assert result.win_rate == Decimal("0")
 
@@ -235,6 +239,7 @@ class TestWinRate:
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("100")],
             trades=[],
+            timeframe=Timeframe.D1,
         )
         assert result.win_rate == Decimal("0")
         assert result.total_trades == 0
@@ -257,56 +262,20 @@ class TestProfitFactor:
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("200")],
             trades=trades,
+            timeframe=Timeframe.D1,
         )
         # Gross profit = 150, Gross loss = 50
         assert result.profit_factor == Decimal("3")
 
     def test_profit_factor_no_losses(self) -> None:
-        """No losses -> profit_factor = 0 (edge case, no denominator)."""
+        """No losses -> undefined (None), not 0."""
         trades = [_trade("100"), _trade("50")]
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("250")],
             trades=trades,
+            timeframe=Timeframe.D1,
         )
-        assert result.profit_factor == Decimal("0")
-
-
-# ---------------------------------------------------------------------------
-# Deflated Sharpe ratio
-# ---------------------------------------------------------------------------
-
-
-class TestDeflatedSharpe:
-    def test_dsr_less_than_raw_sharpe(self) -> None:
-        """Deflated Sharpe (as probability) should be less than 1 and typically
-        less than the raw Sharpe when there are multiple trials."""
-        # Create an equity curve with some variance
-        equity = [Decimal("100")]
-        for i in range(200):
-            change = Decimal("0.5") if i % 3 != 0 else Decimal("-0.3")
-            equity.append(equity[-1] + change)
-
-        trades = [_trade("10"), _trade("-5"), _trade("8")]
-        result = calculate_metrics(
-            equity_curve=equity,
-            trades=trades,
-            n_trials=10,
-        )
-        # DSR is a probability (0-1 range) and should be <= 1
-        assert result.deflated_sharpe_ratio <= 1.0
-
-    def test_dsr_single_trial(self) -> None:
-        """Single trial should still produce a valid DSR."""
-        equity = [Decimal("100")]
-        for i in range(100):
-            change = Decimal("1") if i % 2 == 0 else Decimal("-0.5")
-            equity.append(equity[-1] + change)
-        result = calculate_metrics(
-            equity_curve=equity,
-            trades=[],
-            n_trials=1,
-        )
-        assert isinstance(result.deflated_sharpe_ratio, float)
+        assert result.profit_factor is None
 
 
 # ---------------------------------------------------------------------------
@@ -418,13 +387,14 @@ class TestBenchmarkEquity:
         assert result == []
 
     def test_via_calculate_metrics(self) -> None:
-        """Benchmark equity is populated when bar_closes is provided."""
+        """Benchmark equity is populated when benchmark_prices is provided."""
         equity = [Decimal("10000"), Decimal("10500"), Decimal("11000")]
         closes = [Decimal("100"), Decimal("110"), Decimal("120")]
         result = calculate_metrics(
             equity_curve=equity,
             trades=[],
-            bar_closes=closes,
+            timeframe=Timeframe.D1,
+            benchmark_prices=closes,
             initial_capital=Decimal("10000"),
         )
         assert len(result.benchmark_equity) == 3
@@ -434,10 +404,10 @@ class TestBenchmarkEquity:
         # benchmark_return = (12000 - 10000) / 10000 = 0.2
         assert result.benchmark_return == Decimal("0.2")
 
-    def test_no_bar_closes(self) -> None:
-        """Without bar_closes, benchmark fields stay at defaults."""
+    def test_no_benchmark_prices(self) -> None:
+        """Without benchmark_prices, benchmark fields stay at defaults."""
         equity = [Decimal("10000"), Decimal("11000")]
-        result = calculate_metrics(equity_curve=equity, trades=[])
+        result = calculate_metrics(equity_curve=equity, trades=[], timeframe=Timeframe.D1)
         assert result.benchmark_equity == []
         assert result.benchmark_return == Decimal("0")
         assert result.alpha == 0.0
@@ -453,7 +423,7 @@ class TestAlphaBeta:
     def test_identical_returns(self) -> None:
         """If strategy returns match benchmark exactly, beta=1 and alpha=0."""
         returns = np.array([0.01, -0.005, 0.02, -0.01, 0.015], dtype=np.float64)
-        alpha, beta = _compute_alpha_beta(returns, returns, 0.10, 0.10)
+        alpha, beta = _compute_alpha_beta(returns, returns, 365)
         assert beta == pytest.approx(1.0, abs=1e-6)
         assert alpha == pytest.approx(0.0, abs=1e-6)
 
@@ -463,7 +433,7 @@ class TestAlphaBeta:
         rng = np.random.default_rng(42)
         strategy = rng.normal(0.001, 0.01, 200)
         benchmark = rng.normal(0.001, 0.01, 200)
-        _alpha, beta = _compute_alpha_beta(strategy, benchmark, 0.05, 0.05)
+        _alpha, beta = _compute_alpha_beta(strategy, benchmark, 365)
         # Beta should be near zero for uncorrelated series
         assert abs(beta) < 0.3
 
@@ -471,13 +441,13 @@ class TestAlphaBeta:
         """Zero-variance benchmark returns beta=0, alpha=0."""
         strategy = np.array([0.01, 0.02, 0.03], dtype=np.float64)
         benchmark = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-        alpha, beta = _compute_alpha_beta(strategy, benchmark, 0.10, 0.0)
+        alpha, beta = _compute_alpha_beta(strategy, benchmark, 365)
         assert beta == 0.0
         assert alpha == 0.0
 
     def test_short_arrays(self) -> None:
         """Arrays with fewer than 2 elements return (0, 0)."""
-        alpha, beta = _compute_alpha_beta(np.array([0.01]), np.array([0.01]), 0.1, 0.1)
+        alpha, beta = _compute_alpha_beta(np.array([0.01]), np.array([0.01]), 365)
         assert alpha == 0.0
         assert beta == 0.0
 
@@ -487,7 +457,7 @@ class TestAlphaBeta:
         benchmark = np.array([0.01, -0.005, 0.015, -0.01, 0.02], dtype=np.float64)
         # Strategy: same pattern but shifted up (higher mean)
         strategy = benchmark + 0.01
-        alpha, _beta = _compute_alpha_beta(strategy, benchmark, 0.20, 0.10)
+        alpha, _beta = _compute_alpha_beta(strategy, benchmark, 365)
         assert alpha > 0
 
 
@@ -552,6 +522,7 @@ class TestConsecutiveWinsLosses:
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("112")],
             trades=trades,
+            timeframe=Timeframe.D1,
         )
         assert result.max_consecutive_wins == 2
         assert result.max_consecutive_losses == 3
@@ -602,7 +573,150 @@ class TestExpectancy:
         result = calculate_metrics(
             equity_curve=[Decimal("100"), Decimal("150")],
             trades=trades,
+            timeframe=Timeframe.D1,
         )
         # win_rate=0.5, avg_win=100, loss_rate=0.5, avg_loss=50
         # expectancy = 0.5*100 - 0.5*50 = 25
         assert result.expectancy == Decimal("25")
+
+
+# ---------------------------------------------------------------------------
+# Exact reference values (hand-derived; 24/7 annualisation by bar size)
+# ---------------------------------------------------------------------------
+
+# Returns [0.1, -0.1, 0, 0.1]: mean 0.025, std(ddof=1) 0.0957427107756338, max dd 0.1 over 3 bars.
+_REF = [Decimal("100"), Decimal("110"), Decimal("99"), Decimal("99"), Decimal("108.9")]
+_DAILY_SHARPE = 4.988623420981349  # 0.025 / 0.0957427107756338 * sqrt(365)
+
+
+def _ref(timeframe: Timeframe) -> BacktestResult:
+    return calculate_metrics(_REF, [], timeframe=timeframe)
+
+
+class TestReferenceValues:
+    def test_sharpe_daily_reference(self) -> None:
+        assert _ref(Timeframe.D1).sharpe_ratio == pytest.approx(_DAILY_SHARPE, rel=1e-12)
+
+    def test_sharpe_scales_with_bar_size(self) -> None:
+        """Same returns on 1h bars: ppy 8760, so daily * sqrt(24); 1m: daily * sqrt(1440)."""
+        assert _ref(Timeframe.H1).sharpe_ratio == pytest.approx(24.439163800603485, rel=1e-12)
+        assert _ref(Timeframe.M1).sharpe_ratio == pytest.approx(
+            _DAILY_SHARPE * math.sqrt(1440), rel=1e-12
+        )
+
+    def test_sortino_uses_all_n(self) -> None:
+        """tdd = sqrt((0 + 0.01 + 0 + 0) / 4) = 0.05 -> 0.025 / 0.05 * sqrt(365)."""
+        assert _ref(Timeframe.D1).sortino_ratio == pytest.approx(9.552486587271403, rel=1e-12)
+
+    def test_sortino_none_without_downside(self) -> None:
+        equity = [Decimal("100"), Decimal("101"), Decimal("101"), Decimal("103")]
+        assert calculate_metrics(equity, [], timeframe=Timeframe.D1).sortino_ratio is None
+
+    def test_cagr_hourly_year(self) -> None:
+        """8760 hourly returns compounding to +63.6 % is one year: CAGR 0.636, not 0.0143.
+
+        Constant growth has zero dispersion up to float noise, so Sharpe is 0.0, not 9e12.
+        """
+        g = 1.636 ** (1 / 8760)
+        equity = [Decimal(str(100 * g**i)) for i in range(8761)]
+        result = calculate_metrics(equity, [], timeframe=Timeframe.H1)
+        assert float(result.annualized_return) == pytest.approx(0.636, abs=1e-6)
+        assert result.sharpe_ratio == 0.0
+
+    def test_cagr_on_minute_bars_is_monotonic_and_none_on_overflow(self) -> None:
+        """1000 1m bars (ppy 525600) with a 1 % dip at bar 1, ending at 100 * (1 + r).
+
+        CAGR = (1 + r) ** 525.6 - 1 exceeds 28 digits from r = 0.10; at main a Decimal quantize
+        trap swapped it for r there. r = 3 overflows float, so CAGR and Calmar are None.
+        """
+
+        def run(r: float) -> BacktestResult:
+            g = ((1 + r) / 0.99) ** (1 / 999)
+            equity = [Decimal("100"), *(Decimal(str(99 * g**i)) for i in range(1000))]
+            equity[-1] = Decimal(str(100 * (1 + r)))
+            return calculate_metrics(equity, [], timeframe=Timeframe.M1)
+
+        cagrs = []
+        for r in (0.09, 0.10, 0.12):
+            result = run(r)
+            assert result.annualized_return is not None
+            assert float(result.annualized_return) == pytest.approx((1 + r) ** 525.6 - 1, rel=1e-9)
+            assert result.calmar_ratio == pytest.approx(
+                float(result.annualized_return) / 0.01, rel=1e-9
+            )
+            cagrs.append(result.annualized_return)
+        assert cagrs == sorted(cagrs)
+        overflow = run(3.0)
+        assert (overflow.annualized_return, overflow.calmar_ratio) == (None, None)
+
+    def test_calmar(self) -> None:
+        """CAGR = 1.089 ** (365 / 4) - 1 = 2391.180950741495; Calmar = CAGR / 0.1."""
+        cagr = 1.089 ** (365 / 4) - 1
+        assert _ref(Timeframe.D1).calmar_ratio == pytest.approx(cagr / 0.1, rel=1e-9)
+        rising = [Decimal("100"), Decimal("101"), Decimal("102")]
+        assert calculate_metrics(rising, [], timeframe=Timeframe.D1).calmar_ratio is None
+
+    def test_max_drawdown_and_duration_in_time(self) -> None:
+        """Bars 2, 3 and 4 sit below the 110 peak: 3 bars of 1h, not 3 days."""
+        result = _ref(Timeframe.H1)
+        assert result.max_drawdown == Decimal("0.1")
+        assert result.max_drawdown_duration == timedelta(hours=3)
+
+    def test_alpha_beta_exact(self) -> None:
+        """Strategy returns s = 0.5 * b + 0.001 -> beta 0.5, Jensen alpha 0.001 * 365."""
+        b = [0.02, -0.01, 0.03, -0.02]
+        prices, equity = [100.0], [1000.0]
+        for r in b:
+            prices.append(prices[-1] * (1 + r))
+            equity.append(equity[-1] * (1 + 0.5 * r + 0.001))
+        result = calculate_metrics(
+            [Decimal(str(e)) for e in equity],
+            [],
+            timeframe=Timeframe.D1,
+            benchmark_prices=[Decimal(str(p)) for p in prices],
+            initial_capital=Decimal("1000"),
+        )
+        assert result.beta == pytest.approx(0.5, abs=1e-12)
+        assert result.alpha == pytest.approx(0.365, abs=1e-9)
+
+    def test_buy_and_hold_vs_own_benchmark(self) -> None:
+        """Runner-shaped input (pre-seeded initial point at the first close) is beta 1, alpha 0.
+
+        At main the benchmark was one point shorter and shifted, giving beta -0.369.
+        """
+        closes = [Decimal(c) for c in ("100", "103", "99", "104", "101", "107")]
+        prices = [closes[0], *closes]
+        initial = Decimal("10000")
+        equity = [initial * p / closes[0] for p in prices]
+        result = calculate_metrics(
+            equity,
+            [],
+            timeframe=Timeframe.H1,
+            benchmark_prices=prices,
+            initial_capital=initial,
+        )
+        assert result.benchmark_equity == equity
+        assert result.beta == pytest.approx(1.0, abs=1e-12)
+        assert result.alpha == pytest.approx(0.0, abs=1e-12)
+
+    def test_benchmark_length_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match="benchmark_prices"):
+            calculate_metrics(_REF, [], timeframe=Timeframe.D1, benchmark_prices=[Decimal("1")] * 4)
+        with pytest.raises(ValueError, match="timestamps"):
+            calculate_metrics(_REF, [], timeframe=Timeframe.D1, timestamps=[T0, T1])
+
+    def test_trade_stats_exact(self) -> None:
+        trades = [_trade(p) for p in ("30", "-10", "-10", "0", "50")]
+        result = calculate_metrics(_REF, trades, timeframe=Timeframe.D1)
+        assert result.win_rate == Decimal("0.4")
+        assert result.profit_factor == Decimal("4")
+        assert result.expectancy == Decimal("12")
+        assert (result.avg_win, result.avg_loss) == (Decimal("40"), Decimal("10"))
+
+    def test_no_metric_is_inf_or_nan(self) -> None:
+        flat = [Decimal("100")] * 5
+        for equity in (flat, _REF, [Decimal("100")]):
+            result = calculate_metrics(equity, [], timeframe=Timeframe.H1)
+            ann = result.annualized_return
+            for value in (ann, result.sharpe_ratio, result.sortino_ratio, result.calmar_ratio):
+                assert value is None or math.isfinite(value)

@@ -1,19 +1,52 @@
-"""Backtest result metrics: trade statistics, risk-adjusted returns, and advanced analytics.
+"""Backtest result metrics: trade statistics, risk-adjusted returns and the buy-and-hold benchmark.
 
-All financial quantities use Decimal. Performance-critical array operations use numpy.
+All financial quantities use Decimal; array maths uses numpy float64. This docstring is the one
+place the definitions live.
+
+Conventions: crypto trades 24/7, so a year is 365 days and periods per year
+``ppy = 365 * 86400 / timeframe_seconds`` (8760 for 1h, 365 for 1d). ``e_0..e_n`` is the equity
+curve, ``r_i = e_i / e_{i-1} - 1`` the per-bar simple returns (N = n of them), rf = 0.
+Annualisation counts bars, so data gaps (provenance ``gap_count``) are not calendar-corrected.
+
+================== ============================================================ ================
+Metric             Definition                                                   Undefined case
+================== ============================================================ ================
+total_return       e_n / e_0 - 1 (fraction)                                     0 if < 2 points
+annualized_return  (1 + total_return) ** (ppy / N) - 1, floored at -1           0 if N = 0;
+                                                                                None on overflow
+max_drawdown       max_i (max_{j<=i} e_j - e_i) / max_{j<=i} e_j (fraction)     0
+max_dd_duration    longest run of bars below the running peak * bar length      0
+sharpe_ratio       mean(r) / std(r, ddof=1) * sqrt(ppy)                         0.0 if std<1e-12
+sortino_ratio      mean(r) / sqrt(mean(min(r, 0) ** 2)) * sqrt(ppy), all N      None if no loss
+calmar_ratio       annualized_return / max_drawdown                             None if dd = 0
+                                                                                or ann. None
+win_rate           wins / trades; a break-even trade is not a win               0
+profit_factor      sum(winning pnl) / |sum(losing pnl)|                         None if no loss
+expectancy         mean trade pnl (= win_rate*avg_win - loss_rate*avg_loss)     0
+benchmark_equity   initial_capital * p_i / p_0 on ``benchmark_prices``, which   [] if no prices
+                   are aligned 1:1 with the equity curve (frictionless)
+beta               cov(r, r_b, ddof=1) / var(r_b, ddof=1)                       0.0
+alpha              Jensen, annualised: (mean(r) - beta * mean(r_b)) * ppy       0.0
+================== ============================================================ ================
+
+``Trade.pnl`` is net of the exit fee; the entry fee is included once P2-A lands (BT-9). The API
+reports win_rate, max_drawdown and returns in percent on /backtest results and win_rate as a
+fraction on /strategies/preview.
 """
 
 from __future__ import annotations
 
-import decimal
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from typing import Any
 
 import numpy as np
 from numpy import ndarray
+
+from hydra.core.types import Timeframe
+from hydra.data.bars import timeframe_seconds
 
 # Type alias for individual fill transactions (entry/exit, linked by trade_id)
 TransactionRecord = dict[str, Any]
@@ -61,7 +94,7 @@ class BacktestResult:
 
     # Return metrics
     total_return: Decimal = Decimal("0")
-    annualized_return: Decimal = Decimal("0")
+    annualized_return: Decimal | None = Decimal("0")
 
     # Drawdown
     max_drawdown: Decimal = Decimal("0")
@@ -69,22 +102,18 @@ class BacktestResult:
 
     # Risk-adjusted
     sharpe_ratio: float = 0.0
-    sortino_ratio: float = 0.0
-    calmar_ratio: float = 0.0
+    sortino_ratio: float | None = None
+    calmar_ratio: float | None = None
 
     # Trade statistics
     total_trades: int = 0
     win_rate: Decimal = Decimal("0")
-    profit_factor: Decimal = Decimal("0")
+    profit_factor: Decimal | None = None
     avg_win: Decimal = Decimal("0")
     avg_loss: Decimal = Decimal("0")
     largest_win: Decimal = Decimal("0")
     largest_loss: Decimal = Decimal("0")
     avg_trade_duration: timedelta = field(default_factory=timedelta)
-
-    # Advanced
-    deflated_sharpe_ratio: float = 0.0
-    probability_of_backtest_overfitting: float = 0.0
 
     # Benchmark (buy-and-hold)
     benchmark_equity: list[Decimal] = field(default_factory=list)
@@ -99,6 +128,7 @@ class BacktestResult:
 
     # Series data
     equity_curve: list[Decimal] = field(default_factory=list)
+    timestamps: list[datetime] = field(default_factory=list)
     drawdown_series: list[Decimal] = field(default_factory=list)
     trades: list[Trade] = field(default_factory=list)
     monthly_returns: dict[str, Decimal] = field(default_factory=dict)
@@ -137,21 +167,18 @@ def _compute_total_return(equity: list[Decimal]) -> Decimal:
     return (equity[-1] - equity[0]) / equity[0]
 
 
-def _compute_annualized_return(total_return: Decimal, n_periods: int) -> Decimal:
-    """Annualize return assuming daily periods (252 trading days)."""
-    if n_periods <= 0:
+def _compute_annualized_return(total_return: Decimal, n_returns: int, ppy: float) -> Decimal | None:
+    """Compound growth over ``n_returns`` bars, scaled to ``ppy`` bars per year."""
+    if n_returns <= 0:
         return Decimal("0")
     total_r = float(total_return)
     if total_r <= -1.0:
         return Decimal("-1")
     try:
-        ann = (1.0 + total_r) ** (252.0 / n_periods) - 1.0
-        if not math.isfinite(ann):
-            return Decimal(str(round(total_r, 6)))
-        return Decimal(str(ann)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    except (OverflowError, decimal.InvalidOperation):
-        # Extremely large annualized return; return a capped value
-        return Decimal(str(round(total_r, 6)))
+        ann = (1.0 + total_r) ** (ppy / n_returns) - 1.0
+    except OverflowError:
+        return None
+    return Decimal(str(round(ann, 6)))
 
 
 def _compute_drawdown_series(equity: ndarray) -> tuple[ndarray, float, int]:
@@ -181,45 +208,34 @@ def _compute_drawdown_series(equity: ndarray) -> tuple[ndarray, float, int]:
     return drawdown, max_dd, max_dur
 
 
-def _compute_sharpe(returns: ndarray, risk_free_rate: float = 0.0) -> float:
-    """Annualized Sharpe ratio (daily returns assumed)."""
+_DEGENERATE = 1e-12
+
+
+def _compute_sharpe(returns: ndarray, ppy: float) -> float:
+    """Annualised Sharpe ratio; 0.0 when the dispersion is float noise."""
     if len(returns) < 2:
         return 0.0
-    daily_rf = risk_free_rate / 252.0
-    excess = returns - daily_rf
-    std = float(np.std(excess, ddof=1))
-    if std == 0:
-        if float(np.mean(excess)) > 0:
-            return float("inf")
-        if float(np.mean(excess)) < 0:
-            return float("-inf")
+    std = float(np.std(returns, ddof=1))
+    if std < _DEGENERATE:
         return 0.0
-    return float(np.mean(excess)) / std * math.sqrt(252.0)
+    return float(np.mean(returns)) / std * math.sqrt(ppy)
 
 
-def _compute_sortino(returns: ndarray, risk_free_rate: float = 0.0) -> float:
-    """Annualized Sortino ratio (only downside deviation)."""
+def _compute_sortino(returns: ndarray, ppy: float) -> float | None:
+    """Annualised Sortino ratio with the target downside deviation over all returns."""
     if len(returns) < 2:
-        return 0.0
-    daily_rf = risk_free_rate / 252.0
-    excess = returns - daily_rf
-    downside = excess[excess < 0]
-    if len(downside) == 0:
-        mean_excess = float(np.mean(excess))
-        if mean_excess > 0:
-            return float("inf")
-        return 0.0
-    downside_std = float(np.sqrt(np.mean(downside**2)))
-    if downside_std == 0:
-        return 0.0
-    return float(np.mean(excess)) / downside_std * math.sqrt(252.0)
+        return None
+    tdd = float(np.sqrt(np.mean(np.minimum(returns, 0.0) ** 2)))
+    if tdd < _DEGENERATE:
+        return None
+    return float(np.mean(returns)) / tdd * math.sqrt(ppy)
 
 
-def _compute_calmar(annualized_return: float, max_drawdown: float) -> float:
+def _compute_calmar(annualized_return: Decimal | None, max_drawdown: float) -> float | None:
     """Calmar ratio = annualized return / max drawdown."""
-    if max_drawdown == 0:
-        return 0.0
-    return annualized_return / max_drawdown
+    if annualized_return is None or max_drawdown == 0:
+        return None
+    return float(annualized_return) / max_drawdown
 
 
 def _compute_trade_stats(
@@ -230,7 +246,7 @@ def _compute_trade_stats(
         return {
             "total_trades": 0,
             "win_rate": Decimal("0"),
-            "profit_factor": Decimal("0"),
+            "profit_factor": None,
             "avg_win": Decimal("0"),
             "avg_loss": Decimal("0"),
             "largest_win": Decimal("0"),
@@ -246,7 +262,7 @@ def _compute_trade_stats(
 
     gross_profit = sum((t.pnl for t in wins), Decimal("0"))
     gross_loss = sum((abs(t.pnl) for t in losses), Decimal("0"))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else Decimal("0")
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
 
     avg_win = gross_profit / Decimal(str(len(wins))) if wins else Decimal("0")
     avg_loss = gross_loss / Decimal(str(len(losses))) if losses else Decimal("0")
@@ -302,93 +318,30 @@ def _compute_monthly_returns(
     return monthly
 
 
-def _compute_deflated_sharpe(
-    observed_sharpe: float,
-    n_trials: int,
-    n_returns: int,
-    returns_skew: float,
-    returns_kurtosis: float,
-) -> float:
-    """Bailey & Lopez de Prado Deflated Sharpe Ratio.
-
-    Adjusts the observed Sharpe ratio for the number of strategy trials,
-    non-normal return distribution (skewness, kurtosis), and sample length.
-
-    Returns the DSR as a probability (0-1 range, from a one-sided normal CDF).
-    """
-    from scipy import stats
-
-    if n_trials <= 0 or n_returns < 2:
-        return 0.0
-
-    # Expected maximum Sharpe under null (Euler-Mascheroni approximation)
-    euler_mascheroni = 0.5772156649
-    if n_trials == 1:
-        e_max_sharpe = 0.0
-    else:
-        ln_trials = math.log(n_trials)
-        e_max_sharpe = math.sqrt(2.0 * ln_trials) - (
-            euler_mascheroni / math.sqrt(2.0 * ln_trials)
-            + math.log(math.sqrt(math.pi * ln_trials)) / math.sqrt(2.0 * ln_trials)
-        )
-
-    # Variance of the Sharpe estimator (Lo, 2002 + higher moments)
-    sr = observed_sharpe / math.sqrt(252.0) if observed_sharpe != 0 else 0.0  # de-annualize
-    var_sr = (1.0 - returns_skew * sr + ((returns_kurtosis - 1.0) / 4.0) * sr**2) / (
-        n_returns - 1.0
-    )
-
-    if var_sr <= 0:
-        return 0.0
-
-    # Test statistic
-    numerator = sr - e_max_sharpe / math.sqrt(252.0)
-    denominator = math.sqrt(var_sr)
-    if denominator == 0:
-        return 0.0
-
-    t_stat = numerator / denominator
-    dsr = float(stats.norm.cdf(t_stat))
-    return dsr
-
-
 def _compute_benchmark_equity(
     initial_capital: Decimal,
-    bar_closes: list[Decimal],
+    benchmark_prices: list[Decimal],
 ) -> list[Decimal]:
-    """Compute buy-and-hold equity curve.
-
-    Returns a list of equity values where each value = initial_capital * (close / first_close).
-    """
-    if not bar_closes or bar_closes[0] == 0:
+    """Buy-and-hold equity: initial_capital * price / first price."""
+    if not benchmark_prices or benchmark_prices[0] == 0:
         return []
-    first_close = bar_closes[0]
-    return [initial_capital * (close / first_close) for close in bar_closes]
+    first_price = benchmark_prices[0]
+    return [initial_capital * (price / first_price) for price in benchmark_prices]
 
 
 def _compute_alpha_beta(
     strategy_returns: ndarray,
     benchmark_returns: ndarray,
-    annualized_strategy_return: float,
-    annualized_benchmark_return: float,
+    ppy: float,
 ) -> tuple[float, float]:
-    """Compute alpha and beta of strategy versus benchmark.
-
-    beta  = cov(strategy, benchmark) / var(benchmark)
-    alpha = annualized_strategy_return - beta * annualized_benchmark_return
-    """
-    if len(strategy_returns) < 2 or len(benchmark_returns) < 2:
+    """Beta and annualised Jensen alpha of equal-length per-bar return series."""
+    if len(strategy_returns) < 2 or len(strategy_returns) != len(benchmark_returns):
         return 0.0, 0.0
-    # Ensure arrays are the same length (use shorter)
-    n = min(len(strategy_returns), len(benchmark_returns))
-    s = strategy_returns[:n]
-    b = benchmark_returns[:n]
-    var_b = float(np.var(b, ddof=1))
+    var_b = float(np.var(benchmark_returns, ddof=1))
     if var_b == 0:
         return 0.0, 0.0
-    cov_matrix = np.cov(s, b, ddof=1)
-    beta = float(cov_matrix[0][1]) / var_b
-    alpha = annualized_strategy_return - beta * annualized_benchmark_return
+    beta = float(np.cov(strategy_returns, benchmark_returns, ddof=1)[0][1]) / var_b
+    alpha = (float(np.mean(strategy_returns)) - beta * float(np.mean(benchmark_returns))) * ppy
     return alpha, beta
 
 
@@ -453,84 +406,48 @@ def _compute_expectancy(trades: list[Trade]) -> Decimal:
 def calculate_metrics(
     equity_curve: list[Decimal],
     trades: list[Trade],
-    risk_free_rate: float = 0.0,
+    *,
+    timeframe: Timeframe,
     timestamps: list[datetime] | None = None,
-    n_trials: int = 1,
-    bar_closes: list[Decimal] | None = None,
+    benchmark_prices: list[Decimal] | None = None,
     initial_capital: Decimal = Decimal("100000"),
 ) -> BacktestResult:
-    """Compute all backtest metrics from equity curve and trade list.
+    """Compute all backtest metrics (definitions in the module docstring).
 
-    Parameters
-    ----------
-    equity_curve:
-        Time series of portfolio values (one per bar/day).
-    trades:
-        Completed round-trip trades.
-    risk_free_rate:
-        Annualized risk-free rate (e.g. 0.05 for 5%).
-    timestamps:
-        Optional bar timestamps aligned with equity_curve, for monthly returns.
-    n_trials:
-        Number of strategy configurations tested (for deflated Sharpe).
-    bar_closes:
-        Optional list of bar close prices for buy-and-hold benchmark computation.
-    initial_capital:
-        Starting capital, used to compute benchmark equity curve.
+    ``timestamps`` and ``benchmark_prices``, when given, are aligned 1:1 with ``equity_curve``.
     """
+    for name, series in (("timestamps", timestamps), ("benchmark_prices", benchmark_prices)):
+        if series is not None and len(series) != len(equity_curve):
+            msg = f"{name} has {len(series)} points, equity_curve has {len(equity_curve)}"
+            raise ValueError(msg)
+    tf_seconds = timeframe_seconds(timeframe)
+    ppy = 365 * 86400 / tf_seconds
     equity_arr = _decimal_to_float_array(equity_curve)
     returns = _compute_returns(equity_arr)
 
-    # Basic returns
     total_return = _compute_total_return(equity_curve)
-    n_periods = max(len(returns), 1)
-    annualized_return = _compute_annualized_return(total_return, n_periods)
+    annualized_return = _compute_annualized_return(total_return, len(returns), ppy)
 
-    # Drawdown
     dd_series, max_dd, max_dd_dur = _compute_drawdown_series(equity_arr)
     drawdown_list = [Decimal(str(round(d, 8))) for d in dd_series]
 
-    # Risk-adjusted ratios
-    sharpe = _compute_sharpe(returns, risk_free_rate)
-    sortino = _compute_sortino(returns, risk_free_rate)
-    calmar = _compute_calmar(float(annualized_return), max_dd)
+    sharpe = _compute_sharpe(returns, ppy)
+    sortino = _compute_sortino(returns, ppy)
+    calmar = _compute_calmar(annualized_return, max_dd)
 
-    # Trade stats
     tstats = _compute_trade_stats(trades)
-
-    # Monthly returns
     monthly = _compute_monthly_returns(equity_curve, timestamps)
-
-    # Advanced: Deflated Sharpe Ratio
-    dsr = 0.0
-    if len(returns) >= 2 and n_trials >= 1:
-        try:
-            ret_std = float(np.std(returns, ddof=1))
-            if ret_std > 0:
-                z = (returns - np.mean(returns)) / ret_std
-                skew = float(np.mean(z**3))
-                kurt = float(np.mean(z**4))
-            else:
-                skew = 0.0
-                kurt = 3.0
-            dsr = _compute_deflated_sharpe(sharpe, n_trials, len(returns), skew, kurt)
-        except Exception:
-            dsr = 0.0
 
     # Benchmark (buy-and-hold)
     benchmark_equity: list[Decimal] = []
     benchmark_return = Decimal("0")
     alpha = 0.0
     beta = 0.0
-    if bar_closes:
-        benchmark_equity = _compute_benchmark_equity(initial_capital, bar_closes)
+    if benchmark_prices:
+        benchmark_equity = _compute_benchmark_equity(initial_capital, benchmark_prices)
         benchmark_return = _compute_total_return(benchmark_equity)
-        benchmark_arr = _decimal_to_float_array(benchmark_equity)
-        benchmark_returns = _compute_returns(benchmark_arr)
-        ann_benchmark = _compute_annualized_return(benchmark_return, max(len(benchmark_returns), 1))
-        alpha, beta = _compute_alpha_beta(
-            returns, benchmark_returns, float(annualized_return), float(ann_benchmark)
-        )
+        benchmark_returns = _compute_returns(_decimal_to_float_array(benchmark_equity))
+        alpha, beta = _compute_alpha_beta(returns, benchmark_returns, ppy)
 
     # Consecutive wins/losses and expectancy
     max_consecutive_wins, max_consecutive_losses = _compute_consecutive_wins_losses(trades)
@@ -540,7 +457,7 @@ def calculate_metrics(
         total_return=total_return,
         annualized_return=annualized_return,
         max_drawdown=Decimal(str(round(max_dd, 8))),
-        max_drawdown_duration=timedelta(days=max_dd_dur),
+        max_drawdown_duration=timedelta(seconds=max_dd_dur * tf_seconds),
         sharpe_ratio=sharpe,
         sortino_ratio=sortino,
         calmar_ratio=calmar,
@@ -552,8 +469,6 @@ def calculate_metrics(
         largest_win=tstats["largest_win"],
         largest_loss=tstats["largest_loss"],
         avg_trade_duration=tstats["avg_trade_duration"],
-        deflated_sharpe_ratio=dsr,
-        probability_of_backtest_overfitting=0.0,
         benchmark_equity=benchmark_equity,
         benchmark_return=benchmark_return,
         alpha=alpha,
@@ -562,6 +477,7 @@ def calculate_metrics(
         max_consecutive_losses=max_consecutive_losses,
         expectancy=expectancy,
         equity_curve=list(equity_curve),
+        timestamps=list(timestamps or []),
         drawdown_series=drawdown_list,
         trades=list(trades),
         monthly_returns=monthly,

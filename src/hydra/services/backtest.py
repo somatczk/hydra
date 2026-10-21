@@ -104,6 +104,12 @@ class BacktestMetrics(BaseModel):
     max_consecutive_wins: int | None = None
     max_consecutive_losses: int | None = None
     expectancy: float | None = None
+    total_return: float | None = None
+    annualized_return: float | None = None
+    sortino_ratio: float | None = None
+    calmar_ratio: float | None = None
+    profit_factor: float | None = None
+    max_drawdown_duration_s: int | None = None
 
 
 class BacktestResultSummary(BaseModel):
@@ -316,7 +322,7 @@ async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pf: Preflig
         task["progress"] = 90.0
 
         result_id = f"bt-{task_id}"
-        stored = result_record(result_id, body, pf, result, bars, provenance)
+        stored = result_record(result_id, body, pf, result, provenance)
 
         try:
             await persist_result(pf.pool, stored, result.trades, provenance)

@@ -7,6 +7,7 @@ create and drop their own databases, so the target server's data is never touche
 from __future__ import annotations
 
 import asyncio
+import importlib
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -17,12 +18,13 @@ import asyncpg
 import httpx
 import pytest
 import yaml
+from alembic import command
 from fastapi import FastAPI
 
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes import backtest, strategies
 from hydra.dashboard.routes._db import install_error_handlers
-from hydra.data.migrations.runner import upgrade_to_head
+from hydra.data.migrations.runner import alembic_config, upgrade_to_head
 from hydra.data.storage import MarketDataRepository
 from hydra.services import backtest as backtest_svc
 from hydra.services import research
@@ -59,7 +61,15 @@ _SAW_RULES = {
     },
 }
 
-_NEW_COLUMNS = {
+_METRIC_COLUMNS = {
+    "total_return",
+    "annualized_return",
+    "sortino_ratio",
+    "calmar_ratio",
+    "profit_factor",
+    "max_drawdown_duration_s",
+}
+_NEW_COLUMNS = _METRIC_COLUMNS | {
     "strategy_id",
     "initial_capital",
     "data_source",
@@ -290,6 +300,9 @@ async def test_results_survive_a_restart(
     assert before["benchmark_equity"]
     assert before["metrics"]["max_consecutive_wins"] is not None
     assert before["metrics"]["expectancy"] is not None
+    assert set(before["metrics"]) >= _METRIC_COLUMNS
+    assert before["metrics"]["total_return"] is not None
+    assert before["metrics"]["max_drawdown_duration_s"] is not None
 
     backtest_svc._RESULTS.clear()
     uncached = (await client.get(f"/api/backtest/results/{result_id}")).json()
@@ -598,5 +611,44 @@ async def test_migration_adds_provenance_and_purges_legacy_rows(
 
         ids = [r["id"] for r in await conn.fetch("SELECT id FROM backtest_results")]
         assert ids == ["bt-task-real"]
+    finally:
+        await conn.close()
+
+
+async def test_metrics_migration_adds_columns_and_purges_old_results(
+    monkeypatch: pytest.MonkeyPatch, fresh_database: str
+) -> None:
+    dsn = fresh_database
+    await asyncio.to_thread(command.upgrade, alembic_config(dsn), "0004_credentials_validated_at")
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute(
+            "INSERT INTO backtest_results (id, strategy, period, data_source) "
+            "VALUES ('bt-task-old', 'Saw', 'x', 'db')"
+        )
+        await conn.execute(
+            "INSERT INTO backtest_result_trades "
+            "(backtest_id, entry_time, exit_time, side, entry_price, exit_price, pnl) "
+            "VALUES ('bt-task-old', now(), now(), 'LONG', 42000, 42100, 1)"
+        )
+
+        await _migrate(monkeypatch, dsn)
+
+        columns = await _columns(conn)
+        assert {name: columns[name] for name in _METRIC_COLUMNS} == dict.fromkeys(
+            _METRIC_COLUMNS, "YES"
+        )
+        assert await conn.fetchval("SELECT count(*) FROM backtest_results") == 0
+        assert await conn.fetchval("SELECT count(*) FROM backtest_result_trades") == 0
+
+        await conn.execute(
+            "INSERT INTO backtest_results (id, strategy, period, data_source, total_return) "
+            "VALUES ('bt-task-new', 'Saw', 'x', 'db', 1.5)"
+        )
+        migration = importlib.import_module("hydra.data.migrations.versions.0005_backtest_metrics")
+        for statement in migration._STATEMENTS:
+            await conn.execute(statement)
+        ids = [r["id"] for r in await conn.fetch("SELECT id FROM backtest_results")]
+        assert ids == ["bt-task-new"]
     finally:
         await conn.close()

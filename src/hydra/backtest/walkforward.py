@@ -181,6 +181,7 @@ class WalkForwardAnalyzer:
             agg_metrics = calculate_metrics(
                 equity_curve=all_oos_equity,
                 trades=all_oos_trades,
+                timeframe=timeframe,
             )
         else:
             agg_metrics = None
@@ -313,7 +314,7 @@ class WalkForwardAnalyzer:
         deflated_sharpe = 0.0
         if path_sharpes:
             mean_sharpe = float(np.mean(path_sharpes))
-            deflated_sharpe = mean_sharpe  # Simplified; full DSR would use _compute_deflated_sharpe
+            deflated_sharpe = mean_sharpe  # Simplified; real DSR is P2-C
 
         return CPCVResult(
             fold_results=fold_results,
