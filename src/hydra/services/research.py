@@ -68,7 +68,7 @@ def _suggest_range(param_name: str, default: float, param_type: str) -> tuple[fl
     from hydra.strategy.context import PARAM_LIMITS
 
     if param_name in PARAM_LIMITS:
-        lo, hi = PARAM_LIMITS[param_name]
+        lo, hi = (float(v) for v in PARAM_LIMITS[param_name])
     else:
         lo = max(0.1 if param_type == "float" else 1, round(default * 0.25))
         hi = max(round(default * 4), round(default + 10))
