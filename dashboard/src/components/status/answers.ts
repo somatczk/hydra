@@ -78,8 +78,8 @@ export function safeAnswer(live: Src<LiveStatus>, risk: Src<RiskStatusLite>, now
   return { value: parts.join(' · '), tone, state: live.data.kill_switch_state === 'unknown' ? 'unknown' : state };
 }
 
-function dataText(a: DataAnswer): Answer {
-  switch (a.kind) {
+function dataText(a: DataAnswer, sub: string | undefined): Answer {
+    switch (a.kind) {
     case 'none':
       return { value: "No session running, so the feed isn't checked", tone: 'none', state: 'ok' };
     case 'unknown':
@@ -91,28 +91,31 @@ function dataText(a: DataAnswer): Answer {
         value: `${a.late} of ${a.total} late: ${w.name} ${w.tf} bar ${duration(w.overdueMs)} overdue${paused}`,
         tone: 'caution',
         state: 'ok',
+        sub,
       };
     }
     case 'warming':
-      return { value: `${a.name} is warming up: no closed ${a.tf} bar yet`, tone: 'none', state: 'ok' };
+      return { value: `${a.name} is warming up: no closed ${a.tf} bar yet`, tone: 'none', state: 'ok', sub };
     case 'ok': {
       const caution = a.unreadable > 0;
       if (a.paused.length > 0) {
-        return { value: `Entries paused in ${plural(a.paused.length, 'session')}: ${a.paused[0]}`, tone: 'caution', state: 'ok' };
+        return { value: `Entries paused in ${plural(a.paused.length, 'session')}: ${a.paused[0]}`, tone: 'caution', state: 'ok', sub };
       }
-      return { value: `On time · ${a.total - a.unreadable} of ${a.total} sessions${caution ? ` (${a.unreadable} unreadable)` : ''}`, tone: caution ? 'caution' : 'none', state: 'ok' };
+      return { value: `On time · ${a.total - a.unreadable} of ${a.total} sessions${caution ? ` (${a.unreadable} unreadable)` : ''}`, tone: caution ? 'caution' : 'none', state: 'ok', sub };
     }
   }
 }
 
 /** Loading until the first detail round settles (or nothing runs); never "on time" from unread details. */
-export function dataView(sessions: Src<SessionResponse[]>, details: Map<string, SessionDetail | Error>, ready: boolean, now: number): Answer {
+export function dataView(sessions: Src<SessionResponse[]>, details: Map<string, SessionDetail | Error>, ready: boolean, now: number, readiness: Src<ReadinessLite>): Answer {
   if (!sessions.data) return loading(sessions.state) ? LOADING : unknown("Couldn't read session health");
   if (!ready && sessions.data.some((s) => s.status === 'running')) return LOADING;
-  return dataText(dataAnswer(sessions.data, details, now));
+  return dataText(dataAnswer(sessions.data, details, now), feedSub(readiness));
 }
 
-export function feedSub(r: Src<ReadinessLite>): string {
+export function feedSub(r: Src<ReadinessLite>): string | undefined {
+  if (r.state === 'loading') return undefined;
+  if (r.state !== 'ok' && r.state !== 'refreshing') return 'Per session. Feed check status is out of date.';
   if (!r.data || r.data.stale) return "Per session. Full feed check isn't available.";
   const feeds = r.data.checks.feeds;
   if (!feeds) return 'Per session.';

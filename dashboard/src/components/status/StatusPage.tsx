@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import Link from 'next/link';
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, XAxis, YAxis } from 'recharts';
 import { Button } from '@/components/ui/Button';
@@ -16,7 +16,6 @@ import { Readout } from './Readout';
 import { Section } from './Section';
 import {
   dataView,
-  feedSub,
   needsAnswer,
   recentEvents,
   runningAnswer,
@@ -26,6 +25,14 @@ import {
 } from './answers';
 
 const DETAIL_POLL_MS = 15_000;
+const DESKTOP = '(min-width: 1024px)';
+// jsdom has no matchMedia; treat it as desktop.
+const subscribeDesktop = (cb: () => void) => {
+  const mq = window.matchMedia?.(DESKTOP);
+  mq?.addEventListener('change', cb);
+  return () => mq?.removeEventListener('change', cb);
+};
+const useDesktop = () => useSyncExternalStore(subscribeDesktop, () => window.matchMedia?.(DESKTOP).matches ?? true, () => true);
 // shortcut: detail polling is capped at 10 running sessions, raise it when /sessions carries last_bar_at.
 const DETAIL_CAP = 10;
 
@@ -145,7 +152,7 @@ function SessionsTable({ details, ready }: { details: Details; ready: boolean })
   const { sessions, now } = useShellStatus();
   const running = sessions.data?.filter((x) => x.status === 'running') ?? [];
   return (
-    <Section title="Running sessions" className="max-lg:hidden lg:col-span-8">
+    <Section title="Running sessions" className="lg:col-span-8">
       {running.length === 0 ? (
         <p className="text-sm text-ink-2">
           {sessions.data ? 'Nothing is running. Start a paper session from a strategy.' : "Couldn't read sessions."}
@@ -155,7 +162,7 @@ function SessionsTable({ details, ready }: { details: Details; ready: boolean })
           <thead className="text-xs text-ink-2">
             <tr>
               {['Name', 'Market', 'Started', 'Last bar', 'Entries', 'Stop failures', 'Positions', 'Unrealised (USDT)'].map((h) => (
-                <th key={h} scope="col" className="pb-2 pr-3 font-medium">{h}</th>
+                <th key={h} scope="col" title={h.startsWith('Unrealised') ? 'Marked at the last closed bar' : undefined} className="pb-2 pr-3 font-medium">{h}</th>
               ))}
             </tr>
           </thead>
@@ -198,6 +205,7 @@ function SessionsTable({ details, ready }: { details: Details; ready: boolean })
           </tbody>
         </table>
       )}
+      {running.length > 0 && <p className="mt-2 text-xs text-ink-2">Unrealised is marked at the last closed bar.</p>}
     </Section>
   );
 }
@@ -211,7 +219,7 @@ function Equity() {
     return `Equity from ${money(values[0])} to ${money(values[values.length - 1])} USDT, peak ${money(Math.max(...values))} USDT.`;
   }, [pts]);
   return (
-    <Section title="Equity" className="max-lg:hidden lg:col-span-12">
+    <Section title="Equity" className="lg:col-span-12">
       {!pts && curve.state !== 'loading' ? (
         <DataStateErrorCard error={curve.error} fallback="Equity history couldn't be loaded" onRetry={() => void curve.refetch()} />
       ) : !pts ? (
@@ -239,16 +247,18 @@ function Equity() {
 
 export function StatusPage() {
   const shell = useShellStatus();
+  const desktop = useDesktop();
   const { live, sessions, config, needs, now } = shell;
   const risk = usePoll<RiskStatusLite>('/api/risk/status', 10_000);
   const readiness = usePoll<ReadinessLite>('/api/system/readiness', 15_000);
+  // shortcut: counts at most the newest 500 events, replace with a server-side since= filter when one exists.
   const events = usePoll<Array<{ ts: string | null }>>('/api/risk/events?limit=500', 30_000);
   const runningIds = sessions.data ? sessions.data.filter((s) => s.status === 'running').map((s) => s.session_id) : null;
   const { details, ready } = useRunningDetails(runningIds);
 
   const run = runningAnswer(sessions);
   const safe = safeAnswer(live, risk, now);
-  const data = dataView(sessions, details, ready, now);
+  const data = dataView(sessions, details, ready, now, readiness);
   const need = needsAnswer(needs, [live, sessions, config].some((p) => p.state === 'loading'));
   const hist = recentEvents(events.data, now);
 
@@ -258,11 +268,11 @@ export function StatusPage() {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Readout label="Running" {...run} state={run.state} href="/trading" />
         <Readout label="Safe" {...safe} href="/risk" />
-        <Readout label="Data" {...data} sub={data.value ? feedSub(readiness) : undefined} href="/trading" />
+        <Readout label="Data" {...data} href="/trading" />
         <Readout label="Needs you" {...need} href="#needs-you" />
       </div>
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-        <SessionsTable details={details} ready={ready} />
+        {desktop && <SessionsTable details={details} ready={ready} />}
         <div className="flex flex-col gap-4 lg:col-span-4">
           <Section title="Needs you" id="needs-you">
             <AttentionList
@@ -284,7 +294,7 @@ export function StatusPage() {
           </Section>
           <Account />
         </div>
-        <Equity />
+        {desktop && <Equity />}
       </div>
     </div>
   );

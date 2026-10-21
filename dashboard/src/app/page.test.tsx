@@ -181,4 +181,34 @@ describe('Status page', () => {
     expect(row).toContain('0 positions');
     expect(c.querySelectorAll('th[scope="col"]').length).toBeGreaterThan(0);
   });
+
+  it('shows no feed check under a Data answer that says nothing is checked', async () => {
+    const c = await show({ '/api/trading/sessions': [] });
+    expect(tile(c, 'Data')).toContain("No session running, so the feed isn't checked");
+    expect(tile(c, 'Data')).not.toContain('Feed check');
+  });
+
+  it('says the feed check is out of date when readiness cannot be read', async () => {
+    const c = await show({ '/api/system/readiness': unavailable() });
+    expect(tile(c, 'Data')).toContain('Feed check status is out of date');
+    expect(tile(c, 'Data')).not.toContain('Feed check passed');
+  });
+
+  it('marks the unrealised column as marked at the last closed bar', async () => {
+    const c = await show();
+    expect(c.querySelector('th[title="Marked at the last closed bar"]')).not.toBeNull();
+    expect(c.textContent).toContain('Unrealised is marked at the last closed bar.');
+  });
+
+  it('mounts neither the sessions table nor the equity poll on a phone', async () => {
+    const mm = vi.fn().mockReturnValue({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    vi.stubGlobal('matchMedia', mm);
+    try {
+      const c = await show();
+      expect(c.querySelector('table')).toBeNull();
+      expect(calls.some((x) => x.path.includes('equity-curve'))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
