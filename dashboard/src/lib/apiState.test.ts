@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './api';
-import { describeApiError, isStale, parseErrorDetail, stateFromError } from './apiState';
+import {
+  describeApiError,
+  fetchAgeLabel,
+  isSignedOut,
+  isStale,
+  parseErrorDetail,
+  stateFromError,
+} from './apiState';
 
 function envelope(status: number, detail: unknown): ApiError {
   return new ApiError(status, JSON.stringify({ detail }));
@@ -160,5 +167,53 @@ describe('isStale', () => {
     expect(isStale(undefined, 15_000, now)).toBe(true);
     expect(isStale(null, 15_000, now)).toBe(true);
     expect(isStale('not-a-date', 15_000, now)).toBe(true);
+  });
+});
+
+describe('isSignedOut', () => {
+  it('is true for the security middleware 401 envelope (security.py:294)', () => {
+    const err = new ApiError(
+      401,
+      JSON.stringify({
+        detail: { code: 'unauthenticated', message: 'Authentication required', state: 'unauthenticated' },
+      }),
+    );
+    expect(isSignedOut(err)).toBe(true);
+  });
+
+  it('is true for any 401, whatever its body', () => {
+    expect(isSignedOut(new ApiError(401, '<!DOCTYPE html><title>Login - Authelia</title>'))).toBe(true);
+  });
+
+  it('known limit until E-1: a redirect to the sign-in page reaches us as a JSON SyntaxError, not a 401', () => {
+    expect(isSignedOut(new SyntaxError('Unexpected token < in JSON'))).toBe(false);
+  });
+
+  it('is false for a 403, a 503 and a network TypeError', () => {
+    expect(isSignedOut(new ApiError(403, '{}'))).toBe(false);
+    expect(isSignedOut(new ApiError(503, '{}'))).toBe(false);
+    expect(isSignedOut(new TypeError('Failed to fetch'))).toBe(false);
+  });
+});
+
+describe('fetchAgeLabel', () => {
+  const now = Date.parse('2026-10-21T14:04:10Z');
+
+  it('says Fetching… while a poll is in flight', () => {
+    expect(fetchAgeLabel(null, 'loading', now)).toBe('Fetching…');
+    expect(fetchAgeLabel(now - 6_000, 'refreshing', now)).toBe('Fetching…');
+  });
+
+  it('gives the fetch age when ok and the as-of time when stale', () => {
+    expect(fetchAgeLabel(now - 6_000, 'ok', now)).toBe('Fetched 6 s ago');
+    expect(fetchAgeLabel(now - 120_000, 'stale', now)).toEqual({ stale: true, asOf: '14:02:10 UTC (2 min ago)' });
+  });
+
+  it('names a stale time 24 h or more old once, not twice', () => {
+    expect(fetchAgeLabel(now - 3 * 86_400_000, 'stale', now)).toEqual({ stale: true, asOf: '18 Oct 14:04 UTC' });
+  });
+
+  it('has nothing to say when nothing was ever fetched', () => {
+    expect(fetchAgeLabel(null, 'unavailable', now)).toBeNull();
   });
 });

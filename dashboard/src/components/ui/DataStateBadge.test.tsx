@@ -24,26 +24,29 @@ function render(node: React.ReactNode): void {
 }
 
 describe('DataStateBadge', () => {
-  it('renders UNAVAILABLE with the reason as tooltip', () => {
+  it('renders UNAVAILABLE with the reason linked by aria-describedby', () => {
     render(<DataStateBadge state="unavailable" reason="not wired to engine yet" />);
     const badge = container.querySelector('[role="status"]');
     expect(badge?.textContent).toBe('UNAVAILABLE');
     expect(badge?.getAttribute('data-state')).toBe('unavailable');
-    expect(badge?.getAttribute('title')).toBe('not wired to engine yet');
-    expect(badge?.querySelector('.text-status-error')).not.toBeNull();
+    const describedBy = badge?.getAttribute('aria-describedby') ?? '';
+    expect(document.getElementById(describedBy)?.textContent).toBe('not wired to engine yet');
+    expect(badge?.querySelector('.text-caution')).not.toBeNull();
   });
 
   it.each([
-    ['stale', 'STALE', '.text-status-warning'],
-    ['unknown', 'UNKNOWN', '.text-status-warning'],
-    ['not_implemented', 'NOT IMPLEMENTED', '.text-text-muted'],
-    ['mock', 'MOCK', '.text-status-warning'],
-    ['unauthenticated', 'NOT SIGNED IN', '.text-status-error'],
-    ['forbidden', 'FORBIDDEN', '.text-status-error'],
+    ['stale', 'STALE', '.text-caution'],
+    ['unknown', 'UNKNOWN', '.text-caution'],
+    ['unauthenticated', 'NOT SIGNED IN', '.text-caution'],
+    ['forbidden', 'FORBIDDEN', '.text-caution'],
+    ['no_data', 'NO DATA', '.text-ink-2'],
+    ['not_found', 'NOT FOUND', '.text-ink-2'],
+    ['not_implemented', 'NOT IMPLEMENTED', '.text-ink-2'],
   ] as const)('renders %s as %s', (state, label, tone) => {
     render(<DataStateBadge state={state} />);
     const badge = container.querySelector('[role="status"]');
     expect(badge?.textContent).toBe(label);
+    expect(badge?.hasAttribute('aria-describedby')).toBe(false);
     expect(badge?.querySelector(tone)).not.toBeNull();
   });
 

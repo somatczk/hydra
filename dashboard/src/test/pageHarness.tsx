@@ -1,4 +1,5 @@
 import { act, type ReactNode } from 'react';
+import { vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { ApiError } from '@/lib/api';
 
@@ -50,17 +51,60 @@ export function unavailable(message = 'Database is not available'): ApiError {
 
 export type Routes = Record<string, unknown | (() => unknown)>;
 
-/** fetchApi stand-in: GETs resolve from `routes` by path (query included); Errors reject. */
-export function routeFetch(routes: Routes, calls: Array<{ path: string; init?: RequestInit }>) {
+/** Non-GET responses keyed "METHOD /path"; a function gets the 1-based call count for that key. */
+export type Mutations = Record<string, unknown | ((call: number) => unknown)>;
+
+/** fetchApi stand-in: GETs resolve from `routes` by path (query included); Errors reject.
+ * Non-GETs resolve from `mutations` when scripted, else `{}`. */
+export function routeFetch(
+  routes: Routes,
+  calls: Array<{ path: string; init?: RequestInit }>,
+  mutations: Mutations = {},
+) {
+  const counts = new Map<string, number>();
   return async (path: string, init?: RequestInit): Promise<unknown> => {
     calls.push({ path, init });
-    if (init?.method && init.method !== 'GET') return {};
+    const method = (init?.method ?? 'GET').toUpperCase();
+    if (method !== 'GET') {
+      const key = `${method} ${path}`;
+      if (!(key in mutations)) return {};
+      const n = (counts.get(key) ?? 0) + 1;
+      counts.set(key, n);
+      const entry = mutations[key];
+      const value = typeof entry === 'function' ? (entry as (call: number) => unknown)(n) : entry;
+      if (value instanceof Error) throw value;
+      return value;
+    }
     if (!(path in routes)) throw new ApiError(404, JSON.stringify({ detail: 'no route' }));
     const entry = routes[path];
     const value = typeof entry === 'function' ? (entry as () => unknown)() : entry;
     if (value instanceof Error) throw value;
     return value;
   };
+}
+
+/** jsdom 29.1.1 has no HTMLDialogElement.showModal/close; this stub toggles `open` and fires `close`. */
+export function dialogPolyfill(): void {
+  const proto = HTMLDialogElement.prototype;
+  if (typeof proto.showModal === 'function') return;
+  proto.showModal = function (this: HTMLDialogElement) {
+    this.setAttribute('open', '');
+  };
+  proto.show = proto.showModal;
+  proto.close = function (this: HTMLDialogElement, returnValue?: string) {
+    if (!this.hasAttribute('open')) return;
+    if (returnValue !== undefined) this.returnValue = returnValue;
+    this.removeAttribute('open');
+    this.dispatchEvent(new Event('close'));
+  };
+}
+
+/** Advance fake timers inside act, then let promises settle. */
+export async function advance(ms: number): Promise<void> {
+  await act(async () => {
+    vi.advanceTimersByTime(ms);
+  });
+  await flush();
 }
 
 export function inputByLabel(container: HTMLElement, label: string): HTMLInputElement {

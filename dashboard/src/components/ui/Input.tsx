@@ -22,7 +22,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
         {label && (
           <label
             htmlFor={inputId}
-            className="text-sm font-medium text-text-secondary"
+            className="text-sm font-medium text-ink-2"
           >
             {label}
           </label>
@@ -31,11 +31,11 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
           ref={ref}
           id={inputId}
           className={cn(
-            'h-10 w-full rounded-lg border bg-bg-primary px-3 text-sm text-text-primary placeholder:text-text-light transition-colors',
-            'focus:outline-none focus:ring-2 focus:ring-offset-1',
+            'h-10 w-full rounded border bg-canvas px-3 text-sm text-ink-1 placeholder:text-ink-2 transition-colors',
+            'focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent',
             error
-              ? 'border-status-error focus:border-status-error focus:ring-status-error/30'
-              : 'border-border-default focus:border-border-focus focus:ring-border-focus/30 hover:border-border-hover',
+              ? 'border-danger'
+              : 'border-line-strong',
             className,
           )}
           aria-invalid={error ? true : undefined}
@@ -43,12 +43,12 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
           {...props}
         />
         {error && (
-          <p id={errorId} className="text-xs text-status-error" role="alert">
+          <p id={errorId} className="text-xs text-danger" role="alert">
             {error}
           </p>
         )}
         {hint && !error && (
-          <p id={hintId} className="text-xs text-text-muted">
+          <p id={hintId} className="text-xs text-ink-2">
             {hint}
           </p>
         )}

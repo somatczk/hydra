@@ -30,7 +30,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
         {label && (
           <label
             htmlFor={selectId}
-            className="text-sm font-medium text-text-secondary"
+            className="text-sm font-medium text-ink-2"
           >
             {label}
           </label>
@@ -40,11 +40,11 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
             ref={ref}
             id={selectId}
             className={cn(
-              'h-10 w-full appearance-none rounded-lg border bg-bg-primary px-3 pr-10 text-sm text-text-primary transition-colors',
-              'focus:outline-none focus:ring-2 focus:ring-offset-1',
+              'h-10 w-full appearance-none rounded border bg-canvas px-3 pr-10 text-sm text-ink-1 transition-colors',
+              'focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent',
               error
-                ? 'border-status-error focus:border-status-error focus:ring-status-error/30'
-                : 'border-border-default focus:border-border-focus focus:ring-border-focus/30 hover:border-border-hover',
+                ? 'border-danger'
+                : 'border-line-strong',
               className,
             )}
             aria-invalid={error ? true : undefined}
@@ -63,17 +63,17 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
             ))}
           </select>
           <ChevronDown
-            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-muted"
+            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-2"
             aria-hidden="true"
           />
         </div>
         {error && (
-          <p id={errorId} className="text-xs text-status-error" role="alert">
+          <p id={errorId} className="text-xs text-danger" role="alert">
             {error}
           </p>
         )}
         {hint && !error && (
-          <p id={hintId} className="text-xs text-text-muted">
+          <p id={hintId} className="text-xs text-ink-2">
             {hint}
           </p>
         )}

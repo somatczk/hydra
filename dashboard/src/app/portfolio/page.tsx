@@ -132,14 +132,12 @@ function formatDrawdownTick(value: number): string {
 
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+/** Text and fill together: each pair is in globals.test.ts PAIRS (≥ 4.5:1 in both themes). */
 function getReturnColor(pct: number): string {
-  if (pct > 5) return 'bg-status-success';
-  if (pct > 2) return 'bg-status-success/70';
-  if (pct > 0) return 'bg-status-success/40';
-  if (pct === 0) return 'bg-bg-tertiary';
-  if (pct > -2) return 'bg-status-error/40';
-  if (pct > -5) return 'bg-status-error/70';
-  return 'bg-status-error';
+  if (pct > 5) return 'bg-ink-1 text-canvas';
+  if (pct > -2) return 'bg-hover text-ink-1';
+  if (pct > -5) return 'bg-danger-soft text-danger';
+  return 'bg-danger text-canvas';
 }
 
 function getSentimentLabel(value: number): string {
@@ -862,7 +860,7 @@ export default function PortfolioPage() {
                         <td key={mi} className="px-1 py-1">
                           {val !== undefined ? (
                             <div
-                              className={`rounded px-1.5 py-1 text-center text-xs font-medium text-white ${getReturnColor(val)}`}
+                              className={`rounded px-1.5 py-1 text-center text-xs font-medium ${getReturnColor(val)}`}
                               title={`${MONTH_LABELS[mi]} ${year}: ${val >= 0 ? '+' : ''}${val.toFixed(1)}%`}
                             >
                               {val >= 0 ? '+' : ''}{val.toFixed(1)}%

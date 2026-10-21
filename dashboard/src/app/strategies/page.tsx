@@ -716,10 +716,10 @@ export default function StrategiesPage() {
               >
                 <div
                   className={cn(
-                    'absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform',
+                    'absolute top-1 h-4 w-4 rounded-full shadow transition-transform',
                     strategy.status === 'Active'
-                      ? 'translate-x-[22px]'
-                      : 'translate-x-1',
+                      ? 'translate-x-[22px] bg-canvas'
+                      : 'translate-x-1 bg-ink-1',
                   )}
                 />
               </div>
