@@ -251,7 +251,9 @@ def result_record(
             "max_consecutive_losses": result.max_consecutive_losses,
             "expectancy": round(float(result.expectancy), 2),
             "total_return": round(float(result.total_return) * 100, 2),
-            "annualized_return": round(float(result.annualized_return) * 100, 2),
+            "annualized_return": _round_or_none(
+                None if result.annualized_return is None else result.annualized_return * 100
+            ),
             "sortino_ratio": _round_or_none(result.sortino_ratio),
             "calmar_ratio": _round_or_none(result.calmar_ratio),
             "profit_factor": _round_or_none(result.profit_factor),

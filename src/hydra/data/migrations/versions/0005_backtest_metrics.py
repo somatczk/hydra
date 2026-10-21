@@ -4,9 +4,9 @@ Revision ID: 0005_backtest_metrics
 Revises: 0004_credentials_validated_at
 Create Date: 2026-10-21
 
-Additive and idempotent. Rows stored before this revision use 252-day annualisation, entry-fee-less
-trade PnL and the old fill timing, so they are not comparable and are deleted (their trades
-cascade). Every row written after it has ``total_return`` set, so a re-run deletes nothing.
+Additive and idempotent. Rows stored before this revision use 252-day annualisation and the old
+fill timing, so they are not comparable and are deleted (their trades cascade). Every row written
+after it has ``total_return`` set, so a re-run deletes nothing.
 """
 
 from __future__ import annotations

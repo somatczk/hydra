@@ -12,12 +12,14 @@ Annualisation counts bars, so data gaps (provenance ``gap_count``) are not calen
 Metric             Definition                                                   Undefined case
 ================== ============================================================ ================
 total_return       e_n / e_0 - 1 (fraction)                                     0 if < 2 points
-annualized_return  (1 + total_return) ** (ppy / N) - 1, floored at -1           0 if N = 0
+annualized_return  (1 + total_return) ** (ppy / N) - 1, floored at -1           0 if N = 0;
+                                                                                None on overflow
 max_drawdown       max_i (max_{j<=i} e_j - e_i) / max_{j<=i} e_j (fraction)     0
 max_dd_duration    longest run of bars below the running peak * bar length      0
 sharpe_ratio       mean(r) / std(r, ddof=1) * sqrt(ppy)                         0.0 if std<1e-12
 sortino_ratio      mean(r) / sqrt(mean(min(r, 0) ** 2)) * sqrt(ppy), all N      None if no loss
 calmar_ratio       annualized_return / max_drawdown                             None if dd = 0
+                                                                                or ann. None
 win_rate           wins / trades; a break-even trade is not a win               0
 profit_factor      sum(winning pnl) / |sum(losing pnl)|                         None if no loss
 expectancy         mean trade pnl (= win_rate*avg_win - loss_rate*avg_loss)     0
@@ -27,17 +29,17 @@ beta               cov(r, r_b, ddof=1) / var(r_b, ddof=1)                       
 alpha              Jensen, annualised: (mean(r) - beta * mean(r_b)) * ppy       0.0
 ================== ============================================================ ================
 
-``Trade.pnl`` is net of entry and exit fees. The API reports win_rate, max_drawdown and returns in
-percent on /backtest results and win_rate as a fraction on /strategies/preview.
+``Trade.pnl`` is net of the exit fee; the entry fee is included once P2-A lands (BT-9). The API
+reports win_rate, max_drawdown and returns in percent on /backtest results and win_rate as a
+fraction on /strategies/preview.
 """
 
 from __future__ import annotations
 
-import decimal
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from typing import Any
 
 import numpy as np
@@ -92,7 +94,7 @@ class BacktestResult:
 
     # Return metrics
     total_return: Decimal = Decimal("0")
-    annualized_return: Decimal = Decimal("0")
+    annualized_return: Decimal | None = Decimal("0")
 
     # Drawdown
     max_drawdown: Decimal = Decimal("0")
@@ -165,7 +167,7 @@ def _compute_total_return(equity: list[Decimal]) -> Decimal:
     return (equity[-1] - equity[0]) / equity[0]
 
 
-def _compute_annualized_return(total_return: Decimal, n_returns: int, ppy: float) -> Decimal:
+def _compute_annualized_return(total_return: Decimal, n_returns: int, ppy: float) -> Decimal | None:
     """Compound growth over ``n_returns`` bars, scaled to ``ppy`` bars per year."""
     if n_returns <= 0:
         return Decimal("0")
@@ -174,12 +176,9 @@ def _compute_annualized_return(total_return: Decimal, n_returns: int, ppy: float
         return Decimal("-1")
     try:
         ann = (1.0 + total_r) ** (ppy / n_returns) - 1.0
-        if not math.isfinite(ann):
-            return Decimal(str(round(total_r, 6)))
-        return Decimal(str(ann)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-    except (OverflowError, decimal.InvalidOperation):
-        # Extremely large annualized return; return a capped value
-        return Decimal(str(round(total_r, 6)))
+    except OverflowError:
+        return None
+    return Decimal(str(round(ann, 6)))
 
 
 def _compute_drawdown_series(equity: ndarray) -> tuple[ndarray, float, int]:
@@ -232,11 +231,11 @@ def _compute_sortino(returns: ndarray, ppy: float) -> float | None:
     return float(np.mean(returns)) / tdd * math.sqrt(ppy)
 
 
-def _compute_calmar(annualized_return: float, max_drawdown: float) -> float | None:
+def _compute_calmar(annualized_return: Decimal | None, max_drawdown: float) -> float | None:
     """Calmar ratio = annualized return / max drawdown."""
-    if max_drawdown == 0:
+    if annualized_return is None or max_drawdown == 0:
         return None
-    return annualized_return / max_drawdown
+    return float(annualized_return) / max_drawdown
 
 
 def _compute_trade_stats(
@@ -434,7 +433,7 @@ def calculate_metrics(
 
     sharpe = _compute_sharpe(returns, ppy)
     sortino = _compute_sortino(returns, ppy)
-    calmar = _compute_calmar(float(annualized_return), max_dd)
+    calmar = _compute_calmar(annualized_return, max_dd)
 
     tstats = _compute_trade_stats(trades)
     monthly = _compute_monthly_returns(equity_curve, timestamps)

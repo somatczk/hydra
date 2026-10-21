@@ -623,6 +623,32 @@ class TestReferenceValues:
         assert float(result.annualized_return) == pytest.approx(0.636, abs=1e-6)
         assert result.sharpe_ratio == 0.0
 
+    def test_cagr_on_minute_bars_is_monotonic_and_none_on_overflow(self) -> None:
+        """1000 1m bars (ppy 525600) with a 1 % dip at bar 1, ending at 100 * (1 + r).
+
+        CAGR = (1 + r) ** 525.6 - 1 exceeds 28 digits from r = 0.10; at main a Decimal quantize
+        trap swapped it for r there. r = 3 overflows float, so CAGR and Calmar are None.
+        """
+
+        def run(r: float) -> BacktestResult:
+            g = ((1 + r) / 0.99) ** (1 / 999)
+            equity = [Decimal("100"), *(Decimal(str(99 * g**i)) for i in range(1000))]
+            equity[-1] = Decimal(str(100 * (1 + r)))
+            return calculate_metrics(equity, [], timeframe=Timeframe.M1)
+
+        cagrs = []
+        for r in (0.09, 0.10, 0.12):
+            result = run(r)
+            assert result.annualized_return is not None
+            assert float(result.annualized_return) == pytest.approx((1 + r) ** 525.6 - 1, rel=1e-9)
+            assert result.calmar_ratio == pytest.approx(
+                float(result.annualized_return) / 0.01, rel=1e-9
+            )
+            cagrs.append(result.annualized_return)
+        assert cagrs == sorted(cagrs)
+        overflow = run(3.0)
+        assert (overflow.annualized_return, overflow.calmar_ratio) == (None, None)
+
     def test_calmar(self) -> None:
         """CAGR = 1.089 ** (365 / 4) - 1 = 2391.180950741495; Calmar = CAGR / 0.1."""
         cagr = 1.089 ** (365 / 4) - 1
@@ -691,5 +717,6 @@ class TestReferenceValues:
         flat = [Decimal("100")] * 5
         for equity in (flat, _REF, [Decimal("100")]):
             result = calculate_metrics(equity, [], timeframe=Timeframe.H1)
-            for value in (result.sharpe_ratio, result.sortino_ratio, result.calmar_ratio):
+            ann = result.annualized_return
+            for value in (ann, result.sharpe_ratio, result.sortino_ratio, result.calmar_ratio):
                 assert value is None or math.isfinite(value)
