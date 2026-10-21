@@ -170,6 +170,7 @@ describe('KillSwitchControl', () => {
     expect(outcome).not.toContain('No positions are held');
     expect(outcome).not.toContain('All positions closed');
     expect(m.container.querySelector('dialog[open]')).toBeNull();
+    expect(document.activeElement?.textContent).toContain('Kill switch ON');
   });
 
   it('tries closing each holder with DELETE and never posts the kill switch again', async () => {

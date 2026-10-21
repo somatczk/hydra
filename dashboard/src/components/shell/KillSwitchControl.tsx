@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { OctagonAlert } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -168,6 +168,8 @@ export function KillSwitchControl() {
   const [open, setOpen] = useState(false);
   const [count, setCount] = useState<Count>('unknown');
   const opened = useRef(0);
+  const chip = useRef<HTMLAnchorElement>(null);
+  const refocus = useRef(false);
 
   const openSheet = () => {
     const id = ++opened.current;
@@ -190,6 +192,12 @@ export function KillSwitchControl() {
   };
 
   const state = live.data?.kill_switch_state ?? (live.state === 'loading' ? 'loading' : 'unknown');
+  // After Stop all the button is replaced by the chip; keep keyboard focus on the control.
+  useEffect(() => {
+    if (state !== 'active' || !refocus.current) return;
+    refocus.current = false;
+    if (document.activeElement === document.body || !document.activeElement) chip.current?.focus();
+  }, [state]);
   const stale = live.state === 'stale' && live.fetchedAt !== null && (
     <DataStateBadge state="stale" reason={`Kill switch as of ${utc(live.fetchedAt, now)}`} />
   );
@@ -198,6 +206,7 @@ export function KillSwitchControl() {
     return (
       <span className="inline-flex items-center gap-2">
         <Link
+          ref={chip}
           href="/risk#kill-switch"
           className="inline-flex h-8 items-center gap-1.5 rounded border border-danger bg-danger-soft px-3 text-sm font-semibold text-danger max-lg:h-11"
         >
@@ -240,6 +249,7 @@ export function KillSwitchControl() {
         pendingHint="Closing this won't cancel the stop."
         onClose={() => setOpen(false)}
         onConfirm={async () => {
+          refocus.current = true;
           await activate();
           setOpen(false);
         }}
