@@ -19,6 +19,7 @@ from hydra.backtest.data import load_bars
 from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.events import BarEvent, Event
 from hydra.core.types import OHLCV, Timeframe
+from hydra.data.backfill import ExchangeBackfillService, GapRange
 from hydra.data.bars import last_closed_open
 from hydra.data.ingestion import ExchangeFeedManager
 from hydra.data.migrations.runner import upgrade_to_head
@@ -166,3 +167,66 @@ async def test_warm_up_reads_back_stored_rows_after_rest_fill(pool: Any) -> None
     assert [b.close for b in bars[-3:]] == [Decimal("103.0"), Decimal("102.0"), Decimal("101.0")]
     db = await repo.get_latest_bars("binance", "BTCUSDT", Timeframe.H1, 100, end)
     assert db == bars
+
+
+G0 = datetime(2026, 2, 2, tzinfo=UTC)
+
+
+async def _store_hours(
+    repo: MarketDataRepository, hours: list[int], exchange: str = "binance"
+) -> None:
+    await repo.store_bars(
+        [(exchange, "BTCUSDT", Timeframe.H1, _bar(G0 + h * H, "1", "1")) for h in hours]
+    )
+
+
+async def test_missing_ranges_edges_and_holes(pool: Any) -> None:
+    repo = MarketDataRepository.from_pool(pool)
+    await _store_hours(repo, [2, 6, 7])
+    gaps = await repo.missing_ranges("binance", "BTCUSDT", Timeframe.H1, G0, G0 + 9 * H)
+    assert gaps == [(G0, G0 + H), (G0 + 3 * H, G0 + 5 * H), (G0 + 8 * H, G0 + 9 * H)]
+
+
+async def test_missing_ranges_empty_store(pool: Any) -> None:
+    repo = MarketDataRepository.from_pool(pool)
+    gaps = await repo.missing_ranges("binance", "BTCUSDT", Timeframe.H1, G0, G0 + 9 * H)
+    assert gaps == [(G0, G0 + 9 * H)]
+
+
+async def test_missing_ranges_complete(pool: Any) -> None:
+    repo = MarketDataRepository.from_pool(pool)
+    await _store_hours(repo, list(range(10)))
+    assert await repo.missing_ranges("binance", "BTCUSDT", Timeframe.H1, G0, G0 + 9 * H) == []
+
+
+async def test_missing_ranges_ignores_other_keys(pool: Any) -> None:
+    repo = MarketDataRepository.from_pool(pool)
+    await _store_hours(repo, list(range(10)), exchange="bybit")
+    minutes = [
+        ("binance", "BTCUSDT", Timeframe.M1, _bar(G0 + m * timedelta(minutes=1), "1", "1"))
+        for m in range(600)
+    ]
+    await repo.store_bars(minutes)
+    gaps = await repo.missing_ranges("binance", "BTCUSDT", Timeframe.H1, G0, G0 + 9 * H)
+    assert gaps == [(G0, G0 + 9 * H)]
+
+
+async def test_detect_gaps_unaligned_start(pool: Any) -> None:
+    repo = MarketDataRepository.from_pool(pool)
+    await _store_hours(repo, list(range(10)))
+    service = ExchangeBackfillService(repo)
+    start = G0 + timedelta(seconds=17)
+    assert await service.detect_gaps("binance", "BTCUSDT", Timeframe.H1, start, G0 + 9 * H) == []
+
+
+async def test_detect_gaps_finds_history_before_stored_data(pool: Any) -> None:
+    repo = MarketDataRepository.from_pool(pool)
+    day = timedelta(days=1)
+    first = datetime(2024, 1, 1, tzinfo=UTC)
+    await repo.store_bars(
+        [("binance", "BTCUSDT", Timeframe.D1, _bar(first + i * day, "1", "1")) for i in range(2)]
+    )
+    gaps = await ExchangeBackfillService(repo).detect_gaps(
+        "binance", "BTCUSDT", Timeframe.D1, datetime(2020, 1, 1, tzinfo=UTC), first + day
+    )
+    assert gaps == [GapRange(datetime(2020, 1, 1, tzinfo=UTC), datetime(2023, 12, 31, tzinfo=UTC))]
