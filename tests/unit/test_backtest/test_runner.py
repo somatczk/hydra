@@ -226,6 +226,8 @@ async def test_position_sizing_is_honoured() -> None:
 async def test_warmup_bars_only_seed_the_context() -> None:
     result = await _run()
     assert len(result.equity_curve) == len(BARS) - 2
+    assert result.timestamps == [b.timestamp for b in BARS[2:]]
+    assert len(result.benchmark_equity) == len(result.equity_curve)
     cold = await _run(warmup_bars=0)
     assert len(cold.equity_curve) == len(BARS)
     assert _fills(cold) == _fills(result)
