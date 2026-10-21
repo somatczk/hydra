@@ -1364,12 +1364,14 @@ class PaperTradingExecutor:
             "side": fill.side,
             "type": fill.order_type,
             "amount": float(fill.quantity),
+            "quantity": float(fill.quantity),
             "price": float(fill.price),
             "cost": float(fill.quantity * fill.price),
             "fee": {"cost": float(fill.fee), "currency": fill.fee_currency},
             "pnl": float(fill.gross_pnl or _ZERO),
             "net_pnl": None if fill.net_pnl is None else float(fill.net_pnl),
             "liquidity": fill.liquidity,
+            "reason": fill.reason,
             "fill_seq": fill.fill_seq,
             "timestamp": fill.timestamp.isoformat(),
             "status": "FILLED",
@@ -1458,11 +1460,12 @@ class PaperTradingExecutor:
         return list(self._filled)
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Resting orders, including each stop's trigger, reason and OCO id."""
+        """Resting orders, including each stop's current trigger, reason and OCO id."""
         wanted = None if symbol is None else _canon_symbol(symbol)
         return [
             {
                 **self._pending_response(o),
+                "stop_price": _stop_trigger(o),
                 "reason": o.reason,
                 "oco_id": o.oco_id,
                 "trail_pct": None if o.trail_pct is None else float(o.trail_pct),
@@ -1470,6 +1473,13 @@ class PaperTradingExecutor:
             for o in sorted(self._pending, key=lambda o: o.seq)
             if wanted is None or o.symbol == wanted
         ]
+
+
+def _stop_trigger(o: _PendingOrder) -> float | None:
+    """The stop's trigger; a trailing stop's moves with the peak (SELL) or trough (BUY)."""
+    if o.extreme is not None and o.trail_pct is not None:
+        return float(o.extreme * (_ONE - o.trail_pct if o.side == "SELL" else _ONE + o.trail_pct))
+    return None if o.stop_price is None else float(o.stop_price)
 
 
 def _state_digest(state: dict[str, Any]) -> str:

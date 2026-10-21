@@ -30,7 +30,11 @@ from hydra.execution.errors import (
     UnsupportedVenueError,
 )
 from hydra.execution.order_manager import RiskRejectedError
-from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
+from hydra.execution.paper_trading import (
+    PaperSessionHaltedError,
+    PaperTradingExecutor,
+    PersistenceUnavailableError,
+)
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.risk.market_rules import MarketRulesUnavailableError
 
@@ -65,6 +69,10 @@ class SessionResponse(BaseModel):
     positions_at_stop: int = 0
     flatten_incomplete: bool = False
     persist_error: str | None = None
+    last_bar_at: str | None = None
+    entries_paused: str | None = None
+    persist_dirty: bool | None = None
+    feed_live: bool | None = None
 
 
 class PositionItem(BaseModel):
@@ -92,6 +100,18 @@ class TradeItem(BaseModel, extra="allow"):
         if isinstance(v, dict):
             return float(v.get("cost", 0))
         return float(v) if v is not None else 0.0
+
+
+class OpenOrderItem(BaseModel, extra="allow"):
+    id: str
+    symbol: str
+    side: str
+    type: str
+    amount: float
+    price: float | None
+    stop_price: float | None
+    reason: str
+    protective: bool | None
 
 
 class SessionMetrics(BaseModel):
@@ -129,6 +149,7 @@ class SessionDetailResponse(BaseModel):
     metrics: SessionMetrics = Field(default_factory=SessionMetrics)
     positions: list[PositionItem] = Field(default_factory=list)
     trades: list[TradeItem] = Field(default_factory=list)
+    open_orders: list[OpenOrderItem] = Field(default_factory=list)
 
 
 class KillSwitchResponse(BaseModel):
@@ -354,13 +375,25 @@ async def stop_session(session_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/sessions", response_model=list[SessionResponse])
 async def list_sessions(request: Request) -> list[dict[str, Any]]:
-    """List all trading sessions (running + recent stopped)."""
+    """List all trading sessions (running + recent stopped) with each one's health."""
     mgr = _get_session_manager(request)
     name_map = build_strategy_name_map()
     results = []
     for s in mgr.list_sessions():
         d = _session_to_dict(s)
         d["strategy_name"] = name_map.get(s.strategy_id)
+        # health_snapshot()'s reads without its DB query, so a DB stall never slows this poll
+        rt, executor = s._runtime, s._executor
+        d["last_bar_at"] = s.last_bar_at.isoformat() if s.last_bar_at else None
+        d["entries_paused"] = rt.entries_paused if rt is not None else None
+        d["feed_live"] = (
+            rt.feed.is_live(s.exchange_id) if rt is not None and s.task_alive else False
+        )
+        d["persist_dirty"] = (
+            executor.get_account_snapshot().persist_dirty
+            if isinstance(executor, PaperTradingExecutor)
+            else None
+        )
         results.append(d)
     return results
 
@@ -376,6 +409,19 @@ async def get_session_detail(session_id: str, request: Request) -> dict[str, Any
             404, "session_not_found", f"Session {session_id} not found", "not_found"
         ) from exc
     detail["strategy_name"] = build_strategy_name_map().get(detail.get("strategy_id", ""))
+    session = mgr.get_session(session_id)
+    executor = getattr(session, "_executor", None)
+    if isinstance(executor, PaperTradingExecutor):
+        rt = session._runtime
+        detail["open_orders"] = [
+            {
+                **o,
+                # a LIMIT's stop_price is only its risk-check stop: nothing rests there
+                "stop_price": None if o["type"] == OrderType.LIMIT else o["stop_price"],
+                "protective": rt.protect.is_protective(o["oco_id"] or o["id"]) if rt else None,
+            }
+            for o in await executor.fetch_open_orders()
+        ]
     return dict(detail)
 
 

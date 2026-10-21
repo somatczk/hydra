@@ -3,7 +3,10 @@ quick-trade with SL/TP placed on the entry fill. Only the ccxt boundary is faked
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -13,6 +16,7 @@ import pytest
 
 from hydra.dashboard.api import app
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
+from hydra.execution.session_manager import TradingSession
 from hydra.risk.state import RiskStateUnavailableError
 from tests.unit.test_execution.session_harness import (
     Harness,
@@ -64,6 +68,30 @@ def broadcasts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 class _DownPool:
     def acquire(self) -> Any:
         raise ConnectionError("database down")
+
+
+class _HangingPool:
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[Any]:
+        await asyncio.sleep(60)
+        yield None
+
+
+class _TradesPool:
+    """Answers the trades query with only the columns its SELECT names."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[_TradesPool]:
+        yield self
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        if "FROM trades" not in query:
+            return []
+        cols = [c.strip() for c in query.split("SELECT")[1].split("FROM")[0].split(",")]
+        return [{c: r[c] for c in cols} for r in self.rows]
 
 
 def _detail(resp: httpx.Response) -> dict[str, Any]:
@@ -539,6 +567,11 @@ class TestStopAndDetail:
         assert (resp.json()["status"], resp.json()["positions_at_stop"]) == ("stopped", 0)
         detail = (await api.get(f"/api/trading/sessions/{session.session_id}/detail")).json()
         assert detail["metrics"]["total_trades"] == 2
+        assert [(t["side"], t["quantity"], t["reason"]) for t in detail["trades"]] == [
+            ("BUY", 0.5, "market"),
+            ("SELL", 0.5, "market"),
+        ]
+        assert detail["open_orders"] == []
         assert detail["metrics"]["total_pnl"] == pytest.approx(
             float(executor(session).get_account_snapshot().realized_net)
         )
@@ -562,3 +595,117 @@ class TestStopAndDetail:
     async def test_unknown_session_is_404(self, h: Harness, api: httpx.AsyncClient) -> None:
         resp = await api.delete("/api/trading/sessions/nope")
         assert (resp.status_code, _detail(resp)["code"]) == (404, "session_not_found")
+
+    async def test_detail_lists_resting_orders_and_which_are_protective(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "orders"))
+        await h.bar(session, "100")
+        await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "side": "buy",
+                "quantity": "0.3",
+                "stop_loss": "92",
+                "take_profit": "110",
+            },
+        )
+        await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "side": "buy",
+                "quantity": "0.1",
+                "order_type": "limit",
+                "price": "95",
+            },
+        )
+        detail = (await api.get(f"/api/trading/sessions/{session.session_id}/detail")).json()
+        assert [
+            tuple(
+                o[k]
+                for k in ("side", "type", "amount", "price", "stop_price", "reason", "protective")
+            )
+            for o in detail["open_orders"]
+        ] == [
+            ("SELL", "LIMIT", 0.3, 110.0, None, "take_profit", True),
+            ("SELL", "STOP_MARKET", 0.3, None, 92.0, "stop_loss", True),
+            ("BUY", "LIMIT", 0.1, 95.0, None, "limit", False),
+        ]
+
+
+class TestSessionListHealth:
+    async def test_list_reports_bar_feed_and_ledger_health(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "health"))
+        await h.bar(session, "100")
+        assert session.last_bar_at is not None
+        (row,) = (await api.get("/api/trading/sessions")).json()
+        assert (row["last_bar_at"], row["entries_paused"], row["persist_dirty"]) == (
+            session.last_bar_at.isoformat(),
+            None,
+            False,
+        )
+        assert row["feed_live"] is True
+
+        await api.delete(f"/api/trading/sessions/{session.session_id}")
+        (row,) = (await api.get("/api/trading/sessions")).json()
+        assert (row["status"], row["feed_live"], row["entries_paused"]) == (
+            "stopped",
+            False,
+            None,
+        )
+
+    async def test_list_never_waits_on_the_db_and_shows_paused_dirty_and_ledgerless(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "busy"))
+        await h.bar(session, "100")
+        assert session._runtime is not None
+        session._runtime.entries_paused = "feed stale: binance"
+        executor(session)._set_dirty(True)
+        h.mgr._sessions["restored"] = TradingSession("restored", "old", "paper", status="stopped")
+        h.mgr._db_pool = _HangingPool()
+
+        resp = await asyncio.wait_for(api.get("/api/trading/sessions"), 1)
+        h.mgr._db_pool = None
+
+        rows = {r["session_id"]: r for r in resp.json()}
+        assert [
+            rows[session.session_id][k]
+            for k in ("last_bar_at", "entries_paused", "persist_dirty", "feed_live")
+        ] == [session.last_bar_at.isoformat(), "feed stale: binance", True, True]
+        assert [
+            rows["restored"][k]
+            for k in ("last_bar_at", "entries_paused", "persist_dirty", "feed_live")
+        ] == [None, None, None, False]
+
+    async def test_restored_session_fills_carry_quantity_and_reason(
+        self, h: Harness, api: httpx.AsyncClient
+    ) -> None:
+        h.mgr._sessions["restored"] = TradingSession("restored", "old", "paper", status="stopped")
+        h.mgr._db_pool = _TradesPool(
+            [
+                {
+                    "id": 7,
+                    "symbol": "BTCUSDT",
+                    "side": "SELL",
+                    "quantity": D("0.5"),
+                    "price": D("90"),
+                    "fee": D("0.045"),
+                    "pnl": D("-5"),
+                    "net_pnl": D("-5.095"),
+                    "reason": "stop_loss",
+                    "order_type": "STOP_MARKET",
+                    "timestamp": datetime(2026, 10, 1, tzinfo=UTC),
+                }
+            ]
+        )
+
+        detail = (await api.get("/api/trading/sessions/restored/detail")).json()
+
+        assert [(t["side"], t["quantity"], t["price"], t["reason"]) for t in detail["trades"]] == [
+            ("SELL", 0.5, 90.0, "stop_loss")
+        ]

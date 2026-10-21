@@ -229,10 +229,11 @@ class TestClosedBarSemantics:
     async def test_trailing_stop_sell_follows_peak_then_triggers(self) -> None:
         ex = await holding("1", "100", fee="0", slippage="0")
         await ex.create_order(BTC, "SELL", "TRAILING_STOP", D("1"), params={"trail_pct": "0.05"})
+        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [95.0]
 
         assert await ex.on_closed_bar(BTC, bar(1, "100", "120", "99", "118")) == []
         (order,) = await ex.fetch_open_orders()
-        assert order["trail_pct"] == 0.05
+        assert (order["trail_pct"], order["price"], order["stop_price"]) == (0.05, None, 114.0)
 
         (fill,) = await ex.on_closed_bar(BTC, bar(2, "118", "119", "110", "111"))
         assert fill.reason == "trailing_stop"
@@ -250,6 +251,7 @@ class TestClosedBarSemantics:
         assert ex.get_account_snapshot().quote_locked == D("105.00")
 
         assert await ex.on_closed_bar(BTC, bar(1, "100", "101", "80", "83")) == []
+        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [84.0]
         (fill,) = await ex.on_closed_bar(BTC, bar(2, "82", "90", "81", "89"))
         assert fill.price == D("84.00")
         assert await ex.fetch_balance() == {"USDT": D("916.00"), "BTC": D("1")}
@@ -314,10 +316,15 @@ class TestQueries:
         }
         assert await ex.fetch_balance() == {"USDT": D("92800.0"), "BTC": D("0.1"), "ETH": D("1")}
 
-    async def test_filled_orders_history(self) -> None:
-        ex = await holding("1", "100")
+    async def test_filled_orders_history_reports_quantity_and_reason(self) -> None:
+        ex = await holding("0.3", "100")
+        await ex.create_order(BTC, "SELL", "STOP_MARKET", D("0.3"), stop_price=D("90"))
+        await ex.on_closed_bar(BTC, bar(1, "95", "96", "85", "88"))
         history = await ex.get_filled_orders()
-        assert [h["side"] for h in history] == ["BUY"]
+        assert [(h["side"], h["quantity"], h["amount"], h["reason"]) for h in history] == [
+            ("BUY", 0.3, 0.3, "market"),
+            ("SELL", 0.3, 0.3, "stop_loss"),
+        ]
 
     async def test_snapshot_tracks_peak_and_drawdown(self) -> None:
         ex = await holding("1", "100", fee="0", slippage="0", capital="1000")
