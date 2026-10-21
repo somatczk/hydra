@@ -26,7 +26,7 @@ const text = (o: Outcome) => [o.title, ...o.lines].join(' ');
 const envelope = (status: number, code: string, message: string, state: string, extra: Record<string, unknown> = {}) =>
   new ApiError(status, JSON.stringify({ detail: { code, message, state, ...extra } }));
 
-/** activate_kill_switch body (trading.py:388-422). */
+/** activate_kill_switch body (trading.py:434-468). */
 const ks = (over: Partial<KillSwitchResponse> = {}): KillSwitchResponse => ({
   active: true,
   message: 'Kill switch activated - all positions closed and trading halted',
@@ -141,7 +141,7 @@ describe('stopOutcome', () => {
     expect(o.actions).toEqual([{ kind: 'try_closing', label: 'Try closing again', sessionIds: [session().session_id] }]);
   });
 
-  it('C-STOP-4 quotes session_stop_not_persisted verbatim (errors.py:60, trading.py:341-347)', () => {
+  it('C-STOP-4 quotes session_stop_not_persisted verbatim (errors.py:60, trading.py:362-368)', () => {
     const msg = 'Session x stopped, but the database still says running: pool closed';
     const o = stopOutcome({ err: envelope(503, 'session_stop_not_persisted', msg, 'unavailable') }, NOW);
     expect(o.title).toBe('Stopped, but not saved.');
@@ -158,7 +158,7 @@ describe('stopOutcome', () => {
 describe('quickTradeOutcome', () => {
   const SID = session().session_id;
   const req: QuickTradeRequest = { symbol: 'BTCUSDT', side: 'buy', order_type: 'MARKET', quantity: '0.0015', session_id: SID };
-  /** quick_trade return (trading.py:503-517): side is Side.value, so upper case. */
+  /** quick_trade return (trading.py:549-563): side is Side.value, so upper case. */
   const res = (over: Partial<QuickTradeResponse> = {}): QuickTradeResponse => ({
     order_id: 'a1b2c3d4e5f6',
     session_id: SID,
@@ -226,7 +226,7 @@ describe('quickTradeOutcome', () => {
     expect(sell.lines).toContain('This reduces the held position; no stop is needed.');
   });
 
-  it('maps quick-trade errors (trading.py:479-492)', () => {
+  it('maps quick-trade errors (trading.py:525-538)', () => {
     const rejected = envelope(422, 'risk_rejected', 'Daily loss limit reached', 'invalid', { check: 'daily_loss', intent: 'entry' });
     expect(quickTradeOutcome(req, { err: rejected }, SID)).toMatchObject({
       title: 'Not placed: Daily loss limit reached (daily_loss).',
@@ -270,7 +270,7 @@ describe('startOutcome and copyForCode', () => {
 });
 
 describe('risk outcomes', () => {
-  it('release: C-REL-2 and C-REL-3 (trading.py:425-445)', () => {
+  it('release: C-REL-2 and C-REL-3 (trading.py:471-491)', () => {
     expect(text(releaseOutcome({ ok: ks({ active: false, sessions_stopped: 0 }) }, NOW))).toBe(
       'Kill switch released at 14:03:00 UTC. Trading can resume. No sessions were restarted.',
     );

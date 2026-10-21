@@ -25,7 +25,7 @@ export interface Outcome {
 
 export type Result<T> = { ok: T } | { err: unknown };
 
-/** trading.py:134-140 KillSwitchResponse. */
+/** trading.py:155-161 KillSwitchResponse. */
 export interface KillSwitchResponse {
   active: boolean;
   message: string;
@@ -35,7 +35,7 @@ export interface KillSwitchResponse {
   flatten_failures: string[];
 }
 
-/** trading.py:192-205 QuickTradeResponse: no stop price anywhere. */
+/** trading.py:213-226 QuickTradeResponse: no stop price anywhere. */
 export interface QuickTradeResponse {
   order_id: string | null;
   session_id: string;
@@ -52,7 +52,7 @@ export interface QuickTradeResponse {
   mark_source: string | null;
 }
 
-/** trading.py:150-158 QuickTradeRequest as the UI sends it (decimals as strings). */
+/** trading.py:171-179 QuickTradeRequest as the UI sends it (decimals as strings). */
 export interface QuickTradeRequest {
   symbol: string;
   side: 'buy' | 'sell';
@@ -250,7 +250,7 @@ export function saveAgainOutcome(result: Result<KillSwitchResponse>): Outcome {
   return notConfirmed('the kill switch was saved', err);
 }
 
-/** C-STOP-2/3/4 for DELETE /trading/sessions/{id} (trading.py:325-352). */
+/** C-STOP-2/3/4 for DELETE /trading/sessions/{id} (trading.py:346-373). */
 export function stopOutcome(result: Result<SessionResponse>, now: number = Date.now()): Outcome {
   if ('ok' in result) {
     const s = result.ok;
@@ -288,7 +288,7 @@ const FALLBACK_LINE = "If the engine rejected it, the strategy default stop is i
 
 const baseAsset = (symbol: string) => symbol.replace(/\/?USDT$/, '') || symbol;
 
-/** C-QT-2/3/4, the protection:none sell and the session mismatch (trading.py:453-517). */
+/** C-QT-2/3/4, the protection:none sell and the session mismatch (trading.py:499-563). */
 export function quickTradeOutcome(
   req: QuickTradeRequest,
   result: Result<QuickTradeResponse>,

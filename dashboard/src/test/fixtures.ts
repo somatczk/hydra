@@ -2,7 +2,7 @@
 
 import type { CircuitBreaker, LiveStatus, PlatformConfig, SessionDetail, SessionResponse, TradeItem } from '@/lib/derive';
 
-/** trading.py:52-67 SessionResponse, filled by `_session_to_dict` (trading.py:229-245) — no A3+ fields. */
+/** trading.py:56-75 SessionResponse, filled by `_session_to_dict` (trading.py:250-265) — no A3+ fields. */
 export function session(over: Partial<SessionResponse> = {}): SessionResponse {
   return {
     session_id: 'a1b2c3d4-0000-4000-8000-000000000001',
@@ -24,7 +24,7 @@ export function session(over: Partial<SessionResponse> = {}): SessionResponse {
   };
 }
 
-/** trading.py:110-131 SessionDetailResponse, built by `get_session_detail` (session_manager.py:388-453). */
+/** trading.py:130-150 SessionDetailResponse, built by `get_session_detail` (session_manager.py:388-453). */
 export function detail(over: Partial<SessionDetail> = {}): SessionDetail {
   return {
     ...session(),
@@ -38,7 +38,7 @@ export function detail(over: Partial<SessionDetail> = {}): SessionDetail {
   };
 }
 
-/** A paper fill: `_fill_response` (paper_trading.py:1360-1377) sends `amount`, so TradeItem.quantity defaults to 0 (trading.py:82). */
+/** A pre-A9 paper fill: `_fill_response` sent only `amount`, so TradeItem.quantity defaulted to 0 (trading.py:90); since A9 it also sends `quantity` (paper_trading.py:1360-1379). */
 export function paperFill(over: Partial<TradeItem> = {}): TradeItem {
   return {
     id: 'ord-1',
