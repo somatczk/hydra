@@ -29,7 +29,6 @@ from hydra.execution.errors import (
     PaperCapitalUnavailableError,
     SessionNotRunningError,
     SessionPersistError,
-    UnsupportedStrategyError,
 )
 from hydra.execution.flatten import FlattenResult
 from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
@@ -241,11 +240,7 @@ class SessionManager:
             )
             if trading_mode == "live":
                 raise LiveTradingDisabledError("live trading is disabled until P3")
-            probe = await probe_strategy(cfg, self._config)
-            if probe.order_management:
-                raise UnsupportedStrategyError(
-                    f"{cfg.strategy_class} manages its own orders; DCA/Grid run in P2"
-                )
+            required_history = await probe_strategy(cfg, self._config)
             capital = self._allocate(risk, paper_capital)
 
             session_id = str(uuid.uuid4())
@@ -268,7 +263,7 @@ class SessionManager:
                 market_rules=rules,
             )
             await executor.checkpoint()
-            runtime = self._runtime(session, cfg, executor, probe.required_history)
+            runtime = self._runtime(session, cfg, executor, required_history)
             await self._launch(runtime, capital, recovering=False)
             session.status = "running"
             session.started_at = datetime.now(UTC)
@@ -826,12 +821,10 @@ class SessionManager:
                 raise rules_error
             cfg = self._find_strategy_config(session.strategy_id)
             client_factory.validate_venue(session.exchange_id, cfg.exchange.market_type)
-            probe = await probe_strategy(cfg, self._config)
-            if probe.order_management:
-                raise UnsupportedStrategyError(f"{cfg.strategy_class}: DCA/Grid run in P2")
+            required_history = await probe_strategy(cfg, self._config)
             if session.paper_capital is None or session.paper_capital <= 0:
                 raise PaperCapitalUnavailableError("the session row has no allocated paper_capital")
-            runtime = self._runtime(session, cfg, executor, probe.required_history)
+            runtime = self._runtime(session, cfg, executor, required_history)
             await self._launch(runtime, session.paper_capital, recovering=True)
         except Exception as exc:
             logger.exception("Restored session %s cannot resume", session.session_id)

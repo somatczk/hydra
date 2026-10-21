@@ -31,7 +31,7 @@ class LiveTradingDisabledError(PermissionError):
 
 
 class UnsupportedStrategyError(ValueError):
-    """The strategy class cannot run in a session yet (DCA/Grid until P2)."""
+    """The strategy class cannot be loaded for a session."""
 
     code = "strategy_unsupported"
 

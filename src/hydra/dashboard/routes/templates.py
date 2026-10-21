@@ -27,7 +27,7 @@ class TemplateMeta(BaseModel):
     id: str
     name: str
     description: str
-    type: str  # "rule_based" | "dca" | "grid"
+    type: str  # "rule_based"
     risk_level: str  # "conservative" | "moderate" | "aggressive"
     expected_sharpe: float | None = None
     expected_max_drawdown: float | None = None

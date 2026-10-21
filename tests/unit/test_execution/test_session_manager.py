@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
@@ -110,17 +111,42 @@ class TestStartGates:
         assert construction_spy.calls == []
         assert h.ws == []
 
-    async def test_dca_is_refused_as_unsupported(
-        self, h: Harness, strategies_dir: Path, construction_spy: _Spy
+    @pytest.mark.parametrize(
+        "strategy_class",
+        [
+            "hydra.strategy.builtin.dca.DCAStrategy",
+            "hydra.strategy.builtin.momentum.NoSuchStrategy",
+            "hydra.core.types.OHLCV",
+            "hydra.strategy.base.BaseStrategy",
+        ],
+        ids=["module-missing", "class-missing", "not-a-strategy", "abstract"],
+    )
+    async def test_unloadable_strategy_class_is_refused(
+        self, h: Harness, strategies_dir: Path, construction_spy: _Spy, strategy_class: str
     ) -> None:
         assert h.mgr is not None
-        sid = write_strategy(
-            strategies_dir, "s-dca", strategy_class="hydra.strategy.builtin.dca.DCAStrategy"
-        )
+        sid = write_strategy(strategies_dir, "s-bad", strategy_class=strategy_class)
         with pytest.raises(UnsupportedStrategyError) as err:
             await h.mgr.start_session(sid, "paper")
         assert err.value.code == "strategy_unsupported"
+        assert strategy_class in str(err.value)
         assert construction_spy.calls == []
+        assert h.mgr.list_sessions() == []
+
+    async def test_malformed_config_of_a_loadable_class_is_invalid_not_unsupported(
+        self, h: Harness, strategies_dir: Path, construction_spy: _Spy
+    ) -> None:
+        assert h.mgr is not None
+        sid = write_strategy(strategies_dir, "s-malformed")
+        path = strategies_dir / f"{sid}.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["rules"] = [1]
+        path.write_text(yaml.safe_dump(data))
+        with pytest.raises(ValueError, match="invalid strategy config for s-malformed") as err:
+            await h.mgr.start_session(sid, "paper")
+        assert not isinstance(err.value, UnsupportedStrategyError)
+        assert construction_spy.calls == []
+        assert h.mgr.list_sessions() == []
 
     async def test_kill_switch_blocks_new_sessions(self, h: Harness, strategies_dir: Path) -> None:
         assert h.mgr is not None and h.mgr.risk is not None
