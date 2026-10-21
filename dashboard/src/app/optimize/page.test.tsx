@@ -83,3 +83,13 @@ describe('OptimizePage', () => {
     expect(page.container.textContent).not.toContain('No optimizable parameters found');
   });
 });
+
+describe('OptimizePage placement', () => {
+  it('has one h1 and the phone Research nav with Optimize current', async () => {
+    serve();
+    page = await mount(<OptimizePage />);
+
+    expect(page.container.querySelectorAll('h1')).toHaveLength(1);
+    expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Optimize');
+  });
+});

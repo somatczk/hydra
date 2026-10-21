@@ -1,8 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Bell, Cog, CheckCircle, XCircle, OctagonX, ChevronDown, ChevronUp, Copy, Link } from 'lucide-react';
-import { DataCard } from '@/components/ui/DataCard';
+import { Cog, CheckCircle, XCircle, ChevronDown, ChevronUp, Copy } from 'lucide-react';
+import { Section } from '@/components/ui/Section';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Button } from '@/components/ui/Button';
@@ -11,7 +11,9 @@ import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBad
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
-import { CLEAR_WEBHOOK_SECRET_WARNING, TRADING_MODE_OPTIONS } from '@/lib/platformConfig';
+import { CLEAR_WEBHOOK_SECRET_WARNING } from '@/lib/platformConfig';
+import { useTheme } from '@/components/layout/ThemeProvider';
+import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDialog';
@@ -54,18 +56,9 @@ interface PlatformConfig {
   paper_capital: number;
   paper_capital_pending: number | null;
   webhook_secret_set: boolean;
-  discord_webhook_url_set: boolean;
-  slack_webhook_url_set: boolean;
 }
-
-type SecretField = 'webhook_secret' | 'discord_webhook_url' | 'slack_webhook_url';
-type SecretsSet = Record<SecretField, boolean>;
 
 const SECRET_PLACEHOLDER = 'Configured, enter a new value to replace';
-
-interface RiskConfig {
-  kill_switch_active: boolean;
-}
 
 interface ExchangeBalance {
   currency: string;
@@ -170,28 +163,21 @@ export default function SettingsPage() {
   const [exchanges, setExchanges] = useState<Exchange[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
-  const [tradingMode, setTradingMode] = useState('paper');
+  const [tradingMode, setTradingMode] = useState<string | null>(null);
   const [defaultPair, setDefaultPair] = useState('BTC/USDT');
   const [defaultTimeframe, setDefaultTimeframe] = useState('1h');
   const [maxStrategies, setMaxStrategies] = useState('5');
   const [paperCapital, setPaperCapital] = useState('');
   const [savedPaperCapital, setSavedPaperCapital] = useState<number | null>(null);
   const [pendingPaperCapital, setPendingPaperCapital] = useState<number | null>(null);
-  // null = unknown: the risk config could not be read
-  const [killSwitchActive, setKillSwitchActive] = useState<boolean | null>(null);
-  const [notifications, setNotifications] = useState<Record<string, boolean> | null>(null);
-  const [notificationsError, setNotificationsError] = useState<unknown>(null);
-  const [secretsSet, setSecretsSet] = useState<SecretsSet>({
-    webhook_secret: false,
-    discord_webhook_url: false,
-    slack_webhook_url: false,
-  });
+  const [webhookSecretSet, setWebhookSecretSet] = useState(false);
   const [selectedExchange, setSelectedExchange] = useState<Exchange | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
-  const [discordWebhookUrl, setDiscordWebhookUrl] = useState('');
-  const [slackWebhookUrl, setSlackWebhookUrl] = useState('');
-  const [savingIntegrations, setSavingIntegrations] = useState(false);
+  const [capitalConfirmOpen, setCapitalConfirmOpen] = useState(false);
+  const [capitalError, setCapitalError] = useState<string | null>(null);
+  const [capitalSaveError, setCapitalSaveError] = useState<string | null>(null);
+  const { theme, setTheme } = useTheme();
 
   // Exchange detail panels
   const [expandedExchange, setExpandedExchange] = useState<string | null>(null);
@@ -199,21 +185,13 @@ export default function SettingsPage() {
   const pollTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const failCounts = useRef<Record<string, number>>({});
 
-  const applySecretsSet = (cfg: PlatformConfig) => {
-    setSecretsSet({
-      webhook_secret: cfg.webhook_secret_set,
-      discord_webhook_url: cfg.discord_webhook_url_set,
-      slack_webhook_url: cfg.slack_webhook_url_set,
-    });
-  };
-
-  // Secrets are write-only: only fields in `patch` are sent, '' clears one.
-  const saveSecrets = async (patch: Partial<Record<SecretField, string>>, success: string) => {
+  // The secret is write-only: '' clears it.
+  const saveWebhookSecret = async (secret: string, success: string) => {
     const cfg = await fetchApi<PlatformConfig>('/api/system/config', {
       method: 'PUT',
-      body: JSON.stringify(patch),
+      body: JSON.stringify({ webhook_secret: secret }),
     });
-    applySecretsSet(cfg);
+    setWebhookSecretSet(cfg.webhook_secret_set);
     toast('success', success);
   };
 
@@ -234,39 +212,15 @@ export default function SettingsPage() {
           setPaperCapital(cfg.paper_capital.toString());
           setSavedPaperCapital(cfg.paper_capital);
           setPendingPaperCapital(cfg.paper_capital_pending);
-          applySecretsSet(cfg);
+          setWebhookSecretSet(cfg.webhook_secret_set);
         })
         .catch((err) => { setFetchErrors((prev) => ({ ...prev, config: err ?? true })); }),
-      fetchApi<RiskConfig>('/api/risk/config')
-        .then((risk) => setKillSwitchActive(risk.kill_switch_active))
-        .catch((err) => {
-          logger.warn('Settings', 'Kill switch state unknown', err);
-          setKillSwitchActive(null);
-        }),
-      fetchApi<{ preferences: Record<string, boolean> }>('/api/system/notifications')
-        .then((data) => { setNotifications(data.preferences); setNotificationsError(null); })
-        .catch((err) => {
-          logger.warn('Settings', 'Failed to load notification preferences', err);
-          setNotifications(null);
-          setNotificationsError(err);
-        }),
     ]);
 
     setLoading(false);
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
-
-  // Poll kill switch state every 15s so banner stays in sync
-  useEffect(() => {
-    const pollKillSwitch = () => {
-      fetchApi<{ kill_switch_active: boolean | null }>('/api/risk/live-status')
-        .then((data) => setKillSwitchActive(data.kill_switch_active))
-        .catch(() => setKillSwitchActive(null));
-    };
-    const interval = setInterval(pollKillSwitch, 15_000);
-    return () => clearInterval(interval);
-  }, []);
 
   // Each panel loads on its own: one failing read never hides the other
   const fetchExchangeDetail = useCallback((exchangeId: string) => {
@@ -338,28 +292,15 @@ export default function SettingsPage() {
     } catch (err) { logger.warn('Settings', 'Failed to refresh exchanges', err); }
   };
 
-  const handleSaveConfig = async () => {
-    const capital = Number(paperCapital);
-    if (
-      savedPaperCapital !== null &&
-      capital !== savedPaperCapital &&
-      !confirm(
-        `Change paper capital from ${savedPaperCapital} to ${capital} USDT?\n\n` +
-          'The paper account ledger is reset to the new capital (audited): peak, day start and ' +
-          'carried PnL are rebased. Circuit breaker tiers are not cleared.',
-      )
-    ) {
-      return;
-    }
+  const saveConfig = async (): Promise<string | null> => {
     try {
       const cfg = await fetchApi<PlatformConfig>('/api/system/config', {
         method: 'PUT',
         body: JSON.stringify({
-          trading_mode: tradingMode,
           default_pair: defaultPair,
           default_timeframe: defaultTimeframe,
           max_concurrent_strategies: Number(maxStrategies),
-          paper_capital: capital,
+          paper_capital: Number(paperCapital),
         }),
       });
       setSavedPaperCapital(cfg.paper_capital);
@@ -369,26 +310,27 @@ export default function SettingsPage() {
       } else {
         toast('success', 'Platform configuration saved');
       }
+      return null;
     } catch (err) {
       logger.error('Settings', 'Failed to save config', err);
-      toast('error', describeApiError(err, 'Failed to save configuration'));
+      const message = describeApiError(err, 'Failed to save configuration');
+      toast('error', message);
+      return message;
     }
   };
 
-  const handleNotificationToggle = async (label: string) => {
-    const updated = { ...notifications, [label]: !notifications?.[label] };
-    setNotifications(updated);
-    try {
-      await fetchApi('/api/system/notifications', {
-        method: 'PUT',
-        body: JSON.stringify({ preferences: updated }),
-      });
-    } catch (err) {
-      logger.error('Settings', 'Failed to save notification preferences', err);
-      toast('error', 'Failed to save notification preferences');
-      // Revert on error
-      setNotifications(notifications);
+  const handleSaveConfig = () => {
+    if (!(Number(paperCapital) > 0)) {
+      setCapitalError('Enter a paper capital above 0');
+      return;
     }
+    setCapitalError(null);
+    if (savedPaperCapital !== null && Number(paperCapital) !== savedPaperCapital) {
+      setCapitalSaveError(null);
+      setCapitalConfirmOpen(true);
+      return;
+    }
+    void saveConfig();
   };
 
   const connectionStatusBadge = (detail: ExchangeDetail | undefined) => {
@@ -403,37 +345,20 @@ export default function SettingsPage() {
     }
   };
 
+  const grafanaUrl = process.env.NEXT_PUBLIC_GRAFANA_URL;
+
   return (
     <div className="flex flex-col gap-6">
-      {/* Kill switch warning banner */}
-      {!loading && killSwitchActive === null && (
-        <div className="rounded-xl border border-status-warning/30 bg-status-warning/5 p-4 flex items-center gap-3">
-          <DataStateBadge state="unknown" reason="Risk config could not be read" />
-          <p className="text-sm text-text-primary">
-            Kill switch state is unknown. Check the Risk page before trading.
-          </p>
-        </div>
-      )}
-      {killSwitchActive === true && (
-        <div className="rounded-xl border-2 border-status-error bg-status-error/10 p-4 flex items-center gap-3">
-          <OctagonX className="h-6 w-6 text-status-error shrink-0" />
-          <div>
-            <p className="text-sm font-semibold text-status-error">Kill Switch Active</p>
-            <p className="text-xs text-text-muted">
-              All trading is halted. Release the kill switch from the Risk page to resume trading.
-            </p>
-          </div>
-        </div>
-      )}
+      <h1 className="text-xl font-semibold text-ink-1">Settings</h1>
 
       {/* Exchange connections */}
-      <DataCard title="Exchange Connections" description="Manage your exchange API connections">
+      <Section title="Exchange connections">
         {fetchErrors.exchanges ? (
           <DataStateErrorCard error={fetchErrors.exchanges} fallback="Failed to load exchange connections" onRetry={loadData} />
         ) : loading ? (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="h-28 animate-pulse rounded-xl border border-border-default bg-bg-tertiary" />
+              <div key={i} className="h-28 animate-pulse rounded-xl border border-line bg-raised" />
             ))}
           </div>
         ) : exchanges && exchanges.length > 0 ? (
@@ -447,8 +372,8 @@ export default function SettingsPage() {
                     className={cn(
                       'rounded-xl border p-4 transition-colors',
                       exchange.connected
-                        ? 'border-status-success/30 bg-status-success/5'
-                        : 'border-border-default bg-bg-secondary',
+                        ? 'border-line-strong bg-surface'
+                        : 'border-line bg-surface',
                       isExpanded && 'rounded-b-none',
                     )}
                   >
@@ -458,17 +383,17 @@ export default function SettingsPage() {
                           className={cn(
                             'flex h-10 w-10 items-center justify-center rounded-lg text-sm font-bold',
                             exchange.connected
-                              ? 'bg-status-success/20 text-status-success'
-                              : 'bg-bg-tertiary text-text-muted',
+                              ? 'bg-raised text-ink-1'
+                              : 'bg-raised text-ink-2',
                           )}
                         >
                           {exchange.logo}
                         </div>
                         <div>
-                          <h4 className="text-sm font-semibold text-text-primary">
+                          <h3 className="text-sm font-semibold text-ink-1">
                             {exchange.name}
-                          </h4>
-                          <p className="mt-0.5 text-xs text-text-muted" data-testid={`validation-${exchange.id}`}>
+                          </h3>
+                          <p className="mt-0.5 text-xs text-ink-2" data-testid={`validation-${exchange.id}`}>
                             {validationText(exchange)}
                           </p>
                         </div>
@@ -476,14 +401,14 @@ export default function SettingsPage() {
                       <div className="flex items-center gap-2">
                         {detail && connectionStatusBadge(detail)}
                         {exchange.connected ? (
-                          <CheckCircle className="h-5 w-5 text-status-success" aria-label="Connected" />
+                          <CheckCircle className="h-5 w-5 text-ink-1" aria-label="Connected" />
                         ) : (
-                          <XCircle className="h-5 w-5 text-text-light" aria-label="Disconnected" />
+                          <XCircle className="h-5 w-5 text-ink-2" aria-label="Disconnected" />
                         )}
                       </div>
                     </div>
                     <div className="mt-3 flex items-center justify-between">
-                      <span className="flex items-center gap-2 text-xs text-text-muted">
+                      <span className="flex items-center gap-2 text-xs text-ink-2">
                         API Key: {CREDENTIAL_LABELS[exchange.credentialState]}
                         {exchange.credentialState === 'undecryptable' && (
                           <DataStateBadge state="invalid" reason="HYDRA_CREDENTIAL_KEY cannot decrypt the stored keys" />
@@ -509,7 +434,7 @@ export default function SettingsPage() {
                             setModalOpen(true);
                           }}
                         >
-                          {exchange.connected ? 'Manage' : 'Connect'}
+                          {exchange.connected ? 'Delete keys' : 'Connect'}
                         </Button>
                       </div>
                     </div>
@@ -517,66 +442,66 @@ export default function SettingsPage() {
 
                   {/* Expandable detail panel */}
                   {isExpanded && exchange.connected && (
-                    <div className="rounded-b-xl border border-t-0 border-border-default bg-bg-secondary p-4 space-y-4">
+                    <div className="rounded-b-xl border border-t-0 border-line bg-surface p-4 space-y-4">
                       {/* Balances */}
                       <div>
-                        <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Balances</h5>
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-2 mb-2">Balances</h4>
                         {detail?.balances.error ? (
-                          <p className="text-xs text-status-error" data-testid={`balances-error-${exchange.id}`}>{detail.balances.error}</p>
+                          <p className="text-xs text-danger" data-testid={`balances-error-${exchange.id}`}>{detail.balances.error}</p>
                         ) : detail?.balances.data && detail.balances.data.length > 0 ? (
                           <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                               <thead>
-                                <tr className="border-b border-border-default">
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Currency</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Available</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Total</th>
+                                <tr className="border-b border-line">
+                                  <th className="px-2 py-1.5 text-left text-ink-2 font-semibold">Currency</th>
+                                  <th className="px-2 py-1.5 text-right text-ink-2 font-semibold">Available</th>
+                                  <th className="px-2 py-1.5 text-right text-ink-2 font-semibold">Total</th>
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-border-default">
                                 {detail.balances.data.map((b) => (
                                   <tr key={b.currency}>
-                                    <td className="px-2 py-1.5 text-text-primary font-medium">{b.currency}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{b.available.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{b.total.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                    <td className="px-2 py-1.5 text-ink-1 font-medium">{b.currency}</td>
+                                    <td className="px-2 py-1.5 text-right text-ink-1">{b.available.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                                    <td className="px-2 py-1.5 text-right text-ink-1">{b.total.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
                                   </tr>
                                 ))}
                               </tbody>
                             </table>
                           </div>
                         ) : (
-                          <p className="text-xs text-text-muted">No balance data</p>
+                          <p className="text-xs text-ink-2">No balance data</p>
                         )}
                       </div>
 
                       {/* Open Orders */}
                       <div>
-                        <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Open Orders</h5>
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-2 mb-2">Open Orders</h4>
                         {detail?.orders.error ? (
-                          <p className="text-xs text-status-error" data-testid={`orders-error-${exchange.id}`}>{detail.orders.error}</p>
+                          <p className="text-xs text-danger" data-testid={`orders-error-${exchange.id}`}>{detail.orders.error}</p>
                         ) : detail?.orders.data && detail.orders.data.length > 0 ? (
                           <div className="overflow-x-auto">
                             <table className="w-full text-xs">
                               <thead>
-                                <tr className="border-b border-border-default">
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Symbol</th>
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Side</th>
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Type</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Qty</th>
-                                  <th className="px-2 py-1.5 text-right text-text-muted font-semibold">Price</th>
-                                  <th className="px-2 py-1.5 text-left text-text-muted font-semibold">Status</th>
+                                <tr className="border-b border-line">
+                                  <th className="px-2 py-1.5 text-left text-ink-2 font-semibold">Symbol</th>
+                                  <th className="px-2 py-1.5 text-left text-ink-2 font-semibold">Side</th>
+                                  <th className="px-2 py-1.5 text-left text-ink-2 font-semibold">Type</th>
+                                  <th className="px-2 py-1.5 text-right text-ink-2 font-semibold">Qty</th>
+                                  <th className="px-2 py-1.5 text-right text-ink-2 font-semibold">Price</th>
+                                  <th className="px-2 py-1.5 text-left text-ink-2 font-semibold">Status</th>
                                 </tr>
                               </thead>
                               <tbody className="divide-y divide-border-default">
                                 {detail.orders.data.map((o, i) => (
                                   <tr key={i}>
-                                    <td className="px-2 py-1.5 text-text-primary">{o.symbol}</td>
+                                    <td className="px-2 py-1.5 text-ink-1">{o.symbol}</td>
                                     <td className="px-2 py-1.5">
                                       <StatusBadge status={o.side} variant={o.side.toLowerCase() === 'buy' ? 'success' : 'error'} size="sm" />
                                     </td>
-                                    <td className="px-2 py-1.5 text-text-primary">{o.type}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.quantity ?? '-'}</td>
-                                    <td className="px-2 py-1.5 text-right text-text-primary">{o.price === null ? 'Market' : `$${o.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}</td>
+                                    <td className="px-2 py-1.5 text-ink-1">{o.type}</td>
+                                    <td className="px-2 py-1.5 text-right text-ink-1">{o.quantity ?? '-'}</td>
+                                    <td className="px-2 py-1.5 text-right text-ink-1">{o.price === null ? 'Market' : `$${o.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}</td>
                                     <td className="px-2 py-1.5">
                                       <StatusBadge status={o.status} variant="neutral" size="sm" />
                                     </td>
@@ -586,14 +511,14 @@ export default function SettingsPage() {
                             </table>
                           </div>
                         ) : (
-                          <p className="text-xs text-text-muted">No open orders</p>
+                          <p className="text-xs text-ink-2">No open orders</p>
                         )}
                       </div>
 
                       {/* Positions: a spot account has none */}
                       <div>
-                        <h5 className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">Positions</h5>
-                        <p className="text-xs text-text-muted">
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-2 mb-2">Positions</h4>
+                        <p className="text-xs text-ink-2">
                           Spot account: there are no positions; holdings are listed under Balances.
                         </p>
                       </div>
@@ -604,81 +529,50 @@ export default function SettingsPage() {
             })}
           </div>
         ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
+          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
         )}
-      </DataCard>
+      </Section>
 
-      {/* Notification preferences */}
-      <DataCard title="Notification Preferences" description="Configure alert and notification settings">
-        {notificationsError !== null ? (
-          <DataStateErrorCard
-            error={notificationsError}
-            fallback="Failed to load notification preferences"
-            onRetry={loadData}
-          />
-        ) : notifications === null && loading ? (
-          <div className="space-y-3">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <div key={i} className="h-14 animate-pulse rounded-lg bg-bg-tertiary" />
-            ))}
-          </div>
-        ) : notifications ? (
-          <div className="space-y-4">
-            {[
-              { label: 'Trade Executions', description: 'Notify when trades are filled' },
-              { label: 'Risk Alerts', description: 'Circuit breaker and drawdown warnings' },
-              { label: 'Model Drift', description: 'Alert when model drift exceeds threshold' },
-              { label: 'Strategy Signals', description: 'New signal generated by strategies' },
-              { label: 'System Health', description: 'Service outages and connectivity issues' },
-            ].map((pref) => {
-              const enabled = notifications[pref.label] ?? false;
-              return (
-                <div
-                  key={pref.label}
-                  className="flex items-center justify-between rounded-lg border border-border-default bg-bg-secondary p-3"
-                >
-                  <div className="flex items-center gap-3">
-                    <Bell className="h-4 w-4 text-text-muted shrink-0" aria-hidden="true" />
-                    <div>
-                      <p className="text-sm font-medium text-text-primary">{pref.label}</p>
-                      <p className="text-xs text-text-muted">{pref.description}</p>
-                    </div>
-                  </div>
-                  <div
-                    className={cn(
-                      'relative h-6 w-11 cursor-pointer rounded-full transition-colors',
-                      enabled ? 'bg-accent-primary' : 'bg-bg-active',
-                    )}
-                    role="switch"
-                    aria-checked={enabled}
-                    aria-label={`${enabled ? 'Disable' : 'Enable'} ${pref.label}`}
-                    tabIndex={0}
-                    onClick={() => handleNotificationToggle(pref.label)}
-                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleNotificationToggle(pref.label); } }}
-                  >
-                    <div
-                      className={cn(
-                        'absolute top-1 h-4 w-4 rounded-full shadow transition-transform',
-                        enabled ? 'translate-x-[22px] bg-on-accent' : 'translate-x-1 bg-ink-1',
-                      )}
-                    />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        ) : (
-          <p className="text-sm text-text-muted text-center py-8">No data yet</p>
-        )}
-      </DataCard>
+      <Section title="Alerts">
+        <div className="space-y-2 text-sm text-ink-1">
+          <p>Alerts are sent by Alertmanager to Telegram. Change them in the alert rules, not here.</p>
+          <p className="text-ink-2">Webhook alerts aren&apos;t sent in this version.</p>
+          {grafanaUrl && (
+            <p>
+              <a href={grafanaUrl} className="underline underline-offset-2" target="_blank" rel="noreferrer">
+                Open Grafana
+              </a>
+            </p>
+          )}
+        </div>
+      </Section>
+
+      <Section title="Appearance">
+        <div role="group" aria-label="Theme" className="flex rounded-lg border border-line bg-surface p-1 lg:inline-flex">
+          {(['dark', 'light', 'system'] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              aria-pressed={theme === t}
+              onClick={() => setTheme(t)}
+              className={cn(
+                'h-11 flex-1 rounded-md px-4 text-sm font-medium capitalize lg:h-8',
+                theme === t ? 'bg-raised text-ink-1' : 'text-ink-2 hover:text-ink-1',
+              )}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+      </Section>
 
       {/* Webhook Configuration */}
-      <DataCard title="Webhook Configuration" description="Configure webhook endpoint for external signal ingestion">
+      <Section title="Signal webhook">
         <div className="space-y-4">
           <div>
-            <label className="block text-xs font-medium text-text-secondary mb-1">Webhook URL</label>
-            <div className="flex items-center gap-2">
-              <div className="flex-1 rounded-lg border border-border-default bg-bg-tertiary px-3 py-2 text-sm text-text-muted font-mono">
+            <label className="block text-xs font-medium text-ink-2 mb-1">Webhook URL</label>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="min-w-0 flex-1 break-all rounded-lg border border-line bg-raised px-3 py-2 text-sm text-ink-2 font-mono">
                 {typeof window !== 'undefined' ? `${window.location.origin}/api/signals/webhook` : '/api/signals/webhook'}
               </div>
               <Button
@@ -700,19 +594,19 @@ export default function SettingsPage() {
             type="password"
             autoComplete="off"
             value={webhookSecret}
-            placeholder={secretsSet.webhook_secret ? SECRET_PLACEHOLDER : 'Not set'}
+            placeholder={webhookSecretSet ? SECRET_PLACEHOLDER : 'Not set'}
             onChange={(e) => setWebhookSecret(e.target.value)}
             hint="Shared secret for verifying webhook payloads"
           />
           <div className="flex justify-end gap-2">
-            {secretsSet.webhook_secret && (
+            {webhookSecretSet && (
               <Button
                 variant="outline"
                 size="sm"
                 onClick={async () => {
                   if (!confirm(CLEAR_WEBHOOK_SECRET_WARNING)) return;
                   try {
-                    await saveSecrets({ webhook_secret: '' }, 'Webhook secret cleared');
+                    await saveWebhookSecret('', 'Webhook secret cleared');
                   } catch (err) {
                     toast('error', describeApiError(err, 'Failed to clear webhook secret'));
                   }
@@ -727,7 +621,7 @@ export default function SettingsPage() {
               disabled={webhookSecret === ''}
               onClick={async () => {
                 try {
-                  await saveSecrets({ webhook_secret: webhookSecret }, 'Webhook secret saved');
+                  await saveWebhookSecret(webhookSecret, 'Webhook secret saved');
                   setWebhookSecret('');
                 } catch (err) {
                   toast('error', describeApiError(err, 'Failed to save webhook secret'));
@@ -738,81 +632,16 @@ export default function SettingsPage() {
             </Button>
           </div>
         </div>
-      </DataCard>
-
-      {/* Integration URLs */}
-      <DataCard title="Integration URLs" description="Connect Discord and Slack for notifications">
-        <div className="space-y-4">
-          {([
-            ['discord_webhook_url', 'Discord Webhook URL', discordWebhookUrl, setDiscordWebhookUrl, 'https://discord.com/api/webhooks/...'],
-            ['slack_webhook_url', 'Slack Webhook URL', slackWebhookUrl, setSlackWebhookUrl, 'https://hooks.slack.com/services/...'],
-          ] as const).map(([field, label, value, setValue, example]) => (
-            <div key={field} className="flex items-end gap-2">
-              <div className="flex-1">
-                <Input
-                  label={label}
-                  type="text"
-                  autoComplete="off"
-                  value={value}
-                  placeholder={secretsSet[field] ? SECRET_PLACEHOLDER : example}
-                  onChange={(e) => setValue(e.target.value)}
-                  hint={`${label.replace(' URL', '')} for trade notifications`}
-                />
-              </div>
-              {secretsSet[field] && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="mb-6"
-                  onClick={async () => {
-                    try {
-                      await saveSecrets({ [field]: '' }, `${label} cleared`);
-                    } catch (err) {
-                      toast('error', describeApiError(err, `Failed to clear ${label}`));
-                    }
-                  }}
-                >
-                  Clear
-                </Button>
-              )}
-            </div>
-          ))}
-          <div className="flex justify-end">
-            <Button
-              variant="primary"
-              size="sm"
-              loading={savingIntegrations}
-              disabled={discordWebhookUrl === '' && slackWebhookUrl === ''}
-              onClick={async () => {
-                const patch: Partial<Record<SecretField, string>> = {};
-                if (discordWebhookUrl !== '') patch.discord_webhook_url = discordWebhookUrl;
-                if (slackWebhookUrl !== '') patch.slack_webhook_url = slackWebhookUrl;
-                setSavingIntegrations(true);
-                try {
-                  await saveSecrets(patch, 'Integration URLs saved');
-                  setDiscordWebhookUrl('');
-                  setSlackWebhookUrl('');
-                } catch (err) {
-                  toast('error', describeApiError(err, 'Failed to save integration URLs'));
-                }
-                setSavingIntegrations(false);
-              }}
-            >
-              <Link className="h-4 w-4" />
-              Save Integrations
-            </Button>
-          </div>
-        </div>
-      </DataCard>
+      </Section>
 
       {/* Platform config */}
-      <DataCard title="Platform Configuration" description="General platform settings">
+      <Section title="Platform configuration">
         {fetchErrors.config ? (
           <DataStateErrorCard error={fetchErrors.config} fallback="Failed to load platform configuration" onRetry={loadData} />
         ) : loading ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             {Array.from({ length: 5 }).map((_, i) => (
-              <div key={i} className="h-16 animate-pulse rounded-lg bg-bg-tertiary" />
+              <div key={i} className="h-16 animate-pulse rounded-lg bg-raised" />
             ))}
           </div>
         ) : (
@@ -839,13 +668,14 @@ export default function SettingsPage() {
                 value={defaultTimeframe}
                 onChange={(e) => setDefaultTimeframe(e.target.value)}
               />
-              <Select
-                label="Trading Mode"
-                options={[...TRADING_MODE_OPTIONS]}
-                value={tradingMode}
-                onChange={(e) => setTradingMode(e.target.value)}
-                hint="Paper trading mode is recommended for testing"
-              />
+              <div>
+                <p className="text-sm font-medium text-ink-2">Trading mode</p>
+                <p className="mt-1.5 text-sm text-ink-1" data-testid="trading-mode">
+                  {tradingMode === 'paper'
+                    ? 'Paper. Live trading arrives with a later release and will need a one-time code to turn on.'
+                    : `Stored mode is ${tradingMode ?? 'unknown'}; live trading is refused until a later release. Showing paper.`}
+                </p>
+              </div>
               <Input
                 label="Max Concurrent Strategies"
                 type="number"
@@ -858,6 +688,7 @@ export default function SettingsPage() {
                 type="number"
                 value={paperCapital}
                 onChange={(e) => setPaperCapital(e.target.value)}
+                error={capitalError ?? undefined}
                 hint={
                   pendingPaperCapital !== null
                     ? `Pending: the paper ledger moves to ${pendingPaperCapital} USDT once every held position has a price`
@@ -873,7 +704,33 @@ export default function SettingsPage() {
             </div>
           </>
         )}
-      </DataCard>
+      </Section>
+      <ConfirmDialog
+        open={capitalConfirmOpen}
+        title={`Change paper capital to ${paperCapital} USDT?`}
+        primaryLabel="Reset ledger to new capital"
+        secondaryLabel="Keep current capital"
+        pendingLabel="Saving…"
+        pendingHint="Closing this won't undo a save already sent."
+        onConfirm={async () => {
+          const failure = await saveConfig();
+          setCapitalSaveError(failure);
+          if (failure === null) setCapitalConfirmOpen(false);
+        }}
+        onClose={() => setCapitalConfirmOpen(false)}
+      >
+        <p>
+          This rebases the paper ledger from {savedPaperCapital} to {paperCapital} USDT: peak, day start and carried
+          P&amp;L. Drawdown and today&apos;s loss restart from 0. Trades and history are kept.
+        </p>
+        <p>Breaker tiers, halts and pauses don&apos;t change; reset those separately.</p>
+        <p>If a held position has no mark yet, the change waits and the ledger keeps the current capital until it has one.</p>
+        {capitalSaveError !== null && (
+          <p role="alert" className="text-danger">
+            Not saved: {capitalSaveError}
+          </p>
+        )}
+      </ConfirmDialog>
       <ExchangeConnectDialog
         open={modalOpen}
         onClose={() => { setModalOpen(false); setSelectedExchange(null); }}

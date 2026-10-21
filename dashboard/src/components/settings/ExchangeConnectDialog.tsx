@@ -1,8 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { X, Plug, Unplug } from 'lucide-react';
-import { Button } from '@/components/ui/Button';
+import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { Input } from '@/components/ui/Input';
 import { fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
@@ -33,7 +32,6 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [passphrase, setPassphrase] = useState('');
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -52,7 +50,6 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
       setError('API Key and Secret are required');
       return;
     }
-    setSaving(true);
     setError(null);
     try {
       const res = await fetchApi<ConnectResponse>(`/api/system/exchanges/${exchange.id}/connect`, {
@@ -70,13 +67,10 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
     } catch (err) {
       logger.warn('Settings', `Exchange ${exchange.name} connect refused`, err);
       setError(describeApiError(err, 'Connection failed'));
-    } finally {
-      setSaving(false);
     }
   };
 
   const handleDisconnect = async () => {
-    setSaving(true);
     setError(null);
     try {
       await fetchApi(`/api/system/exchanges/${exchange.id}/connect`, {
@@ -89,77 +83,67 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
     } catch (err) {
       logger.warn('Settings', `Exchange ${exchange.name} disconnect failed`, err);
       setError(describeApiError(err, 'Disconnect failed'));
-    } finally {
-      setSaving(false);
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} aria-hidden="true" />
-      <div className="relative w-full max-w-lg rounded-xl border border-border-default bg-bg-elevated p-6 shadow-xl mx-4">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold text-text-primary">
-            {exchange.connected ? `Manage ${exchange.name}` : `Connect ${exchange.name}`}
-          </h3>
-          <button type="button" onClick={onClose} className="rounded-lg p-1 text-text-muted hover:text-text-primary hover:bg-bg-hover transition-colors" aria-label="Close dialog">
-            <X className="h-5 w-5" />
-          </button>
-        </div>
+  const failure = error && (
+    <p role="alert" className="rounded-lg border border-danger bg-danger-soft p-3 text-sm text-danger">
+      {error}
+    </p>
+  );
 
-        {exchange.connected ? (
-          /* Manage mode */
-          <div className="flex flex-col gap-4">
-            <div className="rounded-lg border border-status-success/30 bg-status-success/5 p-4">
-              <p className="text-sm font-medium text-status-success">Connected</p>
-              <p className="text-xs text-text-muted mt-1">API credentials are configured for {exchange.name}</p>
-            </div>
-            {error && (
-              <div className="rounded-lg border border-status-error/30 bg-status-error/5 p-3">
-                <p className="text-sm text-status-error">{error}</p>
-              </div>
-            )}
-            <div className="flex justify-end gap-3 mt-2">
-              <Button variant="outline" onClick={onClose} disabled={saving}>Close</Button>
-              <Button variant="danger" onClick={handleDisconnect} loading={saving}>
-                <Unplug className="h-4 w-4" />
-                Disconnect
-              </Button>
-            </div>
-          </div>
-        ) : (
-          /* Connect mode */
-          <div className="flex flex-col gap-4">
-            <p className="text-xs text-text-muted" data-testid="connect-target">
-              The keys are checked against {exchange.name} {exchange.environment} with a read-only
-              balance call before anything is stored. Use read-only keys
-              {exchange.environment === 'testnet'
-                ? ' from testnet.binance.vision; mainnet keys are rejected there.'
-                : ' from your mainnet account.'}
-            </p>
-            {exchange.credentialState === 'undecryptable' && (
-              <p className="text-xs text-status-warning">
-                The stored keys cannot be decrypted with the current credential key; enter them again.
-              </p>
-            )}
-            <Input label="API Key" type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Enter API key" autoFocus />
-            <Input label="API Secret" type="password" value={apiSecret} onChange={(e) => setApiSecret(e.target.value)} placeholder="Enter API secret" />
-            <Input label="Passphrase (optional)" type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="Required for some exchanges" />
-            {error && (
-              <div className="rounded-lg border border-status-error/30 bg-status-error/5 p-3">
-                <p className="text-sm text-status-error">{error}</p>
-              </div>
-            )}
-            <div className="flex justify-end gap-3 mt-2">
-              <Button variant="outline" onClick={onClose} disabled={saving}>Cancel</Button>
-              <Button variant="primary" onClick={handleConnect} loading={saving}>
-                <Plug className="h-4 w-4" />
-                Connect
-              </Button>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
+  if (exchange.connected) {
+    return (
+      <ConfirmDialog
+        open
+        destructive
+        title={`Delete the stored ${exchange.name} keys?`}
+        primaryLabel="Delete keys"
+        secondaryLabel="Keep keys"
+        pendingLabel="Deleting…"
+        pendingHint="Closing this won't stop the delete."
+        onConfirm={handleDisconnect}
+        onClose={onClose}
+      >
+        <p>
+          Balance and open orders stop showing here. Paper sessions aren&apos;t affected. You&apos;ll need the keys to
+          connect again.
+        </p>
+        {failure}
+      </ConfirmDialog>
+    );
+  }
+
+  return (
+    <ConfirmDialog
+      open
+      title={`Connect ${exchange.name}`}
+      primaryLabel="Check and save keys"
+      secondaryLabel="Cancel"
+      pendingLabel={`Checking with ${exchange.name}…`}
+      pendingHint="Closing this won't cancel the check."
+      onConfirm={handleConnect}
+      onClose={onClose}
+    >
+      <p>
+        Use a <strong>read-only</strong> API key. Hydra checks it with a read-only call before storing it, encrypted. In
+        this version it&apos;s used only to show your balance and open orders.
+      </p>
+      <p className="text-xs text-ink-2" data-testid="connect-target">
+        The keys are checked against {exchange.name} {exchange.environment}
+        {exchange.environment === 'testnet'
+          ? ' with keys from testnet.binance.vision; mainnet keys are rejected there.'
+          : ' with keys from your mainnet account.'}
+      </p>
+      {exchange.credentialState === 'undecryptable' && (
+        <p className="text-xs text-caution">
+          The stored keys cannot be decrypted with the current credential key; enter them again.
+        </p>
+      )}
+      <Input label="API Key" type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Enter API key" autoComplete="off" />
+      <Input label="API Secret" type="password" value={apiSecret} onChange={(e) => setApiSecret(e.target.value)} placeholder="Enter API secret" autoComplete="off" />
+      <Input label="Passphrase (optional)" type="password" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="Required for some exchanges" autoComplete="off" />
+      {failure}
+    </ConfirmDialog>
   );
 }

@@ -15,6 +15,7 @@ import { Select } from '@/components/ui/Select';
 import { DataCard } from '@/components/ui/DataCard';
 import { fetchApi } from '@/lib/api';
 import { logger } from '@/lib/logger';
+import { ResearchNav } from '@/components/research/ResearchNav';
 import {
   type TimeResolution,
   type EquityPoint,
@@ -189,17 +190,17 @@ export default function BacktestComparePage() {
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
-        <p className="text-sm text-text-muted">Loading backtest results...</p>
+        <p className="text-sm text-ink-2">Loading backtest results...</p>
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Header */}
+      <ResearchNav current="/backtest" />
       <div>
-        <h2 className="text-xl font-bold text-text-primary font-display">Backtest Comparison</h2>
-        <p className="text-sm text-text-muted mt-1">
+        <h1 className="text-xl font-semibold text-ink-1">Backtest comparison</h1>
+        <p className="text-sm text-ink-2 mt-1">
           Compare two backtest results side by side
         </p>
       </div>
@@ -223,7 +224,7 @@ export default function BacktestComparePage() {
           />
         </div>
         {(selectedA || selectedB) && (
-          <div className="mt-3 grid grid-cols-1 gap-4 text-xs text-text-muted md:grid-cols-2">
+          <div className="mt-3 grid grid-cols-1 gap-4 text-xs text-ink-2 md:grid-cols-2">
             <div className="flex items-center gap-2" data-testid="data-a">
               {selectedA && <>Data: <ProvenanceBadge provenance={selectedProvenance(selectedA)} /></>}
             </div>
@@ -243,15 +244,15 @@ export default function BacktestComparePage() {
       )}
 
       {mismatch.length > 0 && (
-        <div className="rounded-xl border border-status-warning/30 bg-status-warning/10 px-4 py-3" data-testid="provenance-mismatch">
-          <p className="text-sm font-medium text-text-primary">These runs used different data</p>
-          <p className="text-xs text-text-muted">{mismatch.join('; ')}</p>
+        <div className="rounded-xl border border-status-warning/30 bg-caution/10 px-4 py-3" data-testid="provenance-mismatch">
+          <p className="text-sm font-medium text-ink-1">These runs used different data</p>
+          <p className="text-xs text-ink-2">{mismatch.join('; ')}</p>
         </div>
       )}
 
       {loadingDetails && (
         <div className="flex h-32 items-center justify-center">
-          <p className="text-sm text-text-muted">Loading comparison data...</p>
+          <p className="text-sm text-ink-2">Loading comparison data...</p>
         </div>
       )}
 
@@ -262,24 +263,24 @@ export default function BacktestComparePage() {
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="border-b border-border-default">
-                    <th className="pb-2 text-left text-xs font-medium text-text-muted">Metric</th>
-                    <th className="pb-2 text-right text-xs font-medium text-text-muted">
+                  <tr className="border-b border-line">
+                    <th className="pb-2 text-left text-xs font-medium text-ink-2">Metric</th>
+                    <th className="pb-2 text-right text-xs font-medium text-ink-2">
                       {detailA.name || detailA.strategy}
                     </th>
-                    <th className="pb-2 text-right text-xs font-medium text-text-muted">
+                    <th className="pb-2 text-right text-xs font-medium text-ink-2">
                       {detailB.name || detailB.strategy}
                     </th>
                   </tr>
                 </thead>
                 <tbody>
                   {comparisonMetrics.map((row) => (
-                    <tr key={row.label} className="border-b border-border-default last:border-0">
-                      <td className="py-2.5 text-text-secondary">{row.label}</td>
-                      <td className={`py-2.5 text-right font-medium ${'colorA' in row ? (row.colorA ? 'text-status-success' : 'text-status-error') : 'text-text-primary'}`}>
+                    <tr key={row.label} className="border-b border-line last:border-0">
+                      <td className="py-2.5 text-ink-2">{row.label}</td>
+                      <td className={`py-2.5 text-right font-medium ${'colorA' in row ? (row.colorA ? 'text-ink-1' : 'text-danger') : 'text-ink-1'}`}>
                         {row.a}
                       </td>
-                      <td className={`py-2.5 text-right font-medium ${'colorB' in row ? (row.colorB ? 'text-status-success' : 'text-status-error') : 'text-text-primary'}`}>
+                      <td className={`py-2.5 text-right font-medium ${'colorB' in row ? (row.colorB ? 'text-ink-1' : 'text-danger') : 'text-ink-1'}`}>
                         {row.b}
                       </td>
                     </tr>
@@ -336,10 +337,10 @@ export default function BacktestComparePage() {
                     content={({ active, payload, label }) => {
                       if (!active || !payload?.length) return null;
                       return (
-                        <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
-                          <p className="text-xs text-text-muted">{label != null ? formatXTick(String(label), resolution) : ''}</p>
+                        <div className="rounded-lg border border-line bg-surface px-3 py-2 shadow-lg">
+                          <p className="text-xs text-ink-2">{label != null ? formatXTick(String(label), resolution) : ''}</p>
                           {payload.map((p) => (
-                            <p key={String(p.dataKey)} className="text-sm font-medium text-text-primary">
+                            <p key={String(p.dataKey)} className="text-sm font-medium text-ink-1">
                               {p.dataKey === 'valueA' ? 'A' : 'B'}: ${(p.value as number)?.toLocaleString('en-US', { minimumFractionDigits: 2 }) ?? 'N/A'}
                             </p>
                           ))}
@@ -349,7 +350,7 @@ export default function BacktestComparePage() {
                   />
                   <Legend
                     formatter={(value) => (
-                      <span className="text-xs text-text-secondary">
+                      <span className="text-xs text-ink-2">
                         {value === 'valueA' ? (detailA.name || detailA.strategy) : (detailB.name || detailB.strategy)}
                       </span>
                     )}
@@ -381,13 +382,13 @@ export default function BacktestComparePage() {
 
       {!selectedA && !selectedB && results.length > 0 && (
         <div className="flex flex-col items-center justify-center py-12">
-          <p className="text-sm text-text-muted">Select two backtest results above to compare</p>
+          <p className="text-sm text-ink-2">Select two backtest results above to compare</p>
         </div>
       )}
 
       {listError === null && results.length < 2 && (
         <div className="flex flex-col items-center justify-center py-12">
-          <p className="text-sm text-text-muted">At least two completed backtests are needed for comparison</p>
+          <p className="text-sm text-ink-2">At least two completed backtests are needed for comparison</p>
         </div>
       )}
     </div>

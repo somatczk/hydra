@@ -174,3 +174,37 @@ describe('BacktestPage', () => {
     expect(page.container.querySelector('[data-state="unavailable"]')).not.toBeNull();
   });
 });
+
+describe('BacktestPage history values', () => {
+  it('shows a losing result with its real numbers, never N/A', async () => {
+    serve();
+    page = await mount(<BacktestPage />);
+
+    const row = page.container.querySelector('tbody tr')?.textContent ?? '';
+    expect(row).toContain('−50.00');
+    expect(row).toContain('0%');
+    expect(row).toContain('0.00');
+    expect(row).not.toContain('N/A');
+  });
+
+  it('shows a missing metric as a dash with NO DATA', async () => {
+    serve({
+      'GET /api/backtest/results': () => [
+        { ...RESULT, metrics: { ...RESULT.metrics, win_rate: null, sharpe_ratio: null } },
+      ],
+    });
+    page = await mount(<BacktestPage />);
+
+    const cells = Array.from(page.container.querySelectorAll('tbody tr td')).map((td) => td.textContent);
+    expect(cells.filter((c) => c === '— NO DATA')).toHaveLength(2);
+  });
+
+  it('has one h1, the Research nav and a real link to the result', async () => {
+    serve();
+    page = await mount(<BacktestPage />);
+
+    expect(page.container.querySelectorAll('h1')).toHaveLength(1);
+    expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Backtests');
+    expect(page.container.querySelector('tbody a[href="/backtest/bt-task-1"]')?.textContent).toBe('View');
+  });
+});

@@ -59,7 +59,7 @@ export function RuleSection({
           <ChevronRight className="h-4 w-4 text-text-muted" />
         )}
         <div className="flex-1">
-          <h4 className="text-sm font-semibold text-text-primary">{title}</h4>
+          <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
           <p className="text-xs text-text-muted">{description}</p>
         </div>
         <span className="rounded-full bg-bg-tertiary px-2 py-0.5 text-xs font-medium text-text-muted">

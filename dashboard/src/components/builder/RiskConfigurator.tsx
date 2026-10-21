@@ -41,7 +41,7 @@ export function RiskConfigurator({
       <div className="flex flex-col gap-6">
         {/* Stop Loss */}
         <div>
-          <h4 className="text-sm font-semibold text-text-primary mb-3">Stop Loss</h4>
+          <h3 className="text-sm font-semibold text-text-primary mb-3">Stop Loss</h3>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <Select
               label="Method"
@@ -83,7 +83,7 @@ export function RiskConfigurator({
 
         {/* Take Profit */}
         <div>
-          <h4 className="text-sm font-semibold text-text-primary mb-3">Take Profit</h4>
+          <h3 className="text-sm font-semibold text-text-primary mb-3">Take Profit</h3>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <Select
               label="Method"
@@ -117,7 +117,7 @@ export function RiskConfigurator({
 
         {/* Position Sizing */}
         <div>
-          <h4 className="text-sm font-semibold text-text-primary mb-3">Position Sizing</h4>
+          <h3 className="text-sm font-semibold text-text-primary mb-3">Position Sizing</h3>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             <Select
               label="Method"

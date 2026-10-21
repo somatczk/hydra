@@ -15,6 +15,7 @@ import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { ProvenancePanel, type DataProvenance } from '@/components/backtest/DataProvenance';
 import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
+import { ResearchNav } from '@/components/research/ResearchNav';
 
 /* ---------- Types ---------- */
 
@@ -314,7 +315,7 @@ export default function OptimizePage() {
       key: 'params',
       header: 'Parameters',
       render: (row: OptimizeResult) => (
-        <span className="text-xs text-text-secondary">
+        <span className="text-xs text-ink-2">
           {Object.entries(row.params)
             .map(([k, v]) => `${k}=${v}`)
             .join(', ')}
@@ -326,7 +327,7 @@ export default function OptimizePage() {
       header: `PnL${sortKey === 'pnl' ? (sortDir === 'desc' ? ' \u2193' : ' \u2191') : ''}`,
       render: (row: OptimizeResult) => (
         <span
-          className={row.pnl >= 0 ? 'text-status-success font-medium cursor-pointer' : 'text-status-error font-medium cursor-pointer'}
+          className={row.pnl >= 0 ? 'text-ink-1 font-medium cursor-pointer' : 'text-danger font-medium cursor-pointer'}
           onClick={() => handleSort('pnl')}
         >
           {fmtPnl(row.pnl)}
@@ -355,7 +356,7 @@ export default function OptimizePage() {
       key: 'max_drawdown',
       header: `Max DD${sortKey === 'max_drawdown' ? (sortDir === 'desc' ? ' \u2193' : ' \u2191') : ''}`,
       render: (row: OptimizeResult) => (
-        <span className="text-status-error cursor-pointer" onClick={() => handleSort('max_drawdown')}>
+        <span className="text-danger cursor-pointer" onClick={() => handleSort('max_drawdown')}>
           {row.max_drawdown.toFixed(1)}%
         </span>
       ),
@@ -365,17 +366,17 @@ export default function OptimizePage() {
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
-        <p className="text-sm text-text-muted">Loading...</p>
+        <p className="text-sm text-ink-2">Loading...</p>
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Header */}
+      <ResearchNav current="/optimize" />
       <div>
-        <h2 className="text-xl font-bold text-text-primary font-display">Strategy Optimizer</h2>
-        <p className="text-sm text-text-muted mt-1">
+        <h1 className="text-xl font-semibold text-ink-1">Strategy optimizer</h1>
+        <p className="text-sm text-ink-2 mt-1">
           Find optimal parameter combinations for your strategy
         </p>
       </div>
@@ -416,18 +417,18 @@ export default function OptimizePage() {
 
         {/* Parameter ranges */}
         <div className="space-y-3">
-          <p className="text-xs font-medium text-text-secondary">Parameter Ranges</p>
+          <p className="text-xs font-medium text-ink-2">Parameter Ranges</p>
           {paramsLoading && (
-            <p className="text-xs text-text-muted">Loading parameters...</p>
+            <p className="text-xs text-ink-2">Loading parameters...</p>
           )}
-          {paramsError && <p className="text-xs text-status-error">{paramsError}</p>}
+          {paramsError && <p className="text-xs text-danger">{paramsError}</p>}
           {!paramsLoading && !paramsError && params.length === 0 && strategyId && (
-            <p className="text-xs text-text-muted">No optimizable parameters found for this strategy.</p>
+            <p className="text-xs text-ink-2">No optimizable parameters found for this strategy.</p>
           )}
           {params.map((param, i) => (
             <div key={param.name} className="grid grid-cols-4 gap-3 items-end">
               <div>
-                <label className="block text-xs text-text-muted mb-1">{param.label}</label>
+                <label className="block text-xs text-ink-2 mb-1">{param.label}</label>
               </div>
               <Input
                 label="Min"
@@ -473,48 +474,48 @@ export default function OptimizePage() {
           {running && (
             <div className="space-y-3">
               <div className="flex items-center gap-3">
-                <div className="flex-1 h-2 rounded-full bg-bg-tertiary overflow-hidden">
+                <div className="flex-1 h-2 rounded-full bg-raised overflow-hidden">
                   <div
-                    className="h-full rounded-full bg-accent-primary transition-all duration-500 ease-out"
+                    className="h-full rounded-full bg-accent transition-all duration-500 ease-out"
                     style={{ width: `${progress}%` }}
                   />
                 </div>
-                <span className="text-xs text-text-muted w-10 text-right">{progress}%</span>
+                <span className="text-xs text-ink-2 w-10 text-right">{progress}%</span>
               </div>
               {trialStatus && (
-                <div className="rounded-lg border border-border-default bg-bg-secondary p-3 space-y-2">
+                <div className="rounded-lg border border-line bg-surface p-3 space-y-2">
                   <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
                     <div className="flex justify-between">
-                      <span className="text-text-muted">Trial</span>
-                      <span className="font-mono text-text-primary">{trialStatus.completed} / {trialStatus.total}</span>
+                      <span className="text-ink-2">Trial</span>
+                      <span className="font-mono text-ink-1">{trialStatus.completed} / {trialStatus.total}</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-text-muted">Best Sharpe</span>
-                      <span className={`font-mono ${trialStatus.bestSoFar != null && trialStatus.bestSoFar > 0 ? 'text-status-success' : 'text-text-primary'}`}>
+                      <span className="text-ink-2">Best Sharpe</span>
+                      <span className={`font-mono ${trialStatus.bestSoFar != null && trialStatus.bestSoFar > 0 ? 'text-ink-1' : 'text-ink-1'}`}>
                         {trialStatus.bestSoFar != null ? trialStatus.bestSoFar.toFixed(3) : '—'}
                       </span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-text-muted">Last Trial Sharpe</span>
-                      <span className="font-mono text-text-secondary">
+                      <span className="text-ink-2">Last Trial Sharpe</span>
+                      <span className="font-mono text-ink-2">
                         {trialStatus.lastSharpe != null ? trialStatus.lastSharpe.toFixed(3) : '—'}
                       </span>
                     </div>
                     {trialStatus.startDate && trialStatus.endDate && (
                       <div className="flex justify-between">
-                        <span className="text-text-muted">Period</span>
-                        <span className="font-mono text-text-secondary">{trialStatus.startDate} — {trialStatus.endDate}</span>
+                        <span className="text-ink-2">Period</span>
+                        <span className="font-mono text-ink-2">{trialStatus.startDate} — {trialStatus.endDate}</span>
                       </div>
                     )}
                   </div>
                   {trialStatus.provenance && <ProvenancePanel provenance={trialStatus.provenance} />}
                   {trialStatus.currentParams && (
-                    <div className="pt-1 border-t border-border-default">
-                      <p className="text-[10px] text-text-muted mb-1">Last Trial Parameters</p>
+                    <div className="pt-1 border-t border-line">
+                      <p className="text-[10px] text-ink-2 mb-1">Last Trial Parameters</p>
                       <div className="flex flex-wrap gap-2">
                         {Object.entries(trialStatus.currentParams).map(([k, v]) => (
-                          <span key={k} className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 text-[10px] font-mono text-text-secondary">
-                            {k}=<span className="text-text-primary">{typeof v === 'number' ? v.toFixed(2) : v}</span>
+                          <span key={k} className="inline-flex items-center gap-1 rounded bg-raised px-1.5 py-0.5 text-[10px] font-mono text-ink-2">
+                            {k}=<span className="text-ink-1">{typeof v === 'number' ? v.toFixed(2) : v}</span>
                           </span>
                         ))}
                       </div>
@@ -532,8 +533,8 @@ export default function OptimizePage() {
         <DataCard title="Results" description={`${results.length} parameter combinations tested`}>
           <div className="mb-3 flex justify-end">
             <Button variant="primary" size="sm" onClick={handleApplyBest}>
-              <ArrowRight className="h-3.5 w-3.5" />
-              Apply Best
+              <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+              Open in Builder
             </Button>
           </div>
           <Table
@@ -555,7 +556,7 @@ export default function OptimizePage() {
                 key: 'status',
                 header: 'Status',
                 render: (r: HyperoptHistoryEntry) => (
-                  <span className={r.status === 'completed' ? 'text-status-success' : r.status === 'failed' ? 'text-status-error' : 'text-text-muted'}>
+                  <span className={r.status === 'completed' ? 'text-ink-1' : r.status === 'failed' ? 'text-danger' : 'text-ink-2'}>
                     {r.status}
                   </span>
                 ),
@@ -574,7 +575,7 @@ export default function OptimizePage() {
                 key: 'created_at',
                 header: 'Date',
                 render: (r: HyperoptHistoryEntry) => (
-                  <span className="text-xs text-text-muted">
+                  <span className="text-xs text-ink-2">
                     {r.created_at ? new Date(r.created_at).toLocaleString() : '—'}
                   </span>
                 ),

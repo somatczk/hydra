@@ -36,7 +36,7 @@ export function DataCard({
       {(title || description) && (
         <div className="mb-3">
           {title && (
-            <h3 className="text-sm font-semibold text-ink-1">{title}</h3>
+            <h2 className="text-sm font-semibold text-ink-1">{title}</h2>
           )}
           {description && (
             <p className="mt-0.5 text-xs text-ink-2">{description}</p>

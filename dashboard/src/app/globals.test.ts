@@ -99,8 +99,8 @@ describe('design tokens', () => {
     }
   });
 
-  it('no hard-coded white outside the sentiment needle: it is illegible on the dark accent and ink fills', () => {
+  it('no hard-coded white: it is illegible on the dark accent and ink fills', () => {
     const hits = sources.flatMap((f) => [...f.text.matchAll(/\b(?:bg|text)-white\b/g)].map(() => relative(here, f.path)));
-    expect(hits).toEqual(['portfolio/page.tsx']);
+    expect(hits).toEqual([]);
   });
 });

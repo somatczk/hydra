@@ -44,3 +44,7 @@ export function isActive(pathname: string, item: Pick<NavItem, 'href' | 'under'>
 
 export const activeItem = (pathname: string): NavItem | undefined =>
   navItems.find((item) => isActive(pathname, item));
+
+/** App-bar title: /portfolio sits under Status but is named Performance. */
+export const pageTitle = (pathname: string): string | undefined =>
+  within(pathname, '/portfolio') ? 'Performance' : activeItem(pathname)?.label;

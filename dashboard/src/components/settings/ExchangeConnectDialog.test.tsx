@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
-import { buttonByText, click, inputByLabel, mount, typeInto, type Mounted } from '@/test/pageHarness';
+import { buttonByText, click, dialogPolyfill, inputByLabel, mount, typeInto, type Mounted } from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
 
@@ -19,6 +19,7 @@ function envelope(status: number, code: string, message: string, state: string):
 let page: Mounted | null = null;
 
 beforeEach(() => {
+  dialogPolyfill();
   fetchApi.mockReset();
 });
 
@@ -39,9 +40,9 @@ async function submit(connected = false): Promise<Mounted> {
   if (!connected) {
     await typeInto(inputByLabel(mounted.container, 'API Key'), 'key');
     await typeInto(inputByLabel(mounted.container, 'API Secret'), 'secret');
-    await click(buttonByText(mounted.container, 'Connect'));
+    await click(buttonByText(mounted.container, 'Check and save keys'));
   } else {
-    await click(buttonByText(mounted.container, 'Disconnect'));
+    await click(buttonByText(mounted.container, 'Delete keys'));
   }
   return mounted;
 }
@@ -75,6 +76,42 @@ describe('ExchangeConnectDialog errors', () => {
     const [path, init] = fetchApi.mock.calls[0] as [string, RequestInit];
     expect(path).toBe('/api/system/exchanges/binance/connect');
     expect(JSON.parse(String(init.body))).toEqual({ api_key: 'key', api_secret: 'secret' });
+  });
+
+  it('asks for read-only keys and tells the operator what deleting them costs', async () => {
+    page = await mount(
+      <ExchangeConnectDialog
+        open
+        onClose={vi.fn()}
+        onUpdated={vi.fn()}
+        exchange={{ id: 'binance', name: 'Binance', connected: false, environment: 'testnet' }}
+      />,
+    );
+    expect(page.container.textContent).toContain('Use a read-only API key.');
+    page.unmount();
+
+    page = await mount(
+      <ExchangeConnectDialog
+        open
+        onClose={vi.fn()}
+        onUpdated={vi.fn()}
+        exchange={{ id: 'binance', name: 'Binance', connected: true, environment: 'testnet' }}
+      />,
+    );
+    const dialog = page.container.querySelector('dialog');
+    expect(dialog?.textContent).toContain('Delete the stored Binance keys?');
+    expect(dialog?.textContent).toContain("Paper sessions aren't affected");
+    expect(document.activeElement?.textContent).toBe('Delete the stored Binance keys?');
+    expect(fetchApi).not.toHaveBeenCalled();
+  });
+
+  it('deletes the keys only after the confirm button', async () => {
+    fetchApi.mockResolvedValue({});
+    page = await submit(true);
+
+    const [path, init] = fetchApi.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe('/api/system/exchanges/binance/connect');
+    expect(init.method).toBe('DELETE');
   });
 
   it('names the environment the keys are checked against', async () => {

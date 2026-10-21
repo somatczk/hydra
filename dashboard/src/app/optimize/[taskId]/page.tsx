@@ -12,6 +12,7 @@ import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { ProvenancePanel, type DataProvenance } from '@/components/backtest/DataProvenance';
 import { stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
+import { ResearchNav } from '@/components/research/ResearchNav';
 
 /* ---------- Types ---------- */
 
@@ -109,7 +110,7 @@ export default function HyperoptDetailPage() {
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
-        <p className="text-sm text-text-muted">Loading hyperopt run...</p>
+        <p className="text-sm text-ink-2">Loading hyperopt run...</p>
       </div>
     );
   }
@@ -119,7 +120,7 @@ export default function HyperoptDetailPage() {
     return (
       <div className="flex flex-col items-center justify-center gap-4 py-20">
         {missing ? (
-          <p className="text-sm text-text-muted">Hyperopt run not found</p>
+          <p className="text-sm text-ink-2">Hyperopt run not found</p>
         ) : (
           <DataStateErrorCard error={loadError} fallback="Failed to load hyperopt run" />
         )}
@@ -132,17 +133,17 @@ export default function HyperoptDetailPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Header */}
+      <ResearchNav current="/optimize" />
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="sm" onClick={() => router.push('/optimize')}>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
-            <h1 className="text-lg font-semibold text-text-primary font-display">
+            <h1 className="text-lg font-semibold text-ink-1 font-display">
               Hyperopt Run {taskId}
             </h1>
-            <p className="text-xs text-text-muted">
+            <p className="text-xs text-ink-2">
               Strategy: {progress.strategy_id}
               {progress.created_at && (
                 <> &middot; {new Date(progress.created_at).toLocaleString()}</>
@@ -163,32 +164,32 @@ export default function HyperoptDetailPage() {
       {/* Summary metrics */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Trials</p>
-          <p className="text-lg font-bold text-text-primary">
+          <p className="text-xs text-ink-2">Trials</p>
+          <p className="text-lg font-bold text-ink-1">
             {progress.completed_trials}/{progress.total_trials}
           </p>
         </DataCard>
         <DataCard padding="sm">
-          <p className="text-xs text-text-muted">Best Sharpe</p>
-          <p className="text-lg font-bold text-text-primary">
+          <p className="text-xs text-ink-2">Best Sharpe</p>
+          <p className="text-lg font-bold text-ink-1">
             {result ? result.best_metric.toFixed(2) : progress.best_so_far != null ? progress.best_so_far.toFixed(2) : '\u2014'}
           </p>
         </DataCard>
         {result && (
           <>
             <DataCard padding="sm">
-              <p className="text-xs text-text-muted">Best Return</p>
+              <p className="text-xs text-ink-2">Best Return</p>
               <p className={`text-lg font-bold ${
                 Math.max(...result.trials.map((t) => t.total_return)) >= 0
-                  ? 'text-status-success'
-                  : 'text-status-error'
+                  ? 'text-ink-1'
+                  : 'text-danger'
               }`}>
                 {(Math.max(...result.trials.map((t) => t.total_return)) * 100).toFixed(1)}%
               </p>
             </DataCard>
             <DataCard padding="sm">
-              <p className="text-xs text-text-muted">Best Params</p>
-              <p className="text-xs font-mono text-text-secondary truncate">
+              <p className="text-xs text-ink-2">Best Params</p>
+              <p className="text-xs font-mono text-ink-2 truncate">
                 {Object.entries(result.best_params)
                   .map(([k, v]) => `${k}=${v}`)
                   .join(', ')}
@@ -201,7 +202,7 @@ export default function HyperoptDetailPage() {
       {/* Not completed states */}
       {progress.status === 'failed' && (
         <DataCard>
-          <p className="text-sm text-status-error">
+          <p className="text-sm text-danger">
             This hyperopt run failed{progress.error ? `: ${progress.error}` : '.'}
           </p>
         </DataCard>
@@ -209,7 +210,7 @@ export default function HyperoptDetailPage() {
 
       {progress.status !== 'completed' && progress.status !== 'failed' && (
         <DataCard>
-          <p className="text-sm text-text-muted">
+          <p className="text-sm text-ink-2">
             This run is still {progress.status}. Results will be available once it completes.
           </p>
         </DataCard>
@@ -226,13 +227,13 @@ export default function HyperoptDetailPage() {
               {
                 key: 'trial_number',
                 header: '#',
-                render: (r: TrialRecord) => <span className="text-text-muted">{r.trial_number}</span>,
+                render: (r: TrialRecord) => <span className="text-ink-2">{r.trial_number}</span>,
               },
               {
                 key: 'params',
                 header: 'Parameters',
                 render: (r: TrialRecord) => (
-                  <span className="text-xs text-text-secondary">
+                  <span className="text-xs text-ink-2">
                     {Object.entries(r.params)
                       .map(([k, v]) => `${k}=${v}`)
                       .join(', ')}
@@ -253,7 +254,7 @@ export default function HyperoptDetailPage() {
                 header: `Return${sortIndicator('total_return')}`,
                 render: (r: TrialRecord) => (
                   <span
-                    className={`cursor-pointer ${r.total_return >= 0 ? 'text-status-success' : 'text-status-error'}`}
+                    className={`cursor-pointer ${r.total_return >= 0 ? 'text-ink-1' : 'text-danger'}`}
                     onClick={() => handleSort('total_return')}
                   >
                     {(r.total_return * 100).toFixed(1)}%
@@ -265,7 +266,7 @@ export default function HyperoptDetailPage() {
                 header: `Max DD${sortIndicator('max_drawdown')}`,
                 render: (r: TrialRecord) => (
                   <span
-                    className="text-status-error cursor-pointer"
+                    className="text-danger cursor-pointer"
                     onClick={() => handleSort('max_drawdown')}
                   >
                     {(r.max_drawdown * 100).toFixed(1)}%
