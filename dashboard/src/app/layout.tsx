@@ -5,10 +5,13 @@ import { AppLayout } from '@/components/layout/AppLayout';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Hydra Trading Platform',
+  title: { template: '%s · Hydra', default: 'Status · Hydra' },
   description:
     'Bitcoin auto-trading platform with ML-assisted signals, multi-exchange support, backtesting, and production monitoring.',
 };
+
+// Same rule as ThemeProvider (stored choice, dark by default), applied before hydration so nothing flashes.
+const THEME_SCRIPT = `try{var t=localStorage.getItem('hydra-theme');document.documentElement.classList.toggle('dark',t==='light'?false:t==='system'?matchMedia('(prefers-color-scheme: dark)').matches:true)}catch(e){document.documentElement.classList.add('dark')}`;
 
 export default function RootLayout({
   children,
@@ -17,6 +20,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
+      </head>
       <body className="antialiased">
         <ThemeProvider>
           <ToastProvider>

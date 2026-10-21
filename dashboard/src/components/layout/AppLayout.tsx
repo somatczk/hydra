@@ -1,27 +1,31 @@
 'use client';
 
-import { useState, type ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
 import { BottomTabBar } from './BottomTabBar';
-import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { KillSwitchOutcome } from '@/components/shell/KillSwitchControl';
+import { ShellStatusProvider } from '@/components/shell/ShellStatusProvider';
 
-interface AppLayoutProps {
-  children: ReactNode;
-}
-
-export function AppLayout({ children }: AppLayoutProps) {
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  useKeyboardShortcuts();
-
+/** DOM order is the Tab order: skip link → kill-switch control (in the header) → nav → main. */
+export function AppLayout({ children }: { children: ReactNode }) {
   return (
-    <div className="min-h-screen bg-bg-primary">
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-      <Header onMenuClick={() => setSidebarOpen(true)} />
-      <main className="px-4 py-6 pb-20 md:px-6 md:pb-6 lg:pl-[calc(18rem+1.5rem)] lg:pr-6">
-        {children}
-      </main>
-      <BottomTabBar />
-    </div>
+    <ShellStatusProvider>
+      <div className="min-h-screen bg-canvas">
+        <a
+          href="#main"
+          className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-2 focus:z-50 focus:rounded focus:bg-surface focus:px-4 focus:py-2 focus:text-ink-1 focus:outline-2 focus:outline-accent"
+        >
+          Skip to content
+        </a>
+        <Header />
+        <Sidebar />
+        <BottomTabBar />
+        <main id="main" tabIndex={-1} className="px-4 py-6 pb-24 outline-none lg:pb-6 lg:pl-62 lg:pr-6">
+          <KillSwitchOutcome />
+          {children}
+        </main>
+      </div>
+    </ShellStatusProvider>
   );
 }

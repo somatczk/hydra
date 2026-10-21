@@ -133,7 +133,7 @@ export function isStale(
   return now - ts > maxAgeMs;
 }
 
-/** Signed out (R-P2-13). shortcut: a direct 401 only, upgrade when fetchApi maps Authelia redirects to 401 (E-1). */
+/** Signed out (R-P2-13): a 401, including the one fetchApi raises for a sign-in redirect (E-1). */
 export function isSignedOut(err: unknown): boolean {
   return isHttpError(err) && err.status === 401;
 }
