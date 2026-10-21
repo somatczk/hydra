@@ -48,6 +48,4 @@ _template_meta:
   description: Triple confirmation (RSI + MACD + EMA) for high-probability entries. Fewer trades but higher win rate. Works across market conditions.
   type: rule_based
   risk_level: conservative
-  expected_sharpe: 1.2
-  expected_max_drawdown: 10.0
   recommended_capital: 5000

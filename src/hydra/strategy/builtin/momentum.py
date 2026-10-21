@@ -13,7 +13,6 @@ import numpy as np
 
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import Direction, Symbol
-from hydra.indicators.library import atr, macd, rsi
 from hydra.strategy.base import BaseStrategy
 
 
@@ -42,13 +41,10 @@ class MomentumRSIMACDStrategy(BaseStrategy):
         if len(bars) < self.required_history:
             return signals
 
-        close = np.array([float(b.close) for b in bars], dtype=np.float64)
-        high = np.array([float(b.high) for b in bars], dtype=np.float64)
-        low = np.array([float(b.low) for b in bars], dtype=np.float64)
-
-        rsi_vals = rsi(close, rsi_period)
-        _, _, hist = macd(close, macd_fast, macd_slow, macd_signal)
-        atr_vals = atr(high, low, close, atr_period)
+        ind = self._context.indicator
+        rsi_vals = ind("rsi", symbol, tf, period=rsi_period)
+        hist = ind("macd_hist", symbol, tf, fast=macd_fast, slow=macd_slow, signal=macd_signal)
+        atr_vals = ind("atr", symbol, tf, period=atr_period)
 
         if len(rsi_vals) < 2 or len(hist) < 2:
             return signals

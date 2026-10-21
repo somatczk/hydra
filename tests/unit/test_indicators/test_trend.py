@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 import numpy as np
+import talib
 
-from hydra.indicators.library import ema, ichimoku, macd, sma, supertrend
+from hydra.indicators.library import (
+    ema,
+    ichimoku,
+    macd,
+    macd_hist,
+    macd_signal,
+    sma,
+    supertrend,
+    supertrend_direction,
+)
 
 
 class TestSMA:
@@ -163,3 +173,23 @@ class TestIchimoku:
         tenkan_first_valid = np.argmax(~np.isnan(result["tenkan_sen"]))
         kijun_first_valid = np.argmax(~np.isnan(result["kijun_sen"]))
         assert tenkan_first_valid < kijun_first_valid
+
+
+def test_supertrend_valid_after_atr_seed() -> None:
+    rng = np.random.default_rng(3)
+    close = 30000 * np.exp(np.cumsum(rng.normal(0, 0.01, 300)))
+    high, low = close * 1.004, close * 0.996
+    line, direction = supertrend(high, low, close, period=10, multiplier=3.0)
+    assert np.isnan(line[:10]).all()
+    assert np.isfinite(line[10:]).all()
+    assert set(direction[10:]) == {1.0, -1.0}
+    only_direction = supertrend_direction(high, low, close, 10, 3.0)
+    assert np.array_equal(only_direction, direction, equal_nan=True)
+
+
+def test_macd_single_outputs_equal_talib() -> None:
+    rng = np.random.default_rng(9)
+    data = 100 + np.cumsum(rng.standard_normal(120))
+    _, ref_signal, ref_hist = talib.MACD(data, 12, 26, 9)
+    assert np.array_equal(macd_signal(data, 12, 26, 9), ref_signal, equal_nan=True)
+    assert np.array_equal(macd_hist(data, 12, 26, 9), ref_hist, equal_nan=True)

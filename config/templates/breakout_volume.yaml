@@ -9,16 +9,16 @@ exchange:
 timeframes:
   primary: 1h
 parameters:
-  description: Breakout strategy that enters when price breaks above Bollinger upper band with above-average volume confirmation.
+  description: Breakout strategy that enters when the close crosses above the upper Bollinger band and exits below the middle band.
   required_history: 50
   rules:
     entry_long:
       operator: AND
       conditions:
-        - indicator: bollinger_bands
-          params: {period: 20, std_dev: 2.0}
-          comparator: greater_than
-          value: 1.0
+        - indicator: close
+          params: {}
+          comparator: crosses_above
+          value: "bollinger_upper:period=20,std_dev=2.0"
         - indicator: atr
           params: {period: 14}
           comparator: greater_than
@@ -26,10 +26,10 @@ parameters:
     exit_long:
       operator: AND
       conditions:
-        - indicator: bollinger_bands
-          params: {period: 20, std_dev: 2.0}
+        - indicator: close
+          params: {}
           comparator: less_than
-          value: 0.5
+          value: "bollinger_middle:period=20,std_dev=2.0"
     entry_short: null
     exit_short: null
 position_sizing:
@@ -40,6 +40,4 @@ _template_meta:
   description: Volatility breakout with Bollinger Band expansion. Aggressive entries on high-momentum moves. Best in volatile markets.
   type: rule_based
   risk_level: aggressive
-  expected_sharpe: 1.3
-  expected_max_drawdown: 22.0
   recommended_capital: 10000

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import numpy as np
+import talib
 
-from hydra.indicators.library import cci, rsi, stochastic, williams_r
+from hydra.indicators.library import cci, rsi, stochastic, stochastic_d, williams_r
 
 
 class TestRSI:
@@ -137,3 +138,25 @@ class TestWilliamsR:
         result = williams_r(high, low, close, period=14)
         valid = result[~np.isnan(result)]
         np.testing.assert_allclose(valid, -100.0)
+
+
+def test_stochastic_is_fast_stochf_exact() -> None:
+    high = np.array([3, 5, 4, 6, 7], dtype=np.float64)
+    low = np.array([1, 2, 2, 3, 5], dtype=np.float64)
+    close = np.array([2, 4, 3, 5, 6], dtype=np.float64)
+    k, d = stochastic(high, low, close, k_period=3, d_period=2)
+    np.testing.assert_array_equal(k, [np.nan, np.nan, np.nan, 75.0, 80.0])
+    np.testing.assert_array_equal(d, [np.nan, np.nan, np.nan, 62.5, 77.5])
+    assert np.array_equal(stochastic_d(high, low, close, 3, 2), d, equal_nan=True)
+
+
+def test_stochastic_matches_stochf_on_a_random_walk_and_zero_range_is_0() -> None:
+    rng = np.random.default_rng(11)
+    close = 100 + np.cumsum(rng.standard_normal(200))
+    high, low = close + rng.uniform(0, 2, 200), close - rng.uniform(0, 2, 200)
+    k, d = stochastic(high, low, close, 14, 3)
+    ref_k, ref_d = talib.STOCHF(high, low, close, 14, 3, 0)
+    assert np.array_equal(k, ref_k, equal_nan=True)
+    assert np.array_equal(d, ref_d, equal_nan=True)
+    flat = np.full(20, 5.0)
+    assert stochastic(flat, flat, flat, 14, 3)[0][-1] == 0.0

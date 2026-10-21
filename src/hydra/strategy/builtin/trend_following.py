@@ -13,7 +13,6 @@ import numpy as np
 
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import Direction, Symbol
-from hydra.indicators.library import ema, supertrend
 from hydra.strategy.base import BaseStrategy
 
 
@@ -39,13 +38,11 @@ class TrendFollowingSupertrend(BaseStrategy):
         if len(bars) < self.required_history:
             return signals
 
-        close = np.array([float(b.close) for b in bars], dtype=np.float64)
-        high = np.array([float(b.high) for b in bars], dtype=np.float64)
-        low = np.array([float(b.low) for b in bars], dtype=np.float64)
-
-        _, st_dir = supertrend(high, low, close, st_period, st_multiplier)
-        fast_ema_vals = ema(close, fast_ema_period)
-        slow_ema_vals = ema(close, slow_ema_period)
+        ind = self._context.indicator
+        st = {"period": st_period, "multiplier": st_multiplier}
+        st_dir = ind("supertrend_direction", symbol, tf, **st)
+        fast_ema_vals = ind("ema", symbol, tf, period=fast_ema_period)
+        slow_ema_vals = ind("ema", symbol, tf, period=slow_ema_period)
 
         if np.isnan(st_dir[-1]) or np.isnan(fast_ema_vals[-1]) or np.isnan(slow_ema_vals[-1]):
             return signals
@@ -59,17 +56,16 @@ class TrendFollowingSupertrend(BaseStrategy):
         htf_confirmed = True
         confirm_tf = self._config.timeframes.confirmation
         if confirm_tf is not None:
-            htf_bars = self._context.bars(symbol, confirm_tf, st_period + 10)
-            if len(htf_bars) >= st_period + 1:
-                htf_close = np.array([float(b.close) for b in htf_bars], dtype=np.float64)
-                htf_high = np.array([float(b.high) for b in htf_bars], dtype=np.float64)
-                htf_low = np.array([float(b.low) for b in htf_bars], dtype=np.float64)
-                _, htf_dir = supertrend(htf_high, htf_low, htf_close, st_period, st_multiplier)
-                if not np.isnan(htf_dir[-1]) and (
+            htf_dir = ind("supertrend_direction", symbol, confirm_tf, **st)
+            if (
+                len(htf_dir)
+                and not np.isnan(htf_dir[-1])
+                and (
                     (is_bullish_st and htf_dir[-1] != 1.0)
                     or (is_bearish_st and htf_dir[-1] != -1.0)
-                ):
-                    htf_confirmed = False
+                )
+            ):
+                htf_confirmed = False
 
         if not htf_confirmed:
             return signals

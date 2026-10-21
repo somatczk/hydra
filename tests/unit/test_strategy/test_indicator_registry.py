@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import numpy as np
+
+from hydra.core.types import OHLCV, Timeframe
+from hydra.strategy.context import StrategyContext
 from hydra.strategy.indicator_registry import IndicatorInfo, ParamInfo, get_all_indicators
 
 
@@ -52,34 +59,62 @@ class TestGetAllIndicators:
         names = {ind.name for ind in indicators}
         assert "sma" in names
 
-    def test_bollinger_bands_present(self) -> None:
-        """Bollinger Bands should be in the indicator list."""
-        indicators = get_all_indicators()
-        names = {ind.name for ind in indicators}
-        assert "bollinger_bands" in names
+    def test_multi_output_functions_are_not_offered(self) -> None:
+        names = {ind.name for ind in get_all_indicators()}
+        assert names.isdisjoint({"bollinger_bands", "keltner_channels", "ichimoku"})
 
     def test_known_indicators_complete(self) -> None:
-        """All known library indicators should be discovered."""
-        indicators = get_all_indicators()
-        names = {ind.name for ind in indicators}
+        """Every single-output library indicator is discovered with its category."""
+        categories = {ind.name: ind.category for ind in get_all_indicators()}
         expected = {
-            "sma",
-            "ema",
-            "macd",
-            "supertrend",
-            "ichimoku",
-            "rsi",
-            "stochastic",
-            "cci",
-            "williams_r",
-            "atr",
-            "bollinger_bands",
-            "keltner_channels",
-            "obv",
-            "vwap",
-            "mfi",
+            "sma": "trend",
+            "ema": "trend",
+            "macd": "trend",
+            "macd_signal": "trend",
+            "macd_hist": "trend",
+            "supertrend": "trend",
+            "supertrend_direction": "trend",
+            "rsi": "momentum",
+            "stochastic": "momentum",
+            "stochastic_d": "momentum",
+            "cci": "momentum",
+            "williams_r": "momentum",
+            "atr": "volatility",
+            "bollinger_upper": "volatility",
+            "bollinger_middle": "volatility",
+            "bollinger_lower": "volatility",
+            "keltner_upper": "volatility",
+            "keltner_lower": "volatility",
+            "rolling_max": "volatility",
+            "obv": "volume",
+            "vwap": "volume",
+            "mfi": "volume",
         }
-        assert expected.issubset(names)
+        assert {name: categories.get(name) for name in expected} == expected
+
+    def test_every_offered_indicator_evaluates_in_a_context(self) -> None:
+        """What the builder offers is what a rule can evaluate, with its default params."""
+        rng = np.random.default_rng(1)
+        closes = 100 + np.cumsum(rng.standard_normal(100))
+        ctx = StrategyContext()
+        for i, c in enumerate(closes):
+            ctx.add_bar(
+                "BTCUSDT",
+                Timeframe.H1,
+                OHLCV(
+                    open=Decimal(str(c)),
+                    high=Decimal(str(c + 1)),
+                    low=Decimal(str(c - 1)),
+                    close=Decimal(str(c)),
+                    volume=Decimal(10 + i),
+                    timestamp=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(hours=i),
+                ),
+            )
+        for ind in get_all_indicators():
+            params = {p.name: p.default if p.default is not None else 14 for p in ind.params}
+            vals = ctx.indicator(ind.name, "BTCUSDT", Timeframe.H1, **params)
+            assert vals.shape == (100,), ind.name
+            assert np.isfinite(vals[-1]), ind.name
 
 
 class TestParamSchemas:

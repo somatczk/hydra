@@ -16,8 +16,8 @@ parameters:
       conditions:
         - indicator: close
           params: {}
-          comparator: equals
-          value: "rolling_max:period=20"
+          comparator: greater_than
+          value: "rolling_max:period=19"
           value_ref_overrides:
             lookback: period
     exit_long:
@@ -26,13 +26,13 @@ parameters:
         - indicator: close
           params: {}
           comparator: less_than
-          value: "rolling_max:period=20"
+          value: "rolling_max:period=19"
           value_ref_overrides:
             lookback: period
     entry_short: null
     exit_short: null
   required_history: 25
-  description: "Quantpedia 2022 / Beluska & Vojtko 2024. MAX(20) trend leg only. Hold BTC on day t+1 if close_t == rolling_max(20). Return/vol 2.06. OOS: MAX held up, MIN degraded — using MAX only."
+  description: "Quantpedia 2022 / Beluska & Vojtko 2024. MAX(20) trend leg only. Hold BTC on day t+1 if close_t is the 20-day max, i.e. above the max of the 19 closes before it (rolling_max excludes the current bar). Return/vol 2.06. OOS: MAX held up, MIN degraded — using MAX only."
 position_sizing:
   method: fixed_fractional
   risk_per_trade_pct: 2.0

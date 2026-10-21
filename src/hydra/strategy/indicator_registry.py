@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from hydra.indicators import library as ind_lib
+from hydra.strategy.context import DATA_PARAMS, MULTI_OUTPUT
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -22,18 +23,24 @@ _CATEGORY_MAP: dict[str, str] = {
     "sma": "trend",
     "ema": "trend",
     "macd": "trend",
+    "macd_signal": "trend",
+    "macd_hist": "trend",
     "supertrend": "trend",
-    "ichimoku": "trend",
+    "supertrend_direction": "trend",
     "rsi": "momentum",
     "stochastic": "momentum",
+    "stochastic_d": "momentum",
     "cci": "momentum",
     "williams_r": "momentum",
     "atr": "volatility",
-    "bollinger_bands": "volatility",
+    "bollinger_upper": "volatility",
+    "bollinger_middle": "volatility",
+    "bollinger_lower": "volatility",
     "rolling_max": "volatility",
     "rolling_min": "volatility",
     "rolling_mid": "volatility",
-    "keltner_channels": "volatility",
+    "keltner_upper": "volatility",
+    "keltner_lower": "volatility",
     "obv": "volume",
     "vwap": "volume",
     "mfi": "volume",
@@ -43,19 +50,25 @@ _CATEGORY_MAP: dict[str, str] = {
 _DESCRIPTION_MAP: dict[str, str] = {
     "sma": "Simple Moving Average",
     "ema": "Exponential Moving Average",
-    "macd": "Moving Average Convergence Divergence",
-    "supertrend": "Supertrend indicator with ATR-based bands",
-    "ichimoku": "Ichimoku Cloud with multiple support/resistance lines",
+    "macd": "MACD line (fast EMA - slow EMA)",
+    "macd_signal": "MACD signal line (EMA of the MACD line)",
+    "macd_hist": "MACD histogram (MACD line - signal line)",
+    "supertrend": "Supertrend line (ATR-based trailing band)",
+    "supertrend_direction": "Supertrend direction (+1 bullish, -1 bearish)",
     "rsi": "Relative Strength Index (0-100 oscillator)",
-    "stochastic": "Stochastic Oscillator (%K, %D)",
+    "stochastic": "Fast stochastic %K (0-100)",
+    "stochastic_d": "Fast stochastic %D (SMA of %K)",
     "cci": "Commodity Channel Index",
     "williams_r": "Williams %R (-100 to 0 oscillator)",
-    "atr": "Average True Range (volatility measure)",
-    "bollinger_bands": "Bollinger Bands (upper, middle, lower)",
-    "rolling_max": "Rolling maximum (Donchian upper on closes)",
-    "rolling_min": "Rolling minimum (Donchian lower on closes)",
-    "rolling_mid": "Rolling midpoint (Donchian midline on closes)",
-    "keltner_channels": "Keltner Channels (upper, middle, lower)",
+    "atr": "Average True Range (Wilder)",
+    "bollinger_upper": "Upper Bollinger Band",
+    "bollinger_middle": "Middle Bollinger Band (SMA)",
+    "bollinger_lower": "Lower Bollinger Band",
+    "rolling_max": "Highest close of the previous N bars (Donchian upper)",
+    "rolling_min": "Lowest close of the previous N bars (Donchian lower)",
+    "rolling_mid": "Midpoint of the previous N closes (Donchian midline)",
+    "keltner_upper": "Upper Keltner Channel (EMA + ATR multiple)",
+    "keltner_lower": "Lower Keltner Channel (EMA - ATR multiple)",
     "obv": "On Balance Volume",
     "vwap": "Volume Weighted Average Price",
     "mfi": "Money Flow Index (0-100 oscillator)",
@@ -71,23 +84,9 @@ _PARAM_CONSTRAINTS: dict[str, dict[str, tuple[int | float, int | float]]] = {
     "std_dev": {"min": 0.1, "max": 5.0},
     "k_period": {"min": 2, "max": 100},
     "d_period": {"min": 2, "max": 100},
-    "tenkan": {"min": 2, "max": 100},
-    "kijun": {"min": 2, "max": 100},
-    "senkou_b": {"min": 2, "max": 200},
     "ema_period": {"min": 2, "max": 200},
     "atr_period": {"min": 2, "max": 200},
 }
-
-# Parameters that represent data arrays (not user-configurable)
-_DATA_PARAMS: frozenset[str] = frozenset(
-    {
-        "data",
-        "close",
-        "high",
-        "low",
-        "volume",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +138,7 @@ def _extract_params(func: Any) -> list[ParamInfo]:
 
     for name, param in sig.parameters.items():
         # Skip data array parameters
-        if name in _DATA_PARAMS:
+        if name in DATA_PARAMS:
             continue
 
         default = param.default if param.default is not inspect.Parameter.empty else None
@@ -173,8 +172,8 @@ def get_all_indicators() -> list[IndicatorInfo]:
     indicators: list[IndicatorInfo] = []
 
     for name in sorted(dir(ind_lib)):
-        # Skip private/internal names and non-functions
-        if name.startswith("_"):
+        # Skip private/internal names, non-functions and multi-output functions
+        if name.startswith("_") or name in MULTI_OUTPUT:
             continue
 
         obj = getattr(ind_lib, name)

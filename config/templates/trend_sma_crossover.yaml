@@ -18,14 +18,14 @@ parameters:
         - indicator: sma
           params: {period: 20}
           comparator: crosses_above
-          value: sma_50
+          value: "sma:period=50"
     exit_long:
       operator: AND
       conditions:
         - indicator: sma
           params: {period: 20}
           comparator: crosses_below
-          value: sma_50
+          value: "sma:period=50"
     entry_short: null
     exit_short: null
 position_sizing:
@@ -36,6 +36,4 @@ _template_meta:
   description: Classic SMA golden/death cross on 4h timeframe. Trend-following with wide stops. Best in trending markets.
   type: rule_based
   risk_level: moderate
-  expected_sharpe: 0.9
-  expected_max_drawdown: 18.0
   recommended_capital: 10000

@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 import numpy as np
+import talib
 
-from hydra.indicators.library import atr, bollinger_bands, keltner_channels
+from hydra.indicators.library import (
+    atr,
+    bollinger_bands,
+    keltner_channels,
+    keltner_lower,
+    keltner_upper,
+    rolling_max,
+    rolling_mid,
+    rolling_min,
+)
 
 
 class TestATR:
@@ -110,3 +120,30 @@ class TestKeltnerChannels:
         assert len(upper) == n
         assert len(middle) == n
         assert len(lower) == n
+
+
+def test_atr_matches_wilder_exact() -> None:
+    high = np.array([10, 12, 13, 12, 15, 16, 15, 17], dtype=np.float64)
+    low = np.array([8, 9, 11, 10, 12, 14, 13, 15], dtype=np.float64)
+    close = np.array([9, 11, 12, 11, 14, 15, 14, 16], dtype=np.float64)
+    expected = [np.nan, np.nan, np.nan, 7 / 3, 26 / 9, 70 / 27, 194 / 81, 631 / 243]
+    result = atr(high, low, close, period=3)
+    np.testing.assert_allclose(result, expected, rtol=1e-12)
+    np.testing.assert_array_equal(result, talib.ATR(high, low, close, timeperiod=3))
+
+
+def test_keltner_single_outputs_equal_the_channel() -> None:
+    rng = np.random.default_rng(5)
+    close = 100 + np.cumsum(rng.standard_normal(80))
+    high, low = close + 1, close - 1
+    upper, _, lower = keltner_channels(high, low, close, 20, 10, 1.5)
+    assert np.array_equal(keltner_upper(high, low, close, 20, 10, 1.5), upper, equal_nan=True)
+    assert np.array_equal(keltner_lower(high, low, close, 20, 10, 1.5), lower, equal_nan=True)
+
+
+def test_donchian_window_excludes_the_current_bar() -> None:
+    data = np.array([1, 3, 2, 5, 4], dtype=np.float64)
+    nan = np.nan
+    np.testing.assert_array_equal(rolling_max(data, 2), [nan, nan, 3, 3, 5])
+    np.testing.assert_array_equal(rolling_min(data, 2), [nan, nan, 1, 2, 2])
+    np.testing.assert_array_equal(rolling_mid(data, 2), [nan, nan, 2, 2.5, 3.5])
