@@ -15,6 +15,7 @@ interface ConfirmDialogProps {
   pendingHint: string;
   onConfirm: () => Promise<void>;
   onClose: () => void;
+  primaryDisabled?: boolean;
   /** Focus the title on open so a stray Enter can't confirm (R-P2-11). */
   destructive?: boolean;
 }
@@ -30,6 +31,7 @@ export function ConfirmDialog({
   pendingHint,
   onConfirm,
   onClose,
+  primaryDisabled = false,
   destructive = false,
 }: ConfirmDialogProps) {
   const ref = useRef<HTMLDialogElement>(null);
@@ -79,7 +81,7 @@ export function ConfirmDialog({
       </h2>
       <div className="mt-2 flex flex-col gap-2 text-sm">{children}</div>
       <div className="mt-6 flex flex-col gap-2 lg:flex-row-reverse">
-        <Button ref={primaryRef} size="lg" className="max-lg:w-full" loading={pending} onClick={() => void confirm()}>
+        <Button ref={primaryRef} size="lg" className="max-lg:w-full" loading={pending} disabled={primaryDisabled} onClick={() => void confirm()}>
           {pending ? pendingLabel : primaryLabel}
         </Button>
         <Button variant="ghost" size="lg" className="max-lg:w-full" onClick={onClose}>

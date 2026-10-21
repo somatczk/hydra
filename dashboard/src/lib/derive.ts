@@ -21,6 +21,8 @@ export interface SessionResponse {
   persist_error: string | null;
   last_bar_at?: string | null;
   entries_paused?: string | null;
+  persist_dirty?: boolean | null;
+  feed_live?: boolean | null;
 }
 
 /** A fill: the TradeItem model plus the paper extras (`amount`); `quantity` is 0 until the A9 fix. */
@@ -45,13 +47,37 @@ export interface PositionItem {
   unrealized_pnl: number;
 }
 
+/** trading.py OpenOrderItem: `stop_price` is where a resting stop triggers (null on a LIMIT). */
+export interface OpenOrder {
+  id: string;
+  symbol: string;
+  side: string;
+  type: string;
+  amount: number;
+  price: number | null;
+  stop_price: number | null;
+  reason: string;
+  protective: boolean | null;
+}
+
+/** trading.py SessionMetrics; the account numbers are null until the paper ledger reports them. */
+export interface SessionMetrics {
+  equity: number | null;
+  realized_pnl: number | null;
+  unrealized_pnl: number | null;
+  fees: number | null;
+  /** A fraction of peak equity, not a percent. */
+  drawdown: number | null;
+}
+
 export interface SessionDetail extends SessionResponse {
   last_bar_at: string | null;
   entries_paused: string | null;
   protection_failures: string[];
-  metrics: Record<string, unknown>;
+  metrics: SessionMetrics;
   positions: PositionItem[];
   trades: TradeItem[];
+  open_orders: OpenOrder[];
 }
 
 export interface Restrictions {

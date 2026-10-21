@@ -31,9 +31,10 @@ export function detail(over: Partial<SessionDetail> = {}): SessionDetail {
     last_bar_at: '2026-10-21T14:00:04+00:00',
     entries_paused: null,
     protection_failures: [],
-    metrics: { balance: { USDT: 4898.58 }, total_pnl: 0, win_rate: 0.0, total_trades: 1, open_positions: 1 },
+    metrics: { equity: 4998.58, realized_pnl: 0, unrealized_pnl: -1.42, fees: 0.1, drawdown: 0.0003 },
     positions: [],
     trades: [],
+    open_orders: [],
     ...over,
   };
 }
