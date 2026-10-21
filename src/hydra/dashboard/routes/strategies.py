@@ -159,4 +159,5 @@ async def export_strategy(strategy_id: str) -> Response:
 @router.post("/import", response_model=SaveResponse, status_code=201)
 async def import_strategy(file: UploadFile) -> SaveResponse:
     """Import a strategy from an uploaded YAML file."""
+    svc.check_import_filename(file.filename)
     return svc.import_strategy(file.filename, await file.read())

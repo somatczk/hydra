@@ -137,7 +137,11 @@ def _hyperopt_body(strategy_id: str = "saw", **overrides: Any) -> dict[str, Any]
 
 def test_dashboard_has_no_synthetic_bar_generator() -> None:
     offenders: list[str] = []
-    for path in [*(SRC / "dashboard").rglob("*.py"), *(SRC / "services").rglob("*.py")]:
+    for path in [
+        *(SRC / "dashboard").rglob("*.py"),
+        *(SRC / "services").rglob("*.py"),
+        SRC / "backtest" / "jobs.py",
+    ]:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "_generate_sample_bars":
@@ -152,7 +156,10 @@ def test_dashboard_has_no_synthetic_bar_generator() -> None:
 
 
 def test_no_seeded_placeholder_results() -> None:
-    source = (SRC / "services" / "backtest.py").read_text()
+    source = "".join(
+        (SRC / rel).read_text()
+        for rel in ("services/backtest.py", "services/research.py", "backtest/jobs.py")
+    )
     assert not any(f'"bt-{n}"' in source for n in (1, 2, 3))
     assert "LSTM Momentum" not in source
 

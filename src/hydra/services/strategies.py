@@ -801,10 +801,15 @@ def save_strategy(request: SaveRequest) -> SaveResponse:
     )
 
 
-def import_strategy(filename: str | None, content: bytes) -> SaveResponse:
-    """Import a strategy from an uploaded YAML file."""
+def check_import_filename(filename: str | None) -> None:
+    """Reject an upload that is not a .yaml/.yml file, before its body is read."""
     if not filename or not filename.endswith((".yaml", ".yml")):
         raise ServiceError(422, "File must be .yaml or .yml")
+
+
+def import_strategy(filename: str | None, content: bytes) -> SaveResponse:
+    """Import a strategy from an uploaded YAML file."""
+    check_import_filename(filename)
 
     try:
         data = yaml.safe_load(content.decode("utf-8"))

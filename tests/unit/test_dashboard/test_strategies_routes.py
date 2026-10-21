@@ -18,6 +18,7 @@ import pytest
 import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile
 
 from hydra.dashboard.routes.strategies import router
 from hydra.services.strategies import _row_to_strategy, _status_from_enabled
@@ -550,6 +551,31 @@ class TestStrategiesFallback:
         assert written["name"] == "Completely Different Name"
         # Verify required_history preserved from original
         assert written["parameters"]["required_history"] == 75
+
+    def test_import_rejects_wrong_extension_without_reading_upload(
+        self, client_no_pool: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads: list[str | None] = []
+        real_read = UploadFile.read
+
+        async def spy_read(self: UploadFile, size: int = -1) -> bytes:
+            reads.append(self.filename)
+            return await real_read(self, size)
+
+        monkeypatch.setattr(UploadFile, "read", spy_read)
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            rejected = client_no_pool.post(
+                "/api/strategies/import", files={"file": ("x.txt", b"a" * 2_000_000)}
+            )
+            accepted = client_no_pool.post(
+                "/api/strategies/import",
+                files={"file": ("ok.yaml", yaml.safe_dump({"name": "Up"}).encode())},
+            )
+        assert rejected.status_code == 422
+        assert rejected.json() == {"detail": "File must be .yaml or .yml"}
+        assert accepted.status_code == 201
+        assert reads == ["ok.yaml"]
+        assert [f.name for f in tmp_path.glob("*.yaml")] == [f"{accepted.json()['id']}.yaml"]
 
 
 # ---------------------------------------------------------------------------
