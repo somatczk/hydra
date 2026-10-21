@@ -241,7 +241,7 @@ class TestEntryBarAfterALiveFill:
         await h.bar(session, "106", open="100", low="100", high="106")
 
         assert [f.side for f in executor(session).get_fills()] == ["BUY"]
-        assert await _resting(session) == [("TRAILING_STOP", None)]
+        assert await _resting(session) == [("TRAILING_STOP", 100.7)]  # 106 x 0.95
 
         await h.bar(session, "100", open="106", high="110", low="100")
 

@@ -229,10 +229,11 @@ class TestClosedBarSemantics:
     async def test_trailing_stop_sell_follows_peak_then_triggers(self) -> None:
         ex = await holding("1", "100", fee="0", slippage="0")
         await ex.create_order(BTC, "SELL", "TRAILING_STOP", D("1"), params={"trail_pct": "0.05"})
+        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [95.0]
 
         assert await ex.on_closed_bar(BTC, bar(1, "100", "120", "99", "118")) == []
         (order,) = await ex.fetch_open_orders()
-        assert order["trail_pct"] == 0.05
+        assert (order["trail_pct"], order["price"], order["stop_price"]) == (0.05, None, 114.0)
 
         (fill,) = await ex.on_closed_bar(BTC, bar(2, "118", "119", "110", "111"))
         assert fill.reason == "trailing_stop"
@@ -250,6 +251,7 @@ class TestClosedBarSemantics:
         assert ex.get_account_snapshot().quote_locked == D("105.00")
 
         assert await ex.on_closed_bar(BTC, bar(1, "100", "101", "80", "83")) == []
+        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [84.0]
         (fill,) = await ex.on_closed_bar(BTC, bar(2, "82", "90", "81", "89"))
         assert fill.price == D("84.00")
         assert await ex.fetch_balance() == {"USDT": D("916.00"), "BTC": D("1")}

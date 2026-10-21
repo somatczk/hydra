@@ -168,7 +168,8 @@ class HealthMonitor:
         metrics.mark_health_monitor_run(at=self._clock())
         return result
 
-    def _fresh(self) -> Readiness | None:
+    def fresh(self) -> Readiness | None:
+        """The last result while at most ``CACHE_INTERVALS`` intervals old, else None."""
         last = self.last
         if last is None:
             return None
@@ -177,11 +178,11 @@ class HealthMonitor:
 
     async def readiness(self) -> Readiness:
         """The last evaluation while fresh, else a new one; never writes the gauges."""
-        cached = self._fresh()
+        cached = self.fresh()
         if cached is not None:
             return cached
         async with self._lock:
-            cached = self._fresh()
+            cached = self.fresh()
             if cached is not None:
                 return cached
             result = await self.check()

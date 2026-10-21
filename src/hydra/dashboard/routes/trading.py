@@ -6,7 +6,6 @@ paper executor). Errors use the ``_db.py`` envelope.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from decimal import Decimal
 from typing import Any, Literal, Self
@@ -15,7 +14,6 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hydra.core.types import OrderType, Side
-from hydra.dashboard.health import SNAPSHOT_TIMEOUT_S
 from hydra.dashboard.routes._db import api_error, require_pool
 from hydra.dashboard.routes.strategies import build_strategy_name_map
 from hydra.dashboard.security import audit
@@ -380,22 +378,22 @@ async def list_sessions(request: Request) -> list[dict[str, Any]]:
     """List all trading sessions (running + recent stopped) with each one's health."""
     mgr = _get_session_manager(request)
     name_map = build_strategy_name_map()
-    try:
-        snap = await asyncio.wait_for(mgr.health_snapshot(), SNAPSHOT_TIMEOUT_S)
-        health = {h.session_id: h for h in snap.sessions}
-    except Exception:
-        logger.warning("Session list: health snapshot failed", exc_info=True)
-        health = {}
     results = []
     for s in mgr.list_sessions():
         d = _session_to_dict(s)
         d["strategy_name"] = name_map.get(s.strategy_id)
-        h = health.get(s.session_id)
-        if h is not None:
-            d["last_bar_at"] = h.last_bar_at.isoformat() if h.last_bar_at else None
-            d["entries_paused"] = h.entries_paused
-            d["persist_dirty"] = h.persist_dirty
-            d["feed_live"] = h.feed_live
+        # health_snapshot()'s reads without its DB query, so a DB stall never slows this poll
+        rt, executor = s._runtime, s._executor
+        d["last_bar_at"] = s.last_bar_at.isoformat() if s.last_bar_at else None
+        d["entries_paused"] = rt.entries_paused if rt is not None else None
+        d["feed_live"] = (
+            rt.feed.is_live(s.exchange_id) if rt is not None and s.task_alive else False
+        )
+        d["persist_dirty"] = (
+            executor.get_account_snapshot().persist_dirty
+            if isinstance(executor, PaperTradingExecutor)
+            else None
+        )
         results.append(d)
     return results
 
@@ -416,7 +414,12 @@ async def get_session_detail(session_id: str, request: Request) -> dict[str, Any
     if isinstance(executor, PaperTradingExecutor):
         rt = session._runtime
         detail["open_orders"] = [
-            {**o, "protective": rt.protect.is_protective(o["oco_id"] or o["id"]) if rt else None}
+            {
+                **o,
+                # a LIMIT's stop_price is only its risk-check stop: nothing rests there
+                "stop_price": None if o["type"] == OrderType.LIMIT else o["stop_price"],
+                "protective": rt.protect.is_protective(o["oco_id"] or o["id"]) if rt else None,
+            }
             for o in await executor.fetch_open_orders()
         ]
     return dict(detail)

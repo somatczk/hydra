@@ -72,7 +72,7 @@ async def load_session_trades(db_pool: Any, session: TradingSession) -> list[dic
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, symbol, side, quantity, price, fee, pnl, net_pnl, timestamp
+                SELECT id, symbol, side, quantity, price, fee, pnl, net_pnl, reason, timestamp
                 FROM trades
                 WHERE session_id = $1 AND source = $2
                 ORDER BY timestamp ASC
@@ -90,6 +90,7 @@ async def load_session_trades(db_pool: Any, session: TradingSession) -> list[dic
                     "fee": float(row["fee"]) if row["fee"] else 0,
                     "pnl": float(row["pnl"]) if row["pnl"] else 0,
                     "net_pnl": float(row["net_pnl"]) if row["net_pnl"] is not None else None,
+                    "reason": row["reason"],
                     "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
                 }
                 for row in rows

@@ -647,13 +647,19 @@ async def get_system_health(request: Request) -> dict[str, Any]:
 
 @router.get("/readiness")
 async def get_readiness(request: Request) -> dict[str, Any]:
-    """The health monitor's last ``/readyz`` result and when it ran; never runs a check."""
-    last = getattr(getattr(request.app.state, "health_monitor", None), "last", None)
-    if last is None:
+    """The health monitor's last ``/readyz`` result, when it ran and whether ``/readyz`` would
+    still serve it (``stale``, judged on the server's clock); never runs a check."""
+    monitor = getattr(request.app.state, "health_monitor", None)
+    last = getattr(monitor, "last", None)
+    if monitor is None or last is None:
         raise api_error(
             503, "readiness_unavailable", "No readiness check has run yet", "unavailable"
         )
-    return {**last.body(), "checked_at": datetime.fromtimestamp(last.checked_at, UTC).isoformat()}
+    return {
+        **last.body(),
+        "checked_at": datetime.fromtimestamp(last.checked_at, UTC).isoformat(),
+        "stale": monitor.fresh() is None,
+    }
 
 
 # ---------------------------------------------------------------------------

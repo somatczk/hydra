@@ -469,8 +469,9 @@ async def test_errored_session_holding_base_keeps_its_position_and_dirty_series(
 class TestReadinessApi:
     async def test_serves_the_last_result_without_running_a_check(self, probe: Probe) -> None:
         probe.app.include_router(system_routes.router)
-        probe.clock.now += CACHE_INTERVALS * probe.monitor.interval_s + 1
         pings = probe.pool.pings
+        assert (await probe.client.get("/api/system/readiness")).json()["stale"] is False
+        probe.clock.now += CACHE_INTERVALS * probe.monitor.interval_s + 1
 
         resp = await probe.client.get("/api/system/readiness")
 
@@ -480,6 +481,7 @@ class TestReadinessApi:
         assert resp.json() == {
             **last.body(),
             "checked_at": datetime.fromtimestamp(last.checked_at, UTC).isoformat(),
+            "stale": True,
         }
         assert probe.pool.pings == pings
         await probe.client.get("/readyz")
@@ -544,4 +546,5 @@ class TestRealApp:
         assert readiness.status_code == 200
         body = readiness.json()
         assert body.pop("checked_at")
+        assert body.pop("stale") is False
         assert (body, body["status"]) == (readyz, "not_ready")
