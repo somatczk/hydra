@@ -1,3 +1,4 @@
+import { act } from 'react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
 import { breaker, liveStatus, platformConfig, session } from '@/test/fixtures';
@@ -5,6 +6,7 @@ import {
   buttonByText,
   click,
   dialogPolyfill,
+  flush,
   inputByLabel,
   mount,
   routeFetch,
@@ -193,6 +195,34 @@ describe('kill switch section', () => {
   });
 });
 
+describe('kill switch section, stale and closed-dialog cases', () => {
+  it('shows a failed release in the page panel when the dialog was closed mid-request', async () => {
+    ksState = 'active';
+    let reject: (e: Error) => void = () => {};
+    const pending = new Promise<never>((_, rej) => (reject = rej));
+    const failed = new ApiError(503, JSON.stringify({ detail: { code: 'kill_switch_release_failed', message: 'x', state: 'unavailable' } }));
+    const c = await open({}, { 'DELETE /api/trading/kill-switch': () => pending });
+    await click(buttonByText(c, 'Release…'));
+    const d = dlg(c, 'Release the kill switch?');
+    await typeInto(inputByLabel(d, 'Type RELEASE to confirm'), 'RELEASE');
+    await typeInto(inputByLabel(d, 'Reason'), 'market calm');
+    await click(buttonByText(d, 'Release kill switch'));
+    await click(buttonByText(d, 'Close'));
+    expect(c.querySelector('[aria-label="Outcome alert"]')?.textContent).toBe('');
+
+    await act(async () => reject(failed));
+    await flush();
+    expect(c.querySelector('[aria-label="Outcome alert"]')?.textContent).toContain('the kill switch stays on');
+  });
+
+  it('does not show an older engagement as the current one after a later release', async () => {
+    ksState = 'active';
+    const off = { ...KS_ON_EVENT, id: 9, ts: '2026-10-21T13:00:00Z', kind: 'kill_switch_off' };
+    const c = await open({ '/api/risk/events?limit=500': [off, KS_ON_EVENT] });
+    expect(c.querySelector('#kill-switch')?.textContent).toContain('On since: not in recent events');
+  });
+});
+
 describe('breakers', () => {
   it('lists four tiers and offers a reset on the active tier only', async () => {
     const c = await open();
@@ -318,16 +348,37 @@ describe('limits', () => {
     expect(sent('PUT', '/api/risk/config')).toEqual([]);
   });
 
-  it('shows a persistent danger panel when the engine did not reload the limits', async () => {
+  it('keeps a non-dismissible not-in-force notice in the Limits card until a save succeeds', async () => {
+    const failed = new ApiError(503, JSON.stringify({ detail: { code: 'risk_reload_failed', message: 'x', state: 'unavailable' } }));
+    const c = await open({}, { 'PUT /api/risk/config': (n: number) => (n === 1 ? failed : {}) });
+    await edit(c, 'Max drawdown (%)', '10');
+    await click(buttonByText(c, 'Save limits'));
+
+    const notice = () => c.querySelector('#limits [role="alert"][aria-label="Limits not in force"]');
+    expect(notice()?.textContent).toContain('Saved, but not in force.');
+    expect(c.querySelector('[aria-label="Outcome alert"]')?.textContent).toBe('');
+    expect(notice()?.querySelector('[aria-label="Dismiss"]')).toBeNull();
+
+    await click(buttonByText(c, 'Try again'));
+    expect(sent('PUT', '/api/risk/config')).toEqual([{ max_drawdown_pct: 0.1 }, { max_drawdown_pct: 0.1 }]);
+    expect(notice()).toBeNull();
+    expect(c.querySelector('[role="status"][aria-label="Outcome"]')?.textContent).toContain('Limits saved.');
+  });
+
+  it('keeps the notice when an unrelated outcome replaces the page panel', async () => {
+    ksState = 'active';
     const failed = new ApiError(503, JSON.stringify({ detail: { code: 'risk_reload_failed', message: 'x', state: 'unavailable' } }));
     const c = await open({}, { 'PUT /api/risk/config': failed });
     await edit(c, 'Max drawdown (%)', '10');
     await click(buttonByText(c, 'Save limits'));
+    await click(buttonByText(c, 'Release…'));
+    const d = dlg(c, 'Release the kill switch?');
+    await typeInto(inputByLabel(d, 'Type RELEASE to confirm'), 'RELEASE');
+    await typeInto(inputByLabel(d, 'Reason'), 'market calm');
+    await click(buttonByText(d, 'Release kill switch'));
 
-    const alert = c.querySelector('[role="alert"][aria-label="Outcome alert"]')?.textContent ?? '';
-    expect(alert).toContain('Saved, but not in force.');
-    await click(buttonByText(c, 'Try again'));
-    expect(sent('PUT', '/api/risk/config')).toEqual([{ max_drawdown_pct: 0.1 }, { max_drawdown_pct: 0.1 }]);
+    expect(c.querySelector('[role="status"][aria-label="Outcome"]')?.textContent).toContain('Kill switch released at');
+    expect(c.querySelector('#limits [aria-label="Limits not in force"]')).not.toBeNull();
   });
 });
 

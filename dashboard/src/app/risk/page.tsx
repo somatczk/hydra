@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ActivityLog, actorLabel, type RiskEvent } from '@/components/risk/ActivityLog';
 import { BreakerTable } from '@/components/risk/BreakerTable';
 import { LimitsSheet } from '@/components/risk/LimitsSheet';
@@ -82,27 +82,44 @@ export default function RiskPage() {
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [dialogError, setDialogError] = useState<string | null>(null);
+  const [reloadFailed, setReloadFailed] = useState<Outcome | null>(null);
   const retry = useRef<(() => Promise<unknown>) | null>(null);
+  const dialogRef = useRef<Dialog>(null);
 
   const st = status.data;
   const ks = live.data?.kill_switch_state ?? (live.state === 'loading' ? 'loading' : 'unknown');
   const activeTier = st?.restrictions?.active_tier ?? live.data?.circuit_breaker_restrictions?.active_tier ?? 0;
   const tierLabels = Object.fromEntries((st?.circuit_breakers ?? []).map((b) => [b.tier, b.label]));
-  const onSince = events.data?.find((e) => e.kind === 'kill_switch_on');
+  const lastKs = events.data?.find((e) => e.kind === 'kill_switch_on' || e.kind === 'kill_switch_off');
+  const onSince = lastKs?.kind === 'kill_switch_on' ? lastKs : undefined;
   const resetTier = typeof dialog === 'number' ? dialog : 0;
   const holders = stoppedHolders(sessions.data ?? []);
+
+  const { refetch: refetchEvents } = events;
+  const prevKs = useRef(ks);
+  useEffect(() => {
+    if (prevKs.current !== ks) void refetchEvents();
+    prevKs.current = ks;
+  }, [ks, refetchEvents]);
+
+  const show = (d: Dialog) => {
+    dialogRef.current = d;
+    setDialog(d);
+  };
 
   const refresh = () => Promise.all([shell.refetchAll(), status.refetch(), events.refetch()]);
 
   /** Runs a typed-confirm request: success and "tier no longer active" close the dialog; any other failure keeps it open with the typed values. */
   const attempt = async <T,>(req: Promise<T>, toOutcome: (r: Result<T>) => Outcome) => {
+    const started = dialogRef.current;
     const result = await settle(req);
     const o = toOutcome(result);
     const keep = 'err' in result && parseErrorDetail(result.err)?.code !== 'tier_not_active';
-    if (keep) {
+    // A dialog closed mid-request has no error line to show, so the failure goes to the page panel.
+    if (keep && dialogRef.current === started) {
       setDialogError([o.title, ...o.lines].join(' '));
     } else {
-      setDialog(null);
+      show(null);
       setOutcome(o);
     }
     void refresh();
@@ -110,13 +127,18 @@ export default function RiskPage() {
 
   const open = (d: Dialog) => {
     setDialogError(null);
-    setDialog(d);
+    show(d);
   };
 
   const saveLimits = async (update: RiskLimitsUpdate): Promise<boolean> => {
     retry.current = () => saveLimits(update);
     const result = await settle(fetchApi('/api/risk/config', { method: 'PUT', ...json(update) }));
-    setOutcome(limitsOutcome(result));
+    const o = limitsOutcome(result);
+    if ('err' in result && parseErrorDetail(result.err)?.code === 'risk_reload_failed') setReloadFailed(o);
+    else {
+      if ('ok' in result) setReloadFailed(null);
+      setOutcome(o);
+    }
     void Promise.all([config.refetch(), events.refetch()]);
     return 'ok' in result;
   };
@@ -242,6 +264,19 @@ export default function RiskPage() {
           <h2 id="limits-h" className="mb-3 text-sm font-semibold text-ink-1">
             Limits
           </h2>
+          {reloadFailed && (
+            <div role="alert" aria-label="Limits not in force" className="mb-3 rounded border border-danger p-3 text-sm">
+              <p className="font-semibold text-ink-1">{reloadFailed.title}</p>
+              {reloadFailed.lines.map((l) => (
+                <p key={l} className="text-ink-1">
+                  {l}
+                </p>
+              ))}
+              <Button className="mt-2" variant="secondary" size="sm" onClick={() => void retry.current?.()}>
+                Try again
+              </Button>
+            </div>
+          )}
           {config.data ? (
             <LimitsSheet cfg={config.data} onSave={saveLimits} />
           ) : config.state === 'loading' ? (
@@ -296,7 +331,7 @@ export default function RiskPage() {
         secondaryLabel="Keep it on"
         pendingLabel="Releasing…"
         error={dialog === 'release' ? dialogError : null}
-        onClose={() => setDialog(null)}
+        onClose={() => show(null)}
         onConfirm={(reason) =>
           attempt(fetchApi<KillSwitchResponse>('/api/trading/kill-switch', { method: 'DELETE', ...json({ confirm: 'RELEASE', reason }) }), (r) => releaseOutcome(r))
         }
@@ -316,7 +351,7 @@ export default function RiskPage() {
         secondaryLabel="Keep it"
         pendingLabel="Resetting…"
         error={typeof dialog === 'number' ? dialogError : null}
-        onClose={() => setDialog(null)}
+        onClose={() => show(null)}
         onConfirm={(reason) =>
           attempt(
             fetchApi<CircuitBreaker[]>(`/api/risk/circuit-breakers/${resetTier}/reset`, { method: 'POST', ...json({ reason, confirm_tier: resetTier }) }),
@@ -338,7 +373,7 @@ export default function RiskPage() {
         secondaryLabel="Cancel"
         pendingLabel="Resetting…"
         error={dialog === 'ledger' ? dialogError : null}
-        onClose={() => setDialog(null)}
+        onClose={() => show(null)}
         onConfirm={(reason) =>
           attempt(fetchApi<RiskStatus>('/api/risk/paper-account/reset', { method: 'POST', ...json({ confirm: 'RESET', reason }) }), (r) => ledgerResetOutcome(r))
         }
