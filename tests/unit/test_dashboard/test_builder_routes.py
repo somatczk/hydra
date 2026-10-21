@@ -171,13 +171,13 @@ class TestSaveStrategy:
 
     def test_save_returns_201(self, client: TestClient, tmp_path: Path) -> None:
         """POST /api/strategies/save with valid data returns 201."""
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             response = client.post("/api/strategies/save", json=self._valid_save_request())
         assert response.status_code == 201
 
     def test_save_creates_yaml_file(self, client: TestClient, tmp_path: Path) -> None:
         """Save endpoint creates a YAML file in the config directory."""
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             response = client.post("/api/strategies/save", json=self._valid_save_request())
         assert response.status_code == 201
         yaml_files = list(tmp_path.glob("*.yaml"))
@@ -185,7 +185,7 @@ class TestSaveStrategy:
 
     def test_save_response_structure(self, client: TestClient, tmp_path: Path) -> None:
         """Response has id, name, config_path, message fields."""
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             response = client.post("/api/strategies/save", json=self._valid_save_request())
         data = response.json()
         assert "id" in data
@@ -198,7 +198,7 @@ class TestSaveStrategy:
         """Invalid exchange_id returns 422."""
         request = self._valid_save_request()
         request["exchange_id"] = "invalid_exchange"
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             response = client.post("/api/strategies/save", json=request)
         assert response.status_code == 422
 
@@ -213,7 +213,7 @@ class TestSaveStrategy:
         """Invalid comparator value returns 422."""
         request = self._valid_save_request()
         request["rules"]["entry_long"]["conditions"][0]["comparator"] = "not_a_comparator"
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             response = client.post("/api/strategies/save", json=request)
         assert response.status_code == 422
 
@@ -221,13 +221,13 @@ class TestSaveStrategy:
         """Invalid timeframe returns 422."""
         request = self._valid_save_request()
         request["timeframes"]["primary"] = "2h"
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             response = client.post("/api/strategies/save", json=request)
         assert response.status_code == 422
 
     def test_saved_yaml_is_valid(self, client: TestClient, tmp_path: Path) -> None:
         """The saved YAML file should be loadable and contain the strategy config."""
-        with patch("hydra.dashboard.routes.strategies._CONFIG_DIR", tmp_path):
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             response = client.post("/api/strategies/save", json=self._valid_save_request())
         assert response.status_code == 201
         yaml_files = list(tmp_path.glob("*.yaml"))

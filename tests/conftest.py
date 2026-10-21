@@ -80,7 +80,7 @@ def strategies_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect every writable config dir into tmp_path; the default strategies dir is empty."""
     path = tmp_path / "config" / "strategies"
     path.mkdir(parents=True)
-    monkeypatch.setattr("hydra.dashboard.routes.strategies._CONFIG_DIR", path)
+    monkeypatch.setattr("hydra.services.strategies._CONFIG_DIR", path)
     monkeypatch.setattr("hydra.dashboard.routes.templates._STRATEGIES_DIR", path)
     monkeypatch.setattr("hydra.execution.session_manager._STRATEGY_DIR", path)
     monkeypatch.setenv("HYDRA_ML__MODELS_DIR", str(tmp_path / "models"))
