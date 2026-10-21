@@ -47,13 +47,18 @@ function callerHeaders(headers: HeadersInit | undefined): Record<string, string>
   return Object.fromEntries(new Headers(headers).entries());
 }
 
+/** Envelope for a request the auth proxy redirected to its sign-in page (E-1, R-P2-13). */
+const SIGNED_OUT_BODY = JSON.stringify({
+  detail: { code: 'signed_out', message: "You're signed out. Sign in, then try again.", state: 'unauthenticated' },
+});
+
 /**
  * Typed fetch wrapper for the Hydra API.
  *
  * @param path  - API path starting with `/` (e.g. `/api/strategies`)
  * @param options - Standard `RequestInit` overrides; caller headers are merged, not replaced
  * @returns Parsed JSON response typed as `T`
- * @throws {ApiError} when the server returns a non-2xx status
+ * @throws {ApiError} when the server returns a non-2xx status, or 401 when sent to sign-in
  */
 export async function fetchApi<T>(
   path: string,
@@ -63,6 +68,8 @@ export async function fetchApi<T>(
   const url = `${API_BASE}${path}`;
   const t0 = performance.now();
   const headers: Record<string, string> = {
+    // Authelia answers 401, not a redirect to its login page, to a request that doesn't accept HTML.
+    accept: 'application/json',
     ...(typeof options?.body === 'string' ? { 'content-type': 'application/json' } : {}),
     ...apiHeaders(method),
     ...callerHeaders(options?.headers),
@@ -70,7 +77,8 @@ export async function fetchApi<T>(
 
   let res: Response;
   try {
-    res = await fetch(url, { ...options, method, headers });
+    // A cross-origin redirect to the sign-in portal would reject as a CORS TypeError; keep it readable instead.
+    res = await fetch(url, { redirect: 'manual', ...options, method, headers });
   } catch (err) {
     const ms = Math.round(performance.now() - t0);
     logger.error('API', `${method} ${path} NETWORK_ERROR (${ms}ms)`, err);
@@ -78,6 +86,12 @@ export async function fetchApi<T>(
   }
 
   const ms = Math.round(performance.now() - t0);
+
+  const loginPage = res.ok && (res.headers.get('content-type') ?? '').includes('text/html');
+  if (loginPage || res.type === 'opaqueredirect') {
+    logger.error('API', `${method} ${path} -> redirected to sign-in (${ms}ms)`);
+    throw new ApiError(401, SIGNED_OUT_BODY);
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);

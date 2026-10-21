@@ -45,21 +45,15 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setThemeState] = useState<Theme>('dark');
   const [resolved, setResolved] = useState<'light' | 'dark'>('dark');
 
-  /* Hydrate from localStorage on mount */
+  /* Same choice as the inline script in app/layout.tsx; re-applied in case hydration recovery reset <html>. */
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY) as Theme | null;
-    if (stored && ['light', 'dark', 'system'].includes(stored)) {
-      setThemeState(stored);
-    }
-  }, []);
-
-  /* Apply resolved theme to <html> */
-  useEffect(() => {
-    const r = resolveTheme(theme);
+    const t = stored && ['light', 'dark', 'system'].includes(stored) ? stored : 'dark';
+    const r = resolveTheme(t);
+    setThemeState(t);
     setResolved(r);
-    const root = document.documentElement;
-    root.classList.toggle('dark', r === 'dark');
-  }, [theme]);
+    document.documentElement.classList.toggle('dark', r === 'dark');
+  }, []);
 
   /* Listen for system theme changes when in 'system' mode */
   useEffect(() => {
@@ -75,7 +69,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [theme]);
 
   const setTheme = useCallback((t: Theme) => {
+    const r = resolveTheme(t);
     setThemeState(t);
+    setResolved(r);
+    document.documentElement.classList.toggle('dark', r === 'dark');
     localStorage.setItem(STORAGE_KEY, t);
   }, []);
 

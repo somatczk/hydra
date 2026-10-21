@@ -11,6 +11,7 @@ import {
   saveAgainOutcome,
   startOutcome,
   stopOutcome,
+  tryClosingOutcome,
   type KillSwitchResponse,
   type Outcome,
   type QuickTradeRequest,
@@ -152,6 +153,40 @@ describe('stopOutcome', () => {
     const gone = envelope(404, 'session_not_found', 'Session x not found', 'not_found');
     expect(stopOutcome({ err: gone }).title).toBe('This session no longer exists.');
     expect(stopOutcome({ err: new TypeError('Failed to fetch') }).actions).toEqual([{ kind: 'retry', label: 'Try again' }]);
+  });
+});
+
+describe('tryClosingOutcome', () => {
+  const notSaved = envelope(503, 'session_stop_not_persisted', 'Session b stopped, but the database still says running', 'unavailable');
+
+  it('one holder: its retry re-sends only that DELETE', () => {
+    const o = tryClosingOutcome([{ id: 'b', name: 'Breakout', result: { err: notSaved } }], NOW);
+    expect(o.title).toBe('Stopped, but not saved.');
+    expect(o.actions).toEqual([{ kind: 'try_closing', label: 'Try closing again', sessionIds: ['b'] }]);
+  });
+
+  it('several holders: worst tone, one line each, retry only the ones that failed', () => {
+    const o = tryClosingOutcome(
+      [
+        { id: 'a', name: 'Momentum 4h', result: { ok: session({ session_id: 'a', status: 'stopped' }) } },
+        { id: 'b', name: 'Breakout', result: { err: notSaved } },
+      ],
+      NOW,
+    );
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe('Tried closing 2 sessions again.');
+    expect(o.lines).toEqual([
+      'Momentum 4h: Stopped at 14:03:00 UTC. All positions closed.',
+      'Breakout: Stopped, but not saved. Session b stopped, but the database still says running. After a restart it will show as running until this is saved.',
+    ]);
+    expect(o.actions).toEqual([{ kind: 'try_closing', label: 'Try closing again', sessionIds: ['b'] }]);
+  });
+
+  it('several holders all closed: no retry', () => {
+    const ok = (id: string) => ({ id, name: id, result: { ok: session({ session_id: id, status: 'stopped' }) } });
+    const o = tryClosingOutcome([ok('a'), ok('b')], NOW);
+    expect(o.tone).toBe('none');
+    expect(o.actions).toEqual([]);
   });
 });
 

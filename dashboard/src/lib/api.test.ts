@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, apiHeaders, fetchApi } from './api';
+import { isSignedOut, stateFromError } from './apiState';
 
 const fetchMock = vi.fn();
 
@@ -71,6 +72,31 @@ describe('fetchApi headers', () => {
     });
     fetchMock.mockResolvedValueOnce(new Response(body, { status: 403 }));
     await expect(fetchApi('/api/x', { method: 'POST' })).rejects.toEqual(new ApiError(403, body));
+  });
+});
+
+describe('fetchApi signed-out detection (E-1)', () => {
+  const caught = (p: Promise<unknown>) => p.then(() => null, (e: unknown) => e);
+
+  it('asks for JSON so Authelia answers 401 instead of redirecting to its login page', async () => {
+    await fetchApi('/api/x');
+    expect(sentHeaders().get('accept')).toBe('application/json');
+  });
+
+  it('does not follow redirects, and maps one (the sign-in portal) to a signed-out 401', async () => {
+    const res = new Response(null, { status: 200 });
+    Object.defineProperties(res, { type: { value: 'opaqueredirect' }, status: { value: 0 }, ok: { value: false } });
+    fetchMock.mockResolvedValueOnce(res);
+    const err = await caught(fetchApi('/api/trading/kill-switch', { method: 'POST' }));
+    expect((fetchMock.mock.calls[0][1] as RequestInit).redirect).toBe('manual');
+    expect(err).toBeInstanceOf(ApiError);
+    expect(isSignedOut(err)).toBe(true);
+    expect(stateFromError(err)).toBe('unauthenticated');
+  });
+
+  it('maps a 2xx HTML page (the login portal) to a signed-out 401', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }));
+    expect(isSignedOut(await caught(fetchApi('/api/risk/live-status')))).toBe(true);
   });
 });
 

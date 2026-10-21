@@ -83,7 +83,7 @@ function ToastItem({
 
   return (
     <div
-      role="alert"
+      role="status"
       className={cn(
         'flex items-start gap-3 rounded-lg border bg-surface p-4 transition-all duration-200',
         typeStyles[t.type],
@@ -134,7 +134,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       <div
         aria-live="polite"
         aria-label="Notifications"
-        className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 w-80 max-w-[calc(100vw-2rem)]"
+        className="fixed bottom-20 right-4 z-50 lg:bottom-4 flex flex-col gap-2 w-80 max-w-[calc(100vw-2rem)]"
       >
         {toasts.map((t) => (
           <ToastItem key={t.id} toast={t} onDismiss={dismiss} />
