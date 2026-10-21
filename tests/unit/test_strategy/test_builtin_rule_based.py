@@ -448,6 +448,10 @@ class TestRuleBasedStrategy:
             "Unknown indicator",
         ),
         ({"indicator": "close", "params": {}, "value": "rsi:periodd=14"}, "periodd"),
+        ({"indicator": "close", "params": {}, "value": "rolling_max:period=2.5"}, "integer"),
+        ({"indicator": "sma", "params": {"period": 0}, "value": 30.0}, "must be in"),
+        ({"indicator": "rsi", "params": {"period": 0}, "value": 30.0}, "must be in"),
+        ({"indicator": "close", "params": {}, "value": "ema:period=100000000"}, "must be in"),
     ],
 )
 def test_invalid_rules_fail_at_construction(condition: dict[str, object], match: str) -> None:

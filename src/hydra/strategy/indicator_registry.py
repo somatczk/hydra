@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from hydra.indicators import library as ind_lib
-from hydra.strategy.context import DATA_PARAMS, MULTI_OUTPUT
+from hydra.strategy.context import DATA_PARAMS, MULTI_OUTPUT, PARAM_LIMITS
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -74,20 +74,6 @@ _DESCRIPTION_MAP: dict[str, str] = {
     "mfi": "Money Flow Index (0-100 oscillator)",
 }
 
-# Parameter constraints: (min, max) for known numeric parameters
-_PARAM_CONSTRAINTS: dict[str, dict[str, tuple[int | float, int | float]]] = {
-    "period": {"min": 2, "max": 200},
-    "fast": {"min": 2, "max": 100},
-    "slow": {"min": 2, "max": 200},
-    "signal": {"min": 2, "max": 100},
-    "multiplier": {"min": 0.1, "max": 10.0},
-    "std_dev": {"min": 0.1, "max": 5.0},
-    "k_period": {"min": 2, "max": 100},
-    "d_period": {"min": 2, "max": 100},
-    "ema_period": {"min": 2, "max": 200},
-    "atr_period": {"min": 2, "max": 200},
-}
-
 
 @dataclass(frozen=True, slots=True)
 class ParamInfo:
@@ -144,9 +130,7 @@ def _extract_params(func: Any) -> list[ParamInfo]:
         default = param.default if param.default is not inspect.Parameter.empty else None
         param_type = _python_type_to_str(param.annotation)
 
-        constraints = _PARAM_CONSTRAINTS.get(name, {})
-        min_val = constraints.get("min")
-        max_val = constraints.get("max")
+        min_val, max_val = PARAM_LIMITS.get(name, (None, None))
 
         params.append(
             ParamInfo(

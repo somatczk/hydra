@@ -33,7 +33,7 @@ position_sizing:
   risk_per_trade_pct: 1.0
   max_position_pct: 10.0
 _template_meta:
-  description: Classic RSI oversold/overbought strategy. Buys on RSI < 30, sells on RSI > 70. Conservative entry with clear exit.
+  description: Classic RSI oversold/overbought strategy. Buys on RSI < 30, sells on RSI > 70.
   type: rule_based
   risk_level: conservative
   recommended_capital: 5000

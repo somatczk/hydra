@@ -163,6 +163,12 @@ def test_dispatch_follows_the_signature() -> None:
         ("rsi", {"period": True}, "must be a number"),
         ("rsi", {"periodd": 14}, "periodd"),
         ("sma", {}, "period"),
+        ("ema", {"period": 2.5}, "must be an integer"),
+        ("supertrend_direction", {"period": 3.5}, "must be an integer"),
+        ("sma", {"period": 0}, r"must be in \[2, 200\]"),
+        ("sma", {"period": -5}, r"must be in \[2, 200\]"),
+        ("ema", {"period": 10**8}, r"must be in \[2, 200\]"),
+        ("bollinger_upper", {"std_dev": 0.0}, r"must be in \[0.1, 5.0\]"),
     ],
 )
 def test_ambiguous_and_invalid_rejected(name: str, params: dict[str, object], match: str) -> None:

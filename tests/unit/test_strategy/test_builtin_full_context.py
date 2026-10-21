@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import ClassVar
 
 import numpy as np
 import talib
 
-from hydra.core.events import BarEvent, EntrySignal
+from hydra.backtest.runner import BacktestRunner
+from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Symbol, Timeframe
 from hydra.indicators.library import supertrend_direction
 from hydra.strategy.base import BaseStrategy
@@ -105,3 +107,30 @@ async def test_trend_following_decides_on_the_full_context() -> None:
     assert full != _trend_reference(closes, 210)
     cfg = _cfg(TrendFollowingSupertrend, {"required_history": 210})
     assert await _entries(TrendFollowingSupertrend, cfg, closes) == full
+
+
+class _Recorder(TrendFollowingSupertrend):
+    held: ClassVar[list[int]] = []
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        type(self).held.append(len(self._context.bars("BTCUSDT", _TF, 10**9)))
+        return await super().on_bar(bar)
+
+
+async def test_backtest_context_is_bounded_like_a_live_session() -> None:
+    closes = _walk(11, 1100)
+    bars = [
+        OHLCV(
+            open=Decimal(str(c)),
+            high=Decimal(str(c * 1.01)),
+            low=Decimal(str(c * 0.99)),
+            close=Decimal(str(c)),
+            volume=Decimal(1),
+            timestamp=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(hours=t),
+        )
+        for t, c in enumerate(closes)
+    ]
+    _Recorder.held = []
+    await BacktestRunner().run(_Recorder, _cfg(_Recorder, {"required_history": 210}), bars)
+    assert len(_Recorder.held) == 1100
+    assert max(_Recorder.held) == 1000

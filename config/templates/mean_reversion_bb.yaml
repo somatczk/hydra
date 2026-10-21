@@ -37,7 +37,7 @@ position_sizing:
   risk_per_trade_pct: 1.0
   max_position_pct: 8.0
 _template_meta:
-  description: Mean reversion with Bollinger Bands + RSI confirmation. Buys at lower band, exits at middle band. Good in ranging markets.
+  description: Mean reversion with Bollinger Bands + RSI confirmation. Buys at lower band, exits at middle band.
   type: rule_based
   risk_level: moderate
   recommended_capital: 5000

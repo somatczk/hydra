@@ -98,3 +98,14 @@ async def test_bollinger_templates_trade_the_bands() -> None:
     assert await _entry_bars(breakout, [*calm, 110.0, 111.0]) == [60]
     bounce = _load(CONFIG / "templates" / "mean_reversion_bb.yaml")
     assert await _entry_bars(bounce, [*calm, 90.0]) == [60]
+
+
+async def test_sma_crossover_tunes_each_leg_separately() -> None:
+    base = _load(CONFIG / "templates" / "trend_sma_crossover.yaml")
+    closes = [200.0 - i for i in range(80)] + [120.0 + 3 * i for i in range(60)]
+
+    def tuned(**top: int) -> StrategyConfig:
+        return base.model_copy(update={"parameters": {**base.parameters, **top}})
+
+    assert await _entry_bars(tuned(sma_period=30), closes)
+    assert await _entry_bars(tuned(sma_period=30, slow_sma_period=30), closes) == []

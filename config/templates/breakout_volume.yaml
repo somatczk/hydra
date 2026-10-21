@@ -1,4 +1,4 @@
-name: Volume Breakout
+name: Bollinger Breakout
 strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy
 enabled: false
 symbols:
@@ -19,10 +19,6 @@ parameters:
           params: {}
           comparator: crosses_above
           value: "bollinger_upper:period=20,std_dev=2.0"
-        - indicator: atr
-          params: {period: 14}
-          comparator: greater_than
-          value: 0
     exit_long:
       operator: AND
       conditions:
@@ -37,7 +33,7 @@ position_sizing:
   risk_per_trade_pct: 2.0
   max_position_pct: 12.0
 _template_meta:
-  description: Volatility breakout with Bollinger Band expansion. Aggressive entries on high-momentum moves. Best in volatile markets.
+  description: Bollinger breakout. Enters when the close crosses above the upper band (20, 2.0) and exits when it closes below the middle band.
   type: rule_based
   risk_level: aggressive
   recommended_capital: 10000

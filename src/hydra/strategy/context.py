@@ -29,6 +29,19 @@ MULTI_OUTPUT: dict[str, str] = {
     "ichimoku": "not available to rules (its chikou span reads future bars)",
 }
 DATA_PARAMS = frozenset({"data", "close", "high", "low", "volume"})
+# Inclusive (min, max) per parameter name; the registry and the hyperopt ranges show the same.
+PARAM_LIMITS: dict[str, tuple[float, float]] = {
+    "period": (2, 200),
+    "fast": (2, 100),
+    "slow": (2, 200),
+    "signal": (2, 100),
+    "multiplier": (0.1, 10.0),
+    "std_dev": (0.1, 5.0),
+    "k_period": (2, 100),
+    "d_period": (2, 100),
+    "ema_period": (2, 200),
+    "atr_period": (2, 200),
+}
 
 
 def resolve_indicator(name: str, params: Mapping[str, object]) -> Callable[..., Any]:
@@ -40,11 +53,19 @@ def resolve_indicator(name: str, params: Mapping[str, object]) -> Callable[..., 
     if name.startswith("_") or not inspect.isfunction(func) or func.__module__ != ind_lib.__name__:
         msg = f"Unknown indicator: {name}"
         raise ValueError(msg)
+    sig = inspect.signature(func)
     for key, value in params.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             msg = f"Indicator {name!r} parameter {key!r} must be a number, got {value!r}"
             raise ValueError(msg)
-    sig = inspect.signature(func)
+        param = sig.parameters.get(key)
+        if param is not None and param.annotation in (int, "int") and not isinstance(value, int):
+            msg = f"Indicator {name!r} parameter {key!r} must be an integer, got {value!r}"
+            raise ValueError(msg)
+        lo, hi = PARAM_LIMITS.get(key, (value, value))
+        if not lo <= value <= hi:
+            msg = f"Indicator {name!r} parameter {key!r} must be in [{lo}, {hi}], got {value!r}"
+            raise ValueError(msg)
     data_args = dict.fromkeys(DATA_PARAMS.intersection(sig.parameters))
     try:
         sig.bind(**data_args, **params)

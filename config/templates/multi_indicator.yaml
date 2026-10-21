@@ -9,7 +9,7 @@ exchange:
 timeframes:
   primary: 1h
 parameters:
-  description: Multi-indicator strategy requiring RSI + MACD + EMA alignment. High-confidence entries with multiple confirmations.
+  description: Multi-indicator strategy requiring RSI, MACD and close-above-EMA to agree before entering.
   required_history: 50
   rules:
     entry_long:
@@ -23,10 +23,10 @@ parameters:
           params: {fast: 12, slow: 26, signal: 9}
           comparator: crosses_above
           value: 0
-        - indicator: ema
-          params: {period: 20}
+        - indicator: close
+          params: {}
           comparator: greater_than
-          value: 0
+          value: "ema:period=20"
     exit_long:
       operator: OR
       conditions:
@@ -45,7 +45,7 @@ position_sizing:
   risk_per_trade_pct: 1.5
   max_position_pct: 10.0
 _template_meta:
-  description: Triple confirmation (RSI + MACD + EMA) for high-probability entries. Fewer trades but higher win rate. Works across market conditions.
+  description: Triple confirmation. Enters when RSI(14) is below 35, the MACD line crosses above 0 and the close is above EMA(20); exits on RSI above 75 or MACD crossing below 0.
   type: rule_based
   risk_level: conservative
   recommended_capital: 5000
