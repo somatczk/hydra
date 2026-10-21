@@ -794,6 +794,21 @@ class TestCSVExport:
         lines = [ln for ln in resp.text.strip().splitlines() if ln]
         assert len(lines) == 1  # header row only
 
+    def test_source_filters_the_query(self) -> None:
+        pool, conn = _make_mock_pool()
+        conn.fetch = AsyncMock(return_value=[])
+        client = TestClient(_make_app(pool=pool))
+
+        assert client.get("/api/portfolio/export/csv?source=paper").status_code == 200
+        sql, *args = conn.fetch.call_args.args
+        assert "source = $1" in sql
+        assert args == ["paper"]
+
+        client.get("/api/portfolio/export/csv")
+        sql, *args = conn.fetch.call_args.args
+        assert "source" not in sql.split("FROM trades")[1]
+        assert args == []
+
     def test_csv_export_db_exception_returns_503(self) -> None:
         pool, conn = _make_mock_pool()
         conn.fetch = AsyncMock(side_effect=asyncpg.PostgresError("DB down"))

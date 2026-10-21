@@ -768,6 +768,7 @@ async def export_trades_csv(
     from_date: datetime | None = None,
     to_date: datetime | None = None,
     format: str = "generic",
+    source: str | None = None,
 ) -> StreamingResponse:
     """Export trades as a downloadable CSV file.
 
@@ -794,6 +795,8 @@ async def export_trades_csv(
         _add("timestamp >= ${n}", _aware(from_date))
     if to_date is not None:
         _add("timestamp <= ${n}", _aware(to_date))
+    if source is not None:
+        _add("source = ${n}", source)
 
     where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 

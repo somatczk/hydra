@@ -156,3 +156,52 @@ describe('PortfolioPage as the Performance screen', () => {
     expect(row).not.toContain('Invalid');
   });
 });
+
+describe('PortfolioPage source pinning, export scope and chart data', () => {
+  it('pins source=paper and says so when the stored mode is live', async () => {
+    const routes = { ...paperRoutes(), '/api/system/config': { trading_mode: 'live' } };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<PortfolioPage />);
+
+    const portfolioCalls = calls.filter((c) => c.path.startsWith('/api/portfolio/'));
+    expect(portfolioCalls.length).toBeGreaterThanOrEqual(6);
+    expect(portfolioCalls.every((c) => c.path.includes('source=paper'))).toBe(true);
+    expect(calls.some((c) => c.path.includes('source=live'))).toBe(false);
+    expect(page.container.querySelector('[data-testid="stored-mode-note"]')?.textContent).toContain(
+      'Stored mode is live',
+    );
+  });
+
+  it('scopes the export to the paper source', async () => {
+    fetchApi.mockImplementation(routeFetch(paperRoutes(), calls));
+    const fetchMock = vi.fn().mockResolvedValue(new Response('x', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    URL.createObjectURL = vi.fn(() => 'blob:x');
+    URL.revokeObjectURL = vi.fn();
+    page = await mount(<PortfolioPage />);
+    await click(buttonByText(page.container, 'Export'));
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/portfolio/export/csv?format=generic&source=paper');
+    vi.unstubAllGlobals();
+  });
+
+  it('offers the equity and daily P&L points as tables', async () => {
+    const routes = {
+      ...paperRoutes(),
+      '/api/portfolio/equity-curve?source=paper': [
+        { timestamp: '2026-10-19T00:00:00+00:00', value: 10000 },
+        { timestamp: '2026-10-20T00:00:00+00:00', value: 10012.5 },
+      ],
+      '/api/portfolio/daily-pnl?source=paper': [{ date: '2026-10-20', pnl: 12.5 }],
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<PortfolioPage />);
+
+    const equity = page.container.querySelector('[data-testid="equity-table"]');
+    expect(equity?.querySelectorAll('tbody tr')).toHaveLength(2);
+    expect(equity?.textContent).toContain('10,012.50 USDT');
+    const daily = page.container.querySelector('[data-testid="daily-pnl-table"]');
+    expect(daily?.textContent).toContain('2026-10-20');
+    expect(daily?.textContent).toContain('12.50');
+  });
+});

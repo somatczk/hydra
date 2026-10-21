@@ -151,7 +151,8 @@ export default function PortfolioPage() {
   const [monthlyReturns, setMonthlyReturns] = useState<MonthlyReturn[] | null>(null);
   const [attribution, setAttribution] = useState<AttributionItem[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [source, setSource] = useState<'live' | 'paper' | null>(null);
+  const [source, setSource] = useState<'paper' | null>(null);
+  const [storedMode, setStoredMode] = useState<string | null>(null);
   const [isDark, setIsDark] = useState(false);
   const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
 
@@ -190,11 +191,12 @@ export default function PortfolioPage() {
     setFetchErrors({});
 
     // No guessed source: without the platform config, source-specific widgets show why
-    let source: 'live' | 'paper' | null = null;
+    let source: 'paper' | null = null;
     let configError: unknown = null;
     try {
       const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config');
-      source = cfg.trading_mode === 'live' ? 'live' : 'paper';
+      source = 'paper'; // live is refused until P3; Settings says the same
+      setStoredMode(cfg.trading_mode);
     } catch (err) {
       logger.warn('Portfolio', 'Trading mode unknown; portfolio data not requested', err);
       configError = err ?? true;
@@ -333,6 +335,7 @@ export default function PortfolioPage() {
     setExporting(true);
     const params = new URLSearchParams();
     params.set('format', exportFormat);
+    if (source) params.set('source', source);
     if (exportFromDate) params.set('from_date', exportFromDate);
     if (exportToDate) params.set('to_date', exportToDate);
     try {
@@ -511,6 +514,11 @@ export default function PortfolioPage() {
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-xl font-semibold text-ink-1">Performance</h1>
+      {storedMode !== null && storedMode !== 'paper' && (
+        <p className="text-xs text-ink-2" data-testid="stored-mode-note">
+          Stored mode is {storedMode}; live trading is refused until a later release. Showing paper.
+        </p>
+      )}
 
       {summary?.paper_capital_pending != null && (
         <p className="rounded-lg border border-caution/30 bg-caution-soft p-3 text-xs text-ink-1" data-testid="capital-pending">
@@ -728,6 +736,50 @@ export default function PortfolioPage() {
           )}
         </Section>
       </div>
+
+      {equityCurve && equityCurve.length > 0 && (
+        <Section title="Chart data">
+          <details>
+            <summary className="cursor-pointer text-sm text-ink-1">Equity and daily P&amp;L as tables</summary>
+            <div className="mt-3 grid max-h-72 grid-cols-1 gap-4 overflow-y-auto lg:grid-cols-2">
+              <table className="w-full text-xs" data-testid="equity-table">
+                <caption className="pb-1 text-left font-semibold text-ink-1">Equity (USDT)</caption>
+                <thead>
+                  <tr>
+                    <th scope="col" className="text-left text-ink-2">Time</th>
+                    <th scope="col" className="text-right text-ink-2">Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {equityCurve.map((p, i) => (
+                    <tr key={i}>
+                      <td className="py-0.5 text-ink-1">{formatXTick(p.timestamp)}</td>
+                      <td className="py-0.5 text-right text-ink-1">{usdt(p.value)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <table className="w-full text-xs" data-testid="daily-pnl-table">
+                <caption className="pb-1 text-left font-semibold text-ink-1">Daily P&amp;L (USDT)</caption>
+                <thead>
+                  <tr>
+                    <th scope="col" className="text-left text-ink-2">Date</th>
+                    <th scope="col" className="text-right text-ink-2">P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {dailyPnl.map((d, i) => (
+                    <tr key={i}>
+                      <td className="py-0.5 text-ink-1">{d.date}</td>
+                      <td className="py-0.5 text-right"><SignedValue value={d.pnl} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </Section>
+      )}
 
       {/* Monthly returns heatmap */}
       <Section title="Monthly Returns">

@@ -304,6 +304,34 @@ describe('SettingsPage platform config', () => {
     ]);
   });
 
+  it('keeps the dialog open and shows the failure when the capital save is rejected', async () => {
+    fetchApi.mockImplementation(
+      routeFetch(routes(), calls, {
+        'PUT /api/system/config': unavailable('risk_reload_failed: saved but not applied'),
+      }),
+    );
+    page = await mountSettings();
+
+    await typeInto(inputByLabel(page.container, 'Paper Trading Capital (USDT)'), '25000');
+    await click(buttonByText(page.container, 'Save Configuration'));
+    await click(buttonByText(page.container, 'Reset ledger to new capital'));
+
+    const dialog = page.container.querySelector('dialog');
+    expect(dialog?.hasAttribute('open')).toBe(true);
+    expect(dialog?.querySelector('[role="alert"]')?.textContent).toContain('Not saved');
+  });
+
+  it.each(['', '0', '-5'])('rejects capital %j before any dialog or request', async (value) => {
+    page = await mountSettings();
+
+    await typeInto(inputByLabel(page.container, 'Paper Trading Capital (USDT)'), value);
+    await click(buttonByText(page.container, 'Save Configuration'));
+
+    expect(page.container.querySelector('dialog')?.hasAttribute('open')).toBe(false);
+    expect(page.container.textContent).toContain('Enter a paper capital above 0');
+    expect(puts()).toEqual([]);
+  });
+
   it('saves other settings without asking when the capital is unchanged', async () => {
     page = await mountSettings();
 

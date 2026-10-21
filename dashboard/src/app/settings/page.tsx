@@ -175,6 +175,8 @@ export default function SettingsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [webhookSecret, setWebhookSecret] = useState('');
   const [capitalConfirmOpen, setCapitalConfirmOpen] = useState(false);
+  const [capitalError, setCapitalError] = useState<string | null>(null);
+  const [capitalSaveError, setCapitalSaveError] = useState<string | null>(null);
   const { theme, setTheme } = useTheme();
 
   // Exchange detail panels
@@ -290,7 +292,7 @@ export default function SettingsPage() {
     } catch (err) { logger.warn('Settings', 'Failed to refresh exchanges', err); }
   };
 
-  const saveConfig = async () => {
+  const saveConfig = async (): Promise<string | null> => {
     try {
       const cfg = await fetchApi<PlatformConfig>('/api/system/config', {
         method: 'PUT',
@@ -308,14 +310,23 @@ export default function SettingsPage() {
       } else {
         toast('success', 'Platform configuration saved');
       }
+      return null;
     } catch (err) {
       logger.error('Settings', 'Failed to save config', err);
-      toast('error', describeApiError(err, 'Failed to save configuration'));
+      const message = describeApiError(err, 'Failed to save configuration');
+      toast('error', message);
+      return message;
     }
   };
 
   const handleSaveConfig = () => {
+    if (!(Number(paperCapital) > 0)) {
+      setCapitalError('Enter a paper capital above 0');
+      return;
+    }
+    setCapitalError(null);
     if (savedPaperCapital !== null && Number(paperCapital) !== savedPaperCapital) {
+      setCapitalSaveError(null);
       setCapitalConfirmOpen(true);
       return;
     }
@@ -677,6 +688,7 @@ export default function SettingsPage() {
                 type="number"
                 value={paperCapital}
                 onChange={(e) => setPaperCapital(e.target.value)}
+                error={capitalError ?? undefined}
                 hint={
                   pendingPaperCapital !== null
                     ? `Pending: the paper ledger moves to ${pendingPaperCapital} USDT once every held position has a price`
@@ -701,8 +713,9 @@ export default function SettingsPage() {
         pendingLabel="Saving…"
         pendingHint="Closing this won't undo a save already sent."
         onConfirm={async () => {
-          await saveConfig();
-          setCapitalConfirmOpen(false);
+          const failure = await saveConfig();
+          setCapitalSaveError(failure);
+          if (failure === null) setCapitalConfirmOpen(false);
         }}
         onClose={() => setCapitalConfirmOpen(false)}
       >
@@ -712,6 +725,11 @@ export default function SettingsPage() {
         </p>
         <p>Breaker tiers, halts and pauses don&apos;t change; reset those separately.</p>
         <p>If a held position has no mark yet, the change waits and the ledger keeps the current capital until it has one.</p>
+        {capitalSaveError !== null && (
+          <p role="alert" className="text-danger">
+            Not saved: {capitalSaveError}
+          </p>
+        )}
       </ConfirmDialog>
       <ExchangeConnectDialog
         open={modalOpen}
