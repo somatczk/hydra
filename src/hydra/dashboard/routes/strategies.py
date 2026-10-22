@@ -16,6 +16,7 @@ from hydra.services import strategies as svc
 from hydra.services.strategies import (
     PreviewRequest,
     PreviewResponse,
+    ReloadResponse,
     SaveRequest,
     SaveResponse,
     StrategyDetailResponse,
@@ -99,7 +100,8 @@ async def list_comparators() -> list[dict[str, str]]:
 @router.get("/{strategy_id}", response_model=StrategyDetailResponse)
 async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
     """Get a single strategy detail with structured builder fields."""
-    return await svc.get_strategy(request_pool(request), strategy_id)
+    manager = getattr(request.app.state, "session_manager", None)
+    return await svc.get_strategy(request_pool(request), strategy_id, manager)
 
 
 @router.put("/{strategy_id}", response_model=SaveResponse)
@@ -125,6 +127,16 @@ async def delete_strategy(strategy_id: str) -> Response:
 async def toggle_strategy(strategy_id: str) -> dict[str, Any]:
     """Toggle enabled flag of a strategy."""
     return svc.toggle_strategy(strategy_id)
+
+
+@router.post("/{strategy_id}/reload", response_model=ReloadResponse)
+async def reload_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
+    """Apply the file's changed ``parameters`` to the running session at its next closed bar.
+
+    Changes to rules, risk, sizing, symbols, timeframes or class return 409 (restart required).
+    """
+    manager = getattr(request.app.state, "session_manager", None)
+    return await svc.reload_strategy(manager, strategy_id)
 
 
 @router.post("/preview", response_model=PreviewResponse)

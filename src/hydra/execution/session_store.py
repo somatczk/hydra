@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -39,14 +40,17 @@ async def _upsert(db_pool: Any, session: TradingSession) -> None:
             INSERT INTO trading_sessions
                 (id, strategy_id, trading_mode, status, exchange_id,
                  symbols, timeframe, paper_capital, started_at,
-                 stopped_at, error_message, positions_at_stop)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 stopped_at, error_message, positions_at_stop, strategy_config, config_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 started_at = EXCLUDED.started_at,
                 stopped_at = EXCLUDED.stopped_at,
                 error_message = EXCLUDED.error_message,
-                positions_at_stop = EXCLUDED.positions_at_stop
+                positions_at_stop = EXCLUDED.positions_at_stop,
+                strategy_config = COALESCE(
+                    EXCLUDED.strategy_config, trading_sessions.strategy_config),
+                config_hash = COALESCE(EXCLUDED.config_hash, trading_sessions.config_hash)
             """,
             session.session_id,
             session.strategy_id,
@@ -60,6 +64,8 @@ async def _upsert(db_pool: Any, session: TradingSession) -> None:
             session.stopped_at,
             session.error_message,
             session.positions_at_stop,
+            json.dumps(session.strategy_config) if session.strategy_config is not None else None,
+            session.config_hash,
         )
 
 

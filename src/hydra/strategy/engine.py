@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 from hydra.core.config import HydraConfig
 from hydra.core.events import BarEvent, Event
@@ -18,21 +23,60 @@ from hydra.strategy.context import StrategyContext
 logger = logging.getLogger(__name__)
 
 
-def _import_strategy_class(dotted_path: str) -> type[BaseStrategy]:
-    """Import a strategy class from its dotted path.
+ALLOWED_CLASS_PREFIX = "hydra.strategy.builtin."
 
-    Example: ``"hydra.strategy.builtin.MomentumRSIMACDStrategy"``
+
+def _import_strategy_class(dotted_path: str) -> type[BaseStrategy]:
+    """Import a strategy class from its dotted path (``hydra.strategy.builtin.*`` only).
+
+    Example: ``"hydra.strategy.builtin.momentum.MomentumRSIMACDStrategy"``. The prefix is checked
+    before the import, which would otherwise run any module's code.
     """
     module_path, _, class_name = dotted_path.rpartition(".")
     if not module_path:
         msg = f"Invalid strategy class path: {dotted_path}"
         raise ValueError(msg)
+    if not module_path.startswith(ALLOWED_CLASS_PREFIX):
+        msg = f"strategy_class {dotted_path!r} must be under {ALLOWED_CLASS_PREFIX}*"
+        raise ValueError(msg)
     module = importlib.import_module(module_path)
-    cls = getattr(module, class_name)
+    cls = getattr(module, class_name, None)
     if not (isinstance(cls, type) and issubclass(cls, BaseStrategy)):
         msg = f"{dotted_path} is not a subclass of BaseStrategy"
         raise TypeError(msg)
     return cls
+
+
+def validate_strategy_config(data: Mapping[str, Any]) -> StrategyConfig:
+    """Strictly validate a strategy mapping: schema, allowlisted class, then a throwaway build.
+
+    Building the class runs the strategy's own checks (rule indicators and parameters).
+    Raises ``ValueError`` (``pydantic.ValidationError`` included) or ``TypeError``.
+    """
+    cfg = StrategyConfig.model_validate(dict(data))
+    try:
+        cls = _import_strategy_class(cfg.strategy_class)
+    except ImportError as exc:
+        msg = f"cannot import {cfg.strategy_class}: {exc}"
+        raise ValueError(msg) from exc
+    if inspect.isabstract(cls):
+        msg = f"{cfg.strategy_class} is abstract"
+        raise TypeError(msg)
+    cls(config=cfg, context=StrategyContext())
+    return cfg
+
+
+def write_strategy_config(path: Path, data: Mapping[str, Any]) -> StrategyConfig:
+    """Validate *data*, then write it to *path* atomically (nothing is written when invalid)."""
+    cfg = validate_strategy_config(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(yaml.dump(dict(data), default_flow_style=False, sort_keys=False))
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return cfg
 
 
 class StrategyEngine:
@@ -67,7 +111,10 @@ class StrategyEngine:
             if not cfg.enabled:
                 logger.info("Skipping disabled strategy: %s", cfg.id)
                 continue
-            await self._instantiate_strategy(cfg)
+            try:
+                await self._instantiate_strategy(cfg)
+            except (ImportError, ValueError, TypeError) as exc:
+                logger.error("Skipping strategy %s: %s", cfg.id, exc)
 
     async def load_strategy_from_config(
         self,
@@ -188,25 +235,26 @@ class StrategyEngine:
 
     # -- Hot reload ----------------------------------------------------------
 
-    async def reload_strategy(self, strategy_id: str) -> None:
-        """Hot-reload a strategy by re-importing its class and re-instantiating."""
-        if strategy_id not in self._strategy_configs:
-            logger.warning("Cannot reload unknown strategy: %s", strategy_id)
-            return
-        cfg = self._strategy_configs[strategy_id]
-        old = self._strategies.get(strategy_id)
-        if old is not None:
-            await old.on_stop()
-        # Re-import (force module reload)
-        module_path, _, class_name = cfg.strategy_class.rpartition(".")
-        module = importlib.import_module(module_path)
-        importlib.reload(module)
-        cls = getattr(module, class_name)
-        new_strategy = cls(config=cfg, context=self._context)
-        self._strategies[strategy_id] = new_strategy
+    async def replace_strategy(self, cfg: StrategyConfig) -> None:
+        """Swap a loaded strategy for a new instance of the same class built from *cfg*.
+
+        The module is not re-imported and the context is shared, so indicator history survives.
+        """
+        old_cfg = self._strategy_configs.get(cfg.id)
+        old = self._strategies.get(cfg.id)
+        if old_cfg is None or old is None:
+            msg = f"Cannot replace unknown strategy: {cfg.id}"
+            raise KeyError(msg)
+        if cfg.strategy_class != old_cfg.strategy_class:
+            msg = f"Cannot change strategy_class of {cfg.id} in place"
+            raise ValueError(msg)
+        new = type(old)(config=cfg, context=self._context)
+        await old.on_stop()
+        self._strategies[cfg.id] = new
+        self._strategy_configs[cfg.id] = cfg
         if self._running:
-            await new_strategy.on_start()
-        logger.info("Reloaded strategy: %s", strategy_id)
+            await new.on_start()
+        logger.info("Replaced strategy config: %s", cfg.id)
 
     # -- Accessors -----------------------------------------------------------
 

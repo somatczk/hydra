@@ -11,7 +11,9 @@ Tests cover:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +24,39 @@ from starlette.datastructures import UploadFile
 
 from hydra.dashboard.routes.strategies import router
 from hydra.services.strategies import _row_to_strategy, _status_from_enabled
+
+_INVALID_INDICATOR_RULES: dict[str, Any] = {
+    "entry_long": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "rsii",
+                "params": {"period": 14},
+                "comparator": "less_than",
+                "value": 30,
+            }
+        ],
+    },
+    "exit_long": None,
+    "entry_short": None,
+    "exit_short": None,
+}
+_INVALID_PARAM_RULES: dict[str, Any] = {
+    "entry_long": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "rsi",
+                "params": {"period": "abc"},
+                "comparator": "less_than",
+                "value": 30,
+            }
+        ],
+    },
+    "exit_long": None,
+    "entry_short": None,
+    "exit_short": None,
+}
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -569,13 +604,328 @@ class TestStrategiesFallback:
             )
             accepted = client_no_pool.post(
                 "/api/strategies/import",
-                files={"file": ("ok.yaml", yaml.safe_dump({"name": "Up"}).encode())},
+                files={
+                    "file": (
+                        "ok.yaml",
+                        yaml.safe_dump(
+                            {
+                                "name": "Up",
+                                "strategy_class": (
+                                    "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
+                                ),
+                            }
+                        ).encode(),
+                    )
+                },
             )
         assert rejected.status_code == 422
         assert rejected.json() == {"detail": "File must be .yaml or .yml"}
         assert accepted.status_code == 201
         assert reads == ["ok.yaml"]
         assert [f.name for f in tmp_path.glob("*.yaml")] == [f"{accepted.json()['id']}.yaml"]
+
+    def test_import_with_disallowed_class_is_422_and_writes_nothing(
+        self, client_no_pool: TestClient, tmp_path: Path
+    ) -> None:
+        upload = yaml.safe_dump({"name": "Bad", "strategy_class": "antigravity.Foo"}).encode()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            resp = client_no_pool.post(
+                "/api/strategies/import", files={"file": ("bad.yaml", upload)}
+            )
+        assert resp.status_code == 422
+        assert list(tmp_path.glob("*.yaml")) == []
+        assert "antigravity" not in sys.modules
+
+    def test_import_without_strategy_class_is_422(
+        self, client_no_pool: TestClient, tmp_path: Path
+    ) -> None:
+        upload = yaml.safe_dump({"name": "No Class"}).encode()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            resp = client_no_pool.post(
+                "/api/strategies/import", files={"file": ("no_class.yaml", upload)}
+            )
+        assert resp.status_code == 422
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    def test_import_with_quoted_required_history_is_422_and_writes_nothing(
+        self, client_no_pool: TestClient, tmp_path: Path
+    ) -> None:
+        """A string required_history would kill the strategy on every bar; it is rejected."""
+        upload = yaml.safe_dump(
+            {
+                "name": "Quoted",
+                "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+                "parameters": {"required_history": "50"},
+            }
+        ).encode()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            resp = client_no_pool.post(
+                "/api/strategies/import", files={"file": ("quoted.yaml", upload)}
+            )
+        assert resp.status_code == 422
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    @pytest.mark.parametrize(
+        "rules",
+        [_INVALID_INDICATOR_RULES, _INVALID_PARAM_RULES],
+        ids=["bad_indicator", "bad_param"],
+    )
+    def test_save_with_invalid_rules_is_422_and_writes_nothing(
+        self, tmp_path: Path, rules: dict[str, Any]
+    ) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            resp = client.post(
+                "/api/strategies/save",
+                json={
+                    "name": "Bad Rules",
+                    "description": "",
+                    "exchange_id": "binance",
+                    "symbol": "BTCUSDT",
+                    "rules": rules,
+                    "timeframes": {"primary": "1h"},
+                    "risk": {
+                        "stop_loss_method": "atr",
+                        "stop_loss_value": 2.0,
+                        "take_profit_method": "atr",
+                        "take_profit_value": 3.0,
+                        "sizing_method": "fixed_fractional",
+                        "sizing_params": {"risk_per_trade_pct": 1.0, "max_position_pct": 10.0},
+                    },
+                    "enable_immediately": False,
+                },
+            )
+        assert resp.status_code == 422
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    def test_put_with_a_valid_body_is_200(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "valid.yaml"
+        yaml_file.write_text(
+            yaml.safe_dump(
+                {
+                    "id": "valid_1",
+                    "name": "Valid",
+                    "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+                    "enabled": False,
+                    "symbols": ["BTCUSDT"],
+                    "exchange": {"exchange_id": "binance", "market_type": "SPOT"},
+                    "timeframes": {"primary": "1h"},
+                    "parameters": {
+                        "required_history": 50,
+                        "rules": {
+                            "entry_long": {
+                                "operator": "AND",
+                                "conditions": [
+                                    {
+                                        "indicator": "rsi",
+                                        "params": {"period": 14},
+                                        "comparator": "less_than",
+                                        "value": 30,
+                                    }
+                                ],
+                            },
+                            "exit_long": None,
+                            "entry_short": None,
+                            "exit_short": None,
+                        },
+                    },
+                }
+            )
+        )
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            resp = client.put(
+                "/api/strategies/valid_1",
+                json={
+                    "name": "Still Valid",
+                    "description": "",
+                    "exchange_id": "binance",
+                    "symbol": "BTCUSDT",
+                    "rules": {
+                        "entry_long": {
+                            "operator": "AND",
+                            "conditions": [
+                                {
+                                    "indicator": "rsi",
+                                    "params": {"period": 14},
+                                    "comparator": "less_than",
+                                    "value": 25,
+                                }
+                            ],
+                        },
+                        "exit_long": None,
+                        "entry_short": None,
+                        "exit_short": None,
+                    },
+                    "timeframes": {"primary": "1h"},
+                    "risk": {
+                        "stop_loss_method": "atr",
+                        "stop_loss_value": 2.0,
+                        "take_profit_method": "atr",
+                        "take_profit_value": 3.0,
+                        "sizing_method": "fixed_fractional",
+                        "sizing_params": {"risk_per_trade_pct": 1.0, "max_position_pct": 10.0},
+                    },
+                    "enable_immediately": False,
+                },
+            )
+        assert resp.status_code == 200
+
+    def test_reload_with_no_running_session_is_404(self, client_no_pool: TestClient) -> None:
+        resp = client_no_pool.post("/api/strategies/nope/reload")
+        assert resp.status_code == 404
+
+
+class _FakeSession:
+    def __init__(self, strategy_id: str, status: str, session_id: str, config_hash: str) -> None:
+        self.strategy_id = strategy_id
+        self.status = status
+        self.session_id = session_id
+        self.config_hash = config_hash
+
+
+class _FakeManager:
+    def __init__(self, sessions: list[_FakeSession]) -> None:
+        self._sessions = sessions
+
+    def list_sessions(self) -> list[_FakeSession]:
+        return self._sessions
+
+
+class TestGetStrategyRunningSessions:
+    def test_running_sessions_and_stale_flag(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "drift.yaml"
+        yaml_file.write_text(
+            "id: drift_1\nname: Drift\n"
+            "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
+            "enabled: true\n"
+            "symbols: [BTCUSDT]\n"
+            "parameters:\n  rsi_period: 21\n"
+        )
+        from hydra.strategy.config import StrategyConfig, config_hash
+        from hydra.strategy.engine import validate_strategy_config
+
+        file_hash = config_hash(validate_strategy_config(yaml.safe_load(yaml_file.read_text())))
+        stale_hash = config_hash(
+            StrategyConfig(
+                id="drift_1",
+                name="Drift",
+                strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+                symbols=["BTCUSDT"],
+                parameters={"rsi_period": 14},
+            )
+        )
+        manager = _FakeManager(
+            [
+                _FakeSession("drift_1", "running", "s-stale", stale_hash),
+                _FakeSession("drift_1", "running", "s-fresh", file_hash),
+                _FakeSession("drift_1", "stopped", "s-stopped", stale_hash),
+                _FakeSession("other", "running", "s-other", stale_hash),
+            ]
+        )
+
+        app = FastAPI()
+        app.include_router(router)
+        app.state.db_pool = None
+        app.state.session_manager = manager
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            resp = TestClient(app).get("/api/strategies/drift_1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["config_hash"] == file_hash
+        by_id = {s["session_id"]: s for s in data["running_sessions"]}
+        assert set(by_id) == {"s-stale", "s-fresh"}
+        assert by_id["s-stale"] == {
+            "session_id": "s-stale",
+            "config_hash": stale_hash,
+            "stale": True,
+        }
+        assert by_id["s-fresh"]["stale"] is False
+        assert data["file_changed"] is True
+
+    def test_no_session_manager_gives_empty_running_sessions(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "solo.yaml"
+        yaml_file.write_text(
+            "id: solo_1\nname: Solo\n"
+            "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
+        )
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            resp = client.get("/api/strategies/solo_1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["running_sessions"] == []
+        assert data["file_changed"] is False
+
+    def test_db_only_path_still_lists_running_sessions(self) -> None:
+        """A snapshot-recovered session with no YAML is visible in the detail, not hidden."""
+        pool, conn = _make_mock_pool()
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "id": "dbonly",
+                "name": "dbonly",
+                "enabled": True,
+                "total_pnl": 0,
+                "win_rate": 0,
+                "total_trades": 0,
+            }
+        )
+        app = _make_app(pool=pool)
+        app.state.session_manager = _FakeManager(
+            [_FakeSession("dbonly", "running", "s-run", "abc123def456")]
+        )
+        resp = TestClient(app).get("/api/strategies/dbonly")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["running_sessions"] == [
+            {"session_id": "s-run", "config_hash": "abc123def456", "stale": True}
+        ]
+        assert data["file_changed"] is True
+        assert data["config_hash"] is None
+
+
+class TestReloadStrategyErrors:
+    """The reload endpoint's 404s distinguish 'no session' from 'no file to reload from'."""
+
+    async def test_deleted_yaml_of_a_running_session_is_404_strategy_not_found(
+        self, strategies_dir: Path
+    ) -> None:
+        from hydra.services import strategies as svc
+        from hydra.services.errors import ServiceError
+        from tests.unit.test_execution.session_harness import Harness, write_strategy
+
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            sid = write_strategy(strategies_dir, "reload-gone")
+            await h.session(sid)
+            (strategies_dir / f"{sid}.yaml").unlink()
+            with pytest.raises(ServiceError) as err:
+                await svc.reload_strategy(h.mgr, sid)
+            assert err.value.status_code == 404
+            assert err.value.detail["code"] == "strategy_not_found"
+        finally:
+            await h.close()
+
+    async def test_missing_strategies_dir_is_404_not_500(self, strategies_dir: Path) -> None:
+        from hydra.services import strategies as svc
+        from hydra.services.errors import ServiceError
+        from tests.unit.test_execution.session_harness import Harness, write_strategy
+
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            sid = write_strategy(strategies_dir, "reload-nodir")
+            session = await h.session(sid)
+            (strategies_dir / f"{sid}.yaml").unlink()
+            strategies_dir.rmdir()
+            with pytest.raises(ServiceError) as err:
+                await svc.reload_strategy(h.mgr, sid)
+            assert err.value.status_code == 404
+            assert err.value.detail["code"] == "strategy_not_found"
+            assert session.status == "running"  # the reload failure never touches the session
+        finally:
+            await h.close()
 
 
 # ---------------------------------------------------------------------------

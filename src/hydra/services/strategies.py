@@ -22,7 +22,11 @@ from hydra.backtest.data import (
 from hydra.core.types import ExchangeId, Timeframe
 from hydra.data.storage import MarketDataRepository
 from hydra.execution.client_factory import validate_venue
-from hydra.execution.errors import UnsupportedVenueError
+from hydra.execution.errors import (
+    ConfigReloadRefusedError,
+    SessionNotRunningError,
+    UnsupportedVenueError,
+)
 from hydra.services.errors import (
     DB_ERRORS,
     ServiceError,
@@ -30,7 +34,8 @@ from hydra.services.errors import (
     require_pool,
     service_error,
 )
-from hydra.strategy.config import StrategyRiskConfig
+from hydra.strategy.config import StrategyRiskConfig, config_hash
+from hydra.strategy.engine import validate_strategy_config, write_strategy_config
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +115,16 @@ def build_strategy_name_map() -> dict[str, str]:
         for _, data in iter_strategy_yamls()
         if "id" in data
     }
+
+
+def _write_validated(path: Path, data: dict[str, Any]) -> None:
+    """Validate strictly and write atomically; an invalid config is a 422 and writes nothing."""
+    try:
+        write_strategy_config(path, data)
+    except (ValueError, TypeError) as exc:
+        raise ServiceError(422, f"Invalid strategy config: {exc}") from exc
+    except OSError as exc:
+        raise ServiceError(500, f"Failed to write: {exc}") from exc
 
 
 def _strategy_not_found(strategy_id: str) -> ServiceError:
@@ -257,6 +272,19 @@ class SaveResponse(BaseModel):
     message: str
 
 
+class ReloadResponse(BaseModel):
+    session_id: str
+    from_hash: str | None
+    to_hash: str
+    applies_at: str
+
+
+class RunningSession(BaseModel):
+    session_id: str
+    config_hash: str | None
+    stale: bool
+
+
 class StrategyDetailResponse(BaseModel):
     id: str
     name: str
@@ -272,6 +300,9 @@ class StrategyDetailResponse(BaseModel):
     performance: StrategyPerformance | None = None
     performance_error: str | None = None
     ml_overlay: dict[str, Any] | None = None
+    config_hash: str | None = None
+    file_changed: bool = False
+    running_sessions: list[RunningSession] = Field(default_factory=list)
 
 
 def _row_to_strategy(row: Any) -> dict[str, Any]:
@@ -496,7 +527,7 @@ _ONE_PERFORMANCE_SQL = (
 )
 
 
-async def get_strategy(pool: Any, strategy_id: str) -> dict[str, Any]:
+async def get_strategy(pool: Any, strategy_id: str, session_manager: Any = None) -> dict[str, Any]:
     """Get a single strategy detail with structured builder fields."""
     # Try YAML first
     path = find_strategy_file(strategy_id)
@@ -520,6 +551,7 @@ async def get_strategy(pool: Any, strategy_id: str) -> dict[str, Any]:
             }
             if is_rule_based:
                 result.update(_extract_strategy_detail(data))
+            result.update(_session_drift(data, strategy_id, session_manager))
             rows, perf_error = await _overlay_performance(pool, _ONE_PERFORMANCE_SQL, strategy_id)
             result["performance_error"] = perf_error
             if perf_error is None:
@@ -535,7 +567,61 @@ async def get_strategy(pool: Any, strategy_id: str) -> dict[str, Any]:
         )
     if row is None:
         raise _strategy_not_found(strategy_id)
-    return _row_to_strategy(row)
+    result = _row_to_strategy(row)
+    # no YAML for this strategy: a snapshot-recovered session can still be running on it
+    result.update(_session_drift(None, strategy_id, session_manager))
+    return result
+
+
+def _session_drift(data: dict[str, Any] | None, strategy_id: str, manager: Any) -> dict[str, Any]:
+    """The file's hash (None without a file) and, per running session, whether it differs."""
+    file_hash: str | None = None
+    if data is not None:
+        try:
+            file_hash = config_hash(validate_strategy_config(data))
+        except (ValueError, TypeError):
+            file_hash = None
+    sessions = [
+        {
+            "session_id": s.session_id,
+            "config_hash": s.config_hash,
+            "stale": s.config_hash != file_hash,
+        }
+        for s in (manager.list_sessions() if manager is not None else [])
+        if s.strategy_id == strategy_id and s.status == "running"
+    ]
+    return {
+        "config_hash": file_hash,
+        "file_changed": any(s["stale"] for s in sessions),
+        "running_sessions": sessions,
+    }
+
+
+async def reload_strategy(manager: Any, strategy_id: str) -> dict[str, Any]:
+    """Queue a parameters-only reload on the strategy's running session (next closed bar)."""
+    if manager is None:
+        raise service_error(404, "session_not_running", "No session manager", "not_found")
+    try:
+        result = await manager.reload_config(strategy_id)
+    except SessionNotRunningError as exc:
+        raise service_error(
+            404, "session_not_running", f"No running session for {strategy_id}", "not_found"
+        ) from exc
+    except (KeyError, FileNotFoundError) as exc:
+        # the session keeps running on its snapshot, but there is no file to reload from
+        raise service_error(404, "strategy_not_found", str(exc).strip("'\""), "not_found") from exc
+    except ConfigReloadRefusedError as exc:
+        raise service_error(
+            409, exc.code, str(exc), "invalid", changed_fields=exc.changed_fields
+        ) from exc
+    except (ValueError, TypeError) as exc:
+        raise ServiceError(422, f"Invalid strategy config: {exc}") from exc
+    return {
+        "session_id": result.session_id,
+        "from_hash": result.from_hash,
+        "to_hash": result.to_hash,
+        "applies_at": "next_closed_bar",
+    }
 
 
 def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
@@ -591,11 +677,7 @@ def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
     if body.timeframes.entry:
         config_dict["timeframes"]["entry"] = body.timeframes.entry
 
-    try:
-        with path.open("w") as f:
-            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
-    except OSError as exc:
-        raise ServiceError(500, f"Failed to write: {exc}") from exc
+    _write_validated(path, config_dict)
 
     return SaveResponse(
         id=strategy_id,
@@ -634,11 +716,7 @@ def toggle_strategy(strategy_id: str) -> dict[str, Any]:
         data = parse_strategy_file(path)
         if data is not None:
             data["enabled"] = not data.get("enabled", False)
-            try:
-                with path.open("w") as f:
-                    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-            except OSError as exc:
-                raise ServiceError(500, str(exc)) from exc
+            _write_validated(path, data)
             return {"id": strategy_id, "enabled": data["enabled"]}
 
     raise _strategy_not_found(strategy_id)
@@ -791,13 +869,8 @@ def save_strategy(request: SaveRequest) -> SaveResponse:
     if request.timeframes.entry:
         config_dict["timeframes"]["entry"] = request.timeframes.entry
 
-    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config_path = _CONFIG_DIR / config_filename
-    try:
-        with config_path.open("w") as f:
-            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
-    except OSError as exc:
-        raise ServiceError(500, f"Failed to write: {exc}") from exc
+    _write_validated(config_path, config_dict)
 
     return SaveResponse(
         id=config_dict["id"],
@@ -831,14 +904,10 @@ def import_strategy(filename: str | None, content: bytes) -> SaveResponse:
     strategy_id = _name_to_id(original_name) + f"_{suffix}"
     data["id"] = strategy_id
     data.setdefault("enabled", False)
+    data.setdefault("name", original_name)
 
-    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     dest = _CONFIG_DIR / f"{strategy_id}.yaml"
-    try:
-        with dest.open("w") as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-    except OSError as exc:
-        raise ServiceError(500, str(exc)) from exc
+    _write_validated(dest, data)
 
     return SaveResponse(
         id=strategy_id,

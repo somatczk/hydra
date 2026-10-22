@@ -59,6 +59,7 @@ class RuleBasedStrategy(BaseStrategy):
         self._rules = self._parse_rules()
         self._apply_param_overrides()
         self._validate_indicators()
+        self._validate_required_history()
 
     def _parse_rules(self) -> RuleSet:
         """Parse the ``rules`` dict from strategy parameters into a RuleSet."""
@@ -146,6 +147,16 @@ class RuleBasedStrategy(BaseStrategy):
                 resolve_indicator(cond.indicator, cond.params)
                 if isinstance(cond.value, str):
                     resolve_indicator(*parse_indicator_ref(cond.value))
+
+    def _validate_required_history(self) -> None:
+        """Raise now for a required_history that is not a positive int.
+
+        It slices the context bars on every ``on_bar``; a string or float would fail on every
+        bar instead, while ``probe_strategy``'s ``int()`` cast hides it at session start.
+        """
+        value = self._config.parameters.get("required_history", 50)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"parameters.required_history must be an integer >= 1, got {value!r}")
 
     @property
     def required_history(self) -> int:

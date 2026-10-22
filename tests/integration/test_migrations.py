@@ -20,6 +20,7 @@ from hydra.dashboard import lifespan
 from hydra.data.migrations import __main__ as migrations_cli
 from hydra.data.migrations.runner import (
     MigrationError,
+    alembic_config,
     current_revision,
     head_revision,
     heads,
@@ -105,6 +106,32 @@ async def test_fresh_db_upgrade(fresh_database: str) -> None:
         "WHERE table_name = 'backtest_results' AND column_name = 'data_source'",
     )
     assert [r["is_nullable"] for r in nullable] == ["NO"]
+    session_cols = await _fetch(
+        fresh_database,
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_name = 'trading_sessions' AND column_name IN "
+        "('strategy_config', 'config_hash') ORDER BY column_name",
+    )
+    assert [tuple(r) for r in session_cols] == [
+        ("config_hash", "text", "YES"),
+        ("strategy_config", "jsonb", "YES"),
+    ]
+
+
+async def test_downgrade_drops_the_session_config_columns(fresh_database: str) -> None:
+    """The session snapshot revision is reversible: its downgrade drops both columns."""
+    await _upgrade(fresh_database)
+
+    await asyncio.to_thread(command.downgrade, alembic_config(fresh_database), "-1")
+
+    columns = await _fetch(
+        fresh_database,
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'trading_sessions' "
+        "AND column_name IN ('strategy_config', 'config_hash')",
+    )
+    assert columns == []
+    assert await current_revision(fresh_database) != head_revision()
 
 
 async def test_legacy_2_1_10_schema_upgrades_in_place(fresh_database: str) -> None:

@@ -11,6 +11,8 @@ import yaml
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from hydra.strategy.engine import write_strategy_config
+
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 logger = logging.getLogger(__name__)
 
@@ -122,11 +124,11 @@ async def import_template(template_id: str) -> dict[str, Any]:
     data["id"] = strategy_id
     data["enabled"] = False
 
-    _STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
     dest = _STRATEGIES_DIR / f"{strategy_id}.yaml"
     try:
-        with dest.open("w") as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        write_strategy_config(dest, data)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid template: {exc}") from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

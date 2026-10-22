@@ -58,7 +58,12 @@ def test_strategy_writes_land_in_isolated_dir(strategies_dir: Path) -> None:
     assert toggled.json() == {"id": saved_id, "enabled": True}
     assert yaml.safe_load(saved_path.read_text())["enabled"] is True
 
-    upload = yaml.safe_dump({"name": "Uploaded Iso", "strategy_class": "x.Y"}).encode()
+    upload = yaml.safe_dump(
+        {
+            "name": "Uploaded Iso",
+            "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        }
+    ).encode()
     imported = client.post(
         "/api/strategies/import",
         files={"file": ("uploaded.yaml", upload, "application/x-yaml")},

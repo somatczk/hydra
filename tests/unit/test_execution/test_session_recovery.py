@@ -188,6 +188,32 @@ async def test_recovery_resumes_paper_and_never_live(
         await h.close()
 
 
+async def test_junk_files_do_not_block_recovery_of_pre_snapshot_rows(
+    strategies_dir: Path, restore_from: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-snapshot row recovers from its file even when unrelated junk sits beside it.
+
+    A list YAML or an unreadable entry in the strategies dir must be skipped, not turn the
+    recovery into a _close_restored that sells the restored holdings.
+    """
+    h = Harness(strategies_dir)
+    write_strategy(strategies_dir, "paper-a")
+    (strategies_dir / "aaa-list.yaml").write_text("- 1\n- 2\n")
+    (strategies_dir / "aaa-unreadable.yaml").mkdir()
+    restore_from["s1"] = await _account_with_long(h.end)
+    mgr, _ = await _boot(h, [_row("s1", "paper-a")], monkeypatch)
+    try:
+        s1 = mgr.get_session("s1")
+        assert s1 is not None and s1.status == "running" and s1.task_alive
+        assert s1.strategy_config is not None and s1.config_hash is not None
+        ex = s1._executor
+        assert [(p.quantity, p.avg_entry_price) for p in await ex.get_positions("BTCUSDT")] == [
+            (D("0.05"), D("100.1"))
+        ]
+    finally:
+        await h.close()
+
+
 async def test_resting_stop_is_adopted_and_a_gap_during_downtime_fills_at_the_first_bar(
     strategies_dir: Path, restore_from: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:

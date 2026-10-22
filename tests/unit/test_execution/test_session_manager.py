@@ -15,10 +15,12 @@ from hydra.core.config import HydraConfig
 from hydra.data.ingestion import InsufficientHistoryError
 from hydra.execution import client_factory, exchange_client
 from hydra.execution.errors import (
+    ConfigReloadRefusedError,
     DuplicateSessionError,
     KillSwitchActiveError,
     LiveTradingDisabledError,
     PaperCapitalUnavailableError,
+    SessionNotRunningError,
     UnsupportedStrategyError,
     UnsupportedVenueError,
 )
@@ -259,3 +261,153 @@ async def test_session_error_is_counted(h: Harness, strategies_dir: Path) -> Non
     assert not session.task_alive
     after = metrics._counter("hydra_sessions_errored_total").labels(strategy_id="err")._value.get()
     assert after - before == 1
+
+
+class TestConfigReload:
+    @pytest.mark.parametrize(
+        ("edit", "field"),
+        [
+            (lambda d: d["symbols"].append("ETHUSDT"), "symbols"),
+            (lambda d: d["timeframes"].__setitem__("primary", "4h"), "timeframes"),
+            (
+                lambda d: d.__setitem__(
+                    "strategy_class", "hydra.strategy.builtin.momentum.MomentumRSIMACDStrategy"
+                ),
+                "strategy_class",
+            ),
+            (lambda d: d.setdefault("risk", {}).__setitem__("stop_loss_value", 9.0), "risk"),
+            (
+                lambda d: d["position_sizing"].__setitem__("max_position_pct", 50.0),
+                "position_sizing",
+            ),
+            (
+                lambda d: d["parameters"]["rules"]["entry_long"]["conditions"][0].__setitem__(
+                    "value", 5.0
+                ),
+                "parameters.rules",
+            ),
+        ],
+        ids=[
+            "symbols",
+            "timeframes",
+            "strategy_class",
+            "risk",
+            "position_sizing",
+            "rules",
+        ],
+    )
+    async def test_reload_refused_for_non_parameter_changes(
+        self, h: Harness, strategies_dir: Path, edit: Any, field: str
+    ) -> None:
+        assert h.mgr is not None
+        sid = write_strategy(strategies_dir, "reload-np")
+        session = await h.session(sid)
+        runtime = session._runtime
+        assert runtime is not None
+        cfg_before = runtime.cfg
+        path = strategies_dir / f"{sid}.yaml"
+
+        data = yaml.safe_load(path.read_text())
+        edit(data)
+        path.write_text(yaml.safe_dump(data))
+
+        with pytest.raises(ConfigReloadRefusedError) as err:
+            await h.mgr.reload_config(sid)
+        assert field in err.value.changed_fields
+        assert runtime.cfg is cfg_before
+
+    async def test_reload_accepts_parameter_only_changes(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        assert h.mgr is not None
+        sid = write_strategy(strategies_dir, "reload-ok")
+        session = await h.session(sid)
+        path = strategies_dir / f"{sid}.yaml"
+
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["rsi_threshold"] = 5
+        path.write_text(yaml.safe_dump(data))
+        result = await h.mgr.reload_config(sid)
+        assert result.session_id == session.session_id
+
+        # enabled: false against a running snapshot of enabled True is neither stale nor refused
+        data = yaml.safe_load(path.read_text())
+        data["enabled"] = False
+        path.write_text(yaml.safe_dump(data))
+        result2 = await h.mgr.reload_config(sid)
+        assert result2.session_id == session.session_id
+
+    async def test_reload_unknown_strategy_is_not_running(self, h: Harness) -> None:
+        assert h.mgr is not None
+        with pytest.raises(SessionNotRunningError):
+            await h.mgr.reload_config("no-such-strategy")
+
+    async def test_reload_applies_required_history_growth_within_the_context(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """Growth up to the context's capacity is a parameter change, not a restart."""
+        assert h.mgr is not None
+        sid = write_strategy(strategies_dir, "reload-rh-in")
+        session = await h.session(sid)
+        runtime = session._runtime
+        assert runtime is not None
+        assert runtime.required_history == 2
+        assert runtime.context.max_bars == 20  # feed.window_for(2), history_window 20
+
+        path = strategies_dir / f"{sid}.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["required_history"] = 10
+        path.write_text(yaml.safe_dump(data))
+
+        result = await h.mgr.reload_config(sid)
+        assert result.session_id == session.session_id
+        await h.bar(session, "100")
+        assert runtime.cfg.parameters["required_history"] == 10
+
+    async def test_reload_refuses_required_history_growth_beyond_the_context(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        assert h.mgr is not None
+        sid = write_strategy(strategies_dir, "reload-rh-out")
+        session = await h.session(sid)
+        runtime = session._runtime
+        assert runtime is not None
+        cfg_before = runtime.cfg
+
+        path = strategies_dir / f"{sid}.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["required_history"] = 30  # the context holds 20 bars
+        path.write_text(yaml.safe_dump(data))
+
+        with pytest.raises(ConfigReloadRefusedError) as err:
+            await h.mgr.reload_config(sid)
+        assert err.value.changed_fields == ["parameters.required_history"]
+        assert runtime.cfg is cfg_before
+
+    async def test_bad_yaml_does_not_block_others(self, h: Harness, strategies_dir: Path) -> None:
+        """A strategy file missing strategy_class is skipped and logged; others still start."""
+        (strategies_dir / "broken.yaml").write_text("id: broken\nname: Broken\n")
+        sid = write_strategy(strategies_dir, "s-ok-despite-broken")
+        assert h.mgr is not None
+        session = await h.session(sid)
+        assert session.status == "running"
+
+    async def test_non_mapping_yaml_does_not_block_others(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """A YAML that parses to a list is skipped like any other bad file, not fatal."""
+        (strategies_dir / "aaa-list.yaml").write_text("- 1\n- 2\n")
+        sid = write_strategy(strategies_dir, "s-ok-despite-list")
+        assert h.mgr is not None
+        session = await h.session(sid)
+        assert session.status == "running"
+
+    async def test_unreadable_strategy_file_does_not_block_others(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """A strategies-dir entry that cannot be opened is skipped, not fatal to every start."""
+        (strategies_dir / "aaa-unreadable.yaml").mkdir()
+        sid = write_strategy(strategies_dir, "s-ok-despite-unreadable")
+        assert h.mgr is not None
+        session = await h.session(sid)
+        assert session.status == "running"
