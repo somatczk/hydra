@@ -275,24 +275,3 @@ def _trades(fills: list[PaperFill]) -> tuple[list[Trade], list[TransactionRecord
         if held == 0:
             entry_time = None
     return trades, transactions
-
-
-if __name__ == "__main__":
-    import asyncio
-    import signal as _signal
-
-    from hydra.core.logging import setup_logging
-
-    setup_logging(level="INFO", log_format="json")
-
-    async def _worker() -> None:
-        """Backtest worker: waits for jobs (placeholder)."""
-        stop = asyncio.Event()
-        loop = asyncio.get_event_loop()
-        for sig in (_signal.SIGTERM, _signal.SIGINT):
-            loop.add_signal_handler(sig, stop.set)
-        logger.info("Backtest worker started, waiting for jobs...")
-        await stop.wait()
-        logger.info("Backtest worker shutting down.")
-
-    asyncio.run(_worker())

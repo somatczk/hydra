@@ -118,6 +118,7 @@ beforeEach(() => {
 afterEach(() => {
   page?.unmount();
   page = null;
+  vi.useRealTimers();
 });
 
 describe('kill switch section', () => {
@@ -225,6 +226,7 @@ describe('kill switch section, stale and closed-dialog cases', () => {
 
 describe('breakers', () => {
   it('lists four tiers and offers a reset on the active tier only', async () => {
+    vi.useFakeTimers({ now: new Date('2026-10-21T14:00:00Z') });
     const c = await open();
     const text = c.querySelector('#breakers')?.textContent ?? '';
     expect(text).toContain('Tier 1: Reduce size 50%');

@@ -2,36 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import math
-import uuid
-from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel
 
-from hydra.backtest.hyperopt import HyperoptResult, HyperoptRunner, ParamDef, ParameterSpace
+from hydra.backtest import jobs
+from hydra.backtest.hyperopt import ParamDef
 from hydra.backtest.jobs import (
     HyperoptRunRequest,
-    Preflight,
     WalkForwardRunRequest,
-    fail_task,
-    load_task_bars,
-)
-from hydra.backtest.runner import BacktestRunner
-from hydra.backtest.walkforward import (
-    WalkForwardAnalyzer,
-    WalkForwardResult,
-    window_bar_counts,
+    walkforward_months,
+    window_fits,
 )
 from hydra.services import strategies as strategy_files
-from hydra.services.backtest import DataProvenanceModel, _preflight, _spawn
-from hydra.services.errors import ServiceError, service_error
-
-logger = logging.getLogger(__name__)
-
+from hydra.services.backtest import DataProvenanceModel, _preflight
+from hydra.services.errors import ServiceError, db_errors, service_error
 
 # ---------------------------------------------------------------------------
 # Strategy optimizable parameter extraction
@@ -221,14 +206,6 @@ def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# In-memory state for hyperopt tasks
-# ---------------------------------------------------------------------------
-
-_HYPEROPT_TASKS: dict[str, dict[str, Any]] = {}
-_HYPEROPT_RESULTS: dict[str, HyperoptResult] = {}
-
-
-# ---------------------------------------------------------------------------
 # Pydantic request/response models
 # ---------------------------------------------------------------------------
 
@@ -236,6 +213,13 @@ _HYPEROPT_RESULTS: dict[str, HyperoptResult] = {}
 class HyperoptRunResponse(BaseModel):
     task_id: str
     status: str = "queued"
+
+
+class JobProvenanceModel(DataProvenanceModel):
+    """Provenance read from a job row: carries the code and config that ran it (D2 decision)."""
+
+    hydra_version: str | None = None
+    config_hash: str | None = None
 
 
 class HyperoptProgressResponse(BaseModel):
@@ -251,7 +235,7 @@ class HyperoptProgressResponse(BaseModel):
     start_date: str = ""
     end_date: str = ""
     error: str | None = None
-    provenance: DataProvenanceModel | None = None
+    provenance: JobProvenanceModel | None = None
 
 
 class TrialRecordResponse(BaseModel):
@@ -271,7 +255,7 @@ class HyperoptResultResponse(BaseModel):
     trials: list[TrialRecordResponse]
     total_trials: int
     completed_trials: int
-    provenance: DataProvenanceModel | None = None
+    provenance: JobProvenanceModel | None = None
 
 
 class HyperoptHistoryEntry(BaseModel):
@@ -283,81 +267,7 @@ class HyperoptHistoryEntry(BaseModel):
     best_so_far: float | None = None
     created_at: str
     error: str | None = None
-    provenance: DataProvenanceModel | None = None
-
-
-# ---------------------------------------------------------------------------
-# Background task
-# ---------------------------------------------------------------------------
-
-
-async def _run_hyperopt_task(task_id: str, body: HyperoptRunRequest, pf: Preflight) -> None:
-    """Execute a hyperopt run on stored bars and keep the result in memory."""
-    task = _HYPEROPT_TASKS[task_id]
-    task["status"] = "running"
-
-    try:
-        loaded = await load_task_bars(task, pf, body.start_date, body.end_date)
-        if loaded is None:
-            return
-        bars, provenance = loaded
-        task["provenance"] = provenance.to_dict()
-
-        space = ParameterSpace(
-            params=[
-                ParamDef(name=p.name, type=p.type, low=p.low, high=p.high, choices=p.choices)
-                for p in body.param_space
-            ]
-        )
-        best_sharpe_seen = float("-inf")
-
-        async def _on_trial_complete(
-            trial_num: int,
-            completed: int,
-            total: int,
-            record: Any,
-        ) -> None:
-            nonlocal best_sharpe_seen
-            task["completed_trials"] = completed
-            task["total_trials"] = total
-            task["last_trial_sharpe"] = record.sharpe
-            task["current_trial_params"] = record.params
-            best_sharpe_seen = max(best_sharpe_seen, record.sharpe)
-            task["best_so_far"] = best_sharpe_seen
-
-        def _run_in_thread() -> HyperoptResult:
-            loop = asyncio.new_event_loop()
-            try:
-                runner = HyperoptRunner(BacktestRunner())
-                return loop.run_until_complete(
-                    runner.run(
-                        strategy_class=pf.strategy_cls,
-                        base_config=pf.config,
-                        bars=bars,
-                        initial_capital=Decimal(str(body.initial_capital)),
-                        param_space=space,
-                        method=body.method,
-                        max_trials=body.max_trials,
-                        symbol=pf.symbol,
-                        timeframe=pf.timeframe,
-                        on_trial_complete=_on_trial_complete,
-                    )
-                )
-            finally:
-                loop.close()
-
-        result = await asyncio.to_thread(_run_in_thread)
-
-        _HYPEROPT_RESULTS[task_id] = result
-        task["status"] = "completed"
-        task["completed_trials"] = result.completed_trials
-        task["total_trials"] = result.total_trials
-        task["best_so_far"] = result.best_metric
-
-    except Exception as exc:
-        logger.exception("Hyperopt task %s failed", task_id)
-        task["status"] = "failed"
-        task["error"] = str(exc)
+    provenance: JobProvenanceModel | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -365,28 +275,8 @@ async def _run_hyperopt_task(task_id: str, body: HyperoptRunRequest, pf: Preflig
 # ---------------------------------------------------------------------------
 
 
-def list_hyperopt_history() -> list[dict[str, Any]]:
-    """Return a summary of all hyperopt runs (most recent first)."""
-    entries = [
-        {
-            "task_id": tid,
-            "status": t["status"],
-            "strategy_id": t.get("strategy_id", ""),
-            "completed_trials": t.get("completed_trials", 0),
-            "total_trials": t.get("total_trials", 0),
-            "best_so_far": t.get("best_so_far"),
-            "created_at": t.get("created_at", ""),
-            "error": t.get("error"),
-            "provenance": t.get("provenance"),
-        }
-        for tid, t in _HYPEROPT_TASKS.items()
-    ]
-    entries.sort(key=lambda e: e["created_at"], reverse=True)
-    return entries
-
-
 async def submit_hyperopt(pool: Any, body: HyperoptRunRequest) -> dict[str, Any]:
-    """Start a hyperparameter optimisation run on stored bars.
+    """Queue a hyperparameter optimisation run on the worker.
 
     Returns a ``task_id`` to poll for progress and results.
     """
@@ -396,95 +286,88 @@ async def submit_hyperopt(pool: Any, body: HyperoptRunRequest) -> dict[str, Any]
     except ValueError as exc:
         raise service_error(422, "invalid_param_space", str(exc), "invalid") from exc
     pf = await _preflight(pool, body.strategy_id, body.timeframe, body.start_date, body.end_date)
-    task_id = f"ho-{uuid.uuid4().hex[:8]}"
-    _HYPEROPT_TASKS[task_id] = {
-        "task_id": task_id,
-        "status": "queued",
-        "completed_trials": 0,
-        "total_trials": body.max_trials,
-        "best_so_far": None,
-        "strategy_id": body.strategy_id,
-        "created_at": datetime.now(UTC).isoformat(),
-        "request": body.model_dump(mode="json"),
-    }
-    _spawn(_run_hyperopt_task(task_id, body, pf))
+    async with db_errors("queueing the job"):
+        task_id = await jobs.enqueue(
+            pool,
+            "hyperopt",
+            body.model_dump(mode="json"),
+            pf.config.model_dump(mode="json"),
+            {"completed_trials": 0, "total_trials": body.max_trials, "best_so_far": None},
+        )
     return {"task_id": task_id, "status": "queued"}
 
 
-def _hyperopt_task(task_id: str) -> dict[str, Any]:
-    if task_id not in _HYPEROPT_TASKS:
+async def _hyperopt_row(pool: Any, task_id: str) -> Any:
+    row = await jobs.get(pool, task_id, "hyperopt")
+    if row is None:
         raise service_error(
             404, "task_not_found", f"Hyperopt task {task_id} not found", "not_found"
         )
-    return _HYPEROPT_TASKS[task_id]
+    return row
 
 
-def get_hyperopt_progress(task_id: str) -> dict[str, Any]:
-    """Poll progress of a running hyperopt task."""
-    t = _hyperopt_task(task_id)
-    req = t.get("request", {})
+async def get_hyperopt_progress(pool: Any, task_id: str) -> dict[str, Any]:
+    """Poll progress of a hyperopt job."""
+    row = await _hyperopt_row(pool, task_id)
+    request = jobs.json_value(row["request"]) or {}
+    detail = jobs.json_value(row["detail"]) or {}
     return {
         "task_id": task_id,
-        "status": t["status"],
-        "strategy_id": t.get("strategy_id", ""),
-        "created_at": t.get("created_at", ""),
-        "completed_trials": t["completed_trials"],
-        "total_trials": t["total_trials"],
-        "best_so_far": t.get("best_so_far"),
-        "current_trial_params": t.get("current_trial_params"),
-        "last_trial_sharpe": t.get("last_trial_sharpe"),
-        "start_date": req.get("start_date", ""),
-        "end_date": req.get("end_date", ""),
-        "error": t.get("error"),
-        "provenance": t.get("provenance"),
+        "status": row["status"],
+        "strategy_id": request.get("strategy_id", ""),
+        "created_at": row["created_at"].isoformat(),
+        "completed_trials": detail.get("completed_trials", 0),
+        "total_trials": detail.get("total_trials", request.get("max_trials", 0)),
+        "best_so_far": detail.get("best_so_far"),
+        "current_trial_params": detail.get("current_trial_params"),
+        "last_trial_sharpe": detail.get("last_trial_sharpe"),
+        "start_date": request.get("start_date", ""),
+        "end_date": request.get("end_date", ""),
+        "error": row["error"],
+        "provenance": detail.get("provenance"),
     }
 
 
-def get_hyperopt_results(task_id: str) -> dict[str, Any]:
+async def get_hyperopt_results(pool: Any, task_id: str) -> dict[str, Any]:
     """Return the full result of a completed hyperopt run."""
-    t = _hyperopt_task(task_id)
-    if t["status"] != "completed":
-        raise ServiceError(409, f"Hyperopt task {task_id} is not completed (status: {t['status']})")
-    result = _HYPEROPT_RESULTS.get(task_id)
+    row = await _hyperopt_row(pool, task_id)
+    if row["status"] != "completed":
+        raise ServiceError(
+            409, f"Hyperopt task {task_id} is not completed (status: {row['status']})"
+        )
+    result = jobs.json_value(row["result"])
     if result is None:
         raise service_error(
             404, "result_not_found", f"No result stored for hyperopt task {task_id}", "not_found"
         )
-    return {
-        "task_id": task_id,
-        "status": t["status"],
-        "best_params": result.best_params,
-        "best_metric": result.best_metric,
-        "trials": [
+    return {"task_id": task_id, "status": row["status"], **result}
+
+
+async def list_hyperopt_history(pool: Any) -> list[dict[str, Any]]:
+    """Return a summary of all hyperopt runs (most recent first)."""
+    entries = []
+    for row in await jobs.list_jobs(pool, "hyperopt"):
+        request = jobs.json_value(row["request"]) or {}
+        detail = jobs.json_value(row["detail"]) or {}
+        entries.append(
             {
-                "trial_number": r.trial_number,
-                "params": r.params,
-                "sharpe": r.sharpe,
-                "total_return": r.total_return,
-                "max_drawdown": r.max_drawdown,
-                "total_trades": r.total_trades,
+                "task_id": row["id"],
+                "status": row["status"],
+                "strategy_id": request.get("strategy_id", ""),
+                "completed_trials": detail.get("completed_trials", 0),
+                "total_trials": detail.get("total_trials", request.get("max_trials", 0)),
+                "best_so_far": detail.get("best_so_far"),
+                "created_at": row["created_at"].isoformat(),
+                "error": row["error"],
+                "provenance": detail.get("provenance"),
             }
-            for r in result.trials
-        ],
-        "total_trials": result.total_trials,
-        "completed_trials": result.completed_trials,
-        "provenance": t.get("provenance"),
-    }
+        )
+    return entries
 
 
 # ===========================================================================
 # Walk-forward validation
 # ===========================================================================
-
-# ---------------------------------------------------------------------------
-# In-memory state for walk-forward tasks
-# ---------------------------------------------------------------------------
-
-_WALKFORWARD_TASKS: dict[str, dict[str, Any]] = {}
-_WALKFORWARD_RESULTS: dict[str, WalkForwardResult] = {}
-
-_DAYS_PER_MONTH = 30.44
-
 
 # ---------------------------------------------------------------------------
 # Pydantic request/response models
@@ -516,82 +399,7 @@ class WalkForwardResultResponse(BaseModel):
     aggregated_return: float | None
     aggregated_drawdown: float | None
     out_of_sample_equity: list[float]
-    provenance: DataProvenanceModel | None = None
-
-
-def _walkforward_months(
-    first: datetime, last: datetime, fold_count: int, train_pct: float
-) -> tuple[int, int]:
-    """In-sample / out-of-sample months per window, derived from the real data span."""
-    total_months = max(1, math.floor((last - first).days / _DAYS_PER_MONTH))
-    in_sample = max(1, round(total_months * train_pct / fold_count))
-    out_of_sample = max(1, round(total_months * (1 - train_pct) / fold_count))
-    return in_sample, out_of_sample
-
-
-def _window_fits(
-    first: datetime, last: datetime, bar_count: int, in_sample: int, out_of_sample: int
-) -> bool:
-    days = (last - first).days
-    if days <= 0:
-        return False
-    is_bars, oos_bars = window_bar_counts(bar_count, days, in_sample, out_of_sample)
-    return is_bars > 0 and oos_bars > 0 and is_bars + oos_bars <= bar_count
-
-
-# ---------------------------------------------------------------------------
-# Background task
-# ---------------------------------------------------------------------------
-
-
-async def _run_walkforward_task(task_id: str, body: WalkForwardRunRequest, pf: Preflight) -> None:
-    """Execute a walk-forward analysis on stored bars."""
-    task = _WALKFORWARD_TASKS[task_id]
-    task["status"] = "running"
-
-    try:
-        loaded = await load_task_bars(task, pf, body.start_date, body.end_date)
-        if loaded is None:
-            return
-        bars, provenance = loaded
-        task["provenance"] = provenance.to_dict()
-
-        in_sample, out_of_sample = _walkforward_months(
-            provenance.first_ts, provenance.last_ts, body.fold_count, body.train_pct
-        )
-        task["in_sample_months"] = in_sample
-        task["out_of_sample_months"] = out_of_sample
-
-        def _run_in_thread() -> WalkForwardResult:
-            loop = asyncio.new_event_loop()
-            try:
-                analyzer = WalkForwardAnalyzer(initial_capital=Decimal(str(body.initial_capital)))
-                return loop.run_until_complete(
-                    analyzer.run_walkforward(
-                        bars=bars,
-                        strategy_class=pf.strategy_cls,
-                        strategy_config=pf.config,
-                        in_sample_months=in_sample,
-                        out_of_sample_months=out_of_sample,
-                        symbol=pf.symbol,
-                        timeframe=pf.timeframe,
-                    )
-                )
-            finally:
-                loop.close()
-
-        result = await asyncio.to_thread(_run_in_thread)
-        if not result.folds:
-            fail_task(task, f"range too short for {body.fold_count} folds")
-            return
-
-        _WALKFORWARD_RESULTS[task_id] = result
-        task["status"] = "completed"
-        task["fold_count"] = len(result.folds)
-
-    except Exception as exc:
-        logger.exception("Walk-forward task %s failed", task_id)
-        fail_task(task, str(exc))
+    provenance: JobProvenanceModel | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -600,15 +408,15 @@ async def _run_walkforward_task(task_id: str, body: WalkForwardRunRequest, pf: P
 
 
 async def submit_walkforward(pool: Any, body: WalkForwardRunRequest) -> dict[str, Any]:
-    """Start a walk-forward validation run on stored bars.
+    """Queue a walk-forward validation run on the worker.
 
     Returns a ``task_id`` to poll for results.
     """
     pf = await _preflight(pool, body.strategy_id, body.timeframe, body.start_date, body.end_date)
     if pf.stored is not None:
         first, last, bar_count = pf.stored
-        in_sample, out_of_sample = _walkforward_months(first, last, body.fold_count, body.train_pct)
-        if not _window_fits(first, last, bar_count, in_sample, out_of_sample):
+        in_sample, out_of_sample = walkforward_months(first, last, body.fold_count, body.train_pct)
+        if not window_fits(first, last, bar_count, in_sample, out_of_sample):
             raise service_error(
                 422,
                 "range_too_short",
@@ -619,30 +427,30 @@ async def submit_walkforward(pool: Any, body: WalkForwardRunRequest) -> dict[str
                 available_first_ts=first.isoformat(),
                 available_last_ts=last.isoformat(),
             )
-    task_id = f"wf-{uuid.uuid4().hex[:8]}"
-    _WALKFORWARD_TASKS[task_id] = {
-        "task_id": task_id,
-        "status": "queued",
-        "fold_count": 0,
-        "request": body.model_dump(mode="json"),
-    }
-    _spawn(_run_walkforward_task(task_id, body, pf))
+    async with db_errors("queueing the job"):
+        task_id = await jobs.enqueue(
+            pool,
+            "walkforward",
+            body.model_dump(mode="json"),
+            pf.config.model_dump(mode="json"),
+            {},
+        )
     return {"task_id": task_id, "status": "queued"}
 
 
-def get_walkforward_results(task_id: str) -> dict[str, Any]:
+async def get_walkforward_results(pool: Any, task_id: str) -> dict[str, Any]:
     """Return fold metrics and aggregated OOS equity for a completed walk-forward run."""
-    if task_id not in _WALKFORWARD_TASKS:
+    row = await jobs.get(pool, task_id, "walkforward")
+    if row is None:
         raise service_error(
             404, "task_not_found", f"Walk-forward task {task_id} not found", "not_found"
         )
-    t = _WALKFORWARD_TASKS[task_id]
-    if t["status"] != "completed":
-        detail = f"Walk-forward task {task_id} is not completed (status: {t['status']})"
-        if t.get("error"):
-            detail = f"{detail}: {t['error']}"
+    if row["status"] != "completed":
+        detail = f"Walk-forward task {task_id} is not completed (status: {row['status']})"
+        if row["error"]:
+            detail = f"{detail}: {row['error']}"
         raise ServiceError(409, detail)
-    result = _WALKFORWARD_RESULTS.get(task_id)
+    result = jobs.json_value(row["result"])
     if result is None:
         raise service_error(
             404,
@@ -650,34 +458,10 @@ def get_walkforward_results(task_id: str) -> dict[str, Any]:
             f"No result stored for walk-forward task {task_id}",
             "not_found",
         )
-
-    folds_out: list[dict[str, Any]] = [
-        {
-            "fold_index": fold.fold_index,
-            "in_sample_sharpe": fold.in_sample_metrics.sharpe_ratio,
-            "in_sample_return": float(fold.in_sample_metrics.total_return),
-            "in_sample_drawdown": float(fold.in_sample_metrics.max_drawdown),
-            "in_sample_trades": fold.in_sample_metrics.total_trades,
-            "out_of_sample_sharpe": fold.out_of_sample_metrics.sharpe_ratio,
-            "out_of_sample_return": float(fold.out_of_sample_metrics.total_return),
-            "out_of_sample_drawdown": float(fold.out_of_sample_metrics.max_drawdown),
-            "out_of_sample_trades": fold.out_of_sample_metrics.total_trades,
-        }
-        for fold in result.folds
-    ]
-
-    agg = result.aggregated_oos_metrics
-    oos_equity: list[float] = []
-    if agg is not None:
-        oos_equity = [float(eq) for eq in agg.equity_curve]
-
+    job_detail = jobs.json_value(row["detail"]) or {}
     return {
         "task_id": task_id,
-        "status": t["status"],
-        "folds": folds_out,
-        "aggregated_sharpe": agg.sharpe_ratio if agg is not None else None,
-        "aggregated_return": float(agg.total_return) if agg is not None else None,
-        "aggregated_drawdown": float(agg.max_drawdown) if agg is not None else None,
-        "out_of_sample_equity": oos_equity,
-        "provenance": t.get("provenance"),
+        "status": row["status"],
+        **result,
+        "provenance": job_detail.get("provenance"),
     }

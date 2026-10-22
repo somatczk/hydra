@@ -158,9 +158,9 @@ class TestBacktest:
         assert resp.status_code == 503
         assert resp.json()["detail"]["state"] == "unavailable"
 
-    def test_backtest_status_not_found(self, client: TestClient) -> None:
+    def test_backtest_status_without_database_is_503(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/status/nonexistent")
-        assert resp.status_code == 404
+        assert resp.status_code == 503
 
     def test_list_results_without_database_is_503(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/results")

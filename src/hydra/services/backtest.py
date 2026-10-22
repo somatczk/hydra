@@ -1,35 +1,28 @@
-"""Backtest runs and results: pre-flight checks, in-process tasks, result reads and sharing."""
+"""Backtest runs and results: pre-flight checks, durable job submission and result reads."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from datetime import datetime
-from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+from hydra.backtest import jobs
 from hydra.backtest.data import no_market_data
 from hydra.backtest.jobs import (
-    LIST_DETAILS_SQL,
     LIST_SUMMARIES_SQL,
     ONE_RESULT_SQL,
     RENAME_SQL,
+    TERMINAL_STATUSES,
     BacktestRunRequest,
     InvalidStrategyError,
     Preflight,
     detail_from_row,
-    fail_task,
-    fetch_fresh_bars,
     import_backtest_strategy,
-    load_task_bars,
-    persist_result,
-    result_record,
     summary_from_row,
 )
-from hydra.backtest.runner import BacktestRunner
 from hydra.core.types import MarketType, Timeframe
 from hydra.data.storage import MarketDataRepository
 from hydra.services import strategies as strategy_files
@@ -52,11 +45,16 @@ class BacktestRunResponse(BaseModel):
 
 class BacktestStatus(BaseModel):
     task_id: str
-    status: str  # queued | running | completed | failed
+    status: str  # queued | running | completed | failed | cancelled
     progress: float = 0.0  # 0-100
     error: str | None = None
     result_id: str | None = None
     fetch_error: str | None = None
+
+
+class CancelJobResponse(BaseModel):
+    task_id: str
+    status: str
 
 
 class DataProvenanceModel(BaseModel):
@@ -165,40 +163,6 @@ class BacktestStrategyOption(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# In-memory state
-# ---------------------------------------------------------------------------
-
-_TASKS: dict[str, dict[str, Any]] = {}
-_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
-_RESULTS: dict[str, dict[str, Any]] = {}
-
-
-def _spawn(coro: Any) -> None:
-    task = asyncio.create_task(coro)
-    _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
-
-
-async def populate_cache_from_db(pool: Any) -> None:
-    """Load backtest results from DB into the in-memory cache on startup."""
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(LIST_DETAILS_SQL)
-            trade_rows = await conn.fetch(
-                "SELECT backtest_id, entry_time, exit_time, side, entry_price, exit_price, pnl "
-                "FROM backtest_result_trades ORDER BY backtest_id, entry_time, id"
-            )
-    except Exception:
-        logger.exception("Failed to populate backtest cache from DB")
-        return
-    trades_by_id: dict[str, list[Any]] = {}
-    for t in trade_rows:
-        trades_by_id.setdefault(t["backtest_id"], []).append(t)
-    for row in rows:
-        _RESULTS[row["id"]] = detail_from_row(row, trades_by_id.get(row["id"], []))
-
-
-# ---------------------------------------------------------------------------
 # Strategy loading and pre-flight checks
 # ---------------------------------------------------------------------------
 
@@ -274,80 +238,12 @@ async def _preflight(
 
 
 # ---------------------------------------------------------------------------
-# Background task
-# ---------------------------------------------------------------------------
-
-
-async def _run_backtest_task(task_id: str, body: BacktestRunRequest, pf: Preflight) -> None:
-    """Execute a backtest on stored bars and persist it; any failure is recorded on the task."""
-    task = _TASKS[task_id]
-    task["status"] = "running"
-    task["progress"] = 10.0
-
-    try:
-        if body.fetch_fresh:
-            await fetch_fresh_bars(task, pf, body)
-        task["progress"] = 20.0
-
-        loaded = await load_task_bars(task, pf, body.start_date, body.end_date)
-        if loaded is None:
-            return
-        bars, provenance = loaded
-        task["progress"] = 30.0
-
-        def _report_progress(pct: float) -> None:
-            task["progress"] = round(30.0 + pct * 60.0, 1)
-
-        runner = BacktestRunner()
-        initial = Decimal(str(body.initial_capital))
-
-        def _run_in_thread() -> Any:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(
-                    runner.run(
-                        strategy_class=pf.strategy_cls,
-                        strategy_config=pf.config,
-                        bars=bars,
-                        initial_capital=initial,
-                        symbol=pf.symbol,
-                        timeframe=pf.timeframe,
-                        on_progress=_report_progress,
-                    )
-                )
-            finally:
-                loop.close()
-
-        result = await asyncio.to_thread(_run_in_thread)
-        task["progress"] = 90.0
-
-        result_id = f"bt-{task_id}"
-        stored = result_record(result_id, body, pf, result, provenance)
-
-        try:
-            await persist_result(pf.pool, stored, result.trades, provenance)
-        except Exception as exc:
-            logger.exception("Backtest %s result not persisted", task_id)
-            fail_task(task, f"result not persisted: {exc}")
-            return
-
-        _RESULTS[result_id] = stored
-        task["status"] = "completed"
-        task["progress"] = 100.0
-        task["result_id"] = result_id
-
-    except Exception as exc:
-        logger.exception("Backtest task %s failed", task_id)
-        fail_task(task, str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Operations
+# Job submission and status
 # ---------------------------------------------------------------------------
 
 
 async def submit_backtest(pool: Any, body: BacktestRunRequest) -> dict[str, Any]:
-    """Start a backtest on stored bars. Returns a task_id to poll for status."""
+    """Queue a backtest on the worker. Returns a task_id to poll for status."""
     pf = await _preflight(
         pool,
         body.strategy_id,
@@ -356,30 +252,56 @@ async def submit_backtest(pool: Any, body: BacktestRunRequest) -> dict[str, Any]
         body.end_date,
         require_data=not body.fetch_fresh,
     )
-    task_id = f"task-{uuid.uuid4().hex[:8]}"
-    _TASKS[task_id] = {
-        "task_id": task_id,
-        "status": "queued",
-        "progress": 0.0,
-        "request": body.model_dump(mode="json"),
-    }
-    _spawn(_run_backtest_task(task_id, body, pf))
+    async with db_errors("queueing the job"):
+        task_id = await jobs.enqueue(
+            pool,
+            "backtest",
+            body.model_dump(mode="json"),
+            pf.config.model_dump(mode="json"),
+            {},
+        )
     return {"task_id": task_id, "status": "queued"}
 
 
-def get_backtest_status(task_id: str) -> dict[str, Any]:
-    """Check the progress of a running backtest."""
-    if task_id not in _TASKS:
+async def get_backtest_status(pool: Any, task_id: str) -> dict[str, Any]:
+    """Check the progress of a queued, running or finished backtest job."""
+    pool = require_pool(pool)
+    async with db_errors("reading a backtest job"), pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM backtest_jobs WHERE id = $1 AND kind = 'backtest'", task_id
+        )
+    if row is None:
         raise service_error(404, "task_not_found", f"Task {task_id} not found", "not_found")
-    task = _TASKS[task_id]
+    detail = jobs.json_value(row["detail"]) or {}
     return {
         "task_id": task_id,
-        "status": task["status"],
-        "progress": task["progress"],
-        "error": task.get("error"),
-        "result_id": task.get("result_id"),
-        "fetch_error": task.get("fetch_error"),
+        "status": row["status"],
+        "progress": row["progress"],
+        "error": row["error"],
+        "result_id": row["result_id"],
+        "fetch_error": detail.get("fetch_error"),
     }
+
+
+async def cancel_job(pool: Any, job_id: str) -> dict[str, Any]:
+    """Cancel a queued or running job; 404 unknown, 409 already terminal."""
+    pool = require_pool(pool)
+    async with db_errors("cancelling a job"):
+        row = await jobs.get(pool, job_id)
+        if row is None:
+            raise service_error(404, "task_not_found", f"Task {job_id} not found", "not_found")
+        if row["status"] in TERMINAL_STATUSES:
+            raise ServiceError(409, f"Task {job_id} is already {row['status']}")
+        row = await jobs.request_cancel(pool, job_id)
+    if row is None:  # a concurrent cancel won the race between our two reads
+        raise ServiceError(409, f"Task {job_id} is already finished or cancelling")
+    status = "cancelled" if row["status"] == "cancelled" else "cancelling"
+    return {"task_id": job_id, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# Result reads
+# ---------------------------------------------------------------------------
 
 
 async def list_results(pool: Any) -> list[dict[str, Any]]:
@@ -392,9 +314,6 @@ async def list_results(pool: Any) -> list[dict[str, Any]]:
 
 async def get_result(pool: Any, result_id: str) -> dict[str, Any]:
     """Get detailed backtest result including equity curve and trades."""
-    if result_id in _RESULTS:
-        return _RESULTS[result_id]
-
     pool = require_pool(pool)
     async with db_errors("loading a backtest result"), pool.acquire() as conn:
         row = await conn.fetchrow(ONE_RESULT_SQL, result_id)
@@ -413,19 +332,17 @@ async def get_result(pool: Any, result_id: str) -> dict[str, Any]:
 
 
 async def rename_result(pool: Any, result_id: str, name: str) -> dict[str, Any]:
-    """Rename a backtest result in the database, then in the cache."""
+    """Rename a backtest result in the database."""
     pool = require_pool(pool)
     async with db_errors("renaming a backtest result"), pool.acquire() as conn:
         row = await conn.fetchrow(RENAME_SQL, name, result_id)
     if row is None:
         raise service_error(404, "result_not_found", f"Result {result_id} not found", "not_found")
-    if result_id in _RESULTS:
-        _RESULTS[result_id]["name"] = name
     return summary_from_row(row)
 
 
 async def delete_result(pool: Any, result_id: str) -> None:
-    """Delete a backtest result from the database, then evict it from the cache."""
+    """Delete a backtest result and its trades from the database."""
     pool = require_pool(pool)
     async with db_errors("deleting a backtest result"), pool.acquire() as conn:
         deleted = await conn.fetchval(
@@ -433,35 +350,25 @@ async def delete_result(pool: Any, result_id: str) -> None:
         )
     if deleted is None:
         raise service_error(404, "result_not_found", f"Result {result_id} not found", "not_found")
-    _RESULTS.pop(result_id, None)
 
 
 async def verify_result(pool: Any, result_id: str) -> dict[str, Any]:
     """Verify a backtest result by recomputing metrics from trades."""
-    # Reuse detail fetch logic
     detail = await get_result(pool, result_id)
 
-    trades = detail.get("trades", []) if isinstance(detail, dict) else detail.trades
-    metrics = detail.get("metrics", {}) if isinstance(detail, dict) else detail.metrics
+    trades = detail.get("trades", [])
+    metrics = detail.get("metrics", {})
+    reported_trade_count = metrics.get("total_trades", 0)
+    reported_win_rate = metrics.get("win_rate", 0.0)
+    reported_total_pnl = metrics.get("total_pnl", 0.0)
 
-    if isinstance(metrics, dict):
-        reported_trade_count = metrics.get("total_trades", 0)
-        reported_win_rate = metrics.get("win_rate", 0.0)
-        reported_total_pnl = metrics.get("total_pnl", 0.0)
-    else:
-        reported_trade_count = metrics.total_trades
-        reported_win_rate = metrics.win_rate
-        reported_total_pnl = metrics.total_pnl
-
-    # Compute from trades
     computed_trade_count = len(trades)
-    computed_total_pnl = round(sum(t["pnl"] if isinstance(t, dict) else t.pnl for t in trades), 2)
-    wins = sum(1 for t in trades if (t["pnl"] if isinstance(t, dict) else t.pnl) > 0)
+    computed_total_pnl = round(sum(t["pnl"] for t in trades), 2)
+    wins = sum(1 for t in trades if t["pnl"] > 0)
     computed_win_rate = (
         round(wins / computed_trade_count * 100, 2) if computed_trade_count > 0 else 0.0
     )
 
-    # Compare with tolerance
     trade_count_match = computed_trade_count == reported_trade_count
     pnl_match = abs(computed_total_pnl - reported_total_pnl) < 0.02
     win_rate_match = abs(computed_win_rate - reported_win_rate) < 0.2

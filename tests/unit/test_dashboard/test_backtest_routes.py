@@ -7,41 +7,34 @@ tests/integration/test_backtest_real_data.py.
 from __future__ import annotations
 
 import ast
-import re
-from collections.abc import Iterator
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 import pytest
 import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from hydra.backtest.jobs import BacktestRunRequest, detail_from_row, summary_from_row
+from hydra.backtest.jobs import (
+    BacktestRunRequest,
+    detail_from_row,
+    walkforward_months,
+    window_fits,
+)
 from hydra.backtest.walkforward import WalkForwardAnalyzer
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.backtest import router
 from hydra.services.backtest import (
-    _RESULTS,
-    _TASKS,
     BacktestResultDetail,
     _load_backtest_strategy,
     _preflight,
-    _run_backtest_task,
 )
 from hydra.services.errors import ServiceError
-from hydra.services.research import (
-    _HYPEROPT_TASKS,
-    _WALKFORWARD_TASKS,
-    _walkforward_months,
-    _window_fits,
-)
+from hydra.services.research import HyperoptProgressResponse
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 
@@ -100,18 +93,6 @@ def _make_app(pool: object | None = None) -> FastAPI:
 @pytest.fixture()
 def client() -> TestClient:
     return TestClient(_make_app(pool=None))
-
-
-@pytest.fixture(autouse=True)
-def _clean_state() -> Iterator[None]:
-    stores: list[dict[str, Any]] = [_TASKS, _RESULTS, _HYPEROPT_TASKS, _WALKFORWARD_TASKS]
-    saved = [dict(s) for s in stores]
-    for s in stores:
-        s.clear()
-    yield
-    for s, snapshot in zip(stores, saved, strict=True):
-        s.clear()
-        s.update(snapshot)
 
 
 def _run_body(strategy_id: str = "saw", **overrides: Any) -> dict[str, Any]:
@@ -280,7 +261,6 @@ class TestRequestDates:
         resp = client.post("/api/backtest/run", json=_run_body(timeframe="30m"))
         assert resp.status_code == 422
         assert resp.json()["detail"]["code"] == "validation_error"
-        assert _TASKS == {}
 
     def test_hyperopt_requires_dates(self, client: TestClient) -> None:
         body = _hyperopt_body()
@@ -319,7 +299,6 @@ class TestPreflightErrors:
             "state": "not_found",
             "strategy_id": "does_not_exist_xyz",
         }
-        assert _TASKS == {} and _HYPEROPT_TASKS == {} and _WALKFORWARD_TASKS == {}
 
     @pytest.mark.parametrize(
         ("path", "body"),
@@ -336,7 +315,6 @@ class TestPreflightErrors:
         resp = client.post(path, json=body)
         assert resp.status_code == 503
         assert resp.json()["detail"]["state"] == "unavailable"
-        assert _TASKS == {} and _HYPEROPT_TASKS == {} and _WALKFORWARD_TASKS == {}
 
     def test_unsupported_class_is_422_before_db(
         self, client: TestClient, strategies_dir: Path
@@ -376,66 +354,70 @@ class TestPreflightErrors:
 # ---------------------------------------------------------------------------
 
 
-_CACHED = {
-    "id": "bt-task-cached",
-    "strategy": "Saw",
-    "strategy_id": "saw",
-    "initial_capital": 10000.0,
-    "period": "2026-01-01T00:00:00+00:00 - 2026-01-02T00:00:00+00:00",
-    "status": "completed",
-    "name": "",
-    "provenance": {
-        "exchange": "binance",
-        "symbol": "BTCUSDT",
-        "timeframe": "1h",
-        "bar_count": 25,
-        "first_ts": "2026-01-01T00:00:00+00:00",
-        "last_ts": "2026-01-02T00:00:00+00:00",
-        "gap_count": 0,
-        "requested_start": "2026-01-01T00:00:00+00:00",
-        "requested_end": "2026-01-02T23:59:59.999999+00:00",
-        "data_source": "db",
+class _JobRowConn:
+    """Serves one backtest_jobs row for the status read."""
+
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self.row = row
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        assert "FROM backtest_jobs" in query
+        return self.row
+
+
+def _job_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": "task-x",
+        "kind": "backtest",
+        "status": "failed",
+        "progress": 0.0,
+        "error": "no market data",
+        "result_id": None,
+        "detail": "{}",
+    }
+    row.update(overrides)
+    return row
+
+
+class _ResultDetailConn:
+    """Serves one backtest_results row plus its trades for the detail and verify reads."""
+
+    def __init__(self, row: dict[str, Any] | None, trades: list[dict[str, Any]]) -> None:
+        self.row = row
+        self.trades = trades
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        assert "FROM backtest_results WHERE id = $1" in query
+        return self.row
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM backtest_result_trades" in query
+        return self.trades
+
+
+_DETAIL_TRADES = [
+    {
+        "entry_time": datetime(2026, 1, 1, 1, tzinfo=UTC),
+        "exit_time": datetime(2026, 1, 1, 2, tzinfo=UTC),
+        "side": "LONG",
+        "entry_price": 100.0,
+        "exit_price": 110.0,
+        "pnl": 10.0,
     },
-    "stopped_reason": None,
-    "metrics": {
-        "total_trades": 2,
-        "win_rate": 50.0,
-        "total_pnl": 5.0,
-        "max_drawdown": 1.0,
-        "sharpe_ratio": 0.5,
+    {
+        "entry_time": datetime(2026, 1, 1, 3, tzinfo=UTC),
+        "exit_time": datetime(2026, 1, 1, 4, tzinfo=UTC),
+        "side": "LONG",
+        "entry_price": 110.0,
+        "exit_price": 105.0,
+        "pnl": -5.0,
     },
-    "equity_curve": [],
-    "benchmark_equity": [],
-    "trades": [
-        {
-            "entry_time": "2026-01-01T01:00:00+00:00",
-            "exit_time": "2026-01-01T02:00:00+00:00",
-            "side": "LONG",
-            "entry_price": 100.0,
-            "exit_price": 110.0,
-            "pnl": 10.0,
-        },
-        {
-            "entry_time": "2026-01-01T03:00:00+00:00",
-            "exit_time": "2026-01-01T04:00:00+00:00",
-            "side": "LONG",
-            "entry_price": 110.0,
-            "exit_price": 105.0,
-            "pnl": -5.0,
-        },
-    ],
-    "transactions": [],
-}
+]
 
 
 class TestStatusAndResults:
-    def test_status_reports_error_and_result_id(self, client: TestClient) -> None:
-        _TASKS["task-x"] = {
-            "task_id": "task-x",
-            "status": "failed",
-            "progress": 0.0,
-            "error": "no market data",
-        }
+    def test_status_reports_error_and_result_id(self) -> None:
+        client = TestClient(_make_app(pool=_Pool(_JobRowConn(_job_row()))))
         resp = client.get("/api/backtest/status/task-x")
         assert resp.json() == {
             "task_id": "task-x",
@@ -446,45 +428,54 @@ class TestStatusAndResults:
             "fetch_error": None,
         }
 
-    def test_unknown_task_is_404(self, client: TestClient) -> None:
+    def test_status_reports_fetch_error_from_the_detail(self) -> None:
+        row = _job_row(detail='{"fetch_error": "backfill failed"}')
+        client = TestClient(_make_app(pool=_Pool(_JobRowConn(row))))
+        resp = client.get("/api/backtest/status/task-x")
+        assert resp.json()["fetch_error"] == "backfill failed"
+
+    def test_hyperopt_progress_created_at_stays_optional(self) -> None:
+        """D1's OpenAPI shape is unchanged: created_at is always served, never required."""
+        assert "created_at" not in HyperoptProgressResponse.model_json_schema()["required"]
+
+    def test_unknown_task_is_404(self) -> None:
+        client = TestClient(_make_app(pool=_Pool(_JobRowConn(None))))
         resp = client.get("/api/backtest/status/nope")
         assert resp.status_code == 404
         assert resp.json()["detail"]["state"] == "not_found"
 
     def test_list_without_database_is_503(self, client: TestClient) -> None:
-        _RESULTS["bt-task-cached"] = dict(_CACHED)
         resp = client.get("/api/backtest/results")
         assert resp.status_code == 503
 
-    def test_cached_detail_carries_provenance(self, client: TestClient) -> None:
-        _RESULTS["bt-task-cached"] = dict(_CACHED)
-        resp = client.get("/api/backtest/results/bt-task-cached")
+    def test_detail_carries_provenance(self) -> None:
+        client = TestClient(
+            _make_app(pool=_Pool(_ResultDetailConn(_db_row("bt-task-db"), _DETAIL_TRADES)))
+        )
+        resp = client.get("/api/backtest/results/bt-task-db")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["provenance"] == _CACHED["provenance"]
+        assert body["provenance"]["bar_count"] == 25
         assert body["strategy_id"] == "saw"
-        assert body["initial_capital"] == 10000.0
+        assert body["initial_capital"] == 1000.0
+        assert [t["pnl"] for t in body["trades"]] == [10.0, -5.0]
 
-    def test_uncached_detail_without_database_is_503(self, client: TestClient) -> None:
+    def test_detail_without_database_is_503(self, client: TestClient) -> None:
         resp = client.get("/api/backtest/results/bt-1")
         assert resp.status_code == 503
 
-    def test_verify_recomputes_from_trades(self, client: TestClient) -> None:
-        _RESULTS["bt-task-cached"] = dict(_CACHED)
-        body = client.get("/api/backtest/results/bt-task-cached/verify").json()
+    def test_verify_recomputes_from_trades(self) -> None:
+        row = _db_row("bt-task-db", total_trades=2, win_rate=50.0, total_pnl=5.0, max_drawdown=1.0)
+        client = TestClient(_make_app(pool=_Pool(_ResultDetailConn(row, _DETAIL_TRADES))))
+        body = client.get("/api/backtest/results/bt-task-db/verify").json()
         assert body["computed_trade_count"] == 2
         assert body["computed_total_pnl"] == 5.0
         assert body["computed_win_rate"] == 50.0
         assert body["all_passed"] is True
 
     def test_rename_and_delete_without_database_are_503(self, client: TestClient) -> None:
-        _RESULTS["bt-task-cached"] = dict(_CACHED)
-        assert (
-            client.patch("/api/backtest/results/bt-task-cached", json={"name": "x"}).status_code
-            == 503
-        )
-        assert client.delete("/api/backtest/results/bt-task-cached").status_code == 503
-        assert _RESULTS["bt-task-cached"] == _CACHED
+        assert client.patch("/api/backtest/results/bt-x", json={"name": "x"}).status_code == 503
+        assert client.delete("/api/backtest/results/bt-x").status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -537,22 +528,22 @@ class TestWalkForwardMonths:
     def test_months_from_span(self) -> None:
         first = datetime(2025, 1, 1, tzinfo=UTC)
         last = first + timedelta(days=399)
-        assert _walkforward_months(first, last, fold_count=2, train_pct=0.75) == (5, 2)
-        assert _window_fits(first, last, 400, 5, 2)
+        assert walkforward_months(first, last, fold_count=2, train_pct=0.75) == (5, 2)
+        assert window_fits(first, last, 400, 5, 2)
 
     def test_thirty_days_cannot_fit_a_window(self) -> None:
         first = datetime(2025, 1, 1, tzinfo=UTC)
         last = first + timedelta(days=30)
-        in_sample, out_of_sample = _walkforward_months(first, last, fold_count=2, train_pct=0.75)
+        in_sample, out_of_sample = walkforward_months(first, last, fold_count=2, train_pct=0.75)
         assert (in_sample, out_of_sample) == (1, 1)
-        assert not _window_fits(first, last, 31, in_sample, out_of_sample)
+        assert not window_fits(first, last, 31, in_sample, out_of_sample)
 
     def test_weekly_bars_are_sized_at_their_real_density(self) -> None:
         first = datetime(2025, 1, 1, tzinfo=UTC)
         last = first + timedelta(weeks=56)
-        assert _walkforward_months(first, last, fold_count=2, train_pct=0.75) == (4, 2)
-        assert _window_fits(first, last, 57, 4, 2)
-        assert not _window_fits(first, first + timedelta(weeks=4), 5, 1, 1)
+        assert walkforward_months(first, last, fold_count=2, train_pct=0.75) == (4, 2)
+        assert window_fits(first, last, 57, 4, 2)
+        assert not window_fits(first, first + timedelta(weeks=4), 5, 1, 1)
 
     async def test_weekly_walkforward_windows_match_the_reported_months(self) -> None:
         start = datetime(2025, 1, 1, tzinfo=UTC)
@@ -584,7 +575,7 @@ class TestWalkForwardMonths:
 
 
 # ---------------------------------------------------------------------------
-# Persistence failure fails the task (happy path is in the integration test)
+# Fake pool for the row-serving connections below
 # ---------------------------------------------------------------------------
 
 
@@ -599,166 +590,12 @@ class _Acquire:
         return None
 
 
-class _Transaction:
-    async def __aenter__(self) -> None:
-        return None
-
-    async def __aexit__(self, *exc: object) -> None:
-        return None
-
-
-class _BarsThenFailingWrites:
-    """Serves stored bars to the loader; the result INSERT fails like a dropped connection."""
-
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self._rows = rows
-
-    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
-        assert "FROM ts.ohlcv_1m" in query
-        return self._rows
-
-    def transaction(self) -> _Transaction:
-        return _Transaction()
-
-    async def execute(self, query: str, *args: Any) -> str:
-        raise asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed")
-
-
 class _Pool:
     def __init__(self, conn: Any) -> None:
         self._conn = conn
 
     def acquire(self) -> _Acquire:
         return _Acquire(self._conn)
-
-
-async def test_persistence_failure_fails_the_task(strategies_dir: Path) -> None:
-    _write_strategy(strategies_dir, "saw")
-    start = datetime(2026, 1, 1, tzinfo=UTC)
-    rows = [
-        {
-            "open": 1000 + (i % 20) * 5,
-            "high": 1000 + (i % 20) * 5,
-            "low": 1000 + (i % 20) * 5,
-            "close": 1000 + (i % 20) * 5,
-            "volume": 10,
-            "timestamp": start + timedelta(hours=i),
-        }
-        for i in range(60)
-    ]
-    pool = _Pool(_BarsThenFailingWrites(rows))
-
-    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
-    pf = await _preflight(pool, "saw", None, body.start_date, body.end_date, require_data=False)
-    _TASKS["task-p"] = {"task_id": "task-p", "status": "queued", "progress": 0.0}
-
-    await _run_backtest_task("task-p", body, pf)
-
-    assert _TASKS["task-p"]["status"] == "failed"
-    assert _TASKS["task-p"]["error"].startswith("result not persisted")
-    assert "result_id" not in _TASKS["task-p"]
-    assert _RESULTS == {}
-
-
-class _Boom(BaseStrategy):
-    @property
-    def required_history(self) -> int:
-        return 1
-
-    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
-        raise ZeroDivisionError("division by zero")
-
-
-async def test_strategy_exception_fails_the_task_with_its_message(strategies_dir: Path) -> None:
-    _write_strategy(strategies_dir, "saw")
-    start = datetime(2026, 1, 1, tzinfo=UTC)
-    rows = [
-        {
-            "open": 1000,
-            "high": 1000,
-            "low": 1000,
-            "close": 1000,
-            "volume": 10,
-            "timestamp": start + timedelta(hours=i),
-        }
-        for i in range(60)
-    ]
-    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
-    pf = await _preflight(
-        _Pool(_BarsThenFailingWrites(rows)),
-        "saw",
-        None,
-        body.start_date,
-        body.end_date,
-        require_data=False,
-    )
-    _TASKS["task-s"] = {"task_id": "task-s", "status": "queued", "progress": 0.0}
-
-    await _run_backtest_task("task-s", body, replace(pf, strategy_cls=_Boom))
-
-    assert _TASKS["task-s"]["status"] == "failed"
-    assert _TASKS["task-s"]["error"] == "saw: ZeroDivisionError('division by zero')"
-    assert _RESULTS == {}
-
-
-class _BarsThenRecordedWrites(_BarsThenFailingWrites):
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        super().__init__(rows)
-        self.inserts: list[tuple[str, tuple[Any, ...]]] = []
-
-    async def execute(self, query: str, *args: Any) -> str:
-        self.inserts.append((query, args))
-        return "OK"
-
-    async def executemany(self, query: str, args: Any) -> None:
-        return None
-
-
-async def test_curves_carry_their_own_timestamps_and_metrics_persist_as_cached(
-    strategies_dir: Path,
-) -> None:
-    _write_strategy(strategies_dir, "saw")
-    start = datetime(2026, 1, 1, tzinfo=UTC)
-    closes = [Decimal(1000 + (i % 20) * 5) for i in range(60)]
-    rows = [
-        {
-            "open": c,
-            "high": c,
-            "low": c,
-            "close": c,
-            "volume": 10,
-            "timestamp": start + timedelta(hours=i),
-        }
-        for i, c in enumerate(closes)
-    ]
-    conn = _BarsThenRecordedWrites(rows)
-    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
-    pf = await _preflight(
-        _Pool(conn), "saw", None, body.start_date, body.end_date, require_data=False
-    )
-    _TASKS["task-t"] = {"task_id": "task-t", "status": "queued", "progress": 0.0}
-
-    await _run_backtest_task("task-t", body, pf)
-
-    assert _TASKS["task-t"]["status"] == "completed", _TASKS["task-t"]
-    cached = _RESULTS["bt-task-t"]
-    equity, bench = cached["equity_curve"], cached["benchmark_equity"]
-    labels = [p["timestamp"] for p in equity]
-    assert labels[-len(rows) :] == [r["timestamp"].isoformat() for r in rows]
-    assert [p["timestamp"] for p in bench] == labels
-    close_at = {r["timestamp"].isoformat(): r["close"] for r in rows}
-    for point in bench:
-        assert point["value"] == float(10000 * close_at[point["timestamp"]] / closes[0])
-
-    query, args = conn.inserts[0]
-    columns = re.search(r"INSERT INTO backtest_results\s*\(([^)]*)\)", query)
-    assert columns is not None
-    row = dict(zip([c.strip() for c in columns.group(1).split(",")], args, strict=True))
-    assert summary_from_row(row)["metrics"] == cached["metrics"]
-    assert cached["metrics"]["total_return"] == round(
-        (equity[-1]["value"] / equity[0]["value"] - 1) * 100, 2
-    )
-    assert isinstance(cached["metrics"]["max_drawdown_duration_s"], int)
 
 
 # ---------------------------------------------------------------------------
@@ -881,9 +718,8 @@ def _results_client(conn: _ResultsConn) -> TestClient:
 
 
 class TestResultMutations:
-    def test_delete_during_outage_is_503_and_keeps_row_and_cache(self) -> None:
+    def test_delete_during_outage_is_503_and_keeps_the_row(self) -> None:
         conn = _ResultsConn({"bt-task-db": _db_row()}, down=True)
-        _RESULTS["bt-task-db"] = dict(_CACHED, id="bt-task-db")
         client = _results_client(conn)
 
         resp = client.delete("/api/backtest/results/bt-task-db")
@@ -891,14 +727,12 @@ class TestResultMutations:
         assert resp.status_code == 503
         assert resp.json()["detail"]["state"] == "unavailable"
         assert "bt-task-db" in conn.rows
-        assert "bt-task-db" in _RESULTS
 
         conn.down = False
         assert client.delete("/api/backtest/results/bt-task-db").status_code == 204
         assert conn.rows == {}
-        assert "bt-task-db" not in _RESULTS
 
-    def test_uncached_row_can_be_renamed_and_deleted(self) -> None:
+    def test_a_row_can_be_renamed_and_deleted(self) -> None:
         conn = _ResultsConn({"bt-task-db": _db_row()})
         client = _results_client(conn)
 
@@ -910,15 +744,6 @@ class TestResultMutations:
 
         assert client.delete("/api/backtest/results/bt-task-db").status_code == 204
         assert conn.rows == {}
-
-    def test_rename_updates_the_cached_copy(self) -> None:
-        conn = _ResultsConn({"bt-task-db": _db_row()})
-        _RESULTS["bt-task-db"] = dict(_CACHED, id="bt-task-db")
-        resp = _results_client(conn).patch(
-            "/api/backtest/results/bt-task-db", json={"name": "Renamed"}
-        )
-        assert resp.status_code == 200
-        assert _RESULTS["bt-task-db"]["name"] == "Renamed"
 
     def test_missing_row_is_404_envelope(self) -> None:
         client = _results_client(_ResultsConn({}))

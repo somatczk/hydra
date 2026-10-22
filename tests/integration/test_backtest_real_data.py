@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from collections.abc import AsyncIterator, Iterator
+import json
+import re
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +24,12 @@ import yaml
 from alembic import command
 from fastapi import FastAPI
 
+from hydra.backtest import worker
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes import backtest, strategies
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.data.migrations.runner import alembic_config, upgrade_to_head
 from hydra.data.storage import MarketDataRepository
-from hydra.services import backtest as backtest_svc
-from hydra.services import research
 
 pytestmark = pytest.mark.integration
 
@@ -119,26 +121,10 @@ async def pool(database_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AsyncItera
             assert set(await _columns(conn)) >= _NEW_COLUMNS, "migration did not apply"
             await conn.execute("TRUNCATE ts.ohlcv_1m")
             await conn.execute("TRUNCATE backtest_results CASCADE")
+            await conn.execute("TRUNCATE backtest_jobs")
         yield db_pool
     finally:
         await db_pool.close()
-
-
-@pytest.fixture(autouse=True)
-def _clean_route_state() -> Iterator[None]:
-    stores: list[dict[str, Any]] = [
-        backtest_svc._TASKS,
-        backtest_svc._RESULTS,
-        research._HYPEROPT_TASKS,
-        research._HYPEROPT_RESULTS,
-        research._WALKFORWARD_TASKS,
-        research._WALKFORWARD_RESULTS,
-    ]
-    for s in stores:
-        s.clear()
-    yield
-    for s in stores:
-        s.clear()
 
 
 @pytest.fixture()
@@ -210,14 +196,16 @@ def _write_strategy(directory: Path, strategy_id: str, **overrides: Any) -> None
     (directory / f"{strategy_id}.yaml").write_text(yaml.safe_dump(data))
 
 
-async def _drain() -> None:
-    await asyncio.gather(*list(backtest_svc._BACKGROUND_TASKS))
+async def _drain(pool: Any) -> None:
+    """Run every queued job on the worker (the engine no longer executes them)."""
+    while await worker.run_once(pool) is not None:
+        pass
 
 
-async def _run(client: httpx.AsyncClient, **body: Any) -> dict[str, Any]:
+async def _run(client: httpx.AsyncClient, pool: Any, **body: Any) -> dict[str, Any]:
     resp = await client.post("/api/backtest/run", json=body)
     assert resp.status_code == 202, resp.text
-    await _drain()
+    await _drain(pool)
     status = (await client.get(f"/api/backtest/status/{resp.json()['task_id']}")).json()
     assert status["status"] == "completed", status
     return status
@@ -239,7 +227,7 @@ async def test_backtest_runs_on_stored_bars_with_exact_provenance(
     _write_strategy(strategies_dir, "saw")
 
     status = await _run(
-        client, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-31", name="real"
+        client, pool, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-31", name="real"
     )
     result_id = status["result_id"]
     detail = (await client.get(f"/api/backtest/results/{result_id}")).json()
@@ -293,7 +281,7 @@ async def test_results_survive_a_restart(
     await _seed_hourly(pool)
     _write_strategy(strategies_dir, "saw")
     result_id = (
-        await _run(client, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-31")
+        await _run(client, pool, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-31")
     )["result_id"]
     before = (await client.get(f"/api/backtest/results/{result_id}")).json()
     assert before["trades"]
@@ -304,19 +292,13 @@ async def test_results_survive_a_restart(
     assert before["metrics"]["total_return"] is not None
     assert before["metrics"]["max_drawdown_duration_s"] is not None
 
-    backtest_svc._RESULTS.clear()
-    uncached = (await client.get(f"/api/backtest/results/{result_id}")).json()
-    assert uncached == before
-
-    await backtest_svc.populate_cache_from_db(pool)
-    assert set(backtest_svc._RESULTS) == {result_id}
+    # every read now comes from the database, so a second read is identical
     after = (await client.get(f"/api/backtest/results/{result_id}")).json()
     assert after == before
 
     listed = (await client.get("/api/backtest/results")).json()
     assert listed[0]["metrics"] == before["metrics"]
 
-    backtest_svc._RESULTS.clear()
     renamed = await client.patch(f"/api/backtest/results/{result_id}", json={"name": "kept"})
     assert renamed.status_code == 200
     assert renamed.json()["provenance"] == before["provenance"]
@@ -345,8 +327,8 @@ async def test_no_stored_bars_is_422_with_available_range(
     assert detail["available_first_ts"] == _iso(seed[0].timestamp)
     assert detail["available_last_ts"] == _iso(seed[-1].timestamp)
     assert "available: 2026-01-01T00:00:00+00:00 to 2026-01-13T11:00:00+00:00" in detail["message"]
-    assert backtest_svc._TASKS == {}
     async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM backtest_jobs") == 0
         assert await conn.fetchval("SELECT count(*) FROM backtest_results") == 0
 
 
@@ -367,7 +349,7 @@ async def test_bars_are_filtered_by_exchange(
         json={"strategy_id": "saw_kraken", "start_date": "2026-01-01", "end_date": "2026-01-31"},
     )
     assert resp.status_code == 202, resp.text
-    await _drain()
+    await _drain(pool)
     status = (await client.get(f"/api/backtest/status/{resp.json()['task_id']}")).json()
     assert status["status"] == "failed"
     assert "kraken SPOT is not supported" in status["error"]
@@ -387,7 +369,9 @@ async def test_bare_end_date_includes_that_whole_day(
     await _seed_hourly(pool)
     _write_strategy(strategies_dir, "saw")
 
-    status = await _run(client, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-12")
+    status = await _run(
+        client, pool, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-12"
+    )
     prov = (await client.get(f"/api/backtest/results/{status['result_id']}")).json()["provenance"]
     assert prov["bar_count"] == 12 * 24
     assert prov["last_ts"] == "2026-01-12T23:00:00+00:00"
@@ -407,7 +391,12 @@ async def test_request_timeframe_overrides_primary_and_is_recorded(
     assert "binance BTCUSDT 4h" in default.json()["detail"]["message"]
 
     status = await _run(
-        client, strategy_id="saw4h", start_date="2026-01-01", end_date="2026-01-31", timeframe="1h"
+        client,
+        pool,
+        strategy_id="saw4h",
+        start_date="2026-01-01",
+        end_date="2026-01-31",
+        timeframe="1h",
     )
     prov = (await client.get(f"/api/backtest/results/{status['result_id']}")).json()["provenance"]
     assert (prov["timeframe"], prov["bar_count"]) == ("1h", H1_COUNT)
@@ -418,7 +407,7 @@ async def test_request_timeframe_overrides_primary_and_is_recorded(
 # ---------------------------------------------------------------------------
 
 
-async def _hyperopt(client: httpx.AsyncClient) -> tuple[dict[str, Any], dict[str, Any]]:
+async def _hyperopt(client: httpx.AsyncClient, pool: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     resp = await client.post(
         "/api/backtest/hyperopt",
         json={
@@ -431,7 +420,7 @@ async def _hyperopt(client: httpx.AsyncClient) -> tuple[dict[str, Any], dict[str
         },
     )
     assert resp.status_code == 202, resp.text
-    await _drain()
+    await _drain(pool)
     task_id = resp.json()["task_id"]
     progress = (await client.get(f"/api/backtest/hyperopt/{task_id}")).json()
     assert progress["status"] == "completed", progress
@@ -445,13 +434,16 @@ async def test_hyperopt_grid_runs_on_stored_bars_reproducibly(
     await _seed_hourly(pool)
     _write_strategy(strategies_dir, "saw")
 
-    progress, first = await _hyperopt(client)
-    _, second = await _hyperopt(client)
+    progress, first = await _hyperopt(client, pool)
+    _, second = await _hyperopt(client, pool)
 
     assert progress["provenance"]["bar_count"] == H1_COUNT
+    assert progress["provenance"]["hydra_version"] == version("hydra")
+    assert re.fullmatch(r"[0-9a-f]{12}", progress["provenance"]["config_hash"])
     assert progress["strategy_id"] == "saw"
     assert progress["start_date"] == "2026-01-01T00:00:00Z"
     assert first["provenance"]["exchange"] == "binance"
+    assert first["provenance"]["hydra_version"] == version("hydra")
     assert [t["params"] for t in first["trials"]] == [{"sma_period": 4}, {"sma_period": 5}]
     assert first["best_metric"] == second["best_metric"]
     assert [t["sharpe"] for t in first["trials"]] == [t["sharpe"] for t in second["trials"]]
@@ -475,24 +467,26 @@ async def test_walkforward_uses_the_real_span(
         },
     )
     assert resp.status_code == 202, resp.text
-    await _drain()
+    await _drain(pool)
     task_id = resp.json()["task_id"]
     result = (await client.get(f"/api/backtest/walkforward/{task_id}/results")).json()
     assert len(result["folds"]) >= 1
     assert result["provenance"]["bar_count"] == D1_COUNT
     assert result["provenance"]["first_ts"] == _iso(daily[0].timestamp)
     assert result["provenance"]["last_ts"] == _iso(daily[-1].timestamp)
-    task = research._WALKFORWARD_TASKS[task_id]
-    assert (task["in_sample_months"], task["out_of_sample_months"]) == (5, 2)
+    assert result["provenance"]["hydra_version"] == version("hydra")
+    assert re.fullmatch(r"[0-9a-f]{12}", result["provenance"]["config_hash"])
+
+    # the window sizing the worker used lives on the durable job row
+    async with pool.acquire() as conn:
+        raw_detail = await conn.fetchval("SELECT detail FROM backtest_jobs WHERE id = $1", task_id)
+    assert raw_detail is not None
+    detail = json.loads(raw_detail)
+    assert (detail["in_sample_months"], detail["out_of_sample_months"]) == (5, 2)
     # 400 daily bars over 399 days: 150 IS + 60 OOS bars per window, stepping 60 bars.
-    folds = research._WALKFORWARD_RESULTS[task_id].folds
-    assert len(result["folds"]) == len(folds) == 4
-    for k, fold in enumerate(folds):
-        window = daily[150 + 60 * k : 210 + 60 * k]
-        assert fold.out_of_sample_metrics.trades
-        for trade in fold.out_of_sample_metrics.trades:
-            assert window[0].timestamp <= trade.entry_time <= trade.exit_time
-            assert trade.exit_time <= window[-1].timestamp
+    assert len(result["folds"]) == 4
+    for fold in result["folds"]:
+        assert fold["out_of_sample_trades"] > 0
 
     short = await client.post(
         "/api/backtest/walkforward",

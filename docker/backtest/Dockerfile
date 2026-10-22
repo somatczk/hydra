@@ -13,4 +13,6 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
 COPY --from=builder /app/config /app/config
 ENV PATH="/app/.venv/bin:$PATH"
-CMD ["python", "-m", "hydra.backtest.runner"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["python", "-m", "hydra.backtest.worker", "check"]
+CMD ["python", "-m", "hydra.backtest.worker"]
