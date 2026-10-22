@@ -158,14 +158,17 @@ def _snapshot(raw: Any) -> dict[str, Any] | None:
 
 
 def _non_parameter_changes(old: StrategyConfig, new: StrategyConfig) -> list[str]:
-    """Top-level fields that differ beyond ``parameters`` (``enabled``/``name`` ignored).
+    """Fields whose change needs a restart (decision 6): everything but plain parameters.
 
-    A rule change lives inside ``parameters`` and is allowed: the endpoint's response and the
-    risks section both say exit-rule changes apply to an already open position by design.
+    ``parameters.rules`` carries the entry/exit rule trees, so a rule change is refused like a
+    risk or sizing change, not applied as a tunable parameter.
     """
     a = old.model_dump(mode="json", exclude={"enabled", "name", "parameters"})
     b = new.model_dump(mode="json", exclude={"enabled", "name", "parameters"})
-    return sorted(k for k in a if a[k] != b[k])
+    changed = sorted(k for k in a if a[k] != b[k])
+    if (old.parameters.get("rules") or None) != (new.parameters.get("rules") or None):
+        changed.append("parameters.rules")
+    return changed
 
 
 class SessionManager:
@@ -306,10 +309,13 @@ class SessionManager:
         return session_id
 
     async def reload_config(self, strategy_id: str) -> ReloadResult:
-        """Queue the strategy file's ``parameters`` for the running session's next closed bar.
+        """Queue the strategy file's plain ``parameters`` for the session's next closed bar.
 
-        Raises ``SessionNotRunningError`` (no running session), ``ValueError`` (invalid file) or
-        ``ConfigReloadRefusedError`` (anything beyond ``parameters`` changed: restart instead).
+        Raises ``SessionNotRunningError`` (no running session), ``KeyError`` /
+        ``FileNotFoundError`` (no strategy file to reload from), ``ValueError`` (invalid file)
+        or ``ConfigReloadRefusedError`` (a change beyond plain parameter values — rules, risk,
+        sizing, symbols, timeframes, class, or a ``required_history`` the session's context
+        cannot hold: restart instead).
         """
         session = next(
             (
@@ -324,7 +330,8 @@ class SessionManager:
             raise SessionNotRunningError(f"Strategy {strategy_id} has no running session")
         new = self._strict_strategy_config(strategy_id)
         changed = _non_parameter_changes(runtime.cfg, new)
-        if await probe_strategy(new, self._config) > runtime.required_history:
+        max_bars = runtime.context.max_bars
+        if max_bars is not None and await probe_strategy(new, self._config) > max_bars:
             changed.append("parameters.required_history")
         if changed:
             raise ConfigReloadRefusedError(changed)
@@ -634,7 +641,7 @@ class SessionManager:
                 continue
             try:
                 cfg = load_strategy_config(path)
-            except (ValueError, yaml.YAMLError) as exc:
+            except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
                 logger.error("Skipping invalid strategy config %s: %s", path.name, exc)
                 continue
             if cfg.id == strategy_id:

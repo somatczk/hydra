@@ -567,15 +567,20 @@ async def get_strategy(pool: Any, strategy_id: str, session_manager: Any = None)
         )
     if row is None:
         raise _strategy_not_found(strategy_id)
-    return _row_to_strategy(row)
+    result = _row_to_strategy(row)
+    # no YAML for this strategy: a snapshot-recovered session can still be running on it
+    result.update(_session_drift(None, strategy_id, session_manager))
+    return result
 
 
-def _session_drift(data: dict[str, Any], strategy_id: str, manager: Any) -> dict[str, Any]:
-    """The file's hash and, per running session, whether it runs a different config."""
-    try:
-        file_hash: str | None = config_hash(validate_strategy_config(data))
-    except (ValueError, TypeError):
-        file_hash = None
+def _session_drift(data: dict[str, Any] | None, strategy_id: str, manager: Any) -> dict[str, Any]:
+    """The file's hash (None without a file) and, per running session, whether it differs."""
+    file_hash: str | None = None
+    if data is not None:
+        try:
+            file_hash = config_hash(validate_strategy_config(data))
+        except (ValueError, TypeError):
+            file_hash = None
     sessions = [
         {
             "session_id": s.session_id,
@@ -598,10 +603,13 @@ async def reload_strategy(manager: Any, strategy_id: str) -> dict[str, Any]:
         raise service_error(404, "session_not_running", "No session manager", "not_found")
     try:
         result = await manager.reload_config(strategy_id)
-    except (SessionNotRunningError, KeyError) as exc:
+    except SessionNotRunningError as exc:
         raise service_error(
             404, "session_not_running", f"No running session for {strategy_id}", "not_found"
         ) from exc
+    except (KeyError, FileNotFoundError) as exc:
+        # the session keeps running on its snapshot, but there is no file to reload from
+        raise service_error(404, "strategy_not_found", str(exc).strip("'\""), "not_found") from exc
     except ConfigReloadRefusedError as exc:
         raise service_error(
             409, exc.code, str(exc), "invalid", changed_fields=exc.changed_fields

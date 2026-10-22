@@ -31,4 +31,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise NotImplementedError("forward-only; restore from a pg_dump instead")
+    for statement in (
+        "ALTER TABLE trading_sessions DROP COLUMN IF EXISTS config_hash",
+        "ALTER TABLE trading_sessions DROP COLUMN IF EXISTS strategy_config",
+    ):
+        op.execute(statement)

@@ -429,6 +429,18 @@ class TestValidateStrategyConfig:
         with pytest.raises(ValueError):
             validate_strategy_config(data)
 
+    @pytest.mark.parametrize(
+        "value",
+        ["50", 50.0, True, 0],
+        ids=["string", "float", "bool", "zero"],
+    )
+    def test_non_integer_required_history_is_rejected(self, value: object) -> None:
+        """A quoted or fractional required_history passes pydantic but kills every on_bar."""
+        data = dict(_VALID_RULE_BASED)
+        data["parameters"] = {**_VALID_RULE_BASED["parameters"], "required_history": value}
+        with pytest.raises(ValueError, match="required_history"):
+            validate_strategy_config(data)
+
 
 class TestWriteStrategyConfig:
     def test_writes_atomically(self, tmp_path: Path) -> None:

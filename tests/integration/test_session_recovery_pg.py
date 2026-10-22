@@ -215,21 +215,41 @@ async def test_recovery_of_pre_snapshot_row_falls_back_to_the_file(
     try:
         h = Harness(strategies_dir)
         sid = write_strategy(strategies_dir, "pg-presnap", entry_long=rule(("less_than", 0.0)))
+        path = strategies_dir / f"{sid}.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["rsi_period"] = 14
+        path.write_text(yaml.safe_dump(data))
+
+        first = SessionManager(db_pool=pool, config=HydraConfig(), clients=_clients(h))
+        await first.startup()
+        session_id = await first.start_session(sid, "paper", D("1000"))
+        await first.graceful_shutdown()
+
+        # A pre-P2 row: the paper state exists, but no config snapshot was stored yet.
         await pool.execute(
-            "INSERT INTO trading_sessions (id, strategy_id, trading_mode, status, exchange_id,"
-            " symbols, timeframe, paper_capital) VALUES"
-            " ('pre-snap-1', $1, 'paper', 'running', 'binance', ARRAY['BTCUSDT'], '1h', 1000)",
-            sid,
+            "UPDATE trading_sessions SET strategy_config = NULL, config_hash = NULL WHERE id = $1",
+            session_id,
         )
+        # The file moved on after the row was written; with no snapshot the file wins.
+        data = yaml.safe_load(path.read_text())
+        data["parameters"]["rsi_period"] = 21
+        path.write_text(yaml.safe_dump(data))
+        file_hash = config_hash(StrategyConfig.model_validate({**data, "enabled": True}))
+
         app = FastAPI()
         app.state.db_pool = pool
         await lifespan._init_session_manager(app, HydraConfig(), _clients(h))
         mgr: SessionManager = app.state.session_manager
         await settle()
         try:
-            recovered = mgr.get_session("pre-snap-1")
+            recovered = mgr.get_session(session_id)
             assert recovered is not None and recovered.status == "running"
+            runtime = recovered._runtime
+            assert runtime is not None
+            assert runtime.cfg.parameters["rsi_period"] == 21  # from the file, not a snapshot
             assert recovered.strategy_config is not None  # backfilled on recovery
+            assert recovered.config_hash == file_hash
+            assert await held(recovered) == D("0")  # entry rule never fires; nothing was sold
         finally:
             await mgr.graceful_shutdown()
     finally:

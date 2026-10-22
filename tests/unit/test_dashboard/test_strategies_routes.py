@@ -647,6 +647,24 @@ class TestStrategiesFallback:
         assert resp.status_code == 422
         assert list(tmp_path.glob("*.yaml")) == []
 
+    def test_import_with_quoted_required_history_is_422_and_writes_nothing(
+        self, client_no_pool: TestClient, tmp_path: Path
+    ) -> None:
+        """A string required_history would kill the strategy on every bar; it is rejected."""
+        upload = yaml.safe_dump(
+            {
+                "name": "Quoted",
+                "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+                "parameters": {"required_history": "50"},
+            }
+        ).encode()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            resp = client_no_pool.post(
+                "/api/strategies/import", files={"file": ("quoted.yaml", upload)}
+            )
+        assert resp.status_code == 422
+        assert list(tmp_path.glob("*.yaml")) == []
+
     @pytest.mark.parametrize(
         "rules",
         [_INVALID_INDICATOR_RULES, _INVALID_PARAM_RULES],
@@ -838,6 +856,76 @@ class TestGetStrategyRunningSessions:
         data = resp.json()
         assert data["running_sessions"] == []
         assert data["file_changed"] is False
+
+    def test_db_only_path_still_lists_running_sessions(self) -> None:
+        """A snapshot-recovered session with no YAML is visible in the detail, not hidden."""
+        pool, conn = _make_mock_pool()
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "id": "dbonly",
+                "name": "dbonly",
+                "enabled": True,
+                "total_pnl": 0,
+                "win_rate": 0,
+                "total_trades": 0,
+            }
+        )
+        app = _make_app(pool=pool)
+        app.state.session_manager = _FakeManager(
+            [_FakeSession("dbonly", "running", "s-run", "abc123def456")]
+        )
+        resp = TestClient(app).get("/api/strategies/dbonly")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["running_sessions"] == [
+            {"session_id": "s-run", "config_hash": "abc123def456", "stale": True}
+        ]
+        assert data["file_changed"] is True
+        assert data["config_hash"] is None
+
+
+class TestReloadStrategyErrors:
+    """The reload endpoint's 404s distinguish 'no session' from 'no file to reload from'."""
+
+    async def test_deleted_yaml_of_a_running_session_is_404_strategy_not_found(
+        self, strategies_dir: Path
+    ) -> None:
+        from hydra.services import strategies as svc
+        from hydra.services.errors import ServiceError
+        from tests.unit.test_execution.session_harness import Harness, write_strategy
+
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            sid = write_strategy(strategies_dir, "reload-gone")
+            await h.session(sid)
+            (strategies_dir / f"{sid}.yaml").unlink()
+            with pytest.raises(ServiceError) as err:
+                await svc.reload_strategy(h.mgr, sid)
+            assert err.value.status_code == 404
+            assert err.value.detail["code"] == "strategy_not_found"
+        finally:
+            await h.close()
+
+    async def test_missing_strategies_dir_is_404_not_500(self, strategies_dir: Path) -> None:
+        from hydra.services import strategies as svc
+        from hydra.services.errors import ServiceError
+        from tests.unit.test_execution.session_harness import Harness, write_strategy
+
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            sid = write_strategy(strategies_dir, "reload-nodir")
+            session = await h.session(sid)
+            (strategies_dir / f"{sid}.yaml").unlink()
+            strategies_dir.rmdir()
+            with pytest.raises(ServiceError) as err:
+                await svc.reload_strategy(h.mgr, sid)
+            assert err.value.status_code == 404
+            assert err.value.detail["code"] == "strategy_not_found"
+            assert session.status == "running"  # the reload failure never touches the session
+        finally:
+            await h.close()
 
 
 # ---------------------------------------------------------------------------
