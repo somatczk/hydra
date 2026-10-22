@@ -34,7 +34,7 @@ from hydra.backtest.jobs import (
     import_backtest_strategy,
 )
 from hydra.backtest.runner import BacktestRunner
-from hydra.backtest.walkforward import WalkForwardAnalyzer, WalkForwardResult
+from hydra.backtest.walkforward import WalkForwardAnalyzer
 from hydra.data.migrations.runner import current_revision, head_revision
 from hydra.risk.state import PgRiskStateStore
 from hydra.strategy.config import StrategyConfig
@@ -128,11 +128,13 @@ async def run_hyperopt_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> Jo
             for p in body.param_space
         ]
     )
-    best_seen = float("-inf")
+    best_seen: float | None = None
 
     async def _on_trial(trial_number: int, completed: int, total: int, record: Any) -> None:
         nonlocal best_seen
-        best_seen = max(best_seen, record.sharpe)
+        # only completed, trading trials count as the best so far
+        if record.status == "ok":
+            best_seen = record.sharpe if best_seen is None else max(best_seen, record.sharpe)
         run.detail["completed_trials"] = completed
         run.detail["total_trials"] = total
         run.detail["last_trial_sharpe"] = record.sharpe
@@ -151,52 +153,9 @@ async def run_hyperopt_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> Jo
         timeframe=config.timeframes.primary,
         on_trial_complete=_on_trial,
     )
-    return JobOutcome(
-        result={
-            "best_params": result.best_params,
-            "best_metric": result.best_metric,
-            "trials": [
-                {
-                    "trial_number": r.trial_number,
-                    "params": r.params,
-                    "sharpe": r.sharpe,
-                    "total_return": r.total_return,
-                    "max_drawdown": r.max_drawdown,
-                    "total_trades": r.total_trades,
-                }
-                for r in result.trials
-            ],
-            "total_trials": result.total_trials,
-            "completed_trials": result.completed_trials,
-            "provenance": provenance_dict,
-        }
-    )
-
-
-def walkforward_payload(result: WalkForwardResult) -> dict[str, Any]:
-    """The walk-forward result payload stored on the job row (the response body minus ids)."""
-    folds = [
-        {
-            "fold_index": fold.fold_index,
-            "in_sample_sharpe": fold.in_sample_metrics.sharpe_ratio,
-            "in_sample_return": float(fold.in_sample_metrics.total_return),
-            "in_sample_drawdown": float(fold.in_sample_metrics.max_drawdown),
-            "in_sample_trades": fold.in_sample_metrics.total_trades,
-            "out_of_sample_sharpe": fold.out_of_sample_metrics.sharpe_ratio,
-            "out_of_sample_return": float(fold.out_of_sample_metrics.total_return),
-            "out_of_sample_drawdown": float(fold.out_of_sample_metrics.max_drawdown),
-            "out_of_sample_trades": fold.out_of_sample_metrics.total_trades,
-        }
-        for fold in result.folds
-    ]
-    agg = result.aggregated_oos_metrics
-    return {
-        "folds": folds,
-        "aggregated_sharpe": agg.sharpe_ratio if agg is not None else None,
-        "aggregated_return": float(agg.total_return) if agg is not None else None,
-        "aggregated_drawdown": float(agg.max_drawdown) if agg is not None else None,
-        "out_of_sample_equity": [float(eq) for eq in agg.equity_curve] if agg is not None else [],
-    }
+    payload = result.to_dict()
+    payload["provenance"] = provenance_dict
+    return JobOutcome(result=payload)
 
 
 async def run_walkforward_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> JobOutcome:
@@ -214,20 +173,30 @@ async def run_walkforward_job(pool: Any, job: Mapping[str, Any], run: JobRun) ->
     run.detail["in_sample_months"] = in_sample
     run.detail["out_of_sample_months"] = out_of_sample
 
+    space = ParameterSpace(
+        params=[
+            ParamDef(name=p.name, type=p.type, low=p.low, high=p.high, choices=p.choices)
+            for p in body.param_space
+        ]
+    )
     analyzer = WalkForwardAnalyzer(initial_capital=Decimal(str(body.initial_capital)))
     result = await analyzer.run_walkforward(
         bars=bars,
         strategy_class=strategy_cls,
         strategy_config=config,
+        param_space=space,
         in_sample_months=in_sample,
         out_of_sample_months=out_of_sample,
+        method=body.method,
+        max_trials=body.max_trials,
+        anchored=body.anchored,
         symbol=config.symbols[0],
         timeframe=config.timeframes.primary,
     )
     if not result.folds:
         raise JobError(f"range too short for {body.fold_count} folds")
     run.detail["fold_count"] = len(result.folds)
-    return JobOutcome(result=walkforward_payload(result))
+    return JobOutcome(result=result.to_dict())
 
 
 Handler = Callable[[Any, Mapping[str, Any], JobRun], Coroutine[Any, Any, JobOutcome]]

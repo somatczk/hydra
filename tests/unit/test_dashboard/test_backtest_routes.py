@@ -7,6 +7,7 @@ tests/integration/test_backtest_real_data.py.
 from __future__ import annotations
 
 import ast
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from hydra.backtest.hyperopt import ParamDef, ParameterSpace
 from hydra.backtest.jobs import (
     BacktestRunRequest,
     detail_from_row,
@@ -25,7 +27,7 @@ from hydra.backtest.jobs import (
 )
 from hydra.backtest.walkforward import WalkForwardAnalyzer
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
-from hydra.core.types import OHLCV, Timeframe
+from hydra.core.types import OHLCV, Direction, Timeframe
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.backtest import router
 from hydra.services.backtest import (
@@ -106,6 +108,14 @@ def _run_body(strategy_id: str = "saw", **overrides: Any) -> dict[str, Any]:
 
 
 def _hyperopt_body(strategy_id: str = "saw", **overrides: Any) -> dict[str, Any]:
+    body = _run_body(
+        strategy_id, param_space=[{"name": "sma_period", "type": "int", "low": 3, "high": 8}]
+    )
+    body.update(overrides)
+    return body
+
+
+def _walkforward_body(strategy_id: str = "saw", **overrides: Any) -> dict[str, Any]:
     body = _run_body(
         strategy_id, param_space=[{"name": "sma_period", "type": "int", "low": 3, "high": 8}]
     )
@@ -285,7 +295,7 @@ class TestPreflightErrors:
         [
             ("/api/backtest/run", _run_body("does_not_exist_xyz")),
             ("/api/backtest/hyperopt", _hyperopt_body("does_not_exist_xyz")),
-            ("/api/backtest/walkforward", _run_body("does_not_exist_xyz")),
+            ("/api/backtest/walkforward", _walkforward_body("does_not_exist_xyz")),
         ],
     )
     def test_unknown_strategy_is_404_and_queues_nothing(
@@ -305,7 +315,7 @@ class TestPreflightErrors:
         [
             ("/api/backtest/run", _run_body()),
             ("/api/backtest/hyperopt", _hyperopt_body()),
-            ("/api/backtest/walkforward", _run_body()),
+            ("/api/backtest/walkforward", _walkforward_body()),
         ],
     )
     def test_no_database_is_503_and_queues_nothing(
@@ -333,6 +343,22 @@ class TestPreflightErrors:
         resp = client.post(
             "/api/backtest/hyperopt",
             json=_hyperopt_body(param_space=[{"name": "x", "type": "int"}]),
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "invalid_param_space"
+
+    def test_walkforward_without_param_space_is_422(self, client: TestClient) -> None:
+        resp = client.post("/api/backtest/walkforward", json=_run_body())
+        assert resp.status_code == 422
+        assert "param_space" in resp.json()["detail"]["message"]
+
+    def test_walkforward_bad_param_space_is_422(
+        self, client: TestClient, strategies_dir: Path
+    ) -> None:
+        _write_strategy(strategies_dir, "saw")
+        resp = client.post(
+            "/api/backtest/walkforward",
+            json=_walkforward_body(param_space=[{"name": "x", "type": "int"}]),
         )
         assert resp.status_code == 422
         assert resp.json()["detail"]["code"] == "invalid_param_space"
@@ -414,6 +440,57 @@ _DETAIL_TRADES = [
     },
 ]
 
+_HYPEROPT_RESULT = {
+    "best_params": {"sma_period": 5},
+    "best_metric": 1.25,
+    "trials": [
+        {
+            "trial_number": 0,
+            "params": {"sma_period": 4},
+            "sharpe": 0.5,
+            "total_return": 0.02,
+            "max_drawdown": 0.01,
+            "total_trades": 6,
+            "status": "ok",
+            "error": None,
+        },
+        {
+            "trial_number": 1,
+            "params": {"sma_period": 5},
+            "sharpe": 1.25,
+            "total_return": 0.05,
+            "max_drawdown": 0.01,
+            "total_trades": 9,
+            "status": "ok",
+            "error": None,
+        },
+        {
+            "trial_number": 2,
+            "params": {"sma_period": 6},
+            "sharpe": 0.0,
+            "total_return": 0.0,
+            "max_drawdown": 0.0,
+            "total_trades": 0,
+            "status": "no_trades",
+            "error": "strategy made no trades",
+        },
+    ],
+    "total_trials": 3,
+    "completed_trials": 3,
+    "n_trials": 2,
+    "failed_trials": 0,
+    "seed": 42,
+    "train_start": "2026-01-01T00:00:00+00:00",
+    "train_end": "2026-01-24T00:00:00+00:00",
+    "holdout_start": "2026-01-25T00:00:00+00:00",
+    "holdout_end": "2026-01-31T00:00:00+00:00",
+    "holdout": {"sharpe": 0.9, "total_return": 0.01, "max_drawdown": 0.005, "total_trades": 2},
+    "holdout_psr": 0.88,
+    "dsr": 0.77,
+    "pbo": None,
+    "provenance": {"exchange": "binance"},
+}
+
 
 class TestStatusAndResults:
     def test_status_reports_error_and_result_id(self) -> None:
@@ -437,6 +514,38 @@ class TestStatusAndResults:
     def test_hyperopt_progress_created_at_stays_optional(self) -> None:
         """D1's OpenAPI shape is unchanged: created_at is always served, never required."""
         assert "created_at" not in HyperoptProgressResponse.model_json_schema()["required"]
+
+    def test_hyperopt_results_carry_status_holdout_and_validation(self) -> None:
+        """The stored payload round-trips: per-trial status, the holdout, the DSR/PBO."""
+        row = {
+            "id": "ho-x",
+            "kind": "hyperopt",
+            "status": "completed",
+            "error": None,
+            "detail": "{}",
+            "result": json.dumps(_HYPEROPT_RESULT),
+        }
+        client = TestClient(_make_app(pool=_Pool(_JobRowConn(row))))
+        resp = client.get("/api/backtest/hyperopt/ho-x/results")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [t["status"] for t in body["trials"]] == ["ok", "ok", "no_trades"]
+        assert body["trials"][2]["error"] == "strategy made no trades"
+        assert body["n_trials"] == 2
+        assert body["failed_trials"] == 0
+        assert body["seed"] == 42
+        assert body["holdout"] == {
+            "sharpe": 0.9,
+            "total_return": 0.01,
+            "max_drawdown": 0.005,
+            "total_trades": 2,
+        }
+        assert body["holdout_psr"] == 0.88
+        assert body["dsr"] == 0.77
+        assert body["pbo"] is None
+        assert body["train_start"].startswith("2026-01-01T00:00:00")
+        assert body["holdout_start"].startswith("2026-01-25T00:00:00")
+        assert body["best_metric"] == 1.25
 
     def test_unknown_task_is_404(self) -> None:
         client = TestClient(_make_app(pool=_Pool(_JobRowConn(None))))
@@ -524,6 +633,26 @@ class _IdleStrategy(BaseStrategy):
         return []
 
 
+class _AlternatingStrategy(BaseStrategy):
+    """Enters when flat and exits on the next bar, so every window trades."""
+
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        if self.context.position(str(bar.symbol)) is None:
+            return [
+                EntrySignal(
+                    symbol=bar.symbol,
+                    direction=Direction.LONG,
+                    strength=Decimal("1"),
+                    strategy_id=self.strategy_id,
+                )
+            ]
+        return [ExitSignal(symbol=bar.symbol, strategy_id=self.strategy_id)]
+
+
 class TestWalkForwardMonths:
     def test_months_from_span(self) -> None:
         first = datetime(2025, 1, 1, tzinfo=UTC)
@@ -561,8 +690,11 @@ class TestWalkForwardMonths:
         config = StrategyConfig(id="wf-1w", name="WF 1w", strategy_class="x.Y", symbols=["BTCUSDT"])
         result = await WalkForwardAnalyzer().run_walkforward(
             bars=bars,
-            strategy_class=_IdleStrategy,
+            strategy_class=_AlternatingStrategy,
             strategy_config=config,
+            param_space=ParameterSpace(
+                params=[ParamDef(name="level", type="categorical", choices=[1])]
+            ),
             in_sample_months=4,
             out_of_sample_months=2,
             timeframe=Timeframe.W1,
@@ -572,6 +704,9 @@ class TestWalkForwardMonths:
         for fold in result.folds:
             assert len(fold.in_sample_metrics.equity_curve) == 17
             assert len(fold.out_of_sample_metrics.equity_curve) == 8
+            assert fold.selected_params == {"level": 1}
+            assert fold.n_trials == 1
+            assert fold.out_of_sample_metrics.total_trades >= 1
 
 
 # ---------------------------------------------------------------------------
