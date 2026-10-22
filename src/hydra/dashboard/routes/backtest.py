@@ -16,10 +16,8 @@ from hydra.services.backtest import (
     BacktestStatus,
     BacktestStrategyOption,
     BacktestVerification,
+    CancelJobResponse,
 )
-
-# shortcut: lifespan imports populate_cache_from_db from here; drop when D2 deletes the cache
-from hydra.services.backtest import populate_cache_from_db as populate_cache_from_db
 from hydra.services.research import (
     HyperoptHistoryEntry,
     HyperoptProgressResponse,
@@ -40,9 +38,15 @@ async def run_backtest(body: BacktestRunRequest, request: Request) -> dict[str, 
 
 
 @router.get("/status/{task_id}", response_model=BacktestStatus)
-async def get_backtest_status(task_id: str) -> dict[str, Any]:
-    """Check the progress of a running backtest."""
-    return svc.get_backtest_status(task_id)
+async def get_backtest_status(task_id: str, request: Request) -> dict[str, Any]:
+    """Check the progress of a queued, running or finished backtest job."""
+    return await svc.get_backtest_status(request_pool(request), task_id)
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=CancelJobResponse)
+async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
+    """Cancel a queued or running backtest, hyperopt or walk-forward job."""
+    return await svc.cancel_job(request_pool(request), job_id)
 
 
 @router.get("/results", response_model=list[BacktestResultSummary])
@@ -61,13 +65,13 @@ async def get_result_detail(result_id: str, request: Request) -> dict[str, Any]:
 async def rename_result(
     result_id: str, body: BacktestRenameRequest, request: Request
 ) -> dict[str, Any]:
-    """Rename a backtest result in the database, then in the cache."""
+    """Rename a backtest result in the database."""
     return await svc.rename_result(request_pool(request), result_id, body.name)
 
 
 @router.delete("/results/{result_id}", status_code=204)
 async def delete_result(result_id: str, request: Request) -> None:
-    """Delete a backtest result from the database, then evict it from the cache."""
+    """Delete a backtest result and its trades from the database."""
     await svc.delete_result(request_pool(request), result_id)
 
 
@@ -96,9 +100,9 @@ async def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
     "/hyperopt/history",
     response_model=list[HyperoptHistoryEntry],
 )
-async def list_hyperopt_history() -> list[dict[str, Any]]:
+async def list_hyperopt_history(request: Request) -> list[dict[str, Any]]:
     """Return a summary of all hyperopt runs (most recent first)."""
-    return research.list_hyperopt_history()
+    return await research.list_hyperopt_history(request_pool(request))
 
 
 @router.post(
@@ -118,18 +122,18 @@ async def start_hyperopt(body: HyperoptRunRequest, request: Request) -> dict[str
     "/hyperopt/{task_id}",
     response_model=HyperoptProgressResponse,
 )
-async def get_hyperopt_progress(task_id: str) -> dict[str, Any]:
-    """Poll progress of a running hyperopt task."""
-    return research.get_hyperopt_progress(task_id)
+async def get_hyperopt_progress(task_id: str, request: Request) -> dict[str, Any]:
+    """Poll progress of a running hyperopt job."""
+    return await research.get_hyperopt_progress(request_pool(request), task_id)
 
 
 @router.get(
     "/hyperopt/{task_id}/results",
     response_model=HyperoptResultResponse,
 )
-async def get_hyperopt_results(task_id: str) -> dict[str, Any]:
+async def get_hyperopt_results(task_id: str, request: Request) -> dict[str, Any]:
     """Return the full result of a completed hyperopt run."""
-    return research.get_hyperopt_results(task_id)
+    return await research.get_hyperopt_results(request_pool(request), task_id)
 
 
 @router.post(
@@ -149,9 +153,9 @@ async def start_walkforward(body: WalkForwardRunRequest, request: Request) -> di
     "/walkforward/{task_id}/results",
     response_model=WalkForwardResultResponse,
 )
-async def get_walkforward_results(task_id: str) -> dict[str, Any]:
+async def get_walkforward_results(task_id: str, request: Request) -> dict[str, Any]:
     """Return fold metrics and aggregated OOS equity for a completed walk-forward run."""
-    return research.get_walkforward_results(task_id)
+    return await research.get_walkforward_results(request_pool(request), task_id)
 
 
 @router.post("/results/{result_id}/share")

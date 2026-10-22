@@ -224,7 +224,6 @@ class TestLifespanClosesClients:
             "_load_exchange_credentials",
             "_load_system_config",
             "_init_session_manager",
-            "_populate_backtest_cache",
             "_shutdown_session_manager",
             "_close_db_pool",
         ]

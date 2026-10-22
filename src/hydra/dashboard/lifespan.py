@@ -1,7 +1,7 @@
 """Engine startup and shutdown.
 
 Startup order: config, logging, credential key, DB pool, Alembic migrations, stored credentials,
-system config, SessionManager (``startup()``: risk state, recovery, display rows), backtest cache,
+system config, SessionManager (``startup()``: risk state, recovery, display rows),
 HealthMonitor (first readiness run; ``/livez`` turns green). Shutdown stops the monitor first.
 Any startup error propagates, so uvicorn exits non-zero instead of serving without a schema or a
 key. Without DATABASE_URL (dev only) there is no pool, no migration and no key requirement.
@@ -58,7 +58,6 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             await _load_exchange_credentials(app)
             await _load_system_config(app)
         await _init_session_manager(app, cfg, clients)
-        await _populate_backtest_cache(app)
         await _start_health_monitor(app)
         yield
     finally:
@@ -162,15 +161,6 @@ async def _init_session_manager(
     mgr = SessionManager(db_pool=app.state.db_pool, config=cfg, clients=clients)
     await mgr.startup()
     app.state.session_manager = mgr
-
-
-async def _populate_backtest_cache(app: FastAPI) -> None:
-    pool = app.state.db_pool
-    if pool is None:
-        return
-    from hydra.dashboard.routes.backtest import populate_cache_from_db
-
-    await populate_cache_from_db(pool)
 
 
 async def _start_health_monitor(app: FastAPI) -> None:

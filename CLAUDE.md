@@ -58,7 +58,8 @@ not duplicate it here; update that table in the PR that changes a row.
   - `data`: ingestion, bar storage, backfill, news and sentiment.
   - `indicators`: TA-Lib wrappers and custom indicators.
   - `strategy`: base class, engine, rule engine, YAML config, `builtin/`.
-  - `backtest`: runner, bar loader, fills, metrics, hyperopt, walk-forward.
+  - `backtest`: runner, bar loader, fills, metrics, hyperopt, walk-forward, job queue (`jobs.py`),
+    worker (`worker.py`, the `hydra-backtest-worker` container).
   - `execution`: SessionManager, OrderManager, paper executor, ExchangeClient.
   - `risk`: pre-trade checks, sizing, circuit breakers, exchange safety.
   - `portfolio`: P&L, positions, reconciliation.
@@ -98,10 +99,12 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   built by `hydra.execution.client_factory` (Binance spot only); live sessions are refused until P3.
 - Persisted (the engine has a DB pool whenever `DATABASE_URL` is set; startup fails without one): risk config and
   kill-switch flag, trading sessions, paper trades, positions and balance snapshots, backtest results and trades with
-  data provenance, exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`), and `system_config` rows (`PUT
+  data provenance, backtest/hyperopt/walk-forward job state (`backtest_jobs`, run by the `hydra-backtest-worker`
+  container: durable across engine and worker restarts, requeued up to 3 attempts, cancellable, 6 h timeout, heartbeat
+  file + Docker healthcheck), exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`), and `system_config` rows (`PUT
   /api/system/config` writes them, secrets Fernet-encrypted; a missing row is a 503, never a default; a
-  `paper_capital` change goes through `RiskService.reload_config`). In memory only: background task state (backtest,
-  hyperopt, walk-forward). Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`;
+  `paper_capital` change goes through `RiskService.reload_config`). In memory only: the backtest share-link tokens.
+  Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`;
   paper sessions are restored from `paper_accounts` by `SessionManager.startup()`.
 - Every paper entry gets a protective stop (strategy `risk:` block, 5 % default); no exchange-side stops yet (P3).
   Only Binance SPOT is accepted (`client_factory.validate_venue`).
