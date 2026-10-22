@@ -1,11 +1,10 @@
-"""M06: Backtesting engine, walk-forward analysis, CPCV."""
+"""M06: Backtesting engine, hyperparameter optimisation, walk-forward optimisation."""
 
 from __future__ import annotations
 
 __all__ = [
     "BacktestResult",
     "BacktestRunner",
-    "CPCVResult",
     "CommissionConfig",
     "FoldResult",
     "StrategyError",
@@ -22,7 +21,6 @@ _IMPORT_MAP: dict[str, tuple[str, str]] = {
     "calculate_metrics": ("hydra.backtest.metrics", "calculate_metrics"),
     "BacktestRunner": ("hydra.backtest.runner", "BacktestRunner"),
     "StrategyError": ("hydra.backtest.runner", "StrategyError"),
-    "CPCVResult": ("hydra.backtest.walkforward", "CPCVResult"),
     "FoldResult": ("hydra.backtest.walkforward", "FoldResult"),
     "WalkForwardAnalyzer": ("hydra.backtest.walkforward", "WalkForwardAnalyzer"),
     "WalkForwardResult": ("hydra.backtest.walkforward", "WalkForwardResult"),

@@ -118,6 +118,10 @@ class HyperoptRunRequest(_DateRange):
 
 class WalkForwardRunRequest(_DateRange):
     strategy_id: str
+    param_space: list[ParamDefRequest] = Field(min_length=1)
+    method: Literal["bayesian", "grid"] = "grid"
+    max_trials: int = Field(default=20, ge=1, le=200)  # per fold
+    anchored: bool = False
     fold_count: int = Field(default=6, ge=2, le=24)
     train_pct: float = Field(default=0.75, gt=0.0, lt=1.0)
     timeframe: Timeframe | None = None

@@ -215,6 +215,11 @@ def _iso(ts: datetime) -> str:
     return ts.isoformat()
 
 
+def _z(ts: datetime) -> str:
+    """The API serialises UTC datetimes with a Z suffix."""
+    return ts.isoformat().replace("+00:00", "Z")
+
+
 # ---------------------------------------------------------------------------
 # Single backtest
 # ---------------------------------------------------------------------------
@@ -431,7 +436,7 @@ async def _hyperopt(client: httpx.AsyncClient, pool: Any) -> tuple[dict[str, Any
 async def test_hyperopt_grid_runs_on_stored_bars_reproducibly(
     client: httpx.AsyncClient, pool: Any, strategies_dir: Path
 ) -> None:
-    await _seed_hourly(pool)
+    seed = await _seed_hourly(pool)
     _write_strategy(strategies_dir, "saw")
 
     progress, first = await _hyperopt(client, pool)
@@ -445,9 +450,27 @@ async def test_hyperopt_grid_runs_on_stored_bars_reproducibly(
     assert first["provenance"]["exchange"] == "binance"
     assert first["provenance"]["hydra_version"] == version("hydra")
     assert [t["params"] for t in first["trials"]] == [{"sma_period": 4}, {"sma_period": 5}]
+    assert all(t["status"] == "ok" for t in first["trials"])
     assert first["best_metric"] == second["best_metric"]
     assert [t["sharpe"] for t in first["trials"]] == [t["sharpe"] for t in second["trials"]]
     assert any(t["total_trades"] > 0 for t in first["trials"])
+
+    # the validation numbers: same seed, same holdout, same DSR/PBO on the same bars
+    assert first["seed"] == second["seed"] == 42
+    assert first["n_trials"] == second["n_trials"] == 2
+    assert first["failed_trials"] == 0
+    assert first["holdout"] is not None
+    assert first["holdout"]["total_trades"] > 0
+    assert first["holdout"]["sharpe"] == second["holdout"]["sharpe"]
+    assert first["holdout_psr"] == second["holdout_psr"]
+    assert first["dsr"] == second["dsr"]
+    assert first["pbo"] == second["pbo"]
+    # the holdout is the final 20 % of the range: the optimiser never saw bars 240+
+    split = int(H1_COUNT * 0.8)
+    assert first["train_start"] == _z(seed[0].timestamp)
+    assert first["train_end"] == _z(seed[split - 1].timestamp)
+    assert first["holdout_start"] == _z(seed[split].timestamp)
+    assert first["holdout_end"] == _z(seed[-1].timestamp)
 
 
 async def test_walkforward_uses_the_real_span(
@@ -464,6 +487,7 @@ async def test_walkforward_uses_the_real_span(
             "start_date": "2024-01-01",
             "end_date": "2025-12-31",
             "fold_count": 2,
+            "param_space": [{"name": "sma_period", "type": "int", "low": 4, "high": 5}],
         },
     )
     assert resp.status_code == 202, resp.text
@@ -486,7 +510,17 @@ async def test_walkforward_uses_the_real_span(
     # 400 daily bars over 399 days: 150 IS + 60 OOS bars per window, stepping 60 bars.
     assert len(result["folds"]) == 4
     for fold in result["folds"]:
+        # every fold re-optimised in-sample and froze one of the two configs
+        assert fold["selected_params"] in ({"sma_period": 4}, {"sma_period": 5})
+        assert fold["n_trials"] == 2
+        assert fold["in_sample_trades"] > 0
         assert fold["out_of_sample_trades"] > 0
+        # the frozen params only ever traded inside the fold's own OOS window
+        assert fold["is_start"] < fold["is_end"] <= fold["oos_start"] < fold["oos_end"]
+    assert isinstance(result["oos_psr"], float)
+    assert result["anchored"] is False
+    assert result["seed"] == 42
+    assert result["efficiency"] is None or isinstance(result["efficiency"], float)
 
     short = await client.post(
         "/api/backtest/walkforward",
@@ -495,6 +529,7 @@ async def test_walkforward_uses_the_real_span(
             "start_date": "2024-01-01",
             "end_date": "2024-01-31",
             "fold_count": 2,
+            "param_space": [{"name": "sma_period", "type": "int", "low": 4, "high": 5}],
         },
     )
     assert short.status_code == 422

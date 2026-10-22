@@ -91,6 +91,24 @@ _NEVER_RULES = {
     },
 }
 
+# the durable hyperopt test optimises two dimensions: the entry SMA period (the
+# {indicator}_{param} auto key) and the exit SMA period (an explicit override)
+_EXIT_SMA_RULES = {
+    "entry_long": _SAW_RULES["entry_long"],
+    "exit_long": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "close",
+                "params": {},
+                "comparator": "crosses_below",
+                "value": "sma:period=5",
+                "value_ref_overrides": {"sma_period_exit": "period"},
+            }
+        ],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -421,7 +439,7 @@ async def test_hyperopt_and_walkforward_are_durable(
     client: httpx.AsyncClient, pool: Any, strategies_dir: Path, database_dsn: str
 ) -> None:
     await _seed_hourly(pool)
-    _write_strategy(strategies_dir, "saw")
+    _write_strategy(strategies_dir, "saw", rules=_EXIT_SMA_RULES)
 
     resp = await client.post(
         "/api/backtest/hyperopt",
@@ -450,6 +468,7 @@ async def test_hyperopt_and_walkforward_are_durable(
             "start_date": "2024-01-01",
             "end_date": "2025-12-31",
             "fold_count": 2,
+            "param_space": [{"name": "sma_period", "type": "int", "low": 4, "high": 5}],
         },
     )
     assert resp.status_code == 202, resp.text
@@ -468,13 +487,22 @@ async def test_hyperopt_and_walkforward_are_durable(
             assert re.fullmatch(r"[0-9a-f]{12}", progress["provenance"]["config_hash"])
             results = (await restarted.get(f"/api/backtest/hyperopt/{ho_id}/results")).json()
             assert len(results["trials"]) == progress["completed_trials"]
-            assert results["best_metric"] == max(t["sharpe"] for t in results["trials"])
+            assert all("status" in t for t in results["trials"])
+            ok_trials = [t for t in results["trials"] if t["status"] == "ok"]
+            assert ok_trials
+            assert results["best_metric"] == max(t["sharpe"] for t in ok_trials)
+            assert results["seed"] == 42
+            assert results["holdout"] is not None
+            assert results["holdout"]["total_trades"] > 0
+            assert results["dsr"] is not None
             assert results["provenance"]["hydra_version"] == version("hydra")
             history = (await restarted.get("/api/backtest/hyperopt/history")).json()
             assert ho_id in [h["task_id"] for h in history]
 
             after = (await restarted.get(f"/api/backtest/walkforward/{wf_id}/results")).json()
             assert after["folds"] == before["folds"]
+            assert after["seed"] == 42
+            assert all("selected_params" in f for f in after["folds"])
             assert after["provenance"]["hydra_version"] == version("hydra")
             assert re.fullmatch(r"[0-9a-f]{12}", after["provenance"]["config_hash"])
     finally:

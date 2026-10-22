@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from hydra.backtest import jobs
-from hydra.backtest.hyperopt import ParamDef
+from hydra.backtest.hyperopt import ParamDef, ParameterSpace, unknown_param_names
 from hydra.backtest.jobs import (
     HyperoptRunRequest,
+    ParamDefRequest,
     WalkForwardRunRequest,
     walkforward_months,
     window_fits,
 )
 from hydra.services import strategies as strategy_files
-from hydra.services.backtest import DataProvenanceModel, _preflight
+from hydra.services.backtest import (
+    DataProvenanceModel,
+    _load_backtest_strategy,
+    _preflight,
+)
 from hydra.services.errors import ServiceError, db_errors, service_error
+from hydra.strategy.config import StrategyConfig
 
 # ---------------------------------------------------------------------------
 # Strategy optimizable parameter extraction
@@ -245,6 +252,17 @@ class TrialRecordResponse(BaseModel):
     total_return: float
     max_drawdown: float
     total_trades: int
+    status: str = "ok"
+    error: str | None = None
+
+
+class HyperoptHoldoutResponse(BaseModel):
+    """The best config re-run once on the holdout window the optimiser never saw."""
+
+    sharpe: float
+    total_return: float
+    max_drawdown: float
+    total_trades: int
 
 
 class HyperoptResultResponse(BaseModel):
@@ -255,6 +273,17 @@ class HyperoptResultResponse(BaseModel):
     trials: list[TrialRecordResponse]
     total_trials: int
     completed_trials: int
+    n_trials: int = 0
+    failed_trials: int = 0
+    seed: int = 42
+    train_start: datetime | None = None
+    train_end: datetime | None = None
+    holdout_start: datetime | None = None
+    holdout_end: datetime | None = None
+    holdout: HyperoptHoldoutResponse | None = None
+    holdout_psr: float | None = None
+    dsr: float | None = None
+    pbo: float | None = None
     provenance: JobProvenanceModel | None = None
 
 
@@ -275,16 +304,39 @@ class HyperoptHistoryEntry(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _validated_space(defs: list[ParamDefRequest]) -> ParameterSpace:
+    """Structurally valid ``ParameterSpace`` or a 422 ``invalid_param_space``."""
+    try:
+        return ParameterSpace(
+            params=[
+                ParamDef(name=p.name, type=p.type, low=p.low, high=p.high, choices=p.choices)
+                for p in defs
+            ]
+        )
+    except ValueError as exc:
+        raise service_error(422, "invalid_param_space", str(exc), "invalid") from exc
+
+
+def _check_param_names(space: ParameterSpace, config: StrategyConfig) -> None:
+    """Reject names the strategy cannot read, before anything is queued."""
+    unknown = unknown_param_names(space, config)
+    if unknown:
+        raise service_error(
+            422,
+            "invalid_param_space",
+            f"param_space names the strategy never reads: {', '.join(unknown)}",
+            "invalid",
+        )
+
+
 async def submit_hyperopt(pool: Any, body: HyperoptRunRequest) -> dict[str, Any]:
     """Queue a hyperparameter optimisation run on the worker.
 
     Returns a ``task_id`` to poll for progress and results.
     """
-    try:
-        for p in body.param_space:
-            ParamDef(name=p.name, type=p.type, low=p.low, high=p.high, choices=p.choices)
-    except ValueError as exc:
-        raise service_error(422, "invalid_param_space", str(exc), "invalid") from exc
+    space = _validated_space(body.param_space)
+    _, config = _load_backtest_strategy(body.strategy_id)
+    _check_param_names(space, config)
     pf = await _preflight(pool, body.strategy_id, body.timeframe, body.start_date, body.end_date)
     async with db_errors("queueing the job"):
         task_id = await jobs.enqueue(
@@ -389,6 +441,12 @@ class FoldMetricsResponse(BaseModel):
     out_of_sample_return: float
     out_of_sample_drawdown: float
     out_of_sample_trades: int
+    selected_params: dict[str, Any] = Field(default_factory=dict)
+    n_trials: int = 0
+    is_start: datetime | None = None
+    is_end: datetime | None = None
+    oos_start: datetime | None = None
+    oos_end: datetime | None = None
 
 
 class WalkForwardResultResponse(BaseModel):
@@ -399,6 +457,10 @@ class WalkForwardResultResponse(BaseModel):
     aggregated_return: float | None
     aggregated_drawdown: float | None
     out_of_sample_equity: list[float]
+    oos_psr: float | None = None
+    efficiency: float | None = None
+    anchored: bool = False
+    seed: int = 42
     provenance: JobProvenanceModel | None = None
 
 
@@ -412,6 +474,9 @@ async def submit_walkforward(pool: Any, body: WalkForwardRunRequest) -> dict[str
 
     Returns a ``task_id`` to poll for results.
     """
+    space = _validated_space(body.param_space)
+    _, config = _load_backtest_strategy(body.strategy_id)
+    _check_param_names(space, config)
     pf = await _preflight(pool, body.strategy_id, body.timeframe, body.start_date, body.end_date)
     if pf.stored is not None:
         first, last, bar_count = pf.stored
