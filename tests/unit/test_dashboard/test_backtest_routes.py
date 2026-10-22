@@ -363,6 +363,36 @@ class TestPreflightErrors:
         assert resp.status_code == 422
         assert resp.json()["detail"]["code"] == "invalid_param_space"
 
+    def test_hyperopt_unknown_param_name_is_422(
+        self, client: TestClient, strategies_dir: Path
+    ) -> None:
+        _write_strategy(strategies_dir, "saw")
+        resp = client.post(
+            "/api/backtest/hyperopt",
+            json=_hyperopt_body(
+                param_space=[{"name": "sma_perod", "type": "int", "low": 3, "high": 8}]
+            ),
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "invalid_param_space"
+        assert "sma_perod" in detail["message"]
+
+    def test_walkforward_unknown_param_name_is_422(
+        self, client: TestClient, strategies_dir: Path
+    ) -> None:
+        _write_strategy(strategies_dir, "saw")
+        resp = client.post(
+            "/api/backtest/walkforward",
+            json=_walkforward_body(
+                param_space=[{"name": "sma_perod", "type": "int", "low": 3, "high": 8}]
+            ),
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "invalid_param_space"
+        assert "sma_perod" in detail["message"]
+
     async def test_request_timeframe_overrides_strategy_primary(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "saw", timeframes={"primary": "4h"})
 
@@ -687,7 +717,13 @@ class TestWalkForwardMonths:
             )
             for i in range(57)
         ]
-        config = StrategyConfig(id="wf-1w", name="WF 1w", strategy_class="x.Y", symbols=["BTCUSDT"])
+        config = StrategyConfig(
+            id="wf-1w",
+            name="WF 1w",
+            strategy_class="x.Y",
+            symbols=["BTCUSDT"],
+            parameters={"level": 1},
+        )
         result = await WalkForwardAnalyzer().run_walkforward(
             bars=bars,
             strategy_class=_AlternatingStrategy,

@@ -91,6 +91,24 @@ _NEVER_RULES = {
     },
 }
 
+# the durable hyperopt test optimises two dimensions: the entry SMA period (the
+# {indicator}_{param} auto key) and the exit SMA period (an explicit override)
+_EXIT_SMA_RULES = {
+    "entry_long": _SAW_RULES["entry_long"],
+    "exit_long": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "close",
+                "params": {},
+                "comparator": "crosses_below",
+                "value": "sma:period=5",
+                "value_ref_overrides": {"sma_period_exit": "period"},
+            }
+        ],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -421,7 +439,7 @@ async def test_hyperopt_and_walkforward_are_durable(
     client: httpx.AsyncClient, pool: Any, strategies_dir: Path, database_dsn: str
 ) -> None:
     await _seed_hourly(pool)
-    _write_strategy(strategies_dir, "saw")
+    _write_strategy(strategies_dir, "saw", rules=_EXIT_SMA_RULES)
 
     resp = await client.post(
         "/api/backtest/hyperopt",

@@ -25,6 +25,7 @@ import numpy as np
 _EULER_MASCHERONI = 0.5772156649015329
 BLOCKS = 16
 _DEGENERATE = 1e-12
+_MAX_TEMP_ELEMENTS = 2_000_000
 
 _ND = NormalDist()
 
@@ -136,6 +137,16 @@ def _combo_sharpe(sums: np.ndarray, sumsqs: np.ndarray, counts: np.ndarray) -> n
     return np.where(var > 0.0, mean / np.sqrt(safe_var), 0.0)
 
 
+def _chunk_size(n_configs: int, blocks: int) -> int:
+    """Combination-chunk size keeping each ``sums[selected]`` temporary within budget.
+
+    The fancy-index gather materialises ``(chunk, blocks // 2, n_configs)`` float64, so
+    the element budget divides by all three extents, not just the config count.
+    """
+    per_combo = max(n_configs * max(blocks // 2, 1), 1)
+    return max(1, _MAX_TEMP_ELEMENTS // per_combo)
+
+
 def pbo_cscv(matrix: np.ndarray | Sequence[Sequence[float]], blocks: int = BLOCKS) -> float | None:
     """Probability of backtest overfitting by CSCV rank-logit.
 
@@ -163,14 +174,16 @@ def pbo_cscv(matrix: np.ndarray | Sequence[Sequence[float]], blocks: int = BLOCK
     total_sumsq = sumsqs.sum(axis=0)
     overfit = 0
     # shortcut: chunked over combinations so a 500-config matrix stays well under 100 MB
-    chunk = max(1, 2_000_000 // max(n_configs, 1))
+    chunk = _chunk_size(n_configs, blocks)
     for start in range(0, len(combos), chunk):
         selected = combos[start : start + chunk]
+        is_sum = sums[selected].sum(axis=1)
+        is_sumsq = sumsqs[selected].sum(axis=1)
         is_count = counts[selected].sum(axis=1, keepdims=True)
-        is_sr = _combo_sharpe(sums[selected].sum(axis=1), sumsqs[selected].sum(axis=1), is_count)
+        is_sr = _combo_sharpe(is_sum, is_sumsq, is_count)
         oos_sr = _combo_sharpe(
-            total_sum - sums[selected].sum(axis=1),
-            total_sumsq - sumsqs[selected].sum(axis=1),
+            total_sum - is_sum,
+            total_sumsq - is_sumsq,
             t_days - is_count,
         )
         best = np.argmax(is_sr, axis=1)

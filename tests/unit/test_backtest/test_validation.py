@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from hydra.backtest.validation import (
+    _chunk_size,
     daily_returns,
     deflated_sharpe,
     expected_max_sharpe,
@@ -94,6 +95,16 @@ def test_pbo_needs_two_configs_and_enough_rows() -> None:
     assert pbo_cscv(np.zeros((100, 1)), blocks=16) is None
     assert pbo_cscv(np.zeros((31, 4)), blocks=16) is None
     assert pbo_cscv(np.zeros((32, 4)), blocks=16) is not None
+
+
+def test_pbo_chunk_size_bounds_the_gather_temporaries() -> None:
+    """Each chunk's fancy-index gather is (chunk, blocks/2, n_configs) float64."""
+    for n_configs in (2, 10, 100, 500):
+        chunk = _chunk_size(n_configs, 16)
+        assert chunk * (16 // 2) * n_configs <= 2_000_000
+        assert chunk >= 1
+    # the documented maximum (hyperopt max_trials=500): ~16 MB temporaries, not ~128 MB
+    assert _chunk_size(500, 16) == 500
 
 
 def test_daily_returns_from_hourly_equity() -> None:

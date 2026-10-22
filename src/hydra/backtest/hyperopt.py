@@ -9,8 +9,10 @@ can never win. Identical parameter sets are evaluated once.
 ``run`` carves a fixed final 20 % holdout that no optimisation trial ever sees and
 re-runs the best config on it once, warmed up with the tail of the train window;
 ``optimise`` runs the trial loop over the bars it is given (the walk-forward analyser
-calls it once per fold). The result records the trial count, failed trials, the seed,
-the windows, the DSR and the CSCV PBO of the eligible trial matrix.
+calls it once per fold). Param-space names the strategy cannot read are rejected up
+front: a typo would otherwise optimise a no-op dimension. The result records the trial
+count, failed trials, the seed, the windows, the DSR and the CSCV PBO of the eligible
+trial matrix.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import itertools
 import json
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -27,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.metrics import BacktestResult
 from hydra.backtest.runner import BacktestRunner
 from hydra.backtest.validation import (
@@ -140,6 +144,58 @@ class ParameterSpace:
         for combo in itertools.product(*per_param):
             combinations.append(dict(zip(names, combo, strict=True)))
         return combinations
+
+
+# ---------------------------------------------------------------------------
+# Parameter-name validation
+# ---------------------------------------------------------------------------
+
+
+def unknown_param_names(param_space: ParameterSpace, base_config: StrategyConfig) -> list[str]:
+    """Param-space names the strategy cannot read, sorted; a typo optimises a no-op.
+
+    Readable names are the config's declared ``parameters`` plus, for a rule-based
+    strategy, every name the rule engine's override machinery consults.
+    """
+    readable = _readable_param_names(base_config)
+    return sorted({p.name for p in param_space.params if p.name not in readable})
+
+
+def _readable_param_names(config: StrategyConfig) -> set[str]:
+    names = set(config.parameters)
+    rules = config.parameters.get("rules")
+    if not isinstance(rules, Mapping):
+        return names
+    for group in rules.values():
+        conditions = group.get("conditions") if isinstance(group, Mapping) else None
+        if not isinstance(conditions, list):
+            continue
+        for cond in conditions:
+            if isinstance(cond, Mapping):
+                names |= _condition_param_names(cond)
+    return names
+
+
+def _condition_param_names(cond: Mapping[str, Any]) -> set[str]:
+    """Every top-level name ``RuleBasedStrategy._apply_param_overrides`` reads per condition."""
+    names: set[str] = set()
+    params = cond.get("params")
+    param_key = cond.get("param_key")
+    if param_key and isinstance(params, Mapping) and params:
+        names.add(str(param_key))
+    if cond.get("value_param_key"):
+        names.add(str(cond["value_param_key"]))
+    value = cond.get("value")
+    overrides = cond.get("value_ref_overrides")
+    if isinstance(overrides, Mapping) and isinstance(value, str):
+        names |= {str(key) for key in overrides}
+    indicator = cond.get("indicator")
+    if not param_key and isinstance(params, Mapping) and isinstance(indicator, str):
+        names |= {f"{indicator}_{name}" for name in params}
+    if not overrides and isinstance(value, str) and ":" in value:
+        ref, _, rest = value.partition(":")
+        names |= {f"{ref}_{kv.partition('=')[0].strip()}" for kv in rest.split(",")}
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +316,9 @@ def _iso(value: datetime | None) -> str | None:
 class HyperoptRunner:
     """Orchestrates hyperparameter optimisation over a BacktestRunner.
 
+    ``commission`` prices every trial and the holdout run alike, so a caller with
+    non-default fees never selects under one fee regime and evaluates under another.
+
     Supports two search methods:
 
     * ``"bayesian"`` — Optuna's seeded TPE sampler. Ineligible trials are told as FAIL,
@@ -268,8 +327,13 @@ class HyperoptRunner:
       small discrete spaces where coverage matters more than efficiency.
     """
 
-    def __init__(self, backtest_runner: BacktestRunner | None = None) -> None:
+    def __init__(
+        self,
+        backtest_runner: BacktestRunner | None = None,
+        commission: CommissionConfig | None = None,
+    ) -> None:
         self._runner = backtest_runner or BacktestRunner()
+        self._commission = commission or CommissionConfig()
 
     async def run(
         self,
@@ -327,6 +391,7 @@ class HyperoptRunner:
             strategy_config=best_config,
             bars=[*warm, *holdout_bars],
             initial_capital=initial_capital,
+            commission=self._commission,
             symbol=symbol,
             timeframe=timeframe,
             warmup_bars=len(warm),
@@ -356,6 +421,15 @@ class HyperoptRunner:
         """
         if not bars:
             return HyperoptResult()
+
+        unknown = unknown_param_names(param_space, base_config)
+        if unknown:
+            msg = (
+                "param_space names the strategy never reads: "
+                f"{', '.join(unknown)}; optimisable names are the strategy config's "
+                "parameters or its rule conditions' override keys"
+            )
+            raise ValueError(msg)
 
         if method == "bayesian":
             return await self._run_bayesian(
@@ -551,6 +625,7 @@ class HyperoptRunner:
                 strategy_config=trial_config,
                 bars=bars,
                 initial_capital=initial_capital,
+                commission=self._commission,
                 symbol=symbol,
                 timeframe=timeframe,
             )

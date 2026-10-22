@@ -20,6 +20,7 @@ from hydra.backtest.hyperopt import (
     NoEligibleTrialError,
     ParamDef,
     ParameterSpace,
+    unknown_param_names,
 )
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Timeframe
@@ -242,7 +243,7 @@ async def test_bayesian_is_reproducible() -> None:
         _CountingStrategy.runs = 0
         result = await HyperoptRunner().run(
             strategy_class=_CountingStrategy,
-            base_config=_config(),
+            base_config=_config(parameters={"mode": "trade", "level": 1}),
             bars=bars,
             initial_capital=D("10000"),
             param_space=space,
@@ -280,3 +281,66 @@ async def test_no_eligible_trial_fails() -> None:
             method="grid",
             max_trials=5,
         )
+
+
+async def test_unknown_param_name_is_rejected_up_front() -> None:
+    """A typo'd name would silently optimise a no-op dimension; no trial ever runs."""
+    with pytest.raises(ValueError, match="param_space names the strategy never reads: mde"):
+        await HyperoptRunner().run(
+            strategy_class=_ModeStrategy,
+            base_config=_config(),
+            bars=_bars(60),
+            initial_capital=D("10000"),
+            param_space=ParameterSpace(
+                params=[ParamDef(name="mde", type="categorical", choices=["trade"])]
+            ),
+            method="grid",
+            max_trials=5,
+        )
+
+
+def test_unknown_param_names_covers_every_rule_override_surface() -> None:
+    config = _config(
+        parameters={
+            "level": 1,
+            "rules": {
+                "entry_long": {
+                    "operator": "AND",
+                    "conditions": [
+                        {
+                            "indicator": "rsi",
+                            "params": {"period": 14},
+                            "comparator": "crosses_below",
+                            "value": 30,
+                            "param_key": "rsi_length",
+                            "value_param_key": "rsi_level",
+                        },
+                        {
+                            "indicator": "close",
+                            "params": {},
+                            "comparator": "crosses_above",
+                            "value": "sma:period=5",
+                            "value_ref_overrides": {"entry_sma": "period"},
+                        },
+                        {
+                            "indicator": "ema",
+                            "params": {"period": 20},
+                            "comparator": "crosses_above",
+                            "value": 100,
+                        },
+                    ],
+                }
+            },
+        }
+    )
+    space = ParameterSpace(
+        params=[
+            ParamDef(name="level", type="int", low=1, high=2),
+            ParamDef(name="rsi_length", type="int", low=10, high=20),
+            ParamDef(name="rsi_level", type="int", low=20, high=40),
+            ParamDef(name="entry_sma", type="int", low=3, high=8),
+            ParamDef(name="ema_period", type="int", low=10, high=30),
+            ParamDef(name="lvl_typo", type="int", low=1, high=2),
+        ]
+    )
+    assert unknown_param_names(space, config) == ["lvl_typo"]

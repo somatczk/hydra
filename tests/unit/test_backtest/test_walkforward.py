@@ -7,12 +7,14 @@ wins in-sample in the first half, and the mirrored ``phase`` 5 wins in the secon
 
 from __future__ import annotations
 
+import itertools
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, ClassVar
 
 import pytest
 
+from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.hyperopt import ParamDef, ParameterSpace
 from hydra.backtest.walkforward import (
     WalkForwardAnalyzer,
@@ -270,6 +272,48 @@ class TestRegimeChange:
         assert result.efficiency is not None and result.efficiency > 0
         assert result.seed == 42
 
+    async def test_stitched_oos_compounds_every_folds_first_bar(
+        self, analyzer: WalkForwardAnalyzer
+    ) -> None:
+        result = await _run_sawtooth(analyzer)
+        agg = result.aggregated_oos_metrics
+        assert agg is not None
+
+        # one stitched point per OOS bar of every fold, plus the starting capital
+        assert len(agg.equity_curve) == 1 + sum(
+            len(f.out_of_sample_metrics.equity_curve) for f in result.folds
+        )
+        # no fold boundary drops a bar: consecutive timestamps are always one day apart
+        assert {b - a for a, b in itertools.pairwise(agg.timestamps)} == {DAY}
+
+        # every fold re-bases through its own starting capital, its first OOS bar's
+        # P&L included, so the stitched end is the compounded per-fold end equity
+        capital = agg.equity_curve[0]
+        expected = capital
+        for fold in result.folds:
+            expected = expected * fold.out_of_sample_metrics.equity_curve[-1] / capital
+        assert float(agg.equity_curve[-1]) == pytest.approx(float(expected), rel=1e-9)
+
+
+class TestCommissionPlumbing:
+    async def test_is_optimisation_runs_with_the_analyzers_commission(self) -> None:
+        """The analyzer's commission prices both windows: IS trials and OOS runs."""
+        default = await _run_sawtooth(WalkForwardAnalyzer(initial_capital=D("10000")))
+        dearer = await _run_sawtooth(
+            WalkForwardAnalyzer(
+                commission=CommissionConfig(spot_taker=D("0.01")), initial_capital=D("10000")
+            )
+        )
+
+        for d_fold, c_fold in zip(default.folds, dearer.folds, strict=True):
+            default_is = sum(float(t.fees) for t in d_fold.in_sample_metrics.trades)
+            dearer_is = sum(float(t.fees) for t in c_fold.in_sample_metrics.trades)
+            default_oos = sum(float(t.fees) for t in d_fold.out_of_sample_metrics.trades)
+            dearer_oos = sum(float(t.fees) for t in c_fold.out_of_sample_metrics.trades)
+            # the 10x taker fee scales both windows' fees, not just the OOS one
+            assert dearer_is == pytest.approx(10.0 * default_is, rel=0.05)
+            assert dearer_oos == pytest.approx(10.0 * default_oos, rel=0.05)
+
 
 class _IdleStrategy(BaseStrategy):
     @property
@@ -290,6 +334,20 @@ class TestFailureModes:
                 strategy_class=_IdleStrategy,
                 strategy_config=_config(),
                 param_space=_phase_space(0, 5),
+                in_sample_months=2,
+                out_of_sample_months=2,
+                timeframe=Timeframe.D1,
+            )
+
+    async def test_unknown_param_name_fails_the_run(self, analyzer: WalkForwardAnalyzer) -> None:
+        with pytest.raises(ValueError, match="fase"):
+            await analyzer.run_walkforward(
+                bars=_saw_bars(240),
+                strategy_class=_PhaseStrategy,
+                strategy_config=_config(),
+                param_space=ParameterSpace(
+                    params=[ParamDef(name="fase", type="categorical", choices=[0, 5])]
+                ),
                 in_sample_months=2,
                 out_of_sample_months=2,
                 timeframe=Timeframe.D1,

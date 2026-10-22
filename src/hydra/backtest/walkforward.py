@@ -181,7 +181,7 @@ class WalkForwardAnalyzer:
         if is_bars <= 0 or oos_bars <= 0 or window_bars > len(bars):
             return empty
 
-        hyperopt = HyperoptRunner(self._runner)
+        hyperopt = HyperoptRunner(self._runner, commission=self._commission)
         folds: list[FoldResult] = []
         fold_idx = 0
         start = 0
@@ -247,21 +247,20 @@ class WalkForwardAnalyzer:
         if not folds:
             return empty
 
-        # Stitch the OOS equity curves: each fold is re-based onto the previous ending
-        # value, so the aggregate is one compounded curve with every bar's timestamp.
+        # Stitch the OOS equity curves: each fold starts a fresh session at the
+        # analyzer's capital, so every point — the first bar's P&L included —
+        # re-bases through that capital onto the previous fold's ending value.
         step = timedelta(seconds=timeframe_seconds(timeframe))
         all_oos_equity: list[Decimal] = [self._initial_capital]
         all_oos_timestamps: list[datetime] = [folds[0].out_of_sample_metrics.timestamps[0] - step]
         all_oos_trades = []
         for fold in folds:
             oos = fold.out_of_sample_metrics
-            if len(oos.equity_curve) > 1:
+            if oos.equity_curve and self._initial_capital != 0:
                 base = all_oos_equity[-1]
-                start_eq = oos.equity_curve[0]
-                if start_eq != 0:
-                    for eq, ts in zip(oos.equity_curve[1:], oos.timestamps[1:], strict=True):
-                        all_oos_equity.append(base * eq / start_eq)
-                        all_oos_timestamps.append(ts)
+                for eq, ts in zip(oos.equity_curve, oos.timestamps, strict=True):
+                    all_oos_equity.append(base * eq / self._initial_capital)
+                    all_oos_timestamps.append(ts)
             all_oos_trades.extend(oos.trades)
 
         agg_metrics = calculate_metrics(
