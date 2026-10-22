@@ -644,12 +644,19 @@ async def finish(
     result: dict[str, Any] | None = None,
     result_id: str | None = None,
     error: str | None = None,
+    detail: dict[str, Any] | None = None,
 ) -> None:
-    """Write the job's terminal state."""
+    """Write the job's terminal state, flushing the handler's final ``detail``.
+
+    The 10 s tick is not guaranteed to have run since the last mutation (short jobs finish
+    inside one tick), so the terminal write persists the detail itself; ``detail=None`` keeps
+    whatever the last tick flushed.
+    """
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE backtest_jobs SET status = $2, "
             "progress = CASE WHEN $2 = 'completed' THEN 100 ELSE progress END, "
+            "detail = COALESCE($6::jsonb, detail), "
             "result = $3::jsonb, result_id = $4, error = $5, cancel_requested = FALSE, "
             "heartbeat_at = now(), finished_at = now() WHERE id = $1",
             job_id,
@@ -657,7 +664,15 @@ async def finish(
             json.dumps(result) if result is not None else None,
             result_id,
             error,
+            json.dumps(detail) if detail is not None else None,
         )
+
+
+async def delete_result_rows(pool: Any, result_id: str) -> None:
+    """Drop a job's result rows: a cancelled or timed-out run leaves no result behind."""
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("DELETE FROM backtest_result_trades WHERE backtest_id = $1", result_id)
+        await conn.execute("DELETE FROM backtest_results WHERE id = $1", result_id)
 
 
 async def requeue_abandoned(pool: Any, max_attempts: int = 3) -> None:

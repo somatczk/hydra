@@ -12,9 +12,11 @@ create and drop their own databases, so the target server's data is never touche
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -440,7 +442,7 @@ async def test_hyperopt_and_walkforward_are_durable(
     assert await worker.run_once(pool) == ho_id
 
     await _seed(pool, "binance", Timeframe.D1, _saw(D1_START, D1_COUNT, timedelta(days=1)))
-    _write_strategy(strategies_dir, "saw_d")
+    _write_strategy(strategies_dir, "saw_d", primary="1d")
     resp = await client.post(
         "/api/backtest/walkforward",
         json={
@@ -462,16 +464,56 @@ async def test_hyperopt_and_walkforward_are_durable(
             progress = (await restarted.get(f"/api/backtest/hyperopt/{ho_id}")).json()
             assert progress["status"] == "completed"
             assert progress["completed_trials"] == progress["total_trials"] == 4
+            assert progress["provenance"]["hydra_version"] == version("hydra")
+            assert re.fullmatch(r"[0-9a-f]{12}", progress["provenance"]["config_hash"])
             results = (await restarted.get(f"/api/backtest/hyperopt/{ho_id}/results")).json()
             assert len(results["trials"]) == progress["completed_trials"]
             assert results["best_metric"] == max(t["sharpe"] for t in results["trials"])
+            assert results["provenance"]["hydra_version"] == version("hydra")
             history = (await restarted.get("/api/backtest/hyperopt/history")).json()
             assert ho_id in [h["task_id"] for h in history]
 
             after = (await restarted.get(f"/api/backtest/walkforward/{wf_id}/results")).json()
             assert after["folds"] == before["folds"]
+            assert after["provenance"]["hydra_version"] == version("hydra")
+            assert re.fullmatch(r"[0-9a-f]{12}", after["provenance"]["config_hash"])
     finally:
         await restarted_pool.close()
+
+
+async def test_backtest_uses_the_operators_global_risk_limits(
+    client: httpx.AsyncClient, pool: Any, strategies_dir: Path
+) -> None:
+    """The worker passes the persisted global RiskConfig, like a paper session would (parity)."""
+    await _seed_hourly(pool)
+    _write_strategy(strategies_dir, "saw")
+
+    default = await _run(
+        client, pool, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-31"
+    )
+    entries = [
+        t
+        for t in (await client.get(f"/api/backtest/results/{default['result_id']}")).json()[
+            "transactions"
+        ]
+        if t["type"] == "entry"
+    ]
+    assert entries, "the sawtooth must trade with the default 10 % limits"
+    assert all(t["quantity"] > 0.5 for t in entries)
+
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE risk_config SET max_position_pct = 0.01 WHERE scope = 'global'")
+    tight = await _run(
+        client, pool, strategy_id="saw", start_date="2026-01-01", end_date="2026-01-31"
+    )
+    tight_detail = (await client.get(f"/api/backtest/results/{tight['result_id']}")).json()
+    assert tight_detail["metrics"]["total_trades"] > 0
+    for t in tight_detail["transactions"]:
+        if t["type"] == "entry":
+            # min(strategy 10 %, global 1 %): ~100 USDT entries instead of ~1000 USDT ones
+            assert t["quantity"] < 0.15
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE risk_config SET max_position_pct = NULL WHERE scope = 'global'")
 
 
 async def test_strategy_snapshot_wins_over_a_later_yaml_edit(

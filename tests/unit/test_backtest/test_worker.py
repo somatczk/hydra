@@ -6,6 +6,7 @@ tests/integration/test_backtest_jobs.py.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -129,6 +130,13 @@ class _BarsThenFailingWrites:
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         assert "FROM ts.ohlcv_1m" in query
         return self._rows
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
+        # the two reads PgRiskStateStore.load_config does before a backtest runs
+        assert "risk_config" in query or "system_config" in query, query
+        if "risk_config" in query:
+            return {"kill_switch_active": False}
+        return {"value": "10000"}
 
     def transaction(self) -> _Transaction:
         return _Transaction()
@@ -344,4 +352,212 @@ async def test_handler_exception_fails_the_job_row(
     assert len(finishes) == 1
     query, args = finishes[0]
     assert "UPDATE backtest_jobs" in query
-    assert args == ("task-x", "failed", None, None, "saw: ZeroDivisionError('division by zero')")
+    assert "detail = COALESCE" in query
+    assert args == (
+        "task-x",
+        "failed",
+        None,
+        None,
+        "saw: ZeroDivisionError('division by zero')",
+        "{}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Durability: the terminal write flushes detail, survives DB blips, cleans up
+# ---------------------------------------------------------------------------
+
+
+async def test_finish_flushes_the_handlers_final_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job completing between ticks must persist its detail (provenance, trials, fetch_error)."""
+
+    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+        run.detail["provenance"] = {"bar_count": 300, "hydra_version": "9.9.9"}
+        run.detail["completed_trials"] = 4
+        return worker.JobOutcome(result_id="bt-task-x")
+
+    monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _handler})
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    conn = _JobsConn()
+    job = {
+        "id": "task-x",
+        "kind": "backtest",
+        "request": "{}",
+        "strategy_config": "{}",
+        "detail": "{}",
+    }
+
+    await worker._run_claimed(_Pool(conn), job, tick_s=0.01)
+
+    finishes = [(q, a) for q, a in conn.executed if "finished_at = now()" in q]
+    assert len(finishes) == 1
+    args = finishes[0][1]
+    assert args[:2] == ("task-x", "completed")
+    detail = json.loads(args[5])
+    assert detail == {
+        "provenance": {"bar_count": 300, "hydra_version": "9.9.9"},
+        "completed_trials": 4,
+    }
+
+
+class _TickBlipConn:
+    """Serves the claim; every tick UPDATE fails like a dropped connection."""
+
+    def __init__(self) -> None:
+        self.finishes: list[tuple[str, tuple[Any, ...]]] = []
+        self.tick_failures = 0
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
+        if "RETURNING cancel_requested" in query:
+            self.tick_failures += 1
+            raise asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed")
+        assert "RETURNING *" in query
+        return {
+            "id": "task-blip",
+            "kind": "backtest",
+            "request": "{}",
+            "strategy_config": "{}",
+            "detail": "{}",
+        }
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.finishes.append((query, args))
+        return "OK"
+
+
+async def test_a_tick_database_error_does_not_kill_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failed progress flush must neither fail the job nor stop the heartbeat."""
+
+    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+        await asyncio.sleep(0.05)
+        return worker.JobOutcome(result_id="bt-task-blip")
+
+    monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _handler})
+    heartbeat = tmp_path / "heartbeat"
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(heartbeat))
+    conn = _TickBlipConn()
+    job = {
+        "id": "task-blip",
+        "kind": "backtest",
+        "request": "{}",
+        "strategy_config": "{}",
+        "detail": "{}",
+    }
+
+    await worker._run_claimed(_Pool(conn), job, tick_s=0.005)
+
+    assert conn.tick_failures >= 1
+    assert len(conn.finishes) == 1
+    assert conn.finishes[0][1][:2] == ("task-blip", "completed")
+    assert heartbeat.exists()
+    assert worker.check() == 0
+
+
+class _FinishOnceFailingConn(_JobsConn):
+    """The first terminal UPDATE fails like a dropped connection; the retry succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._failed_once = False
+
+    async def execute(self, query: str, *args: Any) -> str:
+        if "finished_at = now()" in query and not self._failed_once:
+            self._failed_once = True
+            raise asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed")
+        self.executed.append((query, args))
+        return "OK"
+
+
+async def test_a_database_error_at_the_finish_write_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The outcome exists only in memory, so the terminal write outlives a DB blip."""
+
+    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+        return worker.JobOutcome(result_id="bt-task-r")
+
+    monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _handler})
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    conn = _FinishOnceFailingConn()
+    job = {
+        "id": "task-r",
+        "kind": "backtest",
+        "request": "{}",
+        "strategy_config": "{}",
+        "detail": "{}",
+    }
+
+    await worker._run_claimed(_Pool(conn), job, tick_s=0.01)
+
+    finishes = [(q, a) for q, a in conn.executed if "finished_at = now()" in q]
+    assert len(finishes) == 1
+    assert finishes[0][1][:2] == ("task-r", "completed")
+
+
+class _CancelConn:
+    """Every tick reports a cancel request, so the tick cancels the handler task."""
+
+    def __init__(self) -> None:
+        self.finishes: list[tuple[str, tuple[Any, ...]]] = []
+        self.deletes: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
+        assert "RETURNING cancel_requested" in query
+        return {"cancel_requested": True}
+
+    def transaction(self) -> _Transaction:
+        return _Transaction()
+
+    async def execute(self, query: str, *args: Any) -> str:
+        if "DELETE FROM" in query:
+            self.deletes.append((query, args))
+        else:
+            self.finishes.append((query, args))
+        return "OK"
+
+
+async def test_cancel_after_the_persist_straddle_discards_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel landing after the result commit must not leave an orphan completed result."""
+
+    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+        run.persisted_result_id = f"bt-{job['id']}"
+        await asyncio.sleep(5)  # cancelled by the tick's cancel_requested
+
+    monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _handler})
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    conn = _CancelConn()
+    job = {
+        "id": "task-c",
+        "kind": "backtest",
+        "request": "{}",
+        "strategy_config": "{}",
+        "detail": "{}",
+    }
+
+    await worker._run_claimed(_Pool(conn), job, tick_s=0.01)
+
+    assert len(conn.finishes) == 1
+    assert conn.finishes[0][1][:2] == ("task-c", "cancelled")
+    assert [args for _, args in conn.deletes] == [("bt-task-c",), ("bt-task-c",)]
+
+
+async def test_wait_for_schema_keeps_the_heartbeat_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long migration wait must not let the file-age healthcheck restart the worker."""
+    heartbeat = tmp_path / "heartbeat"
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(heartbeat))
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            worker.wait_for_schema("postgresql://127.0.0.1:1/none", poll_s=0.01), 0.3
+        )
+
+    assert heartbeat.exists()
+    assert worker.check() == 0

@@ -36,6 +36,7 @@ from hydra.backtest.jobs import (
 from hydra.backtest.runner import BacktestRunner
 from hydra.backtest.walkforward import WalkForwardAnalyzer, WalkForwardResult
 from hydra.data.migrations.runner import current_revision, head_revision
+from hydra.risk.state import PgRiskStateStore
 from hydra.strategy.config import StrategyConfig
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ IDLE_SLEEP_S = 2.0
 HEARTBEAT_MAX_AGE_S = 90.0
 DB_CONNECT_BUDGET_S = 30.0
 _DEFAULT_HEARTBEAT = Path(tempfile.gettempdir()) / "hydra-worker.heartbeat"
-HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", str(_DEFAULT_HEARTBEAT))
+HEARTBEAT_PATH = str(_DEFAULT_HEARTBEAT)
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 
@@ -60,6 +61,7 @@ class JobRun:
 
     progress: float = 0.0
     detail: dict[str, Any] = field(default_factory=dict)
+    persisted_result_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +89,7 @@ async def run_backtest_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> Jo
     def _report(pct: float) -> None:
         run.progress = round(30.0 + pct * 60.0, 1)
 
+    risk_config = (await PgRiskStateStore(pool).load_config()).config
     result = await BacktestRunner().run(
         strategy_class=strategy_cls,
         strategy_config=config,
@@ -95,6 +98,7 @@ async def run_backtest_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> Jo
         symbol=config.symbols[0],
         timeframe=config.timeframes.primary,
         on_progress=_report,
+        risk_config=risk_config,
     )
     run.progress = 90.0
 
@@ -104,6 +108,7 @@ async def run_backtest_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> Jo
         await jobs.persist_result(pool, stored, result.trades, provenance)
     except Exception as exc:
         raise JobError(f"result not persisted: {exc}") from exc
+    run.persisted_result_id = result_id
     return JobOutcome(result_id=result_id)
 
 
@@ -266,15 +271,55 @@ async def _tick_loop(
     """Every tick: touch the heartbeat, flush progress to the row, honour a cancel request."""
     while not job_task.done():
         touch_heartbeat()
-        if await jobs.tick(pool, job_id, run.progress, run.detail):
-            job_task.cancel()
-            return
+        try:
+            if await jobs.tick(pool, job_id, run.progress, run.detail):
+                job_task.cancel()
+                return
+        except Exception:
+            # a DB blip must not kill the tick (and with it the heartbeat) or the job
+            logger.warning("Progress flush for %s failed; retrying", job_id, exc_info=True)
         await asyncio.sleep(tick_s)
 
 
 async def _cancel_on_stop(stop: asyncio.Event, job_task: asyncio.Task[JobOutcome]) -> None:
     await stop.wait()
     job_task.cancel()
+
+
+async def _finish_with_retry(
+    pool: Any, job_id: str, status: str, *, detail: dict[str, Any] | None, **outcome: Any
+) -> None:
+    """Persist the terminal row state, retrying until the database takes it.
+
+    The outcome exists only in this process, so a DB blip at the finish write is outlived here
+    instead of failing the job; if it lasts, the stale heartbeat lets Docker restart the worker
+    and the requeue path takes over.
+    """
+    delay = 0.5
+    while True:
+        try:
+            await jobs.finish(pool, job_id, status, detail=detail, **outcome)
+            return
+        except Exception:
+            logger.warning("Finishing %s failed; retrying in %.1fs", job_id, delay, exc_info=True)
+            await asyncio.sleep(delay)
+        delay = min(delay * 2, 5.0)
+
+
+async def _discard_partial_result(pool: Any, run: JobRun) -> None:
+    """Drop a result a cancelled or timed-out run committed but never finished the job with.
+
+    A cancel is honoured on the next tick, which can land after the result transaction has
+    committed; the job row then says cancelled, so no half-claimed result may stay behind.
+    """
+    if run.persisted_result_id is None:
+        return
+    try:
+        await jobs.delete_result_rows(pool, run.persisted_result_id)
+    except Exception:
+        logger.warning(
+            "Could not drop the partial result %s", run.persisted_result_id, exc_info=True
+        )
 
 
 async def _run_claimed(
@@ -289,7 +334,9 @@ async def _run_claimed(
     job_id = job["id"]
     handler = _HANDLERS.get(job["kind"])
     if handler is None:
-        await jobs.finish(pool, job_id, "failed", error=f"unknown job kind: {job['kind']}")
+        await _finish_with_retry(
+            pool, job_id, "failed", detail=None, error=f"unknown job kind: {job['kind']}"
+        )
         return
 
     run = JobRun(detail=jobs.json_value(job["detail"]) or {})
@@ -303,24 +350,35 @@ async def _run_claimed(
         job_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await job_task
-        await jobs.finish(pool, job_id, "failed", error=f"timed out after {timeout_s}s")
+        await _discard_partial_result(pool, run)
+        await _finish_with_retry(
+            pool, job_id, "failed", detail=run.detail, error=f"timed out after {timeout_s}s"
+        )
     except asyncio.CancelledError:
         if stop is not None and stop.is_set():
             await jobs.requeue_for_shutdown(pool, job_id)
         else:
-            await jobs.finish(pool, job_id, "cancelled")
+            await _discard_partial_result(pool, run)
+            await _finish_with_retry(pool, job_id, "cancelled", detail=run.detail)
     except JobError as exc:
-        await jobs.finish(pool, job_id, "failed", error=str(exc))
+        await _finish_with_retry(pool, job_id, "failed", detail=run.detail, error=str(exc))
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
-        await jobs.finish(pool, job_id, "failed", error=str(exc))
+        await _discard_partial_result(pool, run)
+        await _finish_with_retry(pool, job_id, "failed", detail=run.detail, error=str(exc))
     else:
-        await jobs.finish(
-            pool, job_id, "completed", result=outcome.result, result_id=outcome.result_id
+        await _finish_with_retry(
+            pool,
+            job_id,
+            "completed",
+            detail=run.detail,
+            result=outcome.result,
+            result_id=outcome.result_id,
         )
     finally:
         tick_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        # the tick may already have died on its own error; it must not fail the finished job
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await tick_task
         if stop_task is not None:
             stop_task.cancel()
@@ -352,7 +410,13 @@ async def wait_for_schema(dsn: str, *, poll_s: float = 2.0) -> None:
     """Block until the engine has migrated the schema to the single Alembic head."""
     head = head_revision()
     while True:
-        current = await current_revision(dsn)
+        # alive and waiting: a long migration wait must not fail the file-age healthcheck
+        touch_heartbeat()
+        try:
+            current = await current_revision(dsn)
+        except Exception:
+            current = None
+            logger.warning("Reading the schema revision failed; retrying", exc_info=True)
         if current == head:
             return
         logger.info("Waiting for migrations (current=%s, head=%s)", current, head)
@@ -371,6 +435,7 @@ async def _create_pool(dsn: str) -> Any:
         except (OSError, TimeoutError, asyncpg.CannotConnectNowError) as exc:
             if loop.time() + delay > deadline:
                 raise
+            touch_heartbeat()
             logger.warning(
                 "Database not reachable yet (%s); retrying in %.1fs", type(exc).__name__, delay
             )
@@ -384,13 +449,25 @@ async def _serve_forever(pool: Any) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     while not stop.is_set():
-        job = await jobs.claim(pool, WORKER_ID)
+        try:
+            job = await jobs.claim(pool, WORKER_ID)
+        except Exception:
+            # an idle worker must survive one failed claim (e.g. a DB restart) and retry
+            logger.warning("Claiming a job failed; retrying after the idle sleep", exc_info=True)
+            job = None
         if job is None:
             touch_heartbeat()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), IDLE_SLEEP_S)
             continue
-        await _run_claimed(pool, job, stop=stop)
+        try:
+            await _run_claimed(pool, job, stop=stop)
+        except Exception:
+            logger.exception(
+                "Job %s could not reach a terminal state; it stays running and is requeued "
+                "on the next worker start",
+                job["id"],
+            )
     logger.info("Backtest worker shutting down")
 
 

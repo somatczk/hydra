@@ -34,6 +34,7 @@ from hydra.services.backtest import (
     _preflight,
 )
 from hydra.services.errors import ServiceError
+from hydra.services.research import HyperoptProgressResponse
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 
@@ -432,6 +433,10 @@ class TestStatusAndResults:
         client = TestClient(_make_app(pool=_Pool(_JobRowConn(row))))
         resp = client.get("/api/backtest/status/task-x")
         assert resp.json()["fetch_error"] == "backfill failed"
+
+    def test_hyperopt_progress_created_at_stays_optional(self) -> None:
+        """D1's OpenAPI shape is unchanged: created_at is always served, never required."""
+        assert "created_at" not in HyperoptProgressResponse.model_json_schema()["required"]
 
     def test_unknown_task_is_404(self) -> None:
         client = TestClient(_make_app(pool=_Pool(_JobRowConn(None))))

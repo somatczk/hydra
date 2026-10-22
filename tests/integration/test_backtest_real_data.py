@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -436,9 +438,12 @@ async def test_hyperopt_grid_runs_on_stored_bars_reproducibly(
     _, second = await _hyperopt(client, pool)
 
     assert progress["provenance"]["bar_count"] == H1_COUNT
+    assert progress["provenance"]["hydra_version"] == version("hydra")
+    assert re.fullmatch(r"[0-9a-f]{12}", progress["provenance"]["config_hash"])
     assert progress["strategy_id"] == "saw"
     assert progress["start_date"] == "2026-01-01T00:00:00Z"
     assert first["provenance"]["exchange"] == "binance"
+    assert first["provenance"]["hydra_version"] == version("hydra")
     assert [t["params"] for t in first["trials"]] == [{"sma_period": 4}, {"sma_period": 5}]
     assert first["best_metric"] == second["best_metric"]
     assert [t["sharpe"] for t in first["trials"]] == [t["sharpe"] for t in second["trials"]]
@@ -469,6 +474,8 @@ async def test_walkforward_uses_the_real_span(
     assert result["provenance"]["bar_count"] == D1_COUNT
     assert result["provenance"]["first_ts"] == _iso(daily[0].timestamp)
     assert result["provenance"]["last_ts"] == _iso(daily[-1].timestamp)
+    assert result["provenance"]["hydra_version"] == version("hydra")
+    assert re.fullmatch(r"[0-9a-f]{12}", result["provenance"]["config_hash"])
 
     # the window sizing the worker used lives on the durable job row
     async with pool.acquire() as conn:

@@ -215,11 +215,18 @@ class HyperoptRunResponse(BaseModel):
     status: str = "queued"
 
 
+class JobProvenanceModel(DataProvenanceModel):
+    """Provenance read from a job row: carries the code and config that ran it (D2 decision)."""
+
+    hydra_version: str | None = None
+    config_hash: str | None = None
+
+
 class HyperoptProgressResponse(BaseModel):
     task_id: str
     status: str
     strategy_id: str = ""
-    created_at: str
+    created_at: str = ""
     completed_trials: int
     total_trials: int
     best_so_far: float | None = None
@@ -228,7 +235,7 @@ class HyperoptProgressResponse(BaseModel):
     start_date: str = ""
     end_date: str = ""
     error: str | None = None
-    provenance: DataProvenanceModel | None = None
+    provenance: JobProvenanceModel | None = None
 
 
 class TrialRecordResponse(BaseModel):
@@ -248,7 +255,7 @@ class HyperoptResultResponse(BaseModel):
     trials: list[TrialRecordResponse]
     total_trials: int
     completed_trials: int
-    provenance: DataProvenanceModel | None = None
+    provenance: JobProvenanceModel | None = None
 
 
 class HyperoptHistoryEntry(BaseModel):
@@ -260,7 +267,7 @@ class HyperoptHistoryEntry(BaseModel):
     best_so_far: float | None = None
     created_at: str
     error: str | None = None
-    provenance: DataProvenanceModel | None = None
+    provenance: JobProvenanceModel | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +399,7 @@ class WalkForwardResultResponse(BaseModel):
     aggregated_return: float | None
     aggregated_drawdown: float | None
     out_of_sample_equity: list[float]
-    provenance: DataProvenanceModel | None = None
+    provenance: JobProvenanceModel | None = None
 
 
 # ---------------------------------------------------------------------------
