@@ -11,9 +11,9 @@ B1/B2 fill them without touching the transport files.
 
 from __future__ import annotations
 
-import hydra
 from mcp.server import MCPServer
 
+import hydra
 from hydra.dashboard.mcp.server import MCPMount, build_mcp_app, mount_mcp
 
 server: MCPServer = MCPServer("hydra", version=hydra.__version__)

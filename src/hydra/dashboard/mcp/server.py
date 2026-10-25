@@ -42,12 +42,11 @@ def build_mcp_app(cfg: HydraConfig) -> ASGIApp:
     Also imports ``hydra.dashboard.mcp.tools`` so the tool modules register on the shared
     server instance (empty placeholders now; B1/B2 fill them without touching this file).
     """
-    from hydra.dashboard.mcp import server as mcp_server
+    from hydra.dashboard.mcp import server
 
     importlib.import_module("hydra.dashboard.mcp.tools")
-    asgi = mcp_server.streamable_http_app(
+    asgi = server.streamable_http_app(
         streamable_http_path="/",
-        json_response=True,
         transport_security=TransportSecuritySettings(allowed_hosts=cfg.mcp.allowed_hosts),
     )
     return MCPAuthMiddleware(asgi)
@@ -60,14 +59,12 @@ def mount_mcp(app: FastAPI, cfg: HydraConfig) -> MCPMount:
     in the lifespan is race-free: Starlette builds the middleware stack lazily around the
     router, which sees the new ``Mount`` on the next request.
     """
-    from hydra.dashboard.mcp import server as mcp_server
+    from hydra.dashboard.mcp import server
 
     mcp_app = build_mcp_app(cfg)
     app.mount(MCP_PATH_PREFIX, mcp_app, name="mcp")
     log_mcp_posture(cfg)
-    return MCPMount(
-        path=MCP_PATH_PREFIX, app=mcp_app, session_manager=mcp_server.session_manager
-    )
+    return MCPMount(path=MCP_PATH_PREFIX, app=mcp_app, session_manager=server.session_manager)
 
 
 def log_mcp_posture(cfg: HydraConfig) -> None:

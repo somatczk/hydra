@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import asyncpg
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
@@ -16,6 +18,22 @@ from pydantic import ValidationError
 from hydra.core.config import ConfigError
 from hydra.core.encryption import CredentialKeyError, encrypt
 from hydra.dashboard import lifespan
+
+MCP_TEST_TOKEN = "t" * 48
+MCP_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": {"name": "hydra-tests", "version": "0.0.0"},
+    },
+}
+MCP_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
 
 
 def _closed_port_dsn() -> str:
@@ -167,3 +185,66 @@ async def test_system_config_values_are_json_decoded() -> None:
     )
     await lifespan._load_system_config(app)
     assert app.state.system_config == {"paper_capital": 2500, "trading_mode": "paper"}
+
+
+# ---------------------------------------------------------------------------
+# The MCP mount: no token, no surface; with one, the transport is served and shut down
+# ---------------------------------------------------------------------------
+
+
+async def test_no_mcp_token_mounts_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert getattr(app.state, "mcp", None) is None
+        assert not [r for r in app.router.routes if getattr(r, "path", "") == "/mcp"]
+
+
+async def test_mcp_token_mounts_the_transport(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
+    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    app = FastAPI()
+    with caplog.at_level(logging.ERROR, logger="hydra.dashboard.mcp"):
+        async with lifespan.run(app):
+            mount = app.state.mcp
+            assert mount is not None
+            assert mount.path == "/mcp"
+            assert [r for r in app.router.routes if getattr(r, "path", "") == "/mcp"]
+            # a request flows through the FastAPI app into the mounted transport
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/mcp/",
+                    headers={**MCP_HEADERS, "Authorization": f"Bearer {MCP_TEST_TOKEN}"},
+                    json=MCP_INITIALIZE,
+                )
+                assert response.status_code == 200
+                assert response.headers["mcp-session-id"]
+            # leaving the block exits the single-use session manager; nothing may raise
+    assert "Task group is not initialized" not in caplog.text
+
+
+async def test_mcp_mount_stops_serving_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the lifespan exits, the mount is closed: the SDK refuses further requests."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
+    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    app = FastAPI()
+    async with lifespan.run(app):
+        pass
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        with pytest.raises(RuntimeError, match="Task group is not initialized"):
+            await client.post(
+                "/mcp/",
+                headers={**MCP_HEADERS, "Authorization": f"Bearer {MCP_TEST_TOKEN}"},
+                json=MCP_INITIALIZE,
+            )

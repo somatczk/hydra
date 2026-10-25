@@ -54,25 +54,44 @@ class MCPAuthMiddleware:
             await self.app(scope, receive, send)
             return
         cfg = _config(scope)
-        expected = cfg.mcp_token.get_secret_value() if cfg is not None else None
+        expected = (
+            cfg.mcp_token.get_secret_value()
+            if cfg is not None and cfg.mcp_token is not None
+            else None
+        )
         if expected is None:
             await self._refuse(
-                scope, receive, send, 401, "auth_not_configured",
-                "MCP authentication is not configured (HYDRA_MCP_TOKEN)", "unauthenticated",
+                scope,
+                receive,
+                send,
+                401,
+                "auth_not_configured",
+                "MCP authentication is not configured (HYDRA_MCP_TOKEN)",
+                "unauthenticated",
             )
             return
         values = _header_values(scope, "authorization")
         if len(values) > 1:
             await self._refuse(
-                scope, receive, send, 400, "duplicate_header",
-                "Authorization sent more than once", "invalid",
+                scope,
+                receive,
+                send,
+                400,
+                "duplicate_header",
+                "Authorization sent more than once",
+                "invalid",
             )
             return
         provided = _bearer(values[0]) if values else None
         if provided is None or not hmac.compare_digest(provided.encode(), expected.encode()):
             await self._refuse(
-                scope, receive, send, 401, "invalid_token",
-                "Bearer token is not valid", "unauthenticated",
+                scope,
+                receive,
+                send,
+                401,
+                "invalid_token",
+                "Bearer token is not valid",
+                "unauthenticated",
             )
             return
         scope["state"] = {**scope.get("state", {}), "principal": Principal("service", "mcp")}

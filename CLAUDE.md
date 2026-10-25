@@ -64,7 +64,8 @@ not duplicate it here; update that table in the PR that changes a row.
   - `risk`: pre-trade checks, sizing, circuit breakers, exchange safety.
   - `portfolio`: P&L, positions, reconciliation.
   - `ml`: features, serving, export, registry, drift, training.
-  - `dashboard`: the FastAPI app, `routes/`.
+  - `dashboard`: the FastAPI app, `routes/`, and `mcp/` (the MCP server, mounted at `/mcp/`
+    only when `HYDRA_MCP_TOKEN` is set).
   - `services`: backtest, research and strategy operations the routes (and later MCP) call; no FastAPI.
   - `ops`: Discord/Slack webhook notifier.
 - `dashboard/`: Next.js app (see `dashboard/README.md`).
@@ -122,6 +123,14 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   `current_principal` and log security actions with `audit()`. A new public path needs a reviewed edit to
   `PUBLIC_PATHS` and `tests/unit/test_dashboard/test_auth_coverage.py`. Dashboard unit tests call the real app as
   the bearer-token service (`default_api_auth` in their conftest); auth tests override that fixture.
+- The MCP server (D5) is `hydra.dashboard.mcp`: one shared `MCPServer('hydra')` instance whose
+  streamable-HTTP app the lifespan mounts at `/mcp/` **only** when the env-only `HYDRA_MCP_TOKEN`
+  (≥32 chars; must differ from `HYDRA_API_TOKEN` and requires `mcp.allowed_hosts`) is set — no
+  token, no surface (`/mcp` 404s). `SecurityMiddleware` deliberately skips `/mcp` and `/mcp/...`
+  (`MCP_PATH_PREFIX`, a reviewed constant; `PUBLIC_PATHS` is unchanged): the mount's own pure-ASGI
+  gate does the constant-time bearer check and binds `Principal('service', 'mcp')`. MCP tools
+  register on the shared instance from `hydra.dashboard.mcp.tools` (`tools/list` is empty until
+  MCP-B1/B2 fill the placeholder modules — never edit the transport files for a tool).
 - Errors from dashboard routes use one envelope, `{"detail": {"code", "message", "state", ...}}`, built by
   `src/hydra/dashboard/routes/_db.py`; services raise `hydra.services.errors.ServiceError` with the same detail and
   `ServiceErrorRoute` turns it into the HTTP error. The frontend reads it with `dashboard/src/lib/apiState.ts`.
