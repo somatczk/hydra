@@ -14,6 +14,9 @@ export interface DataProvenance {
   requested_start?: string | null;
   requested_end?: string | null;
   data_source: string | null;
+  /** Job-row provenance only (hyperopt/WF reads); result reads never carry them. */
+  hydra_version?: string | null;
+  config_hash?: string | null;
 }
 
 const TIMEFRAME_MS: Record<string, number> = {
@@ -86,13 +89,16 @@ export function ProvenanceBadge({ provenance }: { provenance: DataProvenance | n
   return <DataStateBadge state="unknown" reason="No data provenance recorded for this result" />;
 }
 
+/** First 12 chars on screen; the full value rides along in the title. */
+const short = (v: string) => (v.length > 12 ? `${v.slice(0, 12)}…` : v);
+
 /** The exact stored bars behind a result, plus any coverage warnings. */
 export function ProvenancePanel({ provenance }: { provenance: DataProvenance | null | undefined }) {
   if (!hasRecordedProvenance(provenance)) {
     return (
-      <div className="flex items-center gap-3 rounded-xl border border-status-warning/30 bg-status-warning/10 px-4 py-3">
-        <AlertTriangle className="h-5 w-5 shrink-0 text-status-warning" aria-hidden="true" />
-        <p className="text-sm text-text-primary">
+      <div className="flex items-center gap-3 rounded-lg border border-line bg-caution-soft px-4 py-3">
+        <AlertTriangle className="h-5 w-5 shrink-0 text-caution" aria-hidden="true" />
+        <p className="text-sm text-ink-1">
           No data provenance recorded: this result cannot be traced to stored market data.
         </p>
       </div>
@@ -107,23 +113,33 @@ export function ProvenancePanel({ provenance }: { provenance: DataProvenance | n
     ['Gaps', String(provenance.gap_count ?? 0)],
   ];
   return (
-    <div className="rounded-xl border border-border-default bg-bg-secondary px-4 py-3" data-testid="provenance-panel">
+    <div className="rounded-lg border border-line bg-surface px-4 py-3" data-testid="provenance-panel">
       <div className="mb-2 flex items-center gap-2">
-        <p className="text-xs font-medium text-text-secondary">Data provenance</p>
+        <p className="text-xs font-medium text-ink-2">Data provenance</p>
         <ProvenanceBadge provenance={provenance} />
       </div>
       <dl className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs sm:grid-cols-5">
         {rows.map(([label, value]) => (
           <div key={label} className="flex flex-col">
-            <dt className="text-text-muted">{label}</dt>
-            <dd className="font-mono text-text-primary">{value}</dd>
+            <dt className="text-ink-2">{label}</dt>
+            <dd className="font-mono text-ink-1">{value}</dd>
           </div>
         ))}
       </dl>
+      {(provenance.hydra_version || provenance.config_hash) && (
+        <p className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs text-ink-2">
+          {provenance.hydra_version && (
+            <span title={provenance.hydra_version}>Hydra {short(provenance.hydra_version)}</span>
+          )}
+          {provenance.config_hash && (
+            <span title={provenance.config_hash}>Config {short(provenance.config_hash)}</span>
+          )}
+        </p>
+      )}
       {warnings.length > 0 && (
         <ul className="mt-2 flex flex-col gap-1">
           {warnings.map((w) => (
-            <li key={w} className="flex items-center gap-1.5 text-xs text-status-warning">
+            <li key={w} className="flex items-center gap-1.5 text-xs text-caution">
               <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
               {w}
             </li>

@@ -24,6 +24,7 @@ const pages: Array<[string, () => Promise<{ default: () => ReactNode }>]> = [
   ['/optimize', () => import('@/app/optimize/page')],
   ['/models', () => import('@/app/models/page')],
   ['/builder', () => import('@/app/builder/page')],
+  ['/templates', () => import('@/app/templates/page')],
 ];
 
 let page: Mounted | null = null;
