@@ -90,4 +90,35 @@ describe('ProvenancePanel', () => {
     page = await mount(<ProvenancePanel provenance={undefined} />);
     expect(page.container.textContent).toContain('No data provenance recorded');
   });
+
+  it('renders Hydra and Config rows only when the job carried them', async () => {
+    page = await mount(
+      <ProvenancePanel provenance={{ ...PROV, hydra_version: '2.4.0', config_hash: 'aabbccddeeff0099' }} />,
+    );
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('Hydra 2.4.0');
+    expect(text).toContain('Config aabbccddeeff…');
+    const version = Array.from(page.container.querySelectorAll('span[title]')).find((s) =>
+      s.textContent?.startsWith('Hydra '),
+    );
+    expect(version?.getAttribute('title')).toBe('2.4.0');
+    const hash = Array.from(page.container.querySelectorAll('span[title]')).find((s) =>
+      s.textContent?.startsWith('Config '),
+    );
+    expect(hash?.getAttribute('title')).toBe('aabbccddeeff0099');
+  });
+
+  it('hides both rows when neither field is present, never an em dash', async () => {
+    page = await mount(<ProvenancePanel provenance={PROV} />);
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('Hydra');
+    expect(text).not.toContain('Config');
+
+    page?.unmount();
+    page = await mount(
+      <ProvenancePanel provenance={{ ...PROV, hydra_version: null, config_hash: null }} />,
+    );
+    expect(page.container.textContent).not.toContain('Hydra');
+    expect(page.container.textContent).not.toContain('Config');
+  });
 });
