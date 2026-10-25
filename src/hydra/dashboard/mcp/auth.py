@@ -9,7 +9,8 @@ mount is only ever attached when the token is set, so that 401 is the belt behin
 lifespan's brace. ``Authorization`` sent more than once is refused 400 before any
 comparison (the SDK does not check; ported from ``security._single_header``). A valid
 token binds ``Principal('service', 'mcp')`` on the request state and hands the request
-to the SDK's streamable-HTTP app.
+to the SDK's streamable-HTTP app. WebSocket upgrades are closed 4403 by the gate itself,
+never forwarded: the transport is HTTP-only, so no handshake passes the gate unchecked.
 """
 
 from __future__ import annotations
@@ -19,10 +20,11 @@ import logging
 
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.websockets import WebSocketClose
 
 from hydra.core.config import HydraConfig
 from hydra.dashboard.routes._db import ErrorState, error_detail
-from hydra.dashboard.security import Principal
+from hydra.dashboard.security import WS_CLOSE_FORBIDDEN, Principal
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,15 @@ class MCPAuthMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            peer = (scope.get("client") or ("?",))[0]
+            logger.info(
+                "Refused websocket %s from %s: websocket_not_supported", scope["path"], peer
+            )
+            await WebSocketClose(code=WS_CLOSE_FORBIDDEN, reason="websocket_not_supported")(
+                scope, receive, send
+            )
+            return
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return

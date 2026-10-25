@@ -3,7 +3,9 @@
 Startup order: config, logging, credential key, DB pool, Alembic migrations, stored credentials,
 system config, SessionManager (``startup()``: risk state, recovery, display rows), MCP mount
 (only when ``HYDRA_MCP_TOKEN`` is set: no token, no ``/mcp`` surface), HealthMonitor (first
-readiness run; ``/livez`` turns green). Shutdown closes the MCP session manager first, then
+readiness run; ``/livez`` turns green). Shutdown closes the MCP session manager, unmounts
+``/mcp`` and resets ``app.state.mcp`` (the session manager is single-use, so a re-entered
+lifespan remounts a fresh transport instead of finding the closed mount shadowing it), then
 stops the monitor. Any startup error propagates, so uvicorn exits non-zero instead of serving
 without a schema or a key. Without DATABASE_URL (dev only) there is no pool, no migration and no
 key requirement. ``app.state.session_clients`` (a ``ClientFactory``), when set before startup,
@@ -71,6 +73,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if mcp_stack is not None:
             await mcp_stack.aclose()
+        _unmount_mcp(app)
         await _stop_health_monitor(app)
         await _shutdown_session_manager(app)
         await market_data.close_market_clients(app)
@@ -187,6 +190,22 @@ async def _start_health_monitor(app: FastAPI) -> None:
 # ---------------------------------------------------------------------------
 # Shutdown steps
 # ---------------------------------------------------------------------------
+
+
+def _unmount_mcp(app: FastAPI) -> None:
+    """Detach the ``/mcp`` mount and reset ``app.state.mcp`` to the no-token value.
+
+    The session manager is single-use, so leaving the mount behind would shadow the fresh
+    one a re-entered lifespan attaches (the first, closed match wins in the route list).
+    """
+    from starlette.routing import Mount
+
+    from hydra.dashboard.security import MCP_PATH_PREFIX
+
+    app.router.routes[:] = [
+        r for r in app.router.routes if not (isinstance(r, Mount) and r.path == MCP_PATH_PREFIX)
+    ]
+    app.state.mcp = None
 
 
 async def _stop_health_monitor(app: FastAPI) -> None:

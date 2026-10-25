@@ -409,6 +409,24 @@ class TestMcpFields:
         with pytest.raises(ValidationError, match="must differ from HYDRA_API_TOKEN"):
             load_config()
 
+    @pytest.mark.parametrize(
+        ("api_value", "mcp_value"),
+        [
+            pytest.param("y" * 48, " " + "y" * 48, id="mcp-token-padded-left"),
+            pytest.param("y" * 48, "y" * 48 + " ", id="mcp-token-padded-right"),
+            pytest.param(" " + "y" * 48, "y" * 48, id="api-token-padded-left"),
+        ],
+    )
+    def test_whitespace_padded_tokens_must_differ(
+        self, monkeypatch: pytest.MonkeyPatch, api_value: str, mcp_value: str
+    ) -> None:
+        """Copy-paste padding must not defeat the A7 guard: strip-compare both sides."""
+        monkeypatch.setenv("HYDRA_API_TOKEN", api_value)
+        monkeypatch.setenv("HYDRA_MCP_TOKEN", mcp_value)
+        monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "trading.example.com")
+        with pytest.raises(ValidationError, match="must differ from HYDRA_API_TOKEN"):
+            load_config()
+
     def test_valid_token_and_hosts_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HYDRA_MCP_TOKEN", "z" * 48)
         monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "trading.example.com")

@@ -352,7 +352,8 @@ class HydraConfig(BaseSettings):
         if (
             self.mcp_token is not None
             and self.api_token is not None
-            and self.mcp_token.get_secret_value() == self.api_token.get_secret_value()
+            and self.mcp_token.get_secret_value().strip()
+            == self.api_token.get_secret_value().strip()
         ):
             raise ValueError(
                 "HYDRA_MCP_TOKEN must differ from HYDRA_API_TOKEN: the API token is a full "

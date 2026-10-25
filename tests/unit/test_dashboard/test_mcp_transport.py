@@ -18,6 +18,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import Response
+from starlette.websockets import WebSocketDisconnect
 
 from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
@@ -201,3 +202,24 @@ def test_mount_without_config_refuses_everything(bind_api_config: Bind) -> None:
         response = _post_mcp(client, INITIALIZE)
     assert response.status_code == 401
     assert response.json()["detail"]["code"] == "auth_not_configured"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param(None, id="no-token"),
+        pytest.param("wrong" * 12, id="wrong-token"),
+        pytest.param(TEST_MCP_TOKEN, id="valid-token"),
+    ],
+)
+def test_websocket_upgrade_is_refused_by_the_gate(mcp_app: FastAPI, token: str | None) -> None:
+    """The mount is HTTP-only: the gate closes every websocket upgrade itself, never forwards."""
+    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    with (
+        TestClient(mcp_app) as client,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        client.websocket_connect("/mcp/", headers=headers),
+    ):
+        pytest.fail("the mount must not accept a websocket upgrade")
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "websocket_not_supported"

@@ -39,8 +39,6 @@ logger = logging.getLogger(__name__)
 audit_logger = get_logger("hydra.audit")
 
 PUBLIC_PATHS: frozenset[str] = frozenset({"/health", "/livez", "/readyz", "/metrics"})
-# /mcp paths skip this middleware on purpose: the MCP mount does its own constant-time bearer
-# check against HYDRA_MCP_TOKEN (hydra.dashboard.mcp.auth) — a reviewed, separate surface.
 MCP_PATH_PREFIX = "/mcp"
 SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 CSRF_HEADER = "x-hydra-request"
