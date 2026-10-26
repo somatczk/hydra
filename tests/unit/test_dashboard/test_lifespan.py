@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import asyncpg
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
@@ -16,6 +18,22 @@ from pydantic import ValidationError
 from hydra.core.config import ConfigError
 from hydra.core.encryption import CredentialKeyError, encrypt
 from hydra.dashboard import lifespan
+
+MCP_TEST_TOKEN = "t" * 48
+MCP_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": {"name": "hydra-tests", "version": "0.0.0"},
+    },
+}
+MCP_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
 
 
 def _closed_port_dsn() -> str:
@@ -167,3 +185,122 @@ async def test_system_config_values_are_json_decoded() -> None:
     )
     await lifespan._load_system_config(app)
     assert app.state.system_config == {"paper_capital": 2500, "trading_mode": "paper"}
+
+
+# ---------------------------------------------------------------------------
+# The MCP mount: no token, no surface; with one, the transport is served and shut down
+# ---------------------------------------------------------------------------
+
+
+def _mcp_mounts(app: FastAPI) -> list[Any]:
+    """The routes the lifespan attached at ``/mcp`` (only the mount ever matches)."""
+    return [r for r in app.router.routes if getattr(r, "path", "") == "/mcp"]
+
+
+async def test_no_mcp_token_mounts_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert getattr(app.state, "mcp", None) is None
+        assert not [r for r in app.router.routes if getattr(r, "path", "") == "/mcp"]
+
+
+async def test_mcp_token_mounts_the_transport(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
+    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    app = FastAPI()
+    with caplog.at_level(logging.ERROR, logger="hydra.dashboard.mcp"):
+        async with lifespan.run(app):
+            mount = app.state.mcp
+            assert mount is not None
+            assert mount.path == "/mcp"
+            assert [r for r in app.router.routes if getattr(r, "path", "") == "/mcp"]
+            # a request flows through the FastAPI app into the mounted transport
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/mcp/",
+                    headers={**MCP_HEADERS, "Authorization": f"Bearer {MCP_TEST_TOKEN}"},
+                    json=MCP_INITIALIZE,
+                )
+                assert response.status_code == 200
+                assert response.headers["mcp-session-id"]
+            # leaving the block exits the single-use session manager; nothing may raise
+    assert "Task group is not initialized" not in caplog.text
+
+
+async def test_mcp_mount_is_unmounted_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the lifespan exits the surface is gone: no route, no state, /mcp 404s."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
+    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert len(_mcp_mounts(app)) == 1
+    assert _mcp_mounts(app) == []
+    assert getattr(app.state, "mcp", None) is None
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/mcp/",
+            headers={**MCP_HEADERS, "Authorization": f"Bearer {MCP_TEST_TOKEN}"},
+            json=MCP_INITIALIZE,
+        )
+        assert response.status_code == 404
+
+
+async def test_mcp_lifespan_reentry_serves_a_fresh_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run() is re-enterable on one app: the closed mount must not shadow the new one."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
+    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    app = FastAPI()
+    for _ in range(2):
+        async with lifespan.run(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/mcp/",
+                    headers={**MCP_HEADERS, "Authorization": f"Bearer {MCP_TEST_TOKEN}"},
+                    json=MCP_INITIALIZE,
+                )
+                assert response.status_code == 200
+                assert response.headers["mcp-session-id"]
+            assert len(_mcp_mounts(app)) == 1
+    assert _mcp_mounts(app) == []
+    assert getattr(app.state, "mcp", None) is None
+
+
+async def test_startup_failure_after_mount_still_unmounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A startup error after the mount must not leave a dead /mcp surface behind."""
+
+    class BrokenMonitor:
+        async def start(self) -> None:
+            raise RuntimeError("monitor exploded")
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
+    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    app = FastAPI()
+    app.state.health_monitor_factory = lambda _app: BrokenMonitor()
+    with pytest.raises(RuntimeError, match="monitor exploded"):
+        async with lifespan.run(app):
+            pytest.fail("startup must not complete")
+    assert _mcp_mounts(app) == []
+    assert getattr(app.state, "mcp", None) is None

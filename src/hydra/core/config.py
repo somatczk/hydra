@@ -2,10 +2,10 @@
 
 Precedence (highest first): environment, ``{HYDRA_ENV}.yaml``, ``base.yaml``, model defaults. Any
 behaviour key can be overridden from the environment as ``HYDRA_<SECTION>__<KEY>``. Infrastructure
-settings come only from the environment: ``DATABASE_URL``, ``REDIS_URL``, ``HYDRA_CREDENTIAL_KEY``
-and ``HYDRA_API_TOKEN``. Unknown keys, unknown or retired ``HYDRA_*`` variables, unresolved
-``${VAR}`` placeholders and infrastructure keys in YAML are startup errors. Validation errors never
-echo input values, so a bad secret is named but not printed.
+settings come only from the environment: ``DATABASE_URL``, ``REDIS_URL``, ``HYDRA_CREDENTIAL_KEY``,
+``HYDRA_API_TOKEN`` and ``HYDRA_MCP_TOKEN``. Unknown keys, unknown or retired ``HYDRA_*`` variables,
+unresolved ``${VAR}`` placeholders and infrastructure keys in YAML are startup errors. Validation
+errors never echo input values, so a bad secret is named but not printed.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ _ENV_ONLY_SOURCES: dict[str, tuple[str, ...]] = {
     "REDIS_URL": ("redis", "redis_url"),
     "HYDRA_CREDENTIAL_KEY": ("credential_key", "hydra_credential_key"),
     "HYDRA_API_TOKEN": ("api_token", "hydra_api_token"),
+    "HYDRA_MCP_TOKEN": ("mcp_token", "hydra_mcp_token"),
     "the Settings page (exchange keys are stored encrypted in the database)": ("exchanges",),
 }
 _ENV_ONLY_KEYS = {key: source for source, keys in _ENV_ONLY_SOURCES.items() for key in keys}
@@ -233,6 +234,22 @@ class ApiConfig(_Section):
         return v
 
 
+class McpConfig(_Section):
+    """MCP server settings; the token is env-only (``HYDRA_MCP_TOKEN``) and validated at the root.
+
+    ``allowed_hosts`` is the SDK's DNS-rebinding allowlist (the ``Host`` header must match one
+    entry); it is deliberately empty by default so a token without hosts is a config error, never
+    a server that denies every request.
+    """
+
+    allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def _csv(cls, v: Any) -> Any:
+        return _split_csv(v)
+
+
 class MlConfig(_Section):
     """Machine learning settings."""
 
@@ -269,14 +286,18 @@ class HydraConfig(BaseSettings):
     trading: TradingConfig = Field(default_factory=TradingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
     ml: MlConfig = Field(default_factory=MlConfig)
 
     database_url: SecretStr | None = Field(None, validation_alias="DATABASE_URL")
     redis_url: SecretStr | None = Field(None, validation_alias="REDIS_URL")
     credential_key: SecretStr | None = Field(None, validation_alias="HYDRA_CREDENTIAL_KEY")
     api_token: SecretStr | None = Field(None, validation_alias="HYDRA_API_TOKEN")
+    mcp_token: SecretStr | None = Field(None, validation_alias="HYDRA_MCP_TOKEN")
 
-    @field_validator("database_url", "redis_url", "credential_key", "api_token", mode="before")
+    @field_validator(
+        "database_url", "redis_url", "credential_key", "api_token", "mcp_token", mode="before"
+    )
     @classmethod
     def _blank_is_unset(cls, v: Any) -> Any:
         return None if isinstance(v, str) and not v.strip() else v
@@ -304,10 +325,40 @@ class HydraConfig(BaseSettings):
             raise ValueError("HYDRA_API_TOKEN must be at least 32 characters")
         return v
 
+    @field_validator("mcp_token")
+    @classmethod
+    def _long_mcp_token(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is not None and len(v.get_secret_value()) < 32:
+            raise ValueError("HYDRA_MCP_TOKEN must be at least 32 characters")
+        return v
+
     @model_validator(mode="after")
     def _token_mode_has_token(self) -> HydraConfig:
         if self.api.auth_mode == "token" and self.api_token is None:
             raise ValueError("api.auth_mode 'token' requires HYDRA_API_TOKEN")
+        return self
+
+    @model_validator(mode="after")
+    def _mcp_needs_allowed_hosts(self) -> HydraConfig:
+        if self.mcp_token is not None and not self.mcp.allowed_hosts:
+            raise ValueError(
+                "HYDRA_MCP_TOKEN requires HYDRA_MCP__ALLOWED_HOSTS: the MCP transport's "
+                "DNS-rebinding protection denies every request without an allowed host"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _mcp_token_is_not_api_token(self) -> HydraConfig:
+        if (
+            self.mcp_token is not None
+            and self.api_token is not None
+            and self.mcp_token.get_secret_value().strip()
+            == self.api_token.get_secret_value().strip()
+        ):
+            raise ValueError(
+                "HYDRA_MCP_TOKEN must differ from HYDRA_API_TOKEN: the API token is a full "
+                "service principal over the REST API"
+            )
         return self
 
     @classmethod

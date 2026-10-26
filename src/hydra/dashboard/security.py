@@ -1,6 +1,9 @@
 """API authentication, CSRF and CORS for the engine, as pure ASGI middleware.
 
-Every HTTP and WebSocket request needs a principal, except the paths in ``PUBLIC_PATHS``:
+Every HTTP and WebSocket request needs a principal, except the paths in ``PUBLIC_PATHS`` and the
+paths owned by the MCP mount (``/mcp`` and ``/mcp/...``, when ``HYDRA_MCP_TOKEN`` is set): the
+mount runs its own constant-time bearer check against ``HYDRA_MCP_TOKEN``
+(``hydra.dashboard.mcp.auth``), a different token from ``HYDRA_API_TOKEN``.
 
 - ``service``: ``Authorization: Bearer <HYDRA_API_TOKEN>`` (constant-time compare);
 - ``user``: a ``Remote-User`` header from a TCP peer inside ``api.trusted_proxy_cidrs``
@@ -36,6 +39,7 @@ logger = logging.getLogger(__name__)
 audit_logger = get_logger("hydra.audit")
 
 PUBLIC_PATHS: frozenset[str] = frozenset({"/health", "/livez", "/readyz", "/metrics"})
+MCP_PATH_PREFIX = "/mcp"
 SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 CSRF_HEADER = "x-hydra-request"
 ALLOWED_FETCH_SITES: frozenset[str] = frozenset({"same-origin", "none"})
@@ -80,6 +84,11 @@ def _single_header(scope: Scope, name: str) -> str | None:
     if len(values) > 1:
         raise _DeniedError(400, "duplicate_header", f"{name} sent more than once", "invalid")
     return values[0] if values else None
+
+
+def _is_mcp_path(path: str) -> bool:
+    """``/mcp`` exactly or ``/mcp/...`` (never ``/mcpfoo``): the mount token-checks these."""
+    return path == MCP_PATH_PREFIX or path.startswith(MCP_PATH_PREFIX + "/")
 
 
 def _peer_is_trusted(scope: Scope, cfg: HydraConfig) -> bool:
@@ -169,7 +178,11 @@ class SecurityMiddleware:
         if scope["type"] == "lifespan":
             await self.app(scope, receive, self._lifespan_send(scope, send))
             return
-        if scope["type"] not in ("http", "websocket") or scope["path"] in PUBLIC_PATHS:
+        if (
+            scope["type"] not in ("http", "websocket")
+            or scope["path"] in PUBLIC_PATHS
+            or _is_mcp_path(scope["path"])
+        ):
             await self.app(scope, receive, send)
             return
         cfg = _config(scope)

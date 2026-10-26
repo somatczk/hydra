@@ -34,6 +34,8 @@ dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
     "websockets>=17.2,<18",
+    # MCP server
+    "mcp>=2.3,<3",
     # HTTP client
     "httpx>=0.28.1,<1",
     # Observability
