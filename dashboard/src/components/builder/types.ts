@@ -94,7 +94,6 @@ export interface BuilderState {
   strategyDescription: string;
   exchangeId: string;
   symbol: string;
-  /** Serialised draft at the last loaded/saved point; a difference is the dirty draft guard's trigger. */
   baseline: string;
 }
 

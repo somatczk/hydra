@@ -65,7 +65,6 @@ const initialDraft: Omit<BuilderState, 'baseline'> = {
   symbol: 'BTCUSDT',
 };
 
-/** Serialisable draft snapshot: everything except the baseline itself. */
 function snapshot(state: BuilderState): string {
   return JSON.stringify({ ...state, baseline: undefined });
 }
@@ -341,7 +340,7 @@ function BuilderPageContent() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [discardOpen, setDiscardOpen] = useState(false);
-  /** Set when the discard confirm was opened by an intercepted nav link; null when opened by New Strategy. */
+  /** Held navigation while the discard confirm is open: an intercepted click href or a trapped traversal; null when opened by New Strategy. */
   const [pendingNav, setPendingNav] = useState<string | null>(null);
   const searchParams = useSearchParams();
   const router = useRouter();
@@ -349,8 +348,12 @@ function BuilderPageContent() {
   const saveAndBacktestRef = useRef(false);
 
   const dirty = snapshot(state) !== state.baseline;
+  /* Dirty read at effect-run time, not render time: the ?strategy load must never fire over a dirty draft. */
+  const dirtyRef = useRef(dirty);
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
 
-  /* Tab close/external nav only: client-side route changes never fire beforeunload (S1). */
   useEffect(() => {
     if (!dirty) return;
     const warn = (e: BeforeUnloadEvent) => {
@@ -361,7 +364,7 @@ function BuilderPageContent() {
     return () => window.removeEventListener('beforeunload', warn);
   }, [dirty]);
 
-  /* S1: while dirty, nav-link clicks are stopped in capture phase and routed through the discard confirm. */
+  /* S1: while dirty, nav-link clicks and history traversals (back/forward, phone back) are stopped and routed through the discard confirm. */
   useEffect(() => {
     if (!dirty) return;
     const onClick = (e: MouseEvent) => {
@@ -369,14 +372,31 @@ function BuilderPageContent() {
       const anchor = (e.target as HTMLElement | null)?.closest?.('a[href]') as HTMLAnchorElement | null;
       if (!anchor || (anchor.target && anchor.target !== '_self')) return;
       const url = new URL(anchor.getAttribute('href') ?? '', window.location.href);
-      if (url.origin !== window.location.origin || url.pathname === window.location.pathname) return;
+      const sameRoute = url.pathname === window.location.pathname && url.search === window.location.search;
+      if (url.origin !== window.location.origin || sameRoute) return;
       e.preventDefault();
       e.stopPropagation();
       setPendingNav(url.pathname + url.search + url.hash);
       setDiscardOpen(true);
     };
     document.addEventListener('click', onClick, true);
-    return () => document.removeEventListener('click', onClick, true);
+    const restoreHref = window.location.href;
+    const restoreState = window.history.state;
+    const onPopState = () => {
+      const target = new URL(window.location.href);
+      const restore = new URL(restoreHref);
+      if (target.pathname === restore.pathname && target.search === restore.search) return;
+      history.pushState(restoreState, '', restoreHref);
+      // A re-fired popstate with the restored entry's state supersedes the router's in-flight traversal.
+      window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+      setPendingNav(target.pathname + target.search + target.hash);
+      setDiscardOpen(true);
+    };
+    window.addEventListener('popstate', onPopState, true);
+    return () => {
+      document.removeEventListener('click', onClick, true);
+      window.removeEventListener('popstate', onPopState, true);
+    };
   }, [dirty]);
 
   /* Fetch indicators and comparators from API */
@@ -408,10 +428,11 @@ function BuilderPageContent() {
   /* Load strategy from URL param ?strategy={id} */
   useEffect(() => {
     const strategyId = searchParams.get('strategy');
-    if (!strategyId) return;
+    if (!strategyId || dirtyRef.current) return;
     setLoadError(null);
     fetchApi<StrategyDetail>(`/api/strategies/${strategyId}`)
       .then((detail) => {
+        if (dirtyRef.current) return;
         dispatch({ type: 'LOAD_STRATEGY', payload: detail });
         logger.info('Builder', `Loaded strategy "${detail.name}"`);
         toast('success', `Loaded strategy "${detail.name}"`);
@@ -448,13 +469,10 @@ function BuilderPageContent() {
 
   const confirmDiscard = async () => {
     setDiscardOpen(false);
-    if (pendingNav) {
-      const href = pendingNav;
-      setPendingNav(null);
-      router.push(href);
-    } else {
-      dispatch({ type: 'RESET' });
-    }
+    const href = pendingNav;
+    setPendingNav(null);
+    dispatch({ type: 'RESET' });
+    if (href) router.push(href);
   };
 
   return (
