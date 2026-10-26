@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
-import { breaker, detail, liveStatus, platformConfig, session } from '@/test/fixtures';
+import { breaker, detail, liveStatus, pendingApproval, platformConfig, session } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
 
@@ -117,6 +117,19 @@ describe('Status page', () => {
     expect(tile(c, 'Needs you')).not.toContain('Nothing needs you');
     expect(c.textContent).toContain("Couldn't check everything: settings unavailable");
     expect(c.querySelector('li a[href="/trading/run-a"]')?.textContent).toContain('SMA cross stopped with an error: feed lost');
+  });
+
+  it('lists a pending Claude approval first in Needs you, linking to its review', async () => {
+    const approval = pendingApproval({ id: 'apr-1', requested_at: new Date(Date.now() - 2 * 60_000).toISOString() });
+    const c = await show({
+      '/api/activity/approvals': [approval],
+      '/api/trading/sessions': [session({ session_id: 'run-a', status: 'error', error_message: 'feed lost' })],
+    });
+    expect(tile(c, 'Needs you')).toContain('2 things need you');
+    const rows = Array.from(c.querySelectorAll('#needs-you li a'));
+    expect(rows[0]?.getAttribute('href')).toBe('/activity/approvals/apr-1');
+    expect(rows[0]?.textContent).toContain('Claude asks to release the kill switch');
+    expect(rows[1]?.textContent).toContain('stopped with an error');
   });
 
   it('says the risk state is unavailable and never claims entries are allowed', async () => {

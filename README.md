@@ -169,7 +169,8 @@ prices in a backtest: market orders fill at the signal bar's close).
 | `/optimize` | Launch hyperopt / walk-forward as an in-process task. |
 | `/optimize/[taskId]` | Task progress and result. |
 | `/portfolio` | Positions, allocation, balance snapshots. |
-| `/risk` | Risk limits form, drawdown and daily-loss gauges, VaR; circuit breakers show UNAVAILABLE. |
+| `/risk` | Risk limits form, drawdown and daily-loss gauges, VaR; circuit breakers show UNAVAILABLE. The activity log moved to `/activity`; this page keeps a Recent risk events link to it. |
+| `/activity` | The merged activity trail: every risk event newest first (who did what and why, the raw kind and details one click away), filter chips All / Claude / Me / Services, rows linking to the touched session, and Claude's pending approvals at the top — each a review page (What / Why / Claude's own words, Context, Claude's recent trail) where approving needs the 6-digit one-time code Claude was given and denying needs none. Reached from the desktop rail only; on a phone via Risk and Needs you. |
 | `/models` | ONNX model registry: upload (asks before replacing a model), promote, rollback. Drift shows Unknown. |
 | `/settings` | Persisted system config, exchange keys (checked read-only against the named testnet or mainnet before they are stored; shows where and when they were validated and keys the credential key cannot decrypt), balance and open orders per panel, webhook secrets (write-only), notifications. |
 

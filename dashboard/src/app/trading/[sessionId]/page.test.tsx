@@ -155,4 +155,24 @@ describe('session detail', () => {
     expect(body.stop_loss).toBeUndefined();
     expect(text()).toContain('Not placed: Position would exceed the heat cap (heat_cap).');
   });
+
+  it('shows Claude on the header when the MCP actor started the session, the raw principal otherwise, and nothing when unknown', async () => {
+    setup(detail({ created_by: 'service:mcp' }));
+    m = await page();
+    const header = m.container.querySelector('header')?.textContent ?? '';
+    expect(header).toContain('Claude');
+    expect(header).not.toContain('service:mcp');
+    m.unmount();
+
+    setup(detail({ created_by: 'user:soma' }));
+    m = await page();
+    expect(m.container.querySelector('header')?.textContent).toContain('user:soma');
+    m.unmount();
+
+    setup(detail({ created_by: null }));
+    m = await page();
+    const h = m.container.querySelector('header')?.textContent ?? '';
+    expect(h).not.toContain('Claude');
+    expect(h).not.toContain('user:soma');
+  });
 });

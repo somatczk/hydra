@@ -1,6 +1,6 @@
 /** Pure derivations behind every money and safety sentence (08 §3.2); shapes mirror the API models. */
 
-import { money, pct, utc } from './format';
+import { age, money, pct, utc } from './format';
 
 /** `routes/trading.py` SessionResponse; the optional fields arrive with the A3+ ask. */
 export interface SessionResponse {
@@ -23,6 +23,8 @@ export interface SessionResponse {
   entries_paused?: string | null;
   persist_dirty?: boolean | null;
   feed_live?: boolean | null;
+  /** `migration 0008_session_created_by`: the principal string that started it, null before that. */
+  created_by?: string | null;
 }
 
 /** A fill: the TradeItem model plus the paper extras (`amount`); `quantity` is 0 on older fills, so read it with `fillQty`. */
@@ -116,6 +118,26 @@ export interface PlatformConfig {
   paper_capital_pending: number | null;
 }
 
+/** `routes/activity.py` PendingApproval (actor is always `service:mcp`). */
+export interface PendingApproval {
+  id: string;
+  actor: string;
+  action: string;
+  reason: string;
+  params: Record<string, unknown>;
+  requested_at: string;
+  expires_at: string;
+  status: string;
+}
+
+/** `routes/activity.py` ApprovalDetail: the pending fields plus the decision state. */
+export interface ApprovalDetail extends PendingApproval {
+  attempts_left: number;
+  approved_by: string | null;
+  decided_at: string | null;
+  error: string | null;
+}
+
 export interface StopRule {
   stop_loss_method: string;
   stop_loss_value: number;
@@ -207,7 +229,7 @@ export const ksTargets = (sessions: SessionResponse[]) => ({
 });
 
 export interface NeedItem {
-  kind: 'error' | 'held' | 'persist_error' | 'breaker' | 'ks_not_saved' | 'capital_pending';
+  kind: 'approval' | 'error' | 'held' | 'persist_error' | 'breaker' | 'ks_not_saved' | 'capital_pending';
   text: string;
   href: string;
 }
@@ -219,15 +241,37 @@ export interface NeedsYou {
   unavailable: string[];
 }
 
-/** Current, self-clearing conditions only (R-P1-4); protection failures are not one. */
+/** The gated action as a phrase: 'kill_switch_release' → 'release the kill switch' (06 §2 approval row). */
+export function actionPhrase(action: string): string {
+  if (action === 'kill_switch_release') return 'release the kill switch';
+  return action.replaceAll('_', ' ');
+}
+
+/** Current, self-clearing conditions only (R-P1-4); protection failures are not one.
+ * `approvals` is null when the source couldn't be read (count "?" then, never "none"); `now` ages the rows. */
 export function needsYou(src: {
   sessions: SessionResponse[] | null;
   live: LiveStatus | null;
   config: PlatformConfig | null;
   ksNotSaved: boolean;
+  approvals: PendingApproval[] | null;
+  now?: number;
 }): NeedsYou {
+  const now = src.now ?? Date.now();
   const unavailable: string[] = [];
   const items: NeedItem[] = [];
+  const approvalItems: NeedItem[] = [];
+  if (!src.approvals) unavailable.push('approvals');
+  else {
+    for (const a of src.approvals) {
+      const when = age(now - Date.parse(a.requested_at), now);
+      approvalItems.push({
+        kind: 'approval',
+        text: `Claude asks to ${actionPhrase(a.action)}${when ? ` · ${when}` : ''}`,
+        href: `/activity/approvals/${a.id}`,
+      });
+    }
+  }
   const sessions = src.sessions ?? [];
   if (!src.sessions) unavailable.push('sessions');
   const at = (s: SessionResponse) => `/trading/${s.session_id}`;
@@ -258,7 +302,11 @@ export function needsYou(src: {
       href: '/settings',
     });
   }
-  return { items, count: unavailable.length ? null : items.length, unavailable };
+  return {
+    items: [...approvalItems, ...items],
+    count: unavailable.length ? null : approvalItems.length + items.length,
+    unavailable,
+  };
 }
 
 /** `quantity` defaults to 0 (trading.py TradeItem), so 0 means "not reported", not "nothing". */

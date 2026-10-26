@@ -54,6 +54,9 @@ export type Routes = Record<string, unknown | (() => unknown)>;
 /** Non-GET responses keyed "METHOD /path"; a function gets the 1-based call count for that key. */
 export type Mutations = Record<string, unknown | ((call: number) => unknown)>;
 
+/** The shell polls these; a test that doesn't stub one reads a known-empty state, not an error. */
+const SHELL_STUBS: Routes = { '/api/activity/approvals': [] };
+
 /** fetchApi stand-in: GETs resolve from `routes` by path (query included); Errors reject.
  * Non-GETs resolve from `mutations` when scripted, else `{}`. */
 export function routeFetch(
@@ -75,7 +78,10 @@ export function routeFetch(
       if (value instanceof Error) throw value;
       return value;
     }
-    if (!(path in routes)) throw new ApiError(404, JSON.stringify({ detail: 'no route' }));
+    if (!(path in routes)) {
+      if (path in SHELL_STUBS) return SHELL_STUBS[path];
+      throw new ApiError(404, JSON.stringify({ detail: 'no route' }));
+    }
     const entry = routes[path];
     const value = typeof entry === 'function' ? (entry as () => unknown)() : entry;
     if (value instanceof Error) throw value;

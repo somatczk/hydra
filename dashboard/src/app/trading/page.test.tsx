@@ -134,3 +134,23 @@ describe('Sessions list', () => {
     expect(text()).toContain('All positions closed.');
   });
 });
+
+describe('created_by attribution chip', () => {
+  it('shows Claude on a session started by the MCP actor, in both layouts', async () => {
+    setup([session({ session_id: 'run-1', created_by: 'service:mcp' })]);
+    m = await page();
+    expect(m.container.textContent).toContain('Claude');
+    expect(m.container.textContent).not.toContain('service:mcp');
+  });
+
+  it('shows the raw principal for anyone else and nothing when it is not reported', async () => {
+    setup([RUN, QUIET]);
+    m = await page();
+    expect(m.container.textContent).not.toContain('Claude');
+    const claude = session({ session_id: 'run-2', created_by: 'user:soma' });
+    setup([claude]);
+    m.unmount();
+    m = await page();
+    expect(m.container.textContent).toContain('user:soma');
+  });
+});

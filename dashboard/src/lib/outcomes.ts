@@ -35,6 +35,20 @@ export interface KillSwitchResponse {
   flatten_failures: string[];
 }
 
+/** `routes/activity.py` ApproveResponse: the executor's result plus both attributions. */
+export interface ApproveResponse {
+  executed: boolean;
+  result: unknown;
+  actor: string;
+  approved_by: string;
+}
+
+/** `routes/activity.py` DenyResponse. */
+export interface DenyResponse {
+  id: string;
+  status: string;
+}
+
 /** trading.py:213-226 QuickTradeResponse: no stop price anywhere. */
 export interface QuickTradeResponse {
   order_id: string | null;
@@ -502,4 +516,37 @@ export function limitsOutcome(result: Result<unknown>): Outcome {
   }
   if (d && !unreachable(err)) return { tone: 'danger', title: d.message, lines: [], actions: [], inline: d.state === 'invalid' };
   return notConfirmed('the limits were saved', err);
+}
+
+/** POST /api/activity/approvals/{id}/approve|deny (F8): the double attribution names both actors. */
+export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>): Outcome {
+  if ('ok' in result) {
+    if ('executed' in result.ok) {
+      return ok('Released by Claude, approved by you.', ['Trading can resume. No sessions were restarted.']);
+    }
+    return ok('Denied.', ['Claude can ask again.']);
+  }
+  const err = result.err;
+  if (isSignedOut(err)) return signedOut('decide it again');
+  const d = parseErrorDetail(err);
+  if (d?.code === 'code_mismatch') {
+    const left = typeof d.attempts_left === 'number' ? d.attempts_left : null;
+    return {
+      tone: 'danger',
+      title: "That code didn't match. Nothing changed.",
+      lines: left === null ? [] : [left === 1 ? '1 attempt left.' : `${left} attempts left.`],
+      actions: [],
+      inline: true,
+    };
+  }
+  if (d?.code === 'principal_not_allowed') {
+    return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
+  }
+  if (d?.code === 'approval_execution_failed') {
+    return { tone: 'danger', title: "Approved, but it didn't run.", lines: [d.message, 'Ask for a new one.'], actions: [] };
+  }
+  if (d?.code === 'already_decided' || d?.code === 'approval_expired' || d?.code === 'approval_failed') {
+    return { tone: 'caution', title: d.message, lines: [], actions: [] };
+  }
+  return notConfirmed('the code was accepted', err);
 }
