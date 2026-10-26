@@ -532,10 +532,23 @@ export function limitsOutcome(result: Result<unknown>): Outcome {
   return notConfirmed('the limits were saved', err);
 }
 
+/** R24: the live executors' failure copy — never 'Ask for a new one.' (a re-request would place a
+ * second live order while the first may exist unwatched); null for every other action. */
+function liveUnknownLine(action: string | undefined): string | null {
+  if (action === 'live_order') return "We don't know whether the order was placed. Check this session's fills and positions before trying again.";
+  if (action === 'live_session_start') return "We don't know whether the session started. Check the sessions list before trying again.";
+  return null;
+}
+
 /** POST /api/activity/approvals/{id}/approve|deny (F8): the double attribution names both actors.
  * `intent` picks the not-confirmed wording when the POST's own answer was lost: an approve speaks
- * of the code, a deny must not. */
-export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>, intent: 'approve' | 'deny' = 'approve'): Outcome {
+ * of the code, a deny must not. `action` (R24; UI-4c passes the approval's action) reroutes the live
+ * executors' failures to the unknown-live reality — the approve leg may have run despite the error. */
+export function approvalOutcome(
+  result: Result<ApproveResponse | DenyResponse>,
+  intent: 'approve' | 'deny' = 'approve',
+  action?: string,
+): Outcome {
   if ('ok' in result) {
     if ('executed' in result.ok) {
       return ok('Released by Claude, approved by you.', ['Trading can resume. No sessions were restarted.']);
@@ -559,6 +572,8 @@ export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>, 
     return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
   }
   if (d?.code === 'approval_execution_failed') {
+    const unknown = intent === 'deny' ? null : liveUnknownLine(action);
+    if (unknown) return { tone: 'danger', title: 'Not confirmed.', lines: [unknown, d.message], actions: [], unanswered: true };
     return { tone: 'danger', title: "Approved, but it didn't run.", lines: [d.message, 'Ask for a new one.'], actions: [] };
   }
   if (d?.code === 'executor_not_registered') {
@@ -571,6 +586,11 @@ export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>, 
   }
   if (d?.code === 'already_decided' || d?.code === 'approval_expired' || d?.code === 'approval_failed') {
     return { tone: 'caution', title: d.message, lines: [], actions: [] };
+  }
+  const unknown = intent === 'deny' ? null : liveUnknownLine(action);
+  if (unknown) {
+    const msg = unreachable(err) ? null : d?.message;
+    return { tone: 'danger', title: 'Not confirmed.', lines: [unknown, ...(msg ? [msg] : [])], actions: [], unanswered: true };
   }
   return notConfirmed(intent === 'deny' ? 'the denial was recorded' : 'the code was accepted', err);
 }
@@ -704,7 +724,7 @@ export function liveOrderOutcome(
       return liveCodeMismatch('Nothing was placed.', d);
     case 'approval_execution_failed':
       return unknownLiveOrder([d.message], selectedSessionId);
-    case 'order_submit_unknown':
+    case 'order_submit_unknown': // unreachable until R22 (approvals.py re-raises ServiceError); kept for seam #8
       return unknownLiveOrder(
         [...(d.client_order_id ? [`Binance may hold order ${String(d.client_order_id).slice(0, 8)}.`] : []), d.message],
         selectedSessionId,
@@ -727,5 +747,6 @@ export function liveOrderOutcome(
       { kind: 'open', label: 'Open session', href: `/trading/${selectedSessionId}` },
     ]);
   }
+  // risk_rejected lands here only after R22 (approvals.py re-raises ServiceError); kept for seam #8
   return quickTradeOutcome(req, { err }, selectedSessionId);
 }

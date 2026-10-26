@@ -385,6 +385,45 @@ describe('approvalOutcome', () => {
     expect(o.lines).toEqual(["The approved action 'kill_switch_release' did not run: boom", 'Ask for a new one.']);
   });
 
+  it('a live order executor failure never asks for a new one — the order may exist (R24)', () => {
+    const msg = "The approved action 'live_order' did not run: exchange unreachable";
+    const o = approvalOutcome({ err: envelope(503, 'approval_execution_failed', msg, 'unavailable') }, 'approve', 'live_order');
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(o.lines).toEqual(["We don't know whether the order was placed. Check this session's fills and positions before trying again.", msg]);
+    expect(o.lines).not.toContain('Ask for a new one.');
+  });
+
+  it('a live session start executor failure says the session start is unknown (R24)', () => {
+    const o = approvalOutcome(
+      { err: envelope(503, 'approval_execution_failed', "The approved action 'live_session_start' did not run: boom", 'unavailable') },
+      'approve',
+      'live_session_start',
+    );
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.lines[0]).toBe("We don't know whether the session started. Check the sessions list before trying again.");
+    expect(text(o)).not.toContain('Ask for a new one.');
+  });
+
+  it('a network-lost approve on a live action renders the unknown-order reality, not the code sentence (R24)', () => {
+    const o = approvalOutcome({ err: new TypeError('Failed to fetch') }, 'approve', 'live_order');
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(text(o)).toContain("We don't know whether the order was placed");
+    expect(text(o)).not.toContain('the code was accepted');
+  });
+
+  it('non-live actions keep the generic executor-failure copy even with the action passed (R24)', () => {
+    const o = approvalOutcome(
+      { err: envelope(503, 'approval_execution_failed', "The approved action 'kill_switch_release' did not run: boom", 'unavailable') },
+      'approve',
+      'kill_switch_release',
+    );
+    expect(o.title).toBe("Approved, but it didn't run.");
+    expect(o.lines).toEqual(["The approved action 'kill_switch_release' did not run: boom", 'Ask for a new one.']);
+  });
+
   it('a decision that happened elsewhere and an engine outage', () => {
     const decided = approvalOutcome({ err: envelope(409, 'already_decided', 'This approval was already approved', 'invalid') });
     expect(decided.tone).toBe('caution');

@@ -257,10 +257,17 @@ export const ksTargets = (sessions: SessionResponse[]) => ({
   errored: sessions.filter((s) => s.status === 'error'),
 });
 
-/** Seam #10: LIVE = armed OR any running live session — either leg alone must show real money. */
-export function modeBadge(live: LiveStatus | null, sessions: SessionResponse[] | null): TradingMode {
+/** Seam #10 / R23: LIVE = armed OR any running live session OR any stopped live session still holding
+ * (`positions_at_stop > 0` — R13's unprotected remainder); an unreadable source (live OR sessions null)
+ * returns null — the caller renders '?', never PAPER over real money. */
+export function modeBadge(live: LiveStatus | null, sessions: SessionResponse[] | null): TradingMode | null {
   if (live?.live_armed === true) return 'live';
-  if (sessions?.some((s) => s.trading_mode === 'live' && s.status === 'running')) return 'live';
+  if (
+    sessions?.some((s) => s.trading_mode === 'live' && (s.status === 'running' || (s.status === 'stopped' && s.positions_at_stop > 0)))
+  ) {
+    return 'live';
+  }
+  if (!live || !sessions) return null;
   return 'paper';
 }
 
@@ -396,7 +403,8 @@ export function stopRuleLabel(risk: StopRule | Error | null | undefined): string
   }
 }
 
-export function breakerRow(b: CircuitBreaker, activeTier: number, now: number = Date.now()): { text: string; tone: Tone } {
+/** Breaker states worded per risk/service.py; a status outside the vocabulary returns null (fail-closed). */
+export function breakerRow(b: CircuitBreaker, activeTier: number, now: number = Date.now()): { text: string; tone: Tone } | null {
   if (b.status === 'Tripped' && b.tier < activeTier) {
     return { text: `Tripped (included in tier ${activeTier})`, tone: 'none' };
   }
@@ -407,11 +415,12 @@ export function breakerRow(b: CircuitBreaker, activeTier: number, now: number = 
   if (b.status === 'Warning') {
     return { text: `Near: ${pct(b.current_value)} of ${pct(b.threshold_pct)}`, tone: 'caution' };
   }
+  if (b.status !== 'Normal') return null;
   return { text: pct(b.threshold_pct) ?? b.threshold, tone: 'none' };
 }
 
 /** A7 (seam #2): ok → 'Reconciled {age} ago', mismatch → caution with the drift, never → not yet;
- * a null return means the state is unreadable and the caller renders UNKNOWN. */
+ * a null return means the state is unreadable or out of vocabulary, and the caller renders UNKNOWN. */
 export function reconcileRow(reconcile: ReconcileState | null | undefined, now: number = Date.now()): { text: string; tone: Tone } | null {
   if (!reconcile) return null;
   if (reconcile.state === 'unknown') return null;
@@ -419,11 +428,15 @@ export function reconcileRow(reconcile: ReconcileState | null | undefined, now: 
     return { text: `Mismatch: ${reconcile.detail ?? 'no detail reported'}`, tone: 'caution' };
   }
   if (reconcile.state === 'never') return { text: 'Not reconciled yet', tone: 'none' };
+  if (reconcile.state !== 'ok') return null;
   const a = reconcile.last_reconciled_at ? age(now - Date.parse(reconcile.last_reconciled_at), now) : null;
   return { text: a ? `Reconciled ${a}` : 'Reconciled', tone: 'none' };
 }
 
-/** A8-live (seam #3): a missing stop is danger — the dead-man invariant — and an unreadable verify is UNKNOWN (null). */
+/** A8-live (seam #3): a missing stop is danger — the dead-man invariant — and an unreadable verify is
+ * UNKNOWN (null). Paper positions also carry `exchange_stop` null (the type's own doc), so the danger
+ * row is live-only by caller contract (UI-4c gates on mode); a confirmed stop with `stop_price` null
+ * renders 'Stop at —' (degenerate input; producers pin it via B's contract). */
 export function exchangeStopRow(position: PositionItem): { text: string; tone: Tone } | null {
   const stop = position.exchange_stop;
   if (!stop || stop.state === 'missing') return { text: `No exchange stop for ${position.symbol}`, tone: 'danger' };

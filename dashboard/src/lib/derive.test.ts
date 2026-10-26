@@ -19,8 +19,10 @@ import {
   stopRuleLabel,
   timeframeSeconds,
   winRate,
+  type CircuitBreaker,
   type PendingApproval,
   type PositionItem,
+  type ReconcileState,
   type SessionDetail,
 } from './derive';
 import { breaker, detail, exchangeStop, liveSession, liveStatus, paperFill, pendingApproval, platformConfig, reconcile, session } from '@/test/fixtures';
@@ -141,9 +143,20 @@ describe('live mode (seam #10)', () => {
     expect(modeBadge(null, [liveSession()])).toBe('live');
   });
 
-  it('PAPER for stopped live rows only, and when both sources are quiet', () => {
+  it('PAPER when both sources read and stay quiet — a stopped live row only once it holds nothing', () => {
+    expect(modeBadge(liveStatus(), [session()])).toBe('paper');
     expect(modeBadge(liveStatus(), [liveSession({ status: 'stopped' })])).toBe('paper');
-    expect(modeBadge(null, null)).toBe('paper');
+  });
+
+  it('LIVE for a stopped live session still holding positions — never PAPER over real money (R13/R23)', () => {
+    expect(modeBadge(liveStatus(), [liveSession({ status: 'stopped', positions_at_stop: 2 })])).toBe('live');
+    expect(modeBadge(null, [liveSession({ status: 'stopped', positions_at_stop: 1 })])).toBe('live');
+  });
+
+  it('an unreadable source is null — the caller renders "?", never PAPER (R23)', () => {
+    expect(modeBadge(null, null)).toBeNull();
+    expect(modeBadge(liveStatus(), null)).toBeNull();
+    expect(modeBadge(null, [session()])).toBeNull();
   });
 
   it('row labels only when a view contains a live row; a stopped live row still counts (08 §6)', () => {
@@ -185,6 +198,10 @@ describe('reconcile and exchange stops (A7/A8-live seams)', () => {
   it('an unreadable or absent reconcile renders nothing here — the caller shows UNKNOWN', () => {
     expect(reconcileRow(reconcile({ state: 'unknown' }), NOW)).toBeNull();
     expect(reconcileRow(null, NOW)).toBeNull();
+  });
+
+  it('a state outside the vocabulary renders nothing here — the caller shows UNKNOWN (fail-closed)', () => {
+    expect(reconcileRow(reconcile({ state: 'stale' as ReconcileState['state'] }), NOW)).toBeNull();
   });
 
   it('a confirmed stop names its price: "Stop at {price} on the exchange"', () => {
@@ -322,6 +339,10 @@ describe('breakerRow', () => {
       tone: 'caution',
     });
     expect(breakerRow(breaker({ tier: 4, threshold_pct: 20 }), 2, NOW)).toEqual({ text: '20.00%', tone: 'none' });
+  });
+
+  it('a status outside the vocabulary renders nothing here — the caller shows Unknown (fail-closed)', () => {
+    expect(breakerRow(breaker({ status: 'stale' as CircuitBreaker['status'] }), 2, NOW)).toBeNull();
   });
 });
 

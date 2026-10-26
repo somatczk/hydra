@@ -18,7 +18,7 @@ export function BreakerTable({ breakers, activeTier, now, onReset }: BreakerTabl
   return (
     <ul className="divide-y divide-line text-sm">
       {breakers.map((b) => {
-        const row = breakerRow(b, activeTier, now);
+        const row = breakerRow(b, activeTier, now) ?? { text: 'Unknown', tone: 'caution' as const };
         const active = b.tier === activeTier;
         return (
           <li key={b.tier} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3">
