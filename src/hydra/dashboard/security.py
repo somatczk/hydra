@@ -15,6 +15,11 @@ Browser principals (``user``, ``dev``) must also pass the CSRF checks on non-saf
 and must send an allowed ``Origin`` on WebSocket upgrades. A refused upgrade gets an HTTP 401/403
 with the error envelope (WebSocket denial response). Settings come from
 ``app.state.config`` at request time; without a loaded config every protected request is refused.
+
+A second duty, ``ProxySchemeMiddleware``: behind Traefik's TLS it corrects the request scheme
+from a single ``X-Forwarded-Proto`` header, but only when the TCP peer is a trusted proxy
+(uvicorn's ``proxy_headers`` stays off so the raw peer — the anchor proxy auth trusts —
+survives); the 307 redirect ``Location`` starlette builds from the scheme then says ``https``.
 """
 
 from __future__ import annotations
@@ -265,6 +270,43 @@ def count_wide_proxy_networks(api: ApiConfig) -> int:
     return sum(1 for n in api.trusted_proxy_cidrs if n.prefixlen < n.max_prefixlen)
 
 
+class ProxySchemeMiddleware:
+    """Trust ``X-Forwarded-Proto`` from ``api.trusted_proxy_cidrs`` peers, ``http`` scopes only.
+
+    uvicorn keeps ``proxy_headers=False`` (flipping it would rewrite ``scope['client']`` and
+    break the Remote-User proxy auth), so behind Traefik's TLS the ASGI scheme stays ``http``
+    and starlette builds the trailing-slash 307 ``Location`` from it — ``http://`` on an
+    https site. When the TCP peer is a trusted proxy and a single ``X-Forwarded-Proto``
+    header says exactly ``https`` or ``http``, the scope scheme is corrected before the
+    router sees it. ``scope['client']`` is never touched; any other header value changes
+    nothing, and a duplicate header is refused 400 on every ``http`` path — including the
+    public and MCP paths auth skips, since this middleware checks no paths (fail-closed;
+    unreachable in production, where Traefik sends exactly one).
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        cfg = _config(scope)
+        if cfg is not None and _peer_is_trusted(scope, cfg):
+            try:
+                proto = _single_header(scope, "x-forwarded-proto")
+            except _DeniedError as denied:
+                peer = (scope.get("client") or ("?",))[0]
+                logger.info(
+                    "Refused %s %s from %s: %s", scope["type"], scope["path"], peer, denied.code
+                )
+                await SecurityMiddleware._refuse(scope, receive, send, denied)
+                return
+            if proto in ("http", "https"):
+                scope["scheme"] = proto
+        await self.app(scope, receive, send)
+
+
 class ConfigCORSMiddleware:
     """Starlette's CORSMiddleware with ``allow_origins`` read from ``app.state.config``."""
 
@@ -295,8 +337,13 @@ class ConfigCORSMiddleware:
 
 
 def install_security(app: FastAPI) -> None:
-    """Auth + CSRF inside, CORS outermost so preflights are answered before auth."""
+    """Auth + CSRF inside, CORS outermost so preflights are answered before auth.
+
+    The scheme fix sits between: inside CORS (preflights need no scheme) and outside auth
+    (its 400 answers with the plain envelope either way).
+    """
     app.add_middleware(SecurityMiddleware)
+    app.add_middleware(ProxySchemeMiddleware)
     app.add_middleware(ConfigCORSMiddleware)
 
 
