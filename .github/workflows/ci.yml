@@ -376,7 +376,10 @@ jobs:
               ready=$(curl -fsS http://localhost:8000/readyz)
               echo "$ready"
               jq -e '.status == "ok" and .checks.db.ok == true and .checks.migrations.ok == true' <<<"$ready"
-              # one real MCP tool call through the served python -m app (the layout unit tests can't see)
+              # one real MCP tool call through the served python -m app (the layout unit tests can't see);
+              # the guard fails the step on an empty script — `python -` on empty stdin exits 0
+              test -s .github/scripts/mcp_image_smoke.py \
+                || { echo "::error::mcp_image_smoke.py is missing or empty"; exit 1; }
               docker exec -i smoke python - < .github/scripts/mcp_image_smoke.py
               docker logs smoke 2>&1 | grep -F 'Application startup complete' \
                 | jq -e 'select(.logger == "uvicorn.error" and .level == "info" and .timestamp != null)'

@@ -114,4 +114,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        fail(f"unexpected: {exc!r}")
