@@ -40,7 +40,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
             ref={ref}
             id={selectId}
             className={cn(
-              'h-10 w-full appearance-none rounded border bg-canvas px-3 pr-10 text-sm text-ink-1 transition-colors',
+              'h-10 max-lg:h-11 w-full appearance-none rounded border bg-canvas px-3 pr-10 text-sm text-ink-1 transition-colors',
               'focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent',
               error
                 ? 'border-danger'

@@ -76,7 +76,7 @@ export function SignalPreview({ state }: SignalPreviewProps) {
     <DataCard title="Signal Preview" description="Test your strategy on the latest stored bars">
       <div className="flex flex-col gap-4">
         {/* Preview button */}
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <Button
             variant="outline"
             size="lg"
@@ -88,7 +88,7 @@ export function SignalPreview({ state }: SignalPreviewProps) {
             Preview Signals
           </Button>
           {!hasConditions && (
-            <span className="text-xs text-text-muted">
+            <span className="text-xs text-ink-2">
               Add at least one condition to preview
             </span>
           )}
@@ -96,8 +96,8 @@ export function SignalPreview({ state }: SignalPreviewProps) {
 
         {/* Error message */}
         {error && (
-          <div className="rounded-lg border border-status-error/30 bg-status-error/5 p-3">
-            <p className="text-sm text-status-error">{error}</p>
+          <div className="rounded-lg border border-danger bg-danger-soft p-3">
+            <p className="text-sm text-danger">{error}</p>
           </div>
         )}
 
@@ -105,7 +105,7 @@ export function SignalPreview({ state }: SignalPreviewProps) {
         {preview && (
           <div className="flex flex-col gap-4">
             {preview.provenance && (
-              <p className="text-xs text-text-muted" data-testid="preview-provenance">
+              <p className="text-xs text-ink-2" data-testid="preview-provenance">
                 {preview.provenance.bar_count} stored bars, {preview.provenance.exchange}{' '}
                 {preview.provenance.symbol} {preview.provenance.timeframe},{' '}
                 {formatUtc(preview.provenance.first_ts)} to {formatUtc(preview.provenance.last_ts)}
@@ -114,42 +114,42 @@ export function SignalPreview({ state }: SignalPreviewProps) {
             )}
             {/* Metrics */}
             <div className="grid grid-cols-3 gap-3">
-              <div className="rounded-lg border border-border-default bg-bg-primary p-3 text-center">
-                <BarChart3 className="mx-auto h-5 w-5 text-text-muted mb-1" />
-                <p className="text-lg font-bold text-text-primary font-display">
+              <div className="rounded-lg border border-line bg-surface p-3 text-center">
+                <BarChart3 className="mx-auto h-5 w-5 text-ink-2 mb-1" />
+                <p className="text-lg font-bold text-ink-1 font-display">
                   {preview.metrics.trades}
                 </p>
-                <p className="text-xs text-text-muted">Trades</p>
+                <p className="text-xs text-ink-2">Trades</p>
               </div>
-              <div className="rounded-lg border border-border-default bg-bg-primary p-3 text-center">
-                <TrendingUp className="mx-auto h-5 w-5 text-text-muted mb-1" />
-                <p className="text-lg font-bold text-text-primary font-display">
+              <div className="rounded-lg border border-line bg-surface p-3 text-center">
+                <TrendingUp className="mx-auto h-5 w-5 text-ink-2 mb-1" />
+                <p className="text-lg font-bold text-ink-1 font-display">
                   {(preview.metrics.win_rate * 100).toFixed(1)}%
                 </p>
-                <p className="text-xs text-text-muted">Win Rate</p>
+                <p className="text-xs text-ink-2">Win Rate</p>
               </div>
-              <div className="rounded-lg border border-border-default bg-bg-primary p-3 text-center">
+              <div className="rounded-lg border border-line bg-surface p-3 text-center">
                 {preview.metrics.pnl >= 0 ? (
-                  <TrendingUp className="mx-auto h-5 w-5 text-status-success mb-1" />
+                  <TrendingUp className="mx-auto h-5 w-5 text-ink-1 mb-1" />
                 ) : (
-                  <TrendingDown className="mx-auto h-5 w-5 text-status-error mb-1" />
+                  <TrendingDown className="mx-auto h-5 w-5 text-danger mb-1" />
                 )}
                 <p
                   className={`text-lg font-bold font-display ${
-                    preview.metrics.pnl >= 0 ? 'text-status-success' : 'text-status-error'
+                    preview.metrics.pnl >= 0 ? 'text-ink-1' : 'text-danger'
                   }`}
                 >
                   ${preview.metrics.pnl.toFixed(2)}
                 </p>
-                <p className="text-xs text-text-muted">PnL</p>
+                <p className="text-xs text-ink-2">PnL</p>
               </div>
             </div>
 
             {/* Signal chart placeholder */}
-            <div className="rounded-lg border border-border-default bg-bg-primary p-4">
-              <h3 className="text-sm font-semibold text-text-primary mb-3">Signal Timeline</h3>
+            <div className="rounded-lg border border-line bg-surface p-4">
+              <h3 className="text-sm font-semibold text-ink-1 mb-3">Signal Timeline</h3>
               {preview.signals.length === 0 ? (
-                <p className="text-sm text-text-muted text-center py-4">
+                <p className="text-sm text-ink-2 text-center py-4">
                   No signals generated. Try adjusting your conditions.
                 </p>
               ) : (
@@ -169,22 +169,22 @@ export function SignalPreview({ state }: SignalPreviewProps) {
                           className={`inline-block w-2 h-2 rounded-full ${
                             isEntry
                               ? isLong
-                                ? 'bg-status-success'
-                                : 'bg-status-error'
-                              : 'bg-text-muted'
+                                ? 'bg-ink-1'
+                                : 'bg-danger'
+                              : 'bg-ink-2'
                           }`}
                         />
                         {/* Arrow indicator */}
-                        <span className={isLong ? 'text-status-success' : 'text-status-error'}>
+                        <span className={isLong ? 'text-ink-1' : 'text-danger'}>
                           {isEntry ? (isLong ? '\u2191' : '\u2193') : '\u2190'}
                         </span>
-                        <span className="text-text-muted w-32 shrink-0 font-mono">
+                        <span className="text-ink-2 w-32 max-lg:w-20 shrink-0 font-mono">
                           {new Date(signal.timestamp).toLocaleDateString()}
                         </span>
-                        <span className="text-text-secondary capitalize">
+                        <span className="text-ink-2 capitalize">
                           {signal.type.replace(/_/g, ' ')}
                         </span>
-                        <span className="text-text-primary font-medium ml-auto font-mono">
+                        <span className="text-ink-1 font-medium ml-auto font-mono">
                           ${signal.price.toFixed(2)}
                         </span>
                       </div>

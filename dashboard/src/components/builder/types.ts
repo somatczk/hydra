@@ -94,6 +94,7 @@ export interface BuilderState {
   strategyDescription: string;
   exchangeId: string;
   symbol: string;
+  baseline: string;
 }
 
 /* ---------- Preview types ---------- */
@@ -208,6 +209,7 @@ export type BuilderAction =
   | { type: 'SET_SIZING'; sizing: Partial<SizingConfig> }
   | { type: 'SET_ML_OVERLAY'; mlOverlay: MlOverlay | null }
   | { type: 'LOAD_STRATEGY'; payload: StrategyDetail }
+  | { type: 'MARK_CLEAN' }
   | { type: 'RESET' };
 
 export type RuleSection = 'entryLong' | 'exitLong' | 'entryShort' | 'exitShort';

@@ -32,6 +32,7 @@ const STATE: BuilderState = {
   strategyDescription: '',
   exchangeId: 'kraken',
   symbol: 'ETHUSDT',
+  baseline: '',
 };
 
 let page: Mounted | null = null;

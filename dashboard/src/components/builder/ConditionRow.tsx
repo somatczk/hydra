@@ -33,7 +33,7 @@ export function ConditionRow({
   }));
 
   return (
-    <div className="flex items-start gap-3 rounded-lg border border-border-default bg-bg-primary p-3">
+    <div className="flex items-start gap-3 rounded-lg border border-line bg-surface p-3">
       <div className="flex-1 grid grid-cols-1 gap-3 md:grid-cols-12">
         {/* Indicator picker: takes 5 cols */}
         <div className="md:col-span-5">
@@ -78,7 +78,7 @@ export function ConditionRow({
         variant="ghost"
         size="sm"
         onClick={onRemove}
-        className="mt-6 shrink-0"
+        className="mt-6 shrink-0 max-lg:h-11 max-lg:w-11"
         aria-label="Remove condition"
       >
         <X className="h-4 w-4" />

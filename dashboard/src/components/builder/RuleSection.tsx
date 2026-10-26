@@ -44,32 +44,32 @@ export function RuleSection({
   const conditionCount = group.conditions.length;
 
   return (
-    <div className="rounded-xl border border-border-default bg-bg-elevated overflow-hidden">
+    <div className="rounded-lg border border-line bg-raised overflow-hidden">
       {/* Header - always visible */}
       <button
         type="button"
-        className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-bg-hover transition-colors"
+        className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-hover transition-colors"
         onClick={() => setIsOpen(!isOpen)}
         aria-expanded={isOpen}
       >
         <div className={`h-3 w-3 rounded-full ${colorClass}`} />
         {isOpen ? (
-          <ChevronDown className="h-4 w-4 text-text-muted" />
+          <ChevronDown className="h-4 w-4 text-ink-2" />
         ) : (
-          <ChevronRight className="h-4 w-4 text-text-muted" />
+          <ChevronRight className="h-4 w-4 text-ink-2" />
         )}
         <div className="flex-1">
-          <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
-          <p className="text-xs text-text-muted">{description}</p>
+          <h2 className="text-sm font-semibold text-ink-1">{title}</h2>
+          <p className="text-xs text-ink-2">{description}</p>
         </div>
-        <span className="rounded-full bg-bg-tertiary px-2 py-0.5 text-xs font-medium text-text-muted">
+        <span className="rounded-full bg-surface px-2 py-0.5 text-xs font-medium text-ink-2">
           {conditionCount} {conditionCount === 1 ? 'condition' : 'conditions'}
         </span>
       </button>
 
       {/* Collapsible body */}
       {isOpen && (
-        <div className="border-t border-border-default px-4 py-4">
+        <div className="border-t border-line px-4 py-4">
           <ConditionBuilder
             group={group}
             indicators={indicators}
