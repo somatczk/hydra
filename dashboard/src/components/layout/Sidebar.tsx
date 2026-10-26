@@ -6,7 +6,7 @@ import { cn } from '@/components/ui/cn';
 import { HydraLogo } from '@/components/icons/HydraLogo';
 import { isActive, navItems } from './navItems';
 
-/** ≥1024 px rail: the five destinations; Research shows its children while active. */
+/** ≥1024 px rail: every destination (six, incl. the rail-only Activity); Research shows its children while active. */
 export function Sidebar() {
   const pathname = usePathname();
 

@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { ActivityLog, actorLabel, type RiskEvent } from '@/components/risk/ActivityLog';
+import Link from 'next/link';
+import { actorLabel, type RiskEvent } from '@/components/activity/ActivityLog';
 import { BreakerTable } from '@/components/risk/BreakerTable';
 import { LimitsSheet } from '@/components/risk/LimitsSheet';
 import { KillSwitchControl } from '@/components/shell/KillSwitchControl';
@@ -89,7 +90,6 @@ export default function RiskPage() {
   const st = status.data;
   const ks = live.data?.kill_switch_state ?? (live.state === 'loading' ? 'loading' : 'unknown');
   const activeTier = st?.restrictions?.active_tier ?? live.data?.circuit_breaker_restrictions?.active_tier ?? 0;
-  const tierLabels = Object.fromEntries((st?.circuit_breakers ?? []).map((b) => [b.tier, b.label]));
   const lastKs = events.data?.find((e) => e.kind === 'kill_switch_on' || e.kind === 'kill_switch_off');
   const onSince = lastKs?.kind === 'kill_switch_on' ? lastKs : undefined;
   const resetTier = typeof dialog === 'number' ? dialog : 0;
@@ -310,16 +310,15 @@ export default function RiskPage() {
 
       <section id="activity" aria-labelledby="activity-h" className="scroll-mt-20">
         <DataCard>
-          <h2 id="activity-h" className="mb-3 text-sm font-semibold text-ink-1">
-            Activity log
+          <h2 id="activity-h" className="text-sm font-semibold text-ink-1">
+            Recent risk events
           </h2>
-          {events.data ? (
-            <ActivityLog events={events.data} now={now} tierLabels={tierLabels} />
-          ) : events.state === 'loading' ? (
-            <p className="text-sm text-ink-2">Loading…</p>
-          ) : (
-            <DataStateErrorCard error={events.error} fallback="Risk events could not be loaded" onRetry={() => void events.refetch()} />
-          )}
+          <p className="mt-2 text-sm text-ink-2">
+            The full trail — Claude&apos;s actions, approvals and every risk event — lives on{' '}
+            <Link href="/activity" className="text-accent hover:underline">
+              Activity ›
+            </Link>
+          </p>
         </DataCard>
       </section>
 

@@ -18,7 +18,8 @@ const { AppLayout } = await import('./AppLayout');
 const { ThemeProvider } = await import('./ThemeProvider');
 const { isActive, navItems, pageTitle } = await import('./navItems');
 
-const LABELS = ['Status', 'Sessions', 'Risk', 'Research', 'Settings'];
+const RAIL = ['Status', 'Sessions', 'Risk', 'Activity', 'Research', 'Settings'];
+const TABS = ['Status', 'Sessions', 'Risk', 'Research', 'Settings'];
 const SRC = path.join(process.cwd(), 'src');
 
 let m: Mounted;
@@ -43,10 +44,10 @@ async function bars(at: string) {
 }
 
 describe('navigation', () => {
-  it('renders the same five destinations in the same order in the rail and the tab bar', async () => {
+  it('renders six destinations in the rail (Activity rail-only between Risk and Research) and exactly five in the tab bar', async () => {
     const { rail, tabs } = await bars('/');
-    expect(topLabels(rail)).toEqual(LABELS);
-    expect(topLabels(tabs)).toEqual(LABELS);
+    expect(topLabels(rail)).toEqual(RAIL);
+    expect(topLabels(tabs)).toEqual(TABS);
     for (const a of tabs.querySelectorAll('a')) expect(a.className).toContain('min-h-14');
     expect(m.container.textContent).not.toMatch(/More|Models/);
   });
@@ -60,10 +61,19 @@ describe('navigation', () => {
     ['/builder', 'Research'],
     ['/templates', 'Research'],
     ['/settings', 'Settings'],
-  ])('marks %s as under %s', async (at, label) => {
+  ])('marks %s as under %s in both the rail and the tab bar', async (at, label) => {
     const { rail, tabs } = await bars(at);
     expect(current(tabs)).toEqual([label]);
     expect(current(rail)).toEqual([label]);
+  });
+
+  it.each([
+    ['/activity', 'Activity'],
+    ['/activity/approvals/abc', 'Activity'],
+  ])('marks the rail-only %s only in the rail, never in the tab bar', async (at, label) => {
+    const { rail, tabs } = await bars(at);
+    expect(current(rail)).toEqual([label]);
+    expect(current(tabs)).toEqual([]);
   });
 
   it('shows Research children in the rail only while Research is active, marking the child', async () => {
@@ -75,10 +85,11 @@ describe('navigation', () => {
     expect(rail.textContent).not.toContain('Backtests');
   });
 
-  it('matches nothing for routes outside the five destinations', () => {
+  it('matches nothing for routes outside the destinations', () => {
     expect(navItems.filter((item) => isActive('/models', item))).toEqual([]);
     expect(navItems.filter((item) => isActive('/', item)).map((i) => i.label)).toEqual(['Status']);
     expect(navItems.filter((item) => isActive('/riskier', item))).toEqual([]);
+    expect(navItems.filter((item) => isActive('/activity', item)).map((i) => i.label)).toEqual(['Activity']);
   });
 
   it('has no single-key shortcuts left (WCAG 2.1.4)', () => {
@@ -99,7 +110,7 @@ describe('shell tab order', () => {
       (el) => el.tabIndex >= 0 && !el.closest('dialog:not([open])') && !(el as HTMLButtonElement).disabled,
     );
 
-  it.each(['/', '/trading', '/trading/abc', '/risk', '/strategies', '/backtest', '/portfolio', '/settings', '/models'])(
+  it.each(['/', '/trading', '/trading/abc', '/risk', '/activity', '/strategies', '/backtest', '/portfolio', '/settings', '/models'])(
     'reaches the kill-switch control second on %s, before the nav and main',
     async (at) => {
       pathname = at;
@@ -141,5 +152,6 @@ describe('pageTitle', () => {
     expect(isActive('/portfolio', navItems[0])).toBe(true);
     expect(pageTitle('/')).toBe('Status');
     expect(pageTitle('/backtest/abc')).toBe('Research');
+    expect(pageTitle('/activity/approvals/abc')).toBe('Activity');
   });
 });

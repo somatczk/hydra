@@ -4,6 +4,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { Copy } from 'lucide-react';
+import { ActorChip } from '@/components/activity/ActorChip';
 import { QuickTrade } from '@/components/sessions/QuickTrade';
 import { SessionHealth } from '@/components/sessions/SessionHealth';
 import { StopSessionDialog } from '@/components/sessions/StopSessionDialog';
@@ -217,6 +218,7 @@ export default function SessionDetailPage() {
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-xl font-semibold text-ink-1">{name}</h1>
           <StatusBadge status={d.status} variant={d.status === 'error' ? 'error' : d.status === 'running' ? 'info' : 'neutral'} />
+          <ActorChip actor={d.created_by} />
           {poll.state === 'stale' && poll.fetchedAt !== null && <DataStateBadge state="stale" reason={`Session as of ${utc(poll.fetchedAt)}`} />}
           {running && (
             <Button variant="secondary" onClick={() => setStopping(true)}>

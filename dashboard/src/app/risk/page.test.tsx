@@ -408,24 +408,24 @@ describe('value at risk', () => {
   });
 });
 
-describe('activity log', () => {
-  it('writes events as sentences with the raw kind and details one click away', async () => {
+describe('activity link block', () => {
+  it('links to Activity instead of rendering the log', async () => {
     const c = await open({
       '/api/risk/events?limit=500': [
         KS_ON_EVENT,
         { id: 6, ts: '2026-10-21T11:00:00Z', scope: 'global', kind: 'cb_escalate', tier: 3, actor: 'risk_engine', reason: 'drawdown', details: { text: '10.5% of 10%' } },
       ],
     });
-    const log = c.querySelector('#activity')?.textContent ?? '';
-    expect(log).toContain('Kill switch turned on');
-    expect(log).toContain('Breaker moved to tier 3: Flatten all sessions');
-    expect(log).toContain('by engine (automatic)');
-    expect(log).toContain('cb_escalate');
-    expect(log).toContain('{"text":"10.5% of 10%"}');
+    const block = c.querySelector('#activity');
+    expect(block?.querySelector('a[href="/activity"]')?.textContent).toContain('Activity ›');
+    expect(block?.querySelectorAll('details')).toHaveLength(0);
+    expect(block?.textContent).not.toContain('Kill switch turned on');
+    expect(block?.textContent).not.toContain('cb_escalate');
   });
 
-  it('shows the empty copy', async () => {
-    const c = await open({ '/api/risk/events?limit=500': [] });
-    expect(c.querySelector('#activity')?.textContent).toContain('No risk events yet.');
+  it('still reads recent events for the kill-switch on-since line', async () => {
+    ksState = 'active';
+    const c = await open();
+    expect(c.querySelector('#kill-switch')?.textContent).toContain('by you · via Hydra');
   });
 });

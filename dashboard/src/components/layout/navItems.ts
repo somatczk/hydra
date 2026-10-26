@@ -1,6 +1,7 @@
 import {
   CandlestickChart,
   FlaskConical,
+  History,
   LayoutDashboard,
   Settings,
   ShieldAlert,
@@ -11,16 +12,19 @@ export interface NavItem {
   label: string;
   href: string;
   icon: LucideIcon;
+  /** Rail-only (03 §3): the phone tab bar slices these out, so the rail can hold more than five destinations. */
+  railOnly?: boolean;
   /** Other routes that live under this destination (03 §3). */
   under?: string[];
   children?: Array<{ label: string; href: string }>;
 }
 
-/** The five destinations; the rail and the tab bar both render exactly this list. */
+/** The destinations; the rail renders all of them, the tab bar only the non-railOnly ones. */
 export const navItems: NavItem[] = [
   { label: 'Status', href: '/', icon: LayoutDashboard, under: ['/portfolio'] },
   { label: 'Sessions', href: '/trading', icon: CandlestickChart },
   { label: 'Risk', href: '/risk', icon: ShieldAlert },
+  { label: 'Activity', href: '/activity', icon: History, railOnly: true },
   {
     label: 'Research',
     href: '/strategies',

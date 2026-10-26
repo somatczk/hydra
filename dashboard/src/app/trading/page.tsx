@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
 import { StopSessionDialog } from '@/components/sessions/StopSessionDialog';
 import { useOutcomeSlot } from '@/components/sessions/useOutcomeSlot';
+import { ActorChip } from '@/components/activity/ActorChip';
 import { useShellStatus } from '@/components/shell/ShellStatusProvider';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
@@ -109,6 +110,7 @@ function PhoneList({ rows }: { rows: RowData[] }) {
             <span className="flex items-center gap-2 font-semibold text-ink-1">
               {sessionName(r.session)}
               {r.holds && <HeldChip text={r.holds} />}
+              <ActorChip actor={r.session.created_by} />
             </span>
             <span className="text-sm text-ink-2">
               {r.market} · {r.since}
@@ -151,7 +153,7 @@ function DesktopTable({ rows, onStop }: { rows: RowData[]; onStop: (s: SessionRe
                 <Link href={`/trading/${r.session.session_id}`} className="font-semibold underline">
                   {sessionName(r.session)}
                 </Link>{' '}
-                {r.holds && <HeldChip text={r.holds} />}
+                {r.holds && <HeldChip text={r.holds} />} <ActorChip actor={r.session.created_by} />
               </td>
               <td className="px-3 py-2 text-ink-2">
                 {r.market} · {r.since}

@@ -146,9 +146,14 @@ describe('Header', () => {
     expect(header()).toContain('Stored mode is live; live trading is refused until a later release. Showing paper.');
   });
 
-  it('polls live-status, sessions and config from the shell only', async () => {
+  it('polls live-status, sessions, config and pending approvals from the shell only', async () => {
     setup();
     m = await shell();
-    expect(calls.map((c) => c.path).sort()).toEqual(['/api/risk/live-status', '/api/system/config', '/api/trading/sessions']);
+    expect(calls.map((c) => c.path).sort()).toEqual([
+      '/api/activity/approvals',
+      '/api/risk/live-status',
+      '/api/system/config',
+      '/api/trading/sessions',
+    ]);
   });
 });

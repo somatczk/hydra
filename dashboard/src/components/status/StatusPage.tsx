@@ -248,7 +248,7 @@ function Equity() {
 export function StatusPage() {
   const shell = useShellStatus();
   const desktop = useDesktop();
-  const { live, sessions, config, needs, now } = shell;
+  const { live, sessions, config, approvals, needs, now } = shell;
   const risk = usePoll<RiskStatusLite>('/api/risk/status', 10_000);
   const readiness = usePoll<ReadinessLite>('/api/system/readiness', 15_000);
   // shortcut: counts at most the newest 500 events, replace with a server-side since= filter when one exists.
@@ -259,7 +259,7 @@ export function StatusPage() {
   const run = runningAnswer(sessions);
   const safe = safeAnswer(live, risk, now);
   const data = dataView(sessions, details, ready, now, readiness);
-  const need = needsAnswer(needs, [live, sessions, config].some((p) => p.state === 'loading'));
+  const need = needsAnswer(needs, [live, sessions, config, approvals].some((p) => p.state === 'loading'));
   const hist = recentEvents(events.data, now);
 
   return (
@@ -277,7 +277,7 @@ export function StatusPage() {
           <Section title="Needs you" id="needs-you">
             <AttentionList
               needs={needs}
-              loading={[live, sessions, config].some((p) => p.state === 'loading')}
+              loading={[live, sessions, config, approvals].some((p) => p.state === 'loading')}
               history={
                 hist === null ? (
                   'Risk events couldn’t be read.'
@@ -286,7 +286,7 @@ export function StatusPage() {
                 ) : (
                   <>
                     Since yesterday: {plural(hist, 'risk event')} ·{' '}
-                    <Link href="/risk#activity" className="text-accent hover:underline">Activity log ›</Link>
+                    <Link href="/activity" className="text-accent hover:underline">Activity log ›</Link>
                   </>
                 )
               }

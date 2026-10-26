@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './api';
 import {
+  approvalOutcome,
   breakerResetOutcome,
   copyForCode,
   killSwitchOutcome,
@@ -12,6 +13,8 @@ import {
   startOutcome,
   stopOutcome,
   tryClosingOutcome,
+  type ApproveResponse,
+  type DenyResponse,
   type KillSwitchResponse,
   type Outcome,
   type QuickTradeRequest,
@@ -331,5 +334,87 @@ describe('risk outcomes', () => {
     expect(ledgerResetOutcome({ err: envelope(503, 'paper_reset_unavailable', 'x', 'unavailable') }).title).toBe('Not reset.');
     expect(limitsOutcome({ err: envelope(503, 'risk_reload_failed', 'x', 'unavailable') }).title).toBe('Saved, but not in force.');
     expect(limitsOutcome({ ok: {} }).title).toBe('Limits saved.');
+  });
+});
+
+describe('approvalOutcome', () => {
+  const approved: ApproveResponse = {
+    executed: true,
+    result: { active: false },
+    actor: 'service:mcp',
+    approved_by: 'user:soma',
+  };
+  const denied: DenyResponse = { id: '3f0b9e2a', status: 'denied' };
+
+  it('approve: the double attribution names both actors (F8 trail attribution)', () => {
+    const o = approvalOutcome({ ok: approved });
+    expect(o.title).toBe('Released by Claude, approved by you.');
+    expect(o.lines).toEqual(['Trading can resume. No sessions were restarted.']);
+    expect(o.tone).toBe('none');
+  });
+
+  it('deny: state, then consequence', () => {
+    const o = approvalOutcome({ ok: denied });
+    expect(text(o)).toBe('Denied. Claude can ask again.');
+  });
+
+  it('wrong code: the frozen sentence inline, with the attempts left (422 code_mismatch)', () => {
+    const o = approvalOutcome({ err: envelope(422, 'code_mismatch', "That code didn't match. Nothing changed.", 'invalid', { attempts_left: 4 }) });
+    expect(o.inline).toBe(true);
+    expect(o.title).toBe("That code didn't match. Nothing changed.");
+    expect(o.lines).toEqual(['4 attempts left.']);
+    expect(approvalOutcome({ err: envelope(422, 'code_mismatch', "That code didn't match. Nothing changed.", 'invalid', { attempts_left: 1 }) }).lines).toEqual([
+      '1 attempt left.',
+    ]);
+  });
+
+  it('a service principal is refused with the server message inline (403)', () => {
+    const o = approvalOutcome({
+      err: envelope(403, 'principal_not_allowed', 'Only a signed-in person can approve or deny; service principals cannot', 'forbidden'),
+    });
+    expect(o.inline).toBe(true);
+    expect(o.title).toBe('Only a signed-in person can approve or deny; service principals cannot');
+  });
+
+  it('an executor failure says the approved action did not run and asks for a new one', () => {
+    const o = approvalOutcome({ err: envelope(503, 'approval_execution_failed', "The approved action 'kill_switch_release' did not run: boom", 'unavailable') });
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe("Approved, but it didn't run.");
+    expect(o.lines).toEqual(["The approved action 'kill_switch_release' did not run: boom", 'Ask for a new one.']);
+  });
+
+  it('a decision that happened elsewhere and an engine outage', () => {
+    const decided = approvalOutcome({ err: envelope(409, 'already_decided', 'This approval was already approved', 'invalid') });
+    expect(decided.tone).toBe('caution');
+    expect(decided.title).toBe('This approval was already approved');
+    const outage = approvalOutcome({ err: envelope(503, 'engine_not_ready', 'x', 'unavailable') });
+    expect(outage.title).toBe('Not confirmed.');
+    expect(text(outage)).toContain("We couldn't reach the engine, so we don't know whether the code was accepted");
+  });
+
+  it('a 409 executor_not_registered names the state and carries the server message, never an outage (A1)', () => {
+    const o = approvalOutcome({
+      err: envelope(
+        409,
+        'executor_not_registered',
+        "No executor is registered for 'kill_switch_release'; the approval stays pending and the code was not used",
+        'invalid',
+        { action: 'kill_switch_release' },
+      ),
+    });
+    expect(o.tone).toBe('caution');
+    expect(o.title).toBe('The engine cannot execute this action yet.');
+    expect(o.lines).toEqual([
+      "No executor is registered for 'kill_switch_release'; the approval stays pending and the code was not used",
+      'The code was not used. Wait for the engine, or deny this request.',
+    ]);
+    expect(text(o)).not.toContain("couldn't reach the engine");
+  });
+
+  it('a network-failed deny says the denial is unknown and never speaks of a code (A5)', () => {
+    const o = approvalOutcome({ err: new TypeError('Failed to fetch') }, 'deny');
+    expect(o.title).toBe('Not confirmed.');
+    expect(text(o)).toContain("We couldn't reach the engine, so we don't know whether the denial was recorded");
+    expect(text(o)).not.toContain('the code');
   });
 });

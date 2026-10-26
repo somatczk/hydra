@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  actionPhrase,
   breakerRow,
   dataAnswer,
   fillQty,
@@ -12,9 +13,10 @@ import {
   stopRuleLabel,
   timeframeSeconds,
   winRate,
+  type PendingApproval,
   type SessionDetail,
 } from './derive';
-import { breaker, detail, liveStatus, paperFill, platformConfig, session } from '@/test/fixtures';
+import { breaker, detail, liveStatus, paperFill, pendingApproval, platformConfig, session } from '@/test/fixtures';
 
 const NOW = Date.parse('2026-10-21T14:40:00Z');
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
@@ -123,7 +125,7 @@ describe('holders and targets', () => {
 });
 
 describe('needsYou', () => {
-  const base = { sessions: [session()], live: liveStatus(), config: platformConfig(), ksNotSaved: false };
+  const base = { sessions: [session()], live: liveStatus(), config: platformConfig(), ksNotSaved: false, approvals: [] as PendingApproval[] };
 
   it('ignores protection failures: they live on session health (case 9)', () => {
     expect(needsYou(base)).toEqual({ items: [], count: 0, unavailable: [] });
@@ -131,6 +133,7 @@ describe('needsYou', () => {
 
   it('counts a stopped holder, tier 3, an unsaved kill switch and pending capital, in order', () => {
     const r = needsYou({
+      ...base,
       sessions: [session({ status: 'stopped', positions_at_stop: 1, flatten_incomplete: true, persist_error: 'db down' })],
       live: liveStatus({ circuit_breaker_restrictions: { ...liveStatus().circuit_breaker_restrictions!, active_tier: 3 } }),
       config: platformConfig({ paper_capital_pending: 12000 }),
@@ -164,6 +167,35 @@ describe('needsYou', () => {
     expect(needsYou({ ...base, config: null })).toMatchObject({ count: null, unavailable: ['settings'] });
     const noBreakers = liveStatus({ circuit_breaker_restrictions: null, circuit_breakers_state: 'unavailable' });
     expect(needsYou({ ...base, live: noBreakers })).toMatchObject({ count: null, unavailable: ['breakers'] });
+  });
+
+  it('lists a pending approval above every other need, with its age (06 §2)', () => {
+    const approval = pendingApproval({ requested_at: ago(2 * MIN) });
+    const r = needsYou({
+      ...base,
+      approvals: [approval],
+      sessions: [session({ status: 'error', error_message: 'feed died' })],
+      now: NOW,
+    });
+    expect(r.count).toBe(2);
+    expect(r.items.map((i) => i.kind)).toEqual(['approval', 'error']);
+    expect(r.items[0]).toEqual({
+      kind: 'approval',
+      text: 'Claude asks to release the kill switch · 2 min ago',
+      href: `/activity/approvals/${approval.id}`,
+    });
+  });
+
+  it('never counts unknown approvals as none', () => {
+    const r = needsYou({ ...base, approvals: null });
+    expect(r.count).toBeNull();
+    expect(r.unavailable).toContain('approvals');
+    expect(r.items).toEqual([]);
+  });
+
+  it('phrases the gated action and falls back to a spaced action', () => {
+    expect(actionPhrase('kill_switch_release')).toBe('release the kill switch');
+    expect(actionPhrase('some_future_action')).toBe('some future action');
   });
 });
 

@@ -1,6 +1,15 @@
 /** Response bodies as the engine serialises them at main; each builder cites its model. */
 
-import type { CircuitBreaker, LiveStatus, PlatformConfig, SessionDetail, SessionResponse, TradeItem } from '@/lib/derive';
+import type {
+  ApprovalDetail,
+  CircuitBreaker,
+  LiveStatus,
+  PendingApproval,
+  PlatformConfig,
+  SessionDetail,
+  SessionResponse,
+  TradeItem,
+} from '@/lib/derive';
 
 /** trading.py:56-75 SessionResponse, filled by `_session_to_dict` (trading.py:250-265) — no A3+ fields. */
 export function session(over: Partial<SessionResponse> = {}): SessionResponse {
@@ -94,4 +103,24 @@ export function breaker(over: Partial<CircuitBreaker> = {}): CircuitBreaker {
 /** system.py:298-309 PlatformConfig (only the fields the UI reads). */
 export function platformConfig(over: Partial<PlatformConfig> = {}): PlatformConfig {
   return { trading_mode: 'paper', paper_capital: 10000, paper_capital_pending: null, ...over };
+}
+
+/** routes/activity.py PendingApproval (activity.py:80-88); the actor is always 'service:mcp'. */
+export function pendingApproval(over: Partial<PendingApproval> = {}): PendingApproval {
+  return {
+    id: '3f0b9e2a-1000-4000-8000-000000000001',
+    actor: 'service:mcp',
+    action: 'kill_switch_release',
+    reason: 'drawdown recovered, resume trading',
+    params: { reason: 'drawdown recovered, resume trading' },
+    requested_at: '2026-10-21T13:50:04+00:00',
+    expires_at: '2026-10-21T14:00:04+00:00',
+    status: 'pending',
+    ...over,
+  };
+}
+
+/** routes/activity.py ApprovalDetail (activity.py:91-95). */
+export function approvalDetail(over: Partial<ApprovalDetail> = {}): ApprovalDetail {
+  return { ...pendingApproval(), attempts_left: 5, approved_by: null, decided_at: null, error: null, ...over };
 }

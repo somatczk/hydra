@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { usePoll, type Poll } from '@/hooks/usePoll';
-import { needsYou, type LiveStatus, type NeedsYou, type PlatformConfig, type SessionResponse } from '@/lib/derive';
+import { needsYou, type LiveStatus, type NeedsYou, type PendingApproval, type PlatformConfig, type SessionResponse } from '@/lib/derive';
 import type { Outcome } from '@/lib/outcomes';
 
 /** The last shell outcome; `ksOn` marks one that claims the kill switch is on (C-KS-6 watches it). */
@@ -16,6 +16,7 @@ export interface ShellStatus {
   live: Poll<LiveStatus>;
   sessions: Poll<SessionResponse[]>;
   config: Poll<PlatformConfig>;
+  approvals: Poll<PendingApproval[]>;
   needs: NeedsYou;
   ksNotSaved: boolean;
   setKsNotSaved: (notSaved: boolean) => void;
@@ -38,7 +39,7 @@ const DISAGREE: Outcome = {
   tone: 'caution',
   title: 'The engine now reports the kill switch as off.',
   lines: ['It may have been released elsewhere. Check the activity log.'],
-  actions: [{ kind: 'open', label: 'Open activity log', href: '/risk#activity' }],
+  actions: [{ kind: 'open', label: 'Open activity log', href: '/activity' }],
 };
 
 const NOT_SAVED_KEY = 'hydra-ks-not-saved';
@@ -53,11 +54,12 @@ function storeNotSaved(since: number | null) {
   }
 }
 
-/** The only place live-status, the session list and the system config are polled. */
+/** The only place live-status, the session list, the system config and the pending approvals are polled. */
 export function ShellStatusProvider({ children }: { children: ReactNode }) {
   const live = usePoll<LiveStatus>('/api/risk/live-status', 10_000);
   const sessions = usePoll<SessionResponse[]>('/api/trading/sessions', 10_000);
   const config = usePoll<PlatformConfig>('/api/system/config', 30_000);
+  const approvals = usePoll<PendingApproval[]>('/api/activity/approvals', 15_000);
   const [notSavedSince, setNotSavedSince] = useState<number | null>(null);
   const [outcome, setOutcomeState] = useState<ShellOutcome | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -100,19 +102,28 @@ export function ShellStatusProvider({ children }: { children: ReactNode }) {
   const { refetch: refetchLive } = live;
   const { refetch: refetchSessions } = sessions;
   const { refetch: refetchConfig } = config;
+  const { refetch: refetchApprovals } = approvals;
   const refetchAll = useCallback(async () => {
-    await Promise.all([refetchLive(), refetchSessions(), refetchConfig()]);
-  }, [refetchLive, refetchSessions, refetchConfig]);
+    await Promise.all([refetchLive(), refetchSessions(), refetchConfig(), refetchApprovals()]);
+  }, [refetchLive, refetchSessions, refetchConfig, refetchApprovals]);
 
   const ksNotSaved = notSavedSince !== null;
   const needs = useMemo(
-    () => needsYou({ sessions: sessions.data, live: live.data, config: config.data, ksNotSaved }),
-    [sessions.data, live.data, config.data, ksNotSaved],
+    () =>
+      needsYou({
+        sessions: sessions.data,
+        live: live.data,
+        config: config.data,
+        ksNotSaved,
+        approvals: approvals.data,
+        now,
+      }),
+    [sessions.data, live.data, config.data, ksNotSaved, approvals.data, now],
   );
 
   return (
     <ShellStatusContext.Provider
-      value={{ live, sessions, config, needs, ksNotSaved, setKsNotSaved, outcome, setOutcome, refetchAll, now }}
+      value={{ live, sessions, config, approvals, needs, ksNotSaved, setKsNotSaved, outcome, setOutcome, refetchAll, now }}
     >
       {children}
     </ShellStatusContext.Provider>

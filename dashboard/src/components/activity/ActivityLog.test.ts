@@ -11,6 +11,12 @@ describe('eventSentence', () => {
     [ev('cb_reset', 2), 'Breaker tier 2 reset'],
     [ev('cb_auto_reset', 1), 'Breaker tier 1 reset automatically'],
     [ev('paper_reset'), 'Paper ledger reset'],
+    [ev('approval_requested', null, { approval_id: 'a', action: 'kill_switch_release' }), 'Asked to release the kill switch'],
+    [ev('approval_approved', null, { approval_id: 'a', action: 'kill_switch_release' }), 'Approved: release the kill switch'],
+    [ev('approval_denied', null, { approval_id: 'a', action: 'kill_switch_release' }), 'Denied: release the kill switch'],
+    [ev('approval_expired'), 'Approval expired'],
+    [ev('approval_failed'), 'Approval failed'],
+    [ev('approval_requested', null, {}), 'Approval requested'],
     [ev('never_seen_before'), 'never_seen_before'],
   ])('%j', (e, text) => {
     expect(eventSentence(e)).toBe(text);
@@ -26,6 +32,8 @@ describe('actorLabel', () => {
   it('maps known actors and shows others verbatim', () => {
     expect(actorLabel('user:soma')).toBe('you');
     expect(actorLabel('service:api-token')).toBe('API token');
-    expect(actorLabel('service:mcp')).toBe('service:mcp');
+    expect(actorLabel('service:mcp')).toBe('Claude');
+    expect(actorLabel('risk_engine')).toBe('engine (automatic)');
+    expect(actorLabel('user:someone-else')).toBe('user:someone-else');
   });
 });

@@ -13,9 +13,11 @@ vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast: vi.fn() }) }
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: vi.fn() }),
   useSearchParams: () => new URLSearchParams(),
+  useParams: () => ({ id: 'a1b2c3d4-0000-4000-8000-000000000001' }),
 }));
 
 const { ThemeProvider } = await import('@/components/layout/ThemeProvider');
+const { ShellStatusProvider } = await import('@/components/shell/ShellStatusProvider');
 const pages: Array<[string, () => Promise<{ default: () => ReactNode }>]> = [
   ['/portfolio', () => import('@/app/portfolio/page')],
   ['/settings', () => import('@/app/settings/page')],
@@ -25,6 +27,8 @@ const pages: Array<[string, () => Promise<{ default: () => ReactNode }>]> = [
   ['/models', () => import('@/app/models/page')],
   ['/builder', () => import('@/app/builder/page')],
   ['/templates', () => import('@/app/templates/page')],
+  ['/activity', () => import('@/app/activity/page')],
+  ['/activity/approvals/[id]', () => import('@/app/activity/approvals/[id]/page')],
 ];
 
 let page: Mounted | null = null;
@@ -173,9 +177,11 @@ async function axeViolations(load: () => Promise<{ default: () => ReactNode }>) 
   const { default: Page } = await load();
   page = await mount(
     <ThemeProvider>
-      <main>
-        <Page />
-      </main>
+      <ShellStatusProvider>
+        <main>
+          <Page />
+        </main>
+      </ShellStatusProvider>
     </ThemeProvider>,
   );
   const results = await axe.run(page.container, {
