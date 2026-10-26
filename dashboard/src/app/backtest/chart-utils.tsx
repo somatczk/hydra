@@ -5,6 +5,42 @@ export interface EquityPoint {
   value: number;
 }
 
+export interface ChartColors {
+  /** Primary series: strategy equity, compare run A. */
+  accent: string;
+  /** Second series: compare run B. */
+  caution: string;
+  /** Reference series: benchmark equity. */
+  muted: string;
+  grid: string;
+  text: string;
+}
+
+/** globals.css light-theme hexes, used when the CSS variables cannot be read (test environments). */
+const COLOR_TOKENS: Record<keyof ChartColors, [string, string]> = {
+  accent: ['--accent', '#3949c7'],
+  caution: ['--caution', '#8a5700'],
+  muted: ['--line-strong', '#8a8d97'],
+  grid: ['--line', '#e3e5ea'],
+  text: ['--ink-2', '#555863'],
+};
+
+/** Design tokens read at render time, so a theme switch is reflected; hexes when the variables are absent. */
+export function chartColors(): ChartColors {
+  const style = typeof document === 'undefined' ? null : getComputedStyle(document.documentElement);
+  const read = (name: keyof ChartColors): string => {
+    const [token, hex] = COLOR_TOKENS[name];
+    return style?.getPropertyValue(token).trim() || hex;
+  };
+  return {
+    accent: read('accent'),
+    caution: read('caution'),
+    muted: read('muted'),
+    grid: read('grid'),
+    text: read('text'),
+  };
+}
+
 export function aggregateEquityCurve(data: EquityPoint[], resolution: TimeResolution): EquityPoint[] {
   if (resolution === 'hours') return data;
 
@@ -31,19 +67,5 @@ export function formatXTick(timestamp: string, resolution: TimeResolution = 'day
 }
 
 export function formatYTick(value: number): string {
-  return `$${(value / 1000).toFixed(0)}k`;
-}
-
-export function makeCustomTooltip(resolution: TimeResolution) {
-  return function CustomTooltip({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number }>; label?: string }) {
-    if (!active || !payload?.length) return null;
-    return (
-      <div className="rounded-lg border border-border-default bg-bg-elevated px-3 py-2 shadow-lg">
-        <p className="text-xs text-text-muted">{label ? formatXTick(label, resolution) : ''}</p>
-        <p className="text-sm font-medium text-text-primary">
-          ${payload[0].value.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-        </p>
-      </div>
-    );
-  };
+  return `${(value / 1000).toFixed(0)}k`;
 }
