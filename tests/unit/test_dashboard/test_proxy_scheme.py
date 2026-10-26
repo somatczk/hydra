@@ -95,6 +95,14 @@ def test_garbage_proto_leaves_the_scheme_alone(trusted_proxy: HydraConfig, proto
         assert resp.headers["location"].startswith("http://"), (path, resp.headers["location"])
 
 
+def test_trusted_peer_without_proto_header_stays_http(trusted_proxy: HydraConfig) -> None:
+    """No ``X-Forwarded-Proto`` from the trusted peer: direct ``:8000`` traffic stays ``http``."""
+    client = TestClient(app, client=TRAEFIK)
+    resp = _redirect(client, NO_SLASH_MCP, {"Remote-User": "soma"})
+    assert resp.status_code == 307
+    assert resp.headers["location"].startswith("http://")
+
+
 def test_duplicate_proto_from_the_trusted_peer_is_refused(trusted_proxy: HydraConfig) -> None:
     client = TestClient(app, client=TRAEFIK)
     resp: Response = client.get(

@@ -279,7 +279,9 @@ class ProxySchemeMiddleware:
     https site. When the TCP peer is a trusted proxy and a single ``X-Forwarded-Proto``
     header says exactly ``https`` or ``http``, the scope scheme is corrected before the
     router sees it. ``scope['client']`` is never touched; any other header value changes
-    nothing, and a duplicate header is refused 400 like every other trusted header.
+    nothing, and a duplicate header is refused 400 on every ``http`` path — including the
+    public and MCP paths auth skips, since this middleware checks no paths (fail-closed;
+    unreachable in production, where Traefik sends exactly one).
     """
 
     def __init__(self, app: ASGIApp) -> None:
