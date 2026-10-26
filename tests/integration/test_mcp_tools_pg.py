@@ -390,8 +390,9 @@ async def test_gated_kill_switch_release_writes_the_risk_event_rows(
     """The gated flow end to end on a real database: a session started through the
     service persists ``created_by``; ``kill_switch_on`` latches (and persists); the
     gated ``kill_switch_release`` creates an approval without releasing; approving it
-    through the activity route runs the release, and ``approval_requested`` then
-    ``kill_switch_off`` land in ``risk_events`` attributed ``service:mcp``."""
+    through the activity route runs the release, and the whole sequence — latch, the
+    stopped session's PnL carry (``session_carried``, risk_engine), request, approval,
+    release — lands in ``risk_events`` in order."""
     monkeypatch.setenv("HYDRA_API__AUTH_MODE", "dev")  # survives _bind_engine_state
     cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
     monkeypatch.setattr(engine_app.state, "approval_store", None, raising=False)
@@ -441,16 +442,18 @@ async def test_gated_kill_switch_release_writes_the_risk_event_rows(
         assert not mgr.kill_switch_active()
 
         rows = await fetch_risk_events(pool, 20)  # newest first
-        assert [r.kind for r in rows[:4]] == [
+        assert [r.kind for r in rows[:5]] == [
             "kill_switch_off",
             "approval_approved",
             "approval_requested",
+            "session_carried",
             "kill_switch_on",
         ]
-        assert [r.actor for r in rows[:4]] == [
+        assert [r.actor for r in rows[:5]] == [
             "service:mcp",
             "dev:dev",
             "service:mcp",
+            "risk_engine",
             "service:mcp",
         ]
     finally:
