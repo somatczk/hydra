@@ -1,4 +1,5 @@
-"""The 21 research + strategy MCP tools, called through the mounted transport.
+"""The 31 MCP tools (21 research + strategy, 10 session + risk), called through the
+mounted transport.
 
 Every test drives the real JSON-RPC surface — initialize, notifications/initialized,
 tools/list, tools/call — over the real mount (token gate, SDK streamable-HTTP app)
@@ -11,10 +12,12 @@ internal error.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +33,11 @@ from hydra.core.config import HydraConfig
 from hydra.core.logging import get_logger
 from hydra.dashboard import security
 from hydra.dashboard.api import app as engine_app
-from hydra.dashboard.mcp import mount_mcp, server
+from hydra.dashboard.mcp import mount_mcp
 from hydra.dashboard.security import install_security
 from hydra.execution.errors import ConfigReloadRefusedError
 from hydra.services import strategies as strategy_svc
-from tests.unit.test_execution.session_harness import Harness, write_strategy
+from tests.unit.test_execution.session_harness import Harness, held, write_strategy
 
 from .conftest import TEST_API_TOKEN
 
@@ -74,6 +77,21 @@ B1_TOOLS = frozenset(
         "strategy_reload",
         "strategy_import",
         "strategy_export",
+    }
+)
+
+B2_TOOLS = frozenset(
+    {
+        "session_list",
+        "session_detail",
+        "session_start",
+        "session_stop",
+        "quick_trade",
+        "risk_live_status",
+        "risk_status",
+        "positions",
+        "kill_switch_on",
+        "kill_switch_release",
     }
 )
 
@@ -312,27 +330,11 @@ class _FakePool:
         return None
 
 
-def test_tools_list_advertises_the_21_research_and_strategy_tools(mcp: _McpClient) -> None:
+def test_tools_list_advertises_the_31_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
-    assert names >= B1_TOOLS
-    assert len(names) == 21  # B2 adds 10 (31 total)
-    assert not [name for name in names if name.startswith("live_")]
-
-
-async def _risk_live_status() -> str:
-    """Stands in for B2's pinned read-only live-status tool; registered only in one test."""
-    return "{}"
-
-
-def test_the_live_pin_forbids_only_live_prefixed_tools_not_b2s_risk_live_status(
-    mcp: _McpClient,
-) -> None:
-    """B2 pins ``risk_live_status`` (a read); the pin must hold for it, not break W3."""
-    server.add_tool(_risk_live_status, name="risk_live_status", structured_output=False)
-    try:
-        names = {tool["name"] for tool in mcp.list_tools()}
-    finally:
-        server.remove_tool("risk_live_status")
+    assert names == B1_TOOLS | B2_TOOLS
+    assert len(names) == 31
+    # the live pin: no live-prefixed tool, and B2's read-only risk_live_status is allowed
     assert "risk_live_status" in names
     assert not [name for name in names if name.startswith("live_")]
 
@@ -610,3 +612,307 @@ async def test_strategy_reload_round_trip_applies_a_params_only_change(
         assert audit_lines[0]["session_id"] == session.session_id
     finally:
         await h.close()
+
+
+# ---------------------------------------------------------------------------
+# B2: session + risk tools (real SessionManager on the pytest loop)
+# ---------------------------------------------------------------------------
+
+D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _fresh_approvals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never leak an approval store (or its executor) wired to a closed harness."""
+    monkeypatch.setattr(engine_app.state, "approval_store", None, raising=False)
+
+
+@pytest.fixture()
+def mcp_cfg(bind_api_config: Bind) -> HydraConfig:
+    """Dev auth on the engine app (the activity approve route needs a human principal)."""
+    return bind_api_config(
+        HYDRA_API__AUTH_MODE="dev",
+        HYDRA_API_TOKEN=TEST_API_TOKEN,
+        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
+        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+    )
+
+
+class TestSessionTools:
+    async def test_round_trip_start_list_detail_quick_trade_and_stop(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Paper round trip through the tools, attributed service:mcp (created_by + audit)."""
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            sid = write_strategy(strategies_dir, "saw")
+            monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            monkeypatch.setattr(engine_app.state, "db_pool", None, raising=False)
+            assert h.mgr is not None
+            async with _async_mcp(mcp_cfg) as mcp:
+                with capture_logs() as logs:
+                    # a logger cached by an earlier audit() call would bypass capture_logs
+                    monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
+                    is_error, text = await mcp.call(
+                        "session_start", {"strategy_id": sid, "paper_capital": "250"}
+                    )
+                    assert not is_error, text
+                    started = json.loads(text)
+                    assert (started["status"], started["created_by"]) == (
+                        "running",
+                        "service:mcp",
+                    )
+
+                    is_error, text = await mcp.call("session_list")
+                    assert not is_error
+                    rows = json.loads(text)
+                    assert [r["created_by"] for r in rows] == ["service:mcp"]
+                    assert rows[0]["strategy_name"] == "saw"
+
+                    session = h.mgr.get_session(started["session_id"])
+                    assert session is not None
+                    await h.bar(session, "100")
+
+                    is_error, text = await mcp.call(
+                        "session_detail", {"session_id": session.session_id}
+                    )
+                    assert not is_error
+                    assert json.loads(text)["metrics"]["balance"]["USDT"] == 250.0
+
+                    is_error, text = await mcp.call(
+                        "quick_trade",
+                        {"session_id": session.session_id, "side": "buy", "quantity": "0.2"},
+                    )
+                    assert not is_error, text
+                    body = json.loads(text)
+                    assert (body["status"], body["protection"], body["fill_price"]) == (
+                        "FILLED",
+                        "armed",
+                        100.1,
+                    )
+                    assert await held(session) == D("0.2")
+
+                    is_error, text = await mcp.call("positions")
+                    assert not is_error
+                    held_rows = json.loads(text)
+                    assert [row["session_id"] for row in held_rows] == [session.session_id]
+                    assert held_rows[0]["positions"][0]["symbol"] == "BTCUSDT"
+
+                    is_error, text = await mcp.call(
+                        "session_stop", {"session_id": session.session_id}
+                    )
+                    assert not is_error
+                    assert json.loads(text)["status"] == "stopped"
+            audit_lines = [event for event in logs if event.get("event") == "audit"]
+            assert [
+                (line["action"], line["principal"], line["principal_kind"]) for line in audit_lines
+            ] == [
+                ("session_start", "mcp", "service"),
+                ("manual_order", "mcp", "service"),
+                ("session_stop", "mcp", "service"),
+            ]
+            assert audit_lines[0]["session_id"] == started["session_id"]
+            assert audit_lines[1]["order_id"] == body["order_id"]
+        finally:
+            await h.close()
+
+    async def test_quick_trade_validation_names_the_offending_field(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """In-body pydantic revalidation: a LIMIT without a price is the 422 envelope."""
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            write_strategy(strategies_dir, "saw")
+            monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            assert h.mgr is not None
+            async with _async_mcp(mcp_cfg) as mcp:
+                is_error, text = await mcp.call(
+                    "quick_trade",
+                    {"session_id": "s1", "side": "buy", "quantity": "0.1", "order_type": "LIMIT"},
+                )
+            assert is_error
+            envelope = json.loads(text.removeprefix("Error executing tool quick_trade: "))
+            assert envelope["status"] == 422
+            assert envelope["detail"]["code"] == "validation_error"
+            assert "price" in envelope["detail"]["message"]
+        finally:
+            await h.close()
+
+    async def test_risk_reads_mirror_the_rest_shapes(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            sid = write_strategy(strategies_dir, "saw")
+            monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            monkeypatch.setattr(engine_app.state, "db_pool", None, raising=False)
+            assert h.mgr is not None
+            await h.session(sid)
+            async with _async_mcp(mcp_cfg) as mcp:
+                is_error, text = await mcp.call("risk_live_status")
+                assert not is_error
+                live = json.loads(text)
+                assert (live["running_sessions"], live["kill_switch_state"]) == (1, "unknown")
+                assert live["circuit_breakers_state"] == "live"
+
+                is_error, text = await mcp.call("risk_status")
+                assert not is_error
+                status = json.loads(text)
+                assert status["circuit_breakers_state"] == "live"
+                assert len(status["circuit_breakers"]) == 4
+                assert status["restrictions"]["active_tier"] == 0
+                assert status["current_drawdown"] == 0.0
+        finally:
+            await h.close()
+
+
+class TestKillSwitchTools:
+    async def test_on_is_immediate_latches_and_is_attributed_then_release_is_gated(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S9 + seam 5: kill_switch_on runs now and latches (start refused, attributed
+        risk_events row); kill_switch_release releases nothing until a human approves."""
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            sid = write_strategy(strategies_dir, "ks")
+            other = write_strategy(strategies_dir, "other")
+            monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            # the release executor persists through whatever pool the engine state carries
+            monkeypatch.setattr(engine_app.state, "db_pool", object(), raising=False)
+            assert h.mgr is not None
+            session = await h.session(sid)
+            await h.bar(session, "100")
+            async with _async_mcp(mcp_cfg) as mcp:
+                is_error, text = await mcp.call("kill_switch_on", {"reason": "claude drill"})
+                assert not is_error, text
+                body = json.loads(text)
+                assert (body["active"], body["sessions_stopped"], body["persisted"]) == (
+                    True,
+                    1,
+                    True,
+                )
+                assert h.mgr.kill_switch_active()
+                assert session.status == "stopped"
+
+                # latched: a new session is refused (the belt-and-braces S9 test)
+                is_error, text = await mcp.call("session_start", {"strategy_id": other})
+                assert is_error
+                envelope = json.loads(text.removeprefix("Error executing tool session_start: "))
+                assert (envelope["status"], envelope["detail"]["code"]) == (
+                    409,
+                    "kill_switch_active",
+                )
+
+                # the latch is attributed to the service in risk_events
+                assert h.store is not None
+                on_rows = [e for e in h.store.events if e.kind == "kill_switch_on"]
+                assert on_rows and on_rows[-1].actor == "service:mcp"
+
+                # the gated release: an approval is required, nothing is released
+                is_error, text = await mcp.call("kill_switch_release", {"reason": "drill over"})
+                assert not is_error, text
+                result = json.loads(text)
+                assert result["status"] == "approval_required"
+                assert re.fullmatch(r"[0-9]{6}", result["code"])
+                assert result["expires_at"]
+                assert "Hydra UI Activity page" in result["note"]
+                assert h.mgr.kill_switch_active()
+
+                # a second request dedupes into the same pending approval (A2)
+                again = json.loads(
+                    (await mcp.call("kill_switch_release", {"reason": "drill over"}))[1]
+                )
+                assert again["approval_id"] == result["approval_id"]
+
+                # a short reason is refused before anything is created
+                is_error, text = await mcp.call("kill_switch_release", {"reason": "no"})
+                assert is_error
+                envelope = json.loads(
+                    text.removeprefix("Error executing tool kill_switch_release: ")
+                )
+                assert (envelope["status"], envelope["detail"]["code"]) == (
+                    422,
+                    "validation_error",
+                )
+
+                # the human types the code in the UI: the release runs as service:mcp
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=engine_app),
+                    base_url="http://engine",
+                    headers={"X-Hydra-Request": "1"},
+                ) as ui:
+                    resp = await ui.post(
+                        f"/api/activity/approvals/{result['approval_id']}/approve",
+                        json={"code": result["code"]},
+                    )
+                assert resp.status_code == 200, resp.text
+                approved = resp.json()
+                assert approved["executed"] is True
+                assert approved == {
+                    "executed": True,
+                    "result": {
+                        "active": False,
+                        "message": "Kill switch released - trading can resume",
+                        "sessions_stopped": 0,
+                    },
+                    "actor": "service:mcp",
+                    "approved_by": "dev:dev",
+                }
+                assert not h.mgr.kill_switch_active()
+                off_rows = [e for e in h.store.events if e.kind == "kill_switch_off"]
+                assert off_rows and off_rows[-1].actor == "service:mcp"
+        finally:
+            await h.close()
+
+    async def test_release_of_an_already_released_switch_is_a_clean_no_op(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The executor re-validates at execution time: nothing latched, no exception."""
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            monkeypatch.setattr(engine_app.state, "db_pool", object(), raising=False)
+            assert h.mgr is not None and not h.mgr.kill_switch_active()
+            async with _async_mcp(mcp_cfg) as mcp:
+                is_error, text = await mcp.call("kill_switch_release", {"reason": "not latched"})
+                assert not is_error, text
+                result = json.loads(text)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=engine_app),
+                    base_url="http://engine",
+                    headers={"X-Hydra-Request": "1"},
+                ) as ui:
+                    resp = await ui.post(
+                        f"/api/activity/approvals/{result['approval_id']}/approve",
+                        json={"code": result["code"]},
+                    )
+                assert resp.status_code == 200, resp.text
+                approved = resp.json()
+                assert approved["executed"] is True
+                assert approved["result"] == {
+                    "status": "already_released",
+                    "active": False,
+                    "message": "The kill switch was already released; nothing changed",
+                }
+        finally:
+            await h.close()

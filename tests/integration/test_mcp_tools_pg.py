@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -46,6 +47,10 @@ from hydra.dashboard.mcp import mount_mcp
 from hydra.dashboard.security import install_security
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.data.storage import MarketDataRepository
+from hydra.execution.client_factory import ClientFactory, bars_repository
+from hydra.execution.session_manager import SessionManager
+from hydra.risk.state import fetch_risk_events
+from tests.unit.test_execution.session_harness import Harness, write_strategy
 
 pytestmark = pytest.mark.integration
 
@@ -361,3 +366,88 @@ async def test_backtest_result_reads_back_a_seeded_completed_result(
         is_error, text = await mcp.call("backtest_results")
         assert not is_error
         assert [summary["id"] for summary in json.loads(text)] == ["bt-seeded"]
+
+
+def _real_clients(h: Harness) -> ClientFactory:
+    """The harness's fakes behind the real bars repository (the recovery-test wiring)."""
+    fake = h.clients()
+    return ClientFactory(
+        ws_factory=fake.ws_factory,
+        rest_factory=fake.rest_factory,
+        markets_loader=fake.markets_loader,
+        repository_factory=bars_repository,
+        history_window=fake.history_window,
+    )
+
+
+async def test_gated_kill_switch_release_writes_the_risk_event_rows(
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gated flow end to end on a real database: a session started through the
+    service persists ``created_by``; ``kill_switch_on`` latches (and persists); the
+    gated ``kill_switch_release`` creates an approval without releasing; approving it
+    through the activity route runs the release, and ``approval_requested`` then
+    ``kill_switch_off`` land in ``risk_events`` attributed ``service:mcp``."""
+    monkeypatch.setenv("HYDRA_API__AUTH_MODE", "dev")  # survives _bind_engine_state
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    monkeypatch.setattr(engine_app.state, "approval_store", None, raising=False)
+    h = Harness(strategies_dir)
+    mgr = SessionManager(db_pool=pool, config=HydraConfig(), clients=_real_clients(h))
+    await mgr.startup()
+    monkeypatch.setattr(engine_app.state, "session_manager", mgr)
+    try:
+        sid = write_strategy(strategies_dir, "pg-b2")
+        session_id = await mgr.start_session(sid, "paper", Decimal("500"), actor="service:mcp")
+        async with pool.acquire() as conn:
+            stored_by = await conn.fetchval(
+                "SELECT created_by FROM trading_sessions WHERE id = $1", session_id
+            )
+        assert stored_by == "service:mcp"
+
+        async with _mcp_session(cfg) as mcp:
+            is_error, text = await mcp.call("kill_switch_on", {"reason": "integration drill"})
+            assert not is_error, text
+            assert json.loads(text)["persisted"] is True
+
+            is_error, text = await mcp.call("kill_switch_release", {"reason": "drill over"})
+            assert not is_error, text
+            result = json.loads(text)
+            assert result["status"] == "approval_required"
+            assert re.fullmatch(r"[0-9]{6}", result["code"])
+            assert result["expires_at"]
+
+            # gated: the request released nothing — the DB row stays latched
+            async with pool.acquire() as conn:
+                assert await conn.fetchval(
+                    "SELECT kill_switch_active FROM risk_config WHERE scope = 'global'"
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=engine_app),
+                base_url="http://t",
+                headers={"X-Hydra-Request": "1"},
+            ) as ui:
+                resp = await ui.post(
+                    f"/api/activity/approvals/{result['approval_id']}/approve",
+                    json={"code": result["code"]},
+                )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["executed"] is True
+            assert resp.json()["actor"] == "service:mcp"
+        assert not mgr.kill_switch_active()
+
+        rows = await fetch_risk_events(pool, 20)  # newest first
+        assert [r.kind for r in rows[:4]] == [
+            "kill_switch_off",
+            "approval_approved",
+            "approval_requested",
+            "kill_switch_on",
+        ]
+        assert [r.actor for r in rows[:4]] == [
+            "service:mcp",
+            "dev:dev",
+            "service:mcp",
+            "service:mcp",
+        ]
+    finally:
+        await mgr.graceful_shutdown()

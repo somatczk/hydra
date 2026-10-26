@@ -25,9 +25,6 @@ from hydra.services.strategies import (
     ToggleResponse,
 )
 
-# shortcut: trading.py (UI-1) imports build_strategy_name_map here; drop after UI-1 imports services
-from hydra.services.strategies import build_strategy_name_map as build_strategy_name_map
-
 router = APIRouter(prefix="/api/strategies", tags=["strategies"], route_class=ServiceErrorRoute)
 
 

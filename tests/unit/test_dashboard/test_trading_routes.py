@@ -114,6 +114,7 @@ class TestStartSession:
         resp = await _start(api, "ok", paper_capital=250)
         assert resp.status_code == 201, resp.text
         assert (resp.json()["status"], resp.json()["paper_capital"]) == ("running", 250.0)
+        assert resp.json()["created_by"] == "service:api-token"
 
     @pytest.mark.parametrize(
         ("setup", "body", "status", "code", "state"),
@@ -572,6 +573,7 @@ class TestStopAndDetail:
             ("SELL", 0.5, "market"),
         ]
         assert detail["open_orders"] == []
+        assert detail["created_by"] is None  # started by the harness, not through an actor
         assert detail["metrics"]["total_pnl"] == pytest.approx(
             float(executor(session).get_account_snapshot().realized_net)
         )

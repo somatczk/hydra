@@ -1,8 +1,8 @@
 """MCP tools, registered on the shared server instance (``hydra.dashboard.mcp.server``).
 
-Empty placeholders in this PR — ``tools/list`` returns ``[]``; B1 fills ``research`` and
-``strategies`` (21 research/CRUD tools), B2 fills ``sessions`` and ``risk`` (10 more),
-each without touching the transport files.
+``research`` and ``strategies`` carry the 21 research/CRUD tools (B1); ``sessions`` and
+``risk`` the 10 session/risk tools (B2) — 31 total, with ``kill_switch_release`` the one
+gated action.
 """
 
 from __future__ import annotations
