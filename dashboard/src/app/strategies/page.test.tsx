@@ -145,6 +145,28 @@ describe('StrategiesPage error states', () => {
     expect(card).not.toContain('$');
   });
 
+  it('keeps PnL uncoloured with an sr-only gain/loss label for screen readers', async () => {
+    const routes = baseRoutes();
+    routes['/api/strategies/saw/performance'] = { ...PERFORMANCE, total_pnl: -50 };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const labels = Array.from(page.container.querySelectorAll('.sr-only')).map((s) => s.textContent);
+    expect(labels).toContain('loss 50.00 USDT');
+    const value = Array.from(page.container.querySelectorAll('p')).find((p) => p.textContent?.includes('−50.00'));
+    expect(value).toBeDefined();
+    expect(value?.className).not.toContain('text-danger');
+  });
+
+  it('says Loading… with the ellipsis character while the list loads', async () => {
+    const routes: Routes = { ...baseRoutes(), '/api/strategies': () => new Promise<never>(() => {}) };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    expect(page.container.textContent).toContain('Loading…');
+    expect(page.container.textContent).not.toContain('Loading...');
+  });
+
   it('asks for capital in the start dialog, not on the card', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
     page = await mount(<StrategiesPage />);
@@ -256,6 +278,74 @@ describe('StrategiesPage hot-reload state', () => {
     expect(detailCalls.map((c) => c.path).sort()).toEqual(['/api/strategies/st-07', '/api/strategies/st-22']);
     const perfCalls = calls.filter((c) => c.path.endsWith('/performance'));
     expect(perfCalls).toHaveLength(40);
+  });
+});
+
+describe('StrategiesPage post-reload state', () => {
+  const reloadOk = { session_id: 's1', from_hash: 'ccdd', to_hash: 'aabb', applies_at: 'next_closed_bar' };
+
+  const LANDED = {
+    config_hash: 'aabb',
+    file_changed: false,
+    running_sessions: [{ session_id: 's1', config_hash: 'aabb', stale: false }],
+  };
+
+  const STOPPED = { config_hash: 'aabb', file_changed: false, running_sessions: [] };
+
+  async function applyReload() {
+    const p = page;
+    if (p === null) throw new Error('page not mounted');
+    await click(buttonByText(p.container, 'Apply to session…'));
+    await click(buttonByText(p.container, 'Apply to session'));
+  }
+
+  it('hides the caution row and the apply door while the applied reload is still pending', async () => {
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = DRIFTED;
+    fetchApi.mockImplementation(routeFetch(routes, calls, { 'POST /api/strategies/saw/reload': reloadOk }));
+    page = await mount(<StrategiesPage />);
+
+    await applyReload();
+
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('Applied. The new parameters take effect at the next closed bar.');
+    expect(text).not.toContain('The strategy file changed after this session started.');
+    expect(
+      Array.from(page.container.querySelectorAll('button')).map((b) => b.textContent?.trim()),
+    ).not.toContain('Apply to session…');
+  });
+
+  it('clears the panel once the session reports the reloaded hash (the reload landed)', async () => {
+    let detail: unknown = DRIFTED;
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = () => detail;
+    fetchApi.mockImplementation(routeFetch(routes, calls, { 'POST /api/strategies/saw/reload': reloadOk }));
+    page = await mount(<StrategiesPage />);
+
+    detail = LANDED;
+    await applyReload();
+
+    expect(page.container.querySelector('[data-testid="strategy-drift"]')).toBeNull();
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('Applied.');
+    expect(text).not.toContain('The strategy file changed after this session started.');
+  });
+
+  it('clears the panel when the session stops before the reload lands', async () => {
+    let detail: unknown = DRIFTED;
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = () => detail;
+    fetchApi.mockImplementation(routeFetch(routes, calls, { 'POST /api/strategies/saw/reload': reloadOk }));
+    page = await mount(<StrategiesPage />);
+
+    detail = STOPPED;
+    await applyReload();
+
+    expect(page.container.querySelector('[data-testid="strategy-drift"]')).toBeNull();
+    expect(page.container.textContent).not.toContain('Applied.');
   });
 });
 
@@ -387,6 +477,19 @@ describe('StrategiesPage delete', () => {
     expect(dialog.textContent).toContain("Couldn't check for a running session.");
     expect(dialog.textContent).not.toContain('No session is running on it.');
   });
+
+  it('refreshes the sessions when the delete dialog opens', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, {}));
+    page = await mount(<StrategiesPage />);
+
+    const before = calls.filter((c) => c.path === '/api/trading/sessions').length;
+    expect(before).toBeGreaterThan(0);
+    await click(buttonByText(page.container, 'Delete'));
+    const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.open).toBe(true);
+    expect(calls.filter((c) => c.path === '/api/trading/sessions').length).toBe(before + 1);
+    expect(dialog.textContent).toContain('No session is running on it.');
+  });
 });
 
 describe('StrategiesPage import', () => {
@@ -409,6 +512,22 @@ describe('StrategiesPage import', () => {
     const uploaded = body.get('file');
     expect(uploaded).toBeInstanceOf(Blob);
     expect((uploaded as File).name).toBe('my.yaml');
+  });
+});
+
+describe('StrategiesPage phone-equal targets', () => {
+  it('gives the four card actions and the enable switch a 44 px target below 1024', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
+    page = await mount(<StrategiesPage />);
+
+    const actions = Array.from(page.container.querySelectorAll('button')).filter((b) =>
+      ['Edit', 'Backtest', 'Export', 'Delete'].includes(b.textContent?.trim() ?? ''),
+    );
+    expect(actions).toHaveLength(4);
+    for (const action of actions) expect(action.className).toContain('max-lg:h-11');
+
+    const target = page.container.querySelector('[role="switch"]');
+    expect(target?.className).toContain('max-lg:min-h-11');
   });
 });
 

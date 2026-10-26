@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { Button } from '@/components/ui/Button';
 import { ApiError, fetchApi } from '@/lib/api';
@@ -11,6 +11,13 @@ export interface StrategyDrift {
   config_hash: string | null;
   file_changed: boolean;
   running_sessions: Array<{ session_id: string; config_hash: string | null; stale: boolean }>;
+}
+
+/** `POST /api/strategies/{id}/reload` 200 body (services.strategies.ReloadResponse). */
+interface ReloadOk {
+  session_id: string;
+  from_hash: string | null;
+  to_hash: string;
 }
 
 interface StrategyDriftPanelProps {
@@ -25,13 +32,37 @@ interface DriftNotice {
   text: string;
 }
 
+/** A reload the API accepted; the detail keeps calling the session stale until it lands. */
+interface AppliedReload {
+  sessionId: string;
+  toHash: string;
+}
+
 /** The file-changed caution row and the parameters-only reload (08 §4); C-STRAT-CHANGED / C-RELOAD-1..4. */
 export function StrategyDriftPanel({ strategyId, drift, onRefetch }: StrategyDriftPanelProps) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [notice, setNotice] = useState<DriftNotice | null>(null);
+  const [applied, setApplied] = useState<AppliedReload | null>(null);
   const reloadSent = useRef(false);
 
-  const drifted = drift.file_changed || drift.running_sessions.some((s) => s.stale);
+  // A 200 only queues the reload for the next closed bar, so the refetched detail still calls the
+  // session stale; suppress that known-pending row until the session reports the new hash or stops.
+  const pending = (s: StrategyDrift['running_sessions'][number]) =>
+    applied !== null && s.session_id === applied.sessionId && s.config_hash !== applied.toHash;
+
+  useEffect(() => {
+    if (applied === null) return;
+    const entry = drift.running_sessions.find((s) => s.session_id === applied.sessionId);
+    if (entry === undefined || entry.config_hash === applied.toHash) {
+      setApplied(null);
+      setNotice(null);
+    }
+  }, [drift, applied]);
+
+  const drifted =
+    applied === null
+      ? drift.file_changed || drift.running_sessions.some((s) => s.stale)
+      : drift.running_sessions.some((s) => s.stale && !pending(s));
   if (!drifted && notice === null) return null;
 
   const openDialog = () => {
@@ -44,8 +75,11 @@ export function StrategyDriftPanel({ strategyId, drift, onRefetch }: StrategyDri
     if (reloadSent.current) return;
     reloadSent.current = true;
     try {
-      await fetchApi(`/api/strategies/${strategyId}/reload`, { method: 'POST' });
+      const ok = await fetchApi<ReloadOk>(`/api/strategies/${strategyId}/reload`, { method: 'POST' });
       setNotice({ tone: 'ok', text: 'Applied. The new parameters take effect at the next closed bar.' });
+      if (typeof ok?.session_id === 'string' && typeof ok?.to_hash === 'string') {
+        setApplied({ sessionId: ok.session_id, toHash: ok.to_hash });
+      }
     } catch (err) {
       const detail = parseErrorDetail(err);
       if (err instanceof ApiError && err.status === 409) {
