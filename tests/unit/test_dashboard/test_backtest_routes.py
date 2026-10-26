@@ -934,3 +934,184 @@ class TestResultMutations:
         select_list = query.split(" FROM ")[0]
         for column in ("equity_curve", "benchmark_equity", "transactions"):
             assert column not in select_list
+
+
+# ---------------------------------------------------------------------------
+# The durable jobs list
+# ---------------------------------------------------------------------------
+
+JOB_LIST_FIELDS = {
+    "task_id",
+    "kind",
+    "status",
+    "progress",
+    "created_at",
+    "finished_at",
+    "strategy_id",
+    "name",
+    "error",
+    "result_id",
+    "completed_trials",
+    "total_trials",
+}
+
+
+class _JobsConn:
+    """Serves backtest_jobs rows per kind for the jobs-list read.
+
+    Emulates the SELECT faithfully: newest first per kind, and a query that
+    carries LIMIT never yields more rows than its bound.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.kinds: list[str] = []
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.served: list[int] = []
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM backtest_jobs" in query
+        self.calls.append((query, args))
+        self.kinds.append(args[0])
+        matching = sorted(
+            (r for r in self.rows if r["kind"] == args[0]),
+            key=lambda r: r["created_at"],
+            reverse=True,
+        )
+        if "LIMIT" in query:
+            matching = matching[: args[1]]
+        self.served.append(len(matching))
+        return matching
+
+
+def _jobs_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": "task-x",
+        "kind": "backtest",
+        "status": "running",
+        "progress": 42.0,
+        "error": None,
+        "result_id": None,
+        "request": '{"strategy_id": "saw", "name": "Q1 run"}',
+        "detail": "{}",
+        "created_at": datetime(2026, 10, 25, 12, tzinfo=UTC),
+        "finished_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _jobs_client(conn: _JobsConn) -> TestClient:
+    return TestClient(_make_app(pool=_Pool(conn)))
+
+
+class TestJobListRoute:
+    def test_lists_every_kind_newest_first_with_hyperopt_trials(self) -> None:
+        conn = _JobsConn(
+            [
+                _jobs_row(id="task-old", created_at=datetime(2026, 10, 24, tzinfo=UTC)),
+                _jobs_row(
+                    id="ho-1",
+                    kind="hyperopt",
+                    status="completed",
+                    progress=100.0,
+                    created_at=datetime(2026, 10, 25, 10, tzinfo=UTC),
+                    finished_at=datetime(2026, 10, 25, 13, tzinfo=UTC),
+                    request=(
+                        '{"strategy_id": "saw", "name": "ho", "max_trials": 50, '
+                        '"start_date": "2026-01-01", "end_date": "2026-02-01", '
+                        '"param_space": [{"name": "period", "type": "int", "low": 2, "high": 80}], '
+                        '"method": "bayesian"}'
+                    ),
+                    detail='{"completed_trials": 37, "total_trials": 50}',
+                ),
+                _jobs_row(
+                    id="wf-1",
+                    kind="walkforward",
+                    status="failed",
+                    error="fold 3 made no trades",
+                    finished_at=datetime(2026, 10, 25, 14, tzinfo=UTC),
+                ),
+                _jobs_row(
+                    id="task-new",
+                    status="queued",
+                    created_at=datetime(2026, 10, 26, tzinfo=UTC),
+                ),
+            ]
+        )
+        resp = _jobs_client(conn).get("/api/backtest/jobs")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [e["task_id"] for e in body] == ["task-new", "wf-1", "ho-1", "task-old"]
+        assert conn.kinds == ["backtest", "hyperopt", "walkforward"]
+        assert body[0] == {
+            "task_id": "task-new",
+            "kind": "backtest",
+            "status": "queued",
+            "progress": 42.0,
+            "created_at": "2026-10-26T00:00:00+00:00",
+            "finished_at": None,
+            "strategy_id": "saw",
+            "name": "Q1 run",
+            "error": None,
+            "result_id": None,
+            "completed_trials": None,
+            "total_trials": None,
+        }
+        hyperopt = body[2]
+        assert hyperopt["completed_trials"] == 37
+        assert hyperopt["total_trials"] == 50
+        # pinned seam: the request/strategy_config JSONB never crosses the wire
+        assert all(set(e) == JOB_LIST_FIELDS for e in body)
+        assert all("param_space" not in json.dumps(e) for e in body)
+
+    def test_kind_filter_reads_only_that_kind(self) -> None:
+        conn = _JobsConn([_jobs_row(), _jobs_row(id="ho-1", kind="hyperopt")])
+        resp = _jobs_client(conn).get("/api/backtest/jobs?kind=hyperopt")
+        assert resp.status_code == 200
+        assert [e["task_id"] for e in resp.json()] == ["ho-1"]
+        assert conn.kinds == ["hyperopt"]
+
+    def test_limit_is_enforced_and_bounded(self) -> None:
+        rows = [
+            _jobs_row(id=f"task-{i}", created_at=datetime(2026, 10, 20 + i, tzinfo=UTC))
+            for i in range(3)
+        ]
+        client = _jobs_client(_JobsConn(rows))
+        assert [e["task_id"] for e in client.get("/api/backtest/jobs?limit=2").json()] == [
+            "task-2",
+            "task-1",
+        ]
+        assert client.get("/api/backtest/jobs?limit=501").status_code == 422
+
+    def test_per_kind_reads_are_bounded_in_sql(self) -> None:
+        """Each per-kind SELECT carries the limit; Python only keeps the cross-kind order."""
+        rows = [
+            _jobs_row(id=f"bt-{i}", created_at=datetime(2026, 10, 20 + i, tzinfo=UTC))
+            for i in range(3)
+        ] + [
+            _jobs_row(id="ho-1", kind="hyperopt", created_at=datetime(2026, 10, 25, 9, tzinfo=UTC))
+        ]
+        conn = _JobsConn(rows)
+        resp = _jobs_client(conn).get("/api/backtest/jobs?limit=2")
+        assert resp.status_code == 200
+        assert [e["task_id"] for e in resp.json()] == ["ho-1", "bt-2"]
+        for query, args in conn.calls:
+            assert "LIMIT" in query
+            assert args[1] == 2
+        assert conn.served == [2, 1, 0]
+
+        default_conn = _JobsConn(rows)
+        assert _jobs_client(default_conn).get("/api/backtest/jobs").status_code == 200
+        for _, args in default_conn.calls:
+            assert args[1] == 100
+
+    def test_empty_table_is_an_empty_list(self) -> None:
+        resp = _jobs_client(_JobsConn([])).get("/api/backtest/jobs")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_list_without_database_is_503(self, client: TestClient) -> None:
+        resp = client.get("/api/backtest/jobs")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"

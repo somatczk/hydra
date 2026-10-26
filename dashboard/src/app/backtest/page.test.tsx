@@ -1,11 +1,23 @@
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
-import { buttonByText, click, flush, mount, unavailable, type Mounted } from '@/test/pageHarness';
+import type { ResearchJob } from '@/lib/research';
+import {
+  advance,
+  buttonByText,
+  click,
+  dialogPolyfill,
+  flush,
+  mount,
+  sectionText,
+  unavailable,
+  type Mounted,
+} from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
 const toast = vi.fn();
 const nav = vi.hoisted(() => ({ search: new URLSearchParams() }));
+const router = vi.hoisted(() => ({ push: vi.fn() }));
 
 vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
@@ -13,7 +25,7 @@ vi.mock('@/lib/api', async (orig) => ({
 }));
 vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast }) }));
 vi.mock('next/navigation', () => ({
-  useRouter: () => ({ push: vi.fn() }),
+  useRouter: () => router,
   useSearchParams: () => nav.search,
 }));
 
@@ -25,10 +37,13 @@ const NO_DATA = new ApiError(
     detail: {
       code: 'no_market_data',
       message:
-        'No market data for binance BTCUSDT 4h between 2026-01-01T00:00:00+00:00 and 2026-03-01T23:59:59.999999+00:00; available: none stored',
+        'No market data for binance BTCUSDT 4h between 2026-01-01T00:00:00+00:00 and 2026-03-01T23:59:59.999999+00:00; available: 2026-09-09T00:00:00+00:00 to 2026-10-21T00:00:00+00:00',
       state: 'no_data',
-      available_first_ts: null,
-      available_last_ts: null,
+      symbol: 'BTCUSDT',
+      timeframe: '4h',
+      exchange: 'binance',
+      available_first_ts: '2026-09-09T00:00:00+00:00',
+      available_last_ts: '2026-10-21T00:00:00+00:00',
     },
   }),
 );
@@ -53,24 +68,48 @@ const RESULT = {
   metrics: { total_trades: 14, win_rate: 0, total_pnl: -50, max_drawdown: 1, sharpe_ratio: 0 },
 };
 
+const RESULT2 = { ...RESULT, id: 'bt-task-2', name: 'second' };
+const RESULT3 = { ...RESULT, id: 'bt-task-3', name: 'third' };
+
 type Handler = (path: string, init?: RequestInit) => unknown;
 
 let page: Mounted | null = null;
 let posts: Array<Record<string, unknown>>;
+let calls: Array<{ path: string; init?: RequestInit }>;
 
-function serve(overrides: Record<string, Handler> = {}) {
+/** A durable job row, aged relative to now so the rendered age text stays stable. */
+function job(overrides: Partial<ResearchJob> = {}): ResearchJob {
+  return {
+    task_id: 'task-1',
+    status: 'running',
+    progress: 42,
+    created_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+    finished_at: null,
+    strategy_id: 'saw',
+    name: 'Saw run',
+    error: null,
+    result_id: null,
+    completed_trials: null,
+    total_trials: null,
+    ...overrides,
+  };
+}
+
+function serve(overrides: Record<string, Handler | unknown> = {}) {
   fetchApi.mockImplementation(async (path: string, init?: RequestInit) => {
+    calls.push({ path, init });
     const key = `${init?.method ?? 'GET'} ${path.split('?')[0]}`;
-    if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)));
-    const handler = overrides[key];
-    const value = handler
-      ? handler(path, init)
-      : {
-          'GET /api/backtest/results': [RESULT],
-          'GET /api/backtest/strategies': [{ id: 'saw', name: 'Saw', primary_timeframe: '4h' }],
-        }[key];
-    if (value instanceof Error) throw value;
+    if (init?.method === 'POST' && init.body) posts.push(JSON.parse(String(init.body)));
+    const entry =
+      overrides[key] ??
+      {
+        'GET /api/backtest/results': [RESULT],
+        'GET /api/backtest/strategies': [{ id: 'saw', name: 'Saw', primary_timeframe: '4h' }],
+        'GET /api/backtest/jobs': [],
+      }[key];
+    const value = typeof entry === 'function' ? entry(path, init) : entry;
     if (value === undefined) throw new ApiError(404, JSON.stringify({ detail: 'no route' }));
+    if (value instanceof Error) throw value;
     return value;
   });
 }
@@ -78,9 +117,12 @@ function serve(overrides: Record<string, Handler> = {}) {
 beforeEach(() => {
   nav.search = new URLSearchParams();
   posts = [];
+  calls = [];
   fetchApi.mockReset();
   toast.mockReset();
+  router.push.mockReset();
   localStorage.clear();
+  dialogPolyfill();
 });
 
 afterEach(() => {
@@ -121,42 +163,19 @@ describe('BacktestPage', () => {
     expect(posts).toHaveLength(0);
   });
 
-  it('shows the 422 no-data message with the stored range, persistently', async () => {
+  it('shows the no-stored-bars sentence with the coverage line, persistently', async () => {
     serve({ 'POST /api/backtest/run': () => NO_DATA });
     page = await mount(<BacktestPage />);
 
     await click(buttonByText(page.container, 'Run Backtest'));
 
     const card = page.container.querySelector('[data-testid="run-error"]');
-    expect(card?.textContent).toContain('No market data for binance BTCUSDT 4h');
-    expect(card?.textContent).toContain('available: none stored');
+    expect(card?.textContent).toContain(
+      'No stored bars for BTCUSDT 4h in this range. Nothing was simulated.',
+    );
+    expect(card?.textContent).toContain('Stored bars cover 9 Sep 2026 to 21 Oct 2026.');
     expect(card?.querySelector('[data-state="no_data"]')?.textContent).toBe('NO DATA');
     expect(card?.textContent).not.toContain('{');
-  });
-
-  it('shows the task error when the run fails in the background', async () => {
-    vi.useFakeTimers();
-    serve({
-      'POST /api/backtest/run': () => ({ task_id: 'task-1', status: 'queued' }),
-      'GET /api/backtest/status/task-1': () => ({
-        task_id: 'task-1',
-        status: 'failed',
-        progress: 0,
-        error: 'result not persisted: connection was closed',
-      }),
-    });
-    page = await mount(<BacktestPage />);
-
-    await click(buttonByText(page.container, 'Run Backtest'));
-    await act(async () => {
-      vi.advanceTimersByTime(1600);
-    });
-    await flush();
-
-    expect(page.container.querySelector('[data-testid="run-failure"]')?.textContent).toContain(
-      'Backtest failed: result not persisted: connection was closed',
-    );
-    expect(toast).toHaveBeenCalledWith('error', 'Backtest failed: result not persisted: connection was closed');
   });
 
   it('marks each result with its data source', async () => {
@@ -206,5 +225,193 @@ describe('BacktestPage history values', () => {
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
     expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Backtests');
     expect(page.container.querySelector('tbody a[href="/backtest/bt-task-1"]')?.textContent).toBe('View');
+  });
+
+  it('labels a cancelled row Cancelled, never Running', async () => {
+    serve({ 'GET /api/backtest/results': () => [{ ...RESULT, status: 'cancelled' }] });
+    page = await mount(<BacktestPage />);
+
+    const badges = Array.from(page.container.querySelectorAll('span')).map((s) => s.textContent ?? '');
+    expect(badges).toContain('Cancelled');
+    expect(badges).not.toContain('Running');
+  });
+});
+
+describe('BacktestPage jobs', () => {
+  it('renders every job state with ages, progress, verbatim error and links', async () => {
+    serve({
+      'GET /api/backtest/results': () => [],
+      'GET /api/backtest/jobs': () => [
+        job({ task_id: 'task-q', status: 'queued', progress: 0, name: 'queued run' }),
+        job({ task_id: 'task-r', status: 'running', progress: 42, name: 'running run' }),
+        job({
+          task_id: 'task-c',
+          status: 'completed',
+          progress: 100,
+          name: 'done run',
+          finished_at: new Date(Date.now() - 3600_000).toISOString(),
+          result_id: 'res-9',
+        }),
+        job({
+          task_id: 'task-f',
+          status: 'failed',
+          name: 'failed run',
+          error: 'worker died mid-run',
+          finished_at: new Date(Date.now() - 3600_000).toISOString(),
+        }),
+        job({
+          task_id: 'task-x',
+          status: 'cancelled',
+          name: 'cancelled run',
+          finished_at: new Date(Date.now() - 3600_000).toISOString(),
+        }),
+      ],
+    });
+    page = await mount(<BacktestPage />);
+
+    const badges = Array.from(page.container.querySelectorAll('span'))
+      .filter((s) => s.children.length === 0)
+      .map((s) => s.textContent ?? '')
+      .filter((t) => ['Queued', 'Running', 'Completed', 'Failed', 'Cancelled'].includes(t));
+    expect(badges).toEqual(['Queued', 'Running', 'Completed', 'Failed', 'Cancelled']);
+    expect(page.container.textContent).toContain('Started 3 h ago');
+    expect(page.container.textContent).toContain('42%');
+    expect(page.container.textContent).toContain('worker died mid-run');
+    expect(page.container.querySelector('a[href="/backtest/res-9"]')?.textContent).toBe('View result');
+  });
+
+  it('a 202 never touches localStorage and the job appears on the next jobs read', async () => {
+    vi.useFakeTimers();
+    let started = false;
+    serve({
+      'POST /api/backtest/run': () => {
+        started = true;
+        return { task_id: 'task-9', status: 'queued' };
+      },
+      'GET /api/backtest/jobs': () =>
+        started ? [job({ task_id: 'task-9', status: 'queued', progress: 0, name: 'new run' })] : [],
+    });
+    page = await mount(<BacktestPage />);
+
+    expect(page.container.textContent).not.toContain('new run');
+    await click(buttonByText(page.container, 'Run Backtest'));
+
+    expect(posts).toHaveLength(1);
+    expect(localStorage.getItem('backtest_task_id')).toBeNull();
+    expect(page.container.textContent).toContain('new run');
+    expect(page.container.textContent).toContain('Queued');
+  });
+
+  it('keeps the job list across poll ticks, with no lost-task copy', async () => {
+    vi.useFakeTimers();
+    serve({ 'GET /api/backtest/jobs': () => [job({ status: 'running', progress: 42 })] });
+    page = await mount(<BacktestPage />);
+
+    await advance(10000);
+    await advance(10000);
+
+    expect(page.container.textContent).toContain('42%');
+    expect(page.container.textContent).toContain('Started 3 h ago');
+    expect(page.container.textContent).not.toContain('may have restarted');
+    expect(page.container.textContent).not.toContain('no longer known');
+  });
+
+  it('reports an unavailable jobs list instead of an empty list', async () => {
+    serve({ 'GET /api/backtest/jobs': () => unavailable() });
+    page = await mount(<BacktestPage />);
+
+    expect(sectionText(page.container, 'Jobs')).toContain('Database is not available');
+  });
+
+  it('says Failed to load jobs when the read fails without a server message', async () => {
+    serve({ 'GET /api/backtest/jobs': () => new Error('network gone') });
+    page = await mount(<BacktestPage />);
+
+    const text = sectionText(page.container, 'Jobs');
+    expect(text).toContain('Failed to load jobs');
+    expect(text).toContain('Retry');
+  });
+
+  it('cancels a job through the confirm dialog exactly once', async () => {
+    let cancelled = false;
+    serve({
+      'GET /api/backtest/jobs': () => [
+        cancelled ? job({ status: 'cancelling' }) : job({ status: 'running', progress: 42 }),
+      ],
+      'POST /api/backtest/jobs/task-1/cancel': () => {
+        cancelled = true;
+        return { task_id: 'task-1', status: 'cancelling' };
+      },
+    });
+    page = await mount(<BacktestPage />);
+
+    await click(buttonByText(page.container, 'Cancel'));
+    const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.open).toBe(true);
+    expect(document.activeElement?.textContent).toBe('Cancel this run?');
+
+    await click(buttonByText(page.container, 'Cancel run'));
+    const cancels = calls.filter((c) => c.path === '/api/backtest/jobs/task-1/cancel');
+    expect(cancels).toHaveLength(1);
+    expect(page.container.textContent).toContain('Cancelling…');
+  });
+
+  it('says the run already finished when the cancel hits a 409', async () => {
+    serve({
+      'GET /api/backtest/jobs': () => [job({ status: 'running' })],
+      'POST /api/backtest/jobs/task-1/cancel': new ApiError(
+        409,
+        JSON.stringify({ detail: 'Task task-1 is already completed' }),
+      ),
+    });
+    page = await mount(<BacktestPage />);
+
+    await click(buttonByText(page.container, 'Cancel'));
+    await click(buttonByText(page.container, 'Cancel run'));
+
+    expect(page.container.textContent).toContain('This run already finished.');
+  });
+});
+
+describe('BacktestPage result actions', () => {
+  it('deletes a result through a destructive confirm focused on its title', async () => {
+    serve({ 'DELETE /api/backtest/results/bt-task-1': () => null });
+    page = await mount(<BacktestPage />);
+
+    await click(page.container.querySelector('button[aria-label="Delete backtest real"]')!);
+    const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.open).toBe(true);
+    expect(document.activeElement?.textContent).toBe('Delete this backtest?');
+    expect(dialog.textContent).toContain('This cannot be undone.');
+
+    await click(buttonByText(page.container, 'Delete backtest'));
+    const deletes = calls.filter(
+      (c) => c.path === '/api/backtest/results/bt-task-1' && c.init?.method === 'DELETE',
+    );
+    expect(deletes).toHaveLength(1);
+    expect(page.container.textContent).not.toContain('real');
+    expect(toast).toHaveBeenCalledWith('success', 'Backtest deleted');
+  });
+
+  it('compares two selected results and ignores a third selection', async () => {
+    serve({ 'GET /api/backtest/results': () => [RESULT, RESULT2, RESULT3] });
+    page = await mount(<BacktestPage />);
+
+    const compare = buttonByText(page.container, 'Compare 2 selected');
+    expect(compare.disabled).toBe(true);
+
+    const boxes = page.container.querySelectorAll<HTMLInputElement>('tbody input[type="checkbox"]');
+    expect(boxes).toHaveLength(3);
+    await click(boxes[0]);
+    await click(boxes[1]);
+    expect(compare.disabled).toBe(false);
+
+    await act(async () => {
+      boxes[2].click();
+    });
+    expect(boxes[2].checked).toBe(false);
+
+    await click(compare);
+    expect(router.push).toHaveBeenCalledWith('/backtest/compare?a=bt-task-1&b=bt-task-2');
   });
 });

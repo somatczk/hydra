@@ -57,6 +57,21 @@ class CancelJobResponse(BaseModel):
     status: str
 
 
+class JobListEntry(BaseModel):
+    task_id: str
+    kind: jobs.JobKind
+    status: str  # queued | running | cancelling | completed | failed | cancelled
+    progress: float = 0.0
+    created_at: str
+    finished_at: str | None = None
+    strategy_id: str = ""
+    name: str = ""
+    error: str | None = None
+    result_id: str | None = None
+    completed_trials: int | None = None
+    total_trials: int | None = None
+
+
 class DataProvenanceModel(BaseModel):
     exchange: str | None = None
     symbol: str | None = None
@@ -297,6 +312,47 @@ async def cancel_job(pool: Any, job_id: str) -> dict[str, Any]:
         raise ServiceError(409, f"Task {job_id} is already finished or cancelling")
     status = "cancelled" if row["status"] == "cancelled" else "cancelling"
     return {"task_id": job_id, "status": status}
+
+
+_ALL_KINDS: tuple[jobs.JobKind, ...] = ("backtest", "hyperopt", "walkforward")
+
+
+async def list_jobs(
+    pool: Any, kind: jobs.JobKind | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
+    """Durable job rows of every kind, newest first; only the extracted fields leave the row.
+
+    Every per-kind read carries the same SQL LIMIT: a kind's share of the global
+    newest ``limit`` rows fits within that kind's own newest ``limit``, so the
+    cross-kind merge below still yields the unbounded read's top ``limit``.
+    """
+    pool = require_pool(pool)
+    async with db_errors("listing jobs"):
+        rows: list[Any] = []
+        for one in (kind,) if kind else _ALL_KINDS:
+            rows.extend(await jobs.list_jobs(pool, one, limit))
+    rows.sort(key=lambda row: row["created_at"], reverse=True)
+    entries: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        request = jobs.json_value(row["request"]) or {}
+        entry = {
+            "task_id": row["id"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "progress": row["progress"],
+            "created_at": row["created_at"].isoformat(),
+            "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
+            "strategy_id": str(request.get("strategy_id", "")),
+            "name": str(request.get("name", "")),
+            "error": row["error"],
+            "result_id": row["result_id"],
+        }
+        if row["kind"] == "hyperopt":
+            detail = jobs.json_value(row["detail"]) or {}
+            entry["completed_trials"] = detail.get("completed_trials", 0)
+            entry["total_trials"] = detail.get("total_trials", request.get("max_trials", 0))
+        entries.append(entry)
+    return entries
 
 
 # ---------------------------------------------------------------------------

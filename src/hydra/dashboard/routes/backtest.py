@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Query, Request, status
 
 from hydra.backtest.jobs import BacktestRunRequest, HyperoptRunRequest, WalkForwardRunRequest
 from hydra.dashboard.routes._db import ServiceErrorRoute, request_pool
@@ -17,6 +17,7 @@ from hydra.services.backtest import (
     BacktestStrategyOption,
     BacktestVerification,
     CancelJobResponse,
+    JobListEntry,
 )
 from hydra.services.research import (
     HyperoptHistoryEntry,
@@ -47,6 +48,16 @@ async def get_backtest_status(task_id: str, request: Request) -> dict[str, Any]:
 async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
     """Cancel a queued or running backtest, hyperopt or walk-forward job."""
     return await svc.cancel_job(request_pool(request), job_id)
+
+
+@router.get("/jobs", response_model=list[JobListEntry])
+async def list_jobs(
+    request: Request,
+    kind: Literal["backtest", "hyperopt", "walkforward"] | None = None,
+    limit: int = Query(100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """List durable backtest, hyperopt and walk-forward jobs, newest first."""
+    return await svc.list_jobs(request_pool(request), kind, limit)
 
 
 @router.get("/results", response_model=list[BacktestResultSummary])
