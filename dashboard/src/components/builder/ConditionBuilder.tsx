@@ -35,17 +35,17 @@ export function ConditionBuilder({
   onSetOperator,
 }: ConditionBuilderProps) {
   return (
-    <div className="rounded-lg border-l-4 border-l-accent-primary border border-border-default bg-bg-secondary p-4">
+    <div className="rounded-lg border-l-4 border-l-accent border border-line bg-surface p-4">
       {/* Operator toggle */}
       <div className="mb-3 flex items-center gap-2">
-        <span className="text-xs font-medium text-text-muted uppercase">Combine with:</span>
-        <div className="flex rounded-lg border border-border-default overflow-hidden">
+        <span className="text-xs font-medium text-ink-2 uppercase">Combine with:</span>
+        <div className="flex rounded-lg border border-line overflow-hidden">
           <button
             type="button"
-            className={`px-3 py-1 text-xs font-medium transition-colors ${
+            className={`px-3 py-1 text-xs font-medium transition-colors max-lg:h-11 ${
               group.operator === 'AND'
-                ? 'bg-accent-primary text-on-accent'
-                : 'bg-bg-primary text-text-secondary hover:bg-bg-hover'
+                ? 'bg-accent text-on-accent'
+                : 'bg-surface text-ink-2 hover:bg-hover'
             }`}
             onClick={() => onSetOperator('AND')}
           >
@@ -53,10 +53,10 @@ export function ConditionBuilder({
           </button>
           <button
             type="button"
-            className={`px-3 py-1 text-xs font-medium transition-colors ${
+            className={`px-3 py-1 text-xs font-medium transition-colors max-lg:h-11 ${
               group.operator === 'OR'
-                ? 'bg-accent-primary text-on-accent'
-                : 'bg-bg-primary text-text-secondary hover:bg-bg-hover'
+                ? 'bg-accent text-on-accent'
+                : 'bg-surface text-ink-2 hover:bg-hover'
             }`}
             onClick={() => onSetOperator('OR')}
           >
@@ -71,9 +71,9 @@ export function ConditionBuilder({
           <div key={condition.id}>
             {index > 0 && (
               <div className="flex items-center gap-2 py-1">
-                <div className="h-px flex-1 bg-border-default" />
-                <span className="text-xs font-medium text-text-muted">{group.operator}</span>
-                <div className="h-px flex-1 bg-border-default" />
+                <div className="h-px flex-1 bg-line" />
+                <span className="text-xs font-medium text-ink-2">{group.operator}</span>
+                <div className="h-px flex-1 bg-line" />
               </div>
             )}
             <ConditionRow
