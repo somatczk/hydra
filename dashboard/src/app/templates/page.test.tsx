@@ -85,8 +85,10 @@ describe('TemplatesPage content', () => {
     expect(text).toContain('RSI Momentum');
     expect(text).toContain('BTCUSDT · 1h');
     expect(text).toContain('Rule-based');
-    expect(text).toContain('conservative');
+    expect(text).toContain('Conservative');
+    expect(text).not.toContain('conservative');
     expect(text).not.toContain('by ');
+    expect(page.container.querySelector('.bg-caution-soft, .bg-danger-soft, .text-caution, .text-danger')).toBeNull();
   });
 
   it('marks unset expectations as NO DATA, never as zero', async () => {
@@ -112,7 +114,8 @@ describe('TemplatesPage content', () => {
     expect(rsi).not.toContain('0.00');
     const breakout = sectionText(page.container, 'Bollinger Breakout');
     expect(breakout).toContain('1.20');
-    expect(breakout).toContain('15.0%');
+    expect(breakout).toContain('15.00%');
+    expect(breakout).not.toContain('15.0%');
     expect(breakout).toContain('10,000.00');
     expect(breakout).not.toContain('NO DATA');
   });

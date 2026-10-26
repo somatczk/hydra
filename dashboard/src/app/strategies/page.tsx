@@ -509,7 +509,9 @@ export default function StrategiesPage() {
           onClose={() => setDeleteTarget(null)}
         >
           <p>This removes the strategy&apos;s YAML file. This cannot be undone.</p>
-          {sessionFor(deleteTarget.id) !== null ? (
+          {sessions.data === null && sessions.error !== null ? (
+            <p>Couldn&apos;t check for a running session.</p>
+          ) : sessionFor(deleteTarget.id) !== null ? (
             <p>A running session keeps running on the config it started with; stop it from its session page.</p>
           ) : (
             <p>No session is running on it.</p>

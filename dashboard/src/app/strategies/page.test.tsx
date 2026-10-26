@@ -16,6 +16,7 @@ import {
   type Routes,
 } from '@/test/pageHarness';
 import { liveStatus, session } from '@/test/fixtures';
+import { ApiError } from '@/lib/api';
 
 const fetchApi = vi.fn();
 const push = vi.fn();
@@ -215,6 +216,23 @@ describe('StrategiesPage hot-reload state', () => {
     expect(sectionText(page.container, 'Saw')).toContain('Sawtooth');
   });
 
+  it('keeps the card with a NOT FOUND badge and the reason when the detail 404s between list and poll', async () => {
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = new ApiError(
+      404,
+      JSON.stringify({ detail: { code: 'strategy_not_found', message: 'Strategy saw not found', state: 'not_found' } }),
+    );
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const row = page.container.querySelector('[data-testid="drift-error"]');
+    expect(row?.textContent).toContain('NOT FOUND');
+    expect(row?.textContent).toContain('Strategy saw not found');
+    expect(row?.querySelector('[data-state="not_found"]')).not.toBeNull();
+    expect(sectionText(page.container, 'Saw')).toContain('Sawtooth');
+  });
+
   it('fetches the detail only for strategies with a running session (40 strategies, 2 running)', async () => {
     const many = Array.from({ length: 40 }, (_, i) => ({
       ...STRATEGY,
@@ -355,6 +373,19 @@ describe('StrategiesPage delete', () => {
     await click(buttonByText(page.container, 'Keep it'));
     expect(calls.filter((c) => c.init?.method === 'DELETE')).toHaveLength(0);
     expect(page.container.querySelector('dialog[open]')).toBeNull();
+  });
+
+  it('says it could not check for a running session when the sessions poll is unavailable', async () => {
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = unavailable();
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    await click(buttonByText(page.container, 'Delete'));
+    const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.open).toBe(true);
+    expect(dialog.textContent).toContain("Couldn't check for a running session.");
+    expect(dialog.textContent).not.toContain('No session is running on it.');
   });
 });
 

@@ -12,7 +12,7 @@ import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import { describeApiError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
-import { money } from '@/lib/format';
+import { money, pct } from '@/lib/format';
 
 /* ---------- Types ---------- */
 
@@ -40,16 +40,17 @@ function typeBadgeVariant(type: string): 'success' | 'neutral' {
   return type.toLowerCase() === 'rule_based' ? 'success' : 'neutral';
 }
 
-function riskBadgeVariant(riskLevel: string): 'info' | 'warning' | 'error' | 'neutral' {
+/** Risk levels are labels, not alarms: sentence case, quiet tone (05 §3). */
+function riskLabel(riskLevel: string): string {
   switch (riskLevel.toLowerCase()) {
     case 'conservative':
-      return 'info';
+      return 'Conservative';
     case 'moderate':
-      return 'warning';
+      return 'Moderate';
     case 'aggressive':
-      return 'error';
+      return 'Aggressive';
     default:
-      return 'neutral';
+      return riskLevel;
   }
 }
 
@@ -138,8 +139,8 @@ export default function TemplatesPage() {
                   size="sm"
                 />
                 <StatusBadge
-                  status={template.risk_level}
-                  variant={riskBadgeVariant(template.risk_level)}
+                  status={riskLabel(template.risk_level)}
+                  variant="neutral"
                   size="sm"
                 />
               </div>
@@ -163,7 +164,7 @@ export default function TemplatesPage() {
               </div>
               <div className="text-center">
                 <p className="flex items-center justify-center gap-1 text-sm font-bold text-ink-1">
-                  {template.expected_max_drawdown === null ? '—' : `${template.expected_max_drawdown.toFixed(1)}%`}
+                  {pct(template.expected_max_drawdown) ?? '—'}
                   {template.expected_max_drawdown === null && (
                     <DataStateBadge state="no_data" reason="This template sets no expected max drawdown" />
                   )}
