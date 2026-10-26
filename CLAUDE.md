@@ -107,6 +107,12 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   `paper_capital` change goes through `RiskService.reload_config`). In memory only: the backtest share-link tokens.
   Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`;
   paper sessions are restored from `paper_accounts` by `SessionManager.startup()`.
+- Gated MCP actions go through one in-memory approval store (`services/approvals.py`, served by
+  `routes/activity.py` on `app.state`): at most 20 pending, one-time 6-digit codes with a
+  10-minute expiry and 5 wrong attempts, a second request for the same action returns the
+  pending approval, and every lifecycle transition is a best-effort `risk_events` `approval_*`
+  row plus a `hydra.audit` line (nothing persists across a restart). Only `user`/`dev`
+  principals can decide one.
 - Every paper entry gets a protective stop (strategy `risk:` block, 5 % default); no exchange-side stops yet (P3).
   Only Binance SPOT is accepted (`client_factory.validate_venue`).
 - Probes (`src/hydra/dashboard/health.py`, `routes/health.py`): a `HealthMonitor` started last by the lifespan runs

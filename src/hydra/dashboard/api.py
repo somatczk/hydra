@@ -15,6 +15,7 @@ import hydra
 from hydra.core.websocket import manager
 from hydra.dashboard import lifespan
 from hydra.dashboard.routes import (
+    activity,
     backtest,
     health,
     market_data,
@@ -65,6 +66,7 @@ app.include_router(trading.router)
 app.include_router(signals.router)
 app.include_router(templates.router)
 app.include_router(market_data.router)
+app.include_router(activity.router)
 
 
 # ---------------------------------------------------------------------------
