@@ -16,8 +16,14 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from hydra.dashboard.deps import current_config
-from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
+from hydra.dashboard.routes._db import (
+    api_error,
+    db_errors_to_503,
+    request_trader,
+    require_pool,
+)
 from hydra.dashboard.security import Principal, audit
+from hydra.execution import session_store
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 logger = logging.getLogger(__name__)
@@ -223,21 +229,18 @@ async def _save_system_config(pool: Any, updates: dict[str, Any], actor: str) ->
 
 
 def risk_service(request: Request) -> Any:
-    """The process-wide RiskService on the session manager, or ``None``."""
+    """The process-wide RiskService on the trader's session manager, or ``None``."""
     from hydra.risk.service import RiskService
 
-    mgr = getattr(request.app.state, "session_manager", None)
-    svc = getattr(mgr, "risk", None) if mgr is not None else None
+    backend = request_trader(request)
+    svc = getattr(backend, "risk", None)
     return svc if isinstance(svc, RiskService) else None
 
 
 async def _reload_paper_capital(request: Request) -> None:
-    """Hand paper_capital to the RiskService, which rebases via its audited paper reset."""
-    svc = risk_service(request)
-    if svc is None:
-        return
+    """Hand paper_capital to the risk ledger, which rebases via its audited paper reset."""
     try:
-        await svc.reload_config(actor=_actor(request))
+        await request_trader(request).reload_paper_capital(_actor(request))
     except Exception as exc:
         logger.exception("paper_capital saved but the running engine did not reload it")
         raise api_error(
@@ -863,15 +866,16 @@ async def _exchange_error(request: Request, exchange_id: str) -> HTTPException:
 
 
 async def _order_symbols(request: Request) -> list[str]:
-    """default_pair plus the symbols of running sessions (Binance wants a symbol per call)."""
+    """default_pair plus the symbols of running sessions (Binance wants a symbol per call).
+
+    Running sessions are read from the database, so the order book still covers them when
+    the trading engine is down.
+    """
     pool = require_pool(request)
     stored = await read_system_config(pool)
     symbols = [stored.default_pair]
-    mgr = getattr(request.app.state, "session_manager", None)
-    if mgr is not None:
-        for session in mgr.list_sessions():
-            if session.status == "running":
-                symbols += [str(s) for s in session.symbols]
+    for row in await session_store.load_running(pool):
+        symbols += [str(s) for s in row["symbols"]]
     unique: dict[str, str] = {}
     for symbol in symbols:
         unique.setdefault(symbol.replace("/", "").upper(), symbol)

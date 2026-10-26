@@ -19,6 +19,7 @@ from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.risk.pretrade import OPEN
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore, LoadedConfig, risk_config_from_row
+from hydra.services.trader import LocalTrader
 from tests.unit.test_risk.harness import T0, Clock, order, rules_cache
 
 # ---------------------------------------------------------------------------
@@ -28,9 +29,6 @@ from tests.unit.test_risk.harness import T0, Clock, order, rules_cache
 
 @pytest.fixture()
 def client() -> TestClient:
-    # Ensure session_manager is set (even if None)
-    if not hasattr(app.state, "session_manager"):
-        app.state.session_manager = None
     return TestClient(app)
 
 
@@ -183,6 +181,7 @@ async def test_put_reload_propagates_to_risk_service() -> None:
     test_app = FastAPI()
     test_app.state.db_pool = pool
     test_app.state.session_manager = _Mgr(svc)
+    test_app.state.trader = LocalTrader(pool, _Mgr(svc))
     test_app.include_router(router)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=test_app), base_url="http://t"

@@ -18,6 +18,7 @@ from hydra.dashboard.api import app
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
 from hydra.execution.session_manager import TradingSession
 from hydra.risk.state import RiskStateUnavailableError
+from hydra.services.trader import LocalTrader
 from tests.unit.test_execution.session_harness import (
     Harness,
     executor,
@@ -38,6 +39,7 @@ async def h(strategies_dir: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncItera
     harness = Harness(strategies_dir)
     mgr = await harness.start()
     monkeypatch.setattr(app.state, "session_manager", mgr)
+    monkeypatch.setattr(app.state, "trader", LocalTrader(app.state.db_pool, mgr))
     yield harness
     await harness.close()
 
@@ -259,7 +261,7 @@ class TestKillSwitch:
         self, h: Harness, api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         await api.post("/api/trading/kill-switch")
-        monkeypatch.setattr(app.state, "db_pool", None, raising=False)
+        monkeypatch.setattr(app.state.trader, "db_pool", None)
         resp = await api.request(
             "DELETE",
             "/api/trading/kill-switch",
@@ -272,7 +274,7 @@ class TestKillSwitch:
         self, h: Harness, api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         await api.post("/api/trading/kill-switch")
-        monkeypatch.setattr(app.state, "db_pool", object(), raising=False)
+        monkeypatch.setattr(app.state.trader, "db_pool", object())
         resp = await api.request(
             "DELETE",
             "/api/trading/kill-switch",

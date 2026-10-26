@@ -52,6 +52,7 @@ app.state.exchange_credentials = {}
 app.state.exchange_credential_errors = {}
 app.state.system_config = None
 app.state.session_manager = None
+app.state.trader = None
 app.state.health_monitor = None
 
 # Include all route modules

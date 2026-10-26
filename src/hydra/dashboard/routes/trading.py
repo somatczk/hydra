@@ -1,9 +1,9 @@
 """Trading session, kill-switch and quick-trade API routes.
 
 Every order goes through ``SessionManager.submit_manual_order`` (OrderManager -> RiskService
--> paper executor); the bodies delegate to ``hydra.services.sessions`` — the same functions
-the MCP tools call — so both transports answer identical envelopes. Errors use the
-``_db.py`` envelope.
+-> paper executor); the bodies call the engine's ``TraderBackend`` (``app.state.trader``) —
+the same operations the MCP tools call — so both transports answer identical envelopes.
+Errors use the ``_db.py`` envelope.
 """
 
 from __future__ import annotations
@@ -13,9 +13,8 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from hydra.dashboard.routes._db import ServiceErrorRoute
+from hydra.dashboard.routes._db import ServiceErrorRoute, request_trader
 from hydra.dashboard.security import audit
-from hydra.services import sessions as sessions_svc
 from hydra.services.sessions import (
     KillSwitchNotPersistedError,
     QuickTradeRequest,
@@ -186,9 +185,7 @@ def _actor(request: Request) -> str:
 @router.post("/sessions", response_model=SessionResponse, status_code=201)
 async def start_session(body: StartSessionRequest, request: Request) -> dict[str, Any]:
     """Start a paper session. Live is 403 until P3; only Binance SPOT is accepted."""
-    d = await sessions_svc.start_session(
-        getattr(request.app.state, "session_manager", None), _actor(request), body
-    )
+    d = await request_trader(request).start_session(_actor(request), body)
     audit(
         getattr(request.state, "principal", None),
         "session_start",
@@ -202,9 +199,7 @@ async def start_session(body: StartSessionRequest, request: Request) -> dict[str
 async def stop_session(session_id: str, request: Request) -> dict[str, Any]:
     """Flatten (reduce-only) and stop a session; positions_at_stop reports what is left."""
     try:
-        d = await sessions_svc.stop_session(
-            getattr(request.app.state, "session_manager", None), session_id
-        )
+        d = await request_trader(request).stop_session(session_id)
     except SessionStopNotPersistedError:
         audit(
             getattr(request.state, "principal", None),
@@ -220,15 +215,13 @@ async def stop_session(session_id: str, request: Request) -> dict[str, Any]:
 @router.get("/sessions", response_model=list[SessionResponse])
 async def list_sessions(request: Request) -> list[dict[str, Any]]:
     """List all trading sessions (running + recent stopped) with each one's health."""
-    return sessions_svc.list_sessions(getattr(request.app.state, "session_manager", None))
+    return await request_trader(request).list_sessions()
 
 
 @router.get("/sessions/{session_id}/detail", response_model=SessionDetailResponse)
 async def get_session_detail(session_id: str, request: Request) -> dict[str, Any]:
     """Full session detail with account numbers, positions and fills."""
-    return await sessions_svc.get_session_detail(
-        getattr(request.app.state, "session_manager", None), session_id
-    )
+    return await request_trader(request).session_detail(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +233,7 @@ async def get_session_detail(session_id: str, request: Request) -> dict[str, Any
 async def activate_kill_switch(request: Request) -> dict[str, Any]:
     """Latch the kill switch, then flatten and stop every running or errored session."""
     try:
-        body = await sessions_svc.activate_kill_switch(
-            getattr(request.app.state, "session_manager", None),
+        body = await request_trader(request).activate_kill_switch(
             _actor(request),
             "kill switch (api)",
         )
@@ -268,12 +260,7 @@ async def activate_kill_switch(request: Request) -> dict[str, Any]:
 @router.delete("/kill-switch", response_model=KillSwitchResponse)
 async def release_kill_switch(body: KillSwitchRelease, request: Request) -> dict[str, Any]:
     """Release the kill switch (``{"confirm": "RELEASE", "reason": ...}``)."""
-    d = await sessions_svc.release_kill_switch(
-        getattr(request.app.state, "db_pool", None),
-        getattr(request.app.state, "session_manager", None),
-        _actor(request),
-        body.reason,
-    )
+    d = await request_trader(request).release_kill_switch(_actor(request), body.reason)
     audit(getattr(request.state, "principal", None), "kill_switch_off", reason=body.reason)
     return d
 
@@ -290,9 +277,7 @@ async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, An
     SL/TP (or a trailing stop) are placed reduce-only when the entry fills; without them the
     strategy's protective stop (default 5 %) is placed. A SELL only reduces the held position.
     """
-    d = await sessions_svc.submit_manual_order(
-        getattr(request.app.state, "session_manager", None), body
-    )
+    d = await request_trader(request).quick_trade(body)
     audit(
         getattr(request.state, "principal", None),
         "manual_order",

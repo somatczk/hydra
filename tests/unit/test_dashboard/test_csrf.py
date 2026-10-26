@@ -16,6 +16,7 @@ from hydra.execution.session_manager import SessionManager, TradingSession
 from hydra.risk.market_rules import MarketRulesCache
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore
+from hydra.services.trader import LocalTrader
 
 from .conftest import TEST_API_TOKEN
 from .system_db import FakeSystemDb
@@ -61,6 +62,7 @@ def session(cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch) -> TradingSession
     )
     mgr._sessions[running.session_id] = running
     monkeypatch.setattr(app.state, "session_manager", mgr)
+    monkeypatch.setattr(app.state, "trader", LocalTrader(None, mgr))
     return running
 
 

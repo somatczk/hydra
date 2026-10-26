@@ -1,16 +1,17 @@
 """Engine startup and shutdown.
 
 Startup order: config, logging, credential key, DB pool, Alembic migrations, stored credentials,
-system config, SessionManager (``startup()``: risk state, recovery, display rows), MCP mount
-(only when ``HYDRA_MCP_TOKEN`` is set: no token, no ``/mcp`` surface), HealthMonitor (first
-readiness run; ``/livez`` turns green). Shutdown closes the MCP session manager, unmounts
-``/mcp`` and resets ``app.state.mcp`` (the session manager is single-use, so a re-entered
-lifespan remounts a fresh transport instead of finding the closed mount shadowing it), then
-stops the monitor. Any startup error propagates, so uvicorn exits non-zero instead of serving
-without a schema or a key. Without DATABASE_URL (dev only) there is no pool, no migration and no
-key requirement. ``app.state.session_clients`` (a ``ClientFactory``), when set before startup,
-replaces the public exchange clients of every session, and ``app.state.health_monitor_factory``
-builds the ``HealthMonitor`` (the paper smoke test injects its fakes and a monitor clock there).
+system config, SessionManager (``startup()``: risk state, recovery, display rows) with its
+``LocalTrader`` backend on ``app.state.trader``, MCP mount (only when ``HYDRA_MCP_TOKEN`` is set:
+no token, no ``/mcp`` surface), HealthMonitor (first readiness run; ``/livez`` turns green).
+Shutdown closes the MCP session manager, unmounts ``/mcp`` and resets ``app.state.mcp`` (the
+session manager is single-use, so a re-entered lifespan remounts a fresh transport instead of
+finding the closed mount shadowing it), then stops the monitor. Any startup error propagates, so
+uvicorn exits non-zero instead of serving without a schema or a key. Without DATABASE_URL (dev
+only) there is no pool, no migration and no key requirement. ``app.state.session_clients`` (a
+``ClientFactory``), when set before startup, replaces the public exchange clients of every
+session, and ``app.state.health_monitor_factory`` builds the ``HealthMonitor`` (the paper smoke
+test injects its fakes and a monitor clock there).
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     app.state.exchange_credential_errors = {}
     app.state.system_config = None
     app.state.session_manager = None
+    app.state.trader = None
     app.state.health_monitor = None
     clients: ClientFactory | None = getattr(app.state, "session_clients", None)
     mcp_stack: AsyncExitStack | None = None
@@ -170,10 +172,12 @@ async def _init_session_manager(
 ) -> None:
     """RiskService, recovery and display rows (``SessionManager.startup``); errors propagate."""
     from hydra.execution.session_manager import SessionManager
+    from hydra.services.trader import LocalTrader
 
     mgr = SessionManager(db_pool=app.state.db_pool, config=cfg, clients=clients)
     await mgr.startup()
     app.state.session_manager = mgr
+    app.state.trader = LocalTrader(app.state.db_pool, mgr)
 
 
 async def _start_health_monitor(app: FastAPI) -> None:

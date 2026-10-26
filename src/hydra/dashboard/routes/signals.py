@@ -2,9 +2,9 @@
 
 The route sits behind the API auth middleware, and the body must also carry the configured
 ``webhook_secret``: with no secret configured the webhook is disabled (503), a wrong one is 401.
-Orders go through ``SessionManager.submit_manual_order`` (risk-checked, protective stop on the
-entry fill). An entry without ``quantity`` is sized like a strategy entry; exits are reduce-only
-and default to the whole position.
+Orders go through the trader backend's ``webhook_signal`` (risk-checked, protective stop on
+the entry fill; the webhook origin is the live-refusal seam). An entry without ``quantity``
+is sized like a strategy entry; exits are reduce-only and default to the whole position.
 """
 
 from __future__ import annotations
@@ -18,14 +18,11 @@ from typing import Any
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from hydra.core.types import OrderType, Side
-from hydra.dashboard.routes._db import api_error, unauthenticated
+from hydra.dashboard.routes._db import ServiceErrorRoute, api_error, request_trader, unauthenticated
 from hydra.dashboard.security import audit
-from hydra.execution.errors import SessionNotRunningError, SpotShortError
-from hydra.execution.order_manager import RiskRejectedError
-from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
+from hydra.services.errors import ServiceError
 
-router = APIRouter(prefix="/api/signals", tags=["signals"])
+router = APIRouter(prefix="/api/signals", tags=["signals"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
 
 
@@ -77,10 +74,6 @@ def _require_webhook_secret(request: Request, presented: str) -> None:
         raise unauthenticated("invalid_webhook_secret", "Invalid webhook secret")
 
 
-def _get_session_manager(request: Request) -> Any:
-    return getattr(request.app.state, "session_manager", None)
-
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -96,46 +89,16 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
 
     signal_id = f"sig-{uuid.uuid4().hex[:8]}"
 
-    mgr = _get_session_manager(request)
-    if mgr is None:
-        raise api_error(503, "engine_not_ready", "Trading engine not initialized", "unavailable")
-
-    is_exit = body.action == "exit"
-    if not is_exit and body.side == "sell":
-        raise api_error(
-            422, "spot_short", "Short entries are not supported on spot sessions", "invalid"
-        )
     try:
-        session, result = await mgr.submit_manual_order(
+        executed = await request_trader(request).webhook_signal(
             symbol=body.symbol,
-            side=Side.SELL if is_exit else Side.BUY,
-            order_type=OrderType.MARKET,
+            side=body.side,
+            action=body.action,
             quantity=body.quantity,
             strategy_id=body.strategy_id,
         )
-    except SessionNotRunningError as exc:
-        raise api_error(
-            404,
-            "session_not_found",
-            f"No running session for strategy_id '{body.strategy_id}'",
-            "not_found",
-        ) from exc
-    except SpotShortError as exc:
-        if is_exit:
-            raise api_error(
-                409, "no_position", f"No open {body.symbol} position to exit", "no_data"
-            ) from exc
-        raise api_error(422, exc.code, str(exc), "invalid") from exc
-    except RiskRejectedError as exc:
-        raise api_error(
-            422, "risk_rejected", exc.reason, "invalid", check=exc.check, intent=exc.intent
-        ) from exc
-    except ValueError as exc:
-        raise api_error(422, "order_rejected", str(exc), "invalid") from exc
-    except PersistenceUnavailableError as exc:
-        raise api_error(503, "paper_state_unpersisted", str(exc), "unavailable") from exc
-    except PaperSessionHaltedError as exc:
-        raise api_error(503, "paper_session_halted", str(exc), "unavailable") from exc
+    except ServiceError:
+        raise
     except Exception as exc:
         logger.exception("Webhook signal %s failed", signal_id)
         raise api_error(
@@ -144,19 +107,19 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
             f"Signal {signal_id} failed on the session of '{body.strategy_id}'",
             "unavailable",
         ) from exc
-    executed = 1 if result.order_id is not None else 0
+    order_count = 1 if executed["order_id"] is not None else 0
     audit(
         getattr(request.state, "principal", None),
         "manual_order",
         source="webhook",
         signal_id=signal_id,
-        session_id=session.session_id,
+        session_id=executed["session_id"],
         strategy_id=body.strategy_id,
         symbol=body.symbol,
         side=body.side,
         signal_action=body.action,
         quantity=None if body.quantity is None else str(body.quantity),
-        order_id=result.order_id,
+        order_id=executed["order_id"],
     )
     logger.info(
         "Webhook signal %s: %s %s %s on session %s -> %s",
@@ -164,12 +127,12 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
         body.action,
         body.side,
         body.symbol,
-        session.session_id,
-        result.status,
+        executed["session_id"],
+        executed["status"],
     )
 
     return {
         "status": "accepted",
         "signal_id": signal_id,
-        "message": f"Signal executed on {executed} session(s) ({result.status})",
+        "message": f"Signal executed on {order_count} session(s) ({executed['status']})",
     }

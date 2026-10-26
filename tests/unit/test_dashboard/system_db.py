@@ -31,6 +31,7 @@ class FakeSystemDb:
         for key, value in (SEEDED if config is None else config).items():
             self.config[key] = {"value": json.dumps(value), "updated_by": None}
         self.credentials: dict[str, dict[str, Any]] = {}
+        self.running_sessions: list[dict[str, Any]] = []
         self.fail: BaseException | None = None
         self.fail_on: str | None = None
         self.statements: list[str] = []
@@ -77,6 +78,8 @@ class FakeSystemDb:
                 }
                 for eid, row in self.credentials.items()
             ]
+        if sql == "SELECT * FROM trading_sessions WHERE status = 'running' ORDER BY created_at":
+            return [dict(row) for row in self.running_sessions]
         raise AssertionError(f"unexpected fetch: {sql}")
 
     async def fetchval(self, sql: str, *args: Any) -> Any:

@@ -1,9 +1,9 @@
-"""Engine bindings shared by the tool modules: pool, session manager, error conversion.
+"""Engine bindings shared by the tool modules: pool, trader backend, error conversion.
 
 A tool call has no FastAPI request — the SDK's Starlette app replaces ``scope["app"]``
 with its own — so tool bodies resolve the engine lazily. The engine container serves
 ``python -m hydra.dashboard.api``, which executes ``api.py`` as ``__main__``: the
-served app the lifespan binds (``db_pool``, ``session_manager``) is
+served app the lifespan binds (``db_pool``, ``trader``) is
 ``sys.modules["__main__"].app``, and importing ``hydra.dashboard.api`` in that process
 builds a second, lifespan-less instance. The engine state is therefore resolved from
 the lifespan-bound ``__main__`` app when that is the served engine, with the module
@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from hydra.dashboard.security import Principal
 from hydra.services.errors import ServiceError, service_error
+from hydra.services.trader import LocalTrader
 
 MCP_PRINCIPAL = Principal("service", "mcp")
 """The principal every tool mutation is attributed to (seam 4)."""
@@ -53,9 +54,17 @@ def db_pool() -> Any:
     return getattr(engine_state(), "db_pool", None)
 
 
-def session_manager() -> Any:
-    """The engine's SessionManager, or None when startup has not bound one."""
-    return getattr(engine_state(), "session_manager", None)
+def trader_from(state: Any) -> Any:
+    """The TraderBackend bound on *state* (``app.state``), manager-less fallback when unbound."""
+    backend = getattr(state, "trader", None)
+    if backend is not None:
+        return backend
+    return LocalTrader(getattr(state, "db_pool", None), None)
+
+
+def trader() -> Any:
+    """The engine's TraderBackend; an unbound state behaves like a manager-less engine."""
+    return trader_from(engine_state())
 
 
 def tool_error(exc: ServiceError) -> ToolError:

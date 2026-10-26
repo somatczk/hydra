@@ -1,7 +1,7 @@
 """Session tools (list, detail, start, stop, quick_trade).
 
-Five tools registered on the shared server instance, each a thin call into the session
-service layer (the same functions the REST routes call). The request models are
+Five tools registered on the shared server instance, each a thin call into the engine's
+TraderBackend (the same operations the REST routes call). The request models are
 constructed inside the tool so pydantic revalidates and no schema drift is possible;
 money arrives as strings (``quantity``, ``price``, ``paper_capital``) and is coerced to
 Decimal by the model. Sessions are paper-only here — there is no ``trading_mode`` input
@@ -17,7 +17,6 @@ from pydantic import ValidationError
 from hydra.dashboard.mcp import server
 from hydra.dashboard.mcp.tools import _deps
 from hydra.dashboard.security import audit
-from hydra.services import sessions as sessions_svc
 from hydra.services.approvals import APPROVAL_ACTOR
 from hydra.services.errors import ServiceError
 from hydra.services.sessions import (
@@ -32,7 +31,7 @@ async def session_list() -> str:
     """List every trading session (running + recent stopped) with status, health fields
     (last bar, feed, entries paused) and who started it (``created_by``)."""
     try:
-        return _deps.json_text(sessions_svc.list_sessions(_deps.session_manager()))
+        return _deps.json_text(await _deps.trader().list_sessions())
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
 
@@ -42,9 +41,7 @@ async def session_detail(session_id: str) -> str:
     """Read one session in full: account numbers, metrics, positions, fills, resting
     orders and who started it."""
     try:
-        return _deps.json_text(
-            await sessions_svc.get_session_detail(_deps.session_manager(), session_id)
-        )
+        return _deps.json_text(await _deps.trader().session_detail(session_id))
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
 
@@ -61,7 +58,7 @@ async def session_start(strategy_id: str, paper_capital: str | None = None) -> s
         body = StartSessionRequest(
             strategy_id=strategy_id, trading_mode="paper", paper_capital=paper_capital
         )
-        result = await sessions_svc.start_session(_deps.session_manager(), APPROVAL_ACTOR, body)
+        result = await _deps.trader().start_session(APPROVAL_ACTOR, body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     except ValidationError as exc:
@@ -80,7 +77,7 @@ async def session_stop(session_id: str) -> str:
     """Flatten (reduce-only) and stop a session. ``positions_at_stop`` reports anything
     that could not be closed."""
     try:
-        result = await sessions_svc.stop_session(_deps.session_manager(), session_id)
+        result = await _deps.trader().stop_session(session_id)
     except ServiceError as exc:
         if isinstance(exc, SessionStopNotPersistedError):
             audit(_deps.MCP_PRINCIPAL, "session_stop", session_id=session_id, persisted=False)
@@ -120,7 +117,7 @@ async def quick_trade(
             trailing_stop_pct=trailing_stop_pct,
             session_id=session_id,
         )
-        result = await sessions_svc.submit_manual_order(_deps.session_manager(), body)
+        result = await _deps.trader().quick_trade(body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     except ValidationError as exc:

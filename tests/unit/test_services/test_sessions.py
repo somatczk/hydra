@@ -484,3 +484,100 @@ async def test_quick_trade_round_trip_on_the_real_seam(h: Harness, strategies_di
 
     assert (d["status"], d["protection"], d["fill_price"]) == ("FILLED", "armed", 100.1)
     assert await held(session) == D("0.5")
+
+
+# ---------------------------------------------------------------------------
+# Webhook signal (the R3 live gate)
+# ---------------------------------------------------------------------------
+
+
+class _RowsConn:
+    """Serves the running-session rows the webhook live gate resolves the target from."""
+
+    def __init__(self, rows: list[dict[str, Any]], error: BaseException | None = None) -> None:
+        self.rows = rows
+        self.error = error
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM trading_sessions" in sql and "running" in sql
+        if self.error is not None:
+            raise self.error
+        return self.rows
+
+
+class _RowsPool:
+    def __init__(self, conn: _RowsConn) -> None:
+        self.conn = conn
+
+    def acquire(self) -> _RowsPool:
+        return self
+
+    async def __aenter__(self) -> _RowsConn:
+        return self.conn
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _running_row(mode: str) -> dict[str, Any]:
+    return {
+        "id": "s-row",
+        "strategy_id": "svc",
+        "trading_mode": mode,
+        "status": "running",
+        "symbols": ["BTCUSDT"],
+    }
+
+
+async def _webhook(h: Harness, pool: _RowsPool) -> dict[str, Any]:
+    return await sessions_svc.submit_webhook_order(
+        h.mgr,
+        symbol="BTCUSDT",
+        side="buy",
+        action="entry",
+        quantity=D("0.01"),
+        strategy_id="svc",
+        pool=pool,
+        webhook_origin=True,
+    )
+
+
+async def test_webhook_refuses_a_live_target_row_before_any_order(
+    h: Harness, strategies_dir: Path
+) -> None:
+    write_strategy(strategies_dir, "svc")
+    assert h.mgr is not None
+    session = await h.session("svc")
+    await h.bar(session, "100")
+
+    with pytest.raises(ServiceError) as raised:
+        await _webhook(h, _RowsPool(_RowsConn([_running_row("live")])))
+
+    detail = _detail(raised.value)
+    assert raised.value.status_code == 409
+    assert (detail["code"], detail["state"]) == ("live_gate_required", "invalid")
+    assert await held(session) == D("0")
+
+
+async def test_webhook_trades_a_paper_target_row(h: Harness, strategies_dir: Path) -> None:
+    write_strategy(strategies_dir, "svc")
+    assert h.mgr is not None
+    session = await h.session("svc")
+    await h.bar(session, "100")
+
+    d = await _webhook(h, _RowsPool(_RowsConn([_running_row("paper")])))
+
+    assert (d["session_id"], d["status"]) == (session.session_id, "FILLED")
+    assert await held(session) == D("0.01")
+
+
+async def test_webhook_degrades_when_the_gate_read_fails(h: Harness, strategies_dir: Path) -> None:
+    write_strategy(strategies_dir, "svc")
+    assert h.mgr is not None
+    session = await h.session("svc")
+    await h.bar(session, "100")
+
+    d = await _webhook(h, _RowsPool(_RowsConn([], error=OSError("database down"))))
+
+    assert d["session_id"] == session.session_id
+    assert await held(session) == D("0.01")

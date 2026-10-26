@@ -17,6 +17,7 @@ from hydra.services.errors import DB_ERRORS as DB_ERRORS
 from hydra.services.errors import ErrorState as ErrorState
 from hydra.services.errors import ServiceError
 from hydra.services.errors import error_detail as error_detail
+from hydra.services.trader import LocalTrader
 
 logger = logging.getLogger(__name__)
 
@@ -118,3 +119,16 @@ class ServiceErrorRoute(APIRoute):
 def request_pool(request: Request) -> Any:
     """The app's asyncpg pool, or None; services raise the 503 where they need it."""
     return getattr(request.app.state, "db_pool", None)
+
+
+def request_trader(request: Request) -> Any:
+    """The app's TraderBackend; an unbound state reads like a manager-less local engine.
+
+    The lifespan binds ``app.state.trader`` and the tests inject theirs there. Without one
+    (a lifespan-less app) the routes keep answering exactly what a ``None`` session
+    manager answered before the rewiring.
+    """
+    backend = getattr(request.app.state, "trader", None)
+    if backend is not None:
+        return backend
+    return LocalTrader(getattr(request.app.state, "db_pool", None), None)

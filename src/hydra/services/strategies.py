@@ -527,7 +527,7 @@ _ONE_PERFORMANCE_SQL = (
 )
 
 
-async def get_strategy(pool: Any, strategy_id: str, session_manager: Any = None) -> dict[str, Any]:
+async def get_strategy(pool: Any, strategy_id: str) -> dict[str, Any]:
     """Get a single strategy detail with structured builder fields."""
     # Try YAML first
     path = find_strategy_file(strategy_id)
@@ -551,7 +551,7 @@ async def get_strategy(pool: Any, strategy_id: str, session_manager: Any = None)
             }
             if is_rule_based:
                 result.update(_extract_strategy_detail(data))
-            result.update(_session_drift(data, strategy_id, session_manager))
+            result.update(await _session_drift(data, strategy_id, pool))
             rows, perf_error = await _overlay_performance(pool, _ONE_PERFORMANCE_SQL, strategy_id)
             result["performance_error"] = perf_error
             if perf_error is None:
@@ -569,26 +569,41 @@ async def get_strategy(pool: Any, strategy_id: str, session_manager: Any = None)
         raise _strategy_not_found(strategy_id)
     result = _row_to_strategy(row)
     # no YAML for this strategy: a snapshot-recovered session can still be running on it
-    result.update(_session_drift(None, strategy_id, session_manager))
+    result.update(await _session_drift(None, strategy_id, pool))
     return result
 
 
-def _session_drift(data: dict[str, Any] | None, strategy_id: str, manager: Any) -> dict[str, Any]:
-    """The file's hash (None without a file) and, per running session, whether it differs."""
+async def _session_drift(
+    data: dict[str, Any] | None, strategy_id: str, pool: Any
+) -> dict[str, Any]:
+    """The file's hash (None without a file) and, per running session, whether it differs.
+
+    Running sessions are read from the database (``session_store.load_running``), so the
+    drift read works without a session manager — including while the engine is down.
+    """
+    from hydra.execution import session_store
+
     file_hash: str | None = None
     if data is not None:
         try:
             file_hash = config_hash(validate_strategy_config(data))
         except (ValueError, TypeError):
             file_hash = None
+    rows: list[Any] = []
+    if pool is not None:
+        try:
+            rows = await session_store.load_running(pool)
+        except DB_ERRORS:
+            # like the performance overlay: a DB stall degrades this field, not the read
+            logger.exception("Running sessions unreadable for the strategy drift")
     sessions = [
         {
-            "session_id": s.session_id,
-            "config_hash": s.config_hash,
-            "stale": s.config_hash != file_hash,
+            "session_id": str(row["id"]),
+            "config_hash": row.get("config_hash"),
+            "stale": row.get("config_hash") != file_hash,
         }
-        for s in (manager.list_sessions() if manager is not None else [])
-        if s.strategy_id == strategy_id and s.status == "running"
+        for row in rows
+        if row.get("strategy_id") == strategy_id
     ]
     return {
         "config_hash": file_hash,
