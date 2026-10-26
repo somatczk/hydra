@@ -57,7 +57,12 @@ export function StrategyDriftPanel({ strategyId, drift, onRefetch }: StrategyDri
           text: `A restart is needed to apply: ${fields}. Nothing was applied.`,
         });
       } else if (err instanceof ApiError && err.status === 404) {
-        setNotice({ tone: 'caution', text: 'No running session for this strategy.' });
+        // strategy_not_found: the file is gone while a session runs, so the frozen no-session sentence would be false.
+        if (detail?.code === 'strategy_not_found' && detail.message) {
+          setNotice({ tone: 'danger', text: detail.message });
+        } else {
+          setNotice({ tone: 'caution', text: 'No running session for this strategy.' });
+        }
       } else if (err instanceof ApiError && err.status === 422 && detail?.message) {
         setNotice({ tone: 'danger', text: detail.message });
       } else {

@@ -19,12 +19,13 @@ import { liveStatus, session } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
 const push = vi.fn();
+const toast = vi.fn();
 
 vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
   fetchApi: (...args: unknown[]) => fetchApi(...args),
 }));
-vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
+vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast }) }));
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push }) }));
 
 const { default: StrategiesPage } = await import('./page');
@@ -79,6 +80,7 @@ beforeEach(() => {
   calls = [];
   push.mockReset();
   fetchApi.mockReset();
+  toast.mockReset();
 });
 
 afterEach(() => {
@@ -376,5 +378,77 @@ describe('StrategiesPage import', () => {
     const uploaded = body.get('file');
     expect(uploaded).toBeInstanceOf(Blob);
     expect((uploaded as File).name).toBe('my.yaml');
+  });
+});
+
+describe('StrategiesPage export', () => {
+  const exportFetch = vi.fn();
+  const createObjectURL = vi.fn<(blob: Blob) => string>(() => 'blob:export');
+  const revokeObjectURL = vi.fn();
+  const anchorClicks: HTMLAnchorElement[] = [];
+  const originalCreateObjectURL = URL.createObjectURL;
+  const originalRevokeObjectURL = URL.revokeObjectURL;
+  const originalAnchorClick = HTMLAnchorElement.prototype.click;
+
+  // jsdom has no downloads: record anchor clicks instead of letting them navigate.
+  function recordAnchorClick(this: HTMLAnchorElement): void {
+    anchorClicks.push(this);
+  }
+
+  beforeEach(() => {
+    URL.createObjectURL = createObjectURL;
+    URL.revokeObjectURL = revokeObjectURL;
+    HTMLAnchorElement.prototype.click = recordAnchorClick;
+    vi.stubGlobal('fetch', exportFetch);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    URL.createObjectURL = originalCreateObjectURL;
+    URL.revokeObjectURL = originalRevokeObjectURL;
+    HTMLAnchorElement.prototype.click = originalAnchorClick;
+    anchorClicks.length = 0;
+    createObjectURL.mockClear();
+    revokeObjectURL.mockClear();
+    exportFetch.mockReset();
+  });
+
+  it('downloads the YAML via a raw-text fetch and does not report a JSON-parse failure', async () => {
+    exportFetch.mockResolvedValue(
+      new Response('id: saw\nname: Saw\n', { status: 200, headers: { 'content-type': 'application/x-yaml' } }),
+    );
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
+    page = await mount(<StrategiesPage />);
+
+    await click(buttonByText(page.container, 'Export'));
+
+    expect(String(exportFetch.mock.calls[0]?.[0])).toContain('/api/strategies/saw/export');
+    expect(calls.some((c) => c.path === '/api/strategies/saw/export')).toBe(false);
+    expect(toast).toHaveBeenCalledWith('success', 'Exported "Saw"');
+    expect(toast).not.toHaveBeenCalledWith('error', 'Failed to export strategy');
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    const blob = createObjectURL.mock.calls[0]?.[0];
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob?.type).toBe('application/x-yaml');
+    expect(anchorClicks).toHaveLength(1);
+    expect(anchorClicks[0]?.download).toBe('saw.yaml');
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:export');
+  });
+
+  it('toasts the server message and downloads nothing when the export fails', async () => {
+    exportFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({ detail: { code: 'strategy_not_found', message: "Strategy 'saw' not found", state: 'not_found' } }),
+        { status: 404 },
+      ),
+    );
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
+    page = await mount(<StrategiesPage />);
+
+    await click(buttonByText(page.container, 'Export'));
+
+    expect(toast).toHaveBeenCalledWith('error', "Strategy 'saw' not found");
+    expect(createObjectURL).not.toHaveBeenCalled();
+    expect(anchorClicks).toHaveLength(0);
   });
 });

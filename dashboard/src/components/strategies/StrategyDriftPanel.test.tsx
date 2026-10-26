@@ -140,7 +140,7 @@ describe('StrategyDriftPanel', () => {
     expect(notice?.className).toContain('text-danger');
   });
 
-  it('says no running session on a 404', async () => {
+  it('says no running session on a 404 session_not_running, not the server message', async () => {
     setup({
       'POST /api/strategies/saw/reload': new ApiError(
         404,
@@ -150,7 +150,25 @@ describe('StrategyDriftPanel', () => {
     m = await mount(<StrategyDriftPanel strategyId="saw" drift={DRIFTED} onRefetch={refetch} />);
     await click(buttonByText(m.container, 'Apply to session…'));
     await click(buttonByText(m.container, 'Apply to session'));
-    expect(m.container.textContent).toContain('No running session for this strategy.');
+    const notice = m.container.querySelector('[role="status"]');
+    expect(notice?.textContent).toBe('No running session for this strategy.');
+    expect(m.container.textContent).not.toContain('No running session for saw');
+  });
+
+  it('renders the server message verbatim when the strategy file is gone (404 strategy_not_found)', async () => {
+    setup({
+      'POST /api/strategies/saw/reload': new ApiError(
+        404,
+        JSON.stringify({ detail: { code: 'strategy_not_found', message: "Strategy 'saw' not found", state: 'not_found' } }),
+      ),
+    });
+    m = await mount(<StrategyDriftPanel strategyId="saw" drift={DRIFTED} onRefetch={refetch} />);
+    await click(buttonByText(m.container, 'Apply to session…'));
+    await click(buttonByText(m.container, 'Apply to session'));
+    const notice = m.container.querySelector('[role="status"]');
+    expect(notice?.textContent).toBe("Strategy 'saw' not found");
+    expect(notice?.className).toContain('text-danger');
+    expect(m.container.textContent).not.toContain('No running session for this strategy.');
   });
 
   it('renders the 422 server message verbatim', async () => {

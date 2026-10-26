@@ -6,7 +6,7 @@ import { Plus, Edit2, Trash2, BarChart3, Play, Eye, Download, Upload, LayoutTemp
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { cn } from '@/components/ui/cn';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, fetchApiText } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { describeApiError, stateFromError } from '@/lib/apiState';
@@ -179,12 +179,13 @@ export default function StrategiesPage() {
 
   const handleExport = async (id: string, name: string) => {
     try {
-      const yaml = await fetchApi<string>(`/api/strategies/${id}/export`);
-      const blob = new Blob([typeof yaml === 'string' ? yaml : JSON.stringify(yaml, null, 2)], { type: 'application/x-yaml' });
+      // The export answers raw YAML, which fetchApi's JSON parse would reject.
+      const yaml = await fetchApiText(`/api/strategies/${id}/export`);
+      const blob = new Blob([yaml], { type: 'application/x-yaml' });
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${name.toLowerCase().replace(/\s+/g, '_')}.yaml`;
+      a.download = `${id}.yaml`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -192,7 +193,7 @@ export default function StrategiesPage() {
       toast('success', `Exported "${name}"`);
     } catch (err) {
       logger.error('Strategies', 'Failed to export strategy', err);
-      toast('error', 'Failed to export strategy');
+      toast('error', describeApiError(err, 'Failed to export strategy'));
     }
   };
 
