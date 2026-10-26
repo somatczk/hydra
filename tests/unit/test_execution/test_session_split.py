@@ -16,7 +16,9 @@ from hydra.execution import (
     client_factory,
     flatten,
     protective_orders,
+    session_health,
     session_manager,
+    session_recovery,
     session_store,
     session_wiring,
 )
@@ -25,7 +27,15 @@ from tests.unit.test_execution.session_harness import Harness, write_strategy
 
 REPO = Path(__file__).resolve().parents[3]
 EXECUTION = REPO / "src" / "hydra" / "execution"
-SESSION_MODULES = [session_manager, session_wiring, session_store, flatten, protective_orders]
+SESSION_MODULES = [
+    session_manager,
+    session_wiring,
+    session_store,
+    flatten,
+    protective_orders,
+    session_recovery,
+    session_health,
+]
 
 
 def test_only_client_factory_constructs_exchange_clients() -> None:
@@ -70,6 +80,8 @@ def test_paper_executor_shims_are_gone() -> None:
 def test_sql_lives_in_session_store(marker: str) -> None:
     assert marker not in inspect.getsource(session_manager)
     assert marker not in inspect.getsource(session_wiring)
+    assert marker not in inspect.getsource(session_recovery)
+    assert marker not in inspect.getsource(session_health)
 
 
 @pytest.mark.parametrize(
@@ -94,10 +106,11 @@ def test_public_api() -> None:
         "get_session",
         "get_session_detail",
         "submit_manual_order",
-        "health_snapshot",
         "graceful_shutdown",
     ):
         assert getattr(SessionManager, name).__module__ == session_manager.__name__
+    # S6 split (P3-D2): health_snapshot is the public API's one mixin-defined member.
+    assert SessionManager.health_snapshot.__module__ == session_health.__name__
     for gone in ("recover_running_sessions", "load_recent_sessions", "_reconciliation_loop"):
         assert not hasattr(SessionManager, gone)
     assert callable(client_factory.validate_venue)

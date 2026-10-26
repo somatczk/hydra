@@ -174,7 +174,10 @@ def test_every_series_a_rule_or_panel_reads_has_a_runtime_producer() -> None:
     producers = _producers()
     assert read
     assert {name for name in read if not producers.get(name)} == set()
-    assert producers["hydra_sessions_errored_total"] == {"execution/session_manager.py"}
+    assert producers["hydra_sessions_errored_total"] == {
+        "execution/session_manager.py",
+        "execution/session_recovery.py",
+    }
 
 
 @pytest.fixture()
