@@ -1,16 +1,34 @@
+import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
+import {
+  buttonByText,
+  click,
+  dialogPolyfill,
+  flush,
+  inputByLabel,
+  mount,
+  routeFetch,
+  sectionText,
+  typeInto,
+  unavailable,
+  type Mounted,
+  type Mutations,
+  type Routes,
+} from '@/test/pageHarness';
+import { liveStatus, session } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
+const push = vi.fn();
 
 vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
   fetchApi: (...args: unknown[]) => fetchApi(...args),
 }));
 vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
-vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn() }) }));
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push }) }));
 
 const { default: StrategiesPage } = await import('./page');
+const { ShellStatusProvider } = await import('@/components/shell/ShellStatusProvider');
 
 const STRATEGY = {
   id: 'saw',
@@ -21,18 +39,35 @@ const STRATEGY = {
   editable: true,
 };
 
+const PERFORMANCE = {
+  total_pnl: 12,
+  win_rate: 50,
+  total_trades: 2,
+  sharpe_ratio: 0.4,
+  max_drawdown: 1,
+};
+
+const DRIFTED = {
+  config_hash: 'aabb',
+  file_changed: true,
+  running_sessions: [{ session_id: 's1', config_hash: 'ccdd', stale: true }],
+};
+
+const RUNNING_SESSION = {
+  session_id: 's1',
+  strategy_id: 'saw',
+  trading_mode: 'paper',
+  status: 'running',
+  started_at: null,
+  stopped_at: null,
+};
+
 function baseRoutes(): Routes {
   return {
     '/api/strategies': [STRATEGY],
     '/api/trading/sessions': [],
     '/api/system/config': { trading_mode: 'paper', paper_capital: 2500 },
-    '/api/strategies/saw/performance': {
-      total_pnl: 12,
-      win_rate: 50,
-      total_trades: 2,
-      sharpe_ratio: 0.4,
-      max_drawdown: 1,
-    },
+    '/api/strategies/saw/performance': PERFORMANCE,
   };
 }
 
@@ -40,7 +75,9 @@ let page: Mounted | null = null;
 let calls: Array<{ path: string; init?: RequestInit }>;
 
 beforeEach(() => {
+  dialogPolyfill();
   calls = [];
+  push.mockReset();
   fetchApi.mockReset();
 });
 
@@ -86,22 +123,33 @@ describe('StrategiesPage error states', () => {
     fetchApi.mockImplementation(routeFetch(routes, calls));
     page = await mount(<StrategiesPage />);
 
-    const text = page.container.textContent ?? '';
-    expect(text).not.toContain('0.00Sharpe');
-    expect(text).not.toContain('0.0%Max DD');
-    expect(text).toContain('—Sharpe');
-    expect(text).toContain('—Max DD');
+    const card = sectionText(page.container, 'Saw');
+    expect(card).not.toContain('0.00Sharpe');
+    expect(card).not.toContain('0.0%Max DD');
+    expect(card).toContain('—Sharpe');
+    expect(card).toContain('—Max DD');
   });
 
-  it('uses the configured paper capital', async () => {
+  it('shows PnL signed with USDT in the label, never a $ sign', async () => {
+    const routes = baseRoutes();
+    routes['/api/strategies/saw/performance'] = { ...PERFORMANCE, total_pnl: -50 };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const card = sectionText(page.container, 'Saw');
+    expect(card).toContain('−50.00');
+    expect(card).toContain('PnL (USDT)');
+    expect(card).not.toContain('$');
+  });
+
+  it('asks for capital in the start dialog, not on the card', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
     page = await mount(<StrategiesPage />);
 
-    const capital = page.container.querySelector<HTMLInputElement>('input[type="number"]');
-    expect(capital?.value).toBe('2500');
+    expect(page.container.querySelector('input[type="number"]')).toBeNull();
   });
 
-  it('does not invent a 10000 capital or a paper mode when the config is unavailable', async () => {
+  it('does not invent a paper mode when the config is unavailable', async () => {
     const routes = baseRoutes();
     routes['/api/system/config'] = unavailable();
     fetchApi.mockImplementation(routeFetch(routes, calls));
@@ -123,13 +171,80 @@ describe('StrategiesPage error states', () => {
   });
 });
 
+describe('StrategiesPage hot-reload state', () => {
+  it('shows the caution row and the apply door when the file changed under a running session', async () => {
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = DRIFTED;
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const card = sectionText(page.container, 'Saw');
+    expect(card).toContain('The strategy file changed after this session started.');
+    expect(buttonByText(page.container, 'Apply to session…')).toBeTruthy();
+  });
+
+  it('shows neither when the running session is on the file it started with', async () => {
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = {
+      config_hash: 'aabb',
+      file_changed: false,
+      running_sessions: [{ session_id: 's1', config_hash: 'aabb', stale: false }],
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('The strategy file changed after this session started.');
+    expect(text).not.toContain('Apply to session…');
+  });
+
+  it('renders a strategy whose detail fails instead of vanishing it', async () => {
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = unavailable('Strategy detail could not be read');
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const row = page.container.querySelector('[data-testid="drift-error"]');
+    expect(row?.textContent).toContain('Strategy detail could not be read');
+    expect(row?.querySelector('[data-state="unavailable"]')).not.toBeNull();
+    expect(sectionText(page.container, 'Saw')).toContain('Sawtooth');
+  });
+
+  it('fetches the detail only for strategies with a running session (40 strategies, 2 running)', async () => {
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      ...STRATEGY,
+      id: `st-${String(i).padStart(2, '0')}`,
+      name: `Strategy ${i}`,
+    }));
+    const routes: Routes = {
+      '/api/strategies': many,
+      '/api/trading/sessions': [
+        { ...RUNNING_SESSION, strategy_id: 'st-07' },
+        { ...RUNNING_SESSION, session_id: 's2', strategy_id: 'st-22' },
+      ],
+      '/api/system/config': { trading_mode: 'paper' },
+      '/api/strategies/st-07': DRIFTED,
+      '/api/strategies/st-22': DRIFTED,
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<StrategiesPage />);
+
+    const detailCalls = calls.filter((c) => /^\/api\/strategies\/st-\d\d$/.test(c.path));
+    expect(detailCalls.map((c) => c.path).sort()).toEqual(['/api/strategies/st-07', '/api/strategies/st-22']);
+    const perfCalls = calls.filter((c) => c.path.endsWith('/performance'));
+    expect(perfCalls).toHaveLength(40);
+  });
+});
+
 describe('StrategiesPage research hygiene', () => {
   it('has one h1, the phone Research nav, and no Start Live, Risk Overrides or Stop', async () => {
     const routes = baseRoutes();
     routes['/api/system/config'] = { trading_mode: 'live', paper_capital: 2500 };
-    routes['/api/trading/sessions'] = [
-      { session_id: 's1', strategy_id: 'saw', trading_mode: 'paper', status: 'running', started_at: null, stopped_at: null },
-    ];
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = DRIFTED;
     fetchApi.mockImplementation(routeFetch(routes, calls));
     page = await mount(<StrategiesPage />);
 
@@ -165,5 +280,101 @@ describe('StrategiesPage research hygiene', () => {
     const labels = Array.from(page.container.querySelectorAll('button')).map((b) => b.textContent?.trim());
     expect(labels).toContain('New strategy');
     expect(labels).toContain('New from template');
+  });
+});
+
+describe('StrategiesPage start paper session', () => {
+  it('opens the start dialog and sends nothing until it is confirmed', async () => {
+    const routes: Routes = {
+      ...baseRoutes(),
+      '/api/risk/live-status': liveStatus(),
+      '/api/strategies/saw': { id: 'saw', name: 'Saw', symbol: 'BTCUSDT', timeframes: { primary: '1h' } },
+    };
+    const mutations: Mutations = {
+      'POST /api/trading/sessions': session({ session_id: 'new-1', strategy_id: 'saw', paper_capital: 6000 }),
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls, mutations));
+    page = await mount(
+      <ShellStatusProvider>
+        <StrategiesPage />
+      </ShellStatusProvider>,
+    );
+
+    await click(buttonByText(page.container, 'Start paper session'));
+    const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.open).toBe(true);
+    expect(dialog.textContent).toContain('Start a paper session');
+    expect(calls.filter((c) => c.init?.method === 'POST')).toHaveLength(0);
+
+    await typeInto(inputByLabel(dialog, 'Paper capital for this session (USDT)'), '8000');
+    await click(buttonByText(dialog, 'Start paper session'));
+    const post = calls.find((c) => c.init?.method === 'POST');
+    expect(post?.path).toBe('/api/trading/sessions');
+    expect(JSON.parse(post?.init?.body as string)).toEqual({
+      strategy_id: 'saw',
+      trading_mode: 'paper',
+      paper_capital: '8000',
+    });
+    expect(push).toHaveBeenCalledWith('/trading/new-1');
+  });
+});
+
+describe('StrategiesPage delete', () => {
+  it('asks via a confirm dialog focused on its title and deletes once after confirming', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm');
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, {}));
+    page = await mount(<StrategiesPage />);
+
+    await click(buttonByText(page.container, 'Delete'));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.open).toBe(true);
+    expect(document.activeElement?.textContent).toBe('Delete Saw?');
+    expect(document.activeElement?.tagName).not.toBe('BUTTON');
+    expect(dialog.textContent).toContain("This removes the strategy's YAML file. This cannot be undone.");
+
+    const primary = buttonByText(dialog, 'Delete strategy');
+    await act(async () => {
+      primary.click();
+      primary.click();
+    });
+    await flush();
+    const deletes = calls.filter((c) => c.path === '/api/strategies/saw' && c.init?.method === 'DELETE');
+    expect(deletes).toHaveLength(1);
+    expect(page.container.querySelector('dialog[open]')).toBeNull();
+    confirmSpy.mockRestore();
+  });
+
+  it('keeps the strategy when the secondary is chosen', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, {}));
+    page = await mount(<StrategiesPage />);
+
+    await click(buttonByText(page.container, 'Delete'));
+    await click(buttonByText(page.container, 'Keep it'));
+    expect(calls.filter((c) => c.init?.method === 'DELETE')).toHaveLength(0);
+    expect(page.container.querySelector('dialog[open]')).toBeNull();
+  });
+});
+
+describe('StrategiesPage import', () => {
+  it('sends the chosen file as multipart FormData, not JSON', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, { 'POST /api/strategies/import': {} }));
+    page = await mount(<StrategiesPage />);
+
+    const input = page.container.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(['id: imported\nname: Imported\n'], 'my.yaml', { type: 'application/x-yaml' });
+    Object.defineProperty(input, 'files', { value: [file], configurable: true });
+    await act(async () => {
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await flush();
+
+    const sent = calls.find((c) => c.path === '/api/strategies/import');
+    expect(sent?.init?.method).toBe('POST');
+    const body = sent?.init?.body as FormData;
+    expect(body).toBeInstanceOf(FormData);
+    const uploaded = body.get('file');
+    expect(uploaded).toBeInstanceOf(Blob);
+    expect((uploaded as File).name).toBe('my.yaml');
   });
 });

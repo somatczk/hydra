@@ -5,9 +5,10 @@ const TABS = [
   { label: 'Strategies', href: '/strategies' },
   { label: 'Backtests', href: '/backtest' },
   { label: 'Optimize', href: '/optimize' },
+  { label: 'Templates', href: '/templates' },
 ] as const;
 
-/** Phone-only way between the three Research pages (the rail's children are desktop-only). */
+/** Phone-only way between the Research pages (the rail's children are desktop-only). */
 export function ResearchNav({ current }: { current: (typeof TABS)[number]['href'] }) {
   return (
     <nav aria-label="Research" className="flex rounded-lg border border-line bg-surface p-1 lg:hidden">
