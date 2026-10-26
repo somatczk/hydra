@@ -39,7 +39,7 @@ const DISAGREE: Outcome = {
   tone: 'caution',
   title: 'The engine now reports the kill switch as off.',
   lines: ['It may have been released elsewhere. Check the activity log.'],
-  actions: [{ kind: 'open', label: 'Open activity', href: '/activity' }],
+  actions: [{ kind: 'open', label: 'Open activity log', href: '/activity' }],
 };
 
 const NOT_SAVED_KEY = 'hydra-ks-not-saved';

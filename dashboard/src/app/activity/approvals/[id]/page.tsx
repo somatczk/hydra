@@ -43,11 +43,14 @@ export default function ApprovalReviewPage() {
   const [busy, setBusy] = useState<'approve' | 'deny' | null>(null);
   const [decidedHere, setDecidedHere] = useState<'approved' | 'denied' | null>(null);
   const last = useRef<{ kind: 'approve'; code: string } | { kind: 'deny' } | null>(null);
+  /** A4: an approve whose answer never came back may have won; a later 409 already_decided says it did. */
+  const approveUnanswered = useRef(false);
 
   const refresh = () => Promise.all([detail.refetch(), trail.refetch(), shell.refetchAll()]);
 
   const decidedElsewhere = (err: unknown) => {
     if (DECIDED_ELSEWHERE.has(parseErrorDetail(err)?.code ?? '')) {
+      setOutcome(null);
       void detail.refetch();
       return true;
     }
@@ -62,14 +65,21 @@ export default function ApprovalReviewPage() {
     );
     setBusy(null);
     if ('ok' in result) {
+      approveUnanswered.current = false;
       setInline(null);
       setDecidedHere('approved');
       setOutcome(approvalOutcome(result));
       void refresh();
       return;
     }
-    if (decidedElsewhere(result.err)) return;
+    if (decidedElsewhere(result.err)) {
+      // A 409 after our own unanswered approve means that earlier POST won, not another device.
+      if (parseErrorDetail(result.err)?.code === 'already_decided' && approveUnanswered.current) setDecidedHere('approved');
+      approveUnanswered.current = false;
+      return;
+    }
     const o = approvalOutcome(result);
+    approveUnanswered.current = o.unanswered === true;
     if (o.inline) setInline([o.title, ...o.lines].join(' '));
     else {
       setInline(null);
@@ -91,7 +101,7 @@ export default function ApprovalReviewPage() {
       return;
     }
     if (decidedElsewhere(result.err)) return;
-    setOutcome(approvalOutcome(result));
+    setOutcome(approvalOutcome(result, 'deny'));
     void refresh();
   };
 
@@ -143,6 +153,7 @@ export default function ApprovalReviewPage() {
         trailError={trail.data === null && trail.state !== 'loading' ? trail.error : null}
         onRetryTrail={() => void trail.refetch()}
         now={shell.now}
+        activeTier={shell.live.data?.circuit_breaker_restrictions?.active_tier ?? 0}
         busy={busy}
         error={inline}
         decidedHere={decidedHere}

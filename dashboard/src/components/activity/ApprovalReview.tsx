@@ -22,6 +22,8 @@ export interface ApprovalReviewProps {
   onRetryTrail: () => void;
   /** Ticks at most every 10 s; the expiry line is plain static text between ticks, never a live region. */
   now: number;
+  /** The active breaker tier from the shell's live-status poll; the release facts name it (as /risk does). */
+  activeTier: number;
   busy: 'approve' | 'deny' | null;
   /** The last failed attempt, shown inline; the typed code stays. */
   error: string | null;
@@ -38,6 +40,7 @@ export function ApprovalReview({
   trailError,
   onRetryTrail,
   now,
+  activeTier,
   busy,
   error,
   decidedHere,
@@ -47,13 +50,21 @@ export function ApprovalReview({
   const [code, setCode] = useState('');
   const valid = CODE_RE.test(code);
   const primaryRef = useRef<HTMLButtonElement>(null);
+  const fieldRef = useRef<HTMLInputElement>(null);
   const hadValid = useRef(false);
+  const hadError = useRef(false);
 
   // S11: the primary takes focus only once the code is valid; Deny stays Tab-reachable without one.
   useEffect(() => {
     if (valid && !hadValid.current) primaryRef.current?.focus();
     hadValid.current = valid;
   }, [valid]);
+
+  // A3: a rejected code leaves the field — the recovery surface — focused, so Enter can't re-send it.
+  useEffect(() => {
+    if (error && !hadError.current) fieldRef.current?.focus();
+    hadError.current = error !== null;
+  }, [error]);
 
   const action = actionPhrase(approval.action);
   const pending = approval.status === 'pending';
@@ -84,6 +95,12 @@ export function ApprovalReview({
       </header>
 
       <Section title="Context">
+        {approval.action === 'kill_switch_release' && (
+          <p className="mb-2 text-sm text-ink-1">
+            Releasing lets sessions start and open positions again. It doesn&apos;t restart stopped sessions.
+            {activeTier > 0 && ` Breaker tier ${activeTier} is still active and still blocks entries; reset it separately.`}
+          </p>
+        )}
         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
           <dt className="text-ink-2">Action</dt>
           <dd className="font-mono text-ink-1">{approval.action}</dd>
@@ -115,6 +132,7 @@ export function ApprovalReview({
           <div className="flex flex-col gap-3">
             <p className="text-sm text-ink-2">Expires in {duration(Date.parse(approval.expires_at) - now) ?? '—'}</p>
             <Input
+              ref={fieldRef}
               label="One-time code"
               value={code}
               onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, CODE_LENGTH))}
@@ -131,7 +149,7 @@ export function ApprovalReview({
                 ref={primaryRef}
                 size="lg"
                 className="max-lg:w-full"
-                disabled={!valid}
+                disabled={!valid || busy !== null}
                 loading={busy === 'approve'}
                 onClick={() => onApprove(code)}
               >

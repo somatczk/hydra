@@ -391,4 +391,30 @@ describe('approvalOutcome', () => {
     expect(outage.title).toBe('Not confirmed.');
     expect(text(outage)).toContain("We couldn't reach the engine, so we don't know whether the code was accepted");
   });
+
+  it('a 409 executor_not_registered names the state and carries the server message, never an outage (A1)', () => {
+    const o = approvalOutcome({
+      err: envelope(
+        409,
+        'executor_not_registered',
+        "No executor is registered for 'kill_switch_release'; the approval stays pending and the code was not used",
+        'invalid',
+        { action: 'kill_switch_release' },
+      ),
+    });
+    expect(o.tone).toBe('caution');
+    expect(o.title).toBe('The engine cannot execute this action yet.');
+    expect(o.lines).toEqual([
+      "No executor is registered for 'kill_switch_release'; the approval stays pending and the code was not used",
+      'The code was not used. Wait for the engine, or deny this request.',
+    ]);
+    expect(text(o)).not.toContain("couldn't reach the engine");
+  });
+
+  it('a network-failed deny says the denial is unknown and never speaks of a code (A5)', () => {
+    const o = approvalOutcome({ err: new TypeError('Failed to fetch') }, 'deny');
+    expect(o.title).toBe('Not confirmed.');
+    expect(text(o)).toContain("We couldn't reach the engine, so we don't know whether the denial was recorded");
+    expect(text(o)).not.toContain('the code');
+  });
 });

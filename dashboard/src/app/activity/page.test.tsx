@@ -144,6 +144,22 @@ describe('Activity page', () => {
     expect(link?.textContent).toContain('Open session');
   });
 
+  it('links the row of an event that touched a strategy', async () => {
+    const STRATEGY_EVENT = {
+      id: 8,
+      ts: '2026-10-21T12:30:00Z',
+      scope: 'paper',
+      kind: 'strategy_saved',
+      tier: null,
+      actor: 'user:soma',
+      reason: 'tuned parameters',
+      details: { strategy_id: 'sma-cross-btc-1h' },
+    };
+    const c = await show({ '/api/activity?limit=500': [STRATEGY_EVENT] });
+    const link = c.querySelector('a[href="/builder?strategy=sma-cross-btc-1h"]');
+    expect(link?.textContent).toContain('Open strategy');
+  });
+
   it('renders the empty state and a per-filter empty line', async () => {
     const c = await show({ '/api/activity?limit=500': [] });
     expect(c.textContent).toContain('No risk events yet. Breaker changes, resets and kill-switch changes appear here.');

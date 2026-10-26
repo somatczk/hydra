@@ -21,6 +21,8 @@ export interface Outcome {
   inline?: boolean;
   /** Navigate here on success (start session). */
   navigate?: string;
+  /** True when the request's effect is unknown: the not-confirmed fallthrough, never a definite answer. */
+  unanswered?: boolean;
 }
 
 export type Result<T> = { ok: T } | { err: unknown };
@@ -203,6 +205,7 @@ function notConfirmed(
     title: 'Not confirmed.',
     lines: [`We couldn't reach the engine, so we don't know whether ${what}. ${next}`, ...(msg ? [msg] : [])],
     actions,
+    unanswered: true,
   };
 }
 
@@ -518,8 +521,10 @@ export function limitsOutcome(result: Result<unknown>): Outcome {
   return notConfirmed('the limits were saved', err);
 }
 
-/** POST /api/activity/approvals/{id}/approve|deny (F8): the double attribution names both actors. */
-export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>): Outcome {
+/** POST /api/activity/approvals/{id}/approve|deny (F8): the double attribution names both actors.
+ * `intent` picks the not-confirmed wording when the POST's own answer was lost: an approve speaks
+ * of the code, a deny must not. */
+export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>, intent: 'approve' | 'deny' = 'approve'): Outcome {
   if ('ok' in result) {
     if ('executed' in result.ok) {
       return ok('Released by Claude, approved by you.', ['Trading can resume. No sessions were restarted.']);
@@ -545,8 +550,16 @@ export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>):
   if (d?.code === 'approval_execution_failed') {
     return { tone: 'danger', title: "Approved, but it didn't run.", lines: [d.message, 'Ask for a new one.'], actions: [] };
   }
+  if (d?.code === 'executor_not_registered') {
+    return {
+      tone: 'caution',
+      title: 'The engine cannot execute this action yet.',
+      lines: [d.message, 'The code was not used. Wait for the engine, or deny this request.'],
+      actions: [],
+    };
+  }
   if (d?.code === 'already_decided' || d?.code === 'approval_expired' || d?.code === 'approval_failed') {
     return { tone: 'caution', title: d.message, lines: [], actions: [] };
   }
-  return notConfirmed('the code was accepted', err);
+  return notConfirmed(intent === 'deny' ? 'the denial was recorded' : 'the code was accepted', err);
 }

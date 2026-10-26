@@ -133,6 +133,35 @@ describe('approval review: the ask', () => {
     await advance(10_000);
     expect(expiry()?.textContent).toBe('Expires in 4 min');
   });
+
+  it('states what releasing does before asking for a decision: the C-REL-1 facts and the still-active tier', async () => {
+    setup(approvalDetail(), {}, {
+      '/api/risk/live-status': liveStatus({
+        circuit_breaker_restrictions: {
+          active_tier: 2,
+          can_open_new_trades: false,
+          size_multiplier: 0.5,
+          must_flatten: false,
+          is_shutdown: false,
+          daily_halt_until: null,
+          consecutive_pause_until: null,
+        },
+      }),
+    });
+    m = await page();
+    expect(text()).toContain("Releasing lets sessions start and open positions again. It doesn't restart stopped sessions.");
+    expect(text()).toContain('Breaker tier 2 is still active and still blocks entries; reset it separately.');
+    expect(text()).toContain('Action');
+    expect(text()).toContain('kill_switch_release');
+    expect(text()).toContain('Params');
+  });
+
+  it('renders no release facts for another gated action', async () => {
+    setup(approvalDetail({ action: 'start_session', params: { strategy_id: 'saw' } }));
+    m = await page();
+    expect(text()).not.toContain('Releasing lets sessions start');
+    expect(text()).not.toContain("It doesn't restart stopped sessions.");
+  });
 });
 
 describe('approval review: the one-time code', () => {
@@ -212,6 +241,56 @@ describe('approval review: the one-time code', () => {
     expect(m.container.textContent).toContain('Only a signed-in person can approve or deny; service principals cannot');
     expect(inputByLabel(m.container, 'One-time code').value).toBe('424242');
   });
+
+  it('returns focus to the code field after a wrong code, so it can be edited (A3)', async () => {
+    setup(approvalDetail(), {
+      [`POST /api/activity/approvals/${ID}/approve`]: envelope(422, 'code_mismatch', "That code didn't match. Nothing changed.", 'invalid', { attempts_left: 4 }),
+    });
+    m = await page();
+    await typeCode('000000');
+    expect(document.activeElement).toBe(primary());
+    await click(primary());
+    expect(document.activeElement).toBe(inputByLabel(m.container, 'One-time code'));
+  });
+
+  it('a 409 executor_not_registered is its own outcome: the state and the server message, never an outage (A1)', async () => {
+    setup(approvalDetail(), {
+      [`POST /api/activity/approvals/${ID}/approve`]: envelope(
+        409,
+        'executor_not_registered',
+        "No executor is registered for 'kill_switch_release'; the approval stays pending and the code was not used",
+        'invalid',
+        { action: 'kill_switch_release' },
+      ),
+    });
+    m = await page();
+    await typeCode('424242');
+    await click(primary());
+    expect(text()).toContain('The engine cannot execute this action yet.');
+    expect(text()).toContain("No executor is registered for 'kill_switch_release'; the approval stays pending and the code was not used");
+    expect(text()).not.toContain("couldn't reach the engine");
+    expect(text()).toContain('One-time code');
+  });
+});
+
+describe('approval review: a lost answer', () => {
+  it('credits this device when a retry after a lost answer meets 409 already_decided (A4)', async () => {
+    setup(approvalDetail(), {
+      [`POST /api/activity/approvals/${ID}/approve`]: (n: number) =>
+        n === 1
+          ? new TypeError('Failed to fetch')
+          : envelope(409, 'already_decided', 'This approval was already approved', 'invalid'),
+    });
+    m = await page();
+    await typeCode('424242');
+    await click(primary());
+    expect(text()).toContain('Not confirmed.');
+    detail = approvalDetail({ status: 'approved', approved_by: 'user:soma', decided_at: '2026-10-21T13:56:00+00:00' });
+    await click(buttonByText(m.container, 'Try again'));
+    expect(sent('POST', `/api/activity/approvals/${ID}/approve`)).toHaveLength(2);
+    expect(text()).toContain('You approved this at 13:56:00 UTC.');
+    expect(text()).not.toContain('on another device');
+  });
 });
 
 describe('approval review: deny', () => {
@@ -229,6 +308,28 @@ describe('approval review: deny', () => {
     expect(text()).toContain('Claude can ask again.');
     expect(text()).toContain('You denied this at 13:56:00 UTC.');
     expect(text()).not.toContain('One-time code');
+  });
+
+  it('disables Approve while a Deny is in flight (A2)', async () => {
+    setup(approvalDetail(), {
+      [`POST /api/activity/approvals/${ID}/deny`]: () => new Promise(() => {}),
+    });
+    m = await page();
+    await typeCode('424242');
+    expect(primary().disabled).toBe(false);
+    await click(deny());
+    expect(primary().disabled).toBe(true);
+    expect(deny().disabled).toBe(true);
+  });
+
+  it('a network-failed deny says the denial is unknown and never mentions a code (A5)', async () => {
+    setup(approvalDetail(), {
+      [`POST /api/activity/approvals/${ID}/deny`]: new TypeError('Failed to fetch'),
+    });
+    m = await page();
+    await click(deny());
+    expect(text()).toContain("We couldn't reach the engine, so we don't know whether the denial was recorded");
+    expect(text()).not.toContain('the code');
   });
 });
 

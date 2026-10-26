@@ -117,5 +117,6 @@ describe('ShellStatusProvider outcome', () => {
     const outcome = c.querySelector('[data-outcome]');
     expect(outcome?.textContent).toContain('The engine now reports the kill switch as off.');
     expect(outcome?.querySelector('a')?.getAttribute('href')).toBe('/activity');
+    expect(outcome?.textContent).toContain('Open activity log');
   });
 });
