@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import sys
+import types
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -34,6 +36,7 @@ from hydra.core.logging import get_logger
 from hydra.dashboard import security
 from hydra.dashboard.api import app as engine_app
 from hydra.dashboard.mcp import mount_mcp
+from hydra.dashboard.mcp.tools import _deps
 from hydra.dashboard.security import install_security
 from hydra.execution.errors import ConfigReloadRefusedError
 from hydra.services import strategies as strategy_svc
@@ -335,6 +338,62 @@ class _DownPool:
 
     def acquire(self) -> Any:
         raise ConnectionError("database down")
+
+
+# ---------------------------------------------------------------------------
+# Engine-state resolution: the engine serves `python -m hydra.dashboard.api`
+# ---------------------------------------------------------------------------
+
+
+def test_engine_state_prefers_the_served_python_m_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The engine container serves ``python -m hydra.dashboard.api``, which runs
+    ``api.py`` as ``__main__``: the lifespan-bound app is ``__main__.app`` and the
+    module import builds a stateless second instance — the tools must resolve the
+    served app, not the import."""
+    served = FastAPI()
+    sentinel = object()
+    served.state.db_pool = sentinel
+    # the stateless second instance the import builds in the served process
+    monkeypatch.setattr(engine_app.state, "db_pool", None)
+    main = types.ModuleType("__main__")
+    main.__file__ = sys.modules["hydra.dashboard.api"].__file__
+    main.app = served
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    assert _deps.engine_state() is served.state
+    assert _deps.db_pool() is sentinel
+    assert engine_app.state is not served.state
+    assert engine_app.state.db_pool is None
+
+
+def test_engine_state_falls_back_when_the_python_m_app_is_stateless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``__main__`` whose ``__file__`` is the served ``api.py`` but whose app has
+    no lifespan binding (neither pool nor session manager) is not the served engine:
+    the imported module's state — the unit-test seam — wins, not the stateless
+    ``__main__`` app."""
+    stateless = FastAPI()
+    stateless.state.db_pool = None
+    stateless.state.session_manager = None
+    sentinel = object()
+    monkeypatch.setattr(engine_app.state, "db_pool", sentinel)
+    main = types.ModuleType("__main__")
+    main.__file__ = sys.modules["hydra.dashboard.api"].__file__
+    main.app = stateless
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    assert _deps.engine_state() is engine_app.state
+    assert _deps.db_pool() is sentinel
+
+
+def test_engine_state_falls_back_to_the_imported_module_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The test layout (no served ``__main__``): the imported module's app state is
+    the engine state — the monkeypatch seam every other tool test patches."""
+    sentinel = object()
+    monkeypatch.setattr(engine_app.state, "db_pool", sentinel)
+    assert _deps.engine_state() is engine_app.state
+    assert _deps.db_pool() is sentinel
 
 
 def test_tools_list_advertises_the_31_tools(mcp: _McpClient) -> None:

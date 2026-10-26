@@ -1,15 +1,20 @@
 """Engine bindings shared by the tool modules: pool, session manager, error conversion.
 
 A tool call has no FastAPI request — the SDK's Starlette app replaces ``scope["app"]``
-with its own — so tool bodies resolve the engine lazily: the uvicorn entrypoint object
-(``hydra.dashboard.api.app``) whose state the lifespan binds (``db_pool``,
-``session_manager``). In the engine process that object is the app the MCP mount is
-attached to; without a lifespan-bound pool the services answer their 503 envelope.
+with its own — so tool bodies resolve the engine lazily. The engine container serves
+``python -m hydra.dashboard.api``, which executes ``api.py`` as ``__main__``: the
+served app the lifespan binds (``db_pool``, ``session_manager``) is
+``sys.modules["__main__"].app``, and importing ``hydra.dashboard.api`` in that process
+builds a second, lifespan-less instance. The engine state is therefore resolved from
+the lifespan-bound ``__main__`` app when that is the served engine, with the module
+import as the fallback (the unit-test seam); without a lifespan-bound pool the
+services answer their 503 envelope.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -23,7 +28,21 @@ MCP_PRINCIPAL = Principal("service", "mcp")
 
 
 def engine_state() -> Any:
-    """The engine FastAPI app's state the lifespan bound (config, pool, session manager)."""
+    """The served engine app's state the lifespan bound (config, pool, session manager).
+
+    Under ``python -m hydra.dashboard.api`` the served app is ``__main__.app``; the
+    import below would build a stateless second instance in that process, so the
+    lifespan-bound ``__main__`` app wins and the import stays the fallback.
+    """
+    main = sys.modules.get("__main__")
+    main_file = getattr(main, "__file__", None)
+    if main_file and str(main_file).replace("\\", "/").lower().endswith("dashboard/api.py"):
+        state = getattr(getattr(main, "app", None), "state", None)
+        if state is not None and (
+            getattr(state, "db_pool", None) is not None
+            or getattr(state, "session_manager", None) is not None
+        ):
+            return state
     from hydra.dashboard.api import app
 
     return app.state
