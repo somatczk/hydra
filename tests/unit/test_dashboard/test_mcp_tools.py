@@ -365,6 +365,26 @@ def test_engine_state_prefers_the_served_python_m_app(monkeypatch: pytest.Monkey
     assert engine_app.state.db_pool is None
 
 
+def test_engine_state_falls_back_when_the_python_m_app_is_stateless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``__main__`` whose ``__file__`` is the served ``api.py`` but whose app has
+    no lifespan binding (neither pool nor session manager) is not the served engine:
+    the imported module's state — the unit-test seam — wins, not the stateless
+    ``__main__`` app."""
+    stateless = FastAPI()
+    stateless.state.db_pool = None
+    stateless.state.session_manager = None
+    sentinel = object()
+    monkeypatch.setattr(engine_app.state, "db_pool", sentinel)
+    main = types.ModuleType("__main__")
+    main.__file__ = sys.modules["hydra.dashboard.api"].__file__
+    main.app = stateless
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    assert _deps.engine_state() is engine_app.state
+    assert _deps.db_pool() is sentinel
+
+
 def test_engine_state_falls_back_to_the_imported_module_app(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

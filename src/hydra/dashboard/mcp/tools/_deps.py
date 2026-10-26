@@ -36,7 +36,7 @@ def engine_state() -> Any:
     """
     main = sys.modules.get("__main__")
     main_file = getattr(main, "__file__", None)
-    if main_file and str(main_file).replace("\\", "/").endswith("dashboard/api.py"):
+    if main_file and str(main_file).replace("\\", "/").lower().endswith("dashboard/api.py"):
         state = getattr(getattr(main, "app", None), "state", None)
         if state is not None and (
             getattr(state, "db_pool", None) is not None
