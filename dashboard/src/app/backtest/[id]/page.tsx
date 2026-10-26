@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useMemo, useCallback } from 'react';
+import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import {
   ArrowLeft,
@@ -9,7 +10,6 @@ import {
   CheckCircle,
   XCircle,
   AlertTriangle,
-  Share2,
 } from 'lucide-react';
 import {
   AreaChart,
@@ -23,21 +23,31 @@ import {
 } from 'recharts';
 import type { TooltipContentProps, TooltipValueType } from 'recharts';
 import { Button } from '@/components/ui/Button';
-import { DataCard } from '@/components/ui/DataCard';
+import { Readout } from '@/components/ui/Readout';
+import { Section } from '@/components/ui/Section';
 import { Input } from '@/components/ui/Input';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
+import { money, signed, signedLabel } from '@/lib/format';
 import { useToast } from '@/components/ui/Toast';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { ResearchNav } from '@/components/research/ResearchNav';
-import { ProvenanceBadge, ProvenancePanel, type DataProvenance } from '@/components/backtest/DataProvenance';
+import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
+import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
+import {
+  ProvenanceBadge,
+  ProvenancePanel,
+  formatUtc,
+  type DataProvenance,
+} from '@/components/backtest/DataProvenance';
 import { describeApiError, stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 import {
   type TimeResolution,
   type EquityPoint,
   aggregateEquityCurve,
+  chartColors,
   formatXTick,
   formatYTick,
 } from '../chart-utils';
@@ -111,7 +121,6 @@ interface TxnRow {
   quantity: string;
   fee: string;
   pnl: number | null;
-  pnlFormatted: string;
   isOpen: boolean;
 }
 
@@ -119,6 +128,18 @@ interface MergedEquityPoint {
   timestamp: string;
   value: number;
   benchmark?: number;
+}
+
+const usdt = (v: number) => `${money(v) ?? '—'} USDT`;
+
+/** The sign glyph is hidden from AT, which hear "gain/loss" instead (portfolio pattern). */
+function SignedMoney({ value }: { value: number }) {
+  return (
+    <>
+      <span aria-hidden="true">{signed(value) ?? '—'}</span>
+      <span className="sr-only">{signedLabel(value) ?? 'not available'}</span>
+    </>
+  );
 }
 
 /* ---------- Page ---------- */
@@ -134,7 +155,6 @@ export default function BacktestDetailPage() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [resolution, setResolution] = useState<TimeResolution>('days');
-  const [isDark, setIsDark] = useState(false);
 
   // Rename state
   const [editing, setEditing] = useState(false);
@@ -143,12 +163,8 @@ export default function BacktestDetailPage() {
   // Delete state
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  // Share state
-  const [sharing, setSharing] = useState(false);
-
-  useEffect(() => {
-    setIsDark(document.documentElement.classList.contains('dark'));
-  }, []);
+  // Start paper session state
+  const [starting, setStarting] = useState(false);
 
   useEffect(() => {
     async function load() {
@@ -188,6 +204,7 @@ export default function BacktestDetailPage() {
   const handleDelete = async () => {
     try {
       await fetchApi<undefined>(`/api/backtest/results/${resultId}`, { method: 'DELETE' });
+      setConfirmDelete(false);
       toast('success', 'Backtest deleted');
       router.push('/backtest');
     } catch (err) {
@@ -195,25 +212,7 @@ export default function BacktestDetailPage() {
     }
   };
 
-  const handleShare = async () => {
-    setSharing(true);
-    try {
-      const res = await fetchApi<{ share_url: string }>(`/api/backtest/results/${resultId}/share`, {
-        method: 'POST',
-      });
-      await navigator.clipboard.writeText(res.share_url);
-      toast('success', 'Share link copied to clipboard');
-    } catch {
-      toast('error', 'Failed to create share link');
-    } finally {
-      setSharing(false);
-    }
-  };
-
-  const accentColor = isDark ? '#2383e2' : '#2563eb';
-  const benchmarkColor = isDark ? 'rgba(255,255,255,0.3)' : '#94a3b8';
-  const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
-  const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
+  const colors = chartColors();
 
   const hasBenchmark = detail?.benchmark_equity && detail.benchmark_equity.length > 0;
 
@@ -231,6 +230,26 @@ export default function BacktestDetailPage() {
     }));
   }, [detail, resolution, hasBenchmark]);
 
+  const chartSummary = useMemo(() => {
+    const curve = detail?.equity_curve ?? [];
+    if (curve.length === 0) return null;
+    const first = curve[0];
+    const last = curve[curve.length - 1];
+    const bench = detail?.benchmark_equity ?? [];
+    const benchPart = bench.length > 0
+      ? `, benchmark from ${usdt(bench[0].value)} to ${usdt(bench[bench.length - 1].value)}`
+      : '';
+    return `Equity from ${formatUtc(first.timestamp)} to ${formatUtc(last.timestamp)}: start ${usdt(first.value)}, end ${usdt(last.value)}${benchPart}`;
+  }, [detail]);
+
+  const failedVerifyFields = verification && verification !== 'unavailable'
+    ? ([
+        ['trade count', verification.trade_count_match],
+        ['win rate', verification.win_rate_match],
+        ['total PnL', verification.total_pnl_match],
+      ] as const).filter(([, ok]) => !ok).map(([name]) => name)
+    : [];
+
   // a render function, not a component: recharts calls it with the hover state
   const renderTooltip = useCallback(({ active, payload, label }: TooltipContentProps<TooltipValueType, string | number>) => {
     if (!active || !payload?.length) return null;
@@ -239,7 +258,7 @@ export default function BacktestDetailPage() {
         <p className="text-xs text-ink-2">{label != null ? formatXTick(String(label), resolution) : ''}</p>
         {payload.map((entry) => (
           <p key={String(entry.dataKey)} className="text-sm font-medium text-ink-1">
-            {entry.dataKey === 'benchmark' ? 'Benchmark' : 'Strategy'}: ${Number(entry.value).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            {entry.dataKey === 'benchmark' ? 'Benchmark' : 'Strategy'}: {usdt(Number(entry.value))}
           </p>
         ))}
       </div>
@@ -257,13 +276,10 @@ export default function BacktestDetailPage() {
       type: t.type,
       time: new Date(t.time).toLocaleString(),
       side: t.side,
-      price: `$${t.price.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+      price: money(t.price) ?? '—',
       quantity: t.quantity.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''),
-      fee: t.fee > 0 ? `$${t.fee.toFixed(4)}` : '\u2014',
+      fee: t.fee > 0 ? t.fee.toFixed(4) : '\u2014',
       pnl: t.pnl,
-      pnlFormatted: t.pnl != null
-        ? `${t.pnl >= 0 ? '+' : '-'}$${Math.abs(t.pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
-        : '\u2014',
       isOpen: t.type === 'entry' && !exitIds.has(t.trade_id),
     }));
   }, [detail]);
@@ -297,15 +313,16 @@ export default function BacktestDetailPage() {
         />
       ),
     },
-    { key: 'price', header: 'Price' },
+    { key: 'price', header: 'Price (USDT)', numeric: true },
     { key: 'quantity', header: 'Qty', hideOnMobile: true },
-    { key: 'fee', header: 'Fee', hideOnMobile: true },
+    { key: 'fee', header: 'Fee (USDT)', numeric: true, hideOnMobile: true },
     {
       key: 'pnl',
-      header: 'PnL',
+      header: 'PnL (USDT)',
+      numeric: true,
       render: (row: TxnRow) => row.pnl != null ? (
-        <span className={row.pnl >= 0 ? 'text-ink-1 font-medium' : 'text-danger font-medium'}>
-          {row.pnlFormatted}
+        <span className="font-medium text-ink-1">
+          <SignedMoney value={row.pnl} />
         </span>
       ) : <span className="text-ink-2">{'\u2014'}</span>,
     },
@@ -336,14 +353,17 @@ export default function BacktestDetailPage() {
   }
 
   const { metrics } = detail;
+  const hasExtendedMetrics = metrics.alpha != null || metrics.beta != null
+    || metrics.max_consecutive_wins != null || metrics.max_consecutive_losses != null
+    || metrics.expectancy != null;
 
   return (
     <div className="flex flex-col gap-6">
       <ResearchNav current="/backtest" />
       {/* Stopped reason banner */}
       {detail.stopped_reason && (
-        <div className="flex items-center gap-3 rounded-xl border border-status-warning/30 bg-caution/10 px-4 py-3">
-          <AlertTriangle className="h-5 w-5 shrink-0 text-caution" />
+        <div className="flex items-center gap-3 rounded-lg border border-caution/30 bg-caution-soft px-4 py-3">
+          <AlertTriangle className="h-5 w-5 shrink-0 text-caution" aria-hidden="true" />
           <div>
             <p className="text-sm font-medium text-ink-1">Backtest stopped early</p>
             <p className="text-xs text-ink-2">
@@ -379,7 +399,7 @@ export default function BacktestDetailPage() {
                 <h1 className="text-lg font-semibold text-ink-1">
                   {detail.name || detail.strategy}
                 </h1>
-                <button onClick={() => { setEditName(detail.name || detail.strategy); setEditing(true); }} className="text-ink-2 hover:text-ink-1">
+                <button onClick={() => { setEditName(detail.name || detail.strategy); setEditing(true); }} className="text-ink-2 hover:text-ink-1" aria-label="Rename this backtest">
                   <Pencil className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -387,23 +407,23 @@ export default function BacktestDetailPage() {
             <p className="text-xs text-ink-2">{detail.strategy} &middot; {detail.period}</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <ProvenanceBadge provenance={detail.provenance} />
           <StatusBadge status={detail.status === 'completed' ? 'Completed' : detail.status} variant={detail.status === 'completed' ? 'success' : 'info'} />
-          <Button variant="outline" size="sm" onClick={handleShare} loading={sharing}>
-            <Share2 className="h-4 w-4" /> Share
-          </Button>
-          {confirmDelete ? (
-            <div className="flex items-center gap-2 rounded-lg border border-danger bg-danger-soft px-3 py-1.5">
-              <span className="text-xs text-ink-1">Delete this backtest?</span>
-              <Button variant="danger" size="sm" onClick={handleDelete}>Confirm</Button>
-              <Button variant="ghost" size="sm" onClick={() => setConfirmDelete(false)}>Cancel</Button>
-            </div>
-          ) : (
-            <Button variant="outline" size="sm" onClick={() => setConfirmDelete(true)}>
-              <Trash2 className="h-4 w-4" /> Delete
+          <Link
+            href={`/backtest/compare?a=${resultId}`}
+            className="inline-flex h-8 max-lg:h-11 items-center rounded border border-line-strong bg-surface px-3 text-sm font-medium text-ink-1 transition-colors hover:bg-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+          >
+            Compare with…
+          </Link>
+          {detail.strategy_id && (
+            <Button variant="outline" size="sm" onClick={() => setStarting(true)}>
+              Start paper session
             </Button>
           )}
+          <Button variant="outline" size="sm" onClick={() => setConfirmDelete(true)}>
+            <Trash2 className="h-4 w-4" aria-hidden="true" /> Delete
+          </Button>
         </div>
       </div>
 
@@ -411,72 +431,42 @@ export default function BacktestDetailPage() {
 
       {/* Metrics row */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <DataCard padding="sm">
-          <p className="text-xs text-ink-2">Total PnL</p>
-          <p className={`text-lg font-bold ${metrics.total_pnl >= 0 ? 'text-ink-1' : 'text-danger'}`}>
-            {metrics.total_pnl >= 0 ? '+' : '-'}${Math.abs(metrics.total_pnl).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-          </p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-ink-2">Win Rate</p>
-          <p className="text-lg font-bold text-ink-1">{metrics.win_rate.toFixed(1)}%</p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-ink-2">Sharpe Ratio</p>
-          <p className="text-lg font-bold text-ink-1">{metrics.sharpe_ratio.toFixed(2)}</p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-ink-2">Max Drawdown</p>
-          <p className="text-lg font-bold text-danger">{metrics.max_drawdown.toFixed(1)}%</p>
-        </DataCard>
-        <DataCard padding="sm">
-          <p className="text-xs text-ink-2">Total Trades</p>
-          <p className="text-lg font-bold text-ink-1">{metrics.total_trades}</p>
-        </DataCard>
+        <Readout label="Total PnL (USDT)" value={<SignedMoney value={metrics.total_pnl} />} />
+        <Readout label="Win rate" value={`${metrics.win_rate.toFixed(1)}%`} />
+        <Readout label="Sharpe" value={metrics.sharpe_ratio.toFixed(2)} />
+        <Readout label="Max drawdown" value={<span className="text-danger">{metrics.max_drawdown.toFixed(1)}%</span>} />
+        <Readout label="Trades" value={metrics.total_trades} />
       </div>
 
       {/* Extended metrics row */}
-      {(metrics.alpha != null || metrics.beta != null || metrics.max_consecutive_wins != null || metrics.max_consecutive_losses != null || metrics.expectancy != null) && (
+      {hasExtendedMetrics && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
           {metrics.alpha != null && (
-            <DataCard padding="sm">
-              <p className="text-xs text-ink-2">Alpha</p>
-              <p className={`text-lg font-bold ${metrics.alpha >= 0 ? 'text-ink-1' : 'text-danger'}`}>
-                {metrics.alpha >= 0 ? '+' : ''}{metrics.alpha.toFixed(2)}
-              </p>
-            </DataCard>
+            <Readout
+              label="Alpha"
+              value={<span className={metrics.alpha < 0 ? 'text-danger' : undefined}>{`${metrics.alpha >= 0 ? '+' : ''}${metrics.alpha.toFixed(2)}`}</span>}
+            />
           )}
           {metrics.beta != null && (
-            <DataCard padding="sm">
-              <p className="text-xs text-ink-2">Beta</p>
-              <p className="text-lg font-bold text-ink-1">{metrics.beta.toFixed(2)}</p>
-            </DataCard>
+            <Readout label="Beta" value={metrics.beta.toFixed(2)} />
           )}
           {metrics.max_consecutive_wins != null && (
-            <DataCard padding="sm">
-              <p className="text-xs text-ink-2">Max Consec. Wins</p>
-              <p className="text-lg font-bold text-ink-1">{metrics.max_consecutive_wins}</p>
-            </DataCard>
+            <Readout label="Max consec. wins" value={metrics.max_consecutive_wins} />
           )}
           {metrics.max_consecutive_losses != null && (
-            <DataCard padding="sm">
-              <p className="text-xs text-ink-2">Max Consec. Losses</p>
-              <p className="text-lg font-bold text-danger">{metrics.max_consecutive_losses}</p>
-            </DataCard>
+            <Readout label="Max consec. losses" value={<span className="text-danger">{metrics.max_consecutive_losses}</span>} />
           )}
           {metrics.expectancy != null && (
-            <DataCard padding="sm">
-              <p className="text-xs text-ink-2">Expectancy</p>
-              <p className={`text-lg font-bold ${metrics.expectancy >= 0 ? 'text-ink-1' : 'text-danger'}`}>
-                {metrics.expectancy >= 0 ? '+' : ''}${metrics.expectancy.toFixed(2)}
-              </p>
-            </DataCard>
+            <Readout
+              label="Expectancy (USDT)"
+              value={<SignedMoney value={metrics.expectancy} />}
+            />
           )}
         </div>
       )}
 
       {/* Equity curve chart with optional benchmark overlay */}
-      <DataCard title="Equity Curve">
+      <Section title="Equity curve">
         <div className="flex items-center gap-1 mb-3">
           {(['hours', 'days', 'months'] as TimeResolution[]).map((r) => (
             <Button
@@ -489,117 +479,142 @@ export default function BacktestDetailPage() {
             </Button>
           ))}
         </div>
-        <div className="h-64">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-              <defs>
-                <linearGradient id="detailGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor={accentColor} stopOpacity={0.2} />
-                  <stop offset="95%" stopColor={accentColor} stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />
-              <XAxis
-                dataKey="timestamp"
-                tickFormatter={(ts) => formatXTick(ts, resolution)}
-                tick={{ fontSize: 11, fill: textMuted }}
-                axisLine={false}
-                tickLine={false}
-                minTickGap={40}
-              />
-              <YAxis
-                tickFormatter={formatYTick}
-                tick={{ fontSize: 11, fill: textMuted }}
-                axisLine={false}
-                tickLine={false}
-                width={44}
-              />
-              <Tooltip content={renderTooltip} />
-              {hasBenchmark && <Legend />}
-              <Area
-                type="monotone"
-                dataKey="value"
-                name="Strategy"
-                stroke={accentColor}
-                strokeWidth={2}
-                fill="url(#detailGradient)"
-                dot={false}
-                activeDot={{ r: 4, fill: accentColor, strokeWidth: 0 }}
-              />
-              {hasBenchmark && (
+        {chartSummary ? (
+          <div className="h-64" role="img" aria-label={chartSummary}>
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="detailGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor={colors.accent} stopOpacity={0.2} />
+                    <stop offset="95%" stopColor={colors.accent} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} vertical={false} />
+                <XAxis
+                  dataKey="timestamp"
+                  tickFormatter={(ts) => formatXTick(ts, resolution)}
+                  tick={{ fontSize: 11, fill: colors.text }}
+                  axisLine={false}
+                  tickLine={false}
+                  minTickGap={40}
+                />
+                <YAxis
+                  tickFormatter={formatYTick}
+                  tick={{ fontSize: 11, fill: colors.text }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={44}
+                  label={{ value: 'USDT', angle: -90, position: 'insideLeft', fill: colors.text, fontSize: 11 }}
+                />
+                <Tooltip content={renderTooltip} />
+                {hasBenchmark && <Legend />}
                 <Area
                   type="monotone"
-                  dataKey="benchmark"
-                  name="Benchmark"
-                  stroke={benchmarkColor}
-                  strokeWidth={1.5}
-                  strokeDasharray="5 3"
-                  fill="none"
+                  dataKey="value"
+                  name="Strategy"
+                  stroke={colors.accent}
+                  strokeWidth={2}
+                  fill="url(#detailGradient)"
                   dot={false}
-                  activeDot={{ r: 3, fill: benchmarkColor, strokeWidth: 0 }}
+                  activeDot={{ r: 4, fill: colors.accent, strokeWidth: 0 }}
                 />
-              )}
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      </DataCard>
+                {hasBenchmark && (
+                  <Area
+                    type="monotone"
+                    dataKey="benchmark"
+                    name="Benchmark"
+                    stroke={colors.muted}
+                    strokeWidth={1.5}
+                    strokeDasharray="5 3"
+                    fill="none"
+                    dot={false}
+                    activeDot={{ r: 3, fill: colors.muted, strokeWidth: 0 }}
+                  />
+                )}
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        ) : (
+          <p className="text-sm text-ink-2">No equity points recorded.</p>
+        )}
+      </Section>
 
       {/* Verification panel */}
       {verification === 'unavailable' && (
-        <DataCard title="Result Verification">
+        <Section title="Result verification">
           <div className="flex items-center gap-2 text-sm text-ink-2">
             <DataStateBadge state="unavailable" reason="The stored trades could not be re-read to verify the metrics" />
             Verification UNAVAILABLE: the metrics above are not confirmed against the stored trades.
           </div>
-        </DataCard>
+        </Section>
       )}
       {verification && verification !== 'unavailable' && (
-        <DataCard title="Result Verification">
+        <Section title="Result verification">
           <div className="flex flex-col gap-3">
             <div className="mb-2">
               {verification.all_passed ? (
                 <StatusBadge status={`Metrics recomputed from ${verification.computed_trade_count} stored trades: match`} variant="success" size="md" />
               ) : (
                 <StatusBadge
-                  status={`Metrics recomputed from ${verification.computed_trade_count} stored trades: mismatch: ${[['trade count', verification.trade_count_match], ['win rate', verification.win_rate_match], ['total PnL', verification.total_pnl_match]].filter(([, ok]) => !ok).map(([name]) => name).join(', ')}`}
-                  variant="error"
+                  status={`Metrics recomputed from ${verification.computed_trade_count} stored trades: mismatch on ${failedVerifyFields.join(', ')}`}
+                  variant="warning"
                   size="md"
                 />
               )}
             </div>
             <div className="grid grid-cols-1 gap-2 text-sm">
               {([
-                { label: 'Trade Count', reported: verification.reported_trade_count, computed: verification.computed_trade_count, match: verification.trade_count_match },
-                { label: 'Win Rate', reported: `${verification.reported_win_rate.toFixed(1)}%`, computed: `${verification.computed_win_rate.toFixed(1)}%`, match: verification.win_rate_match },
-                { label: 'Total PnL', reported: `$${verification.reported_total_pnl.toFixed(2)}`, computed: `$${verification.computed_total_pnl.toFixed(2)}`, match: verification.total_pnl_match },
+                { label: 'Trade count', reported: verification.reported_trade_count, computed: verification.computed_trade_count, match: verification.trade_count_match },
+                { label: 'Win rate', reported: `${verification.reported_win_rate.toFixed(1)}%`, computed: `${verification.computed_win_rate.toFixed(1)}%`, match: verification.win_rate_match },
+                { label: 'Total PnL (USDT)', reported: signed(verification.reported_total_pnl) ?? '—', computed: signed(verification.computed_total_pnl) ?? '—', match: verification.total_pnl_match },
               ] as const).map((row) => (
-                <div key={row.label} className="flex items-center justify-between rounded-lg bg-surface px-3 py-2">
+                <div key={row.label} className="flex items-center justify-between rounded-lg bg-raised px-3 py-2">
                   <span className="text-ink-2">{row.label}</span>
                   <div className="flex items-center gap-4">
                     <span className="text-ink-1">Reported: <span className="font-medium">{row.reported}</span></span>
                     <span className="text-ink-1">Computed: <span className="font-medium">{row.computed}</span></span>
                     {row.match ? (
-                      <CheckCircle className="h-4 w-4 text-ink-1" />
+                      <CheckCircle className="h-4 w-4 text-ink-1" aria-hidden="true" />
                     ) : (
-                      <XCircle className="h-4 w-4 text-danger" />
+                      <XCircle className="h-4 w-4 text-danger" aria-hidden="true" />
                     )}
                   </div>
                 </div>
               ))}
             </div>
           </div>
-        </DataCard>
+        </Section>
       )}
 
       {/* Transactions table */}
-      <DataCard title="Transactions" description={`${txnRows.length} fills recorded`}>
+      <Section title="Transactions" action={<span className="text-xs text-ink-2">{txnRows.length} fills recorded</span>}>
         <Table
           columns={txnColumns}
           data={txnRows}
           keyExtractor={(row) => row.id}
           emptyMessage="No transactions recorded"
         />
-      </DataCard>
+      </Section>
+
+      {confirmDelete && (
+        <ConfirmDialog
+          open
+          destructive
+          title="Delete this backtest?"
+          primaryLabel="Delete backtest"
+          secondaryLabel="Keep it"
+          pendingLabel="Deleting…"
+          pendingHint="Closing this won't cancel the delete."
+          onConfirm={handleDelete}
+          onClose={() => setConfirmDelete(false)}
+        >
+          <p>The stored result and its trades are deleted for good.</p>
+        </ConfirmDialog>
+      )}
+
+      {starting && detail.strategy_id && (
+        <StartSessionDialog strategyId={detail.strategy_id} onClose={() => setStarting(false)} />
+      )}
     </div>
   );
 }

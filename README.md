@@ -164,8 +164,8 @@ prices in a backtest: market orders fill at the signal bar's close).
 | `/builder` | Visual rule builder; preview on stored bars. Stop-loss / take-profit are saved and enforced in paper sessions and backtests. |
 | `/templates` | Browse the shipped templates (risk level; expected Sharpe / max drawdown / capital show NO DATA when a template sets none; a failed fetch shows an error with Retry) and import one into the strategy list, which opens it in the builder. |
 | `/backtest` | Run a backtest on stored bars, with a provenance panel. |
-| `/backtest/[id]` | Result detail: metrics, equity curve, trades. |
-| `/backtest/compare` | Compare two results, with a warning when their data differs. |
+| `/backtest/[id]` | Result detail: metrics, equity curve, trades, verify, compare, start paper session; share links are not surfaced. |
+| `/backtest/compare` | URL-driven two-result compare (`?a=&b=`), with a warning when their data differs. |
 | `/optimize` | Launch hyperopt / walk-forward as an in-process task. |
 | `/optimize/[taskId]` | Task progress and result. |
 | `/portfolio` | Positions, allocation, balance snapshots. |

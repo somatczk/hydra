@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState, useMemo } from 'react';
+import { Suspense, useEffect, useRef, useState, useMemo } from 'react';
+import { useSearchParams } from 'next/navigation';
 import {
   AreaChart,
   Area,
@@ -12,14 +13,16 @@ import {
   Legend,
 } from 'recharts';
 import { Select } from '@/components/ui/Select';
-import { DataCard } from '@/components/ui/DataCard';
+import { Section } from '@/components/ui/Section';
 import { fetchApi } from '@/lib/api';
+import { money, signed, signedLabel } from '@/lib/format';
 import { logger } from '@/lib/logger';
 import { ResearchNav } from '@/components/research/ResearchNav';
 import {
   type TimeResolution,
   type EquityPoint,
   aggregateEquityCurve,
+  chartColors,
   formatXTick,
   formatYTick,
 } from '../chart-utils';
@@ -28,6 +31,7 @@ import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import {
   ProvenanceBadge,
   provenanceMismatch,
+  formatUtc,
   type DataProvenance,
 } from '@/components/backtest/DataProvenance';
 
@@ -93,14 +97,30 @@ function mergeEquityCurves(
   );
 }
 
-function fmtPnl(v: number): string {
-  const sign = v >= 0 ? '+' : '-';
-  return `${sign}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+const usdt = (v: number) => `${money(v) ?? '—'} USDT`;
+
+/** The sign glyph is hidden from AT, which hear "gain/loss" instead (portfolio pattern). */
+function SignedMoney({ value }: { value: number }) {
+  return (
+    <>
+      <span aria-hidden="true">{signed(value) ?? '—'}</span>
+      <span className="sr-only">{signedLabel(value) ?? 'not available'}</span>
+    </>
+  );
+}
+
+function CompareLoading() {
+  return (
+    <div className="flex h-64 items-center justify-center">
+      <p className="text-sm text-ink-2">Loading backtest results...</p>
+    </div>
+  );
 }
 
 /* ---------- Page ---------- */
 
-export default function BacktestComparePage() {
+function BacktestCompareContent() {
+  const searchParams = useSearchParams();
   const [results, setResults] = useState<BacktestListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState<unknown>(null);
@@ -111,11 +131,6 @@ export default function BacktestComparePage() {
   const [detailB, setDetailB] = useState<BacktestDetail | null>(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [resolution, setResolution] = useState<TimeResolution>('days');
-  const [isDark, setIsDark] = useState(false);
-
-  useEffect(() => {
-    setIsDark(document.documentElement.classList.contains('dark'));
-  }, []);
 
   const loadResults = () => {
     setListError(null);
@@ -132,6 +147,19 @@ export default function BacktestComparePage() {
   };
 
   useEffect(() => { loadResults(); }, []);
+
+  // Seed ?a=&b= only once the completed list is known, so a dead id (or a=b) falls
+  // back to the empty "Choose runs" state instead of a blank/self-comparing select.
+  const seededFromUrl = useRef(false);
+  useEffect(() => {
+    if (seededFromUrl.current || results.length === 0) return;
+    seededFromUrl.current = true;
+    const ids = new Set(results.map((r) => r.id));
+    const a = searchParams.get('a');
+    const b = searchParams.get('b');
+    if (a && ids.has(a)) setSelectedA(a);
+    if (b && ids.has(b) && b !== a) setSelectedB(b);
+  }, [results, searchParams]);
 
   useEffect(() => {
     if (!selectedA || !selectedB) {
@@ -156,15 +184,27 @@ export default function BacktestComparePage() {
       .finally(() => setLoadingDetails(false));
   }, [selectedA, selectedB]);
 
-  const accentA = isDark ? '#2383e2' : '#2563eb';
-  const accentB = isDark ? '#e88c30' : '#ea580c';
-  const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
-  const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
+  const colors = chartColors();
 
   const chartData = useMemo(() => {
     if (!detailA || !detailB) return [];
     return mergeEquityCurves(detailA.equity_curve, detailB.equity_curve, resolution);
   }, [detailA, detailB, resolution]);
+
+  const chartSummary = useMemo(() => {
+    if (!detailA || !detailB) return null;
+    const a = detailA.equity_curve;
+    const b = detailB.equity_curve;
+    if (a.length === 0 || b.length === 0) return null;
+    // first/last (curves are bar-ordered): a Math.min spread overflows the arg limit
+    const firstA = a[0].timestamp;
+    const lastA = a[a.length - 1].timestamp;
+    const firstB = b[0].timestamp;
+    const lastB = b[b.length - 1].timestamp;
+    const start = formatUtc(Date.parse(firstA) <= Date.parse(firstB) ? firstA : firstB);
+    const end = formatUtc(Date.parse(lastA) >= Date.parse(lastB) ? lastA : lastB);
+    return `Equity from ${start} to ${end}: A from ${usdt(a[0].value)} to ${usdt(a[a.length - 1].value)}, B from ${usdt(b[0].value)} to ${usdt(b[b.length - 1].value)}`;
+  }, [detailA, detailB]);
 
   const mismatch = detailA && detailB ? provenanceMismatch(detailA.provenance, detailB.provenance) : [];
   const selectedProvenance = (id: string) => results.find((r) => r.id === id)?.provenance;
@@ -179,20 +219,16 @@ export default function BacktestComparePage() {
     const mA = detailA.metrics;
     const mB = detailB.metrics;
     return [
-      { label: 'Total Trades', a: String(mA.total_trades), b: String(mB.total_trades) },
-      { label: 'Win Rate', a: `${mA.win_rate.toFixed(1)}%`, b: `${mB.win_rate.toFixed(1)}%` },
-      { label: 'Total PnL', a: fmtPnl(mA.total_pnl), b: fmtPnl(mB.total_pnl), colorA: mA.total_pnl >= 0, colorB: mB.total_pnl >= 0 },
-      { label: 'Max Drawdown', a: `${mA.max_drawdown.toFixed(1)}%`, b: `${mB.max_drawdown.toFixed(1)}%` },
-      { label: 'Sharpe Ratio', a: mA.sharpe_ratio.toFixed(2), b: mB.sharpe_ratio.toFixed(2) },
+      { label: 'Total trades', a: String(mA.total_trades), b: String(mB.total_trades) },
+      { label: 'Win rate', a: `${mA.win_rate.toFixed(1)}%`, b: `${mB.win_rate.toFixed(1)}%` },
+      { label: 'Total PnL (USDT)', a: <SignedMoney value={mA.total_pnl} />, b: <SignedMoney value={mB.total_pnl} /> },
+      { label: 'Max drawdown', a: `${mA.max_drawdown.toFixed(1)}%`, b: `${mB.max_drawdown.toFixed(1)}%` },
+      { label: 'Sharpe', a: mA.sharpe_ratio.toFixed(2), b: mB.sharpe_ratio.toFixed(2) },
     ];
   }, [detailA, detailB]);
 
   if (loading) {
-    return (
-      <div className="flex h-64 items-center justify-center">
-        <p className="text-sm text-ink-2">Loading backtest results...</p>
-      </div>
-    );
+    return <CompareLoading />;
   }
 
   return (
@@ -206,7 +242,7 @@ export default function BacktestComparePage() {
       </div>
 
       {/* Selectors */}
-      <DataCard>
+      <Section title="Choose runs">
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <Select
             label="Backtest A"
@@ -233,7 +269,7 @@ export default function BacktestComparePage() {
             </div>
           </div>
         )}
-      </DataCard>
+      </Section>
 
       {listError !== null && (
         <DataStateErrorCard error={listError} fallback="Failed to load backtest results" onRetry={loadResults} />
@@ -244,7 +280,7 @@ export default function BacktestComparePage() {
       )}
 
       {mismatch.length > 0 && (
-        <div className="rounded-xl border border-status-warning/30 bg-caution/10 px-4 py-3" data-testid="provenance-mismatch">
+        <div className="rounded-lg border border-caution/30 bg-caution-soft px-4 py-3" data-testid="provenance-mismatch">
           <p className="text-sm font-medium text-ink-1">These runs used different data</p>
           <p className="text-xs text-ink-2">{mismatch.join('; ')}</p>
         </div>
@@ -259,16 +295,16 @@ export default function BacktestComparePage() {
       {/* Comparison table */}
       {comparisonMetrics && detailA && detailB && (
         <>
-          <DataCard title="Metrics Comparison">
+          <Section title="Metrics comparison">
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-line">
-                    <th className="pb-2 text-left text-xs font-medium text-ink-2">Metric</th>
-                    <th className="pb-2 text-right text-xs font-medium text-ink-2">
+                    <th scope="col" className="pb-2 text-left text-xs font-medium text-ink-2">Metric</th>
+                    <th scope="col" className="pb-2 text-right text-xs font-medium text-ink-2">
                       {detailA.name || detailA.strategy}
                     </th>
-                    <th className="pb-2 text-right text-xs font-medium text-ink-2">
+                    <th scope="col" className="pb-2 text-right text-xs font-medium text-ink-2">
                       {detailB.name || detailB.strategy}
                     </th>
                   </tr>
@@ -277,21 +313,17 @@ export default function BacktestComparePage() {
                   {comparisonMetrics.map((row) => (
                     <tr key={row.label} className="border-b border-line last:border-0">
                       <td className="py-2.5 text-ink-2">{row.label}</td>
-                      <td className={`py-2.5 text-right font-medium ${'colorA' in row ? (row.colorA ? 'text-ink-1' : 'text-danger') : 'text-ink-1'}`}>
-                        {row.a}
-                      </td>
-                      <td className={`py-2.5 text-right font-medium ${'colorB' in row ? (row.colorB ? 'text-ink-1' : 'text-danger') : 'text-ink-1'}`}>
-                        {row.b}
-                      </td>
+                      <td className="py-2.5 text-right font-medium text-ink-1">{row.a}</td>
+                      <td className="py-2.5 text-right font-medium text-ink-1">{row.b}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-          </DataCard>
+          </Section>
 
           {/* Overlaid equity curves */}
-          <DataCard title="Equity Curves">
+          <Section title="Equity curves">
             <div className="flex items-center gap-1 mb-3">
               {(['hours', 'days', 'months'] as TimeResolution[]).map((r) => (
                 <Button
@@ -304,79 +336,84 @@ export default function BacktestComparePage() {
                 </Button>
               ))}
             </div>
-            <div className="h-72">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="compareGradientA" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor={accentA} stopOpacity={0.15} />
-                      <stop offset="95%" stopColor={accentA} stopOpacity={0} />
-                    </linearGradient>
-                    <linearGradient id="compareGradientB" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor={accentB} stopOpacity={0.15} />
-                      <stop offset="95%" stopColor={accentB} stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />
-                  <XAxis
-                    dataKey="timestamp"
-                    tickFormatter={(ts) => formatXTick(ts, resolution)}
-                    tick={{ fontSize: 11, fill: textMuted }}
-                    axisLine={false}
-                    tickLine={false}
-                    minTickGap={40}
-                  />
-                  <YAxis
-                    tickFormatter={formatYTick}
-                    tick={{ fontSize: 11, fill: textMuted }}
-                    axisLine={false}
-                    tickLine={false}
-                    width={44}
-                  />
-                  <Tooltip
-                    content={({ active, payload, label }) => {
-                      if (!active || !payload?.length) return null;
-                      return (
-                        <div className="rounded-lg border border-line bg-surface px-3 py-2 shadow-lg">
-                          <p className="text-xs text-ink-2">{label != null ? formatXTick(String(label), resolution) : ''}</p>
-                          {payload.map((p) => (
-                            <p key={String(p.dataKey)} className="text-sm font-medium text-ink-1">
-                              {p.dataKey === 'valueA' ? 'A' : 'B'}: ${(p.value as number)?.toLocaleString('en-US', { minimumFractionDigits: 2 }) ?? 'N/A'}
-                            </p>
-                          ))}
-                        </div>
-                      );
-                    }}
-                  />
-                  <Legend
-                    formatter={(value) => (
-                      <span className="text-xs text-ink-2">
-                        {value === 'valueA' ? (detailA.name || detailA.strategy) : (detailB.name || detailB.strategy)}
-                      </span>
-                    )}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="valueA"
-                    stroke={accentA}
-                    strokeWidth={2}
-                    fill="url(#compareGradientA)"
-                    dot={false}
-                    activeDot={{ r: 4, fill: accentA, strokeWidth: 0 }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="valueB"
-                    stroke={accentB}
-                    strokeWidth={2}
-                    fill="url(#compareGradientB)"
-                    dot={false}
-                    activeDot={{ r: 4, fill: accentB, strokeWidth: 0 }}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          </DataCard>
+            {chartSummary ? (
+              <div className="h-72" role="img" aria-label={chartSummary}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="compareGradientA" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={colors.accent} stopOpacity={0.15} />
+                        <stop offset="95%" stopColor={colors.accent} stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="compareGradientB" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={colors.caution} stopOpacity={0.15} />
+                        <stop offset="95%" stopColor={colors.caution} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke={colors.grid} vertical={false} />
+                    <XAxis
+                      dataKey="timestamp"
+                      tickFormatter={(ts) => formatXTick(ts, resolution)}
+                      tick={{ fontSize: 11, fill: colors.text }}
+                      axisLine={false}
+                      tickLine={false}
+                      minTickGap={40}
+                    />
+                    <YAxis
+                      tickFormatter={formatYTick}
+                      tick={{ fontSize: 11, fill: colors.text }}
+                      axisLine={false}
+                      tickLine={false}
+                      width={44}
+                      label={{ value: 'USDT', angle: -90, position: 'insideLeft', fill: colors.text, fontSize: 11 }}
+                    />
+                    <Tooltip
+                      content={({ active, payload, label }) => {
+                        if (!active || !payload?.length) return null;
+                        return (
+                          <div className="rounded-lg border border-line bg-surface px-3 py-2 shadow-lg">
+                            <p className="text-xs text-ink-2">{label != null ? formatXTick(String(label), resolution) : ''}</p>
+                            {payload.map((p) => (
+                              <p key={String(p.dataKey)} className="text-sm font-medium text-ink-1">
+                                {p.dataKey === 'valueA' ? 'A' : 'B'}: {usdt(Number(p.value))}
+                              </p>
+                            ))}
+                          </div>
+                        );
+                      }}
+                    />
+                    <Legend
+                      formatter={(value) => (
+                        <span className="text-xs text-ink-2">
+                          {value === 'valueA' ? (detailA.name || detailA.strategy) : (detailB.name || detailB.strategy)}
+                        </span>
+                      )}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="valueA"
+                      stroke={colors.accent}
+                      strokeWidth={2}
+                      fill="url(#compareGradientA)"
+                      dot={false}
+                      activeDot={{ r: 4, fill: colors.accent, strokeWidth: 0 }}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="valueB"
+                      stroke={colors.caution}
+                      strokeWidth={2}
+                      fill="url(#compareGradientB)"
+                      dot={false}
+                      activeDot={{ r: 4, fill: colors.caution, strokeWidth: 0 }}
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            ) : (
+              <p className="text-sm text-ink-2">No equity points recorded for these runs.</p>
+            )}
+          </Section>
         </>
       )}
 
@@ -392,5 +429,13 @@ export default function BacktestComparePage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function BacktestComparePage() {
+  return (
+    <Suspense fallback={<CompareLoading />}>
+      <BacktestCompareContent />
+    </Suspense>
   );
 }
