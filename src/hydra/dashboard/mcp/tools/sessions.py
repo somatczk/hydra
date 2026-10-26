@@ -20,7 +20,11 @@ from hydra.dashboard.security import audit
 from hydra.services import sessions as sessions_svc
 from hydra.services.approvals import APPROVAL_ACTOR
 from hydra.services.errors import ServiceError
-from hydra.services.sessions import QuickTradeRequest, StartSessionRequest
+from hydra.services.sessions import (
+    QuickTradeRequest,
+    SessionStopNotPersistedError,
+    StartSessionRequest,
+)
 
 
 @server.tool(name="session_list", structured_output=False)
@@ -78,6 +82,8 @@ async def session_stop(session_id: str) -> str:
     try:
         result = await sessions_svc.stop_session(_deps.session_manager(), session_id)
     except ServiceError as exc:
+        if isinstance(exc, SessionStopNotPersistedError):
+            audit(_deps.MCP_PRINCIPAL, "session_stop", session_id=session_id, persisted=False)
         raise _deps.tool_error(exc) from exc
     audit(_deps.MCP_PRINCIPAL, "session_stop", session_id=session_id)
     return _deps.json_text(result)

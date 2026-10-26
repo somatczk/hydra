@@ -41,7 +41,7 @@ from hydra.backtest.data import DataProvenance
 from hydra.core.config import HydraConfig, load_config
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
-from hydra.dashboard import security
+from hydra.dashboard import deps, security
 from hydra.dashboard.api import app as engine_app
 from hydra.dashboard.mcp import mount_mcp
 from hydra.dashboard.security import install_security
@@ -171,7 +171,7 @@ async def pool(fresh_database: str) -> AsyncIterator[Any]:
 def _bind_engine_state(
     pool: Any, monkeypatch: pytest.MonkeyPatch, strategies_dir: Path
 ) -> HydraConfig:
-    """Write the strategy, bind the pool on the engine state, and load the test config."""
+    """Write the strategy, bind the pool and the loaded config on the engine state."""
     _write_strategy(strategies_dir, "saw")
     monkeypatch.setattr(engine_app.state, "db_pool", pool)
     monkeypatch.setattr(engine_app.state, "session_manager", None)
@@ -180,7 +180,11 @@ def _bind_engine_state(
     monkeypatch.setenv("HYDRA_API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("HYDRA_MCP_TOKEN", TEST_MCP_TOKEN)
     monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
-    return load_config()
+    cfg = load_config()
+    # engine_app serves the approve POST below; its middleware and deps read the config
+    monkeypatch.setattr(engine_app.state, "config", cfg)
+    monkeypatch.setattr(deps, "_bound", cfg)
+    return cfg
 
 
 @asynccontextmanager

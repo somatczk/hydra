@@ -62,7 +62,14 @@ class _Pool:
         yield self.conn
 
 
-def _row(sid: str, strategy_id: str, *, mode: str = "paper", exchange: str = "binance") -> dict:
+def _row(
+    sid: str,
+    strategy_id: str,
+    *,
+    mode: str = "paper",
+    exchange: str = "binance",
+    created_by: str | None = None,
+) -> dict:
     return {
         "id": sid,
         "strategy_id": strategy_id,
@@ -76,6 +83,7 @@ def _row(sid: str, strategy_id: str, *, mode: str = "paper", exchange: str = "bi
         "stopped_at": None,
         "error_message": None,
         "positions_at_stop": 0,
+        "created_by": created_by,
     }
 
 
@@ -139,7 +147,7 @@ async def test_recovery_resumes_paper_and_never_live(
     restore_from["s1"] = await _account_with_long(h.end)
     restore_from["s5"] = PaperStateUnavailableError("state row unreadable")
     rows = [
-        _row("s1", "paper-a"),
+        _row("s1", "paper-a", created_by="service:mcp"),
         _row("s2", "live-b", mode="live"),
         _row("s3", "bybit-c", exchange="bybit"),
         _row("s4", "old-d"),
@@ -150,6 +158,7 @@ async def test_recovery_resumes_paper_and_never_live(
         sessions = {s.session_id: s for s in mgr.list_sessions()}
         s1 = sessions["s1"]
         assert s1.status == "running" and s1.task_alive
+        assert s1.created_by == "service:mcp"  # the attribution survives the restart
         assert s1._runtime is not None and s1._runtime.engine._running
         assert (sessions["s2"].status, sessions["s2"].error_message) == (
             "stopped",

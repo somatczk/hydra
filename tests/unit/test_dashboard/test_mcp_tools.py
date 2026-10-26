@@ -330,6 +330,13 @@ class _FakePool:
         return None
 
 
+class _DownPool:
+    """A pool whose acquire fails: the session's terminal row cannot be persisted."""
+
+    def acquire(self) -> Any:
+        raise ConnectionError("database down")
+
+
 def test_tools_list_advertises_the_31_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
     assert names == B1_TOOLS | B2_TOOLS
@@ -746,6 +753,46 @@ class TestSessionTools:
         finally:
             await h.close()
 
+    async def test_stop_that_cannot_be_persisted_is_503_and_audits(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An MCP-initiated stop that cannot persist still writes the persisted=False
+        audit line — the same line the REST route writes before answering its 503."""
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            session = await h.session(write_strategy(strategies_dir, "unsaved"))
+            await h.bar(session, "100")
+            monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            assert h.mgr is not None
+            h.mgr._db_pool = _DownPool()
+            async with _async_mcp(mcp_cfg) as mcp:
+                with capture_logs() as logs:
+                    # a logger cached by an earlier audit() call would bypass capture_logs
+                    monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
+                    is_error, text = await mcp.call(
+                        "session_stop", {"session_id": session.session_id}
+                    )
+            assert is_error
+            envelope = json.loads(text.removeprefix("Error executing tool session_stop: "))
+            assert (envelope["status"], envelope["detail"]["code"]) == (
+                503,
+                "session_stop_not_persisted",
+            )
+            assert session.status == "stopped" and not session.task_alive
+            audit_lines = [event for event in logs if event.get("event") == "audit"]
+            assert [
+                (line["action"], line["principal"], line["principal_kind"], line["persisted"])
+                for line in audit_lines
+            ] == [("session_stop", "mcp", "service", False)]
+            assert audit_lines[0]["session_id"] == session.session_id
+        finally:
+            h.mgr._db_pool = None
+            await h.close()
+
     async def test_risk_reads_mirror_the_rest_shapes(
         self,
         mcp_cfg: HydraConfig,
@@ -779,6 +826,37 @@ class TestSessionTools:
 
 
 class TestKillSwitchTools:
+    async def test_on_reason_is_bounded_like_the_release_reason(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 501-char latch reason is the 422 envelope naming the field and nothing
+        latches; the default reason still latches."""
+        h = Harness(strategies_dir)
+        await h.start()
+        try:
+            monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            assert h.mgr is not None and not h.mgr.kill_switch_active()
+            async with _async_mcp(mcp_cfg) as mcp:
+                is_error, text = await mcp.call("kill_switch_on", {"reason": "x" * 501})
+                assert is_error
+                envelope = json.loads(text.removeprefix("Error executing tool kill_switch_on: "))
+                assert (envelope["status"], envelope["detail"]["code"]) == (
+                    422,
+                    "validation_error",
+                )
+                assert envelope["detail"]["message"].startswith("reason:")
+                assert not h.mgr.kill_switch_active()
+
+                is_error, text = await mcp.call("kill_switch_on")
+                assert not is_error, text
+                assert json.loads(text)["active"] is True
+                assert h.mgr.kill_switch_active()
+        finally:
+            await h.close()
+
     async def test_on_is_immediate_latches_and_is_attributed_then_release_is_gated(
         self,
         mcp_cfg: HydraConfig,

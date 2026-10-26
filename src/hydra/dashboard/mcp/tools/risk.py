@@ -205,6 +205,14 @@ async def positions() -> str:
 # ---------------------------------------------------------------------------
 
 
+class _Reason(BaseModel):
+    """A kill-switch reason a human can read: the latch and release share the bounds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=3, max_length=500)
+
+
 @server.tool(name="kill_switch_on", structured_output=False)
 async def kill_switch_on(reason: str = "kill switch (mcp)") -> str:
     """Latch the kill switch NOW and flatten + stop every running session (ungated,
@@ -215,6 +223,7 @@ async def kill_switch_on(reason: str = "kill switch (mcp)") -> str:
     one-time code in the Hydra UI.
     """
     try:
+        reason = _Reason(reason=reason).reason
         body = await sessions_svc.activate_kill_switch(
             _deps.session_manager(), APPROVAL_ACTOR, reason
         )
@@ -229,6 +238,8 @@ async def kill_switch_on(reason: str = "kill switch (mcp)") -> str:
                 persisted=detail.get("persisted"),
             )
         raise _deps.tool_error(exc) from exc
+    except ValidationError as exc:
+        raise _deps.invalid_arguments(exc) from exc
     audit(
         _deps.MCP_PRINCIPAL,
         "kill_switch_on",
@@ -237,14 +248,6 @@ async def kill_switch_on(reason: str = "kill switch (mcp)") -> str:
         persisted=body["persisted"],
     )
     return _deps.json_text(body)
-
-
-class _ReleaseReason(BaseModel):
-    """The gated release's ask: a reason a human can read before deciding."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = Field(min_length=3, max_length=500)
 
 
 async def _release_executor(deps: Any, params: dict[str, Any], actor: str) -> dict[str, Any]:
@@ -298,7 +301,7 @@ async def kill_switch_release(reason: str) -> str:
     10 minutes; if it expires, call this tool again for a fresh one.
     """
     try:
-        body = _ReleaseReason(reason=reason)
+        body = _Reason(reason=reason)
         store = _approval_store()
         approval = await store.create("kill_switch_release", body.reason, {"reason": body.reason})
     except ServiceError as exc:
