@@ -586,14 +586,20 @@ async def get(pool: Any, job_id: str, kind: JobKind | None = None) -> Any:
         )
 
 
-async def list_jobs(pool: Any, kind: JobKind) -> list[Any]:
-    """All rows of one kind, newest first."""
+async def list_jobs(pool: Any, kind: JobKind, limit: int | None = None) -> list[Any]:
+    """Rows of one kind, newest first; the SQL read stops at ``limit`` rows when given."""
     async with pool.acquire() as conn:
-        return list(
-            await conn.fetch(
+        if limit is None:
+            rows = await conn.fetch(
                 "SELECT * FROM backtest_jobs WHERE kind = $1 ORDER BY created_at DESC", kind
             )
-        )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM backtest_jobs WHERE kind = $1 ORDER BY created_at DESC LIMIT $2",
+                kind,
+                limit,
+            )
+    return list(rows)
 
 
 async def request_cancel(pool: Any, job_id: str) -> Any:

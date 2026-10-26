@@ -403,7 +403,7 @@ function BacktestPageContent() {
         ) : (
           <DataStateErrorCard
             error={jobs.error}
-            fallback="Jobs could not be loaded"
+            fallback="Failed to load jobs"
             onRetry={() => void jobs.refetch()}
           />
         )}

@@ -957,16 +957,31 @@ JOB_LIST_FIELDS = {
 
 
 class _JobsConn:
-    """Serves backtest_jobs rows per kind for the jobs-list read."""
+    """Serves backtest_jobs rows per kind for the jobs-list read.
+
+    Emulates the SELECT faithfully: newest first per kind, and a query that
+    carries LIMIT never yields more rows than its bound.
+    """
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
         self.kinds: list[str] = []
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.served: list[int] = []
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         assert "FROM backtest_jobs" in query
+        self.calls.append((query, args))
         self.kinds.append(args[0])
-        return [r for r in self.rows if r["kind"] == args[0]]
+        matching = sorted(
+            (r for r in self.rows if r["kind"] == args[0]),
+            key=lambda r: r["created_at"],
+            reverse=True,
+        )
+        if "LIMIT" in query:
+            matching = matching[: args[1]]
+        self.served.append(len(matching))
+        return matching
 
 
 def _jobs_row(**overrides: Any) -> dict[str, Any]:
@@ -1068,6 +1083,28 @@ class TestJobListRoute:
             "task-1",
         ]
         assert client.get("/api/backtest/jobs?limit=501").status_code == 422
+
+    def test_per_kind_reads_are_bounded_in_sql(self) -> None:
+        """Each per-kind SELECT carries the limit; Python only keeps the cross-kind order."""
+        rows = [
+            _jobs_row(id=f"bt-{i}", created_at=datetime(2026, 10, 20 + i, tzinfo=UTC))
+            for i in range(3)
+        ] + [
+            _jobs_row(id="ho-1", kind="hyperopt", created_at=datetime(2026, 10, 25, 9, tzinfo=UTC))
+        ]
+        conn = _JobsConn(rows)
+        resp = _jobs_client(conn).get("/api/backtest/jobs?limit=2")
+        assert resp.status_code == 200
+        assert [e["task_id"] for e in resp.json()] == ["ho-1", "bt-2"]
+        for query, args in conn.calls:
+            assert "LIMIT" in query
+            assert args[1] == 2
+        assert conn.served == [2, 1, 0]
+
+        default_conn = _JobsConn(rows)
+        assert _jobs_client(default_conn).get("/api/backtest/jobs").status_code == 200
+        for _, args in default_conn.calls:
+            assert args[1] == 100
 
     def test_empty_table_is_an_empty_list(self) -> None:
         resp = _jobs_client(_JobsConn([])).get("/api/backtest/jobs")

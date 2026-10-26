@@ -61,7 +61,7 @@ class JobListEntry(BaseModel):
     task_id: str
     kind: jobs.JobKind
     status: str  # queued | running | cancelling | completed | failed | cancelled
-    progress: float = 0.0  # 0-100
+    progress: float = 0.0
     created_at: str
     finished_at: str | None = None
     strategy_id: str = ""
@@ -320,12 +320,17 @@ _ALL_KINDS: tuple[jobs.JobKind, ...] = ("backtest", "hyperopt", "walkforward")
 async def list_jobs(
     pool: Any, kind: jobs.JobKind | None = None, limit: int = 100
 ) -> list[dict[str, Any]]:
-    """Durable job rows of every kind, newest first; only the extracted fields leave the row."""
+    """Durable job rows of every kind, newest first; only the extracted fields leave the row.
+
+    Every per-kind read carries the same SQL LIMIT: a kind's share of the global
+    newest ``limit`` rows fits within that kind's own newest ``limit``, so the
+    cross-kind merge below still yields the unbounded read's top ``limit``.
+    """
     pool = require_pool(pool)
     async with db_errors("listing jobs"):
         rows: list[Any] = []
         for one in (kind,) if kind else _ALL_KINDS:
-            rows.extend(await jobs.list_jobs(pool, one))
+            rows.extend(await jobs.list_jobs(pool, one, limit))
     rows.sort(key=lambda row: row["created_at"], reverse=True)
     entries: list[dict[str, Any]] = []
     for row in rows[:limit]:

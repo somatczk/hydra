@@ -323,6 +323,15 @@ describe('BacktestPage jobs', () => {
     expect(sectionText(page.container, 'Jobs')).toContain('Database is not available');
   });
 
+  it('says Failed to load jobs when the read fails without a server message', async () => {
+    serve({ 'GET /api/backtest/jobs': () => new Error('network gone') });
+    page = await mount(<BacktestPage />);
+
+    const text = sectionText(page.container, 'Jobs');
+    expect(text).toContain('Failed to load jobs');
+    expect(text).toContain('Retry');
+  });
+
   it('cancels a job through the confirm dialog exactly once', async () => {
     let cancelled = false;
     serve({
