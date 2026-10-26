@@ -1,7 +1,7 @@
 'use client';
 
-import { useEffect, useState, useRef, Suspense } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { useEffect, useRef, useState, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Play, Download, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Section } from '@/components/ui/Section';
@@ -12,12 +12,21 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
 import { ErrorCard } from '@/components/ui/ErrorCard';
-import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { ProvenanceBadge, type DataProvenance } from '@/components/backtest/DataProvenance';
-import { describeApiError, parseErrorDetail } from '@/lib/apiState';
+import { describeApiError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 import { signed } from '@/lib/format';
+import { usePoll } from '@/hooks/usePoll';
 import { ResearchNav } from '@/components/research/ResearchNav';
+import { JobRow } from '@/components/research/JobRow';
+import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
+import {
+  jobStatusText,
+  jobStatusTone,
+  noStoredBars,
+  type ResearchJob,
+} from '@/lib/research';
 import Link from 'next/link';
 
 /* ---------- Types ---------- */
@@ -61,13 +70,6 @@ interface StrategyOption {
   primary_timeframe?: string | null;
 }
 
-interface TaskStatus {
-  status: string;
-  progress: number;
-  error?: string | null;
-  fetch_error?: string | null;
-}
-
 const TIMEFRAME_OPTIONS = [
   { value: '1m', label: '1 Minute' },
   { value: '5m', label: '5 Minutes' },
@@ -79,9 +81,12 @@ const TIMEFRAME_OPTIONS = [
 ];
 
 function statusDisplay(status: string): Pick<BacktestRun, 'status' | 'statusVariant'> {
-  if (status === 'completed') return { status: 'Completed', statusVariant: 'success' };
-  if (status === 'failed') return { status: 'Failed', statusVariant: 'error' };
-  return { status: 'Running', statusVariant: 'info' };
+  if (status === 'completed') return { status: jobStatusText(status), statusVariant: 'success' };
+  const tone = jobStatusTone(status);
+  return {
+    status: jobStatusText(status),
+    statusVariant: tone === 'danger' ? 'error' : tone === 'caution' ? 'warning' : 'info',
+  };
 }
 
 /* ---------- Helpers ---------- */
@@ -113,13 +118,13 @@ function mapApiResults(data: ApiBacktestResult[]): BacktestRun[] {
 
 function BacktestPageContent() {
   const searchParams = useSearchParams();
+  const router = useRouter();
   const { toast } = useToast();
   const [backtestRuns, setBacktestRuns] = useState<BacktestRun[]>([]);
   const [resultsError, setResultsError] = useState<unknown>(null);
   const [runError, setRunError] = useState<unknown>(null);
-  const [runFailure, setRunFailure] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [running, setRunning] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [strategies, setStrategies] = useState<StrategyOption[]>([]);
   const [strategyId, setStrategyId] = useState(searchParams.get('strategy') || '');
   const [strategiesError, setStrategiesError] = useState(false);
@@ -128,23 +133,12 @@ function BacktestPageContent() {
   const [timeframe, setTimeframe] = useState('1h');
   const [initialCapital, setInitialCapital] = useState('10000');
   const [backtestName, setBacktestName] = useState('');
-  const [pollingTaskId, setPollingTaskId] = useState<string | null>(() => {
-    if (typeof window !== 'undefined') return localStorage.getItem('backtest_task_id');
-    return null;
-  });
-  const [progress, setProgress] = useState(0);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [compareIds, setCompareIds] = useState<string[]>([]);
   const autorunTriggered = useRef(false);
 
-  // Sync pollingTaskId to localStorage
-  useEffect(() => {
-    if (pollingTaskId) {
-      localStorage.setItem('backtest_task_id', pollingTaskId);
-      setRunning(true);
-    } else {
-      localStorage.removeItem('backtest_task_id');
-    }
-  }, [pollingTaskId]);
+  // Durable rows straight from the job queue; nothing about a run lives in this page's state.
+  const jobs = usePoll<ResearchJob[]>('/api/backtest/jobs?kind=backtest&limit=50', 10000);
 
   const fetchResults = async () => {
     try {
@@ -184,51 +178,11 @@ function BacktestPageContent() {
   };
   useEffect(() => { fetchStrategies(); }, []);
 
-  useEffect(() => {
-    if (!pollingTaskId) return;
-    const interval = setInterval(async () => {
-      try {
-        const status = await fetchApi<TaskStatus>(`/api/backtest/status/${pollingTaskId}`);
-        setProgress(Math.round(status.progress));
-        if (status.status === 'completed' || status.status === 'failed') {
-          clearInterval(interval);
-          setPollingTaskId(null);
-          setRunning(false);
-          setProgress(0);
-          fetchResults();
-          if (status.status === 'completed') {
-            toast('success', 'Backtest completed');
-            if (status.fetch_error) toast('warning', `Fresh data fetch failed: ${status.fetch_error}`);
-          } else {
-            const reason = status.error || 'no reason reported';
-            setRunFailure(`Backtest failed: ${reason}`);
-            toast('error', `Backtest failed: ${reason}`);
-            logger.error('Backtest', 'Backtest failed', reason);
-          }
-        }
-      } catch (err) {
-        logger.warn('Backtest', 'Polling failed, stopping', err);
-        clearInterval(interval);
-        setPollingTaskId(null);
-        setRunning(false);
-        setProgress(0);
-        const lost = parseErrorDetail(err)?.state === 'not_found';
-        setRunFailure(
-          lost
-            ? 'The backtest task is no longer known to the server (it may have restarted).'
-            : describeApiError(err, 'Lost contact with the backtest task'),
-        );
-      }
-    }, 1500);
-    return () => clearInterval(interval);
-  }, [pollingTaskId]);
-
   const handleRunBacktest = async () => {
-    setRunning(true);
+    setSubmitting(true);
     setRunError(null);
-    setRunFailure(null);
     try {
-      const result = await fetchApi<{ task_id: string }>('/api/backtest/run', {
+      await fetchApi<{ task_id: string }>('/api/backtest/run', {
         method: 'POST',
         body: JSON.stringify({
           strategy_id: strategyId,
@@ -240,17 +194,13 @@ function BacktestPageContent() {
         }),
       });
       toast('info', 'Backtest started');
-      if (result.task_id) {
-        setPollingTaskId(result.task_id);
-      } else {
-        fetchResults();
-        setRunning(false);
-      }
+      void jobs.refetch();
     } catch (err) {
       logger.error('Backtest', 'Failed to start backtest', err);
       setRunError(err);
       toast('error', describeApiError(err, 'Failed to start backtest'));
-      setRunning(false);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -265,7 +215,7 @@ function BacktestPageContent() {
     if (autorunTriggered.current) return;
     if (searchParams.get('autorun') !== 'true') return;
     const requested = searchParams.get('strategy');
-    if (!requested || strategyId !== requested || running) return;
+    if (!requested || strategyId !== requested || submitting) return;
     if (!strategies.some((s) => s.id === requested)) return;
     autorunTriggered.current = true;
     handleRunBacktest();
@@ -276,15 +226,39 @@ function BacktestPageContent() {
       await fetchApi<undefined>(`/api/backtest/results/${id}`, { method: 'DELETE' });
       toast('success', 'Backtest deleted');
       setBacktestRuns((prev) => prev.filter((r) => r.id !== id));
+      setCompareIds((prev) => prev.filter((c) => c !== id));
     } catch (err) {
       logger.error('Backtest', 'Failed to delete backtest', err);
       toast('error', 'Failed to delete backtest');
-    } finally {
-      setDeletingId(null);
     }
   };
 
+  const toggleCompare = (id: string) => {
+    setCompareIds((prev) =>
+      prev.includes(id) ? prev.filter((c) => c !== id) : prev.length < 2 ? [...prev, id] : prev,
+    );
+  };
+
+  const compareSelected = () => {
+    const [a, b] = compareIds;
+    if (!a || !b) return;
+    router.push(`/backtest/compare?a=${a}&b=${b}`);
+  };
+
   const columns = [
+    {
+      key: 'compare',
+      header: 'Compare',
+      render: (row: BacktestRun) => (
+        <input
+          type="checkbox"
+          checked={compareIds.includes(row.id)}
+          onChange={() => toggleCompare(row.id)}
+          aria-label={`Compare ${row.name || row.strategy}`}
+          className="h-5 w-5 cursor-pointer accent-accent"
+        />
+      ),
+    },
     {
       key: 'name',
       header: 'Name',
@@ -326,24 +300,19 @@ function BacktestPageContent() {
               View
             </Link>
           )}
-          {deletingId === row.id ? (
-            <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-              <button onClick={() => handleDelete(row.id)} className="text-xs text-danger hover:underline">Confirm</button>
-              <button onClick={() => setDeletingId(null)} className="text-xs text-ink-2 hover:underline">Cancel</button>
-            </div>
-          ) : (
-            <button
-              aria-label={`Delete backtest ${row.name || row.strategy}`}
-              onClick={(e) => { e.stopPropagation(); setDeletingId(row.id); }}
-              className="inline-flex h-8 w-8 items-center justify-center text-ink-2 hover:text-danger transition-colors"
-            >
-              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
-          )}
+          <button
+            aria-label={`Delete backtest ${row.name || row.strategy}`}
+            onClick={() => setDeletingId(row.id)}
+            className="inline-flex h-8 w-8 items-center justify-center text-ink-2 hover:text-danger transition-colors"
+          >
+            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
         </div>
       ),
     },
   ];
+
+  const noBars = runError !== null ? noStoredBars(runError) : null;
 
   return (
     <div className="flex flex-col gap-6">
@@ -375,55 +344,84 @@ function BacktestPageContent() {
           <Input label="Initial Capital ($)" type="number" value={initialCapital} onChange={(e) => setInitialCapital(e.target.value)} />
           <Input label="Name (optional)" type="text" value={backtestName} onChange={(e) => setBacktestName(e.target.value)} placeholder="e.g. Q1 BTC 1h" />
         </div>
-        {runError !== null && (
+        {noBars ? (
+          <div className="mt-4 flex flex-col gap-2" data-testid="run-error">
+            <DataStateBadge state="no_data" />
+            <ErrorCard message={noBars.title} />
+            <p className="text-sm text-ink-2">{noBars.line}</p>
+          </div>
+        ) : runError !== null ? (
           <div className="mt-4" data-testid="run-error">
             <DataStateErrorCard error={runError} fallback="Failed to start backtest" />
           </div>
-        )}
-        {runFailure && (
-          <div className="mt-4" data-testid="run-failure">
-            <ErrorCard message={runFailure} />
-          </div>
-        )}
-        <div className="mt-4 flex flex-col gap-3">
-          <div className="flex flex-wrap gap-3">
-            <Button variant="primary" onClick={handleRunBacktest} disabled={running}>
-              <Play className="h-4 w-4" />
-              {running ? `Running${progress > 0 ? ` (${progress}%)` : '...'}` : 'Run Backtest'}
-            </Button>
-            <Button
-              variant="outline"
-              disabled={backtestRuns.length === 0}
-              onClick={() => {
-                const blob = new Blob([JSON.stringify(backtestRuns, null, 2)], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `backtest-results-${new Date().toISOString().slice(0, 10)}.json`;
-                a.click();
-                URL.revokeObjectURL(url);
-              }}
-            >
-              <Download className="h-4 w-4" />
-              Export Results
-            </Button>
-          </div>
-          {running && (
-            <div className="flex items-center gap-3">
-              <div className="flex-1 h-2 rounded-full bg-raised overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-accent transition-all duration-500 ease-out"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-              <span className="text-xs text-ink-2 w-10 text-right">{progress}%</span>
-            </div>
-          )}
+        ) : null}
+        <div className="mt-4 flex flex-wrap gap-3">
+          <Button variant="primary" onClick={handleRunBacktest} disabled={submitting}>
+            <Play className="h-4 w-4" />
+            {submitting ? 'Starting…' : 'Run Backtest'}
+          </Button>
+          <Button
+            variant="outline"
+            disabled={backtestRuns.length === 0}
+            onClick={() => {
+              const blob = new Blob([JSON.stringify(backtestRuns, null, 2)], { type: 'application/json' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `backtest-results-${new Date().toISOString().slice(0, 10)}.json`;
+              a.click();
+              URL.revokeObjectURL(url);
+            }}
+          >
+            <Download className="h-4 w-4" />
+            Export Results
+          </Button>
         </div>
       </Section>
 
+      {/* Durable job queue */}
+      <Section title="Jobs">
+        {jobs.data ? (
+          jobs.data.length === 0 ? (
+            <p className="text-sm text-ink-2">
+              No backtest jobs yet. Runs submitted here stay in this list across restarts.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {jobs.data.map((job) => (
+                <JobRow
+                  key={job.task_id}
+                  kind="backtest"
+                  job={job}
+                  onRefetch={() => void jobs.refetch()}
+                />
+              ))}
+            </div>
+          )
+        ) : jobs.state === 'loading' ? (
+          <p className="text-sm text-ink-2">Loading…</p>
+        ) : (
+          <DataStateErrorCard
+            error={jobs.error}
+            fallback="Jobs could not be loaded"
+            onRetry={() => void jobs.refetch()}
+          />
+        )}
+      </Section>
+
       {/* Results table */}
-      <Section title="Backtest History">
+      <Section
+        title="Backtest History"
+        action={
+          <Button
+            variant="outline"
+            disabled={compareIds.length !== 2}
+            onClick={compareSelected}
+          >
+            Compare 2 selected
+          </Button>
+        }
+      >
         {resultsError !== null ? (
           <DataStateErrorCard error={resultsError} fallback="Failed to load backtest results" onRetry={fetchResults} />
         ) : (
@@ -435,6 +433,25 @@ function BacktestPageContent() {
         />
         )}
       </Section>
+
+      <ConfirmDialog
+        open={deletingId !== null}
+        destructive
+        title="Delete this backtest?"
+        primaryLabel="Delete backtest"
+        secondaryLabel="Keep it"
+        pendingLabel="Deleting…"
+        pendingHint="Closing this won't undo the delete."
+        onConfirm={async () => {
+          if (deletingId) {
+            await handleDelete(deletingId);
+            setDeletingId(null);
+          }
+        }}
+        onClose={() => setDeletingId(null)}
+      >
+        <p>The result and its trades are removed from the database. This cannot be undone.</p>
+      </ConfirmDialog>
     </div>
   );
 }
