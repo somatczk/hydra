@@ -165,9 +165,13 @@ function BacktestCompareContent() {
     const a = detailA.equity_curve;
     const b = detailB.equity_curve;
     if (a.length === 0 || b.length === 0) return null;
-    const times = [...a, ...b].map((p) => Date.parse(p.timestamp));
-    const start = formatUtc(new Date(Math.min(...times)).toISOString());
-    const end = formatUtc(new Date(Math.max(...times)).toISOString());
+    // first/last (curves are bar-ordered): a Math.min spread overflows the arg limit
+    const firstA = a[0].timestamp;
+    const lastA = a[a.length - 1].timestamp;
+    const firstB = b[0].timestamp;
+    const lastB = b[b.length - 1].timestamp;
+    const start = formatUtc(Date.parse(firstA) <= Date.parse(firstB) ? firstA : firstB);
+    const end = formatUtc(Date.parse(lastA) >= Date.parse(lastB) ? lastA : lastB);
     return `Equity from ${start} to ${end}: A from ${usdt(a[0].value)} to ${usdt(a[a.length - 1].value)}, B from ${usdt(b[0].value)} to ${usdt(b[b.length - 1].value)}`;
   }, [detailA, detailB]);
 

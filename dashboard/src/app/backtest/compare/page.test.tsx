@@ -140,6 +140,35 @@ describe('BacktestComparePage', () => {
     );
   });
 
+  it('summarises two 65,000-point equity curves without blowing the call-arg limit', async () => {
+    // ts.ohlcv_1m is the stored granularity and the curve is served uncapped:
+    // a 45-day 1m-bar run is ~65k points per curve; two of them spread ~130k
+    // timestamps into Math.min/Math.max, past V8's call-argument limit.
+    const points = (startIso: string) =>
+      Array.from({ length: 65_000 }, (_, i) => ({
+        timestamp: new Date(Date.parse(startIso) + i * 60_000).toISOString(),
+        value: 10_000 + i,
+      }));
+    const a = result('bt-a', prov('binance', '1m'), {
+      equity_curve: points('2026-01-01T00:00:00Z'),
+    });
+    const b = result('bt-b', prov('kraken', '1m'), {
+      equity_curve: points('2026-02-15T00:00:00Z'),
+    });
+    nav.search = new URLSearchParams('a=bt-a&b=bt-b');
+    const routes: Routes = {
+      '/api/backtest/results': [a, b],
+      '/api/backtest/results/bt-a': a,
+      '/api/backtest/results/bt-b': b,
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<BacktestComparePage />);
+
+    expect(page.container.querySelector('[role="img"]')?.getAttribute('aria-label')).toBe(
+      'Equity from 2026-01-01 00:00 UTC to 2026-04-01 03:19 UTC: A from 10,000.00 USDT to 74,999.00 USDT, B from 10,000.00 USDT to 74,999.00 USDT',
+    );
+  });
+
   it('reports an unavailable results list', async () => {
     fetchApi.mockImplementation(routeFetch({ '/api/backtest/results': unavailable() }, calls));
     page = await mount(<BacktestComparePage />);
