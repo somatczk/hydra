@@ -18,6 +18,7 @@ from hydra.execution import (
     protective_orders,
     session_health,
     session_manager,
+    session_recovery,
     session_store,
     session_wiring,
 )
@@ -26,7 +27,15 @@ from tests.unit.test_execution.session_harness import Harness, write_strategy
 
 REPO = Path(__file__).resolve().parents[3]
 EXECUTION = REPO / "src" / "hydra" / "execution"
-SESSION_MODULES = [session_manager, session_wiring, session_store, flatten, protective_orders]
+SESSION_MODULES = [
+    session_manager,
+    session_wiring,
+    session_store,
+    flatten,
+    protective_orders,
+    session_recovery,
+    session_health,
+]
 
 
 def test_only_client_factory_constructs_exchange_clients() -> None:
@@ -71,6 +80,8 @@ def test_paper_executor_shims_are_gone() -> None:
 def test_sql_lives_in_session_store(marker: str) -> None:
     assert marker not in inspect.getsource(session_manager)
     assert marker not in inspect.getsource(session_wiring)
+    assert marker not in inspect.getsource(session_recovery)
+    assert marker not in inspect.getsource(session_health)
 
 
 @pytest.mark.parametrize(
