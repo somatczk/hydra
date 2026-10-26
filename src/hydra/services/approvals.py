@@ -6,7 +6,10 @@ shrug -- the MCP client retries the request and gets a fresh code). Every lifecy
 transition (``requested`` / ``approved`` / ``denied`` / ``expired`` / ``failed``) is logged
 on ``hydra.audit`` and, when the caller injects an event writer, appended to ``risk_events``
 as a best-effort ``approval_*`` row (scope ``paper``); a failing write never blocks the
-transition.
+transition. An executor that raises marks the approval ``failed`` and answers
+``approval_execution_failed`` (the approval is not left pretending to be approved), and
+because dedup applies only while one is pending the action can simply be requested again.
+Decided approvals are dropped from memory ``DECIDED_RETENTION`` after their decision.
 
 The one-time code is 6 numeric digits from ``secrets`` (20 bits), single-use, compared with
 ``hmac.compare_digest``, invalidating the approval after 5 wrong attempts and expiring after
@@ -40,6 +43,7 @@ CODE_LENGTH = 6
 CODE_PATTERN = r"^[0-9]{6}$"
 MAX_CODE_ATTEMPTS = 5
 MAX_PENDING = 20
+DECIDED_RETENTION = timedelta(hours=1)
 APPROVAL_ACTOR = "service:mcp"
 
 ApprovalStatus = Literal["pending", "approved", "denied", "expired", "failed"]
@@ -51,8 +55,10 @@ ApprovalExecutor = Callable[[Any, dict[str, Any], str], Awaitable[Any]]
 copy of the approval's params; ``actor`` is ``APPROVAL_ACTOR``, so the executed action is
 always attributed to the service that asked, while ``approved_by`` names the human who said
 yes. Executors must re-validate their target state and stay idempotent: the approval is
-already recorded as approved when they run, and their result (or exception) is returned to
-the approving caller verbatim.
+already recorded as approved when they run, and their result is returned to the approving
+caller verbatim. An executor that raises (any exception, ``ServiceError`` included) marks
+the approval ``failed`` — the decision is answered with ``approval_execution_failed`` and
+a fresh request can be made.
 """
 ApprovalEventWriter = Callable[[RiskEventRecord], Awaitable[None]]
 
@@ -89,6 +95,7 @@ class Approval:
     attempts: int = 0
     approved_by: str | None = None
     decided_at: datetime | None = None
+    error: str | None = None
 
     @property
     def attempts_left(self) -> int:
@@ -110,8 +117,12 @@ class ApprovalStore:
     ``create`` dedupes per action (a second request while one is pending returns the same
     approval, code and expiry, and writes no new event) and caps the store at
     ``MAX_PENDING`` pending approvals, sweeping expired ones first and then refusing.
-    All state transitions run under one ``asyncio.Lock``; expiry is swept lazily at the top
-    of every operation, so nothing schedules work on a timer. Lost on restart by design.
+    Every transition runs under one ``asyncio.Lock``; the executor itself runs only after
+    the lock is released (the atomic status flip before it settles exactly-once), so a slow
+    action never stalls deny, the pending list or other decisions. Expiry is swept lazily
+    at the top of every operation — decided approvals (approved/denied/expired/failed) are
+    dropped from memory ``DECIDED_RETENTION`` after their decision — so nothing schedules
+    work on a timer. Lost on restart by design.
     """
 
     def __init__(
@@ -135,7 +146,7 @@ class ApprovalStore:
     ) -> Approval:
         """Request a gated action; dedupes while one is pending for the same action."""
         async with self._lock:
-            await self._sweep_expired()
+            await self._sweep()
             for approval in self._approvals.values():
                 if approval.action == action and approval.status == "pending":
                     return approval
@@ -165,7 +176,7 @@ class ApprovalStore:
     async def get(self, approval_id: str) -> Approval:
         """One approval by id, sweeping lazily (a stale pending one comes back ``expired``)."""
         async with self._lock:
-            await self._sweep_expired()
+            await self._sweep()
             approval = self._approvals.get(approval_id)
             if approval is None:
                 raise self._not_found(approval_id)
@@ -174,7 +185,7 @@ class ApprovalStore:
     async def list_pending(self) -> list[Approval]:
         """Pending approvals, oldest first (the closest to expiring is the most urgent)."""
         async with self._lock:
-            await self._sweep_expired()
+            await self._sweep()
             return [
                 a
                 for a in sorted(self._approvals.values(), key=lambda a: a.requested_at)
@@ -214,8 +225,23 @@ class ApprovalStore:
             approval.decided_at = self._clock()
             approval.approved_by = approved_by
             await self._emit("approved", approval, actor=approved_by)
+        # the flip above already settled exactly-once: run the executor unlocked so a slow
+        # action cannot stall deny, the pending list or other decisions
+        try:
             result = await executor(deps, dict(approval.params), APPROVAL_ACTOR)
-            return ApprovalOutcome(approval=approval, result=result, executed=True)
+        except Exception as exc:
+            async with self._lock:
+                approval.status = "failed"
+                approval.error = str(exc)
+                await self._emit("failed", approval, actor=approved_by)
+            raise service_error(
+                503,
+                "approval_execution_failed",
+                f"The approved action {approval.action!r} did not run: {exc}",
+                "unavailable",
+                executed=False,
+            ) from exc
+        return ApprovalOutcome(approval=approval, result=result, executed=True)
 
     async def deny(
         self, approval_id: str, *, decided_by: str, reason: str | None = None
@@ -225,13 +251,12 @@ class ApprovalStore:
             approval = await self._decidable(approval_id)
             approval.status = "denied"
             approval.decided_at = self._clock()
-            approval.approved_by = decided_by
             await self._emit("denied", approval, actor=decided_by, reason=reason)
             return ApprovalOutcome(approval=approval)
 
     async def _decidable(self, approval_id: str) -> Approval:
         """The approval if it can still be decided, else the matching refusal."""
-        await self._sweep_expired()
+        await self._sweep()
         approval = self._approvals.get(approval_id)
         if approval is None:
             raise self._not_found(approval_id)
@@ -243,7 +268,8 @@ class ApprovalStore:
             raise service_error(
                 410,
                 "approval_failed",
-                "This approval is invalidated: the code was entered wrong too many times",
+                "This approval is invalidated (too many wrong codes, or the action "
+                "failed to run); ask for a new one",
                 "invalid",
             )
         if approval.status in ("approved", "denied"):
@@ -256,14 +282,22 @@ class ApprovalStore:
             )
         return approval
 
-    async def _sweep_expired(self) -> None:
-        """Transition pending approvals past their expiry to ``expired`` (caller holds the lock)."""
+    async def _sweep(self) -> None:
+        """Sweep pending approvals past their expiry and drop decided ones past retention.
+
+        Decided approvals (approved/denied/expired/failed) are kept for
+        ``DECIDED_RETENTION`` after their decision — the decided-elsewhere rendering and
+        post-mortems need them — and then silently dropped. The caller holds the lock.
+        """
         now = self._clock()
-        for approval in self._approvals.values():
-            if approval.status == "pending" and now >= approval.expires_at:
-                approval.status = "expired"
-                approval.decided_at = now
-                await self._emit("expired", approval, actor=APPROVAL_ACTOR)
+        for approval_id, approval in list(self._approvals.items()):
+            if approval.status == "pending":
+                if now >= approval.expires_at:
+                    approval.status = "expired"
+                    approval.decided_at = now
+                    await self._emit("expired", approval, actor=APPROVAL_ACTOR)
+            elif approval.decided_at is not None and now >= approval.decided_at + DECIDED_RETENTION:
+                del self._approvals[approval_id]
 
     async def _emit(
         self,
@@ -286,6 +320,8 @@ class ApprovalStore:
         details: dict[str, Any] = {"approval_id": approval.id, "action": approval.action}
         if kind == "failed":
             details["attempts"] = approval.attempts
+            if approval.error is not None:
+                details["error"] = approval.error
         if reason is not None:
             details["reason"] = reason
         event = RiskEventRecord(

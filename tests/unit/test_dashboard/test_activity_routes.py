@@ -1,9 +1,10 @@
 """Activity + approval routes: the pinned seam (MCP-D consumes), browser and service principals.
 
-Requests go through the real app on this test's event loop (httpx ASGITransport): the
-approval store's asyncio lock must never be touched from another loop, which a sync
-TestClient's portal would do. The browser principal is auth_mode 'dev' (no bearer); the
-service principal sends the bearer token.
+Requests go through the real app with httpx ASGITransport, the repo's idiom for async
+route tests (e.g. test_trading_routes.py), so the direct-await helpers here (creating
+approvals, registering executors on the app's store) share the client's event loop. The
+browser principal is auth_mode 'dev' (no bearer); the service principal sends the bearer
+token.
 """
 
 from __future__ import annotations
@@ -256,6 +257,47 @@ class TestApprove:
         assert resp.status_code == 404
         assert resp.json()["detail"]["code"] == "approval_not_found"
 
+    async def test_service_principal_is_refused_before_the_unknown_id_404(
+        self, service: httpx.AsyncClient
+    ) -> None:
+        approve_resp = await service.post(approve_url("nope"), json={"code": "123456"})
+        assert (approve_resp.status_code, approve_resp.json()["detail"]["code"]) == (
+            403,
+            "principal_not_allowed",
+        )
+        deny_resp = await service.post(deny_url("nope"), json={})
+        assert (deny_resp.status_code, deny_resp.json()["detail"]["code"]) == (
+            403,
+            "principal_not_allowed",
+        )
+
+    async def test_failing_executor_answers_the_envelope_and_fails_the_approval(
+        self, browser: httpx.AsyncClient
+    ) -> None:
+        async def boom(deps: Any, params: dict[str, Any], actor: str) -> Any:
+            raise RuntimeError("release exploded")
+
+        get_approval_store(app).register("kill_switch_release", boom)
+        approval = await make_approval()
+
+        resp = await browser.post(approve_url(approval.id), json={"code": approval.code})
+        assert resp.status_code == 503
+        assert resp.headers["content-type"].startswith("application/json")
+        detail = resp.json()["detail"]
+        assert detail["code"] == "approval_execution_failed"
+        assert "release exploded" in detail["message"]
+        assert detail["executed"] is False
+
+        body = (await browser.get(f"/api/activity/approvals/{approval.id}")).json()
+        assert (body["status"], body["error"]) == ("failed", "release exploded")
+
+        again = await browser.post(approve_url(approval.id), json={"code": approval.code})
+        assert (again.status_code, again.json()["detail"]["code"]) == (410, "approval_failed")
+
+        fresh = await make_approval()  # a re-request is a fresh approval, not a dedup hit
+        assert fresh.id != approval.id
+        assert fresh.status == "pending"
+
 
 class TestDeny:
     async def test_deny_without_code_decides_and_blocks_approve(
@@ -281,6 +323,17 @@ class TestDeny:
         resp = await browser.post(deny_url(approval.id))
         assert resp.status_code == 200
         assert resp.json() == {"id": approval.id, "status": "denied"}
+
+    async def test_deny_leaves_approved_by_empty_but_marks_the_decision(
+        self, browser: httpx.AsyncClient
+    ) -> None:
+        approval = await make_approval()
+        resp = await browser.post(deny_url(approval.id), json={})
+        assert resp.status_code == 200
+        body = (await browser.get(f"/api/activity/approvals/{approval.id}")).json()
+        assert body["status"] == "denied"
+        assert body["approved_by"] is None
+        assert body["decided_at"] is not None
 
     async def test_service_principal_cannot_deny(self, service: httpx.AsyncClient) -> None:
         approval = await make_approval()

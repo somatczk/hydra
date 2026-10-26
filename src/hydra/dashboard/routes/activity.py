@@ -92,6 +92,7 @@ class ApprovalDetail(PendingApproval):
     attempts_left: int
     approved_by: str | None = None
     decided_at: datetime | None = None
+    error: str | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -181,6 +182,7 @@ async def get_approval(request: Request, approval_id: str) -> ApprovalDetail:
         attempts_left=approval.attempts_left if approval.status == "pending" else 0,
         approved_by=approval.approved_by,
         decided_at=approval.decided_at,
+        error=approval.error,
     )
 
 
