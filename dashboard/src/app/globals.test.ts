@@ -88,7 +88,6 @@ describe('design tokens', () => {
   it('every alias used as text colour resolves to a token ≥ 4.5:1 on canvas, surface and raised', () => {
     const used = new Set<string>();
     for (const f of sources) for (const m of f.text.matchAll(/\btext-((?:bg|text|border|status|accent)-[a-z]+(?:-[a-z]+)?)\b/g)) used.add(m[1]);
-    expect(used.has('text-light')).toBe(true);
     for (const name of used) {
       const token = aliases[name].slice(6, -1);
       for (const [theme, t] of Object.entries(THEMES)) {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, apiHeaders, fetchApi } from './api';
+import { ApiError, apiHeaders, fetchApi, fetchApiText } from './api';
 import { isSignedOut, stateFromError } from './apiState';
 
 const fetchMock = vi.fn();
@@ -105,6 +105,30 @@ describe('apiHeaders', () => {
     expect(apiHeaders()).toEqual({ 'x-hydra-request': '1' });
     expect(apiHeaders('PUT')).toEqual({ 'x-hydra-request': '1' });
     expect(apiHeaders('GET')).toEqual({});
+  });
+});
+
+describe('fetchApiText', () => {
+  it('resolves the raw body as text, without JSON parsing', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response('id: saw\nname: Saw\n', { status: 200, headers: { 'content-type': 'application/x-yaml' } }),
+    );
+    await expect(fetchApiText('/api/strategies/saw/export')).resolves.toBe('id: saw\nname: Saw\n');
+  });
+
+  it('sends the same headers as fetchApi, so a plain GET carries no CSRF header', async () => {
+    await fetchApiText('/api/x');
+    const headers = sentHeaders();
+    expect(headers.get('accept')).toBe('application/json');
+    expect(headers.get('x-hydra-request')).toBeNull();
+  });
+
+  it('throws the same error envelope as fetchApi on a non-2xx', async () => {
+    const body = JSON.stringify({
+      detail: { code: 'strategy_not_found', message: "Strategy 'saw' not found", state: 'not_found' },
+    });
+    fetchMock.mockResolvedValueOnce(new Response(body, { status: 404 }));
+    await expect(fetchApiText('/api/strategies/saw/export')).rejects.toEqual(new ApiError(404, body));
   });
 });
 

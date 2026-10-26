@@ -64,6 +64,29 @@ export async function fetchApi<T>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
+  const res = await request(path, options);
+
+  if (res.status === 204) {
+    return undefined as T;
+  }
+
+  return res.json() as Promise<T>;
+}
+
+/**
+ * Raw-text variant of `fetchApi` for endpoints that answer a non-JSON body
+ * (e.g. the YAML strategy export). Same auth headers, redirect handling and
+ * error envelope; resolves the body as text instead of parsing JSON.
+ *
+ * @throws {ApiError} when the server returns a non-2xx status, or 401 when sent to sign-in
+ */
+export async function fetchApiText(path: string, options?: RequestInit): Promise<string> {
+  const res = await request(path, options);
+  return res.text();
+}
+
+/** Shared request core of `fetchApi`/`fetchApiText`: headers, fetch, sign-in and error handling. */
+async function request(path: string, options?: RequestInit): Promise<Response> {
   const method = (options?.method ?? 'GET').toUpperCase();
   const url = `${API_BASE}${path}`;
   const t0 = performance.now();
@@ -100,12 +123,7 @@ export async function fetchApi<T>(
   }
 
   logger.info('API', `${method} ${path} -> ${res.status} (${ms}ms)`);
-
-  if (res.status === 204) {
-    return undefined as T;
-  }
-
-  return res.json() as Promise<T>;
+  return res;
 }
 
 // ---------------------------------------------------------------------------

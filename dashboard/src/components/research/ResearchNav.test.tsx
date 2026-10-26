@@ -9,7 +9,7 @@ afterEach(() => {
 });
 
 describe('ResearchNav', () => {
-  it('links the three Research pages and marks only the current one', async () => {
+  it('links the four Research pages and marks only the current one', async () => {
     page = await mount(<ResearchNav current="/backtest" />);
 
     const nav = page.container.querySelector('nav[aria-label="Research"]');
@@ -18,6 +18,7 @@ describe('ResearchNav', () => {
       ['Strategies', '/strategies'],
       ['Backtests', '/backtest'],
       ['Optimize', '/optimize'],
+      ['Templates', '/templates'],
     ]);
     expect(links.filter((a) => a.getAttribute('aria-current') === 'page').map((a) => a.textContent)).toEqual([
       'Backtests',
