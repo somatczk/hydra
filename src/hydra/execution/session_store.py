@@ -40,8 +40,9 @@ async def _upsert(db_pool: Any, session: TradingSession) -> None:
             INSERT INTO trading_sessions
                 (id, strategy_id, trading_mode, status, exchange_id,
                  symbols, timeframe, paper_capital, started_at,
-                 stopped_at, error_message, positions_at_stop, strategy_config, config_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14)
+                 stopped_at, error_message, positions_at_stop, strategy_config, config_hash,
+                 created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 started_at = EXCLUDED.started_at,
@@ -66,6 +67,7 @@ async def _upsert(db_pool: Any, session: TradingSession) -> None:
             session.positions_at_stop,
             json.dumps(session.strategy_config) if session.strategy_config is not None else None,
             session.config_hash,
+            session.created_by,
         )
 
 

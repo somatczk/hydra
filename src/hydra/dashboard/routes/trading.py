@@ -1,56 +1,34 @@
 """Trading session, kill-switch and quick-trade API routes.
 
-Every order goes through ``SessionManager.submit_manual_order`` (OrderManager -> RiskService ->
-paper executor). Errors use the ``_db.py`` envelope.
+Every order goes through ``SessionManager.submit_manual_order`` (OrderManager -> RiskService
+-> paper executor); the bodies delegate to ``hydra.services.sessions`` — the same functions
+the MCP tools call — so both transports answer identical envelopes. Errors use the
+``_db.py`` envelope.
 """
 
 from __future__ import annotations
 
-import logging
-from decimal import Decimal
-from typing import Any, Literal, Self
+from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from hydra.core.types import OrderType, Side
-from hydra.dashboard.routes._db import api_error, require_pool
-from hydra.dashboard.routes.strategies import build_strategy_name_map
+from hydra.dashboard.routes._db import ServiceErrorRoute
 from hydra.dashboard.security import audit
-from hydra.data.ingestion import InsufficientHistoryError
-from hydra.execution.errors import (
-    DuplicateSessionError,
-    KillSwitchActiveError,
-    LiveTradingDisabledError,
-    PaperCapitalUnavailableError,
-    SessionNotRunningError,
-    SessionPersistError,
-    SpotShortError,
-    UnsupportedStrategyError,
-    UnsupportedVenueError,
+from hydra.services import sessions as sessions_svc
+from hydra.services.sessions import (
+    KillSwitchNotPersistedError,
+    QuickTradeRequest,
+    SessionStopNotPersistedError,
+    StartSessionRequest,
 )
-from hydra.execution.order_manager import RiskRejectedError
-from hydra.execution.paper_trading import (
-    PaperSessionHaltedError,
-    PaperTradingExecutor,
-    PersistenceUnavailableError,
-)
-from hydra.execution.protective_orders import ProtectionSpec
-from hydra.risk.market_rules import MarketRulesUnavailableError
 
-router = APIRouter(prefix="/api/trading", tags=["trading"])
-logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/trading", tags=["trading"], route_class=ServiceErrorRoute)
 
 
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
-
-
-class StartSessionRequest(BaseModel):
-    strategy_id: str
-    trading_mode: str = "paper"  # 'paper' | 'live'
-    paper_capital: Decimal | None = Field(None, gt=0, max_digits=24, decimal_places=8)
 
 
 class SessionResponse(BaseModel):
@@ -73,6 +51,7 @@ class SessionResponse(BaseModel):
     entries_paused: str | None = None
     persist_dirty: bool | None = None
     feed_live: bool | None = None
+    created_by: str | None = None
 
 
 class PositionItem(BaseModel):
@@ -150,6 +129,7 @@ class SessionDetailResponse(BaseModel):
     positions: list[PositionItem] = Field(default_factory=list)
     trades: list[TradeItem] = Field(default_factory=list)
     open_orders: list[OpenOrderItem] = Field(default_factory=list)
+    created_by: str | None = None
 
 
 class KillSwitchResponse(BaseModel):
@@ -166,48 +146,6 @@ class KillSwitchRelease(BaseModel):
 
     confirm: Literal["RELEASE"]
     reason: str = Field(..., min_length=3, max_length=500)
-
-
-class QuickTradeRequest(BaseModel):
-    """A manual order; SL/TP/trailing are placed reduce-only when the entry fills."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    symbol: str = "BTCUSDT"
-    side: Literal["buy", "sell"]
-    order_type: Literal["MARKET", "LIMIT"] = "MARKET"
-    quantity: Decimal = Field(..., gt=0, max_digits=24, decimal_places=8)
-    price: Decimal | None = Field(None, gt=0, max_digits=24, decimal_places=8)
-    take_profit: Decimal | None = Field(None, gt=0, max_digits=24, decimal_places=8)
-    stop_loss: Decimal | None = Field(None, gt=0, max_digits=24, decimal_places=8)
-    trailing_stop_pct: Decimal | None = Field(None, gt=0, lt=100)
-    session_id: str = Field(..., min_length=1)
-
-    @field_validator("side", mode="before")
-    @classmethod
-    def _lower(cls, v: Any) -> Any:
-        return v.lower() if isinstance(v, str) else v
-
-    @field_validator("order_type", mode="before")
-    @classmethod
-    def _upper(cls, v: Any) -> Any:
-        return v.upper() if isinstance(v, str) else v
-
-    @model_validator(mode="after")
-    def _consistent(self) -> Self:
-        if self.order_type == "LIMIT" and self.price is None:
-            raise ValueError("price is required for LIMIT orders")
-        if self.trailing_stop_pct is not None and (
-            self.stop_loss is not None or self.take_profit is not None
-        ):
-            raise ValueError("trailing_stop_pct cannot be combined with stop_loss or take_profit")
-        if (
-            self.stop_loss is not None
-            and self.take_profit is not None
-            and self.stop_loss >= self.take_profit
-        ):
-            raise ValueError("stop_loss must be below take_profit")
-        return self
 
 
 class QuickTradeResponse(BaseModel):
@@ -231,13 +169,6 @@ class QuickTradeResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_session_manager(request: Request) -> Any:
-    mgr = getattr(request.app.state, "session_manager", None)
-    if mgr is None:
-        raise api_error(503, "engine_not_ready", "Session manager not initialized", "unavailable")
-    return mgr
-
-
 def _actor(request: Request) -> str:
     principal = getattr(request.state, "principal", None)
     name = getattr(principal, "name", None)
@@ -245,57 +176,6 @@ def _actor(request: Request) -> str:
     if name:
         return f"{kind}:{name}" if kind else str(name)
     return "anonymous"
-
-
-def _session_to_dict(session: Any) -> dict[str, Any]:
-    return {
-        "session_id": session.session_id,
-        "strategy_id": session.strategy_id,
-        "trading_mode": session.trading_mode,
-        "status": session.status,
-        "exchange_id": session.exchange_id,
-        "symbols": session.symbols,
-        "timeframe": session.timeframe,
-        "paper_capital": float(session.paper_capital) if session.paper_capital else None,
-        "started_at": session.started_at.isoformat() if session.started_at else None,
-        "stopped_at": session.stopped_at.isoformat() if session.stopped_at else None,
-        "error_message": session.error_message,
-        "positions_at_stop": session.positions_at_stop,
-        "flatten_incomplete": session.flatten_incomplete,
-        "persist_error": session.persist_error,
-    }
-
-
-def _start_error(exc: Exception) -> HTTPException:
-    """Map a session-start failure to the shared envelope."""
-    if isinstance(exc, KillSwitchActiveError):
-        return api_error(409, exc.code, str(exc), "invalid")
-    if isinstance(exc, DuplicateSessionError):
-        return api_error(409, exc.code, str(exc), "invalid")
-    if isinstance(exc, LiveTradingDisabledError):
-        return api_error(403, exc.code, str(exc), "not_implemented")
-    if isinstance(exc, UnsupportedVenueError):
-        return api_error(400, exc.code, str(exc), "invalid")
-    if isinstance(exc, UnsupportedStrategyError):
-        return api_error(400, exc.code, str(exc), "not_implemented")
-    if isinstance(exc, PaperCapitalUnavailableError):
-        return api_error(503, exc.code, str(exc), "unavailable")
-    if isinstance(exc, InsufficientHistoryError):
-        return api_error(
-            422,
-            "insufficient_history",
-            str(exc),
-            "no_data",
-            symbol=exc.symbol,
-            timeframe=str(exc.timeframe),
-            have=exc.have,
-            need=exc.need,
-        )
-    if isinstance(exc, MarketRulesUnavailableError):
-        return api_error(503, "market_rules_unavailable", str(exc), "unavailable")
-    if isinstance(exc, KeyError | FileNotFoundError):
-        return api_error(404, "strategy_not_found", str(exc).strip("'\""), "not_found")
-    return api_error(400, "invalid_session", str(exc), "invalid")
 
 
 # ---------------------------------------------------------------------------
@@ -306,123 +186,49 @@ def _start_error(exc: Exception) -> HTTPException:
 @router.post("/sessions", response_model=SessionResponse, status_code=201)
 async def start_session(body: StartSessionRequest, request: Request) -> dict[str, Any]:
     """Start a paper session. Live is 403 until P3; only Binance SPOT is accepted."""
-    mgr = _get_session_manager(request)
-    if body.trading_mode not in ("paper", "live"):
-        raise api_error(
-            400, "invalid_trading_mode", "trading_mode must be 'paper' or 'live'", "invalid"
-        )
-    try:
-        session_id = await mgr.start_session(
-            strategy_id=body.strategy_id,
-            trading_mode=body.trading_mode,
-            paper_capital=body.paper_capital,
-        )
-    except (
-        KillSwitchActiveError,
-        DuplicateSessionError,
-        LiveTradingDisabledError,
-        UnsupportedVenueError,
-        UnsupportedStrategyError,
-        PaperCapitalUnavailableError,
-        InsufficientHistoryError,
-        MarketRulesUnavailableError,
-        KeyError,
-        FileNotFoundError,
-        ValueError,
-    ) as exc:
-        raise _start_error(exc) from exc
+    d = await sessions_svc.start_session(
+        getattr(request.app.state, "session_manager", None), _actor(request), body
+    )
     audit(
         getattr(request.state, "principal", None),
         "session_start",
-        session_id=session_id,
+        session_id=d["session_id"],
         strategy_id=body.strategy_id,
     )
-    session = mgr.get_session(session_id)
-    d = _session_to_dict(session)
-    d["strategy_name"] = build_strategy_name_map().get(session.strategy_id)
     return d
 
 
 @router.delete("/sessions/{session_id}", response_model=SessionResponse)
 async def stop_session(session_id: str, request: Request) -> dict[str, Any]:
     """Flatten (reduce-only) and stop a session; positions_at_stop reports what is left."""
-    mgr = _get_session_manager(request)
     try:
-        await mgr.stop_session(session_id)
-    except KeyError as exc:
-        raise api_error(
-            404, "session_not_found", f"Session {session_id} not found", "not_found"
-        ) from exc
-    except SessionPersistError as exc:
+        d = await sessions_svc.stop_session(
+            getattr(request.app.state, "session_manager", None), session_id
+        )
+    except SessionStopNotPersistedError:
         audit(
             getattr(request.state, "principal", None),
             "session_stop",
             session_id=session_id,
             persisted=False,
         )
-        raise api_error(
-            503,
-            exc.code,
-            f"Session {session_id} stopped, but the database still says running: {exc}",
-            "unavailable",
-        ) from exc
+        raise
     audit(getattr(request.state, "principal", None), "session_stop", session_id=session_id)
-    session = mgr.get_session(session_id)
-    d = _session_to_dict(session)
-    d["strategy_name"] = build_strategy_name_map().get(session.strategy_id)
     return d
 
 
 @router.get("/sessions", response_model=list[SessionResponse])
 async def list_sessions(request: Request) -> list[dict[str, Any]]:
     """List all trading sessions (running + recent stopped) with each one's health."""
-    mgr = _get_session_manager(request)
-    name_map = build_strategy_name_map()
-    results = []
-    for s in mgr.list_sessions():
-        d = _session_to_dict(s)
-        d["strategy_name"] = name_map.get(s.strategy_id)
-        # health_snapshot()'s reads without its DB query, so a DB stall never slows this poll
-        rt, executor = s._runtime, s._executor
-        d["last_bar_at"] = s.last_bar_at.isoformat() if s.last_bar_at else None
-        d["entries_paused"] = rt.entries_paused if rt is not None else None
-        d["feed_live"] = (
-            rt.feed.is_live(s.exchange_id) if rt is not None and s.task_alive else False
-        )
-        d["persist_dirty"] = (
-            executor.get_account_snapshot().persist_dirty
-            if isinstance(executor, PaperTradingExecutor)
-            else None
-        )
-        results.append(d)
-    return results
+    return sessions_svc.list_sessions(getattr(request.app.state, "session_manager", None))
 
 
 @router.get("/sessions/{session_id}/detail", response_model=SessionDetailResponse)
 async def get_session_detail(session_id: str, request: Request) -> dict[str, Any]:
     """Full session detail with account numbers, positions and fills."""
-    mgr = _get_session_manager(request)
-    try:
-        detail = await mgr.get_session_detail(session_id)
-    except KeyError as exc:
-        raise api_error(
-            404, "session_not_found", f"Session {session_id} not found", "not_found"
-        ) from exc
-    detail["strategy_name"] = build_strategy_name_map().get(detail.get("strategy_id", ""))
-    session = mgr.get_session(session_id)
-    executor = getattr(session, "_executor", None)
-    if isinstance(executor, PaperTradingExecutor):
-        rt = session._runtime
-        detail["open_orders"] = [
-            {
-                **o,
-                # a LIMIT's stop_price is only its risk-check stop: nothing rests there
-                "stop_price": None if o["type"] == OrderType.LIMIT else o["stop_price"],
-                "protective": rt.protect.is_protective(o["oco_id"] or o["id"]) if rt else None,
-            }
-            for o in await executor.fetch_open_orders()
-        ]
-    return dict(detail)
+    return await sessions_svc.get_session_detail(
+        getattr(request.app.state, "session_manager", None), session_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -433,62 +239,43 @@ async def get_session_detail(session_id: str, request: Request) -> dict[str, Any
 @router.post("/kill-switch", response_model=KillSwitchResponse)
 async def activate_kill_switch(request: Request) -> dict[str, Any]:
     """Latch the kill switch, then flatten and stop every running or errored session."""
-    mgr = _get_session_manager(request)
-    report = await mgr.stop_all(actor=_actor(request), reason="kill switch (api)")
+    try:
+        body = await sessions_svc.activate_kill_switch(
+            getattr(request.app.state, "session_manager", None),
+            _actor(request),
+            "kill switch (api)",
+        )
+    except KillSwitchNotPersistedError as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        audit(
+            getattr(request.state, "principal", None),
+            "kill_switch_on",
+            sessions_stopped=detail.get("sessions_stopped"),
+            positions_remaining=detail.get("positions_remaining"),
+            persisted=detail.get("persisted"),
+        )
+        raise
     audit(
         getattr(request.state, "principal", None),
         "kill_switch_on",
-        sessions_stopped=report.sessions_stopped,
-        positions_remaining=report.positions_remaining,
-        persisted=report.persisted,
+        sessions_stopped=body["sessions_stopped"],
+        positions_remaining=body["positions_remaining"],
+        persisted=body["persisted"],
     )
-    if report.positions_remaining:
-        message = (
-            f"Kill switch latched; {report.positions_remaining} position(s) could NOT be "
-            "closed - check the sessions"
-        )
-    else:
-        message = "Kill switch activated - all positions closed and trading halted"
-    body = {
-        "active": True,
-        "message": message,
-        "sessions_stopped": report.sessions_stopped,
-        "positions_remaining": report.positions_remaining,
-        "persisted": report.persisted,
-        "flatten_failures": list(report.flatten_failures),
-    }
-    if not report.persisted:
-        raise api_error(
-            503,
-            "kill_switch_not_persisted",
-            message + "; the latch is in memory only and is lost on restart",
-            "unavailable",
-            **{k: v for k, v in body.items() if k != "message"},
-        )
     return body
 
 
 @router.delete("/kill-switch", response_model=KillSwitchResponse)
 async def release_kill_switch(body: KillSwitchRelease, request: Request) -> dict[str, Any]:
     """Release the kill switch (``{"confirm": "RELEASE", "reason": ...}``)."""
-    mgr = _get_session_manager(request)
-    require_pool(request)
-    try:
-        await mgr.release_kill_switch(actor=_actor(request), reason=body.reason)
-    except Exception as exc:
-        logger.exception("Kill switch release not persisted")
-        raise api_error(
-            503,
-            "kill_switch_release_failed",
-            "The release could not be persisted; the kill switch stays active",
-            "unavailable",
-        ) from exc
+    d = await sessions_svc.release_kill_switch(
+        getattr(request.app.state, "db_pool", None),
+        getattr(request.app.state, "session_manager", None),
+        _actor(request),
+        body.reason,
+    )
     audit(getattr(request.state, "principal", None), "kill_switch_off", reason=body.reason)
-    return {
-        "active": False,
-        "message": "Kill switch released - trading can resume",
-        "sessions_stopped": 0,
-    }
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -503,61 +290,17 @@ async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, An
     SL/TP (or a trailing stop) are placed reduce-only when the entry fills; without them the
     strategy's protective stop (default 5 %) is placed. A SELL only reduces the held position.
     """
-    mgr = _get_session_manager(request)
-    side = Side.BUY if body.side == "buy" else Side.SELL
-    protection: ProtectionSpec | None = None
-    if body.stop_loss is not None or body.take_profit is not None or body.trailing_stop_pct:
-        protection = ProtectionSpec(
-            stop_loss=body.stop_loss,
-            take_profit=body.take_profit,
-            trailing_pct=body.trailing_stop_pct / 100 if body.trailing_stop_pct else None,
-        )
-    try:
-        session, result = await mgr.submit_manual_order(
-            symbol=body.symbol,
-            side=side,
-            order_type=OrderType(body.order_type),
-            quantity=body.quantity,
-            price=body.price,
-            protection=protection,
-            session_id=body.session_id,
-        )
-    except SessionNotRunningError as exc:
-        raise api_error(404, exc.code, str(exc), "not_found") from exc
-    except SpotShortError as exc:
-        raise api_error(422, exc.code, str(exc), "invalid") from exc
-    except RiskRejectedError as exc:
-        raise api_error(
-            422, "risk_rejected", exc.reason, "invalid", check=exc.check, intent=exc.intent
-        ) from exc
-    except ValueError as exc:
-        raise api_error(422, "order_rejected", str(exc), "invalid") from exc
-    except PersistenceUnavailableError as exc:
-        raise api_error(503, "paper_state_unpersisted", str(exc), "unavailable") from exc
-    except PaperSessionHaltedError as exc:
-        raise api_error(503, "paper_session_halted", str(exc), "unavailable") from exc
+    d = await sessions_svc.submit_manual_order(
+        getattr(request.app.state, "session_manager", None), body
+    )
     audit(
         getattr(request.state, "principal", None),
         "manual_order",
-        session_id=session.session_id,
+        session_id=d["session_id"],
         symbol=body.symbol,
         side=body.side,
         order_type=body.order_type,
         quantity=str(body.quantity),
-        order_id=result.order_id,
+        order_id=d["order_id"],
     )
-    return {
-        "order_id": result.order_id,
-        "session_id": session.session_id,
-        "symbol": body.symbol,
-        "side": side.value,
-        "order_type": body.order_type,
-        "quantity": float(result.quantity),
-        "price": float(body.price) if body.price is not None else None,
-        "status": result.status,
-        "protection": result.protection,
-        "protective_order_id": result.protective_order_id,
-        "exit_orders_deferred": side == Side.BUY and result.protection == "pending",
-        "fill_price": float(result.fill_price) if result.fill_price is not None else None,
-        "mark_source": result.mark_source,
-    }
+    return d

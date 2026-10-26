@@ -81,6 +81,7 @@ class TradingSession:
     persist_error: str | None = None
     strategy_config: dict[str, Any] | None = None
     config_hash: str | None = None
+    created_by: str | None = None  # the principal string that started the session
 
     # Runtime components (not persisted)
     _runtime: SessionRuntime | None = field(default=None, repr=False)
@@ -254,8 +255,13 @@ class SessionManager:
         strategy_id: str,
         trading_mode: str,
         paper_capital: Decimal | None = None,
+        actor: str | None = None,
     ) -> str:
-        """Start a paper session; returns its id. Raises the typed errors in ``errors``."""
+        """Start a paper session; returns its id. Raises the typed errors in ``errors``.
+
+        *actor* names the starting principal (``user:<name>`` / ``service:mcp``) and is
+        persisted as the row's ``created_by``.
+        """
         risk = self._require_risk()
         if risk.kill_switch_active():
             raise KillSwitchActiveError("Kill switch is active: new sessions cannot start")
@@ -287,6 +293,7 @@ class SessionManager:
                 paper_capital=capital,
                 strategy_config=cfg.model_dump(mode="json"),
                 config_hash=config_hash(cfg),
+                created_by=actor,
             )
             rules = await self._market_rules.get(exchange_id, cfg.symbols)
             executor = client_factory.build_paper_executor(
@@ -877,6 +884,7 @@ class SessionManager:
                 paper_capital=row["paper_capital"],
                 started_at=row["started_at"],
                 strategy_config=_snapshot(row.get("strategy_config")),
+                created_by=row.get("created_by"),
             )
             self._sessions[sid] = session
             try:
@@ -999,6 +1007,7 @@ class SessionManager:
                 stopped_at=row["stopped_at"],
                 error_message=row["error_message"],
                 positions_at_stop=row.get("positions_at_stop", 0),
+                created_by=row.get("created_by"),
             )
 
     # -- Background tasks -----------------------------------------------------

@@ -67,6 +67,8 @@ not duplicate it here; update that table in the PR that changes a row.
   - `dashboard`: the FastAPI app, `routes/`, and `mcp/` (the MCP server, mounted at `/mcp/`
     only when `HYDRA_MCP_TOKEN` is set).
   - `services`: backtest, research and strategy operations the routes (and later MCP) call; no FastAPI.
+    `services/sessions.py` is the session/kill-switch/quick-trade seam both `routes/trading.py` and the
+    MCP session/risk tools call; the routes keep only their models, audit lines and principals.
   - `ops`: Discord/Slack webhook notifier.
 - `dashboard/`: Next.js app (see `dashboard/README.md`).
 - `config/`: `base.yaml`, `strategies/`, `templates/`.

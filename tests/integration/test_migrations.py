@@ -122,7 +122,8 @@ async def test_downgrade_drops_the_session_config_columns(fresh_database: str) -
     """The session snapshot revision is reversible: its downgrade drops both columns."""
     await _upgrade(fresh_database)
 
-    await asyncio.to_thread(command.downgrade, alembic_config(fresh_database), "-1")
+    # pin the target: 0007 reverses onto 0006, so '-1' would stop at 0008's parent
+    await asyncio.to_thread(command.downgrade, alembic_config(fresh_database), "0006_backtest_jobs")
 
     columns = await _fetch(
         fresh_database,
@@ -131,7 +132,7 @@ async def test_downgrade_drops_the_session_config_columns(fresh_database: str) -
         "AND column_name IN ('strategy_config', 'config_hash')",
     )
     assert columns == []
-    assert await current_revision(fresh_database) != head_revision()
+    assert await current_revision(fresh_database) == "0006_backtest_jobs"
 
 
 async def test_legacy_2_1_10_schema_upgrades_in_place(fresh_database: str) -> None:
