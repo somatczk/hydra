@@ -67,7 +67,7 @@ const DP2 = new Intl.NumberFormat('en-GB', { minimumFractionDigits: 2, maximumFr
 const dp2 = (v: number) => DP2.format(v);
 
 /** "9 Sep 2026" — bar coverage is a date fact; the time of day would be noise. */
-function utcDay(iso: string): string {
+export function utcDay(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;

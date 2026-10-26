@@ -166,8 +166,8 @@ prices in a backtest: market orders fill at the signal bar's close).
 | `/backtest` | Run a backtest on stored bars. The Jobs list shows the newest 50 backtest runs (state, age, progress, confirmed cancel, verbatim errors) and survives restarts; the results table compares two selected runs. |
 | `/backtest/[id]` | Result detail: metrics, equity curve, trades, verify, compare, start paper session; share links are not surfaced. |
 | `/backtest/compare` | URL-driven two-result compare (`?a=&b=`), with a warning when their data differs. |
-| `/optimize` | Launch hyperopt / walk-forward as an in-process task. |
-| `/optimize/[taskId]` | Task progress and result. |
+| `/optimize` | Optimisation launcher with a Hyperopt / Walk-forward segmented control: one shared form (strategy, dates, capital, method), per-mode fields and editable parameter ranges read from the strategy (a run needs a parameter space). Both modes queue durable jobs — hyperopt progress polls with a confirmed cancel and auto-opens its results page, walk-forward renders its folds and stitched out-of-sample equity inline once its durable row completes. Recent runs lists both kinds with states, ages and verbatim errors. |
+| `/optimize/[taskId]` | One optimisation run by id prefix: hyperopt shows the best params, seed, train window, the holdout block and PBO / DSR / holdout PSR only when the API returned them, provenance and a trials table with per-trial status (a failed trial shows its error, never a 0.00 Sharpe); walk-forward shows the aggregate readouts, the fold table and the stitched OOS equity chart with fold-boundary labels. Active runs poll with a confirmed cancel. |
 | `/portfolio` | Positions, allocation, balance snapshots. |
 | `/risk` | Risk limits form, drawdown and daily-loss gauges, VaR; circuit breakers show UNAVAILABLE. |
 | `/models` | ONNX model registry: upload (asks before replacing a model), promote, rollback. Drift shows Unknown. |
