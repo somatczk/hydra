@@ -50,7 +50,6 @@
   --text-primary: var(--ink-1);
   --text-secondary: var(--ink-2);
   --text-muted: var(--ink-2);
-  --text-light: var(--ink-2);
   --border-default: var(--line);
   --border-hover: var(--line-strong);
   --border-focus: var(--accent);
@@ -88,7 +87,6 @@
   --color-text-primary: var(--text-primary);
   --color-text-secondary: var(--text-secondary);
   --color-text-muted: var(--text-muted);
-  --color-text-light: var(--text-light);
   --color-border-default: var(--border-default);
   --color-border-hover: var(--border-hover);
   --color-border-focus: var(--border-focus);
