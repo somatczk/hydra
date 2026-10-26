@@ -42,7 +42,7 @@ const THEMES = { light, dark: blocks('.dark')[0] };
 
 /** 05 §2.1 claims: text roles ≥ 4.5:1 (1.4.3), control outlines ≥ 3:1 (1.4.11). */
 const PAIRS: Array<[fg: string, bg: string, min: number]> = [
-  ...['ink-1', 'ink-2', 'accent', 'caution', 'danger'].flatMap((fg) =>
+  ...['ink-1', 'ink-2', 'accent', 'caution', 'danger', 'live'].flatMap((fg) =>
     ['canvas', 'surface', 'raised'].map((bg): [string, string, number] => [fg, bg, 4.5]),
   ),
   ['ink-1', 'hover', 4.5],
@@ -52,6 +52,9 @@ const PAIRS: Array<[fg: string, bg: string, min: number]> = [
   ['ink-1', 'caution-soft', 4.5],
   ['danger', 'danger-soft', 4.5],
   ['canvas', 'danger', 4.5],
+  ['on-live', 'live', 4.5],
+  ['ink-1', 'live-soft', 4.5],
+  ['live', 'live-soft', 4.5],
   ['ink-1', 'line', 3],
   ['line-strong', 'surface', 3],
   ['line-strong', 'canvas', 3],

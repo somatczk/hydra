@@ -3,20 +3,27 @@ import {
   actionPhrase,
   breakerRow,
   dataAnswer,
+  exchangeStopRow,
   fillQty,
   heldAfter,
   isOverdue,
   ksTargets,
+  modeBadge,
+  needsLiveOrderReview,
+  needsModeLabels,
   needsYou,
+  reconcileRow,
+  rowMode,
   sideLabel,
   stoppedHolders,
   stopRuleLabel,
   timeframeSeconds,
   winRate,
   type PendingApproval,
+  type PositionItem,
   type SessionDetail,
 } from './derive';
-import { breaker, detail, liveStatus, paperFill, pendingApproval, platformConfig, session } from '@/test/fixtures';
+import { breaker, detail, exchangeStop, liveSession, liveStatus, paperFill, pendingApproval, platformConfig, reconcile, session } from '@/test/fixtures';
 
 const NOW = Date.parse('2026-10-21T14:40:00Z');
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
@@ -124,6 +131,76 @@ describe('holders and targets', () => {
   });
 });
 
+describe('live mode (seam #10)', () => {
+  it('LIVE when armed, even with no live session running', () => {
+    expect(modeBadge(liveStatus({ live_armed: true }), [session()])).toBe('live');
+  });
+
+  it('LIVE when a live session runs, even with the armed read missing', () => {
+    expect(modeBadge(liveStatus(), [session(), liveSession()])).toBe('live');
+    expect(modeBadge(null, [liveSession()])).toBe('live');
+  });
+
+  it('PAPER for stopped live rows only, and when both sources are quiet', () => {
+    expect(modeBadge(liveStatus(), [liveSession({ status: 'stopped' })])).toBe('paper');
+    expect(modeBadge(null, null)).toBe('paper');
+  });
+
+  it('row labels only when a view contains a live row; a stopped live row still counts (08 §6)', () => {
+    expect(needsModeLabels([session(), liveSession({ status: 'stopped' })])).toBe(true);
+    expect(needsModeLabels([session({ status: 'stopped' }), session()])).toBe(false);
+    expect(rowMode(liveSession())).toBe('live');
+    expect(rowMode(session())).toBe('paper');
+  });
+
+  it('only a running live session needs the L4 review', () => {
+    expect(needsLiveOrderReview(liveSession())).toBe(true);
+    expect(needsLiveOrderReview(liveSession({ status: 'stopped' }))).toBe(false);
+    expect(needsLiveOrderReview(session())).toBe(false);
+  });
+});
+
+const position = (exchange_stop: PositionItem['exchange_stop']): PositionItem => ({
+  symbol: 'BTCUSDT',
+  direction: 'long',
+  quantity: 0.0015,
+  avg_entry_price: 67612.4,
+  unrealized_pnl: -1.42,
+  exchange_stop,
+});
+
+describe('reconcile and exchange stops (A7/A8-live seams)', () => {
+  it('ok reads as the age of the last pass; never says not reconciled yet', () => {
+    expect(reconcileRow(reconcile({ last_reconciled_at: ago(2 * MIN) }), NOW)).toEqual({ text: 'Reconciled 2 min ago', tone: 'none' });
+    expect(reconcileRow(reconcile({ state: 'never', last_reconciled_at: null }), NOW)).toEqual({ text: 'Not reconciled yet', tone: 'none' });
+  });
+
+  it('mismatch carries the drift verbatim as caution', () => {
+    expect(reconcileRow(reconcile({ state: 'mismatch', detail: 'balance drift USDT local 100.00 exchange 98.00' }), NOW)).toEqual({
+      text: 'Mismatch: balance drift USDT local 100.00 exchange 98.00',
+      tone: 'caution',
+    });
+  });
+
+  it('an unreadable or absent reconcile renders nothing here — the caller shows UNKNOWN', () => {
+    expect(reconcileRow(reconcile({ state: 'unknown' }), NOW)).toBeNull();
+    expect(reconcileRow(null, NOW)).toBeNull();
+  });
+
+  it('a confirmed stop names its price: "Stop at {price} on the exchange"', () => {
+    expect(exchangeStopRow(position(exchangeStop()))).toEqual({ text: 'Stop at 64,256.00 on the exchange', tone: 'none' });
+  });
+
+  it('a missing or absent stop is danger - the dead-man invariant', () => {
+    expect(exchangeStopRow(position(exchangeStop({ state: 'missing' })))).toEqual({ text: 'No exchange stop for BTCUSDT', tone: 'danger' });
+    expect(exchangeStopRow(position(null))).toEqual({ text: 'No exchange stop for BTCUSDT', tone: 'danger' });
+  });
+
+  it('an unreadable verify renders nothing here — the caller shows UNKNOWN', () => {
+    expect(exchangeStopRow(position(exchangeStop({ state: 'unknown' })))).toBeNull();
+  });
+});
+
 describe('needsYou', () => {
   const base = { sessions: [session()], live: liveStatus(), config: platformConfig(), ksNotSaved: false, approvals: [] as PendingApproval[] };
 
@@ -196,6 +273,13 @@ describe('needsYou', () => {
   it('phrases the gated action and falls back to a spaced action', () => {
     expect(actionPhrase('kill_switch_release')).toBe('release the kill switch');
     expect(actionPhrase('some_future_action')).toBe('some future action');
+  });
+
+  it('phrases the four P3 live executors after "Claude asks to" (seam #1)', () => {
+    expect(actionPhrase('live_arming')).toBe('turn on live trading');
+    expect(actionPhrase('live_session_start')).toBe('start a live session');
+    expect(actionPhrase('live_order')).toBe('place a live order');
+    expect(actionPhrase('credential_delete')).toBe('delete the stored exchange keys');
   });
 });
 
