@@ -172,7 +172,9 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   containers with `HYDRA_REQUIRE_INFRA=1`, `paper-smoke` ("Paper Smoke", `make smoke`, the P1 acceptance test on the
   same services), and `image-smoke`, which builds each image without pushing and starts it (engine against the
   services with `DATABASE_URL`, `REDIS_URL` and a throwaway `HYDRA_CREDENTIAL_KEY`; `/livez` and `/readyz` must be
-  green and every engine and backtest log line must be JSON). PR runs read the image build cache but do not write it.
+  green and every engine and backtest log line must be JSON; a committed throwaway `HYDRA_MCP_TOKEN` mounts `/mcp` and
+  `.github/scripts/mcp_image_smoke.py` drives one real `session_list` tool call through the served `python -m` layout).
+  PR runs read the image build cache but do not write it.
 - `publish` (in `ci.yml`) needs every other job and runs only on pushes to `main` and manual dispatch on `main`: it
   builds `hydra-engine`, `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag
   only if it does not exist yet. Version tags never move. A push that changes no image input (`IMAGE_INPUTS`) skips

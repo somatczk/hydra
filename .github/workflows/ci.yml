@@ -360,10 +360,13 @@ jobs:
           case "$IMAGE" in
             hydra-engine)
               # romulus env shape: DATABASE_URL, REDIS_URL and a throwaway HYDRA_CREDENTIAL_KEY
+              # HYDRA_MCP_TOKEN is a committed throwaway too (never a secret); the allowlist is this smoke's own Host
               docker run -d --name smoke --network host \
                 -e DATABASE_URL="postgresql://hydra:test@localhost:${PG_PORT}/hydra_test" \
                 -e REDIS_URL="redis://localhost:${REDIS_PORT}/0" \
                 -e HYDRA_CREDENTIAL_KEY="$(openssl rand -base64 32 | tr '+/' '-_')" \
+                -e HYDRA_MCP_TOKEN="ci-smoke-token-0123456789abcdef0123456789abcdef" \
+                -e HYDRA_MCP__ALLOWED_HOSTS="localhost:8000" \
                 "$IMAGE:smoke"
               wait_for curl -fsS -o /dev/null http://localhost:8000/livez
               live=$(curl -fsS http://localhost:8000/livez)
@@ -373,6 +376,8 @@ jobs:
               ready=$(curl -fsS http://localhost:8000/readyz)
               echo "$ready"
               jq -e '.status == "ok" and .checks.db.ok == true and .checks.migrations.ok == true' <<<"$ready"
+              # one real MCP tool call through the served python -m app (the layout unit tests can't see)
+              docker exec -i smoke python - < .github/scripts/mcp_image_smoke.py
               docker logs smoke 2>&1 | grep -F 'Application startup complete' \
                 | jq -e 'select(.logger == "uvicorn.error" and .level == "info" and .timestamp != null)'
               docker logs smoke 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
