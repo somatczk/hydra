@@ -71,6 +71,15 @@ describe('TemplatesPage error states', () => {
     expect(page.container.textContent).toContain('No templates available yet');
     expect(page.container.querySelector('[data-state="unavailable"]')).toBeNull();
   });
+
+  it('says Loading… with the ellipsis character while the list loads', async () => {
+    const routes: Routes = { '/api/templates': () => new Promise<never>(() => {}) };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<TemplatesPage />);
+
+    expect(page.container.textContent).toContain('Loading…');
+    expect(page.container.textContent).not.toContain('Loading...');
+  });
 });
 
 describe('TemplatesPage content', () => {

@@ -12,7 +12,7 @@ import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBad
 import { describeApiError, stateFromError } from '@/lib/apiState';
 import { usePoll } from '@/hooks/usePoll';
 import { logger } from '@/lib/logger';
-import { signed, utc } from '@/lib/format';
+import { signed, signedLabel, utc } from '@/lib/format';
 import { ResearchNav } from '@/components/research/ResearchNav';
 import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
@@ -164,6 +164,12 @@ export default function StrategiesPage() {
     }
   };
 
+  const openDelete = (strategy: BuilderStrategy) => {
+    // The no-session fact comes from the last 30 s poll; refresh it as the door opens.
+    void sessions.refetch();
+    setDeleteTarget(strategy);
+  };
+
   const confirmDelete = async () => {
     if (deleteTarget === null) return;
     try {
@@ -218,7 +224,7 @@ export default function StrategiesPage() {
           <h1 className="text-xl font-semibold text-ink-1">Strategies</h1>
           <p className="mt-1 text-sm text-ink-2">
             {loading
-              ? 'Loading...'
+              ? 'Loading…'
               : loadError !== null
                 ? 'Strategies unavailable'
                 : `${(strategies ?? []).filter((s) => s.enabled).length} active strategies`}
@@ -343,11 +349,9 @@ export default function StrategiesPage() {
               {performance && (
                 <div className="mt-3 grid grid-cols-5 gap-2 rounded-lg border border-line bg-surface p-2.5">
                   <div className="text-center">
-                    <p className={cn(
-                      'text-sm font-bold',
-                      performance.total_pnl >= 0 ? 'text-ink-1' : 'text-danger',
-                    )}>
-                      {signed(performance.total_pnl)}
+                    <p className="text-sm font-bold text-ink-1">
+                      <span aria-hidden="true">{signed(performance.total_pnl)}</span>
+                      <span className="sr-only">{signedLabel(performance.total_pnl)}</span>
                     </p>
                     <p className="text-xs text-ink-2">PnL (USDT)</p>
                   </div>
@@ -431,7 +435,7 @@ export default function StrategiesPage() {
                   {strategy.editable && (
                     <button
                       onClick={() => router.push(`/builder?strategy=${strategy.id}`)}
-                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors"
+                      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors max-lg:h-11"
                     >
                       <Edit2 className="h-3 w-3" />
                       Edit
@@ -439,21 +443,21 @@ export default function StrategiesPage() {
                   )}
                   <button
                     onClick={() => router.push(`/backtest?strategy=${strategy.id}`)}
-                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors"
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors max-lg:h-11"
                   >
                     <BarChart3 className="h-3 w-3" />
                     Backtest
                   </button>
                   <button
                     onClick={() => handleExport(strategy.id, strategy.name)}
-                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors"
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-hover hover:text-ink-1 transition-colors max-lg:h-11"
                   >
                     <Download className="h-3 w-3" />
                     Export
                   </button>
                   <button
-                    onClick={() => setDeleteTarget(strategy)}
-                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-danger-soft hover:text-danger transition-colors"
+                    onClick={() => openDelete(strategy)}
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-ink-2 hover:bg-danger-soft hover:text-danger transition-colors max-lg:h-11"
                   >
                     <Trash2 className="h-3 w-3" />
                     Delete
@@ -461,13 +465,10 @@ export default function StrategiesPage() {
                 </div>
                 <div
                   className={cn(
-                    'relative h-6 w-11 rounded-full transition-colors',
+                    'flex items-center max-lg:min-h-11',
                     session
-                      ? 'cursor-not-allowed opacity-50'
+                      ? 'cursor-not-allowed'
                       : 'cursor-pointer',
-                    strategy.enabled
-                      ? 'bg-ink-2'
-                      : 'bg-line',
                   )}
                   role="switch"
                   aria-checked={strategy.enabled}
@@ -478,13 +479,24 @@ export default function StrategiesPage() {
                   onKeyDown={(e) => { if (!session && (e.key === 'Enter' || e.key === ' ')) handleToggle(strategy.id); }}
                 >
                   <div
+                    aria-hidden="true"
                     className={cn(
-                      'absolute top-1 h-4 w-4 rounded-full shadow transition-transform',
+                      'relative h-6 w-11 rounded-full transition-colors',
+                      session && 'opacity-50',
                       strategy.enabled
-                        ? 'translate-x-[22px] bg-canvas'
-                        : 'translate-x-1 bg-ink-1',
+                        ? 'bg-ink-2'
+                        : 'bg-line',
                     )}
-                  />
+                  >
+                    <div
+                      className={cn(
+                        'absolute top-1 h-4 w-4 rounded-full shadow transition-transform',
+                        strategy.enabled
+                          ? 'translate-x-[22px] bg-canvas'
+                          : 'translate-x-1 bg-ink-1',
+                      )}
+                    />
+                  </div>
                 </div>
               </div>
             </div>

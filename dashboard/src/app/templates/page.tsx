@@ -88,7 +88,7 @@ export default function TemplatesPage() {
         <h1 className="text-xl font-semibold text-ink-1">Templates</h1>
         <p className="mt-1 text-sm text-ink-2">
           {loading
-            ? 'Loading...'
+            ? 'Loading…'
             : templates.error !== null
               ? 'Templates unavailable'
               : `${(list ?? []).length} template${(list ?? []).length !== 1 ? 's' : ''} available`}
