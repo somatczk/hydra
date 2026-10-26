@@ -216,12 +216,58 @@ describe('BacktestDetailPage', () => {
     expect(text).not.toContain('$');
   });
 
+  it('tells screen readers gain or loss on signed money, which stays uncoloured', async () => {
+    const detail = {
+      ...DETAIL,
+      metrics: { ...DETAIL.metrics, total_pnl: -50, max_drawdown: 8.3, expectancy: -316.67 },
+      transactions: [
+        { trade_id: 1, type: 'entry', time: '2026-01-02T00:00:00+00:00', side: 'Buy', price: 67612.4, quantity: 0.0015, fee: 0.1014, pnl: null },
+        { trade_id: 1, type: 'exit', time: '2026-01-03T00:00:00+00:00', side: 'Sell', price: 68000, quantity: 0.0015, fee: 0.102, pnl: 0.57 },
+        { trade_id: 2, type: 'entry', time: '2026-01-04T00:00:00+00:00', side: 'Buy', price: 68000, quantity: 0.0015, fee: 0.102, pnl: null },
+        { trade_id: 2, type: 'exit', time: '2026-01-05T00:00:00+00:00', side: 'Sell', price: 67000, quantity: 0.0015, fee: 0.1005, pnl: -12.5 },
+      ],
+    };
+    fetchApi.mockImplementation(routeFetch(routes(detail), calls));
+    page = await mount(<BacktestDetailPage />);
+
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('loss 50.00 USDT');
+    expect(text).toContain('loss 316.67 USDT');
+    expect(text).toContain('gain 0.57 USDT');
+    expect(text).toContain('loss 12.50 USDT');
+    // the sign glyph is replaced, not doubled, for assistive tech
+    const hidden = Array.from(page.container.querySelectorAll('span[aria-hidden="true"]')).map((s) => s.textContent);
+    expect(hidden).toContain('−50.00');
+    expect(hidden).toContain('+0.57');
+    // no signed-money element sits in the danger colour (drawdown/Sell badges may)
+    for (const visible of ['−50.00', '−316.67', '+0.57', '−12.50']) {
+      const el = Array.from(page.container.querySelectorAll('span[aria-hidden="true"]')).find(
+        (s) => s.textContent === visible,
+      );
+      expect(el, `visible ${visible}`).toBeDefined();
+      expect(el?.closest('.text-danger'), `visible ${visible}`).toBeNull();
+    }
+  });
+
   it('gives the equity chart a value-bearing summary for screen readers', async () => {
     fetchApi.mockImplementation(routeFetch(routes({ ...DETAIL, equity_curve: EQUITY, benchmark_equity: [] }), calls));
     page = await mount(<BacktestDetailPage />);
 
     expect(page.container.querySelector('[role="img"]')?.getAttribute('aria-label')).toBe(
       'Equity from 2026-01-01 00:00 UTC to 2026-01-13 11:00 UTC: start 10,000.00 USDT, end 10,500.00 USDT',
+    );
+  });
+
+  it('adds the benchmark start and end to the chart summary when one was recorded', async () => {
+    const bench = [
+      { timestamp: '2026-01-01T00:00:00+00:00', value: 9800 },
+      { timestamp: '2026-01-13T11:00:00+00:00', value: 9900 },
+    ];
+    fetchApi.mockImplementation(routeFetch(routes({ ...DETAIL, equity_curve: EQUITY, benchmark_equity: bench }), calls));
+    page = await mount(<BacktestDetailPage />);
+
+    expect(page.container.querySelector('[role="img"]')?.getAttribute('aria-label')).toBe(
+      'Equity from 2026-01-01 00:00 UTC to 2026-01-13 11:00 UTC: start 10,000.00 USDT, end 10,500.00 USDT, benchmark from 9,800.00 USDT to 9,900.00 USDT',
     );
   });
 

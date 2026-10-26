@@ -29,7 +29,7 @@ import { Input } from '@/components/ui/Input';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { fetchApi } from '@/lib/api';
-import { money, signed } from '@/lib/format';
+import { money, signed, signedLabel } from '@/lib/format';
 import { useToast } from '@/components/ui/Toast';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { ResearchNav } from '@/components/research/ResearchNav';
@@ -121,7 +121,6 @@ interface TxnRow {
   quantity: string;
   fee: string;
   pnl: number | null;
-  pnlFormatted: string;
   isOpen: boolean;
 }
 
@@ -132,6 +131,16 @@ interface MergedEquityPoint {
 }
 
 const usdt = (v: number) => `${money(v) ?? '—'} USDT`;
+
+/** The sign glyph is hidden from AT, which hear "gain/loss" instead (portfolio pattern). */
+function SignedMoney({ value }: { value: number }) {
+  return (
+    <>
+      <span aria-hidden="true">{signed(value) ?? '—'}</span>
+      <span className="sr-only">{signedLabel(value) ?? 'not available'}</span>
+    </>
+  );
+}
 
 /* ---------- Page ---------- */
 
@@ -226,7 +235,11 @@ export default function BacktestDetailPage() {
     if (curve.length === 0) return null;
     const first = curve[0];
     const last = curve[curve.length - 1];
-    return `Equity from ${formatUtc(first.timestamp)} to ${formatUtc(last.timestamp)}: start ${usdt(first.value)}, end ${usdt(last.value)}`;
+    const bench = detail?.benchmark_equity ?? [];
+    const benchPart = bench.length > 0
+      ? `, benchmark from ${usdt(bench[0].value)} to ${usdt(bench[bench.length - 1].value)}`
+      : '';
+    return `Equity from ${formatUtc(first.timestamp)} to ${formatUtc(last.timestamp)}: start ${usdt(first.value)}, end ${usdt(last.value)}${benchPart}`;
   }, [detail]);
 
   const failedVerifyFields = verification && verification !== 'unavailable'
@@ -267,7 +280,6 @@ export default function BacktestDetailPage() {
       quantity: t.quantity.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''),
       fee: t.fee > 0 ? t.fee.toFixed(4) : '\u2014',
       pnl: t.pnl,
-      pnlFormatted: signed(t.pnl) ?? '—',
       isOpen: t.type === 'entry' && !exitIds.has(t.trade_id),
     }));
   }, [detail]);
@@ -309,8 +321,8 @@ export default function BacktestDetailPage() {
       header: 'PnL (USDT)',
       numeric: true,
       render: (row: TxnRow) => row.pnl != null ? (
-        <span className={row.pnl >= 0 ? 'text-ink-1 font-medium' : 'text-danger font-medium'}>
-          {row.pnlFormatted}
+        <span className="font-medium text-ink-1">
+          <SignedMoney value={row.pnl} />
         </span>
       ) : <span className="text-ink-2">{'\u2014'}</span>,
     },
@@ -419,10 +431,7 @@ export default function BacktestDetailPage() {
 
       {/* Metrics row */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <Readout
-          label="Total PnL (USDT)"
-          value={<span className={metrics.total_pnl < 0 ? 'text-danger' : undefined}>{signed(metrics.total_pnl)}</span>}
-        />
+        <Readout label="Total PnL (USDT)" value={<SignedMoney value={metrics.total_pnl} />} />
         <Readout label="Win rate" value={`${metrics.win_rate.toFixed(1)}%`} />
         <Readout label="Sharpe" value={metrics.sharpe_ratio.toFixed(2)} />
         <Readout label="Max drawdown" value={<span className="text-danger">{metrics.max_drawdown.toFixed(1)}%</span>} />
@@ -450,7 +459,7 @@ export default function BacktestDetailPage() {
           {metrics.expectancy != null && (
             <Readout
               label="Expectancy (USDT)"
-              value={<span className={metrics.expectancy < 0 ? 'text-danger' : undefined}>{signed(metrics.expectancy)}</span>}
+              value={<SignedMoney value={metrics.expectancy} />}
             />
           )}
         </div>

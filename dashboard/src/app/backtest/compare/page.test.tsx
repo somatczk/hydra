@@ -207,6 +207,33 @@ describe('BacktestComparePage', () => {
     );
   });
 
+  it('tells screen readers gain or loss on the compared PnL, which stays uncoloured', async () => {
+    const a = result('bt-a', prov('binance', '1h'), {
+      metrics: { total_trades: 1, win_rate: 0, total_pnl: -50, max_drawdown: 0, sharpe_ratio: 0 },
+    });
+    const b = result('bt-b', prov('kraken', '4h'), {
+      metrics: { total_trades: 2, win_rate: 0, total_pnl: 100, max_drawdown: 0, sharpe_ratio: 0 },
+    });
+    const routes: Routes = {
+      '/api/backtest/results': [a, b],
+      '/api/backtest/results/bt-a': a,
+      '/api/backtest/results/bt-b': b,
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<BacktestComparePage />);
+
+    await choose(page.container, 0, 'bt-a');
+    await choose(page.container, 1, 'bt-b');
+
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('loss 50.00 USDT');
+    expect(text).toContain('gain 100.00 USDT');
+    const hidden = Array.from(page.container.querySelectorAll('span[aria-hidden="true"]')).map((s) => s.textContent);
+    expect(hidden).toContain('−50.00');
+    expect(hidden).toContain('+100.00');
+    expect(page.container.querySelectorAll('.text-danger')).toHaveLength(0);
+  });
+
   it('summarises two 65,000-point equity curves without blowing the call-arg limit', async () => {
     // ts.ohlcv_1m is the stored granularity and the curve is served uncapped:
     // a 45-day 1m-bar run is ~65k points per curve; two of them spread ~130k

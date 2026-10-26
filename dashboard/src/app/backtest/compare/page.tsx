@@ -15,7 +15,7 @@ import {
 import { Select } from '@/components/ui/Select';
 import { Section } from '@/components/ui/Section';
 import { fetchApi } from '@/lib/api';
-import { money, signed } from '@/lib/format';
+import { money, signed, signedLabel } from '@/lib/format';
 import { logger } from '@/lib/logger';
 import { ResearchNav } from '@/components/research/ResearchNav';
 import {
@@ -98,6 +98,16 @@ function mergeEquityCurves(
 }
 
 const usdt = (v: number) => `${money(v) ?? '—'} USDT`;
+
+/** The sign glyph is hidden from AT, which hear "gain/loss" instead (portfolio pattern). */
+function SignedMoney({ value }: { value: number }) {
+  return (
+    <>
+      <span aria-hidden="true">{signed(value) ?? '—'}</span>
+      <span className="sr-only">{signedLabel(value) ?? 'not available'}</span>
+    </>
+  );
+}
 
 function CompareLoading() {
   return (
@@ -211,7 +221,7 @@ function BacktestCompareContent() {
     return [
       { label: 'Total trades', a: String(mA.total_trades), b: String(mB.total_trades) },
       { label: 'Win rate', a: `${mA.win_rate.toFixed(1)}%`, b: `${mB.win_rate.toFixed(1)}%` },
-      { label: 'Total PnL (USDT)', a: signed(mA.total_pnl) ?? '—', b: signed(mB.total_pnl) ?? '—', colorA: mA.total_pnl >= 0, colorB: mB.total_pnl >= 0 },
+      { label: 'Total PnL (USDT)', a: <SignedMoney value={mA.total_pnl} />, b: <SignedMoney value={mB.total_pnl} /> },
       { label: 'Max drawdown', a: `${mA.max_drawdown.toFixed(1)}%`, b: `${mB.max_drawdown.toFixed(1)}%` },
       { label: 'Sharpe', a: mA.sharpe_ratio.toFixed(2), b: mB.sharpe_ratio.toFixed(2) },
     ];
@@ -303,12 +313,8 @@ function BacktestCompareContent() {
                   {comparisonMetrics.map((row) => (
                     <tr key={row.label} className="border-b border-line last:border-0">
                       <td className="py-2.5 text-ink-2">{row.label}</td>
-                      <td className={`py-2.5 text-right font-medium ${'colorA' in row ? (row.colorA ? 'text-ink-1' : 'text-danger') : 'text-ink-1'}`}>
-                        {row.a}
-                      </td>
-                      <td className={`py-2.5 text-right font-medium ${'colorB' in row ? (row.colorB ? 'text-ink-1' : 'text-danger') : 'text-ink-1'}`}>
-                        {row.b}
-                      </td>
+                      <td className="py-2.5 text-right font-medium text-ink-1">{row.a}</td>
+                      <td className="py-2.5 text-right font-medium text-ink-1">{row.b}</td>
                     </tr>
                   ))}
                 </tbody>
