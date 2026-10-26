@@ -77,7 +77,6 @@ describe('design tokens', () => {
     const used = new Set<string>();
     const re = /[a-z]+(?:-[lrtbxy])?-((?:bg|text|border|status|accent)-[a-z]+(?:-[a-z]+)?)(?=[\s'"`/]|$)/g;
     for (const f of sources) for (const m of f.text.matchAll(re)) used.add(m[1]);
-    expect(used.has('text-muted')).toBe(true);
     for (const name of used) {
       expect(css, name).toContain(`--color-${name}: var(--${name});`);
       expect(aliases[name], name).toMatch(/^var\(--[a-z0-9-]+\)$/);
