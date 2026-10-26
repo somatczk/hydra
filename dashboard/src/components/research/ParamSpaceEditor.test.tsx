@@ -98,6 +98,27 @@ describe('ParamSpaceEditor', () => {
     expect(buttonByText(page.container, 'Submit').disabled).toBe(false);
   });
 
+  it('treats an empty bound as invalid, never as a silent zero', async () => {
+    page = await mount(<Harness defs={DEFS} />);
+
+    const min = page.container.querySelector<HTMLInputElement>('[aria-label="SMA Period min"]')!;
+    const max = page.container.querySelector<HTMLInputElement>('[aria-label="SMA Period max"]')!;
+
+    await typeInto(min, '');
+    expect(page.container.textContent).toContain('Enter a number.');
+    expect(emitted.at(-1)).toBeNull();
+    expect(buttonByText(page.container, 'Submit').disabled).toBe(true);
+
+    await typeInto(min, '2');
+    expect(page.container.textContent).not.toContain('Enter a number.');
+    expect(buttonByText(page.container, 'Submit').disabled).toBe(false);
+
+    await typeInto(max, '');
+    expect(page.container.textContent).toContain('Enter a number.');
+    expect(emitted.at(-1)).toBeNull();
+    expect(buttonByText(page.container, 'Submit').disabled).toBe(true);
+  });
+
   it('re-seeds the ranges when the definitions change', async () => {
     page = await mount(<SwappingHarness />);
 

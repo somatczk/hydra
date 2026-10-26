@@ -25,14 +25,17 @@ function rowsFromDefs(defs: StrategyParamDef[]): Row[] {
   }));
 }
 
+/** Number('') is 0; an empty range bound must read as invalid, never as a silent zero. */
+const parseBound = (v: string): number => (v.trim() === '' ? NaN : Number(v));
+
 /** The wire param_space, or null when a range is empty, unparseable or not ascending. */
 function wireSpace(rows: Row[]): WireParamDef[] | null {
   const parsed = rows.map((r) => ({
     name: r.name,
     type: r.type,
     default: r.default,
-    min: Number(r.min),
-    max: Number(r.max),
+    min: parseBound(r.min),
+    max: parseBound(r.max),
   }));
   if (parsed.some((r) => !Number.isFinite(r.min) || !Number.isFinite(r.max) || r.max <= r.min)) {
     return null;
@@ -77,9 +80,9 @@ export function ParamSpaceEditor({ defs, onChange, disabled }: ParamSpaceEditorP
   return (
     <div className="flex flex-col gap-4" data-testid="param-space">
       {rows.map((row) => {
-        const min = Number(row.min);
-        const max = Number(row.max);
-        const invalid = !Number.isFinite(min) || !Number.isFinite(max) || max <= min;
+        const min = parseBound(row.min);
+        const max = parseBound(row.max);
+        const notAscending = Number.isFinite(min) && Number.isFinite(max) && max <= min;
         return (
           <div key={row.name} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-3">
             <div className="pb-2">
@@ -92,6 +95,7 @@ export function ParamSpaceEditor({ defs, onChange, disabled }: ParamSpaceEditorP
               aria-label={`${row.label} min`}
               value={row.min}
               disabled={disabled}
+              error={row.min.trim() === '' ? 'Enter a number.' : undefined}
               onChange={(e) => update(row.name, 'min', e.target.value)}
             />
             <Input
@@ -100,7 +104,13 @@ export function ParamSpaceEditor({ defs, onChange, disabled }: ParamSpaceEditorP
               aria-label={`${row.label} max`}
               value={row.max}
               disabled={disabled}
-              error={invalid ? 'Max must be greater than min.' : undefined}
+              error={
+                row.max.trim() === ''
+                  ? 'Enter a number.'
+                  : notAscending
+                    ? 'Max must be greater than min.'
+                    : undefined
+              }
               onChange={(e) => update(row.name, 'max', e.target.value)}
             />
           </div>

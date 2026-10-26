@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
 import type { ResearchJob } from '@/lib/research';
-import { buttonByText, click, mount, unavailable, type Mounted } from '@/test/pageHarness';
+import { advance, buttonByText, click, mount, unavailable, type Mounted } from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
 
@@ -183,6 +183,7 @@ beforeEach(() => {
 afterEach(() => {
   page?.unmount();
   page = null;
+  vi.useRealTimers();
 });
 
 describe('OptimizeTaskPage hyperopt', () => {
@@ -306,6 +307,30 @@ describe('OptimizeTaskPage hyperopt', () => {
     expect(calls.some((c) => c.path.startsWith('/api/backtest/jobs'))).toBe(false);
     expect(calls.some((c) => c.path.startsWith('/api/backtest/walkforward'))).toBe(false);
   });
+
+  it('re-arms the 2s poll when Retry recovers contact with the run', async () => {
+    vi.useFakeTimers();
+    serve({
+      'GET /api/backtest/hyperopt/ho-1': () => ({ ...HYPEROPT, status: 'running', completed_trials: 3 }),
+    });
+    page = await mount(<OptimizeTaskPage />);
+    expect(page.container.textContent).toContain('3/14 trials');
+
+    serve({ 'GET /api/backtest/hyperopt/ho-1': () => unavailable() });
+    await advance(2000);
+    expect(page.container.textContent).toContain('Database is not available');
+
+    serve({
+      'GET /api/backtest/hyperopt/ho-1': () => ({ ...HYPEROPT, status: 'running', completed_trials: 4 }),
+    });
+    await click(buttonByText(page.container, 'Retry'));
+    expect(page.container.textContent).toContain('4/14 trials');
+
+    const polls = () => calls.filter((c) => c.path === '/api/backtest/hyperopt/ho-1').length;
+    const afterRetry = polls();
+    await advance(2000);
+    expect(polls()).toBe(afterRetry + 1);
+  });
 });
 
 describe('OptimizeTaskPage walk-forward', () => {
@@ -385,6 +410,28 @@ describe('OptimizeTaskPage walk-forward', () => {
     });
     page = await mount(<OptimizeTaskPage />);
     expect(page.container.textContent).toContain('Database is not available');
+  });
+
+  it('watches a run pushed out of the jobs window through the results endpoint', async () => {
+    vi.useFakeTimers();
+    serve({
+      'GET /api/backtest/jobs?kind=walkforward&limit=50': () => [] as unknown[],
+      'GET /api/backtest/walkforward/wf-1/results': () => notCompleted('running', null),
+    });
+    page = await mount(<OptimizeTaskPage />);
+
+    const text = page.container.textContent ?? '';
+    expect(text).not.toContain('Reading the run…');
+    expect(text).toContain('Running');
+    expect(buttonByText(page.container, 'Cancel')).not.toBeNull();
+
+    serve({
+      'GET /api/backtest/jobs?kind=walkforward&limit=50': () => [] as unknown[],
+      'GET /api/backtest/walkforward/wf-1/results': () => WF_RESULT,
+    });
+    await advance(10000);
+
+    expect(page.container.textContent).toContain('OOS Sharpe 0.90');
   });
 });
 

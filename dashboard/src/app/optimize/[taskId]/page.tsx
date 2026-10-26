@@ -301,7 +301,10 @@ function HyperoptView({ taskId }: { taskId: string }) {
         <DataStateErrorCard
           error={loadError}
           fallback="Lost contact with the run"
-          onRetry={() => setRefresh((n) => n + 1)}
+          onRetry={() => {
+            setPolling(true);
+            setRefresh((n) => n + 1);
+          }}
         />
       )}
       {result !== null ? (
@@ -366,15 +369,21 @@ function HyperoptView({ taskId }: { taskId: string }) {
 
 /* ---------- Walk-forward ---------- */
 
+/** The 409 detail reads "not completed (status: running)"; the status is the live row state. */
+const NOT_COMPLETED_STATUS = /\(status: ([a-z_]+)\)/;
+
 function WalkforwardView({ taskId }: { taskId: string }) {
   const router = useRouter();
   const [result, setResult] = useState<WalkForwardResult | null>(null);
   const [notCompleted, setNotCompleted] = useState<string | null>(null);
+  const [fallbackStatus, setFallbackStatus] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
 
   const jobs = usePoll<JobsRow[]>('/api/backtest/jobs?kind=walkforward&limit=50', 10000);
   const row = jobs.data?.find((j) => j.task_id === taskId) ?? null;
+  // a run pushed past the newest-50 window: the results endpoint stays a live read of it
+  const outsideWindow = row === null && jobs.data !== null;
 
   const loadResults = useCallback(async () => {
     try {
@@ -384,7 +393,10 @@ function WalkforwardView({ taskId }: { taskId: string }) {
       setLoadError(null);
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        setNotCompleted(describeApiError(err, 'Run not completed'));
+        const message = describeApiError(err, 'Run not completed');
+        setNotCompleted(message);
+        setFallbackStatus(NOT_COMPLETED_STATUS.exec(message)?.[1] ?? null);
+        setLoadError(null);
       } else {
         logger.warn('OptimizeTask', 'Failed to load walk-forward results', err);
         setLoadError(err);
@@ -405,6 +417,13 @@ function WalkforwardView({ taskId }: { taskId: string }) {
     }
   }, [loading, row?.status, result, loadError, loadResults]);
 
+  // outside the window the 409 is the only live status left: poll it on the jobs cadence
+  useEffect(() => {
+    if (!outsideWindow || result !== null) return;
+    const timer = setInterval(() => void loadResults(), 10000);
+    return () => clearInterval(timer);
+  }, [outsideWindow, result, loadResults]);
+
   if (loading) {
     return (
       <div className="flex h-64 items-center justify-center">
@@ -416,6 +435,9 @@ function WalkforwardView({ taskId }: { taskId: string }) {
   if (loadError !== null && result === null) {
     return <MissingRun error={loadError} back={() => router.push('/optimize')} />;
   }
+
+  const outsideJob: JobsRow | null =
+    row === null && fallbackStatus !== null ? { task_id: taskId, status: fallbackStatus } : null;
 
   return (
     <div className="flex flex-col gap-6">
@@ -432,6 +454,8 @@ function WalkforwardView({ taskId }: { taskId: string }) {
         <>
           {row ? (
             <JobRow kind="walkforward" job={row} onRefetch={() => void jobs.refetch()} />
+          ) : outsideJob ? (
+            <JobRow kind="walkforward" job={outsideJob} onRefetch={() => void loadResults()} />
           ) : jobs.data === null && jobs.error !== null ? (
             <DataStateErrorCard
               error={jobs.error}

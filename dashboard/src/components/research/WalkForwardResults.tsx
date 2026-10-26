@@ -66,7 +66,7 @@ function summaryLines(r: WalkForwardResult): string[] {
 }
 
 /** Fold-boundary tick positions and labels; per-fold point counts are not on the wire, so they are even. */
-function foldTicks(r: WalkForwardResult): { ticks: number[]; label: (i: number) => string } {
+export function foldTicks(r: WalkForwardResult): { ticks: number[]; label: (i: number) => string } {
   const points = r.out_of_sample_equity.length;
   const last = points - 1;
   const labels = new Map<number, string>();
@@ -76,7 +76,8 @@ function foldTicks(r: WalkForwardResult): { ticks: number[]; label: (i: number) 
     labels.set(k === 0 ? 1 : Math.round(1 + (k * last) / r.folds.length), utcDay(start));
   });
   const lastFold = r.folds[r.folds.length - 1];
-  if (last >= 0 && lastFold?.oos_end) labels.set(last, utcDay(lastFold.oos_end));
+  // a colliding index keeps the fold's start label; the end label is the one that yields
+  if (last >= 0 && lastFold?.oos_end && !labels.has(last)) labels.set(last, utcDay(lastFold.oos_end));
   return {
     ticks: [...labels.keys()].sort((a, b) => a - b),
     label: (i: number) => labels.get(i) ?? String(i),

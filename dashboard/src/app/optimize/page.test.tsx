@@ -6,6 +6,7 @@ import {
   advance,
   buttonByText,
   click,
+  flush,
   mount,
   sectionText,
   unavailable,
@@ -29,6 +30,18 @@ const STRATEGIES = [{ id: 'saw', name: 'Saw', primary_timeframe: '1h' }];
 const PARAMS = [
   { name: 'sma_period', label: 'SMA Period', type: 'int', default: 5, min: 2, max: 20, step: 1 },
 ];
+const OTHER_PARAMS = [
+  { name: 'rsi_period', label: 'RSI Period', type: 'int', default: 14, min: 5, max: 30, step: 1 },
+];
+
+/** Controllable promise: the test decides when a route's response lands. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
 
 const NO_DATA = new ApiError(
   422,
@@ -201,6 +214,10 @@ describe('OptimizePage segmented control', () => {
 
     expect(labels(page.container)).toContain('Max Trials');
     expect(labels(page.container)).not.toContain('Folds');
+    expect(labels(page.container)).toContain('Initial capital (USDT)');
+    expect(page.container.querySelector('select option[value=""]')?.textContent).toBe(
+      'Select strategy…',
+    );
 
     await click(wf);
     expect(ho.getAttribute('aria-pressed')).toBe('false');
@@ -216,6 +233,7 @@ describe('OptimizePage segmented control', () => {
     page = await mount(<OptimizePage />);
 
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
+    expect(page.container.querySelector('h1')?.textContent).toBe('Strategy optimiser');
     expect(
       page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent,
     ).toBe('Optimize');
@@ -356,6 +374,35 @@ describe('OptimizePage submissions', () => {
     expect(page.container.textContent).not.toContain('This strategy has no optimisable parameters.');
     expect(buttonByText(page.container, 'Run Hyperopt').disabled).toBe(true);
   });
+
+  it('binds the param space to the current strategy when params responses land out of order', async () => {
+    const sawParams = deferred<unknown[]>();
+    serve({
+      'GET /api/backtest/strategies': () => [...STRATEGIES, { id: 'other', name: 'Other' }],
+      'GET /api/backtest/strategies/saw/params': () => sawParams.promise,
+      'GET /api/backtest/strategies/other/params': () => OTHER_PARAMS,
+    });
+    page = await mount(<OptimizePage />);
+
+    const label = Array.from(page.container.querySelectorAll('label')).find(
+      (l) => l.textContent === 'Strategy',
+    )!;
+    const select = document.getElementById(label.htmlFor) as HTMLSelectElement;
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+    await act(async () => {
+      setter?.call(select, 'other');
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await flush();
+
+    expect(page.container.textContent).toContain('RSI Period');
+
+    sawParams.resolve(PARAMS); // the previous strategy's response lands last
+    await flush();
+
+    expect(page.container.textContent).toContain('RSI Period');
+    expect(page.container.textContent).not.toContain('SMA Period');
+  });
 });
 
 describe('OptimizePage hyperopt run', () => {
@@ -387,6 +434,53 @@ describe('OptimizePage hyperopt run', () => {
     page = await mount(<OptimizePage />);
 
     expect(calls.some((c) => c.path.includes('/hyperopt/history'))).toBe(false);
+  });
+
+  it('never navigates when the completing poll lands after unmount', async () => {
+    vi.useFakeTimers();
+    let land: ((value: unknown) => void) | null = null;
+    serve({
+      'POST /api/backtest/hyperopt': () => ({ task_id: 'ho-1', status: 'queued' }),
+      'GET /api/backtest/hyperopt/ho-1': () =>
+        new Promise((resolve) => {
+          land = resolve;
+        }),
+    });
+    page = await mount(<OptimizePage />);
+    await click(buttonByText(page.container, 'Run Hyperopt'));
+
+    page.unmount();
+    page = null;
+    await act(async () => {
+      land?.({ ...runningProgress(), status: 'completed' });
+    });
+
+    expect(router.push).not.toHaveBeenCalled();
+  });
+
+  it('re-arms the watcher from the submitted id when the very first poll failed', async () => {
+    vi.useFakeTimers();
+    serve({
+      'POST /api/backtest/hyperopt': () => ({ task_id: 'ho-1', status: 'queued' }),
+      'GET /api/backtest/hyperopt/ho-1': () => unavailable(),
+    });
+    page = await mount(<OptimizePage />);
+    await click(buttonByText(page.container, 'Run Hyperopt'));
+
+    expect(page.container.textContent).toContain('Database is not available');
+    expect(page.container.textContent).not.toContain('Running');
+
+    serve({
+      'POST /api/backtest/hyperopt': () => ({ task_id: 'ho-1', status: 'queued' }),
+      'GET /api/backtest/hyperopt/ho-1': () => runningProgress(),
+    });
+    await click(buttonByText(page.container, 'Retry'));
+
+    const polls = () => calls.filter((c) => c.path === '/api/backtest/hyperopt/ho-1').length;
+    const afterRetry = polls();
+    await advance(2000);
+    expect(polls()).toBe(afterRetry + 1);
+    expect(page.container.textContent).toContain('Running');
   });
 });
 

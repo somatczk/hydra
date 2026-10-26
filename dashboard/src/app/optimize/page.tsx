@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Play } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -102,6 +102,8 @@ export default function OptimizePage() {
   const [hoWatch, setHoWatch] = useState<string | null>(null);
   const [hoJob, setHoJob] = useState<ResearchJob | null>(null);
   const [hoWatchError, setHoWatchError] = useState<unknown>(null);
+  // the id from the submit response, so the watcher can be re-armed after a lost first poll
+  const hoStartedRef = useRef<string | null>(null);
 
   // the walk-forward run started here: watched through the durable jobs list
   const [wfWatchId, setWfWatchId] = useState<string | null>(null);
@@ -134,18 +136,27 @@ export default function OptimizePage() {
     setDefs(null);
     setParamsError(null);
     setParamSpace(null);
+    // a slower previous strategy must not bind its param space to this one
+    let cancelled = false;
     fetchApi<StrategyParamDef[]>(`/api/backtest/strategies/${strategyId}/params`)
-      .then(setDefs)
+      .then((data) => {
+        if (cancelled) return;
+        setDefs(data);
+      })
       .catch((err) => {
+        if (cancelled) return;
         logger.warn('Optimize', 'Failed to fetch strategy params', err);
         setParamsError(err);
       });
+    return () => {
+      cancelled = true;
+    };
   }, [strategyId, paramsReload]);
 
   const handleParamSpace = useCallback((space: WireParamDef[] | null) => setParamSpace(space), []);
 
   const applyProgress = useCallback(
-    (p: HyperoptProgress) => {
+    (p: HyperoptProgress, isCancelled?: () => boolean) => {
       setHoJob({
         task_id: p.task_id,
         status: p.status,
@@ -157,16 +168,18 @@ export default function OptimizePage() {
       });
       if (TERMINAL.has(p.status)) {
         setHoWatch(null);
-        if (p.status === 'completed') router.push(`/optimize/${p.task_id}`);
+        if (p.status === 'completed' && !isCancelled?.()) {
+          router.push(`/optimize/${p.task_id}`);
+        }
       }
     },
     [router],
   );
 
   const pollHyperopt = useCallback(
-    async (taskId: string) => {
+    async (taskId: string, isCancelled?: () => boolean) => {
       try {
-        applyProgress(await fetchApi<HyperoptProgress>(`/api/backtest/hyperopt/${taskId}`));
+        applyProgress(await fetchApi<HyperoptProgress>(`/api/backtest/hyperopt/${taskId}`), isCancelled);
         setHoWatchError(null);
       } catch (err) {
         setHoWatchError(err);
@@ -178,9 +191,14 @@ export default function OptimizePage() {
 
   useEffect(() => {
     if (hoWatch === null) return;
-    void pollHyperopt(hoWatch);
-    const timer = setInterval(() => void pollHyperopt(hoWatch), 2000);
-    return () => clearInterval(timer);
+    let cancelled = false;
+    const poll = () => void pollHyperopt(hoWatch, () => cancelled);
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, [hoWatch, pollHyperopt]);
 
   const wfRow = useMemo(
@@ -252,6 +270,7 @@ export default function OptimizePage() {
           }),
         });
         setHoWatch(res.task_id);
+        hoStartedRef.current = res.task_id;
         void hyperoptJobs.refetch();
         toast('info', 'Hyperopt started');
       } else {
@@ -306,7 +325,7 @@ export default function OptimizePage() {
     <div className="flex flex-col gap-6">
       <ResearchNav current="/optimize" />
       <div>
-        <h1 className="text-xl font-semibold text-ink-1">Strategy optimizer</h1>
+        <h1 className="text-xl font-semibold text-ink-1">Strategy optimiser</h1>
         <p className="mt-1 text-sm text-ink-2">
           Find optimal parameter combinations for your strategy
         </p>
@@ -347,7 +366,7 @@ export default function OptimizePage() {
             options={strategies.map((s) => ({ value: s.id, label: s.name }))}
             value={strategyId}
             onChange={(e) => setStrategyId(e.target.value)}
-            placeholder="Select strategy..."
+            placeholder="Select strategy…"
           />
           <Select
             label="Method"
@@ -356,7 +375,7 @@ export default function OptimizePage() {
             onChange={(e) => setMethod(e.target.value)}
           />
           <Input
-            label="Initial Capital (USDT)"
+            label="Initial capital (USDT)"
             type="number"
             min={0}
             value={initialCapital}
@@ -459,7 +478,7 @@ export default function OptimizePage() {
             <DataStateErrorCard
               error={hoWatchError}
               fallback="Lost contact with the run"
-              onRetry={() => hoJob && setHoWatch(hoJob.task_id)}
+              onRetry={() => hoStartedRef.current && setHoWatch(hoStartedRef.current)}
             />
           )}
           {wfResultError !== null && (
