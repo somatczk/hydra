@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useState, useMemo } from 'react';
+import { Suspense, useEffect, useRef, useState, useMemo } from 'react';
 import { useSearchParams } from 'next/navigation';
 import {
   AreaChart,
@@ -99,6 +99,14 @@ function mergeEquityCurves(
 
 const usdt = (v: number) => `${money(v) ?? '—'} USDT`;
 
+function CompareLoading() {
+  return (
+    <div className="flex h-64 items-center justify-center">
+      <p className="text-sm text-ink-2">Loading backtest results...</p>
+    </div>
+  );
+}
+
 /* ---------- Page ---------- */
 
 function BacktestCompareContent() {
@@ -107,8 +115,8 @@ function BacktestCompareContent() {
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState<unknown>(null);
   const [detailError, setDetailError] = useState<unknown>(null);
-  const [selectedA, setSelectedA] = useState(searchParams.get('a') ?? '');
-  const [selectedB, setSelectedB] = useState(searchParams.get('b') ?? '');
+  const [selectedA, setSelectedA] = useState('');
+  const [selectedB, setSelectedB] = useState('');
   const [detailA, setDetailA] = useState<BacktestDetail | null>(null);
   const [detailB, setDetailB] = useState<BacktestDetail | null>(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
@@ -129,6 +137,19 @@ function BacktestCompareContent() {
   };
 
   useEffect(() => { loadResults(); }, []);
+
+  // Seed ?a=&b= only once the completed list is known, so a dead id (or a=b) falls
+  // back to the empty "Choose runs" state instead of a blank/self-comparing select.
+  const seededFromUrl = useRef(false);
+  useEffect(() => {
+    if (seededFromUrl.current || results.length === 0) return;
+    seededFromUrl.current = true;
+    const ids = new Set(results.map((r) => r.id));
+    const a = searchParams.get('a');
+    const b = searchParams.get('b');
+    if (a && ids.has(a)) setSelectedA(a);
+    if (b && ids.has(b) && b !== a) setSelectedB(b);
+  }, [results, searchParams]);
 
   useEffect(() => {
     if (!selectedA || !selectedB) {
@@ -197,11 +218,7 @@ function BacktestCompareContent() {
   }, [detailA, detailB]);
 
   if (loading) {
-    return (
-      <div className="flex h-64 items-center justify-center">
-        <p className="text-sm text-ink-2">Loading backtest results...</p>
-      </div>
-    );
+    return <CompareLoading />;
   }
 
   return (
@@ -411,7 +428,7 @@ function BacktestCompareContent() {
 
 export default function BacktestComparePage() {
   return (
-    <Suspense>
+    <Suspense fallback={<CompareLoading />}>
       <BacktestCompareContent />
     </Suspense>
   );

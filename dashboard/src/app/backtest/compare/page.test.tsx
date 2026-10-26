@@ -3,13 +3,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flush, mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
-const nav = vi.hoisted(() => ({ search: new URLSearchParams() }));
+const nav = vi.hoisted(() => ({
+  search: new URLSearchParams(),
+  pending: null as Promise<unknown> | null,
+}));
 
 vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
   fetchApi: (...args: unknown[]) => fetchApi(...args),
 }));
-vi.mock('next/navigation', () => ({ useSearchParams: () => nav.search }));
+vi.mock('next/navigation', () => ({
+  useSearchParams: () => {
+    if (nav.pending) throw nav.pending;
+    return nav.search;
+  },
+}));
 
 const { default: BacktestComparePage } = await import('./page');
 
@@ -49,6 +57,7 @@ let calls: Array<{ path: string; init?: RequestInit }>;
 beforeEach(() => {
   calls = [];
   nav.search = new URLSearchParams();
+  nav.pending = null;
   fetchApi.mockReset();
 });
 
@@ -102,6 +111,64 @@ describe('BacktestComparePage', () => {
     expect(calls.filter((c) => c.path === '/api/backtest/results/bt-a')).toHaveLength(1);
     expect(calls.filter((c) => c.path === '/api/backtest/results/bt-b')).toHaveLength(1);
     expect(page.container.textContent).toContain('Metrics comparison');
+  });
+
+  it('renders the loading skeleton while the search params suspend the page', async () => {
+    nav.pending = new Promise(() => {}); // never resolves: first paint shows the Suspense fallback
+    fetchApi.mockImplementation(routeFetch({ '/api/backtest/results': [A, B] }, calls));
+    page = await mount(<BacktestComparePage />);
+
+    expect(page.container.textContent).toContain('Loading backtest results...');
+  });
+
+  it('ignores ?a= ids that are not completed runs: placeholder shows, no dead-id fetch', async () => {
+    nav.search = new URLSearchParams('a=bt-dead&b=bt-b');
+    const routes: Routes = {
+      '/api/backtest/results': [A, B],
+      '/api/backtest/results/bt-a': A,
+      '/api/backtest/results/bt-b': B,
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<BacktestComparePage />);
+
+    const selects = page.container.querySelectorAll('select');
+    expect(selects[0].selectedIndex).toBe(0); // placeholder option, not a blank controlled select
+    expect(selects[0].selectedOptions[0]?.textContent).toBe('Select backtest...');
+    expect(selects[1].value).toBe('bt-b');
+    expect(calls.filter((c) => c.path !== '/api/backtest/results')).toHaveLength(0);
+  });
+
+  it('prefills ?a= alone without selecting B, crashing or fetching details', async () => {
+    nav.search = new URLSearchParams('a=bt-a');
+    const routes: Routes = {
+      '/api/backtest/results': [A, B],
+      '/api/backtest/results/bt-a': A,
+      '/api/backtest/results/bt-b': B,
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<BacktestComparePage />);
+
+    const selects = page.container.querySelectorAll('select');
+    expect(selects[0].value).toBe('bt-a');
+    expect(selects[1].selectedIndex).toBe(0);
+    expect(calls.filter((c) => c.path !== '/api/backtest/results')).toHaveLength(0);
+    expect(page.container.textContent).not.toContain('Metrics comparison');
+  });
+
+  it('never self-compares ?a=X&b=X: B stays unselected and the run is not fetched twice', async () => {
+    nav.search = new URLSearchParams('a=bt-a&b=bt-a');
+    const routes: Routes = {
+      '/api/backtest/results': [A, B],
+      '/api/backtest/results/bt-a': A,
+      '/api/backtest/results/bt-b': B,
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<BacktestComparePage />);
+
+    const selects = page.container.querySelectorAll('select');
+    expect(selects[0].value).toBe('bt-a');
+    expect(selects[1].selectedIndex).toBe(0);
+    expect(calls.filter((c) => c.path !== '/api/backtest/results')).toHaveLength(0);
   });
 
   it('renders money as signed USDT with no currency symbol, and names both curves for screen readers', async () => {
