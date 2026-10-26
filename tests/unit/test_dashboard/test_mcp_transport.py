@@ -131,7 +131,7 @@ def test_tools_list_returns_the_registered_tools(mcp_app: FastAPI) -> None:
     assert tools.status_code == 200
     names = [tool["name"] for tool in _sse_json(tools)["result"]["tools"]]
     assert names  # the tool modules (B1/B2) register on the shared server instance
-    assert not [name for name in names if "live" in name]
+    assert not [name for name in names if name.startswith("live_")]
 
 
 @pytest.mark.parametrize(

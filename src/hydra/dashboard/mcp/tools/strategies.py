@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import ValidationError
+
 from hydra.dashboard.mcp import server
 from hydra.dashboard.mcp.tools import _deps
 from hydra.dashboard.security import audit
@@ -94,21 +96,23 @@ async def strategy_save(
     ``rules`` is the builder's rule set (entry/exit long/short condition groups);
     ``enable_immediately`` also marks it enabled for paper sessions.
     """
-    body = _save_request(
-        name,
-        rules,
-        description,
-        exchange_id,
-        symbol,
-        timeframes,
-        risk,
-        enable_immediately,
-        ml_overlay,
-    )
     try:
+        body = _save_request(
+            name,
+            rules,
+            description,
+            exchange_id,
+            symbol,
+            timeframes,
+            risk,
+            enable_immediately,
+            ml_overlay,
+        )
         result = strategy_svc.save_strategy(body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
+    except ValidationError as exc:
+        raise _deps.invalid_arguments(exc) from exc
     audit(_deps.MCP_PRINCIPAL, "strategy_save", strategy_id=result.id, name=result.name)
     return _deps.json_text(result.model_dump(mode="json"))
 
@@ -128,21 +132,23 @@ async def strategy_update(
 ) -> str:
     """Update an existing rule-based strategy's YAML config; only rule-based strategies
     can be edited (400 otherwise)."""
-    body = _save_request(
-        name,
-        rules,
-        description,
-        exchange_id,
-        symbol,
-        timeframes,
-        risk,
-        enable_immediately,
-        ml_overlay,
-    )
     try:
+        body = _save_request(
+            name,
+            rules,
+            description,
+            exchange_id,
+            symbol,
+            timeframes,
+            risk,
+            enable_immediately,
+            ml_overlay,
+        )
         result = strategy_svc.update_strategy(strategy_id, body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
+    except ValidationError as exc:
+        raise _deps.invalid_arguments(exc) from exc
     audit(_deps.MCP_PRINCIPAL, "strategy_update", strategy_id=strategy_id, name=result.name)
     return _deps.json_text(result.model_dump(mode="json"))
 
@@ -208,18 +214,34 @@ async def strategy_import(filename: str, yaml_content: str) -> str:
     return _deps.json_text(result.model_dump(mode="json"))
 
 
+def _export_not_found(strategy_id: str) -> ServiceError:
+    return service_error(
+        404,
+        "strategy_not_found",
+        f"Strategy {strategy_id} not found",
+        "not_found",
+        strategy_id=strategy_id,
+    )
+
+
 @server.tool(name="strategy_export", structured_output=False)
 async def strategy_export(strategy_id: str) -> str:
     """Read a strategy's YAML config file and return its full text."""
     path = strategy_svc.find_strategy_file(strategy_id)
     if path is None:
+        raise _deps.tool_error(_export_not_found(strategy_id))
+    try:
+        return path.read_text()
+    except FileNotFoundError as exc:
+        # the file can vanish between the finder's scan and this read
+        raise _deps.tool_error(_export_not_found(strategy_id)) from exc
+    except OSError as exc:
         raise _deps.tool_error(
             service_error(
-                404,
-                "strategy_not_found",
-                f"Strategy {strategy_id} not found",
-                "not_found",
+                503,
+                "strategy_file_unreadable",
+                f"Strategy {strategy_id} file is unreadable: {exc}",
+                "unavailable",
                 strategy_id=strategy_id,
             )
-        )
-    return path.read_text()
+        ) from exc

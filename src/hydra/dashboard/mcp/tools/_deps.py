@@ -13,9 +13,10 @@ import json
 from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import ValidationError
 
 from hydra.dashboard.security import Principal
-from hydra.services.errors import ServiceError
+from hydra.services.errors import ServiceError, service_error
 
 MCP_PRINCIPAL = Principal("service", "mcp")
 """The principal every tool mutation is attributed to (seam 4)."""
@@ -45,6 +46,32 @@ def tool_error(exc: ServiceError) -> ToolError:
     its ``changed_fields`` list and a 422 keeps its ``no_market_data`` extras.
     """
     return ToolError(json.dumps({"status": exc.status_code, "detail": exc.detail}, default=str))
+
+
+def invalid_arguments(exc: ValidationError) -> ToolError:
+    """A 422 validation envelope naming every invalid field, like the REST 422s.
+
+    The SDK converts any non-ToolError raised inside a tool body into an opaque
+    ``Error executing tool <name>``; without this, a caller cannot correct the input.
+    """
+    raw = exc.errors()
+    errors = [
+        {
+            "loc": [str(part) for part in error["loc"]],
+            "msg": error["msg"],
+            "type": error["type"],
+        }
+        for error in raw
+    ]
+    parts = [
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+        if error["loc"]
+        else error["msg"]
+        for error in raw
+    ]
+    return tool_error(
+        service_error(422, "validation_error", "; ".join(parts), "invalid", errors=errors)
+    )
 
 
 def json_text(value: Any) -> str:

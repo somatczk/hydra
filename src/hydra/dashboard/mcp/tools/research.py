@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+from pydantic import ValidationError
+
 from hydra.backtest.jobs import (
     BacktestRunRequest,
     HyperoptRunRequest,
@@ -61,6 +63,8 @@ async def backtest_run(
         result = await backtest_svc.submit_backtest(_deps.db_pool(), body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
+    except ValidationError as exc:
+        raise _deps.invalid_arguments(exc) from exc
     audit(
         _deps.MCP_PRINCIPAL,
         "backtest_run",
@@ -138,6 +142,8 @@ async def hyperopt_run(
         result = await research_svc.submit_hyperopt(_deps.db_pool(), body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
+    except ValidationError as exc:
+        raise _deps.invalid_arguments(exc) from exc
     audit(
         _deps.MCP_PRINCIPAL,
         "hyperopt_run",
@@ -205,6 +211,8 @@ async def walkforward_run(
         result = await research_svc.submit_walkforward(_deps.db_pool(), body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
+    except ValidationError as exc:
+        raise _deps.invalid_arguments(exc) from exc
     audit(
         _deps.MCP_PRINCIPAL,
         "walkforward_run",

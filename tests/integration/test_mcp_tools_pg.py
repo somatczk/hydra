@@ -3,8 +3,16 @@
 The tools resolve the engine app's state exactly as in the engine process, so these
 tests bind a real pool (a fresh migrated database) and drive JSON-RPC tools/call over
 the real mount: data_coverage reads back exactly what was stored, a backtest on an
-empty range is the honest 422 no-market-data envelope, and a backtest on stored bars
-queues a durable job whose task_id is readable via backtest_status.
+empty range is the honest 422 no-market-data envelope, a backtest on stored bars
+queues a durable job whose task_id is readable via backtest_status, and a seeded
+completed result reads back in full via backtest_result.
+
+The mounted app is driven with httpx's ASGI transport on the pytest event loop — the
+same loop the asyncpg pool lives on. A starlette TestClient would run the tool
+coroutines on its own portal loop and every pool operation would fail with asyncpg's
+``got Future attached to a different loop``. The session manager is entered inside
+each test (not a fixture) because its anyio cancel scope cannot span pytest-asyncio's
+fixture/test task boundary.
 """
 
 from __future__ import annotations
@@ -12,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,14 +28,16 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+import httpx
 import pytest
 import yaml
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from httpx import Response
 from structlog.testing import capture_logs
 
-from hydra.core.config import load_config
+from hydra.backtest import jobs
+from hydra.backtest.data import DataProvenance
+from hydra.core.config import HydraConfig, load_config
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard import security
@@ -42,6 +52,16 @@ pytestmark = pytest.mark.integration
 TEST_API_TOKEN = secrets.token_urlsafe(32)
 TEST_MCP_TOKEN = "m" + secrets.token_urlsafe(48)
 ACCEPT_BOTH = "application/json, text/event-stream"
+INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": {"name": "hydra-tests", "version": "0.0.0"},
+    },
+}
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 H = timedelta(hours=1)
@@ -106,14 +126,14 @@ def _sse_json(response: Response) -> Any:
 
 
 class _McpClient:
-    """One initialized MCP session over the mounted transport."""
+    """One initialized MCP session over the mounted transport, on the pytest loop."""
 
-    def __init__(self, client: TestClient, session_id: str) -> None:
+    def __init__(self, client: httpx.AsyncClient, session_id: str) -> None:
         self._client = client
         self._session_id = session_id
         self._id = 0
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         self._id += 1
         payload: dict[str, Any] = {"jsonrpc": "2.0", "id": self._id, "method": method}
         if params is not None:
@@ -123,10 +143,10 @@ class _McpClient:
             "Accept": ACCEPT_BOTH,
             "Mcp-Session-Id": self._session_id,
         }
-        return _sse_json(self._client.post("/mcp/", json=payload, headers=headers))["result"]
+        return _sse_json(await self._client.post("/mcp/", json=payload, headers=headers))["result"]
 
-    def call(self, name: str, arguments: dict[str, Any] | None = None) -> tuple[bool, str]:
-        result = self.request("tools/call", {"name": name, "arguments": arguments or {}})
+    async def call(self, name: str, arguments: dict[str, Any] | None = None) -> tuple[bool, str]:
+        result = await self.request("tools/call", {"name": name, "arguments": arguments or {}})
         content = result["content"]
         assert len(content) == 1
         assert content[0]["type"] == "text"
@@ -143,13 +163,10 @@ async def pool(fresh_database: str) -> AsyncIterator[Any]:
         await db_pool.close()
 
 
-@pytest.fixture()
-async def mcp(
-    pool: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    strategies_dir: Path,
-) -> AsyncIterator[_McpClient]:
-    """The mounted MCP app with the engine state bound to the real pool."""
+def _bind_engine_state(
+    pool: Any, monkeypatch: pytest.MonkeyPatch, strategies_dir: Path
+) -> HydraConfig:
+    """Write the strategy, bind the pool on the engine state, and load the test config."""
     _write_strategy(strategies_dir, "saw")
     monkeypatch.setattr(engine_app.state, "db_pool", pool)
     monkeypatch.setattr(engine_app.state, "session_manager", None)
@@ -158,37 +175,33 @@ async def mcp(
     monkeypatch.setenv("HYDRA_API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("HYDRA_MCP_TOKEN", TEST_MCP_TOKEN)
     monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
-    cfg = load_config()
+    return load_config()
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> Iterator[None]:
-        mount = mount_mcp(app, cfg)
-        async with mount.session_manager.run():
-            yield
 
-    mounted = FastAPI(lifespan=lifespan)
+@asynccontextmanager
+async def _mcp_session(cfg: HydraConfig) -> AsyncIterator[_McpClient]:
+    """The mounted MCP app driven over ASGI, entered inside the test's own task.
+
+    httpx's ASGI transport runs the app (and so the tool coroutines) on the caller's
+    event loop — the same loop the asyncpg pool fixture built its pool on.
+    """
+    mounted = FastAPI()
     install_security(mounted)
     mounted.state.config = cfg
-    with TestClient(mounted) as client:
-        initialize = client.post(
+    mount = mount_mcp(mounted, cfg)
+    async with (
+        mount.session_manager.run(),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mounted), base_url="http://testserver"
+        ) as client,
+    ):
+        initialize = await client.post(
             "/mcp/",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {},
-                    "clientInfo": {"name": "hydra-tests", "version": "0.0.0"},
-                },
-            },
-            headers={
-                "Authorization": f"Bearer {TEST_MCP_TOKEN}",
-                "Accept": ACCEPT_BOTH,
-            },
+            json=INITIALIZE,
+            headers={"Authorization": f"Bearer {TEST_MCP_TOKEN}", "Accept": ACCEPT_BOTH},
         )
         session_id = initialize.headers["mcp-session-id"]
-        client.post(
+        await client.post(
             "/mcp/",
             json={"jsonrpc": "2.0", "method": "notifications/initialized"},
             headers={
@@ -200,15 +213,19 @@ async def mcp(
         yield _McpClient(client, session_id)
 
 
-async def test_data_coverage_returns_the_exact_stored_range(mcp: _McpClient, pool: Any) -> None:
-    repo = MarketDataRepository.from_pool(pool)
-    stored = await repo.store_bars(
-        [("binance", "BTCUSDT", Timeframe.H1, _bar(i)) for i in range(5)]
-    )
-    assert stored == 5
-    is_error, text = mcp.call(
-        "data_coverage", {"exchange_id": "binance", "symbol": "BTCUSDT", "timeframe": "1h"}
-    )
+async def test_data_coverage_returns_the_exact_stored_range(
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    async with _mcp_session(cfg) as mcp:
+        repo = MarketDataRepository.from_pool(pool)
+        stored = await repo.store_bars(
+            [("binance", "BTCUSDT", Timeframe.H1, _bar(i)) for i in range(5)]
+        )
+        assert stored == 5
+        is_error, text = await mcp.call(
+            "data_coverage", {"exchange_id": "binance", "symbol": "BTCUSDT", "timeframe": "1h"}
+        )
     assert not is_error
     assert json.loads(text) == {
         "exchange_id": "binance",
@@ -221,12 +238,14 @@ async def test_data_coverage_returns_the_exact_stored_range(mcp: _McpClient, poo
 
 
 async def test_backtest_run_on_an_empty_range_is_the_honest_no_data_envelope(
-    mcp: _McpClient,
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    is_error, text = mcp.call(
-        "backtest_run",
-        {"strategy_id": "saw", "start_date": "2026-03-01", "end_date": "2026-03-02"},
-    )
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    async with _mcp_session(cfg) as mcp:
+        is_error, text = await mcp.call(
+            "backtest_run",
+            {"strategy_id": "saw", "start_date": "2026-03-01", "end_date": "2026-03-02"},
+        )
     assert is_error
     envelope = json.loads(text.removeprefix("Error executing tool backtest_run: "))
     assert envelope["status"] == 422
@@ -237,36 +256,108 @@ async def test_backtest_run_on_an_empty_range_is_the_honest_no_data_envelope(
 
 
 async def test_backtest_run_on_stored_bars_queues_a_durable_job(
-    mcp: _McpClient, pool: Any, monkeypatch: pytest.MonkeyPatch
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = MarketDataRepository.from_pool(pool)
-    stored = await repo.store_bars(
-        [("binance", "BTCUSDT", Timeframe.H1, _bar(i)) for i in range(30)]
-    )
-    assert stored == 30
-    with capture_logs() as logs:
-        # a logger cached by an earlier audit() call would bypass capture_logs
-        monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
-        is_error, text = mcp.call(
-            "backtest_run",
-            {"strategy_id": "saw", "start_date": "2026-01-01", "end_date": "2026-01-02"},
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    async with _mcp_session(cfg) as mcp:
+        repo = MarketDataRepository.from_pool(pool)
+        stored = await repo.store_bars(
+            [("binance", "BTCUSDT", Timeframe.H1, _bar(i)) for i in range(30)]
         )
-    assert not is_error
-    queued = json.loads(text)
-    assert queued["status"] == "queued"
-    task_id = queued["task_id"]
-    assert task_id.startswith("task-")
+        assert stored == 30
+        with capture_logs() as logs:
+            # a logger cached by an earlier audit() call would bypass capture_logs
+            monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
+            is_error, text = await mcp.call(
+                "backtest_run",
+                {"strategy_id": "saw", "start_date": "2026-01-01", "end_date": "2026-01-02"},
+            )
+        assert not is_error
+        queued = json.loads(text)
+        assert queued["status"] == "queued"
+        task_id = queued["task_id"]
+        assert task_id.startswith("task-")
 
-    audit_lines = [event for event in logs if event.get("event") == "audit"]
-    assert [
-        (line["action"], line["principal"], line["principal_kind"]) for line in audit_lines
-    ] == [("backtest_run", "mcp", "service")]
-    assert audit_lines[0]["strategy_id"] == "saw"
-    assert audit_lines[0]["task_id"] == task_id
+        audit_lines = [event for event in logs if event.get("event") == "audit"]
+        assert [
+            (line["action"], line["principal"], line["principal_kind"]) for line in audit_lines
+        ] == [("backtest_run", "mcp", "service")]
+        assert audit_lines[0]["strategy_id"] == "saw"
+        assert audit_lines[0]["task_id"] == task_id
 
-    is_error, text = mcp.call("backtest_status", {"task_id": task_id})
-    assert not is_error
-    status = json.loads(text)
-    assert status["task_id"] == task_id
-    assert status["status"] in ("queued", "running")  # no worker runs in this test
-    assert status["result_id"] is None
+        is_error, text = await mcp.call("backtest_status", {"task_id": task_id})
+        assert not is_error
+        status = json.loads(text)
+        assert status["task_id"] == task_id
+        assert status["status"] in ("queued", "running")  # no worker runs in this test
+        assert status["result_id"] is None
+
+
+async def test_backtest_result_reads_back_a_seeded_completed_result(
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 'read the result' leg of the acceptance scenario: a completed result seeded
+    through the repository seam (jobs.persist_result) surfaces in full through the tool."""
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    async with _mcp_session(cfg) as mcp:
+        await jobs.persist_result(
+            pool,
+            {
+                "id": "bt-seeded",
+                "strategy": "Strategy saw",
+                "strategy_id": "saw",
+                "initial_capital": 10000.0,
+                "period": f"{T0.isoformat()} - {(T0 + 29 * H).isoformat()}",
+                "status": "completed",
+                "name": "seeded run",
+                "stopped_reason": None,
+                "metrics": {
+                    "total_trades": 3,
+                    "win_rate": 66.67,
+                    "total_pnl": 125.5,
+                    "max_drawdown": 2.1,
+                    "sharpe_ratio": 1.42,
+                    "benchmark_return": 8.4,
+                    "alpha": 0.0123,
+                    "beta": 0.87,
+                    "max_consecutive_wins": 2,
+                    "max_consecutive_losses": 1,
+                    "expectancy": 41.83,
+                    "total_return": 1.26,
+                    "annualized_return": 15.1,
+                    "sortino_ratio": 1.9,
+                    "calmar_ratio": 3.2,
+                    "profit_factor": 2.5,
+                    "max_drawdown_duration_s": 3600,
+                },
+                "equity_curve": [{"ts": T0.isoformat(), "equity": 10000.0}],
+                "benchmark_equity": [{"ts": T0.isoformat(), "equity": 10000.0}],
+                "transactions": [],
+            },
+            [],
+            DataProvenance(
+                exchange="binance",
+                symbol="BTCUSDT",
+                timeframe=Timeframe.H1,
+                bar_count=30,
+                first_ts=T0,
+                last_ts=T0 + 29 * H,
+                gap_count=0,
+                requested_start=T0,
+                requested_end=T0 + 29 * H,
+            ),
+        )
+        is_error, text = await mcp.call("backtest_result", {"result_id": "bt-seeded"})
+        assert not is_error
+        detail = json.loads(text)
+        assert detail["id"] == "bt-seeded"
+        assert detail["status"] == "completed"
+        assert detail["strategy_id"] == "saw"
+        assert detail["metrics"]["total_trades"] == 3
+        assert detail["metrics"]["sharpe_ratio"] == 1.42
+        assert detail["provenance"]["bar_count"] == 30
+        assert detail["trades"] == []
+
+        is_error, text = await mcp.call("backtest_results")
+        assert not is_error
+        assert [summary["id"] for summary in json.loads(text)] == ["bt-seeded"]
