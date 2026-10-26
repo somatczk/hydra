@@ -112,8 +112,8 @@ def test_initialize_returns_server_info_and_capabilities(mcp_app: FastAPI) -> No
     assert response.headers["mcp-session-id"]
 
 
-def test_tools_list_returns_no_tools(mcp_app: FastAPI) -> None:
-    """The handshake completes over the mounted app; A ships an empty tool registry."""
+def test_tools_list_returns_the_registered_tools(mcp_app: FastAPI) -> None:
+    """The handshake completes over the mounted app; the tool modules registered on it."""
     with TestClient(mcp_app) as client:
         initialized = _post_mcp(client, INITIALIZE)
         session_id = initialized.headers["mcp-session-id"]
@@ -129,7 +129,9 @@ def test_tools_list_returns_no_tools(mcp_app: FastAPI) -> None:
             client, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session_id=session_id
         )
     assert tools.status_code == 200
-    assert _sse_json(tools)["result"]["tools"] == []
+    names = [tool["name"] for tool in _sse_json(tools)["result"]["tools"]]
+    assert names  # the tool modules (B1/B2) register on the shared server instance
+    assert not [name for name in names if name.startswith("live_")]
 
 
 @pytest.mark.parametrize(
