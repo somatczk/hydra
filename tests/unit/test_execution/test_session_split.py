@@ -16,6 +16,7 @@ from hydra.execution import (
     client_factory,
     flatten,
     protective_orders,
+    session_health,
     session_manager,
     session_store,
     session_wiring,
@@ -94,10 +95,11 @@ def test_public_api() -> None:
         "get_session",
         "get_session_detail",
         "submit_manual_order",
-        "health_snapshot",
         "graceful_shutdown",
     ):
         assert getattr(SessionManager, name).__module__ == session_manager.__name__
+    # S6 split (P3-D2): health_snapshot is the public API's one mixin-defined member.
+    assert SessionManager.health_snapshot.__module__ == session_health.__name__
     for gone in ("recover_running_sessions", "load_recent_sessions", "_reconciliation_loop"):
         assert not hasattr(SessionManager, gone)
     assert callable(client_factory.validate_venue)
