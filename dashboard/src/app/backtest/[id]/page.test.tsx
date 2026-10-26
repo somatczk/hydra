@@ -316,7 +316,11 @@ describe('BacktestDetailPage', () => {
     fetchApi.mockImplementation(routeFetch(routes(DETAIL), calls));
     page = await mount(<BacktestDetailPage />);
 
-    expect(page.container.querySelector('a[href="/backtest/compare?a=bt-task-1"]')).not.toBeNull();
+    const link = page.container.querySelector('a[href="/backtest/compare?a=bt-task-1"]');
+    expect(link).not.toBeNull();
     expect(page.container.textContent).toContain('Compare with…');
+    expect(link?.classList.contains('focus-visible:outline-2')).toBe(true);
+    expect(link?.classList.contains('focus-visible:outline-offset-2')).toBe(true);
+    expect(link?.classList.contains('focus-visible:outline-accent')).toBe(true);
   });
 });

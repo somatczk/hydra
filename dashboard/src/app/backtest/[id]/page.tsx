@@ -400,7 +400,7 @@ export default function BacktestDetailPage() {
           <StatusBadge status={detail.status === 'completed' ? 'Completed' : detail.status} variant={detail.status === 'completed' ? 'success' : 'info'} />
           <Link
             href={`/backtest/compare?a=${resultId}`}
-            className="inline-flex h-8 max-lg:h-11 items-center rounded border border-line-strong bg-surface px-3 text-sm font-medium text-ink-1 transition-colors hover:bg-hover"
+            className="inline-flex h-8 max-lg:h-11 items-center rounded border border-line-strong bg-surface px-3 text-sm font-medium text-ink-1 transition-colors hover:bg-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
           >
             Compare with…
           </Link>
