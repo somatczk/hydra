@@ -1,6 +1,6 @@
 /** Pure derivations behind every money and safety sentence (08 §3.2); shapes mirror the API models. */
 
-import { age, money, pct, utc } from './format';
+import { age, money, pct, price, utc } from './format';
 
 /** `routes/trading.py` SessionResponse; the optional fields arrive with the A3+ ask. */
 export interface SessionResponse {
@@ -25,6 +25,17 @@ export interface SessionResponse {
   feed_live?: boolean | null;
   /** `migration 0008_session_created_by`: the principal string that started it, null before that. */
   created_by?: string | null;
+  /** A7 (pinned seam #2): the live session's reconcile state on the list; null/absent on paper. */
+  reconcile_state?: ReconcileState['state'] | null;
+}
+
+export type TradingMode = 'paper' | 'live';
+
+/** A7 reconcile read (pinned seam #2): `never` = no pass has run yet; `detail` carries the mismatch reasons. */
+export interface ReconcileState {
+  state: 'ok' | 'mismatch' | 'unknown' | 'never';
+  last_reconciled_at: string | null;
+  detail: string | null;
 }
 
 /** A fill: the TradeItem model plus the paper extras (`amount`); `quantity` is 0 on older fills, so read it with `fillQty`. */
@@ -40,6 +51,18 @@ export interface TradeItem {
   net_pnl?: number | null;
   timestamp?: string | null;
   reason?: string | null;
+  /** R20: true once a reconcile pass (state ok|mismatch) has covered the fill, false until then; absent on paper fills. */
+  reconciled?: boolean | null;
+}
+
+/** A8-live (pinned seam #3, B's ExchangeStopState); null when the session is paper. */
+export interface ExchangeStopState {
+  state: 'confirmed' | 'missing' | 'unknown';
+  kind: 'oco' | 'stop' | 'trailing' | null;
+  stop_price: number | null;
+  take_profit: number | null;
+  order_list_id: string | null;
+  checked_at: string;
 }
 
 export interface PositionItem {
@@ -48,6 +71,8 @@ export interface PositionItem {
   quantity: number;
   avg_entry_price: number;
   unrealized_pnl: number;
+  /** A8-live (pinned seam #3): the exchange-side protective stop verified for this position. */
+  exchange_stop?: ExchangeStopState | null;
 }
 
 /** trading.py OpenOrderItem: `stop_price` is where a resting stop triggers (null on a LIMIT). */
@@ -81,6 +106,8 @@ export interface SessionDetail extends SessionResponse {
   positions: PositionItem[];
   trades: TradeItem[];
   open_orders: OpenOrder[];
+  /** A7 (pinned seam #2): present on live sessions only; null on paper. */
+  reconcile?: ReconcileState | null;
 }
 
 export interface Restrictions {
@@ -99,6 +126,8 @@ export interface LiveStatus {
   running_sessions: number | null;
   circuit_breaker_restrictions: Restrictions | null;
   circuit_breakers_state: 'live' | 'unavailable';
+  /** P3-C adds it to GET /api/risk/live-status (must-fix 6, R9): the persisted armed row, fail-safe false; absent before P3-C. */
+  live_armed?: boolean | null;
 }
 
 export interface CircuitBreaker {
@@ -228,6 +257,34 @@ export const ksTargets = (sessions: SessionResponse[]) => ({
   errored: sessions.filter((s) => s.status === 'error'),
 });
 
+/** Seam #10 / R23: LIVE = armed OR any running live session OR any stopped live session still holding
+ * (`positions_at_stop > 0` — R13's unprotected remainder); an unreadable source (live OR sessions null)
+ * returns null — the caller renders '?', never PAPER over real money. */
+export function modeBadge(live: LiveStatus | null, sessions: SessionResponse[] | null): TradingMode | null {
+  if (live?.live_armed === true) return 'live';
+  if (
+    sessions?.some((s) => s.trading_mode === 'live' && (s.status === 'running' || (s.status === 'stopped' && s.positions_at_stop > 0)))
+  ) {
+    return 'live';
+  }
+  if (!live || !sessions) return null;
+  return 'paper';
+}
+
+/** 08 §6: per-row labels only when a view contains a live row — a stopped live row still traded real money. */
+export function needsModeLabels(sessions: SessionResponse[]): boolean {
+  return sessions.some((s) => s.trading_mode === 'live');
+}
+
+export function rowMode(s: Pick<SessionResponse, 'trading_mode'>): TradingMode {
+  return s.trading_mode === 'live' ? 'live' : 'paper';
+}
+
+/** A manual order in a running live session goes through the L4 review (08 §6); paper keeps the single-step flow. */
+export function needsLiveOrderReview(s: Pick<SessionResponse, 'trading_mode' | 'status'>): boolean {
+  return s.trading_mode === 'live' && s.status === 'running';
+}
+
 export interface NeedItem {
   kind: 'approval' | 'error' | 'held' | 'persist_error' | 'breaker' | 'ks_not_saved' | 'capital_pending';
   text: string;
@@ -241,9 +298,14 @@ export interface NeedsYou {
   unavailable: string[];
 }
 
-/** The gated action as a phrase: 'kill_switch_release' → 'release the kill switch' (06 §2 approval row). */
+/** The gated action as a phrase: 'kill_switch_release' → 'release the kill switch' (06 §2 approval row).
+ * The four P3 live executors (seam #1) read as sentences after 'Claude asks to …'. */
 export function actionPhrase(action: string): string {
   if (action === 'kill_switch_release') return 'release the kill switch';
+  if (action === 'live_arming') return 'turn on live trading';
+  if (action === 'live_session_start') return 'start a live session';
+  if (action === 'live_order') return 'place a live order';
+  if (action === 'credential_delete') return 'delete the stored exchange keys';
   return action.replaceAll('_', ' ');
 }
 
@@ -341,7 +403,8 @@ export function stopRuleLabel(risk: StopRule | Error | null | undefined): string
   }
 }
 
-export function breakerRow(b: CircuitBreaker, activeTier: number, now: number = Date.now()): { text: string; tone: Tone } {
+/** Breaker states worded per risk/service.py; a status outside the vocabulary returns null (fail-closed). */
+export function breakerRow(b: CircuitBreaker, activeTier: number, now: number = Date.now()): { text: string; tone: Tone } | null {
   if (b.status === 'Tripped' && b.tier < activeTier) {
     return { text: `Tripped (included in tier ${activeTier})`, tone: 'none' };
   }
@@ -352,7 +415,33 @@ export function breakerRow(b: CircuitBreaker, activeTier: number, now: number = 
   if (b.status === 'Warning') {
     return { text: `Near: ${pct(b.current_value)} of ${pct(b.threshold_pct)}`, tone: 'caution' };
   }
+  if (b.status !== 'Normal') return null;
   return { text: pct(b.threshold_pct) ?? b.threshold, tone: 'none' };
+}
+
+/** A7 (seam #2): ok → 'Reconciled {age} ago', mismatch → caution with the drift, never → not yet;
+ * a null return means the state is unreadable or out of vocabulary, and the caller renders UNKNOWN. */
+export function reconcileRow(reconcile: ReconcileState | null | undefined, now: number = Date.now()): { text: string; tone: Tone } | null {
+  if (!reconcile) return null;
+  if (reconcile.state === 'unknown') return null;
+  if (reconcile.state === 'mismatch') {
+    return { text: `Mismatch: ${reconcile.detail ?? 'no detail reported'}`, tone: 'caution' };
+  }
+  if (reconcile.state === 'never') return { text: 'Not reconciled yet', tone: 'none' };
+  if (reconcile.state !== 'ok') return null;
+  const a = reconcile.last_reconciled_at ? age(now - Date.parse(reconcile.last_reconciled_at), now) : null;
+  return { text: a ? `Reconciled ${a}` : 'Reconciled', tone: 'none' };
+}
+
+/** A8-live (seam #3): a missing stop is danger — the dead-man invariant — and an unreadable verify is
+ * UNKNOWN (null). Paper positions also carry `exchange_stop` null (the type's own doc), so the danger
+ * row is live-only by caller contract (UI-4c gates on mode); a confirmed stop with `stop_price` null
+ * renders 'Stop at —' (degenerate input; producers pin it via B's contract). */
+export function exchangeStopRow(position: PositionItem): { text: string; tone: Tone } | null {
+  const stop = position.exchange_stop;
+  if (!stop || stop.state === 'missing') return { text: `No exchange stop for ${position.symbol}`, tone: 'danger' };
+  if (stop.state === 'confirmed') return { text: `Stop at ${price(stop.stop_price) ?? '—'} on the exchange`, tone: 'none' };
+  return null;
 }
 
 /** Percent of closing fills that won; null when none closed (the API reports 0.0 then). */

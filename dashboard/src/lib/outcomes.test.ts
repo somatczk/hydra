@@ -7,6 +7,8 @@ import {
   killSwitchOutcome,
   ledgerResetOutcome,
   limitsOutcome,
+  liveGateOutcome,
+  liveOrderOutcome,
   quickTradeOutcome,
   releaseOutcome,
   saveAgainOutcome,
@@ -383,6 +385,45 @@ describe('approvalOutcome', () => {
     expect(o.lines).toEqual(["The approved action 'kill_switch_release' did not run: boom", 'Ask for a new one.']);
   });
 
+  it('a live order executor failure never asks for a new one — the order may exist (R24)', () => {
+    const msg = "The approved action 'live_order' did not run: exchange unreachable";
+    const o = approvalOutcome({ err: envelope(503, 'approval_execution_failed', msg, 'unavailable') }, 'approve', 'live_order');
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(o.lines).toEqual(["We don't know whether the order was placed. Check this session's fills and positions before trying again.", msg]);
+    expect(o.lines).not.toContain('Ask for a new one.');
+  });
+
+  it('a live session start executor failure says the session start is unknown (R24)', () => {
+    const o = approvalOutcome(
+      { err: envelope(503, 'approval_execution_failed', "The approved action 'live_session_start' did not run: boom", 'unavailable') },
+      'approve',
+      'live_session_start',
+    );
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.lines[0]).toBe("We don't know whether the session started. Check the sessions list before trying again.");
+    expect(text(o)).not.toContain('Ask for a new one.');
+  });
+
+  it('a network-lost approve on a live action renders the unknown-order reality, not the code sentence (R24)', () => {
+    const o = approvalOutcome({ err: new TypeError('Failed to fetch') }, 'approve', 'live_order');
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(text(o)).toContain("We don't know whether the order was placed");
+    expect(text(o)).not.toContain('the code was accepted');
+  });
+
+  it('non-live actions keep the generic executor-failure copy even with the action passed (R24)', () => {
+    const o = approvalOutcome(
+      { err: envelope(503, 'approval_execution_failed', "The approved action 'kill_switch_release' did not run: boom", 'unavailable') },
+      'approve',
+      'kill_switch_release',
+    );
+    expect(o.title).toBe("Approved, but it didn't run.");
+    expect(o.lines).toEqual(["The approved action 'kill_switch_release' did not run: boom", 'Ask for a new one.']);
+  });
+
   it('a decision that happened elsewhere and an engine outage', () => {
     const decided = approvalOutcome({ err: envelope(409, 'already_decided', 'This approval was already approved', 'invalid') });
     expect(decided.tone).toBe('caution');
@@ -416,5 +457,137 @@ describe('approvalOutcome', () => {
     expect(o.title).toBe('Not confirmed.');
     expect(text(o)).toContain("We couldn't reach the engine, so we don't know whether the denial was recorded");
     expect(text(o)).not.toContain('the code');
+  });
+});
+
+describe('liveGateOutcome', () => {
+  const armed: ApproveResponse = { executed: true, result: { armed: true }, actor: 'user:soma', approved_by: 'user:soma' };
+
+  it('a decided arm says live trading is on, and what still needs a code', () => {
+    const o = liveGateOutcome({ ok: armed });
+    expect(o.tone).toBe('none');
+    expect(text(o)).toBe('Live trading is on. Each live session start and manual live order still needs its own one-time code.');
+  });
+
+  it("a wrong code keeps it off with the frozen sentence inline (08 §6)", () => {
+    const o = liveGateOutcome({ err: envelope(422, 'code_mismatch', "That code didn't match. Nothing changed.", 'invalid', { attempts_left: 4 }) });
+    expect(o.inline).toBe(true);
+    expect(o.title).toBe("That code didn't match. Nothing changed.");
+    expect(o.lines).toEqual(['4 attempts left.']);
+  });
+
+  it('a challenge the code service could not create armed nothing, and live actions hide (fail-safe)', () => {
+    const o = liveGateOutcome({ err: envelope(503, 'engine_unreachable', 'trader unreachable', 'unavailable') }, 'challenge');
+    expect(o.tone).toBe('caution');
+    expect(o.title).toBe("Live trading wasn't turned on.");
+    expect(o.lines).toEqual(['Live actions are hidden until the code service recovers.']);
+    expect(o.actions).toEqual([{ kind: 'retry', label: 'Try again' }]);
+  });
+
+  it('an arm the executor could not run stays off, naming why', () => {
+    const msg = "The approved action 'live_arming' did not run: credentials not live-capable";
+    const o = liveGateOutcome({ err: envelope(503, 'approval_execution_failed', msg, 'unavailable') });
+    expect(o.title).toBe("Live trading wasn't turned on.");
+    expect(o.lines).toEqual([msg]);
+  });
+
+  it('an approve the engine never answered is not confirmed, never claimed off', () => {
+    const o = liveGateOutcome({ err: new TypeError('Failed to fetch') });
+    expect(o.title).toBe('Not confirmed.');
+    expect(text(o)).toContain("we don't know whether live trading was turned on");
+  });
+});
+
+describe('liveOrderOutcome', () => {
+  const SID = session().session_id;
+  const req: QuickTradeRequest = { symbol: 'BTCUSDT', side: 'buy', order_type: 'MARKET', quantity: '0.0015', session_id: SID };
+  const approve = (result: unknown): ApproveResponse => ({ executed: true, result, actor: 'service:mcp', approved_by: 'user:soma' });
+  /** The live executor returns the paper response shapes (seam #4), the orderListId as the id. */
+  const res = (over: Partial<QuickTradeResponse> = {}): QuickTradeResponse => ({
+    order_id: 'a1b2c3d4e5f6',
+    session_id: SID,
+    symbol: 'BTCUSDT',
+    side: 'BUY',
+    order_type: 'MARKET',
+    quantity: 0.0015,
+    price: null,
+    status: 'FILLED',
+    protection: 'armed',
+    protective_order_id: 'oco-5',
+    exit_orders_deferred: false,
+    fill_price: 67612.4,
+    mark_source: 'live',
+    ...over,
+  });
+
+  it('a filled buy says real money, the fill, the exchange stop and the order id', () => {
+    const o = liveOrderOutcome({ ...req, stop_loss: '64256' }, { ok: approve(res()) }, SID);
+    expect(o.title).toBe('Bought 0.00150 BTC with real money.');
+    expect(o.lines).toEqual([
+      'Filled at 67,612.40.',
+      'Stop requested at 64,256.00.',
+      'The position shows the stop actually placed on the exchange.',
+      'Order a1b2c3d4.',
+    ]);
+  });
+
+  it('a default-stop buy, and a sell that only reduces', () => {
+    const buy = liveOrderOutcome(req, { ok: approve(res()) }, SID);
+    expect(buy.lines).toEqual(['Filled at 67,612.40.', 'Stop placed on the exchange.', 'Order a1b2c3d4.']);
+    const sell = liveOrderOutcome({ ...req, side: 'sell' }, { ok: approve(res({ side: 'SELL', protection: 'none', fill_price: 67590.1 })) }, SID);
+    expect(sell.title).toBe('Sold 0.00150 BTC with real money.');
+    expect(sell.lines).toEqual(['Filled at 67,590.10.', 'This reduces the held position; no stop is needed.', 'Order a1b2c3d4.']);
+  });
+
+  it('a placed limit says real money and keeps the deferred-stop line', () => {
+    const o = liveOrderOutcome(req, { ok: approve(res({ status: 'SUBMITTED', order_type: 'LIMIT', protection: 'pending', exit_orders_deferred: true })) }, SID);
+    expect(text(o)).toBe('Limit order placed with real money. The stop will be placed when it fills. Order a1b2c3d4.');
+  });
+
+  it('a filled buy with no exchange stop is danger, the session one click away (the dead-man)', () => {
+    const o = liveOrderOutcome(req, { ok: approve(res({ protection: 'pending', protective_order_id: null, exit_orders_deferred: true })) }, SID);
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe('Bought 0.00150 BTC with real money, but no exchange stop could be placed.');
+    expect(o.actions).toEqual([{ kind: 'open', label: 'Open session', href: `/trading/${SID}` }]);
+  });
+
+  it('a wrong code is the frozen sentence inline; a refused risk re-check reuses the quick-trade mapping', () => {
+    const mismatch = liveOrderOutcome(req, { err: envelope(422, 'code_mismatch', "That code didn't match. Nothing was placed.", 'invalid', { attempts_left: 2 }) }, SID);
+    expect(mismatch.inline).toBe(true);
+    expect(mismatch.title).toBe("That code didn't match. Nothing was placed.");
+    expect(mismatch.lines).toEqual(['2 attempts left.']);
+    const refused = liveOrderOutcome(req, { err: envelope(422, 'risk_rejected', 'Daily loss limit reached', 'invalid', { check: 'daily_loss', intent: 'entry' }) }, SID);
+    expect(refused.title).toBe('Not placed: Daily loss limit reached (daily_loss).');
+  });
+
+  it('a challenge the code service could not create placed nothing, and live actions hide (fail-safe)', () => {
+    const o = liveOrderOutcome(req, { err: envelope(503, 'engine_unreachable', 'trader unreachable', 'unavailable') }, SID, 'challenge');
+    expect(o.title).toBe('No order was placed.');
+    expect(o.lines).toEqual(['Live actions are hidden until the code service recovers.']);
+  });
+
+  it('an executor failure is not-confirmed — a real order may exist on Binance', () => {
+    const msg = "The approved action 'live_order' did not run: exchange unreachable";
+    const o = liveOrderOutcome(req, { err: envelope(503, 'approval_execution_failed', msg, 'unavailable') }, SID);
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(o.lines).toContain(msg);
+    expect(o.actions).toEqual([{ kind: 'open', label: 'Open session', href: `/trading/${SID}` }]);
+  });
+
+  it('an unknown submit names the client order id it may have landed under', () => {
+    const o = liveOrderOutcome(req, { err: envelope(503, 'order_submit_unknown', 'submit unknown', 'unavailable', { client_order_id: 'hydra-abc123-x' }) }, SID);
+    expect(o.tone).toBe('danger');
+    expect(o.unanswered).toBe(true);
+    expect(o.lines).toContain('Binance may hold order hydra-ab.');
+  });
+
+  it('an approve the engine never answered is the quick-trade not-confirmed mapping, plus the session', () => {
+    const o = liveOrderOutcome(req, { err: new TypeError('Failed to fetch') }, SID);
+    expect(o.title).toBe('Not confirmed.');
+    expect(text(o)).toContain("we don't know whether the live order was placed");
+    expect(text(o)).toContain("Check this session's fills before trying again.");
+    expect(o.actions).toEqual([{ kind: 'open', label: 'Open session', href: `/trading/${SID}` }]);
   });
 });

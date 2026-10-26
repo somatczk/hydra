@@ -17,6 +17,9 @@
   --caution-soft: #fbf1dc;
   --danger: #b3261e;
   --danger-soft: #fbe9e7;
+  --live: #0f766e;
+  --on-live: #ffffff;
+  --live-soft: #e6f4f1;
   color-scheme: light;
 }
 
@@ -36,6 +39,9 @@
   --caution-soft: #33280f;
   --danger: #ff7b72;
   --danger-soft: #3a1715;
+  --live: #2dd4bf;
+  --on-live: #0f1012;
+  --live-soft: #0a2e28;
   color-scheme: dark;
 }
 
@@ -77,6 +83,9 @@
   --color-caution-soft: var(--caution-soft);
   --color-danger: var(--danger);
   --color-danger-soft: var(--danger-soft);
+  --color-live: var(--live);
+  --color-on-live: var(--on-live);
+  --color-live-soft: var(--live-soft);
 
   --color-bg-primary: var(--bg-primary);
   --color-bg-secondary: var(--bg-secondary);

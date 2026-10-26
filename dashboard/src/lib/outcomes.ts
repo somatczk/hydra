@@ -51,6 +51,17 @@ export interface DenyResponse {
   status: string;
 }
 
+/** R9: every /api/live create-route answers this — the challenge the L4 dialog displays once;
+ * the code is then typed into the existing approve endpoint. */
+export interface LiveApprovalChallenge {
+  status: 'approval_required';
+  approval_id: string;
+  code: string;
+  expires_at: string;
+  params: Record<string, unknown>;
+  note: string;
+}
+
 /** trading.py:213-226 QuickTradeResponse: no stop price anywhere. */
 export interface QuickTradeResponse {
   order_id: string | null;
@@ -521,10 +532,23 @@ export function limitsOutcome(result: Result<unknown>): Outcome {
   return notConfirmed('the limits were saved', err);
 }
 
+/** R24: the live executors' failure copy — never 'Ask for a new one.' (a re-request would place a
+ * second live order while the first may exist unwatched); null for every other action. */
+function liveUnknownLine(action: string | undefined): string | null {
+  if (action === 'live_order') return "We don't know whether the order was placed. Check this session's fills and positions before trying again.";
+  if (action === 'live_session_start') return "We don't know whether the session started. Check the sessions list before trying again.";
+  return null;
+}
+
 /** POST /api/activity/approvals/{id}/approve|deny (F8): the double attribution names both actors.
  * `intent` picks the not-confirmed wording when the POST's own answer was lost: an approve speaks
- * of the code, a deny must not. */
-export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>, intent: 'approve' | 'deny' = 'approve'): Outcome {
+ * of the code, a deny must not. `action` (R24; UI-4c passes the approval's action) reroutes the live
+ * executors' failures to the unknown-live reality — the approve leg may have run despite the error. */
+export function approvalOutcome(
+  result: Result<ApproveResponse | DenyResponse>,
+  intent: 'approve' | 'deny' = 'approve',
+  action?: string,
+): Outcome {
   if ('ok' in result) {
     if ('executed' in result.ok) {
       return ok('Released by Claude, approved by you.', ['Trading can resume. No sessions were restarted.']);
@@ -548,6 +572,8 @@ export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>, 
     return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
   }
   if (d?.code === 'approval_execution_failed') {
+    const unknown = intent === 'deny' ? null : liveUnknownLine(action);
+    if (unknown) return { tone: 'danger', title: 'Not confirmed.', lines: [unknown, d.message], actions: [], unanswered: true };
     return { tone: 'danger', title: "Approved, but it didn't run.", lines: [d.message, 'Ask for a new one.'], actions: [] };
   }
   if (d?.code === 'executor_not_registered') {
@@ -561,5 +587,166 @@ export function approvalOutcome(result: Result<ApproveResponse | DenyResponse>, 
   if (d?.code === 'already_decided' || d?.code === 'approval_expired' || d?.code === 'approval_failed') {
     return { tone: 'caution', title: d.message, lines: [], actions: [] };
   }
+  const unknown = intent === 'deny' ? null : liveUnknownLine(action);
+  if (unknown) {
+    const msg = unreachable(err) ? null : d?.message;
+    return { tone: 'danger', title: 'Not confirmed.', lines: [unknown, ...(msg ? [msg] : [])], actions: [], unanswered: true };
+  }
   return notConfirmed(intent === 'deny' ? 'the denial was recorded' : 'the code was accepted', err);
+}
+
+/** 08 §6: which leg of the two-call live ceremony a result came from. A failed challenge executed
+ * nothing, so it can say so; an approve the engine never answered stays not-confirmed. */
+export type LivePhase = 'challenge' | 'approve';
+
+const LIVE_HIDDEN_LINE = 'Live actions are hidden until the code service recovers.';
+
+/** The challenge leg only creates an approval, so an outage (or any refusal) placed/armed nothing. */
+function challengeOutcome(title: string, err: unknown): Outcome {
+  const d = parseErrorDetail(err);
+  return { tone: 'caution', title, lines: d && d.state !== 'unavailable' ? [d.message] : [LIVE_HIDDEN_LINE], actions: [retry] };
+}
+
+function liveCodeMismatch(what: string, d: ApiErrorDetail): Outcome {
+  const left = typeof d.attempts_left === 'number' ? d.attempts_left : null;
+  return {
+    tone: 'danger',
+    title: `That code didn't match. ${what}`,
+    lines: left === null ? [] : [left === 1 ? '1 attempt left.' : `${left} attempts left.`],
+    actions: [],
+    inline: true,
+  };
+}
+
+/** POST /api/live/arm, then the existing approve endpoint. A decided response says the armed state;
+ * a challenge that never got created armed nothing, and an unanswered approve stays not-confirmed. */
+export function liveGateOutcome(result: Result<ApproveResponse>, phase: LivePhase = 'approve'): Outcome {
+  if ('ok' in result) {
+    if (result.ok.executed === false) return { tone: 'caution', title: "Live trading wasn't turned on.", lines: [], actions: [retry] };
+    return ok('Live trading is on.', ['Each live session start and manual live order still needs its own one-time code.']);
+  }
+  const err = result.err;
+  if (isSignedOut(err)) return signedOut('turn live trading on again');
+  const d = parseErrorDetail(err);
+  if (phase === 'challenge') return challengeOutcome("Live trading wasn't turned on.", err);
+  if (d?.code === 'code_mismatch') return liveCodeMismatch('Nothing changed.', d);
+  if (d?.code === 'approval_execution_failed') {
+    return { tone: 'caution', title: "Live trading wasn't turned on.", lines: [d.message], actions: [retry] };
+  }
+  if (d?.code === 'already_decided' || d?.code === 'approval_expired') {
+    return { tone: 'caution', title: d.message, lines: ['Nothing changed from this screen.'], actions: [] };
+  }
+  if (d?.code === 'executor_not_registered') {
+    return {
+      tone: 'caution',
+      title: 'The engine cannot execute this action yet.',
+      lines: [d.message, 'The code was not used. Wait for the engine, or deny this request.'],
+      actions: [],
+    };
+  }
+  if (d?.code === 'principal_not_allowed') return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
+  return notConfirmed('live trading was turned on', err);
+}
+
+function unknownLiveOrder(lines: string[], selectedSessionId: string): Outcome {
+  return {
+    tone: 'danger',
+    title: 'Not confirmed.',
+    lines: ["We don't know whether the order was placed. Check this session's fills and positions before trying again.", ...lines],
+    actions: [{ kind: 'open', label: 'Open session', href: `/trading/${selectedSessionId}` }],
+    unanswered: true,
+  };
+}
+
+/** The decided live order (seam #4: the executor returns the paper shapes, the orderListId as the id):
+ * FILLED and PLACED say 'with real money', and the protective stop is the exchange's, not a paper mark. */
+function liveOrderAnswer(req: QuickTradeRequest, r: QuickTradeResponse, sid: string): Outcome {
+  if (r.session_id !== sid) return quickTradeOutcome(req, { ok: r }, sid);
+  if (!PLACED.has(r.status) && r.status !== 'FILLED') return quickTradeOutcome(req, { ok: r }, sid);
+  const amount = `${qty(r.quantity)} ${baseAsset(r.symbol)}`;
+  const fill = price(r.fill_price ?? r.price);
+  const fillLine = fill ? [`Filled at ${fill}.`] : [];
+  const order = r.order_id ? [`Order ${r.order_id.slice(0, 8)}.`] : [];
+  if (PLACED.has(r.status)) {
+    const kind = r.order_type === 'LIMIT' ? 'Limit' : 'Market';
+    return ok(`${kind} order placed with real money.`, [
+      ...(r.exit_orders_deferred ? ['The stop will be placed when it fills.'] : []),
+      ...order,
+    ]);
+  }
+  if (r.side.toLowerCase() === 'sell') {
+    const rest = r.protection === 'none' ? 'This reduces the held position; no stop is needed.' : 'The rest of the position keeps its stop on the exchange.';
+    return ok(`Sold ${amount} with real money.`, [...fillLine, rest, ...order]);
+  }
+  if (r.protection !== 'armed') {
+    return {
+      tone: 'danger',
+      title: `Bought ${amount} with real money, but no exchange stop could be placed.`,
+      lines: [
+        ...fillLine,
+        "The engine closes an unprotected position, or stops the session if it cannot. Check this session's positions and fills.",
+        ...order,
+      ],
+      actions: [{ kind: 'open', label: 'Open session', href: `/trading/${sid}` }],
+    };
+  }
+  const stop = req.stop_loss
+    ? [`Stop requested at ${price(Number(req.stop_loss))}.`, 'The position shows the stop actually placed on the exchange.']
+    : req.trailing_stop_pct
+      ? [`Trailing stop requested (${req.trailing_stop_pct}%).`, 'The position shows the stop actually placed on the exchange.']
+      : ['Stop placed on the exchange.'];
+  return ok(`Bought ${amount} with real money.`, [...fillLine, ...stop, ...order]);
+}
+
+/** POST /api/live/order (the challenge), then the existing approve endpoint whose `result` is the live
+ * order response. The executor's failures stay unknown to this screen — a real order may exist — so
+ * they render not-confirmed with the session one click away, never 'nothing was placed'. */
+export function liveOrderOutcome(
+  req: QuickTradeRequest,
+  result: Result<ApproveResponse>,
+  selectedSessionId: string,
+  phase: LivePhase = 'approve',
+): Outcome {
+  if ('ok' in result) {
+    if (result.ok.executed === false) return { tone: 'caution', title: 'No order was placed.', lines: [], actions: [] };
+    const r = result.ok.result;
+    if (typeof r !== 'object' || r === null || typeof (r as QuickTradeResponse).status !== 'string') {
+      return unknownLiveOrder(["The engine didn't return an order answer."], selectedSessionId);
+    }
+    return liveOrderAnswer(req, r as QuickTradeResponse, selectedSessionId);
+  }
+  const err = result.err;
+  if (isSignedOut(err)) return signedOut('place the order again');
+  const d = parseErrorDetail(err);
+  if (phase === 'challenge') return challengeOutcome('No order was placed.', err);
+  switch (d?.code) {
+    case 'code_mismatch':
+      return liveCodeMismatch('Nothing was placed.', d);
+    case 'approval_execution_failed':
+      return unknownLiveOrder([d.message], selectedSessionId);
+    case 'order_submit_unknown': // unreachable until R22 (approvals.py re-raises ServiceError); kept for seam #8
+      return unknownLiveOrder(
+        [...(d.client_order_id ? [`Binance may hold order ${String(d.client_order_id).slice(0, 8)}.`] : []), d.message],
+        selectedSessionId,
+      );
+    case 'already_decided':
+    case 'approval_expired':
+      return { tone: 'caution', title: d.message, lines: ['Nothing was sent from this screen.'], actions: [] };
+    case 'executor_not_registered':
+      return {
+        tone: 'caution',
+        title: 'The engine cannot execute this action yet.',
+        lines: [d.message, 'The code was not used. Wait for the engine, or deny this request.'],
+        actions: [],
+      };
+    case 'principal_not_allowed':
+      return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
+  }
+  if (unreachable(err)) {
+    return notConfirmed('the live order was placed', err, "Check this session's fills before trying again.", [
+      { kind: 'open', label: 'Open session', href: `/trading/${selectedSessionId}` },
+    ]);
+  }
+  // risk_rejected lands here only after R22 (approvals.py re-raises ServiceError); kept for seam #8
+  return quickTradeOutcome(req, { err }, selectedSessionId);
 }

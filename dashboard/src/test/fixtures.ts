@@ -3,9 +3,11 @@
 import type {
   ApprovalDetail,
   CircuitBreaker,
+  ExchangeStopState,
   LiveStatus,
   PendingApproval,
   PlatformConfig,
+  ReconcileState,
   SessionDetail,
   SessionResponse,
   TradeItem,
@@ -33,6 +35,11 @@ export function session(over: Partial<SessionResponse> = {}): SessionResponse {
   };
 }
 
+/** A P3 live session: `trading_mode: 'live'` reaches the API only once P3-A/C land (403 before). */
+export function liveSession(over: Partial<SessionResponse> = {}): SessionResponse {
+  return session({ trading_mode: 'live', ...over });
+}
+
 /** trading.py:130-150 SessionDetailResponse, built by `get_session_detail` (session_manager.py:388-453). */
 export function detail(over: Partial<SessionDetail> = {}): SessionDetail {
   return {
@@ -44,6 +51,26 @@ export function detail(over: Partial<SessionDetail> = {}): SessionDetail {
     positions: [],
     trades: [],
     open_orders: [],
+    // A7 sends null on paper; live details carry the block below.
+    reconcile: null,
+    ...over,
+  };
+}
+
+/** A7 (pinned seam #2): the reconcile block a live detail carries; null on paper sessions. */
+export function reconcile(over: Partial<ReconcileState> = {}): ReconcileState {
+  return { state: 'ok', last_reconciled_at: '2026-10-21T14:35:04+00:00', detail: null, ...over };
+}
+
+/** A8-live (pinned seam #3, B's ExchangeStopState) as it rides a held position on a live detail. */
+export function exchangeStop(over: Partial<ExchangeStopState> = {}): ExchangeStopState {
+  return {
+    state: 'confirmed',
+    kind: 'oco',
+    stop_price: 64256,
+    take_profit: 69800,
+    order_list_id: '5',
+    checked_at: '2026-10-21T14:35:04+00:00',
     ...over,
   };
 }
@@ -81,6 +108,8 @@ export function liveStatus(over: Partial<LiveStatus> = {}): LiveStatus {
       consecutive_pause_until: null,
     },
     circuit_breakers_state: 'live',
+    // P3-C adds it (must-fix 6, R9): fail-safe false when the armed row can't be read.
+    live_armed: false,
     ...over,
   };
 }
