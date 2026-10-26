@@ -237,14 +237,25 @@ class PgRiskStateStore:
         return await fetch_risk_events(self._pool, limit, scope=self._scope)
 
 
-async def fetch_risk_events(pool: Any, limit: int, scope: str = "paper") -> list[RiskEventRecord]:
+async def fetch_risk_events(
+    pool: Any, limit: int, scope: str = "paper", actor: str | None = None
+) -> list[RiskEventRecord]:
+    """Newest first (``ts DESC, id DESC``); ``actor`` filters in SQL, before the LIMIT.
+
+    Callers that filter by actor must pass it here, never post-filter a limited read:
+    the newest 500 overall may hold none of the actor's rows.
+    """
+    query = (
+        "SELECT id, ts, scope, kind, tier, actor, reason, details FROM risk_events WHERE scope = $1"
+    )
+    params: list[Any] = [scope]
+    if actor is not None:
+        params.append(actor)
+        query += f" AND actor = ${len(params)}"
+    params.append(limit)
+    query += f" ORDER BY ts DESC, id DESC LIMIT ${len(params)}"
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, ts, scope, kind, tier, actor, reason, details FROM risk_events "
-            "WHERE scope = $1 ORDER BY ts DESC, id DESC LIMIT $2",
-            scope,
-            limit,
-        )
+        rows = await conn.fetch(query, *params)
     out: list[RiskEventRecord] = []
     for r in rows:
         details = r["details"]
