@@ -713,3 +713,25 @@ class TestSessionListHealth:
         assert [(t["side"], t["quantity"], t["price"], t["reason"]) for t in detail["trades"]] == [
             ("SELL", 0.5, 90.0, "stop_loss")
         ]
+
+
+class TestA7AdditiveSurfaces:
+    """Paper answers the additive A7 fields with their null defaults (seam #2)."""
+
+    async def test_paper_list_and_detail_carry_the_null_defaults(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        session = await h.session(write_strategy(strategies_dir, "a7-surface"))
+        await h.bar(session, "100")
+        await api.post(
+            "/api/trading/quick-trade",
+            json={"session_id": session.session_id, "side": "buy", "quantity": "0.1"},
+        )
+
+        (row,) = (await api.get("/api/trading/sessions")).json()
+        assert row["reconcile_state"] is None
+
+        detail = (await api.get(f"/api/trading/sessions/{session.session_id}/detail")).json()
+        assert detail["orders"] == []
+        assert detail["reconcile"] is None
+        assert detail["trades"][0]["reconciled"] is None

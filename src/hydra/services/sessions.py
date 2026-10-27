@@ -41,6 +41,7 @@ from hydra.execution.exchange_stops import (
     normalize_open_orders,
     verify_exchange_stop,
 )
+from hydra.execution.live_orders import LiveOrderRecord, PgLiveOrderStore
 from hydra.execution.order_manager import RiskRejectedError
 from hydra.execution.paper_trading import (
     PaperSessionHaltedError,
@@ -137,7 +138,7 @@ def require_manager(mgr: Any) -> Any:
     return mgr
 
 
-def session_to_dict(session: Any) -> dict[str, Any]:
+def session_to_dict(session: Any, *, reconcile_state: str | None = None) -> dict[str, Any]:
     return {
         "session_id": session.session_id,
         "strategy_id": session.strategy_id,
@@ -154,7 +155,17 @@ def session_to_dict(session: Any) -> dict[str, Any]:
         "flatten_incomplete": session.flatten_incomplete,
         "persist_error": session.persist_error,
         "created_by": session.created_by,
+        "reconcile_state": reconcile_state,
     }
+
+
+def _reconcile_state(mgr: Any, session: Any) -> str | None:
+    """The list field: a live session's reconcile state ('never' before the first pass)."""
+    reader = getattr(mgr, "reconcile_status", None)
+    if reader is None:
+        return None
+    status = reader(session.session_id)
+    return None if status is None else status.state
 
 
 def _start_error(exc: Exception) -> ServiceError:
@@ -276,7 +287,7 @@ async def start_session(mgr: Any, actor: str, body: StartSessionRequest) -> dict
     ) as exc:
         raise _start_error(exc) from exc
     session = mgr.get_session(session_id)
-    d = session_to_dict(session)
+    d = session_to_dict(session, reconcile_state=_reconcile_state(mgr, session))
     d["strategy_name"] = build_strategy_name_map().get(session.strategy_id)
     return d
 
@@ -300,7 +311,7 @@ async def stop_session(mgr: Any, session_id: str) -> dict[str, Any]:
             ),
         ) from exc
     session = mgr.get_session(session_id)
-    d = session_to_dict(session)
+    d = session_to_dict(session, reconcile_state=_reconcile_state(mgr, session))
     d["strategy_name"] = build_strategy_name_map().get(session.strategy_id)
     return d
 
@@ -311,7 +322,7 @@ def list_sessions(mgr: Any) -> list[dict[str, Any]]:
     name_map = build_strategy_name_map()
     results = []
     for s in mgr.list_sessions():
-        d = session_to_dict(s)
+        d = session_to_dict(s, reconcile_state=_reconcile_state(mgr, s))
         d["strategy_name"] = name_map.get(s.strategy_id)
         # health_snapshot()'s reads without its DB query, so a DB stall never slows this poll
         rt, executor = s._runtime, s._executor
@@ -355,6 +366,8 @@ async def get_session_detail(mgr: Any, session_id: str) -> dict[str, Any]:
         ]
     else:
         await _live_exchange_state(detail, session, executor)
+    if session is not None and session.trading_mode == "live":
+        await _live_reconcile_reads(mgr, detail, session)
     return dict(detail)
 
 
@@ -397,6 +410,73 @@ async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: A
             "checked_at": state.checked_at.isoformat(),
             "error": state.error,
         }
+
+
+async def _live_reconcile_reads(mgr: Any, detail: dict[str, Any], session: Any) -> None:
+    """A7 for a live session: the tracked order rows (newest first, cap 100), the
+    reconcile state, and R20's ``reconciled`` flag on every fill."""
+    reader = getattr(mgr, "reconcile_status", None)
+    status = reader(session.session_id) if reader is not None else None
+    if status is not None:
+        detail["reconcile"] = {
+            "state": status.state,
+            "last_reconciled_at": (
+                status.last_reconciled_at.isoformat() if status.last_reconciled_at else None
+            ),
+            "detail": status.detail,
+        }
+        covered_at = status.covered_at
+        for trade in detail.get("trades") or []:
+            trade["reconciled"] = _covered(trade.get("timestamp"), covered_at)
+    detail["orders"] = [live_order_row(row) for row in await _live_order_rows(mgr, session)]
+
+
+def _covered(timestamp: Any, covered_at: datetime | None) -> bool:
+    """R20: a reconcile pass with state ok|mismatch covered this fill or it did not."""
+    if covered_at is None or not isinstance(timestamp, str):
+        return False
+    try:
+        at = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    return at <= covered_at
+
+
+async def _live_order_rows(mgr: Any, session: Any) -> list[LiveOrderRecord]:
+    """The tracked rows from the running executor's store, else the live_orders table."""
+    store = getattr(getattr(session, "_executor", None), "live_orders", None)
+    if store is None:
+        pool = getattr(mgr, "_db_pool", None)
+        if pool is None:
+            return []
+        store = PgLiveOrderStore(pool)
+    return await store.orders(session.session_id, 100)
+
+
+def live_order_row(row: LiveOrderRecord) -> dict[str, Any]:
+    """One tracked live order in the pinned seam #2 shape (16 fields)."""
+    return {
+        "client_order_id": row.client_order_id,
+        "exchange_order_id": row.exchange_order_id,
+        "symbol": row.symbol,
+        "side": row.side,
+        "order_type": row.order_type,
+        "quantity": float(row.quantity),
+        "price": None if row.price is None else float(row.price),
+        "stop_price": None if row.stop_price is None else float(row.stop_price),
+        "filled_quantity": float(row.filled_quantity),
+        "average_fill_price": (
+            None if row.average_fill_price is None else float(row.average_fill_price)
+        ),
+        "status": row.status.value,
+        "tag": row.tag,
+        "actor": row.actor,
+        "submitted_at": None if row.submitted_at is None else row.submitted_at.isoformat(),
+        "terminal_at": None if row.terminal_at is None else row.terminal_at.isoformat(),
+        "error": row.error,
+    }
 
 
 # ---------------------------------------------------------------------------

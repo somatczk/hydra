@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -40,6 +41,11 @@ from hydra.execution.errors import (
 )
 from hydra.execution.flatten import FlattenResult
 from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
+from hydra.execution.reconcile import (
+    NEVER_STATUS,
+    ReconcileStatus,
+    reconcile_live_session,
+)
 from hydra.execution.session_health import (
     HealthSnapshot as HealthSnapshot,
 )
@@ -62,6 +68,7 @@ from hydra.risk.service import RiskService
 from hydra.risk.state import (
     InMemoryRiskStateStore,
     PgRiskStateStore,
+    RiskEventRecord,
     RiskStateStore,
     RiskStateUnavailableError,
 )
@@ -72,6 +79,7 @@ if TYPE_CHECKING:
     from hydra.execution.protective_orders import ProtectionSpec
 
 logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("hydra.audit")
 
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 _STRATEGY_DIR = _CONFIG_DIR / "strategies"
@@ -157,6 +165,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         self._background: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
         self._unpersisted: set[str] = set()
+        self._reconcile: dict[str, ReconcileStatus] = {}
+        self._reconcile_last: float | None = None
 
     # -- Startup -------------------------------------------------------------
 
@@ -695,6 +705,17 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
     def get_session(self, session_id: str) -> TradingSession | None:
         return self._sessions.get(session_id)
 
+    def reconcile_status(self, session_id: str) -> ReconcileStatus | None:
+        """The A7 read: a live session's reconcile status; None for anything not live.
+
+        A live session the loop has not reached yet reports ``never`` — before the first
+        pass — never a guess.
+        """
+        session = self._sessions.get(session_id)
+        if session is None or session.trading_mode != "live":
+            return None
+        return self._reconcile.get(session_id, NEVER_STATUS)
+
     async def submit_manual_order(
         self,
         *,
@@ -1143,11 +1164,13 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             self._stale_cleanup_task = asyncio.create_task(self._stale_order_cleanup_loop())
 
     async def _stale_order_cleanup_loop(self) -> None:
-        """Cancel stale non-protective orders of running sessions every minute."""
+        """Cancel stale non-protective orders of running sessions every minute, and
+        reconcile every running live session (the A2 drift detector)."""
         while True:
             try:
                 await asyncio.sleep(60)
                 await self.retry_unpersisted()
+                await self._reconcile_live_sessions()
                 for session in list(self._sessions.values()):
                     om = session._order_manager
                     if session.status != "running" or om is None:
@@ -1167,3 +1190,82 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 break
             except Exception:
                 logger.exception("Error in stale order cleanup loop")
+
+    async def _reconcile_live_sessions(self) -> None:
+        """One reconcile pass per running live session, cadence-gated by the config.
+
+        The per-minute loop is the carrier; ``live_reconcile_interval_s`` decides how often
+        a pass actually runs, so a longer interval simply skips ticks. A pass that cannot
+        even start (its own exception) keeps the session's last status: the holder never
+        guesses a state a pass did not produce.
+        """
+        interval = self._config.trading.live_reconcile_interval_s
+        now = time.monotonic()
+        if self._reconcile_last is not None and now - self._reconcile_last < interval:
+            return
+        self._reconcile_last = now
+        for session in list(self._sessions.values()):
+            if session.trading_mode != "live" or session.status != "running":
+                continue
+            executor = session._executor
+            store = getattr(executor, "live_orders", None)
+            client = getattr(executor, "exchange_client", None)
+            if store is None or client is None:
+                continue
+            runtime = session._runtime
+            previous = self._reconcile.get(session.session_id)
+            try:
+                status = await reconcile_live_session(
+                    store,
+                    client,
+                    executor,
+                    poller=runtime._poller if runtime is not None else None,
+                    previous=previous,
+                )
+            except Exception:
+                logger.exception("Reconcile pass failed for %s", session.session_id)
+                continue
+            self._reconcile[session.session_id] = status
+            metrics.set_live_reconcile_state(session.session_id, status.state)
+            await self._record_reconcile_mismatch(session, previous, status)
+
+    async def _record_reconcile_mismatch(
+        self,
+        session: TradingSession,
+        previous: ReconcileStatus | None,
+        status: ReconcileStatus,
+    ) -> None:
+        """A transition into mismatch is an audited event; a pass that stays mismatched
+        is not a new one (the alert pages continuously; the trail records the change)."""
+        if status.state != "mismatch" or (previous is not None and previous.state == "mismatch"):
+            return
+        detail = status.detail or ""
+        audit_logger.info(
+            json.dumps(
+                {
+                    "event": "live.reconcile_mismatch",
+                    "session_id": session.session_id,
+                    "strategy_id": session.strategy_id,
+                    "state": status.state,
+                    "detail": detail,
+                }
+            )
+        )
+        if self._db_pool is None:
+            return
+        try:
+            store = PgRiskStateStore(self._db_pool, scope="live")
+            await store.append_event(
+                RiskEventRecord(
+                    kind="live_reconcile_mismatch",
+                    actor="reconcile",
+                    reason=detail[:500],
+                    details={
+                        "session_id": session.session_id,
+                        "strategy_id": session.strategy_id,
+                    },
+                    scope="live",
+                )
+            )
+        except Exception:
+            logger.exception("Reconcile mismatch of %s could not be recorded", session.session_id)

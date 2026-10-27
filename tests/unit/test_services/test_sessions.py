@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -774,11 +774,24 @@ class _FakeProtect:
 class _LiveManager:
     """Serves one live session whose executor exposes the keyed client and the group."""
 
-    def __init__(self, client: _FakeKeyedClient, runtime: Any | None = None) -> None:
+    def __init__(
+        self,
+        client: _FakeKeyedClient,
+        runtime: Any | None = None,
+        *,
+        status: Any = None,
+        store: Any = None,
+        trades: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.session = _session(trading_mode="live")
-        self.session._executor = SimpleNamespace(exchange_client=client)
+        self.session._executor = SimpleNamespace(exchange_client=client, live_orders=store)
         self.session._runtime = runtime
         self.client = client
+        self._status = status
+        self.trades: list[dict[str, Any]] = list(trades or [])
+
+    def reconcile_status(self, session_id: str) -> Any:
+        return self._status
 
     def list_sessions(self) -> list[TradingSession]:
         return [self.session]
@@ -804,7 +817,7 @@ class _LiveManager:
                     "unrealized_pnl": 0.0,
                 }
             ],
-            "trades": [],
+            "trades": list(self.trades),
         }
 
 
@@ -888,3 +901,159 @@ class TestSessionDetailLive:
         assert all("exchange_stop" not in p for p in detail["positions"])
         model = SessionDetailResponse.model_validate(detail)
         assert all(p.exchange_stop is None for p in model.positions)
+
+
+# ---------------------------------------------------------------------------
+# A7 (P3-A2): the tracked orders, the reconcile state and R20's reconciled flag
+# ---------------------------------------------------------------------------
+
+
+async def _seed_store() -> Any:
+    from hydra.execution.live_orders import (
+        InMemoryLiveOrderStore,
+        LiveOrderRecord,
+        LiveOrderStatus,
+    )
+
+    store = InMemoryLiveOrderStore()
+    for i, (cid, status, submitted) in enumerate(
+        [
+            ("hyd-old", LiveOrderStatus.FILLED, _NOW - timedelta(hours=2)),
+            ("hyd-new", LiveOrderStatus.NEW, _NOW - timedelta(hours=1)),
+            ("hyd-newest", LiveOrderStatus.PARTIALLY_FILLED, _NOW),
+        ]
+    ):
+        await store.create(
+            LiveOrderRecord(
+                client_order_id=cid,
+                session_id="s1",
+                strategy_id="saw",
+                exchange_id="binance",
+                symbol="BTCUSDT",
+                side="BUY",
+                order_type="LIMIT",
+                quantity=D("0.01"),
+                price=D("90000"),
+                stop_price=D("88000") if i == 2 else None,
+                filled_quantity=D("0.004") if i == 2 else D("0.01") if i == 0 else D("0"),
+                average_fill_price=D("90500") if i == 0 else None,
+                status=status,
+                tag="entry",
+                actor="user:someone",
+                exchange_order_id=f"10{i}",
+                submitted_at=submitted,
+                terminal_at=_NOW if i == 0 else None,
+                error="stop moved" if i == 2 else None,
+            )
+        )
+    return store
+
+
+class TestSessionDetailA7:
+    async def test_orders_are_the_tracked_rows_newest_first_in_the_pinned_shape(self) -> None:
+        from hydra.execution.reconcile import NEVER_STATUS
+
+        mgr = _LiveManager(_FakeKeyedClient(), status=NEVER_STATUS, store=await _seed_store())
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert [o["client_order_id"] for o in detail["orders"]] == [
+            "hyd-newest",
+            "hyd-new",
+            "hyd-old",
+        ]
+        newest = detail["orders"][0]
+        assert set(newest) == {
+            "client_order_id",
+            "exchange_order_id",
+            "symbol",
+            "side",
+            "order_type",
+            "quantity",
+            "price",
+            "stop_price",
+            "filled_quantity",
+            "average_fill_price",
+            "status",
+            "tag",
+            "actor",
+            "submitted_at",
+            "terminal_at",
+            "error",
+        }
+        assert newest["status"] == "partially_filled"
+        assert newest["error"] == "stop moved"
+
+    async def test_orders_come_from_the_live_orders_table_without_an_executor(self) -> None:
+        """A stopped live session (display-only row) still reads its tracked orders."""
+        from hydra.execution.reconcile import NEVER_STATUS
+
+        class _PooledManager(_LiveManager):
+            _db_pool = None
+
+        mgr = _PooledManager(_FakeKeyedClient(), status=NEVER_STATUS)
+        mgr.session._executor = None
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert detail["orders"] == []
+
+    async def test_reconcile_is_served_verbatim(self) -> None:
+        from hydra.execution.reconcile import ReconcileStatus
+
+        at = _NOW - timedelta(minutes=5)
+        status = ReconcileStatus(
+            state="mismatch", last_reconciled_at=at, detail="untracked order 7 on BTCUSDT"
+        )
+        mgr = _LiveManager(_FakeKeyedClient(), status=status)
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert detail["reconcile"] == {
+            "state": "mismatch",
+            "last_reconciled_at": at.isoformat(),
+            "detail": "untracked order 7 on BTCUSDT",
+        }
+        model = SessionDetailResponse.model_validate(detail)
+        assert model.reconcile is not None
+        assert model.reconcile.state == "mismatch"
+        assert model.reconcile.detail == "untracked order 7 on BTCUSDT"
+
+    async def test_trades_carry_the_r20_reconciled_truth_table(self) -> None:
+        from hydra.execution.reconcile import ReconcileStatus
+
+        covered = _NOW - timedelta(minutes=10)
+        status = ReconcileStatus(state="ok", last_reconciled_at=covered, covered_at=covered)
+        mgr = _LiveManager(_FakeKeyedClient(), status=status)
+        mgr.trades = [
+            {"id": "t1", "timestamp": (_NOW - timedelta(hours=1)).isoformat()},
+            {"id": "t2", "timestamp": (_NOW).isoformat()},
+        ]
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert [t["reconciled"] for t in detail["trades"]] == [True, False]
+
+    async def test_fills_before_the_first_covering_pass_are_not_reconciled(self) -> None:
+        from hydra.execution.reconcile import ReconcileStatus
+
+        mgr = _LiveManager(_FakeKeyedClient(), status=ReconcileStatus(state="never"))
+        mgr.trades = [{"id": "t1", "timestamp": _NOW.isoformat()}]
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert detail["trades"][0]["reconciled"] is False
+
+    async def test_the_list_and_session_dict_carry_reconcile_state(self) -> None:
+        from hydra.execution.reconcile import NEVER_STATUS
+
+        mgr = _LiveManager(_FakeKeyedClient(), status=NEVER_STATUS)
+        rows = sessions_svc.list_sessions(mgr)
+        assert [r["reconcile_state"] for r in rows] == ["never"]
+
+        d = sessions_svc.session_to_dict(
+            mgr.session, reconcile_state=sessions_svc._reconcile_state(mgr, mgr.session)
+        )
+        assert d["reconcile_state"] == "never"
+        paper = sessions_svc.session_to_dict(_session())
+        assert paper["reconcile_state"] is None

@@ -128,6 +128,10 @@ class RiskStatusLive(BaseModel):
     running_sessions: int | None
     circuit_breaker_restrictions: CircuitBreakerRestrictionsModel | None = None
     circuit_breakers_state: Literal["live", "unavailable"] = "unavailable"
+    # additive (A2): the live-scope numbers, served when source=live
+    equity: float | None = None
+    current_drawdown: float | None = None
+    active_tier: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +150,13 @@ def _risk_config_missing(scope: str = "global") -> HTTPException:
 
 
 def _paper_only(source: str | None) -> None:
+    """This read exists for the paper account only; live has its own scope reads."""
     if source not in (None, "paper"):
         raise api_error(
             503,
             "live_disabled",
-            "Live trading is disabled; risk state exists for the paper account only",
+            "This read exists for the paper account only; the live-scope risk reads are "
+            "GET /api/risk/status?source=live and /api/risk/live-status?source=live",
             "unavailable",
             source=source,
         )
@@ -228,7 +234,13 @@ async def _get_risk_config_from_db(pool: Any, scope: str = "global") -> dict[str
 
 @router.get("/status", response_model=RiskStatus)
 async def get_risk_status(request: Request, source: str | None = None) -> dict[str, Any]:
-    """Account drawdown, daily loss and breakers from the engine's RiskService (paper ledger)."""
+    """Account drawdown, daily loss and breakers from the engine's RiskService.
+
+    ``source=live`` reads the live-scoped RiskService (Q1) through the same
+    ``live_status`` op (R11); no live service built is 503 ``live_risk_unavailable``.
+    """
+    if source == "live":
+        return await request_trader(request).live_status(source="live")
     _paper_only(source)
     return await request_trader(request).risk_status()
 
@@ -362,6 +374,11 @@ async def update_strategy_risk_config(strategy_id: str) -> None:
 
 
 @router.get("/live-status", response_model=RiskStatusLive)
-async def get_live_risk_status(request: Request) -> dict[str, Any]:
-    """Kill switch, sessions and breaker restrictions; unknown values are reported as unknown."""
-    return await request_trader(request).live_status()
+async def get_live_risk_status(request: Request, source: str | None = None) -> dict[str, Any]:
+    """Kill switch, sessions and breaker restrictions; unknown values are reported as unknown.
+
+    ``source=live`` answers the same picture on the live scope plus its account numbers
+    (equity, current drawdown, active tier); 503 ``live_risk_unavailable`` when no live
+    service is built.
+    """
+    return await request_trader(request).live_status(source=source or "paper")

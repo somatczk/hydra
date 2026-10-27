@@ -186,6 +186,36 @@ async def _ledger_capital(request: Request, pool: Any) -> float:
     return await get_paper_capital(pool)
 
 
+async def _live_capital_baseline(pool: Any) -> float:
+    """system_config 'live_capital': the capital a source=live summary is based on.
+
+    The live account curve is the account-level balance snapshots (rows without a
+    session); until one exists the summary's total value falls back to this baseline,
+    like paper's falls back to the ledger capital. A missing row is the 503 of the
+    paper read, never a silent 0.
+    """
+    async with db_errors_to_503("reading live_capital"), pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM system_config WHERE key = 'live_capital'")
+    if row is None:
+        raise api_error(
+            503,
+            "live_capital_missing",
+            "system_config has no 'live_capital' row; it is set by the arm ceremony",
+            "unavailable",
+        )
+    raw = row["value"]
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise api_error(
+            503,
+            "live_capital_missing",
+            f"system_config live_capital is unreadable: {exc}",
+            "unavailable",
+        ) from exc
+
+
 def _capital(value: Any) -> float | None:
     try:
         return float(value) if value is not None else None
@@ -315,9 +345,17 @@ async def get_summary(request: Request, source: str | None = None) -> PortfolioS
     Paper: total_value is the ledger the RiskService runs on (capital + sleeves, carried PnL
     dropped at a paper reset); realized PnL and fees count every paper session (running or
     stopped), unrealized PnL running sessions, and daily PnL is net realized since 00:00 UTC.
+    source=live: the same totals over the live-sourced rows, with ``live_capital`` as the
+    capital baseline until account-level live snapshots exist.
     """
     pool = require_pool(request)
-    capital = await _ledger_capital(request, pool) if source == "paper" else None
+    capital: float | None
+    if source == "paper":
+        capital = await _ledger_capital(request, pool)
+    elif source == "live":
+        capital = await _live_capital_baseline(pool)
+    else:
+        capital = None
     pending = await _pending_capital(request, pool) if source == "paper" else None
 
     async with db_errors_to_503("reading portfolio summary"), pool.acquire() as conn:

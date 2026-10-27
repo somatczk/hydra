@@ -12,6 +12,7 @@ from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.risk.service import RiskService
 
 if TYPE_CHECKING:
+    from hydra.execution.reconcile import ReconcileStatus
     from hydra.execution.session_manager import TradingSession
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ class SessionHealth:
     error_message: str | None
     protection_failures: tuple[str, ...] = ()
     status_persisted: bool = True
+    reconcile_state: str | None = None
+    last_reconciled_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +62,9 @@ class SessionHealthMixin:
     def kill_switch_active(self) -> bool:
         raise NotImplementedError
 
+    def reconcile_status(self, session_id: str) -> ReconcileStatus | None:
+        raise NotImplementedError
+
     async def health_snapshot(self) -> HealthSnapshot:
         """Per session: desired (DB) vs supervised (task alive), feed and bar freshness."""
         desired_ids: set[str] | None = None
@@ -78,6 +84,7 @@ class SessionHealthMixin:
                 else None
             )
             eid = s.exchange_id
+            reconcile = self.reconcile_status(s.session_id) if s.trading_mode == "live" else None
             out.append(
                 SessionHealth(
                     session_id=s.session_id,
@@ -101,6 +108,8 @@ class SessionHealthMixin:
                     error_message=s.error_message,
                     protection_failures=tuple(rt.protect.failures[-10:]) if rt is not None else (),
                     status_persisted=s.persist_error is None,
+                    reconcile_state=None if reconcile is None else reconcile.state,
+                    last_reconciled_at=None if reconcile is None else reconcile.last_reconciled_at,
                 )
             )
         for sid in sorted((desired_ids or set()) - set(self._sessions)):
