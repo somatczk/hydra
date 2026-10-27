@@ -10,6 +10,7 @@ dicts. The acting principal arrives as an actor string (``user:<name>`` from the
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -22,12 +23,16 @@ from hydra.data.ingestion import InsufficientHistoryError
 from hydra.execution import session_store
 from hydra.execution.errors import (
     DuplicateSessionError,
+    ExchangeRateLimitedError,
     KillSwitchActiveError,
-    LiveTradingDisabledError,
+    LiveCapitalUnavailableError,
+    LiveCredentialsError,
+    LiveNotArmedError,
     PaperCapitalUnavailableError,
     SessionNotRunningError,
     SessionPersistError,
     SpotShortError,
+    SubmitUnknownError,
     UnsupportedStrategyError,
     UnsupportedVenueError,
 )
@@ -44,6 +49,7 @@ from hydra.execution.paper_trading import (
 )
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.risk.market_rules import MarketRulesUnavailableError
+from hydra.risk.state import RiskStateUnavailableError
 from hydra.services.errors import (
     DB_ERRORS,
     ServiceError,
@@ -157,8 +163,14 @@ def _start_error(exc: Exception) -> ServiceError:
         return service_error(409, exc.code, str(exc), "invalid")
     if isinstance(exc, DuplicateSessionError):
         return service_error(409, exc.code, str(exc), "invalid")
-    if isinstance(exc, LiveTradingDisabledError):
-        return service_error(403, exc.code, str(exc), "not_implemented")
+    if isinstance(exc, LiveNotArmedError):
+        return service_error(409, exc.code, str(exc), "invalid")
+    if isinstance(exc, LiveCredentialsError):
+        return service_error(403, exc.code, str(exc), "invalid")
+    if isinstance(exc, LiveCapitalUnavailableError):
+        return service_error(403, exc.code, str(exc), "invalid")
+    if isinstance(exc, RiskStateUnavailableError):
+        return service_error(503, "live_risk_unavailable", str(exc), "unavailable")
     if isinstance(exc, UnsupportedVenueError):
         return service_error(400, exc.code, str(exc), "invalid")
     if isinstance(exc, UnsupportedStrategyError):
@@ -183,18 +195,62 @@ def _start_error(exc: Exception) -> ServiceError:
     return service_error(400, "invalid_session", str(exc), "invalid")
 
 
+LIVE_ARMED_KEY = "live_armed"
+
+
+async def _require_live_armed(mgr: Any) -> None:
+    """R1: the armed row is the single master gate; anything unreadable is disarmed.
+
+    A DB read that works in the trader process: absent row, no pool, a failed read or a
+    malformed value all count as disarmed — the live start is refused, never guessed.
+    """
+    pool = getattr(mgr, "_db_pool", None)
+    row: Any = None
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT value FROM system_config WHERE key = $1", LIVE_ARMED_KEY
+                )
+        except Exception:
+            logger.exception("Live-arming state unreadable; refusing the live start")
+            row = None
+    armed = False
+    if row is not None:
+        value = row["value"]
+        try:
+            value = json.loads(value) if isinstance(value, str) else value
+            armed = isinstance(value, dict) and bool(value.get("armed"))
+        except (TypeError, ValueError):
+            armed = False
+    if not armed:
+        raise LiveNotArmedError(
+            "live trading is not armed; arm it through the code-gated ceremony first"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Session operations
 # ---------------------------------------------------------------------------
 
 
 async def start_session(mgr: Any, actor: str, body: StartSessionRequest) -> dict[str, Any]:
-    """Start a paper session (live is refused until P3) attributed to *actor*."""
+    """Start a paper or live session attributed to *actor*.
+
+    A live start begins with the armed check (R1): the ``live_armed`` system_config row is
+    the single master gate and anything unreadable counts as disarmed. Only then does the
+    manager's live branch check credentials, ``live_capital`` and the kill switch.
+    """
     mgr = require_manager(mgr)
     if body.trading_mode not in ("paper", "live"):
         raise service_error(
             400, "invalid_trading_mode", "trading_mode must be 'paper' or 'live'", "invalid"
         )
+    if body.trading_mode == "live":
+        try:
+            await _require_live_armed(mgr)
+        except LiveNotArmedError as exc:
+            raise _start_error(exc) from exc
     try:
         session_id = await mgr.start_session(
             strategy_id=body.strategy_id,
@@ -205,7 +261,10 @@ async def start_session(mgr: Any, actor: str, body: StartSessionRequest) -> dict
     except (
         KillSwitchActiveError,
         DuplicateSessionError,
-        LiveTradingDisabledError,
+        LiveNotArmedError,
+        LiveCredentialsError,
+        LiveCapitalUnavailableError,
+        RiskStateUnavailableError,
         UnsupportedVenueError,
         UnsupportedStrategyError,
         PaperCapitalUnavailableError,
@@ -499,6 +558,12 @@ async def submit_webhook_order(
                 409, "no_position", f"No open {symbol} position to exit", "no_data"
             ) from exc
         raise service_error(422, exc.code, str(exc), "invalid") from exc
+    except SubmitUnknownError as exc:
+        raise service_error(
+            503, exc.code, str(exc), "unavailable", client_order_id=exc.client_order_id
+        ) from exc
+    except ExchangeRateLimitedError as exc:
+        raise service_error(503, exc.code, str(exc), "unavailable") from exc
     except RiskRejectedError as exc:
         raise service_error(
             422, "risk_rejected", exc.reason, "invalid", check=exc.check, intent=exc.intent
@@ -546,6 +611,12 @@ async def submit_manual_order(mgr: Any, order: QuickTradeRequest) -> dict[str, A
         raise service_error(404, exc.code, str(exc), "not_found") from exc
     except SpotShortError as exc:
         raise service_error(422, exc.code, str(exc), "invalid") from exc
+    except SubmitUnknownError as exc:
+        raise service_error(
+            503, exc.code, str(exc), "unavailable", client_order_id=exc.client_order_id
+        ) from exc
+    except ExchangeRateLimitedError as exc:
+        raise service_error(503, exc.code, str(exc), "unavailable") from exc
     except RiskRejectedError as exc:
         raise service_error(
             422, "risk_rejected", exc.reason, "invalid", check=exc.check, intent=exc.intent

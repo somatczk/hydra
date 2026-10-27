@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -217,6 +218,28 @@ class ExchangeClient:
         request: dict[str, Any] = {"symbol": symbol} if symbol else {}
         with observe_exchange_call(self._exchange_id, "fetch_open_order_lists"):
             result: list[dict[str, Any]] = await exchange.privateGetOpenOrderList(request)
+        return result
+
+    async def fetch_order(
+        self, order_id: str, symbol: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """One order by exchange id, or by ``params={'clientOrderId': ...}`` (ccxt maps it
+        to Binance's ``origClientOrderId``; a lookup by our own id never needs the exchange
+        id, so mid-submit timeouts stay resolvable)."""
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "fetch_order"):
+            result: dict[str, Any] = await exchange.fetch_order(order_id, symbol, params or {})
+        return result
+
+    async def fetch_my_trades(
+        self, symbol: str, since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """This account's executed trades on *symbol* since *since* (inclusive; replays are
+        harmless — the live_fills unique constraint is the double-apply guard)."""
+        exchange = self._get_exchange()
+        since_ms = None if since is None else int(since.timestamp() * 1000)
+        with observe_exchange_call(self._exchange_id, "fetch_my_trades"):
+            result: list[dict[str, Any]] = await exchange.fetch_my_trades(symbol, since=since_ms)
         return result
 
     async def fetch_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:

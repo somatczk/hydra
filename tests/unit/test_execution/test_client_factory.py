@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from hydra.core.types import MarketType
 from hydra.execution import client_factory
-from hydra.execution.errors import LiveTradingDisabledError, UnsupportedVenueError
+from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.exchange_client import ExchangeClient
+from hydra.risk.market_rules import MarketRules
+
+
+def _rules() -> MarketRules:
+    return MarketRules(
+        symbol="BTCUSDT",
+        amount_step=Decimal("0.00001"),
+        min_qty=Decimal("0.00001"),
+        min_notional=Decimal("5"),
+        price_tick=Decimal("0.01"),
+    )
 
 
 def test_binance_spot_is_the_only_venue() -> None:
@@ -70,10 +82,73 @@ def test_readonly_client_refuses_other_venues() -> None:
         )
 
 
-def test_live_executor_is_never_built() -> None:
-    with pytest.raises(LiveTradingDisabledError) as err:
-        client_factory.build_live_executor("binance", {"apiKey": "k"})
-    assert err.value.code == "live_trading_disabled"
+def test_build_live_executor_constructs_the_live_executor() -> None:
+    fake = object()
+    executor = client_factory.build_live_executor(
+        "binance",
+        client=fake,
+        market_rules={"BTCUSDT": _rules()},
+        db_pool=object(),
+        strategy_id="s",
+        session_id="sess",
+        initial_quote=Decimal("100"),
+        poll_interval=5.0,
+    )
+    assert executor.exchange_client is fake
+    assert executor.poll_interval == 5.0
+    assert executor.get_account_snapshot().quote_free == Decimal("100")
+
+
+def test_build_live_executor_refuses_other_venues() -> None:
+    with pytest.raises(UnsupportedVenueError):
+        client_factory.build_live_executor(
+            "bybit",
+            client=object(),
+            market_rules={"BTCUSDT": _rules()},
+            db_pool=object(),
+            strategy_id="s",
+            session_id="sess",
+            initial_quote=Decimal("100"),
+        )
+
+
+def test_build_live_executor_needs_full_market_rules_and_a_pool() -> None:
+    with pytest.raises(ValueError, match="MarketRules"):
+        client_factory.build_live_executor(
+            "binance",
+            client=object(),
+            market_rules={"BTCUSDT": SimpleNamespace(amount_step=Decimal("0.00001"))},
+            db_pool=object(),
+            strategy_id="s",
+            session_id="sess",
+            initial_quote=Decimal("100"),
+        )
+    with pytest.raises(ValueError, match="database"):
+        client_factory.build_live_executor(
+            "binance",
+            client=object(),
+            market_rules={"BTCUSDT": _rules()},
+            db_pool=None,
+            strategy_id="s",
+            session_id="sess",
+            initial_quote=Decimal("100"),
+        )
+
+
+async def test_trading_client_maps_credentials_and_stays_off_mainnet_on_testnet() -> None:
+    client = client_factory.build_trading_client(
+        "binance", {"api_key": "k", "api_secret": "s"}, testnet=True
+    )
+    exchange = client._get_exchange()
+    try:
+        assert (exchange.apiKey, exchange.secret) == ("k", "s")
+        assert exchange.isSandboxModeEnabled is True
+    finally:
+        await client.close()
+    with pytest.raises(UnsupportedVenueError):
+        client_factory.build_trading_client(
+            "kraken", {"api_key": "k", "api_secret": "s"}, testnet=False
+        )
 
 
 def test_feed_and_rest_factories_build_spot_classes() -> None:

@@ -18,7 +18,7 @@ from hydra.execution.errors import (
     ConfigReloadRefusedError,
     DuplicateSessionError,
     KillSwitchActiveError,
-    LiveTradingDisabledError,
+    LiveCredentialsError,
     PaperCapitalUnavailableError,
     SessionNotRunningError,
     UnsupportedStrategyError,
@@ -82,13 +82,13 @@ class TestStartGates:
         assert h.mgr is not None and h.mgr.risk is not None
         assert h.mgr.risk.registered_sessions() == [session.session_id]
 
-    async def test_live_start_is_refused_before_anything_is_built(
+    async def test_live_start_without_credentials_is_refused_before_anything_is_built(
         self, h: Harness, strategies_dir: Path, construction_spy: _Spy
     ) -> None:
         assert h.mgr is not None
-        with pytest.raises(LiveTradingDisabledError) as err:
+        with pytest.raises(LiveCredentialsError) as err:
             await h.mgr.start_session(write_strategy(strategies_dir, "s-live"), "live")
-        assert err.value.code == "live_trading_disabled"
+        assert err.value.code == "live_credentials_missing"
         assert construction_spy.calls == []
         assert h.mgr.list_sessions() == []
 

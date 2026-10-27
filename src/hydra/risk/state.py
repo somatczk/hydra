@@ -110,25 +110,32 @@ def parse_paper_capital(raw: Any) -> Decimal:
 
 
 class PgRiskStateStore:
-    """asyncpg-backed store; every call raises RiskStateUnavailableError on failure."""
+    """asyncpg-backed store; every call raises RiskStateUnavailableError on failure.
 
-    def __init__(self, pool: Any, scope: str = "paper") -> None:
+    *capital_key* is the system_config row holding this scope's capital baseline:
+    ``paper_capital`` for the paper scope, ``live_capital`` for the live one (Q1).
+    """
+
+    def __init__(
+        self, pool: Any, scope: str = "paper", *, capital_key: str = "paper_capital"
+    ) -> None:
         self._pool = pool
         self._scope = scope
+        self._capital_key = capital_key
 
     async def load_config(self) -> LoadedConfig:
         try:
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT * FROM risk_config WHERE scope = 'global'")
                 capital = await conn.fetchrow(
-                    "SELECT value FROM system_config WHERE key = 'paper_capital'"
+                    "SELECT value FROM system_config WHERE key = $1", self._capital_key
                 )
         except Exception as exc:
             raise RiskStateUnavailableError(f"reading risk config failed: {exc}") from exc
         if row is None:
             raise RiskStateUnavailableError("no risk_config row for scope 'global'")
         if capital is None:
-            raise RiskStateUnavailableError("no system_config row for 'paper_capital'")
+            raise RiskStateUnavailableError(f"no system_config row for '{self._capital_key}'")
         row = dict(row)
         return LoadedConfig(
             config=risk_config_from_row(row),

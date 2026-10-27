@@ -1,9 +1,11 @@
-"""SessionRuntime: one paper session's bus, context, engine, executor, OrderManager and feed.
+"""SessionRuntime: one session's bus, context, engine, executor, OrderManager and feed.
 
 Wiring order (fixed): the session's closed-bar handler is subscribed before the engine, so the
 paper executor evaluates resting orders and marks to a bar before any strategy sees that bar;
 every fill is published before the strategy runs. Then signals, fills, feed status and live
 prices (the executor's market-fill mark only; risk marks and resting orders stay on closed bars).
+A live session's runtime also starts the LiveOrderPoller (the single fill source) in ``wire``
+and sets the ``_live_coverage`` producer B's dead-man hook reads per closed bar.
 """
 
 from __future__ import annotations
@@ -49,12 +51,21 @@ from hydra.data.bars import timeframe_seconds
 from hydra.data.ingestion import ExchangeFeedManager
 from hydra.execution import session_store
 from hydra.execution.client_factory import ClientFactory
-from hydra.execution.errors import SessionNotRunningError, SpotShortError, UnsupportedStrategyError
-from hydra.execution.exchange_stops import ExchangeStopState
+from hydra.execution.errors import (
+    ExchangeRateLimitedError,
+    SessionNotRunningError,
+    SpotShortError,
+    SubmitUnknownError,
+    UnsupportedStrategyError,
+)
+from hydra.execution.exchange_stops import ExchangeStopState, verify_exchange_stop
 from hydra.execution.flatten import FlattenResult, flatten_session
+from hydra.execution.live_executor import LiveOrderPoller, LiveTradingExecutor
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import (
+    InsufficientBalanceError,
     LedgerInvariantError,
+    OrderRejectedError,
     PaperFill,
     PaperSessionHaltedError,
     PaperTradingExecutor,
@@ -177,6 +188,10 @@ class SessionRuntime:
         self.entries_paused: str | None = None
         self.spot_shorts_ignored = 0
         self._manual_orders: dict[str, str] = {}
+        self._poller: LiveOrderPoller | None = None
+        if isinstance(executor, LiveTradingExecutor):
+            # R4: B's dead-man hook reads this producer after every closed bar
+            self._live_coverage = self._verify_live_coverage
 
     # ------------------------------------------------------------------
     # Build, warm up, wire, connect
@@ -222,6 +237,14 @@ class SessionRuntime:
         await self.bus.subscribe("order_cancel", self._on_cancel)
         await self.bus.subscribe("feed_status", self._on_feed_status)
         await self.bus.subscribe("price", self._on_price)
+        if isinstance(self.executor, LiveTradingExecutor):
+            self._poller = LiveOrderPoller(
+                self.executor,
+                self.om,
+                interval=self.executor.poll_interval,
+                resolve_grace=self.executor.resolve_grace,
+            )
+            self._poller.start()
 
     async def prime(self, warm: WarmBars) -> None:
         """Treat each symbol's newest warm-up bar as the first closed bar: marks, resting orders."""
@@ -239,7 +262,10 @@ class SessionRuntime:
         await self._done.wait()
 
     async def shutdown(self) -> None:
-        """Stop the feed and the engine and end the task; positions are left to the caller."""
+        """Stop the poller, the feed and the engine; positions are left to the caller."""
+        if self._poller is not None:
+            await self._poller.stop()
+            self._poller = None
         self._done.set()
         try:
             await self.feed.disconnect_all()
@@ -316,6 +342,29 @@ class SessionRuntime:
         halted = self.executor.get_account_snapshot().halted
         if halted is not None and not self.closing:
             await self._fail(f"paper ledger halted: {halted}")
+
+    async def _verify_live_coverage(self) -> Mapping[str, ExchangeStopState | None]:
+        """R4: per session symbol the verified exchange stop; None when nothing is held.
+
+        The real producer B's dead-man hook consumes: ``verify_exchange_stop`` per held
+        symbol per closed bar. A symbol with nothing held reads None, so the gauge clears.
+        """
+        if not isinstance(self.executor, LiveTradingExecutor):
+            return {}
+        client = self.executor.exchange_client
+        states: dict[str, ExchangeStopState | None] = {}
+        for symbol in self.cfg.symbols:
+            try:
+                held = any(p.quantity > 0 for p in await self.executor.get_positions(symbol))
+            except Exception:
+                logger.exception("Held positions of %s unreadable", self.session.session_id)
+                held = True  # can't confirm the position is gone: keep checking the stop
+            if not held:
+                states[symbol] = None
+                continue
+            expected = self.protect.armed(symbol)
+            states[symbol] = await verify_exchange_stop(client, symbol, expected)
+        return states
 
     async def _check_live_coverage(self) -> None:
         """The dead-man hook (R4): set/clear ``hydra_live_protective_gap`` per closed bar.
@@ -394,6 +443,15 @@ class SessionRuntime:
             logger.warning(
                 "Entry refused in %s until fills persist: %s", self.session.session_id, exc
             )
+        except SubmitUnknownError as exc:
+            logger.error(
+                "Order from signal in %s has an unknown submit outcome; the poller resolves "
+                "it by client order id: %s",
+                self.session.session_id,
+                exc,
+            )
+        except ExchangeRateLimitedError as exc:
+            logger.warning("Order from signal in %s skipped: %s", self.session.session_id, exc)
         except Exception:
             logger.exception("Failed to submit order from signal in %s", self.session.session_id)
         await self._fail_if_halted()
@@ -404,6 +462,12 @@ class SessionRuntime:
             return
         symbol = str(order.symbol)
         if await self._fail_if_halted():
+            return
+        if self._is_live():
+            # F3: the old group rests through the in-flight sell; on_fill cleans it up
+            order_id = await self.om.submit_order(order)
+            if order_id is None:
+                await self.protect.disarm(symbol)  # nothing to reduce: nothing to protect
             return
         await self.protect.disarm(symbol)
         try:
@@ -654,16 +718,22 @@ class SessionRuntime:
         )
         if await self._fail_if_halted():
             raise PaperSessionHaltedError(f"session {self.session.session_id} ledger is halted")
-        await self.protect.disarm(symbol)
-        try:
+        if self._is_live():
+            # F3: never disarm-then-rearm around a live sell; on_fill cleans the group up
             order_id = await self.om.submit_order(order)
-        except BaseException:
-            if not await self._fail_if_halted():
+            if order_id is None:
+                await self.protect.disarm(symbol)
+        else:
+            await self.protect.disarm(symbol)
+            try:
+                order_id = await self.om.submit_order(order)
+            except BaseException:
+                if not await self._fail_if_halted():
+                    await self.protect.rearm(symbol)
+                raise
+            if order_id is None or self.om.get_order_status(order_id) != OrderStatus.FILLED:
                 await self.protect.rearm(symbol)
-            raise
         status = self.om.get_order_status(order_id) if order_id is not None else None
-        if status != OrderStatus.FILLED:
-            await self.protect.rearm(symbol)
         group = self.protect.armed(symbol)
         fill = self._market_fill(order_id) if status == OrderStatus.FILLED else None
         return ManualOrderResult(
@@ -743,13 +813,31 @@ class SessionRuntime:
                     tag=UNPROTECTED_TAG,
                 )
             )
-        except Exception as exc:
+        except (
+            OrderRejectedError,
+            InsufficientBalanceError,
+            PaperSessionHaltedError,
+            LedgerInvariantError,
+        ) as exc:
+            # definitive and raised before the wire: the executor's own flatten may still sell
             logger.warning("Reduce-only close of unprotected %s failed (%s)", symbol, exc)
             try:
                 for fill in await self.executor.flatten(symbol, reason=UNPROTECTED_TAG):
                     await self.om.on_external_fill(fill)
             except Exception as flatten_exc:
                 await self._fail(f"{symbol} is unprotected and could not be closed: {flatten_exc}")
+        except Exception as exc:
+            # an unknown close outcome is never re-sold (F4): fail the session honestly
+            logger.error(
+                "Close of unprotected %s in %s has an unknown outcome (%s)",
+                symbol,
+                self.session.session_id,
+                exc,
+            )
+            await self._fail(f"{symbol} is unprotected and its close outcome is unknown: {exc}")
+
+    def _is_live(self) -> bool:
+        return isinstance(self.executor, LiveTradingExecutor)
 
     async def _on_cancel(self, event: Event) -> None:
         if isinstance(event, OrderCancelEvent):

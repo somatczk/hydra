@@ -870,8 +870,8 @@ class TestLiveGroups:
         assert protect.failures == []
 
     async def test_live_adopt_takes_only_resting_sells_with_a_client_id(self) -> None:
-        """A8/R5: a live executor adopts only hydra-owned orders — a leg without a
-        client id (the user's) is never hijacked into hydra's protective group."""
+        """A8/R5: a live executor adopts only hydra-owned orders — a leg without hydra's
+        ``hyd-`` client id prefix (the user's) is never hijacked into hydra's group."""
 
         def stop_leg(order_id: int, client_id: str | None) -> dict[str, Any]:
             info: dict[str, Any] = {
@@ -892,7 +892,9 @@ class TestLiveGroups:
 
         ex = FakeLiveExecutor(
             [_position("BTCUSDT", "0.01")],
-            normalize_open_orders([stop_leg(21, None), stop_leg(22, "hydra-7a")]),
+            normalize_open_orders(
+                [stop_leg(21, None), stop_leg(22, "hyd-1f2e3d4a5b6c7d8e9f0a1b2c3d4e5f6a")]
+            ),
             exchange_client=object(),
         )
         protect = _manager(ex)
@@ -901,6 +903,40 @@ class TestLiveGroups:
 
         group = protect.armed("BTCUSDT")
         assert group is not None and group.order_id == "22"  # hydra's, not the user's
+
+    async def test_live_adopt_leaves_an_unprefixed_user_order_and_heals_the_gap(self) -> None:
+        """A user order carrying some other client id is not hydra's: leave it, arm our own."""
+
+        def user_leg() -> dict[str, Any]:
+            return {
+                "info": {
+                    "symbol": "BTCUSDT",
+                    "orderId": 21,
+                    "orderListId": "-1",
+                    "price": "0.00000000",
+                    "origQty": "0.01000000",
+                    "status": "NEW",
+                    "type": "STOP_LOSS",
+                    "side": "SELL",
+                    "stopPrice": "98.00000000",
+                    "trailingDelta": "0",
+                    "clientOrderId": "binance-auto-xyz",
+                }
+            }
+
+        ex = FakeLiveExecutor(
+            [_position("BTCUSDT", "0.01")],
+            normalize_open_orders([user_leg()]),
+            exchange_client=object(),
+        )
+        protect = _manager(ex)
+
+        await protect.adopt(["BTCUSDT"])
+
+        # the user's order was left alone and hydra armed its OWN stop over the gap
+        assert ex.calls and ex.calls[0]["side"] == "SELL"
+        group = protect.armed("BTCUSDT")
+        assert group is not None and group.order_id != "21"
 
     async def test_live_adopt_leaves_a_client_id_less_user_order_and_heals_the_gap(
         self,

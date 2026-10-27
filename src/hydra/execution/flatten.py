@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from hydra.core.types import Direction, OrderRequest, OrderType, Side, Symbol
+from hydra.execution.errors import SubmitUnknownError
+from hydra.execution.paper_trading import (
+    InsufficientBalanceError,
+    LedgerInvariantError,
+    OrderRejectedError,
+    PaperSessionHaltedError,
+)
 
 if TYPE_CHECKING:
     from hydra.execution.session_wiring import SessionRuntime
@@ -14,6 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FLATTEN_TAG = "flatten"
+_DRAIN_SWEEPS = 3  # the bounded fill drain: ~2-3 sweeps / 10-15s at the 5 s poll interval
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,8 +35,12 @@ class FlattenResult:
 async def flatten_session(runtime: SessionRuntime, reason: str = FLATTEN_TAG) -> FlattenResult:
     """Cancel every resting order of the session, sell every holding reduce-only, re-check.
 
-    Each SELL goes through the OrderManager (fill event, risk, WS, metrics). If it cannot (no
-    mark, halted ledger), the executor's own ``flatten`` exits and its fills are published.
+    Each SELL goes through the OrderManager (fill event, risk, WS, metrics). The executor's
+    own ``flatten`` is a fallback ONLY for definitive pre-wire rejections — on an unknown
+    submit outcome it must never fire, because the first sell may rest on the exchange and a
+    second sell of the same lot spends money the session no longer owns (F4); the unknown is
+    recorded, the drain books the landed sell if it made it, and whatever remains is reported
+    honestly through ``positions_at_stop``.
     """
     session = runtime.session
     executor = runtime.executor
@@ -69,7 +83,13 @@ async def flatten_session(runtime: SessionRuntime, reason: str = FLATTEN_TAG) ->
                         tag=reason,
                     )
                 )
-            except Exception as exc:
+            except (
+                OrderRejectedError,
+                InsufficientBalanceError,
+                PaperSessionHaltedError,
+                LedgerInvariantError,
+            ) as exc:
+                # pre-wire definitive refusals (a halted paper ledger's flatten is the closer)
                 logger.warning(
                     "Reduce-only flatten of %s in %s failed (%s); using the executor's flatten",
                     symbol,
@@ -77,6 +97,28 @@ async def flatten_session(runtime: SessionRuntime, reason: str = FLATTEN_TAG) ->
                     exc,
                 )
                 await _executor_flatten(runtime, symbol, failures)
+            except SubmitUnknownError as exc:
+                # the sell may rest: never a second sell of the same lot (F4)
+                logger.error(
+                    "Reduce-only flatten of %s in %s has an unknown outcome (%s);"
+                    " the position will be reported as remaining",
+                    symbol,
+                    session.session_id,
+                    exc,
+                )
+                failures.append(f"{symbol}: flatten sell outcome unknown ({exc})")
+            except Exception as exc:
+                # not a definitive pre-wire rejection either: report, never re-sell (F4)
+                logger.error(
+                    "Reduce-only flatten of %s in %s failed (%s);"
+                    " the position will be reported as remaining",
+                    symbol,
+                    session.session_id,
+                    exc,
+                )
+                failures.append(f"{symbol}: flatten sell failed ({exc})")
+
+    await _drain_live_fills(runtime)
 
     remaining = 0
     for symbol in session.symbols:
@@ -95,6 +137,38 @@ async def flatten_session(runtime: SessionRuntime, reason: str = FLATTEN_TAG) ->
             "; ".join(failures) or "no error reported",
         )
     return FlattenResult(positions_remaining=remaining, failures=tuple(failures))
+
+
+async def _drain_live_fills(runtime: SessionRuntime) -> None:
+    """A live executor's sells fill on the exchange, not in the local ledger: drain the
+    landed fills, retrying within a bounded wait (F10), so positions_at_stop reports the
+    ledger's truth rather than a REST-lagged pre-fill state."""
+    executor = runtime.executor
+    collect = getattr(executor, "collect_exchange_fills", None)
+    if collect is None:
+        return
+    symbols = list(runtime.session.symbols)
+    interval = float(getattr(executor, "poll_interval", 5.0) or 5.0)
+    deadline = time.monotonic() + _DRAIN_SWEEPS * interval
+    while True:
+        try:
+            for fill in await collect(symbols):
+                await runtime.om.on_external_fill(fill)
+        except Exception as exc:
+            logger.warning("Draining live fills during flatten of %s failed: %s", FLATTEN_TAG, exc)
+        if time.monotonic() >= deadline or not await _any_position(runtime, symbols):
+            return
+        await asyncio.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+
+
+async def _any_position(runtime: SessionRuntime, symbols: list[str]) -> bool:
+    for symbol in symbols:
+        try:
+            if any(p.quantity > 0 for p in await runtime.executor.get_positions(symbol)):
+                return True
+        except Exception:
+            return True  # unreadable: keep draining until the wait exhausts
+    return False
 
 
 async def _executor_flatten(runtime: SessionRuntime, symbol: str, failures: list[str]) -> None:

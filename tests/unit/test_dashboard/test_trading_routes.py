@@ -121,7 +121,7 @@ class TestStartSession:
     @pytest.mark.parametrize(
         ("setup", "body", "status", "code", "state"),
         [
-            ("ok", {"trading_mode": "live"}, 403, "live_trading_disabled", "not_implemented"),
+            ("ok", {"trading_mode": "live"}, 409, "live_not_armed", "invalid"),
             ("bybit", {}, 400, "unsupported_venue", "invalid"),
             ("futures", {}, 400, "unsupported_venue", "invalid"),
             ("dca", {}, 400, "strategy_unsupported", "not_implemented"),

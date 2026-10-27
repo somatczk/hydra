@@ -24,10 +24,22 @@ class UnsupportedVenueError(ValueError):
     code = "unsupported_venue"
 
 
-class LiveTradingDisabledError(PermissionError):
-    """Live trading is disabled until P3."""
+class LiveNotArmedError(RuntimeError):
+    """The ``live_armed`` system_config row is absent or off: no live session may start."""
 
-    code = "live_trading_disabled"
+    code = "live_not_armed"
+
+
+class LiveCredentialsError(RuntimeError):
+    """No stored, decryptable, environment-validated credentials for the live venue."""
+
+    code = "live_credentials_missing"
+
+
+class LiveCapitalUnavailableError(RuntimeError):
+    """``system_config.live_capital`` is missing or unusable; there is no live allocation."""
+
+    code = "live_capital_missing"
 
 
 class UnsupportedStrategyError(ValueError):
@@ -68,3 +80,23 @@ class ConfigReloadRefusedError(ValueError):
     def __init__(self, changed_fields: list[str]) -> None:
         super().__init__(f"restart required to change: {', '.join(changed_fields)}")
         self.changed_fields = changed_fields
+
+
+class SubmitUnknownError(RuntimeError):
+    """A submit timed out or the network failed mid-call: the order may rest; never resubmit.
+
+    The reconciler resolves the outcome by ``client_order_id`` (seam #8 carries it as a
+    structured envelope field, not message text).
+    """
+
+    code = "order_submit_unknown"
+
+    def __init__(self, client_order_id: str, message: str) -> None:
+        super().__init__(f"{message} (client_order_id {client_order_id})")
+        self.client_order_id = client_order_id
+
+
+class ExchangeRateLimitedError(RuntimeError):
+    """The exchange refused the call with a rate limit or temporary ban (418/429)."""
+
+    code = "exchange_rate_limited"

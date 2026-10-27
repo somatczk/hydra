@@ -90,7 +90,7 @@ _INSERT_TRADE = """
     INSERT INTO trades
         (symbol, side, price, quantity, fee, pnl, net_pnl, strategy_id, exchange_id,
          timestamp, source, session_id, order_id, fill_seq, liquidity, reason, order_type)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'paper', $11, $12, $13, $14, $15, $16)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $17, $11, $12, $13, $14, $15, $16)
     ON CONFLICT (session_id, fill_seq) WHERE fill_seq IS NOT NULL DO NOTHING
 """
 
@@ -98,7 +98,7 @@ _UPSERT_POSITION = """
     INSERT INTO positions
         (strategy_id, session_id, exchange_id, symbol, direction, quantity, avg_entry_price,
          unrealized_pnl, realized_pnl, source, updated_at)
-    VALUES ($1, $2, $3, $4, 'LONG', $5, $6, $7, $8, 'paper', now())
+    VALUES ($1, $2, $3, $4, 'LONG', $5, $6, $7, $8, $9, now())
     ON CONFLICT (session_id, symbol) DO UPDATE SET
         direction = EXCLUDED.direction,
         quantity = EXCLUDED.quantity,
@@ -112,7 +112,7 @@ _INSERT_SNAPSHOT = """
     INSERT INTO balance_snapshots
         (timestamp, total_value, unrealized_pnl, realized_pnl, drawdown_pct, peak_value,
          source, session_id)
-    VALUES ($1, $2, $3, $4, $5, $6, 'paper', $7)
+    VALUES ($1, $2, $3, $4, $5, $6, $8, $7)
 """
 
 
@@ -137,8 +137,14 @@ async def save(
     positions: Sequence[PositionRow] = (),
     flat_symbols: Sequence[str] = (),
     snapshot: SnapshotRow | None = None,
+    *,
+    source: str = "paper",
 ) -> None:
-    """Write the account, its new trades, positions and an optional snapshot atomically."""
+    """Write the account, its new trades, positions and an optional snapshot atomically.
+
+    *source* labels the trades/positions/snapshot rows (``'paper'`` or ``'live'``) so the
+    portfolio and relay reads flow unchanged over live fills (seam #6).
+    """
     async with conn.transaction():
         status = await conn.execute(
             _UPSERT_ACCOUNT,
@@ -173,6 +179,7 @@ async def save(
                 t.liquidity,
                 t.reason,
                 t.order_type,
+                source,
             )
         for p in positions:
             await conn.execute(
@@ -185,6 +192,7 @@ async def save(
                 p.avg_entry_price,
                 p.unrealized_pnl,
                 p.realized_pnl,
+                source,
             )
         for symbol in flat_symbols:
             await conn.execute(
@@ -202,6 +210,7 @@ async def save(
                 snapshot.drawdown_pct,
                 snapshot.peak_value,
                 account.session_id,
+                source,
             )
 
 

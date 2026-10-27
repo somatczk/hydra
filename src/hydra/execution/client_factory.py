@@ -1,6 +1,8 @@
 """The only place that constructs exchange clients, executors and feed clients on the session path.
 
-P1 accepts Binance SPOT only (D10); live executors are refused until P3.
+P3-A opens the live path behind the service-layer armed gate: ``build_trading_client`` builds
+the keyed client from stored credentials and ``build_live_executor`` the live session executor
+(Binance SPOT only, D10).
 """
 
 from __future__ import annotations
@@ -9,16 +11,17 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from hydra.core.logging import get_logger
 from hydra.core.types import ExchangeId, MarketType
 from hydra.data.storage import MarketDataRepository
-from hydra.execution.errors import LiveTradingDisabledError, UnsupportedVenueError
+from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.paper_trading import PaperTradingExecutor, SpotMarketRules
 
 if TYPE_CHECKING:
     from hydra.execution.exchange_client import ExchangeClient
+    from hydra.execution.live_executor import LiveTradingExecutor
 
 logger = get_logger(__name__)
 
@@ -78,6 +81,21 @@ def build_readonly_client(
     )
 
 
+def build_trading_client(
+    exchange_id: str, stored_creds: Mapping[str, Any], *, testnet: bool
+) -> ExchangeClient:
+    """The keyed live client (orders, trades, balance); same class the read-only path uses."""
+    from hydra.execution.exchange_client import ExchangeClient
+
+    eid = validate_venue(exchange_id, MarketType.SPOT)
+    return ExchangeClient(
+        exchange_id=eid,
+        config=map_credentials(stored_creds),
+        testnet=testnet,
+        market_type=MarketType.SPOT,
+    )
+
+
 def build_paper_executor(
     exchange_id: ExchangeId,
     initial_balances: dict[str, Decimal],
@@ -97,10 +115,41 @@ def build_paper_executor(
     )
 
 
-def build_live_executor(exchange_id: str, config: Mapping[str, Any] | None = None) -> NoReturn:
-    """Live trading is disabled until P3; nothing is constructed."""
-    raise LiveTradingDisabledError(
-        f"live trading on {exchange_id} is disabled until P3 (paper only in P1)"
+def build_live_executor(
+    exchange_id: str,
+    *,
+    client: Any,
+    market_rules: Mapping[str, SpotMarketRules],
+    db_pool: Any,
+    strategy_id: str,
+    session_id: str,
+    initial_quote: Decimal,
+    poll_interval: float = 5.0,
+) -> LiveTradingExecutor:
+    """Create the live executor for one session over the keyed *client* (venue-validated).
+
+    *market_rules* must be real ``MarketRules``: the protective ladder needs tick rounding,
+    lot flooring and the TRAILING_DELTA bounds, not just the paper pre-check trio. Binance
+    SPOT is quote-USDT only (D10), so the sleeve seeds USDT.
+    """
+    from hydra.execution.live_executor import LiveTradingExecutor
+    from hydra.risk.market_rules import MarketRules
+
+    eid = validate_venue(exchange_id, MarketType.SPOT)
+    bad = sorted(k for k, v in market_rules.items() if not isinstance(v, MarketRules))
+    if bad:
+        raise ValueError(f"live trading needs full MarketRules for: {', '.join(bad)}")
+    if db_pool is None:
+        raise ValueError("a live session needs the database (order ledger and credentials)")
+    return LiveTradingExecutor(
+        client,
+        exchange_id=eid,
+        initial_balances={"USDT": initial_quote},
+        db_pool=db_pool,
+        strategy_id=strategy_id,
+        session_id=session_id,
+        market_rules=market_rules,
+        poll_interval=poll_interval,
     )
 
 
@@ -234,6 +283,7 @@ def bars_repository(db_pool: Any) -> MarketDataRepository | None:
 
 
 MarketsLoader = Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]]
+TradingClientFactory = Callable[[str, Mapping[str, Any], bool], Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +292,8 @@ class ClientFactory:
 
     Production uses the public Binance spot clients and the ``ts.ohlcv_1m`` repository; tests
     and the paper smoke inject fakes. The REST client comes from the shared refcounted pool
-    (S10b); the WebSocket client stays per feed.
+    (S10b); the WebSocket client stays per feed. ``trading_client_factory`` builds the keyed
+    live client from stored credentials — the seam the live tests use to inject the fake.
     """
 
     ws_factory: Callable[[str], Callable[[], Any]] = feed_exchange_factory
@@ -250,3 +301,6 @@ class ClientFactory:
     markets_loader: MarketsLoader | None = None
     repository_factory: Callable[[Any], MarketDataRepository | None] = bars_repository
     history_window: int = 1000
+    trading_client_factory: TradingClientFactory = lambda eid, creds, testnet: build_trading_client(
+        eid, creds, testnet=testnet
+    )

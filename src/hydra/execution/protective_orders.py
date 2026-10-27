@@ -227,9 +227,11 @@ class ProtectiveOrderManager:
         """After a restore: take over the executor's resting SELL protection, arm any gap.
 
         A live executor's resting SELLs are adopted only when they carry hydra's own
-        ``client_order_id`` (R5: the user's orders are never hijacked — a later disarm
+        ``hyd-`` client id prefix (R5: the user's orders are never hijacked — a later disarm
         would cancel them); paper orders are all hydra's, so paper adopt is unchanged.
         """
+        from hydra.execution.live_orders import CLIENT_ORDER_ID_PREFIX
+
         live = getattr(self._executor, "exchange_client", None) is not None
         for symbol in symbols:
             position = await self._position(symbol)
@@ -238,7 +240,11 @@ class ProtectiveOrderManager:
             resting = [
                 o
                 for o in await self._executor.fetch_open_orders(symbol)
-                if str(o.get("side")) == "SELL" and (not live or o.get("client_order_id"))
+                if str(o.get("side")) == "SELL"
+                and (
+                    not live
+                    or str(o.get("client_order_id") or "").startswith(CLIENT_ORDER_ID_PREFIX)
+                )
             ]
             if resting:
                 order = resting[0]
@@ -300,7 +306,11 @@ class ProtectiveOrderManager:
                 "SELL",
                 OrderType.TRAILING_STOP,
                 qty,
-                params={"trail_pct": str(spec.trailing_pct)},
+                params={
+                    "trail_pct": str(spec.trailing_pct),
+                    "tag": PROTECTIVE_TAG,
+                    "reduce_only": True,
+                },
             )
             return self._group_from_response(symbol, OrderType.TRAILING_STOP, qty, spec, resp)
         if spec.stop_loss is None:

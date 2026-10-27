@@ -572,7 +572,7 @@ async def test_only_binance_paper_sessions_start(romulus_env: str, strategies_di
         live = await eng.client.post(
             "/api/trading/sessions", json={"strategy_id": STRATEGY_ID, "trading_mode": "live"}
         )
-        assert live.status_code == 403
-        assert live.json()["detail"]["code"] == "live_trading_disabled"
+        assert live.status_code == 409
+        assert live.json()["detail"]["code"] == "live_not_armed"
         assert await eng.fetch("SELECT id FROM trading_sessions") == []
         assert (await eng.client.get("/readyz")).status_code == 200
