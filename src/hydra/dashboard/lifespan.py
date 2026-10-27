@@ -1,14 +1,18 @@
 """Engine startup and shutdown.
 
 Startup order: config, logging, credential key, DB pool, Alembic migrations, stored credentials,
-system config, SessionManager (``startup()``: risk state, recovery, display rows) with its
-``LocalTrader`` backend on ``app.state.trader``, MCP mount (only when ``HYDRA_MCP_TOKEN`` is set:
-no token, no ``/mcp`` surface), HealthMonitor (first readiness run; ``/livez`` turns green).
-Shutdown closes the MCP session manager, unmounts ``/mcp`` and resets ``app.state.mcp`` (the
-session manager is single-use, so a re-entered lifespan remounts a fresh transport instead of
-finding the closed mount shadowing it), then stops the monitor. Any startup error propagates, so
-uvicorn exits non-zero instead of serving without a schema or a key. Without DATABASE_URL (dev
-only) there is no pool, no migration and no key requirement. ``app.state.session_clients`` (a
+system config, then one of two modes behind the same routes: with ``trader.url`` set (the D5
+process split) a :class:`~hydra.dashboard.trader_client.RemoteTrader` is bound on
+``app.state.trader`` and no ``SessionManager`` is ever constructed in this process; unset, the
+single-process engine starts here (``SessionManager.startup()``: risk state, recovery, display
+rows) with its ``LocalTrader`` backend. Then the MCP mount (only when ``HYDRA_MCP_TOKEN`` is set:
+no token, no ``/mcp`` surface) and the HealthMonitor (first readiness run; ``/livez`` turns
+green — the engine-side full set, or the split set with the remote-trader check). Shutdown closes
+the MCP session manager, unmounts ``/mcp`` and resets ``app.state.mcp`` (the session manager is
+single-use, so a re-entered lifespan remounts a fresh transport instead of finding the closed
+mount shadowing it), then stops the monitor. Any startup error propagates, so uvicorn exits
+non-zero instead of serving without a schema or a key. Without DATABASE_URL (dev only) there is
+no pool, no migration and no key requirement. ``app.state.session_clients`` (a
 ``ClientFactory``), when set before startup, replaces the public exchange clients of every
 session, and ``app.state.health_monitor_factory`` builds the ``HealthMonitor`` (the paper smoke
 test injects its fakes and a monitor clock there).
@@ -63,7 +67,15 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             await _run_migrations(dsn)
             await _load_exchange_credentials(app)
             await _load_system_config(app)
-        await _init_session_manager(app, cfg, clients)
+        if cfg.trader.url is not None:
+            # the split (D5): the trader process owns the engine; this process never
+            # constructs a SessionManager, and every engine op goes through RemoteTrader
+            from hydra.dashboard.trader_client import RemoteTrader
+
+            app.state.session_manager = None
+            app.state.trader = RemoteTrader(cfg)
+        else:
+            await _init_session_manager(app, cfg, clients)
         if cfg.mcp_token is not None:
             from hydra.dashboard.mcp import mount_mcp
 
@@ -78,6 +90,8 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
         _unmount_mcp(app)
         await _stop_health_monitor(app)
         await _shutdown_session_manager(app)
+        await _close_remote_trader(app)
+        await _stop_trades_relay(app)
         await market_data.close_market_clients(app)
         await _close_db_pool(app)
 
@@ -178,6 +192,21 @@ async def _init_session_manager(
     await mgr.startup()
     app.state.session_manager = mgr
     app.state.trader = LocalTrader(app.state.db_pool, mgr)
+
+
+async def _close_remote_trader(app: FastAPI) -> None:
+    """Close the split-mode backend's HTTP client (no-op in single-process mode)."""
+    trader = getattr(app.state, "trader", None)
+    aclose = getattr(trader, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
+async def _stop_trades_relay(app: FastAPI) -> None:
+    """Stop the /ws/trades relay started by the first trades connection, if any."""
+    relay = getattr(app.state, "trades_relay", None)
+    if relay is not None:
+        await relay.stop()
 
 
 async def _start_health_monitor(app: FastAPI) -> None:

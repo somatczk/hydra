@@ -1163,12 +1163,30 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         if self._stale_cleanup_task is None or self._stale_cleanup_task.done():
             self._stale_cleanup_task = asyncio.create_task(self._stale_order_cleanup_loop())
 
+    async def _apply_db_kill_switch_latch(self) -> None:
+        """R7: apply the DB kill-switch latch — once — when memory has not latched it.
+
+        The API latches the switch in the database when the trader process cannot be
+        reached; this loop applies it within one 60 s tick. The application is
+        idempotent by construction: ``stop_all`` latches the in-memory services, so
+        later ticks with the same DB row never sweep again.
+        """
+        pool = self._db_pool
+        if pool is None or self.kill_switch_active():
+            return
+        latched = await session_store.kill_switch_latched(pool)
+        if latched:
+            logger.warning("Kill switch latched in the database; applying stop_all")
+            await self.stop_all(actor="db-latch", reason="kill switch latched in the database")
+
     async def _stale_order_cleanup_loop(self) -> None:
-        """Cancel stale non-protective orders of running sessions every minute, and
-        reconcile every running live session (the A2 drift detector)."""
+        """Cancel stale non-protective orders of running sessions every minute, apply
+        the DB kill-switch latch (R7), and reconcile every running live session (the
+        A2 drift detector)."""
         while True:
             try:
                 await asyncio.sleep(60)
+                await self._apply_db_kill_switch_latch()
                 await self.retry_unpersisted()
                 await self._reconcile_live_sessions()
                 for session in list(self._sessions.values()):

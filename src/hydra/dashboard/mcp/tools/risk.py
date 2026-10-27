@@ -26,7 +26,10 @@ from hydra.services.approvals import (
     write_approval_event,
 )
 from hydra.services.errors import ServiceError
-from hydra.services.sessions import KillSwitchNotPersistedError
+from hydra.services.sessions import (
+    KillSwitchNotPersistedError,
+    activate_kill_switch_fail_safe,
+)
 
 # ---------------------------------------------------------------------------
 # Reads (mirroring routes/risk.py)
@@ -85,7 +88,9 @@ async def kill_switch_on(reason: str = "kill switch (mcp)") -> str:
     """
     try:
         reason = _Reason(reason=reason).reason
-        body = await _deps.trader().activate_kill_switch(APPROVAL_ACTOR, reason)
+        body = await activate_kill_switch_fail_safe(
+            _deps.trader(), _deps.db_pool(), APPROVAL_ACTOR, reason
+        )
     except ServiceError as exc:
         if isinstance(exc, KillSwitchNotPersistedError):
             detail = exc.detail if isinstance(exc.detail, dict) else {}

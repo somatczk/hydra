@@ -54,6 +54,7 @@ from hydra.risk.state import RiskStateUnavailableError
 from hydra.services.errors import (
     DB_ERRORS,
     ServiceError,
+    db_errors,
     error_detail,
     require_pool,
     service_error,
@@ -485,6 +486,69 @@ def live_order_row(row: LiveOrderRecord) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Kill switch
 # ---------------------------------------------------------------------------
+
+LATCH_APPLY_WINDOW_S = 60
+
+
+async def latch_kill_switch_db(pool: Any, actor: str, reason: str) -> None:
+    """D5's fail-safe: latch the switch in the database when the trader cannot be reached.
+
+    The write is the durable half — the same ``risk_config`` row the engine's RiskService
+    latches, plus its audit event — and the trader's 60 s cleanup loop applies it
+    (``stop_all``) within :data:`LATCH_APPLY_WINDOW_S` seconds. Scope ``global`` is the
+    switch's own row, so the event names the switch, not one ledger.
+    """
+    require_pool(pool)
+    async with db_errors("latching the kill switch"), pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE risk_config SET kill_switch_active = TRUE, updated_at = now() "
+            "WHERE scope = 'global'"
+        )
+        if str(result).strip() == "UPDATE 0":
+            raise service_error(
+                503,
+                "risk_config_missing",
+                "No risk_config row for scope 'global'",
+                "unavailable",
+            )
+        await conn.execute(
+            "INSERT INTO risk_events (scope, kind, tier, actor, reason, details) "
+            "VALUES ('global', 'kill_switch_on', NULL, $1, $2, $3::jsonb)",
+            actor,
+            reason,
+            json.dumps({"persisted": True, "source": "db_latch"}),
+        )
+
+
+async def activate_kill_switch_fail_safe(
+    backend: Any, pool: Any, actor: str, reason: str
+) -> dict[str, Any]:
+    """Activate through the backend; on ``engine_unreachable`` latch in the DB and 503.
+
+    The 503 answers honestly: the latch is durable and the trader applies it within one
+    cleanup tick, but this call does NOT report sessions stopped — the engine never
+    answered, so nobody knows whether it is still running.
+    """
+    try:
+        body: dict[str, Any] = await backend.activate_kill_switch(actor, reason)
+        return body
+    except ServiceError as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        if exc.status_code != 503 or detail.get("code") != "engine_unreachable":
+            raise
+        await latch_kill_switch_db(pool, actor, reason)
+        raise ServiceError(
+            503,
+            error_detail(
+                "engine_unreachable",
+                "The trading engine could not be reached; the kill switch was latched in "
+                f"the database and the trader applies it within {LATCH_APPLY_WINDOW_S} "
+                "seconds",
+                "unavailable",
+                latched=True,
+                apply_window_s=LATCH_APPLY_WINDOW_S,
+            ),
+        ) from exc
 
 
 async def activate_kill_switch(mgr: Any, actor: str, reason: str) -> dict[str, Any]:

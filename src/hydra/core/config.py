@@ -252,6 +252,26 @@ class McpConfig(_Section):
         return _split_csv(v)
 
 
+class TraderConfig(_Section):
+    """The trader/api process split (D5).
+
+    ``url`` points the dashboard API at the trader's internal bearer-gated API
+    (``HYDRA_TRADER__URL``): unset is today's single process, set is the two-process layout
+    (the API serves the UI and MCP, the trader holds the sessions). ``timeout_s`` bounds
+    every remote call.
+    """
+
+    url: str | None = None
+    timeout_s: float = Field(10.0, gt=0)
+
+    @field_validator("url")
+    @classmethod
+    def _http_url(cls, v: str | None) -> str | None:
+        if v is not None and not v.startswith(("http://", "https://")):
+            raise ValueError("trader.url must be an http:// or https:// URL of the trader process")
+        return v
+
+
 class MlConfig(_Section):
     """Machine learning settings."""
 
@@ -290,6 +310,7 @@ class HydraConfig(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     ml: MlConfig = Field(default_factory=MlConfig)
+    trader: TraderConfig = Field(default_factory=TraderConfig)
 
     database_url: SecretStr | None = Field(None, validation_alias="DATABASE_URL")
     redis_url: SecretStr | None = Field(None, validation_alias="REDIS_URL")
@@ -333,6 +354,15 @@ class HydraConfig(BaseSettings):
         if v is not None and len(v.get_secret_value()) < 32:
             raise ValueError("HYDRA_MCP_TOKEN must be at least 32 characters")
         return v
+
+    @model_validator(mode="after")
+    def _trader_url_needs_token(self) -> HydraConfig:
+        if self.trader.url is not None and self.api_token is None:
+            raise ValueError(
+                "HYDRA_TRADER__URL requires HYDRA_API_TOKEN: the trader's internal API is "
+                "bearer-gated with the same token"
+            )
+        return self
 
     @model_validator(mode="after")
     def _token_mode_has_token(self) -> HydraConfig:
