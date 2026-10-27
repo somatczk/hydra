@@ -5,11 +5,13 @@ P1 accepts Binance SPOT only (D10); live executors are refused until P3.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
+from hydra.core.logging import get_logger
 from hydra.core.types import ExchangeId, MarketType
 from hydra.data.storage import MarketDataRepository
 from hydra.execution.errors import LiveTradingDisabledError, UnsupportedVenueError
@@ -17,6 +19,8 @@ from hydra.execution.paper_trading import PaperTradingExecutor, SpotMarketRules
 
 if TYPE_CHECKING:
     from hydra.execution.exchange_client import ExchangeClient
+
+logger = get_logger(__name__)
 
 ALLOWED_VENUES: frozenset[tuple[str, MarketType]] = frozenset({("binance", MarketType.SPOT)})
 
@@ -121,14 +125,107 @@ def rest_exchange_factory(exchange_id: str) -> Any:
     return cls({"enableRateLimit": True, "options": dict(SPOT_OPTIONS)})
 
 
-async def public_markets_loader(exchange_id: str) -> list[Mapping[str, Any]]:
-    """Public spot ``load_markets`` for ``MarketRulesCache`` (no keys)."""
-    client = rest_exchange_factory(exchange_id)
-    try:
-        markets = await client.load_markets()
-    finally:
-        await client.close()
-    return list(markets.values())
+type PoolKey = tuple[str, str | None]
+type RestPoolFactory = Callable[[str, str | None], Any]
+
+
+def _public_rest_factory(exchange_id: str, creds: str | None) -> Any:
+    """The pool's default construction: public (no-keys) spot clients only (S10b).
+
+    A non-``None`` credential identity is a distinct pool key, but building the
+    trade-credentials client is P3-A/P3-B's seam, not this PR's.
+    """
+    if creds is not None:
+        raise NotImplementedError("trade-credentials REST entries arrive with P3-A/P3-B")
+    return rest_exchange_factory(exchange_id)
+
+
+@dataclass(eq=False, slots=True)
+class _PoolEntry:
+    key: PoolKey
+    client: Any
+    refs: int
+
+
+class RestHandle:
+    """One reference on a pooled REST client; ``client`` is the caller's lease object."""
+
+    __slots__ = ("_entry", "_pool", "_released", "client")
+
+    def __init__(self, pool: SharedRestClients, entry: _PoolEntry) -> None:
+        self._pool = pool
+        self._entry = entry
+        self.client: Any = entry.client
+        self._released = False
+
+    async def release(self) -> None:
+        """Drop this reference; the last release closes the client.
+
+        Raises ``RuntimeError`` on a second release of the same handle — a leak of
+        refcount bugs beats hiding one. Cancellation-safe: the reference drops
+        before the first suspension, so a cancelled release never leaks it.
+        """
+        if self._released:
+            raise RuntimeError("RestHandle.release() called twice")
+        self._released = True
+        await self._pool._release(self._entry)
+
+
+class SharedRestClients:
+    """Process-wide refcounted REST client pool, keyed by (exchange id, credential identity).
+
+    The first reference constructs the client through *rest_factory* (venue-validated for
+    the public entries), every later reference reuses it, and the last release closes it.
+    The public entry (``creds=None``) and a credentials-scoped entry of the same exchange
+    are distinct keys that coexist; constructing the trade-credentials client itself is
+    P3-A/P3-B's to add behind the same *rest_factory* seam. Releases never wait on the
+    lock: the decrement is synchronous, so a cancelled release cannot leak a reference.
+    """
+
+    def __init__(self, rest_factory: RestPoolFactory = _public_rest_factory) -> None:
+        self._factory = rest_factory
+        self._entries: dict[PoolKey, _PoolEntry] = {}
+        self._lock = asyncio.Lock()
+
+    async def handle(self, exchange_id: str, creds: str | None = None) -> RestHandle:
+        """Acquire the entry for ``(exchange_id, creds)``; constructing it on first use."""
+        key: PoolKey = (exchange_id, creds)
+        async with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = self._entries[key] = _PoolEntry(key, self._factory(exchange_id, creds), 0)
+            entry.refs += 1
+            return RestHandle(self, entry)
+
+    async def markets_loader(self, exchange_id: str) -> list[Mapping[str, Any]]:
+        """Public spot ``load_markets`` for ``MarketRulesCache`` through a pooled handle."""
+        handle = await self.handle(exchange_id)
+        try:
+            markets = await handle.client.load_markets()
+        finally:
+            await handle.release()
+        return list(markets.values())
+
+    async def _release(self, entry: _PoolEntry) -> None:
+        # Synchronous: a cancelled release must never be able to skip the decrement.
+        entry.refs -= 1
+        if entry.refs != 0:
+            return
+        self._entries.pop(entry.key, None)
+        try:
+            await self._close_quietly(entry)
+        except asyncio.CancelledError:
+            # The reference already dropped; finish the interrupted close.
+            await self._close_quietly(entry)
+            raise
+
+    async def _close_quietly(self, entry: _PoolEntry) -> None:
+        try:
+            await entry.client.close()
+        except Exception:
+            logger.warning(
+                "Pooled REST client close failed", exchange=entry.key[0], creds=entry.key[1]
+            )
 
 
 def bars_repository(db_pool: Any) -> MarketDataRepository | None:
@@ -143,12 +240,13 @@ MarketsLoader = Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]]
 class ClientFactory:
     """The exchange seams of a session: WebSocket feed, REST warm-up/gap fill, market rules.
 
-    Production uses the public Binance spot clients and the ``ts.ohlcv_1m`` repository; tests and
-    the paper smoke inject fakes.
+    Production uses the public Binance spot clients and the ``ts.ohlcv_1m`` repository; tests
+    and the paper smoke inject fakes. The REST client comes from the shared refcounted pool
+    (S10b); the WebSocket client stays per feed.
     """
 
     ws_factory: Callable[[str], Callable[[], Any]] = feed_exchange_factory
-    rest_factory: Callable[[str], Any] = rest_exchange_factory
-    markets_loader: MarketsLoader = public_markets_loader
+    rest_pool: SharedRestClients = field(default_factory=SharedRestClients)
+    markets_loader: MarketsLoader | None = None
     repository_factory: Callable[[Any], MarketDataRepository | None] = bars_repository
     history_window: int = 1000

@@ -378,7 +378,7 @@ def _real_clients(h: Harness) -> ClientFactory:
     fake = h.clients()
     return ClientFactory(
         ws_factory=fake.ws_factory,
-        rest_factory=fake.rest_factory,
+        rest_pool=fake.rest_pool,
         markets_loader=fake.markets_loader,
         repository_factory=bars_repository,
         history_window=fake.history_window,

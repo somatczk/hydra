@@ -31,7 +31,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from hydra.core import metrics
 from hydra.core.events import BarEvent, Event, FeedStatusEvent, PriceEvent
@@ -74,6 +74,34 @@ type RestFactory = Callable[[str], Any]
 type StreamKey = tuple[str, Timeframe]
 type StatusKey = tuple[str, Timeframe | None]
 type PersistRow = tuple[str, str, Timeframe, OHLCV]
+
+
+class RestPoolHandle(Protocol):
+    """A lease on a REST client; the concrete pool lives in ``execution.client_factory``."""
+
+    @property
+    def client(self) -> Any: ...
+
+    async def release(self) -> None: ...
+
+
+class RestPool(Protocol):
+    """The refcounted client pool the feed acquires from and releases back into (S10b)."""
+
+    def handle(self, exchange_id: str) -> Awaitable[RestPoolHandle]: ...
+
+
+@dataclass(slots=True)
+class _OwnedRestHandle:
+    """The feed-owned fallback when no pool is injected: releasing closes the client."""
+
+    client: Any
+
+    async def release(self) -> None:
+        if hasattr(self.client, "close"):
+            with contextlib.suppress(Exception):
+                await self.client.close()
+
 
 _EXCHANGE_SCOPE: StatusKey = ("", None)
 
@@ -227,7 +255,12 @@ class ExchangeFeedManager:
         Where closed bars are upserted and warm-up history is read; ``None`` disables both.
     rest_factory:
         Exchange id -> ccxt async REST instance for warm-up and gap fills. Defaults to a
-        rate-limited spot instance.
+        rate-limited spot instance. The feed owns this client (closing it with the feed);
+        pass ``rest_pool`` instead to share one process-wide client.
+    rest_pool:
+        A refcounted shared pool (``execution.client_factory.SharedRestClients``); the
+        feed acquires a handle per exchange and releases it on disconnect. Takes precedence
+        over ``rest_factory``.
     history_window:
         Bars returned per stream by ``warm_up`` (at least ``min_bars``, see ``window_for``).
     publish_replay:
@@ -247,6 +280,7 @@ class ExchangeFeedManager:
         *,
         repository: MarketDataRepository | None = None,
         rest_factory: RestFactory | None = None,
+        rest_pool: RestPool | None = None,
         history_window: int = 1000,
         publish_replay: bool = False,
         stale_after_bars: int = 2,
@@ -264,11 +298,12 @@ class ExchangeFeedManager:
         self._tasks: dict[str, list[asyncio.Task[None]]] = {}
         self._running: dict[ExchangeId, bool] = {}
         self._feeds: dict[str, _Feed] = {}
-        self._rest: dict[str, Any] = {}
+        self._rest_handles: dict[str, RestPoolHandle] = {}
         self._rest_markets: dict[str, dict[str, Any]] = {}
         self._warm_tails: dict[tuple[str, str, Timeframe], datetime] = {}
         self._repository = repository
         self._rest_factory = rest_factory or _default_rest_factory
+        self._rest_pool = rest_pool
         self._history_window = history_window
         self._publish_replay = publish_replay
         self._stale_after_bars = stale_after_bars
@@ -389,11 +424,14 @@ class ExchangeFeedManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        for instance in (self._exchanges.pop(exchange_id, None), self._rest.pop(exchange_id, None)):
+        for instance in (self._exchanges.pop(exchange_id, None),):
             if instance is not None and hasattr(instance, "close"):
                 with contextlib.suppress(Exception):
                     await instance.close()
         self._rest_markets.pop(exchange_id, None)
+        rest_handle = self._rest_handles.pop(exchange_id, None)
+        if rest_handle is not None:
+            await rest_handle.release()
 
         feed = self._feeds.pop(exchange_id, None)
         if feed is not None:
@@ -411,10 +449,9 @@ class ExchangeFeedManager:
         exchange_ids: list[ExchangeId] = list(self._running.keys())
         for eid in exchange_ids:
             await self.disconnect(eid)
-        for rest_id in list(self._rest):
-            rest = self._rest.pop(rest_id)
-            with contextlib.suppress(Exception):
-                await rest.close()
+        for rest_id in list(self._rest_handles):
+            handle = self._rest_handles.pop(rest_id)
+            await handle.release()
 
     # ------------------------------------------------------------------
     # Warm-up
@@ -551,14 +588,23 @@ class ExchangeFeedManager:
             with contextlib.suppress(Exception):
                 await old.close()
 
-    async def _rest_exchange(self, exchange_id: str) -> tuple[Any, dict[str, Any]]:
-        rest = self._rest.get(exchange_id)
-        if rest is None:
-            rest = self._rest[exchange_id] = self._rest_factory(exchange_id)
+    async def _ensure_rest(self, exchange_id: str) -> tuple[Any, dict[str, Any]]:
+        """The exchange's REST client (a pool handle; acquired on first use) and its markets."""
+        handle = self._rest_handles.get(exchange_id)
+        if handle is None:
+            if self._rest_pool is not None:
+                handle = await self._rest_pool.handle(exchange_id)
+            else:
+                handle = _OwnedRestHandle(self._rest_factory(exchange_id))
+            # Two concurrent cold fetches both acquire; the loser must not leak its reference.
+            existing = self._rest_handles.setdefault(exchange_id, handle)
+            if existing is not handle:
+                await handle.release()
+                handle = existing
         markets = self._rest_markets.get(exchange_id)
         if markets is None:
-            markets = self._rest_markets[exchange_id] = dict(await rest.load_markets())
-        return rest, markets
+            markets = self._rest_markets[exchange_id] = dict(await handle.client.load_markets())
+        return handle.client, markets
 
     async def _fetch_rest(
         self,
@@ -571,7 +617,7 @@ class ExchangeFeedManager:
         unified: str | None = None,
         max_retries: int = 5,
     ) -> list[OHLCV]:
-        rest, markets = await self._rest_exchange(exchange_id)
+        rest, markets = await self._ensure_rest(exchange_id)
         unified = unified or resolve_spot_symbol(markets, symbol, exchange_id)
         return await fetch_closed_bars(
             rest,

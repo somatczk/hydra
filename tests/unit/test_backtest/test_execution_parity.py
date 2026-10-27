@@ -28,7 +28,7 @@ from hydra.core.config import HydraConfig
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, MarketType, Symbol, Timeframe
 from hydra.data.bars import last_closed_open
-from hydra.execution.client_factory import ClientFactory
+from hydra.execution.client_factory import ClientFactory, SharedRestClients
 from hydra.execution.paper_trading import PaperFill, PaperTradingExecutor
 from hydra.execution.session_manager import SessionManager
 from hydra.risk.market_rules import MarketRulesCache
@@ -205,7 +205,7 @@ async def _paper(
         config=HydraConfig(),
         clients=ClientFactory(
             ws_factory=lambda _eid: FakeWsExchange,
-            rest_factory=lambda _eid: FakeRestExchange(rows),
+            rest_pool=SharedRestClients(rest_factory=lambda eid, creds: FakeRestExchange(rows)),
             markets_loader=_markets,
             repository_factory=lambda _pool: None,
         ),

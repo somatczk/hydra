@@ -147,7 +147,7 @@ class SessionRuntime:
             event_bus=self.bus,
             exchange_factories={self.exchange_id: clients.ws_factory(self.exchange_id)},
             repository=clients.repository_factory(db_pool),
-            rest_factory=clients.rest_factory,
+            rest_pool=clients.rest_pool,
             history_window=clients.history_window,
             publish_replay=True,
         )
