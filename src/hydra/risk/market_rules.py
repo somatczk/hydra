@@ -30,6 +30,24 @@ def _dec(value: Any) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _trailing_delta_bips(market: Mapping[str, Any]) -> tuple[Decimal, Decimal] | None:
+    """The SELL-stop trailing bounds (BIPS) from the raw TRAILING_DELTA filter.
+
+    A SELL STOP_LOSS trailing order is bounded by the ``minTrailingBelowDelta`` /
+    ``maxTrailingBelowDelta`` pair; ccxt has no unified limits field for it, so it is read
+    from ``info.filters``. None when the symbol has no filter.
+    """
+    filters = (market.get("info") or {}).get("filters") or []
+    for item in filters:
+        if not isinstance(item, Mapping) or item.get("filterType") != "TRAILING_DELTA":
+            continue
+        low = _dec(item.get("minTrailingBelowDelta"))
+        high = _dec(item.get("maxTrailingBelowDelta"))
+        if low is not None and high is not None:
+            return (low, high)
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class MarketRules:
     symbol: str
@@ -38,6 +56,7 @@ class MarketRules:
     min_notional: Decimal
     max_market_qty: Decimal | None = None
     price_tick: Decimal | None = None
+    trailing_delta_bips: tuple[Decimal, Decimal] | None = None
 
     @classmethod
     def from_ccxt_market(cls, market: Mapping[str, Any]) -> MarketRules:
@@ -56,6 +75,7 @@ class MarketRules:
             min_notional=_dec((limits.get("cost") or {}).get("min")) or Decimal("0"),
             max_market_qty=_dec((limits.get("market") or {}).get("max")),
             price_tick=_dec(precision.get("price")),
+            trailing_delta_bips=_trailing_delta_bips(market),
         )
 
     def floor_qty(self, qty: Decimal) -> Decimal:

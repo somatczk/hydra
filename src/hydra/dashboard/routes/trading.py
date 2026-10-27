@@ -53,12 +53,29 @@ class SessionResponse(BaseModel):
     created_by: str | None = None
 
 
+class ExchangeStopState(BaseModel):
+    """The A8-live exchange-side stop state of one position (pinned seam #3).
+
+    ``'Stop at {stop_price} on the exchange'`` only when ``state == 'confirmed'``; danger
+    copy ``'No exchange stop for {symbol}'`` on ``'missing'``; ``'unknown'`` shows as such.
+    """
+
+    state: Literal["confirmed", "missing", "unknown"]
+    kind: str | None = None
+    stop_price: float | None = None
+    take_profit: float | None = None
+    order_list_id: str | None = None
+    checked_at: str
+    error: str | None = None
+
+
 class PositionItem(BaseModel):
     symbol: str
     direction: str
     quantity: float
     avg_entry_price: float
     unrealized_pnl: float
+    exchange_stop: ExchangeStopState | None = None
 
 
 class TradeItem(BaseModel, extra="allow"):

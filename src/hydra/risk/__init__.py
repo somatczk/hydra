@@ -4,7 +4,6 @@ from __future__ import annotations
 
 __all__ = [
     "CircuitBreakerManager",
-    "ExchangeSafetyManager",
     "InMemoryRiskStateStore",
     "MarketRules",
     "MarketRulesCache",
@@ -18,7 +17,6 @@ __all__ = [
 
 _IMPORT_MAP: dict[str, tuple[str, str]] = {
     "CircuitBreakerManager": ("hydra.risk.circuit_breakers", "CircuitBreakerManager"),
-    "ExchangeSafetyManager": ("hydra.risk.exchange_safety", "ExchangeSafetyManager"),
     "InMemoryRiskStateStore": ("hydra.risk.state", "InMemoryRiskStateStore"),
     "MarketRules": ("hydra.risk.market_rules", "MarketRules"),
     "MarketRulesCache": ("hydra.risk.market_rules", "MarketRulesCache"),

@@ -61,7 +61,7 @@ not duplicate it here; update that table in the PR that changes a row.
   - `backtest`: runner, bar loader, fills, metrics, hyperopt, walk-forward, job queue (`jobs.py`),
     worker (`worker.py`, the `hydra-backtest-worker` container).
   - `execution`: SessionManager, OrderManager, paper executor, ExchangeClient.
-  - `risk`: pre-trade checks, sizing, circuit breakers, exchange safety.
+  - `risk`: pre-trade checks, sizing, circuit breakers.
   - `portfolio`: P&L, positions, reconciliation.
   - `ml`: features, serving, export, registry, drift, training.
   - `dashboard`: the FastAPI app, `routes/`, and `mcp/` (the MCP server, mounted at `/mcp/`
@@ -115,8 +115,10 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   pending approval, and every lifecycle transition is a best-effort `risk_events` `approval_*`
   row plus a `hydra.audit` line (nothing persists across a restart). Only `user`/`dev`
   principals can decide one.
-- Every paper entry gets a protective stop (strategy `risk:` block, 5 % default); no exchange-side stops yet (P3).
-  Only Binance SPOT is accepted (`client_factory.validate_venue`).
+- Every paper entry gets a protective stop (strategy `risk:` block, 5 % default). Exchange-side stop placement for
+  Binance spot exists (`execution/exchange_stops.py`: the OCO order-list + fallback ladder, `normalize_open_orders`,
+  the A8 verify and the dead-man gauge/alert); live sessions place real exchange stops once P3-A lands the live
+  executor. Only Binance SPOT is accepted (`client_factory.validate_venue`).
 - Probes (`src/hydra/dashboard/health.py`, `routes/health.py`): a `HealthMonitor` started last by the lifespan runs
   every 15 s and sets `hydra_ready{check}`, the per-session desired/supervised gauges and its heartbeat; `/readyz`
   serves its last result while it is at most 30 s old and never writes gauges. `/livez`

@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 import yaml
-from prometheus_client import generate_latest
+from prometheus_client import REGISTRY, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from hydra.core import metrics
@@ -174,3 +174,68 @@ def test_every_alert_has_a_firing_and_a_silent_promtool_case() -> None:
     alerts = set(_rules())
     assert alerts - fires == set(), "alerts without a firing case"
     assert alerts - silent == set(), "alerts without a non-firing case"
+
+
+# ---------------------------------------------------------------------------
+# The live protective gap (P3-B): rule/producer agreement and the gauge lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _gap(session_id: str) -> float | None:
+    return REGISTRY.get_sample_value(
+        "hydra_live_protective_gap",
+        {
+            "session_id": session_id,
+            "strategy_id": "saw",
+            "exchange_id": "binance",
+            "symbol": "BTCUSDT",
+        },
+    )
+
+
+def test_live_protective_gap_rule_matches_the_contract() -> None:
+    rules = _rules()
+    gap = rules["HydraLiveProtectiveGap"]
+    assert gap["expr"].strip() == "hydra_live_protective_gap == 1"
+    assert gap["for"] == "1m"
+    assert gap["labels"] == {"severity": "critical", "team": "trading"}
+    assert "dead-man checklist" in gap["annotations"]["description"]
+
+    (spec,) = [s for s in metrics.CONTRACT if s.name == "hydra_live_protective_gap"]
+    assert spec.kind == "gauge"
+    assert set(spec.labels) == {"session_id", "strategy_id", "exchange_id", "symbol"}
+    assert spec.samples == ("hydra_live_protective_gap",)
+
+
+def test_the_gap_gauge_sets_and_clears() -> None:
+    metrics.set_live_protective_gap("s1", "saw", "binance", "BTCUSDT", True)
+    assert _gap("s1") == 1.0
+
+    metrics.set_live_protective_gap("s1", "saw", "binance", "BTCUSDT", False)
+    assert _gap("s1") is None  # cleared, not zero: nothing restates the series
+
+
+def test_forget_session_keeps_the_gap_while_a_position_remains() -> None:
+    metrics.set_session_position("s1", "saw", "binance", "BTCUSDT", 1.0)
+    metrics.set_live_protective_gap("s1", "saw", "binance", "BTCUSDT", True)
+
+    metrics.forget_session("s1", "saw", "live")
+
+    assert _gap("s1") == 1.0  # R13: the unprotected remainder keeps paging
+
+
+def test_forget_session_clears_the_gap_when_nothing_is_held() -> None:
+    metrics.set_session_position("s2", "saw", "binance", "BTCUSDT", 0.0)
+    metrics.set_live_protective_gap("s2", "saw", "binance", "BTCUSDT", True)
+
+    metrics.forget_session("s2", "saw", "live")
+
+    assert _gap("s2") is None
+
+
+def test_forget_session_clears_the_gap_of_a_session_that_never_reported_positions() -> None:
+    metrics.set_live_protective_gap("s3", "saw", "binance", "BTCUSDT", True)
+
+    metrics.forget_session("s3", "saw", "live")
+
+    assert _gap("s3") is None

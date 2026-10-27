@@ -118,6 +118,9 @@ Contract (name: type, unit / labels / producer):
 - hydra_paper_persist_dirty: gauge, 1
   labels: session_id
   producer: P1-D/P1-E paper executor
+- hydra_live_protective_gap: gauge, 1
+  labels: session_id, strategy_id, exchange_id, symbol
+  producer: P3-B session_wiring live coverage hook
 - hydra_ready: gauge, 1
   labels: check
   producer: P1-G1 HealthMonitor
@@ -452,6 +455,14 @@ CONTRACT: tuple[MetricSpec, ...] = (
         ("session_id",),
     ),
     MetricSpec(
+        "hydra_live_protective_gap",
+        "gauge",
+        "1 while a live session holds a position with no confirmed exchange-side protective order",
+        "1",
+        "P3-B session_wiring live coverage hook",
+        ("session_id", "strategy_id", "exchange_id", "symbol"),
+    ),
+    MetricSpec(
         "hydra_ready",
         "gauge",
         "1 when a readiness check passes (db, migrations, sessions, feeds, risk)",
@@ -470,7 +481,8 @@ CONTRACT: tuple[MetricSpec, ...] = (
 
 _SPECS: dict[str, MetricSpec] = {spec.name: spec for spec in CONTRACT}
 _collectors: dict[str, Counter | Gauge | Histogram] = {}
-_session_positions: dict[str, set[tuple[str, str, str]]] = {}
+_session_positions: dict[str, dict[tuple[str, str, str], float]] = {}
+_live_gaps: dict[str, set[tuple[str, str, str]]] = {}
 _initialized: bool = False
 
 _wall_clock: Callable[[], float] = time.time
@@ -622,7 +634,7 @@ def set_session_position(
         session_id=session_id, strategy_id=strategy_id, exchange_id=exchange_id, symbol=symbol
     ).set(size)
     if not _muted.get():
-        _session_positions.setdefault(session_id, set()).add((strategy_id, exchange_id, symbol))
+        _session_positions.setdefault(session_id, {})[(strategy_id, exchange_id, symbol)] = size
 
 
 def update_portfolio(value: float, drawdown_ratio: float, daily_pnl: float) -> None:
@@ -844,13 +856,25 @@ def set_session_state(
 
 
 def forget_session(session_id: str, strategy_id: str, mode: str) -> None:
-    """Remove every per-session series of a session that is neither desired nor running."""
+    """Remove every per-session series of a session that is neither desired nor running.
+
+    A live protective-gap series is kept while the session still held a position at its last
+    fill (R13): an unprotected remainder must keep paging until an operator resolves it.
+    """
     _gauge("hydra_session_desired").remove(session_id, strategy_id, mode)
     _gauge("hydra_session_supervised").remove(session_id, strategy_id, mode)
     _gauge("hydra_paper_persist_dirty").remove(session_id)
     positions = _gauge("hydra_position_size")
-    for position_strategy, exchange_id, symbol in _session_positions.pop(session_id, set()):
+    held = _session_positions.pop(session_id, {})
+    for position_strategy, exchange_id, symbol in held:
         positions.remove(session_id, position_strategy, exchange_id, symbol)
+    gaps = _live_gaps.pop(session_id, set())
+    if not any(held.values()):
+        for gap_strategy, exchange_id, symbol in gaps:
+            with contextlib.suppress(KeyError):
+                _gauge("hydra_live_protective_gap").remove(
+                    session_id, gap_strategy, exchange_id, symbol
+                )
 
 
 def record_session_errored(strategy_id: str) -> None:
@@ -861,6 +885,23 @@ def record_session_errored(strategy_id: str) -> None:
 def set_paper_persist_dirty(session_id: str, dirty: bool) -> None:
     """Set 1 while a paper session has unpersisted fills."""
     _gauge("hydra_paper_persist_dirty").labels(session_id=session_id).set(1.0 if dirty else 0.0)
+
+
+def set_live_protective_gap(
+    session_id: str, strategy_id: str, exchange_id: str, symbol: str, gap: bool
+) -> None:
+    """Set 1 while a live position has no confirmed exchange-side stop; else clear it."""
+    labels = (strategy_id, exchange_id, symbol)
+    if gap:
+        _gauge("hydra_live_protective_gap").labels(
+            session_id=session_id, strategy_id=strategy_id, exchange_id=exchange_id, symbol=symbol
+        ).set(1)
+        if not _muted.get():
+            _live_gaps.setdefault(session_id, set()).add(labels)
+        return
+    with contextlib.suppress(KeyError):
+        _gauge("hydra_live_protective_gap").remove(session_id, *labels)
+    _live_gaps.get(session_id, set()).discard(labels)
 
 
 def set_ready(check: str, ok: bool) -> None:
@@ -896,4 +937,5 @@ def _reset_metrics() -> None:
             REGISTRY.unregister(collector)
     _collectors.clear()
     _session_positions.clear()
+    _live_gaps.clear()
     _initialized = False

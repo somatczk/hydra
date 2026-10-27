@@ -56,6 +56,43 @@ class TestMarketRules:
         assert r.min_notional == Decimal("5.0")
         assert r.max_market_qty == Decimal("120.5")
         assert r.price_tick == Decimal("0.01")
+        assert r.trailing_delta_bips is None
+
+    @pytest.mark.parametrize(
+        ("below", "expected"),
+        [
+            (("10", "2000"), (Decimal("10"), Decimal("2000"))),
+            (("1", "1000000"), (Decimal("1"), Decimal("1000000"))),
+        ],
+    )
+    def test_trailing_delta_bips_from_the_filter(
+        self, below: tuple[str, str], expected: tuple[Decimal, Decimal]
+    ) -> None:
+        market = {
+            **BINANCE_BTCUSDT,
+            "info": {
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01000000"},
+                    {
+                        "filterType": "TRAILING_DELTA",
+                        "minTrailingAboveDelta": "10",
+                        "maxTrailingAboveDelta": "2000",
+                        "minTrailingBelowDelta": below[0],
+                        "maxTrailingBelowDelta": below[1],
+                    },
+                ]
+            },
+        }
+
+        assert MarketRules.from_ccxt_market(market).trailing_delta_bips == expected
+
+    def test_no_trailing_delta_filter_is_none(self) -> None:
+        market = {
+            **BINANCE_BTCUSDT,
+            "info": {"filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.01"}]},
+        }
+
+        assert MarketRules.from_ccxt_market(market).trailing_delta_bips is None
 
     @pytest.mark.parametrize(
         ("raw", "floored"),

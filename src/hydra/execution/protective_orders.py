@@ -97,13 +97,20 @@ def spec_from_policy(
 
 @dataclass(slots=True)
 class ProtectiveGroup:
-    """The resting protective order of one symbol (the OCO id for an OCO)."""
+    """The resting protective order of one symbol (the OCO id for an OCO).
+
+    ``leg_ids`` and ``confirmed`` are the live convention: a live create response carries
+    the exchange legs (even a single-leg stop), and their presence is the exchange ack.
+    Paper responses never do, so both stay empty/False there.
+    """
 
     symbol: str
     order_id: str
     order_type: OrderType
     quantity: Decimal
     spec: ProtectionSpec
+    leg_ids: tuple[str, ...] = ()
+    confirmed: bool = False
 
 
 class ProtectiveOrderManager:
@@ -166,7 +173,7 @@ class ProtectiveOrderManager:
         symbol = str(event.symbol)
         position = await self._position(symbol)
         group = self._groups.get(symbol)
-        if group is not None and event.order_id == group.order_id:
+        if group is not None and event.order_id in (group.order_id, *group.leg_ids):
             del self._groups[symbol]
             if position is not None:
                 await self._arm(position, group.spec)
@@ -217,7 +224,13 @@ class ProtectiveOrderManager:
     # -- Recovery --------------------------------------------------------------------
 
     async def adopt(self, symbols: list[str]) -> None:
-        """After a restore: take over the executor's resting SELL protection, arm any gap."""
+        """After a restore: take over the executor's resting SELL protection, arm any gap.
+
+        A live executor's resting SELLs are adopted only when they carry hydra's own
+        ``client_order_id`` (R5: the user's orders are never hijacked — a later disarm
+        would cancel them); paper orders are all hydra's, so paper adopt is unchanged.
+        """
+        live = getattr(self._executor, "exchange_client", None) is not None
         for symbol in symbols:
             position = await self._position(symbol)
             if position is None:
@@ -225,7 +238,7 @@ class ProtectiveOrderManager:
             resting = [
                 o
                 for o in await self._executor.fetch_open_orders(symbol)
-                if str(o.get("side")) == "SELL"
+                if str(o.get("side")) == "SELL" and (not live or o.get("client_order_id"))
             ]
             if resting:
                 order = resting[0]
@@ -256,22 +269,25 @@ class ProtectiveOrderManager:
             logger.debug("protective order %s already gone", group.order_id)
 
     async def _arm(self, position: Position, spec: ProtectionSpec) -> None:
+        """Arm *spec*; only the ladder's definitive exhaustion is recorded here.
+
+        ``StopUnplaceableError`` (every rung definitively rejected, ``exchange_stops``)
+        records a failure and leaves no group, so the wiring's armed-is-None check
+        market-closes. Anything else re-raises — an unknown-outcome network error or a
+        breached stop propagates to the wiring's decision-17 market-close path instead
+        of a second placement (R18: no double-stop).
+        """
+        # local import: exchange_stops imports this module at its own top level
+        from hydra.execution.exchange_stops import StopUnplaceableError
+
         symbol = str(position.symbol)
         try:
             group = await self._place(position, spec)
-        except Exception as exc:
+        except StopUnplaceableError as exc:
             msg = f"{symbol}: protective order {spec} rejected ({exc})"
             logger.error("Protective order failed: %s", msg)
             self.failures.append(msg)
-            fallback = default_stop(position.avg_entry_price)
-            if spec == fallback:
-                return
-            try:
-                group = await self._place(position, fallback)
-            except Exception:
-                logger.exception("Default protective stop failed for %s", symbol)
-                self.failures.append(f"{symbol}: default stop rejected")
-                return
+            return
         if group is not None:
             self._groups[symbol] = group
 
@@ -286,7 +302,7 @@ class ProtectiveOrderManager:
                 qty,
                 params={"trail_pct": str(spec.trailing_pct)},
             )
-            return ProtectiveGroup(symbol, str(resp["id"]), OrderType.TRAILING_STOP, qty, spec)
+            return self._group_from_response(symbol, OrderType.TRAILING_STOP, qty, spec, resp)
         if spec.stop_loss is None:
             spec = replace(spec, stop_loss=default_stop(position.avg_entry_price).stop_loss)
         order_type = OrderType.OCO if spec.take_profit is not None else OrderType.STOP_MARKET
@@ -307,7 +323,29 @@ class ProtectiveOrderManager:
         )
         if order_id is None:
             return None
-        return ProtectiveGroup(symbol, order_id, order_type, qty, spec)
+        return self._group_from_response(
+            symbol, order_type, qty, spec, self._om.order_response(order_id) or {}, order_id
+        )
+
+    def _group_from_response(
+        self,
+        symbol: str,
+        order_type: OrderType,
+        qty: Decimal,
+        spec: ProtectionSpec,
+        resp: dict[str, Any],
+        order_id: str | None = None,
+    ) -> ProtectiveGroup:
+        legs = tuple(str(leg["id"]) for leg in resp.get("legs") or [])
+        return ProtectiveGroup(
+            symbol=symbol,
+            order_id=str(resp.get("id") or order_id),
+            order_type=order_type,
+            quantity=qty,
+            spec=spec,
+            leg_ids=legs,
+            confirmed=bool(legs),
+        )
 
 
 def _spec_from_resting(orders: list[dict[str, Any]]) -> ProtectionSpec:

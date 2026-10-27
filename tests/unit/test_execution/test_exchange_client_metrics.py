@@ -66,6 +66,31 @@ class _FakeCcxt:
         await self._call("set_margin_mode", None)
 
 
+async def _fake_post_oco(fake: _FakeCcxt, params: dict[str, Any]) -> dict[str, Any]:
+    return await fake._call("create_oco", {"orderListId": 5, **params})
+
+
+async def _fake_delete_order_list(fake: _FakeCcxt, params: dict[str, Any]) -> dict[str, Any]:
+    return await fake._call("cancel_order_list", {"code": 200, **params})
+
+
+async def _fake_delete_open_orders(fake: _FakeCcxt, params: dict[str, Any]) -> dict[str, Any]:
+    return await fake._call("cancel_all_orders", {"code": 200, **params})
+
+
+async def _fake_get_open_order_lists(
+    fake: _FakeCcxt, params: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return await fake._call("fetch_open_order_lists", [{"orderListId": 5}])
+
+
+# ccxt's camelCase implicit API names, bound as attributes (pep8-naming flags the defs)
+_FakeCcxt.privatePostOrderListOco = _fake_post_oco
+_FakeCcxt.privateDeleteOrderList = _fake_delete_order_list
+_FakeCcxt.privateDeleteOpenOrders = _fake_delete_open_orders
+_FakeCcxt.privateGetOpenOrderList = _fake_get_open_order_lists
+
+
 ClientCall = Callable[[ExchangeClient], Awaitable[Any]]
 
 CALLS: list[tuple[str, ClientCall]] = [
@@ -73,9 +98,16 @@ CALLS: list[tuple[str, ClientCall]] = [
         "create_order",
         lambda c: c.create_order("BTC/USDT", "BUY", "MARKET", Decimal("0.01")),
     ),
+    (
+        "create_oco",
+        lambda c: c.create_oco("BTCUSDT", "SELL", "0.01000", "103.00", "98.00"),
+    ),
     ("cancel_order", lambda c: c.cancel_order("o1", "BTC/USDT")),
+    ("cancel_order_list", lambda c: c.cancel_order_list("5", "BTCUSDT")),
+    ("cancel_all_orders", lambda c: c.cancel_all_orders("BTCUSDT")),
     ("fetch_balance", lambda c: c.fetch_balance()),
     ("fetch_open_orders", lambda c: c.fetch_open_orders("BTC/USDT")),
+    ("fetch_open_order_lists", lambda c: c.fetch_open_order_lists("BTCUSDT")),
     ("fetch_positions", lambda c: c.fetch_positions("BTC/USDT")),
     ("fetch_ticker", lambda c: c.get_last_price("BTC/USDT")),
     ("set_leverage", lambda c: c.set_leverage("BTC/USDT", 2)),
