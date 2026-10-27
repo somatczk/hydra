@@ -353,7 +353,12 @@ async def get_session_detail(mgr: Any, session_id: str) -> dict[str, Any]:
     session = mgr.get_session(session_id)
     detail["created_by"] = session.created_by if session is not None else None
     executor = getattr(session, "_executor", None)
-    if isinstance(executor, PaperTradingExecutor):
+    if session is not None and (
+        session.trading_mode == "live" or getattr(executor, "exchange_client", None) is not None
+    ):
+        # not isinstance: LiveTradingExecutor subclasses the paper executor (R12)
+        await _live_exchange_state(detail, session, executor)
+    elif isinstance(executor, PaperTradingExecutor):
         rt = session._runtime
         detail["open_orders"] = [
             {
@@ -364,8 +369,6 @@ async def get_session_detail(mgr: Any, session_id: str) -> dict[str, Any]:
             }
             for o in await executor.fetch_open_orders()
         ]
-    else:
-        await _live_exchange_state(detail, session, executor)
     if session is not None and session.trading_mode == "live":
         await _live_reconcile_reads(mgr, detail, session)
     return dict(detail)

@@ -891,11 +891,11 @@ class TestLiveSummary:
         curve = client.get("/api/portfolio/equity-curve?source=live").json()
         assert [p["value"] for p in curve] == [5000.0, 5100.0]
 
-    def test_a_missing_live_capital_row_is_503_never_zero(
+    def test_a_missing_live_capital_row_is_403_never_zero(
         self, db: FakePortfolioDb, client: TestClient
     ) -> None:
         db.live_capital = None
         resp = client.get("/api/portfolio/summary?source=live")
-        assert resp.status_code == 503
+        assert resp.status_code == 403  # seam #8: one code, one status, everywhere
         assert resp.json()["detail"]["code"] == "live_capital_missing"
-        assert resp.json()["detail"]["state"] == "unavailable"
+        assert resp.json()["detail"]["state"] == "invalid"

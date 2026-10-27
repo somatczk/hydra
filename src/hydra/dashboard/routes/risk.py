@@ -162,6 +162,18 @@ def _paper_only(source: str | None) -> None:
         )
 
 
+def _validate_source(source: str | None) -> None:
+    """The source vocabulary is paper, live, or unset; anything else fails closed (R29 A6)."""
+    if source not in (None, "paper", "live"):
+        raise api_error(
+            422,
+            "invalid_source",
+            f"source must be 'paper' or 'live', got {source!r}",
+            "invalid",
+            source=source,
+        )
+
+
 def _actor(request: Request) -> str:
     principal = getattr(request.state, "principal", None)
     name = getattr(principal, "name", None)
@@ -238,10 +250,11 @@ async def get_risk_status(request: Request, source: str | None = None) -> dict[s
 
     ``source=live`` reads the live-scoped RiskService (Q1) through the same
     ``live_status`` op (R11); no live service built is 503 ``live_risk_unavailable``.
+    An unrecognized source is refused 422, never silently served as paper (A6≡S8).
     """
+    _validate_source(source)
     if source == "live":
         return await request_trader(request).live_status(source="live")
-    _paper_only(source)
     return await request_trader(request).risk_status()
 
 
@@ -379,6 +392,8 @@ async def get_live_risk_status(request: Request, source: str | None = None) -> d
 
     ``source=live`` answers the same picture on the live scope plus its account numbers
     (equity, current drawdown, active tier); 503 ``live_risk_unavailable`` when no live
-    service is built.
+    service is built. An unrecognized source is refused 422, never silently served as
+    paper (A6≡S8).
     """
+    _validate_source(source)
     return await request_trader(request).live_status(source=source or "paper")

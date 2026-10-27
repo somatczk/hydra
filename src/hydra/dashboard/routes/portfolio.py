@@ -191,17 +191,17 @@ async def _live_capital_baseline(pool: Any) -> float:
 
     The live account curve is the account-level balance snapshots (rows without a
     session); until one exists the summary's total value falls back to this baseline,
-    like paper's falls back to the ledger capital. A missing row is the 503 of the
-    paper read, never a silent 0.
+    like paper's falls back to the ledger capital. A missing row is the 403 of the
+    live start path (seam #8: one code, one status, everywhere), never a silent 0.
     """
     async with db_errors_to_503("reading live_capital"), pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM system_config WHERE key = 'live_capital'")
     if row is None:
         raise api_error(
-            503,
+            403,
             "live_capital_missing",
             "system_config has no 'live_capital' row; it is set by the arm ceremony",
-            "unavailable",
+            "invalid",
         )
     raw = row["value"]
     try:
@@ -209,10 +209,10 @@ async def _live_capital_baseline(pool: Any) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise api_error(
-            503,
+            403,
             "live_capital_missing",
             f"system_config live_capital is unreadable: {exc}",
-            "unavailable",
+            "invalid",
         ) from exc
 
 

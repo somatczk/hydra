@@ -264,6 +264,17 @@ def test_live_reconcile_rule_matches_the_contract() -> None:
     assert spec.samples == ("hydra_live_reconcile_state",)
 
 
+def test_live_reconcile_unknown_rule_matches_the_contract() -> None:
+    """A5: value 2 (unknown) gets the consumer it was exported for — the blind alert."""
+    rules = _rules()
+    alert = rules["HydraLiveReconcileUnknown"]
+    assert alert["expr"].strip() == "hydra_live_reconcile_state == 2"
+    assert alert["for"] == "10m"
+    assert alert["labels"] == {"severity": "warning", "team": "trading"}
+    assert "BLIND" in alert["annotations"]["description"]
+    assert "cannot be detected" in alert["annotations"]["description"]
+
+
 def test_the_reconcile_gauge_maps_the_states() -> None:
     metrics.set_live_reconcile_state("s1", "ok")
     assert _reconcile_state("s1") == 0.0

@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from hydra.core.config import HydraConfig
 from hydra.core.types import OrderType, Timeframe
 from hydra.dashboard.routes.trading import SessionDetailResponse
 from hydra.data.ingestion import InsufficientHistoryError
@@ -34,12 +35,13 @@ from hydra.execution.errors import (
     UnsupportedStrategyError,
     UnsupportedVenueError,
 )
+from hydra.execution.live_executor import LiveTradingExecutor
 from hydra.execution.order_manager import RiskRejectedError
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
 from hydra.execution.protective_orders import ProtectionSpec
-from hydra.execution.session_manager import KillSwitchReport, TradingSession
+from hydra.execution.session_manager import KillSwitchReport, SessionManager, TradingSession
 from hydra.execution.session_wiring import ManualOrderResult
-from hydra.risk.market_rules import MarketRulesUnavailableError
+from hydra.risk.market_rules import MarketRules, MarketRulesUnavailableError
 from hydra.risk.state import RiskStateUnavailableError
 from hydra.services import sessions as sessions_svc
 from hydra.services.errors import ServiceError
@@ -49,12 +51,22 @@ from hydra.services.sessions import (
     SessionStopNotPersistedError,
     StartSessionRequest,
 )
+from tests.fixtures.binance_trading import FakeBinanceTradingClient
 from tests.unit.test_execution.session_harness import Harness, held, rule, write_strategy
 
 pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
 
 D = Decimal
 _NOW = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+
+_LIVE_RULES = MarketRules(
+    symbol="BTCUSDT",
+    amount_step=D("0.00001"),
+    min_qty=D("0.00001"),
+    min_notional=D("5"),
+    price_tick=D("0.01"),
+    trailing_delta_bips=(D("10"), D("2000")),
+)
 
 
 def _session(**overrides: Any) -> TradingSession:
@@ -597,6 +609,62 @@ def _running_row(mode: str) -> dict[str, Any]:
     }
 
 
+class _OrdersConn:
+    """Serves the seeded live_orders rows a stopped session's PgLiveOrderStore reads."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM live_orders" in sql
+        return self.rows
+
+
+class _OrdersPool:
+    def __init__(self, conn: _OrdersConn) -> None:
+        self.conn = conn
+
+    def acquire(self) -> _OrdersPool:
+        return self
+
+    async def __aenter__(self) -> _OrdersConn:
+        return self.conn
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _stored_live_order_row() -> dict[str, Any]:
+    """One asyncpg-shaped live_orders row in the state a stopped session leaves behind."""
+    return {
+        "client_order_id": "hyd-stopped",
+        "session_id": "s1",
+        "strategy_id": "saw",
+        "exchange_id": "binance",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "quantity": D("0.01"),
+        "price": D("90000"),
+        "stop_price": None,
+        "filled_quantity": D("0.01"),
+        "average_fill_price": D("90500"),
+        "fee": None,
+        "fee_currency": None,
+        "reduce_only": False,
+        "tag": "entry",
+        "actor": "user:soma",
+        "status": "filled",
+        "exchange_order_id": "101",
+        "order_list_id": None,
+        "leg_client_order_ids": None,
+        "submitted_at": _NOW - timedelta(hours=2),
+        "terminal_at": _NOW - timedelta(hours=1),
+        "updated_at": _NOW - timedelta(hours=1),
+        "error": None,
+    }
+
+
 async def _webhook(h: Harness, pool: _RowsPool) -> dict[str, Any]:
     return await sessions_svc.submit_webhook_order(
         h.mgr,
@@ -902,6 +970,54 @@ class TestSessionDetailLive:
         model = SessionDetailResponse.model_validate(detail)
         assert all(p.exchange_stop is None for p in model.positions)
 
+    async def test_a_real_live_executor_routes_through_the_live_branch(
+        self, strategies_dir: Path
+    ) -> None:
+        """S1 (R29): a REAL LiveTradingExecutor gets the R12 dispatch — the exchange
+        legs as open orders and exchange_stop per position — never the DB-row shape."""
+        fake = FakeBinanceTradingClient()
+        ex = LiveTradingExecutor(
+            fake,
+            exchange_id="binance",
+            initial_balances={"USDT": D("10000")},
+            db_pool=None,
+            strategy_id="saw",
+            session_id="s1",
+            market_rules={"BTCUSDT": _LIVE_RULES},
+            poll_interval=5.0,
+            resolve_grace=0.0,
+        )
+        ex.set_mark("BTCUSDT", D("100000"))
+        await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"), params={"tag": "entry"})
+        await ex.collect_exchange_fills(None)  # the fill reaches the sleeve's ledger
+        await ex.create_order(
+            "BTCUSDT", "SELL", "OCO", D("0.00999"), price=D("110000"), stop_price=D("95000")
+        )
+        session = _session(trading_mode="live")
+        session._executor = ex
+        mgr = SessionManager(config=HydraConfig())
+        mgr._sessions["s1"] = session
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert [
+            (o["id"], o["type"], o["price"], o["stop_price"], o["oco_id"], o["protective"])
+            for o in detail["open_orders"]
+        ] == [
+            ("101", "LIMIT", 110000.0, None, "1", None),
+            ("102", "STOP_MARKET", None, 95000.0, "1", None),
+        ]
+        (position,) = detail["positions"]
+        stop = position["exchange_stop"]
+        assert stop["state"] == "confirmed"
+        assert stop["kind"] == "oco"
+        assert stop["stop_price"] == 95000.0
+        assert stop["take_profit"] is None  # no expected group: the stop leg is the proof
+        assert stop["order_list_id"] == "1"
+        model = SessionDetailResponse.model_validate(detail)
+        assert model.positions[0].exchange_stop is not None
+        assert model.positions[0].exchange_stop.state == "confirmed"
+
 
 # ---------------------------------------------------------------------------
 # A7 (P3-A2): the tracked orders, the reconcile state and R20's reconciled flag
@@ -985,14 +1101,28 @@ class TestSessionDetailA7:
         assert newest["error"] == "stop moved"
 
     async def test_orders_come_from_the_live_orders_table_without_an_executor(self) -> None:
-        """A stopped live session (display-only row) still reads its tracked orders."""
+        """A stopped live session (display-only row) still reads its tracked orders
+        through PgLiveOrderStore over the manager's pool (S6: the claim, proven)."""
         from hydra.execution.reconcile import NEVER_STATUS
 
-        class _PooledManager(_LiveManager):
-            _db_pool = None
-
-        mgr = _PooledManager(_FakeKeyedClient(), status=NEVER_STATUS)
+        mgr = _LiveManager(_FakeKeyedClient(), status=NEVER_STATUS)
         mgr.session._executor = None
+        mgr._db_pool = _OrdersPool(_OrdersConn([_stored_live_order_row()]))
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert [o["client_order_id"] for o in detail["orders"]] == ["hyd-stopped"]
+        assert detail["orders"][0]["status"] == "filled"
+        assert detail["orders"][0]["quantity"] == 0.01
+        assert detail["orders"][0]["submitted_at"] == (_NOW - timedelta(hours=2)).isoformat()
+
+    async def test_without_a_pool_a_stopped_live_session_has_no_orders(self) -> None:
+        """The degenerate leg: no executor, no pool — nothing to read, honestly empty."""
+        from hydra.execution.reconcile import NEVER_STATUS
+
+        mgr = _LiveManager(_FakeKeyedClient(), status=NEVER_STATUS)
+        mgr.session._executor = None
+        mgr._db_pool = None
 
         detail = await sessions_svc.get_session_detail(mgr, "s1")
 

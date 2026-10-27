@@ -9,8 +9,9 @@ N-consecutive/60s not-found window and the myTrades cross-check live THERE, neve
 no second, divergent window). Fills are the poller's claim-apply-confirm pipeline, called
 through the executor, never re-applied by hand.
 
-The state machine is fail-closed: any exchange read the pass depends on failing answers
-``unknown`` — never ``ok``, never ``mismatch``. Any finding (an untracked order, an
+The state machine is fail-closed: any read the pass depends on — the exchange, the
+live-order store or the executor — failing answers ``unknown`` — never ``ok``, never
+``mismatch``. Any finding (an untracked order, an
 unresolved submit past its resolve grace, a proven terminal applied to a row we still
 held open, balance drift) answers ``mismatch`` with the findings composed into one detail
 line; a clean pass answers ``ok`` with no detail. Before the first pass the holder reports
@@ -18,11 +19,14 @@ line; a clean pass answers ``ok`` with no detail. Before the first pass the hold
 
 Only exchange-reported facts mutate state, and only through the store's monotonic
 ``apply_status``; a refused or unchanged apply is a benign no-op (R16), never a finding.
-Balance drift compares the sleeve's own claim per asset against the wallet plus what the
-session's own resting orders lock (the exchange is the locker of resting funds): a shared
-wallet may legitimately hold more than the sleeve — Q3 tracks only the session's own
-fills, so a surplus is not drift — but the exchange holding less than the sleeve's claim
-is. It is reported, never auto-rebased.
+An exchange leg tracked by ANY session's ``live_orders`` row is tracked-elsewhere and
+skipped (A1: the classification is account-wide; the fill pipeline's lookups stay
+session-scoped, F1) — only a leg no session knows is ``untracked`` (R5: never adopted).
+Balance drift compares the sleeve's own claim per asset against the wallet TOTAL
+(free + locked): a shared wallet, the user's own resting orders on any symbol and
+Earn-style locks may legitimately hold more than the sleeve — Q3 tracks only the
+session's own fills, so a surplus is not drift — but the exchange holding less than the
+sleeve's claim is. It is reported, never auto-rebased.
 """
 
 from __future__ import annotations
@@ -49,8 +53,7 @@ logger = logging.getLogger(__name__)
 
 ReconcileState = Literal["ok", "mismatch", "unknown", "never"]
 
-# real drift starts past 0.1 % of the sleeve's own balance: dust and the documented
-# BNB-commission conversion approximation stay under it
+# dust and the BNB-commission approximation stay under 0.1 % of the sleeve's balance
 BALANCE_DRIFT_THRESHOLD = Decimal("0.001")
 
 COVERING_STATES = frozenset({"ok", "mismatch"})
@@ -122,6 +125,23 @@ async def reconcile_live_session(
         logger.warning("Reconcile sweep of %s failed: %s", session_id, exc)
         return _status("unknown", ran_at, f"resolution and fill sweep failed: {exc}", previous)
 
+    try:
+        return await _drift_pass(store, client, executor, session_id, ran_at, previous)
+    except Exception as exc:
+        # A4≡S5: a failed dependent read is unknown — never a latched stale ok
+        logger.warning("Reconcile of %s failed on a dependent read: %s", session_id, exc)
+        return _status("unknown", ran_at, f"dependent read failed: {exc}", previous)
+
+
+async def _drift_pass(
+    store: LiveOrderStore,
+    client: Any,
+    executor: LiveTradingExecutor,
+    session_id: str,
+    ran_at: datetime,
+    previous: ReconcileStatus | None,
+) -> ReconcileStatus:
+    """(a)-(f): the comparison pass; every read it depends on may fail into ``unknown``."""
     # (a) the exchange's open orders in the one normalized shape, per tracked symbol
     symbols = sorted(
         set(await store.symbols(session_id))
@@ -140,9 +160,9 @@ async def reconcile_live_session(
     open_rows = await store.open_orders(session_id)
     findings: list[str] = []
 
-    # (b) an exchange order hydra does not know is reported, never adopted (R5)
+    # (b) an exchange order no session knows is reported, never adopted (R5)
     for leg in legs:
-        if not await _tracked(store, session_id, leg):
+        if not await _tracked(store, leg):
             findings.append(f"untracked order {leg['id']} on {leg['symbol']} (not managed)")
 
     # (c) a row we hold open that the exchange no longer lists: prove how it ended
@@ -162,15 +182,14 @@ async def reconcile_live_session(
     for row in await store.unsettled(session_id, deadline):
         findings.append(f"unresolved submit {row.client_order_id}")
 
-    # (f) the sleeve's own claim per asset against the wallet plus its own locks
+    # (f) the sleeve's own claim per asset against the wallet total (free + locked)
     try:
-        wallet = await client.fetch_balance()
+        wallet = await client.fetch_balance_totals()
     except Exception as exc:
         logger.warning("Reconcile balance of %s unreadable: %s", session_id, exc)
         return _status("unknown", ran_at, f"exchange balance unreadable: {exc}", previous)
     sleeve = await executor.fetch_balance()
-    resting = await store.open_orders(session_id)  # what still rests after (c), not before
-    findings.extend(_balance_findings(sleeve, wallet, _locks(resting, executor)))
+    findings.extend(_balance_findings(sleeve, wallet))
 
     if findings:
         return _status("mismatch", ran_at, "; ".join(findings), previous)
@@ -182,20 +201,20 @@ async def reconcile_live_session(
 # ---------------------------------------------------------------------------
 
 
-async def _tracked(store: LiveOrderStore, session_id: str, leg: dict[str, Any]) -> bool:
-    """Is this exchange leg one of the session's own rows (session-scoped, F1/F12-safe)?"""
+async def _tracked(store: LiveOrderStore, leg: dict[str, Any]) -> bool:
+    """Is this exchange leg tracked by ANY session's live_orders row (A1, account-wide)?
+
+    Another session's tracked order is tracked-elsewhere — skipped, never ``untracked``
+    here — while the fill pipeline's lookups stay session-scoped (F1).
+    """
     leg_id = str(leg.get("id") or "")
-    if leg_id and await store.by_exchange_order_id(leg_id, session_id) is not None:
+    if leg_id and await store.tracked_by_exchange_order_id(leg_id):
         return True
     oco_id = leg.get("oco_id")
-    if oco_id and await store.by_order_list_id(str(oco_id), session_id) is not None:
+    if oco_id and await store.tracked_by_order_list_id(str(oco_id)):
         return True
     client_id = str(leg.get("client_order_id") or "")
-    if client_id:
-        row = await store.by_client_order_id(client_id)
-        if row is not None and row.session_id == session_id:
-            return True
-    return False
+    return bool(client_id) and await store.by_client_order_id(client_id) is not None
 
 
 def _leg_matches_row(leg: dict[str, Any], row: LiveOrderRecord) -> bool:
@@ -300,31 +319,17 @@ async def _apply_proven(
 # ---------------------------------------------------------------------------
 
 
-def _locks(open_rows: list[LiveOrderRecord], executor: LiveTradingExecutor) -> dict[str, Decimal]:
-    """What the session's own resting orders lock on the wallet (the sleeve never locks)."""
-    locks: dict[str, Decimal] = {}
-    for row in open_rows:
-        if row.side == "BUY" and row.order_type == OrderType.LIMIT.value and row.price is not None:
-            asset = executor._quote
-            locks[asset] = locks.get(asset, Decimal("0")) + row.quantity * row.price
-        elif row.side == "SELL":
-            asset = executor._base(executor._canon_of(row.symbol))
-            locks[asset] = locks.get(asset, Decimal("0")) + row.quantity
-    return locks
-
-
 def _balance_findings(
     local: dict[str, Decimal],
     wallet: dict[str, Decimal],
-    locks: dict[str, Decimal],
 ) -> list[str]:
-    """The sleeve's own claim per asset against the wallet plus the session's own locks."""
+    """The sleeve's own claim per asset against the wallet total (free + locked)."""
     findings: list[str] = []
     for asset in sorted(local):
         have = local[asset]
         if have <= 0:
             continue
-        there = wallet.get(asset, Decimal("0")) + locks.get(asset, Decimal("0"))
+        there = wallet.get(asset, Decimal("0"))
         if have - there > BALANCE_DRIFT_THRESHOLD * have:
             findings.append(f"balance drift {asset} local {_fmt(have)} exchange {_fmt(there)}")
     return findings

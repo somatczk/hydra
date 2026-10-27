@@ -265,6 +265,20 @@ class TestRiskStatus:
             assert resp.status_code == 503
             assert resp.json()["detail"]["code"] == "live_risk_unavailable"
 
+    async def test_an_unrecognized_source_is_refused_never_served_as_paper(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """A6≡S8: the source vocabulary is validated; a typo fails closed with 422."""
+        for path in ("/api/risk/status?source=liev", "/api/risk/live-status?source=liev"):
+            resp = await client.get(path)
+            assert resp.status_code == 422
+            detail = resp.json()["detail"]
+            assert (detail["code"], detail["state"], detail["source"]) == (
+                "invalid_source",
+                "invalid",
+                "liev",
+            )
+
     async def test_var_source_live_stays_the_paper_read(self, client: httpx.AsyncClient) -> None:
         resp = await client.get("/api/risk/var?source=live")
         assert resp.status_code == 503

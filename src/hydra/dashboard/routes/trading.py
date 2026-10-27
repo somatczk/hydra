@@ -89,8 +89,7 @@ class TradeItem(BaseModel, extra="allow"):
     pnl: float = 0
     net_pnl: float | None = None
     timestamp: str | None = None
-    # R20: true once a reconcile pass with state ok|mismatch covered this fill; false
-    # until the first covering pass; None for paper fills
+    # R20: true once an ok|mismatch reconcile pass covered this fill; None for paper fills
     reconciled: bool | None = None
 
     @field_validator("fee", mode="before")
@@ -198,8 +197,7 @@ class SessionDetailResponse(BaseModel):
     trades: list[TradeItem] = Field(default_factory=list)
     open_orders: list[OpenOrderItem] = Field(default_factory=list)
     created_by: str | None = None
-    # A7 (live sessions): the tracked order rows and the reconcile state; paper answers
-    # the defaults (no orders list, no reconcile object)
+    # A7 (live sessions): the tracked order rows + reconcile; paper answers the defaults
     orders: list[LiveOrderItem] = Field(default_factory=list)
     reconcile: ReconcileStatus | None = None
 

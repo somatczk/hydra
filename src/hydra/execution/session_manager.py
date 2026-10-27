@@ -1197,7 +1197,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         The per-minute loop is the carrier; ``live_reconcile_interval_s`` decides how often
         a pass actually runs, so a longer interval simply skips ticks. A pass that cannot
         even start (its own exception) keeps the session's last status: the holder never
-        guesses a state a pass did not produce.
+        guesses a state a pass did not produce. A running live session with no completed
+        pass yet exports gauge value 3 ('never', A7≡S9); a stopped session's gauge stays
+        frozen at its last value — defensible for held money, and stated in the README.
         """
         interval = self._config.trading.live_reconcile_interval_s
         now = time.monotonic()
@@ -1207,6 +1209,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         for session in list(self._sessions.values()):
             if session.trading_mode != "live" or session.status != "running":
                 continue
+            if session.session_id not in self._reconcile:
+                # A7≡S9: 'never' is a real export, not a missing series
+                metrics.set_live_reconcile_state(session.session_id, "never")
             executor = session._executor
             store = getattr(executor, "live_orders", None)
             client = getattr(executor, "exchange_client", None)
