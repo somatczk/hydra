@@ -315,6 +315,7 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 )
             if session.persist_error is not None:
                 failures.append(f"{session.session_id}: {session.persist_error}")
+        failures.extend(await self._sweep_live_orders(targets))
         logger.warning(
             "Kill switch: stopped %d session(s), %d position(s) remain",
             len(targets),
@@ -327,6 +328,29 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             positions_remaining=remaining,
             flatten_failures=tuple(failures),
         )
+
+    async def _sweep_live_orders(self, sessions: list[TradingSession]) -> list[str]:
+        """After every flatten, cancel ALL orders on each live-traded symbol (Q2).
+
+        Blast radius: every open order on the symbol's account, hydra's or not; a
+        single-session stop stays scoped to its own order lists. The duck-typed gate is the
+        executor's ``cancel_all_orders`` (only the live executor exposes it).
+        """
+        sweep: dict[Any, set[str]] = {}
+        for session in sessions:
+            executor = session._executor
+            if getattr(executor, "cancel_all_orders", None) is None:
+                continue
+            sweep.setdefault(executor, set()).update(session.symbols)
+        failures: list[str] = []
+        for executor, symbols in sweep.items():
+            for symbol in sorted(symbols):
+                try:
+                    await executor.cancel_all_orders(symbol)
+                except Exception as exc:
+                    logger.exception("Kill-switch sweep failed for %s", symbol)
+                    failures.append(f"{symbol}: cancel-all failed ({exc})")
+        return failures
 
     async def release_kill_switch(self, actor: str = "operator", reason: str = "") -> None:
         """Release the kill switch (raises when it cannot be persisted; stays latched)."""

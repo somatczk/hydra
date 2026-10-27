@@ -10,12 +10,14 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from hydra.core.types import Timeframe
+from hydra.core.types import OrderType, Timeframe
+from hydra.dashboard.routes.trading import SessionDetailResponse
 from hydra.data.ingestion import InsufficientHistoryError
 from hydra.execution.errors import (
     DuplicateSessionError,
@@ -30,6 +32,7 @@ from hydra.execution.errors import (
 )
 from hydra.execution.order_manager import RiskRejectedError
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
+from hydra.execution.protective_orders import ProtectionSpec
 from hydra.execution.session_manager import KillSwitchReport, TradingSession
 from hydra.execution.session_wiring import ManualOrderResult
 from hydra.risk.market_rules import MarketRulesUnavailableError
@@ -41,7 +44,7 @@ from hydra.services.sessions import (
     SessionStopNotPersistedError,
     StartSessionRequest,
 )
-from tests.unit.test_execution.session_harness import Harness, held, write_strategy
+from tests.unit.test_execution.session_harness import Harness, held, rule, write_strategy
 
 pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
 
@@ -610,3 +613,213 @@ async def test_webhook_refuses_when_no_pool_is_bound(h: Harness, strategies_dir:
     assert raised.value.status_code == 503
     assert (detail["code"], detail["state"]) == ("live_gate_unreadable", "unavailable")
     assert await held(session) == D("0")
+
+
+# ---------------------------------------------------------------------------
+# A8-live: the exchange is the truth for open orders and each position's stop
+# ---------------------------------------------------------------------------
+
+
+OCO_LEGS: list[dict[str, Any]] = [
+    {
+        "info": {
+            "symbol": "BTCUSDT",
+            "orderId": 11,
+            "orderListId": "5",
+            "type": "LIMIT_MAKER",
+            "side": "SELL",
+            "price": "103.00000000",
+            "origQty": "0.01000000",
+            "stopPrice": "0.00000000",
+            "trailingDelta": "0",
+            "status": "NEW",
+        }
+    },
+    {
+        "info": {
+            "symbol": "BTCUSDT",
+            "orderId": 12,
+            "orderListId": "5",
+            "type": "STOP_LOSS",
+            "side": "SELL",
+            "price": "0.00000000",
+            "origQty": "0.01000000",
+            "stopPrice": "98.00000000",
+            "trailingDelta": "0",
+            "status": "NEW",
+        }
+    },
+]
+
+OPEN_LISTS: list[dict[str, Any]] = [
+    {
+        "symbol": "BTCUSDT",
+        "orderListId": 5,
+        "contingencyType": "OCO",
+        "listStatusType": "EXEC_STARTED",
+        "listOrderStatus": "EXECUTING",
+        "listClientOrderId": "lcid",
+        "transactionTime": 1700000000000,
+        "orders": [
+            {"symbol": "BTCUSDT", "orderId": 11, "clientOrderId": "a"},
+            {"symbol": "BTCUSDT", "orderId": 12, "clientOrderId": "b"},
+        ],
+    }
+]
+
+
+class _FakeKeyedClient:
+    """The live executor's keyed ExchangeClient (fetch methods only)."""
+
+    def __init__(
+        self,
+        legs: list[dict[str, Any]] | None = None,
+        lists: list[dict[str, Any]] | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.legs = OCO_LEGS if legs is None else legs
+        self.lists = OPEN_LISTS if lists is None else lists
+        self.error = error
+
+    async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if self.error is not None:
+            raise self.error
+        return self.legs
+
+    async def fetch_open_order_lists(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if self.error is not None:
+            raise self.error
+        return self.lists
+
+
+class _FakeProtect:
+    """The runtime's protective manager surface the live branch reads."""
+
+    def __init__(self, group: Any) -> None:
+        self.group = group
+
+    def armed(self, symbol: str) -> Any:
+        return self.group
+
+    def is_protective(self, order_id: str) -> bool:
+        return self.group is not None and order_id == self.group.order_id
+
+
+class _LiveManager:
+    """Serves one live session whose executor exposes the keyed client and the group."""
+
+    def __init__(self, client: _FakeKeyedClient, runtime: Any | None = None) -> None:
+        self.session = _session(trading_mode="live")
+        self.session._executor = SimpleNamespace(exchange_client=client)
+        self.session._runtime = runtime
+        self.client = client
+
+    def list_sessions(self) -> list[TradingSession]:
+        return [self.session]
+
+    def get_session(self, session_id: str) -> TradingSession | None:
+        return self.session if session_id == self.session.session_id else None
+
+    async def get_session_detail(self, session_id: str) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "strategy_id": self.session.strategy_id,
+            "trading_mode": "live",
+            "status": "running",
+            "exchange_id": "binance",
+            "symbols": ["BTCUSDT"],
+            "timeframe": "1h",
+            "positions": [
+                {
+                    "symbol": "BTCUSDT",
+                    "direction": "long",
+                    "quantity": 0.01,
+                    "avg_entry_price": 100.0,
+                    "unrealized_pnl": 0.0,
+                }
+            ],
+            "trades": [],
+        }
+
+
+def _live_group() -> Any:
+    from hydra.execution.protective_orders import ProtectiveGroup
+
+    return ProtectiveGroup(
+        symbol="BTCUSDT",
+        order_id="5",
+        order_type=OrderType.OCO,
+        quantity=D("0.01"),
+        spec=ProtectionSpec(stop_loss=D("98"), take_profit=D("103")),
+        leg_ids=("11", "12"),
+        confirmed=True,
+    )
+
+
+class TestSessionDetailLive:
+    async def test_positions_carry_the_confirmed_exchange_stop(self) -> None:
+        mgr = _LiveManager(_FakeKeyedClient(), SimpleNamespace(protect=_FakeProtect(_live_group())))
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        (position,) = detail["positions"]
+        stop = position["exchange_stop"]
+        assert stop["state"] == "confirmed"
+        assert stop["kind"] == "oco"
+        assert stop["stop_price"] == 98.0
+        assert stop["take_profit"] == 103.0
+        assert stop["order_list_id"] == "5"
+        assert stop["error"] is None
+        assert datetime.fromisoformat(stop["checked_at"]).tzinfo is not None
+        # the pinned seam renders through the route model (UI-4 consumes the same names)
+        model = SessionDetailResponse.model_validate(detail)
+        assert model.positions[0].exchange_stop is not None
+        assert model.positions[0].exchange_stop.state == "confirmed"
+        assert model.positions[0].exchange_stop.stop_price == 98.0
+
+    async def test_a_held_position_without_a_resting_stop_is_missing(self) -> None:
+        mgr = _LiveManager(_FakeKeyedClient(legs=[], lists=[]))
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert detail["positions"][0]["exchange_stop"]["state"] == "missing"
+
+    async def test_an_unreadable_exchange_is_unknown_with_the_error(self) -> None:
+        mgr = _LiveManager(_FakeKeyedClient(error=RuntimeError("binance unreachable")))
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        stop = detail["positions"][0]["exchange_stop"]
+        assert stop["state"] == "unknown"
+        assert "binance unreachable" in (stop["error"] or "")
+
+    async def test_open_orders_come_from_the_normalized_exchange_legs(self) -> None:
+        mgr = _LiveManager(_FakeKeyedClient(), SimpleNamespace(protect=_FakeProtect(_live_group())))
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert [
+            (o["id"], o["type"], o["stop_price"], o["price"], o["protective"])
+            for o in detail["open_orders"]
+        ] == [
+            ("11", "LIMIT", None, 103.0, True),
+            ("12", "STOP_MARKET", 98.0, None, True),
+        ]
+
+    async def test_a_paper_session_has_no_exchange_stop(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        sid = write_strategy(
+            strategies_dir, "svc-a8", entry_long=rule(("less_than", 100.5), ("greater_than", 99.5))
+        )
+        session = await h.session(sid)
+        await h.bar(session, "100")
+        assert await held(session) == D("1.00000")
+
+        detail = await sessions_svc.get_session_detail(h.mgr, session.session_id)
+
+        assert detail["positions"]
+        assert all("exchange_stop" not in p for p in detail["positions"])
+        model = SessionDetailResponse.model_validate(detail)
+        assert all(p.exchange_stop is None for p in model.positions)

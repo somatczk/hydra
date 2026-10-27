@@ -11,6 +11,7 @@ dicts. The acting principal arrives as an actor string (``user:<name>`` from the
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal, Self
 
@@ -29,6 +30,11 @@ from hydra.execution.errors import (
     SpotShortError,
     UnsupportedStrategyError,
     UnsupportedVenueError,
+)
+from hydra.execution.exchange_stops import (
+    ExchangeStopState,
+    normalize_open_orders,
+    verify_exchange_stop,
 )
 from hydra.execution.order_manager import RiskRejectedError
 from hydra.execution.paper_trading import (
@@ -288,7 +294,50 @@ async def get_session_detail(mgr: Any, session_id: str) -> dict[str, Any]:
             }
             for o in await executor.fetch_open_orders()
         ]
+    else:
+        await _live_exchange_state(detail, session, executor)
     return dict(detail)
+
+
+async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: Any) -> None:
+    """A8-live (R12): the exchange is the truth for open orders and each position's stop.
+
+    Runs only for an executor that exposes its keyed ``exchange_client`` (the live executor,
+    P3-A); paper positions never carry ``exchange_stop``. Failures per symbol surface as
+    state ``unknown`` with the error string, never ``missing``.
+    """
+    client = getattr(executor, "exchange_client", None)
+    if client is None or getattr(client, "fetch_open_order_lists", None) is None:
+        return
+    protect = session._runtime.protect if session._runtime is not None else None
+    orders: list[dict[str, Any]] = []
+    for symbol in session.symbols:
+        try:
+            legs = normalize_open_orders(await client.fetch_open_orders(symbol))
+        except Exception as exc:
+            logger.warning("Live open orders of %s unreadable: %s", symbol, exc)
+            continue
+        for leg in legs:
+            leg["protective"] = (
+                protect.is_protective(str(leg["oco_id"] or leg["id"])) if protect else None
+            )
+            orders.append(leg)
+    detail["open_orders"] = orders
+    for position in detail.get("positions") or []:
+        expected = protect.armed(position.get("symbol")) if protect is not None else None
+        try:
+            state = await verify_exchange_stop(client, position.get("symbol"), expected)
+        except Exception as exc:
+            state = ExchangeStopState(state="unknown", checked_at=datetime.now(UTC), error=str(exc))
+        position["exchange_stop"] = {
+            "state": state.state,
+            "kind": state.kind,
+            "stop_price": state.stop_price,
+            "take_profit": state.take_profit,
+            "order_list_id": state.order_list_id,
+            "checked_at": state.checked_at.isoformat(),
+            "error": state.error,
+        }
 
 
 # ---------------------------------------------------------------------------

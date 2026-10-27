@@ -13,6 +13,8 @@ import pytest
 
 from hydra.core.types import OrderStatus
 from hydra.execution.errors import KillSwitchActiveError, SessionPersistError
+from hydra.execution.flatten import FlattenResult
+from hydra.execution.session_manager import SessionManager, TradingSession
 from hydra.risk.pretrade import RiskConfig
 from tests.unit.test_execution.session_harness import (
     Harness,
@@ -228,6 +230,93 @@ class _Pool:
     async def execute(self, query: str, *args: Any) -> str:
         self.rows[args[0]] = args[3]
         return "INSERT 0 1"
+
+
+class _FakeLiveExecutor:
+    """Exposes the live executor's duck-typed sweep method (R4a)."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.cancel_all: list[str] = []
+        self.error = error
+
+    async def cancel_all_orders(self, symbol: str) -> None:
+        self.cancel_all.append(symbol)
+        if self.error is not None:
+            raise self.error
+
+
+class _StubRuntime:
+    """The flatten/shutdown surface ``_stop_session_internal`` needs of a live runtime."""
+
+    def __init__(self) -> None:
+        self.closing = False
+        self.flattens = 0
+
+    async def flatten(self) -> Any:
+        self.flattens += 1
+        return FlattenResult(0)
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def broadcast_status(self) -> None:
+        return None
+
+
+def _live_session(mgr: SessionManager, session_id: str, executor: Any, symbols: list[str]) -> Any:
+    session = TradingSession(
+        session_id=session_id,
+        strategy_id=f"strat-{session_id}",
+        trading_mode="live",
+        status="running",
+        exchange_id="binance",
+        symbols=symbols,
+        timeframe="1h",
+    )
+    session._executor = executor
+    session._runtime = _StubRuntime()
+    mgr._sessions[session_id] = session
+    return session
+
+
+class TestKillSwitchSweep:
+    async def test_stop_all_sweeps_cancel_all_once_per_live_symbol(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        assert h.mgr is not None
+        shared = _FakeLiveExecutor()
+        first = _live_session(h.mgr, "live-a", shared, ["BTCUSDT", "ETHUSDT"])
+        second = _live_session(h.mgr, "live-b", shared, ["BTCUSDT"])
+        other = _live_session(h.mgr, "live-c", _FakeLiveExecutor(), ["ETHUSDT"])
+        paper = await h.session(write_strategy(strategies_dir, "sweep-paper"))
+        await h.mgr.stop_all(actor="test", reason="drill")
+
+        assert shared.cancel_all == ["BTCUSDT", "ETHUSDT"]  # deduped across its sessions
+        assert other._executor.cancel_all == ["ETHUSDT"]
+        assert [s.flattens for s in (first._runtime, second._runtime, other._runtime)] == [1, 1, 1]
+        assert not hasattr(paper._executor, "cancel_all")  # paper executors are never swept
+        assert all(s.status == "stopped" for s in (first, second, other))
+
+    async def test_a_single_stop_session_never_sweeps(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        assert h.mgr is not None
+        live = _live_session(h.mgr, "live-one", _FakeLiveExecutor(), ["BTCUSDT"])
+
+        await h.mgr.stop_session(live.session_id)
+
+        assert live._executor.cancel_all == []
+        assert live.status == "stopped"
+
+    async def test_a_failing_sweep_is_reported(self, h: Harness) -> None:
+        assert h.mgr is not None
+        executor = _FakeLiveExecutor(error=RuntimeError("binance down"))
+        _live_session(h.mgr, "live-stuck", executor, ["BTCUSDT"])
+
+        report = await h.mgr.stop_all(actor="test", reason="drill")
+
+        assert executor.cancel_all == ["BTCUSDT"]
+        assert any("BTCUSDT" in f and "binance down" in f for f in report.flatten_failures)
 
 
 class TestRaces:

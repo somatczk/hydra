@@ -3,11 +3,16 @@
 Entry: 1 BTC at 100 x 1.001 = 100.1, fee 0.1001, USDT 899.7999. Stops evaluate on the next closed
 bar with P1-D's rules (worse of stop and open, then 0.1 % slippage; take-profit at the better of
 limit and open, maker).
+
+The ``TestLiveGroups`` section pins the live contracts (P3-B): a live executor's create
+responses carry ``legs``/``oco_link`` (the orderListId convention), fills arrive per leg, and
+adopt consumes ``normalize_open_orders`` output.
 """
 
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
@@ -15,11 +20,25 @@ from typing import Any
 
 import pytest
 
+from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.events import ExitSignal, OrderFillEvent
-from hydra.core.types import OrderStatus, Side, Symbol
-from hydra.execution.order_manager import PROTECTIVE_TAG
+from hydra.core.types import (
+    Direction,
+    MarketType,
+    OrderStatus,
+    Position,
+    Side,
+    Symbol,
+)
+from hydra.execution.exchange_stops import normalize_open_orders
+from hydra.execution.order_manager import PROTECTIVE_TAG, OrderManager
 from hydra.execution.paper_trading import OrderRejectedError
-from hydra.execution.protective_orders import ProtectionSpec, default_stop, spec_from_policy
+from hydra.execution.protective_orders import (
+    ProtectionSpec,
+    ProtectiveOrderManager,
+    default_stop,
+    spec_from_policy,
+)
 from hydra.strategy.config import StrategyRiskConfig
 from tests.unit.test_execution.session_harness import (
     Harness,
@@ -344,3 +363,326 @@ class TestPolicyMath:
             ProtectionSpec(stop_loss=D("110"), take_profit=D("100"))
         with pytest.raises(ValueError, match="mutually exclusive"):
             ProtectionSpec(stop_loss=D("90"), trailing_pct=D("0.02"))
+
+
+# ---------------------------------------------------------------------------
+# Live groups: the exchange_stops contracts through the real OrderManager
+# ---------------------------------------------------------------------------
+
+
+def _position(symbol: str, qty: str, entry: str = "100") -> Position:
+    return Position(
+        symbol=Symbol(symbol),
+        direction=Direction.LONG,
+        quantity=D(qty),
+        avg_entry_price=D(entry),
+        unrealized_pnl=D("0"),
+        realized_pnl=D("0"),
+        strategy_id="live",
+        exchange_id="binance",
+    )
+
+
+class FakeLiveExecutor:
+    """A live executor's seam behaviour: paper-shaped responses that carry ``legs``.
+
+    OCO responses use the orderListId as ``id``/``oco_link`` and list their legs; the same
+    convention the keyed client's ``create_oco`` returns (P3-A's executor delegates to
+    ``exchange_stops`` and returns exactly this).
+    """
+
+    def __init__(
+        self,
+        positions: list[Any] | None = None,
+        resting: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.resting = resting or []
+        self._positions = positions or []
+        self._seq = 100
+
+    async def create_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "order_type": str(order_type),
+                "quantity": D(str(quantity)),
+                "price": price,
+                "stop_price": stop_price,
+                "params": dict(params or {}),
+            }
+        )
+        otype = str(order_type)
+        if otype == "MARKET":
+            return {
+                "id": f"m{uuid.uuid4().hex[:6]}",
+                "status": "FILLED",
+                "filled": True,
+                "price": float(price or 99),
+            }
+        if otype == "OCO":
+            self._seq += 1
+            list_id = str(self._seq)
+            legs = [
+                {
+                    "id": f"{list_id}-tp",
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "amount": float(quantity),
+                    "price": float(price or 0),
+                    "stop_price": None,
+                    "status": "PENDING",
+                    "filled": False,
+                    "reason": "take_profit",
+                    "oco_id": list_id,
+                    "trail_pct": None,
+                },
+                {
+                    "id": f"{list_id}-sl",
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "type": "STOP_MARKET",
+                    "amount": float(quantity),
+                    "price": None,
+                    "stop_price": float(stop_price or 0),
+                    "status": "PENDING",
+                    "filled": False,
+                    "reason": "stop_loss",
+                    "oco_id": list_id,
+                    "trail_pct": None,
+                },
+            ]
+            return {
+                "id": list_id,
+                "symbol": symbol,
+                "side": side,
+                "type": "OCO",
+                "amount": float(quantity),
+                "price": float(price or 0),
+                "stop_price": float(stop_price or 0),
+                "status": "NEW",
+                "filled": False,
+                "oco_link": list_id,
+                "legs": legs,
+            }
+        self._seq += 1
+        order_id = str(self._seq)
+        return {
+            "id": order_id,
+            "symbol": symbol,
+            "side": side,
+            "type": otype,
+            "amount": float(quantity),
+            "price": None,
+            "stop_price": float(stop_price or 0) if stop_price is not None else None,
+            "status": "NEW",
+            "filled": False,
+            "legs": [
+                {
+                    "id": order_id,
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "type": otype,
+                    "amount": float(quantity),
+                    "price": None,
+                    "stop_price": float(stop_price or 0) if stop_price is not None else None,
+                    "status": "PENDING",
+                    "filled": False,
+                    "reason": "trailing_stop" if otype == "TRAILING_STOP" else "stop_loss",
+                    "oco_id": None,
+                    "trail_pct": float(D(str((params or {}).get("trail_pct", "0")))),
+                }
+            ],
+        }
+
+    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
+        self.calls.append({"cancel_order": order_id, "symbol": symbol})
+        return {"id": order_id, "status": "CANCELED"}
+
+    async def get_positions(self, symbol: str | None = None) -> list[Any]:
+        return [p for p in self._positions if symbol is None or str(p.symbol) == symbol]
+
+    async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        return [o for o in self.resting if symbol is None or o["symbol"] == symbol]
+
+
+def _manager(
+    executor: FakeLiveExecutor, policy: StrategyRiskConfig | None = None
+) -> ProtectiveOrderManager:
+    om = OrderManager(executor, InMemoryEventBus())
+    return ProtectiveOrderManager(
+        om,
+        executor,
+        strategy_id="live",
+        exchange_id="binance",
+        market_type=MarketType.SPOT,
+        policy=policy or StrategyRiskConfig(),
+        atr=lambda symbol: None,
+    )
+
+
+def _fill(
+    symbol: str,
+    order_id: str,
+    side: Side = Side.SELL,
+    qty: str = "0.01",
+    tag: str = "protective",
+) -> OrderFillEvent:
+    return OrderFillEvent(
+        order_id=order_id,
+        symbol=Symbol(symbol),
+        side=side,
+        quantity=D(qty),
+        price=D("99"),
+        tag=tag,
+    )
+
+
+class TestLiveGroups:
+    OCO_POLICY = StrategyRiskConfig(
+        stop_loss_method="fixed_pct",
+        stop_loss_value=2.0,
+        take_profit_method="fixed_pct",
+        take_profit_value=3.0,
+    )
+
+    async def test_an_entry_fill_arms_a_confirmed_group_with_leg_ids(self) -> None:
+        ex = FakeLiveExecutor([_position("BTCUSDT", "0.01")])
+        protect = _manager(ex, self.OCO_POLICY)
+
+        await protect.on_fill(_fill("BTCUSDT", "e1", side=Side.BUY, tag="entry"))
+
+        group = protect.armed("BTCUSDT")
+        assert group is not None
+        assert group.order_id == "101"  # the orderListId, not a leg id
+        assert group.order_type.value == "OCO"
+        assert group.leg_ids == ("101-tp", "101-sl")
+        assert group.confirmed is True
+        assert group.quantity == D("0.01")
+        assert group.spec == ProtectionSpec(stop_loss=D("98"), take_profit=D("103"))
+
+    async def test_a_leg_fill_closes_the_group_by_parent_or_leg_id(self) -> None:
+        for fill_id in ("101", "101-sl"):  # the parent convention, and the leg variant
+            ex = FakeLiveExecutor([_position("BTCUSDT", "0.01")])
+            protect = _manager(ex, self.OCO_POLICY)
+            await protect.on_fill(_fill("BTCUSDT", "e1", side=Side.BUY, tag="entry"))
+            assert protect.armed("BTCUSDT") is not None
+            ex._positions = []  # the leg fill closed the position
+
+            await protect.on_fill(_fill("BTCUSDT", fill_id))
+
+            assert protect.armed("BTCUSDT") is None
+
+    async def test_a_partial_leg_fill_rearms_the_remainder(self) -> None:
+        ex = FakeLiveExecutor([_position("BTCUSDT", "0.01")])
+        protect = _manager(ex, self.OCO_POLICY)
+        await protect.on_fill(_fill("BTCUSDT", "e1", side=Side.BUY, tag="entry"))
+        assert len(ex.calls) == 1
+
+        ex._positions = [_position("BTCUSDT", "0.004")]
+        await protect.on_fill(_fill("BTCUSDT", "101-tp", qty="0.006"))
+
+        assert len(ex.calls) == 2
+        assert ex.calls[1]["order_type"] == "OCO"
+        assert ex.calls[1]["quantity"] == D("0.004")
+        group = protect.armed("BTCUSDT")
+        assert group is not None and group.confirmed and group.quantity == D("0.004")
+
+    async def test_disarm_cancels_by_list_id_and_a_failed_exit_replaces(self) -> None:
+        ex = FakeLiveExecutor([_position("BTCUSDT", "0.01")])
+        protect = _manager(ex, self.OCO_POLICY)
+        await protect.on_fill(_fill("BTCUSDT", "e1", side=Side.BUY, tag="entry"))
+
+        await protect.disarm("BTCUSDT")
+
+        assert protect.armed("BTCUSDT") is None
+        assert ex.calls[-1] == {"cancel_order": "101", "symbol": "BTCUSDT"}
+
+        await protect.rearm("BTCUSDT")
+
+        group = protect.armed("BTCUSDT")
+        assert group is not None and group.order_id != "101"  # a NEW OCO (cancel/replace)
+        assert ex.calls[-1]["order_type"] == "OCO"
+
+    async def test_adopt_attaches_normalized_legs_and_heals_a_gap(self) -> None:
+        resting = normalize_open_orders(
+            [
+                {
+                    "info": {
+                        "symbol": "BTCUSDT",
+                        "orderId": 11,
+                        "orderListId": "5",
+                        "type": "LIMIT_MAKER",
+                        "side": "SELL",
+                        "price": "103.00000000",
+                        "origQty": "0.01000000",
+                        "stopPrice": "0.00000000",
+                        "trailingDelta": "0",
+                        "status": "NEW",
+                    }
+                },
+                {
+                    "info": {
+                        "symbol": "BTCUSDT",
+                        "orderId": 12,
+                        "orderListId": "5",
+                        "type": "STOP_LOSS",
+                        "side": "SELL",
+                        "price": "0.00000000",
+                        "origQty": "0.01000000",
+                        "stopPrice": "98.00000000",
+                        "trailingDelta": "0",
+                        "status": "NEW",
+                    }
+                },
+            ]
+        )
+        ex = FakeLiveExecutor([_position("BTCUSDT", "0.01")], resting=resting)
+        protect = _manager(ex, self.OCO_POLICY)
+
+        await protect.adopt(["BTCUSDT"])
+
+        group = protect.armed("BTCUSDT")
+        assert group is not None
+        assert group.order_id == "5" and group.order_type.value == "OCO"
+        assert group.spec == ProtectionSpec(stop_loss=D("98.0"), take_profit=D("103.0"))
+        assert ex.calls == []  # attached, nothing placed
+
+        ex.resting = []
+        ex._positions = [_position("ETHUSDT", "0.01")]
+        await protect.adopt(["ETHUSDT"])
+
+        assert len(ex.calls) == 1 and ex.calls[0]["order_type"] == "OCO"  # the gap heal
+        assert protect.armed("ETHUSDT") is not None
+
+    async def test_every_placement_rejected_leaves_failures_and_no_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ex = FakeLiveExecutor([_position("BTCUSDT", "0.01")])
+        real = ex.create_order
+
+        async def refuse_resting_sells(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("side") == "SELL" and kwargs.get("order_type") != "MARKET":
+                raise OrderRejectedError("venue refuses stops")
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(ex, "create_order", refuse_resting_sells)
+        protect = _manager(ex)
+
+        await protect.on_fill(_fill("BTCUSDT", "e1", side=Side.BUY, tag="entry"))
+
+        assert protect.armed("BTCUSDT") is None
+        # the policy stop is the 5% default, so there is no separate fallback attempt
+        assert len(protect.failures) == 1
+        assert "venue refuses stops" in protect.failures[0]

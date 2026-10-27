@@ -14,7 +14,7 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -50,6 +50,7 @@ from hydra.data.ingestion import ExchangeFeedManager
 from hydra.execution import session_store
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import SessionNotRunningError, SpotShortError, UnsupportedStrategyError
+from hydra.execution.exchange_stops import ExchangeStopState
 from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import (
@@ -306,6 +307,7 @@ class SessionRuntime:
                 logger.exception("Publishing paper fill %s failed", fill.order_id)
             if fill.status == "CANCELLED":
                 await self._release_manual(fill.parent_order_id or fill.order_id, "gap_cancel")
+        await self._check_live_coverage()
         self.session.last_bar_at = datetime.now(UTC)
         try:
             await self.risk.on_mark(self.exchange_id, symbol, bar.close, bar.timestamp)
@@ -314,6 +316,35 @@ class SessionRuntime:
         halted = self.executor.get_account_snapshot().halted
         if halted is not None and not self.closing:
             await self._fail(f"paper ledger halted: {halted}")
+
+    async def _check_live_coverage(self) -> None:
+        """The dead-man hook (R4): set/clear ``hydra_live_protective_gap`` per closed bar.
+
+        The live executor build (P3-A) sets ``_live_coverage``, an async callable returning
+        per session symbol the verified ``ExchangeStopState`` — ``None`` for a symbol with
+        nothing held. Paper runtimes never set it, so they never enter this branch. A raised
+        check is logged and never fails the bar.
+        """
+        coverage: (
+            Callable[[], Coroutine[Any, Any, Mapping[str, ExchangeStopState | None]]] | None
+        ) = getattr(self, "_live_coverage", None)
+        if coverage is None or self.closing:
+            return
+        try:
+            states = await coverage()
+        except Exception:
+            logger.exception(
+                "Live protective coverage check failed for %s", self.session.session_id
+            )
+            return
+        for symbol, state in states.items():
+            metrics.set_live_protective_gap(
+                self.session.session_id,
+                self.cfg.id,
+                self.exchange_id,
+                symbol,
+                state is not None and state.state != "confirmed",
+            )
 
     async def _on_price(self, event: Event) -> None:
         if (

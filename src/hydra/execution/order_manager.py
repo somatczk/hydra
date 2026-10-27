@@ -136,13 +136,20 @@ def _realized_pnl(
 class _TrackedOrder:
     """Internal bookkeeping for an in-flight order."""
 
-    __slots__ = ("order_id", "request", "status", "submitted_at")
+    __slots__ = ("order_id", "request", "response", "status", "submitted_at")
 
-    def __init__(self, request: OrderRequest, order_id: str, submitted_at: float) -> None:
+    def __init__(
+        self,
+        request: OrderRequest,
+        order_id: str,
+        submitted_at: float,
+        response: dict[str, Any] | None = None,
+    ) -> None:
         self.request = request
         self.order_id = order_id
         self.status: OrderStatus = OrderStatus.SUBMITTED
         self.submitted_at = submitted_at
+        self.response = response
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +308,12 @@ class OrderManager:
         self, order: OrderRequest, intent: Intent, resp: dict[str, Any], started: float
     ) -> str:
         order_id = str(resp.get("id", str(uuid.uuid4())))
-        tracked = _TrackedOrder(request=order, order_id=order_id, submitted_at=self._clock())
+        tracked = _TrackedOrder(
+            request=order,
+            order_id=order_id,
+            submitted_at=self._clock(),
+            response=resp if isinstance(resp, dict) else None,
+        )
         self._orders[order_id] = tracked
 
         status_str = str(resp.get("status", "")).upper()
@@ -404,6 +416,11 @@ class OrderManager:
         if tracked is None:
             raise KeyError(f"Unknown order_id: {order_id}")
         return tracked.status
+
+    def order_response(self, order_id: str) -> dict[str, Any] | None:
+        """The raw executor create response of a tracked order (live leg bookkeeping)."""
+        tracked = self._orders.get(order_id)
+        return None if tracked is None else tracked.response
 
     def mark_cancelled(self, order_id: str) -> bool:
         """Record that the executor dropped a tracked order (e.g. a gap-cancelled BUY)."""

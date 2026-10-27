@@ -8,7 +8,7 @@ by RiskService.size_entry: sleeve 1000 x max_position_pct 10 % = 100 USDT at mar
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -254,3 +254,90 @@ class TestHotReload:
         assert session.config_hash == config_hash(v2)
         assert runtime.protect._policy is protect_policy_before
         assert type(runtime.engine.get_strategy(sid)) is type(strategy)
+
+
+class TestLiveCoverage:
+    """The dead-man hook (R4): the live executor provides the verifier, the wiring the gauge."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_gauge(self) -> AsyncIterator[None]:
+        from hydra.core import metrics
+
+        metrics._reset_metrics()
+        yield
+        metrics._reset_metrics()
+
+    def _gap(self, session: Any) -> float | None:
+        return REGISTRY.get_sample_value(
+            "hydra_live_protective_gap",
+            {
+                "session_id": session.session_id,
+                "strategy_id": session.strategy_id,
+                "exchange_id": "binance",
+                "symbol": "BTCUSDT",
+            },
+        )
+
+    async def test_the_hook_sets_and_clears_the_gap_gauge(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        from hydra.execution.exchange_stops import ExchangeStopState
+
+        session = await h.session(
+            write_strategy(strategies_dir, "cov", entry_long=rule(("less_than", 0.0)))
+        )
+        runtime = session._runtime
+        assert runtime is not None
+        state: dict[str, ExchangeStopState | None] = {}
+
+        async def coverage() -> dict[str, ExchangeStopState | None]:
+            return dict(state)
+
+        runtime._live_coverage = coverage
+        state["BTCUSDT"] = ExchangeStopState(state="missing", checked_at=datetime.now(UTC))
+        await h.bar(session, "100")
+        assert self._gap(session) == 1.0
+
+        state["BTCUSDT"] = ExchangeStopState(state="confirmed", checked_at=datetime.now(UTC))
+        await h.bar(session, "101")
+        assert self._gap(session) is None
+
+        state["BTCUSDT"] = None  # nothing held: no gap
+        await h.bar(session, "102")
+        assert self._gap(session) is None
+
+        state["BTCUSDT"] = ExchangeStopState(
+            state="unknown", checked_at=datetime.now(UTC), error="read failed"
+        )
+        await h.bar(session, "103")
+        assert self._gap(session) == 1.0  # unconfirmed, whatever the reason
+
+    async def test_a_raising_hook_never_fails_the_bar(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        session = await h.session(
+            write_strategy(strategies_dir, "covboom", entry_long=rule(("less_than", 0.0)))
+        )
+        runtime = session._runtime
+        assert runtime is not None
+        calls = 0
+
+        async def broken() -> dict[str, None]:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("exchange unreadable")
+
+        runtime._live_coverage = broken
+        await h.bar(session, "100")
+
+        assert calls == 1
+        assert session.status == "running"
+        assert session.last_bar_at is not None
+
+    async def test_paper_never_sets_the_gauge(self, h: Harness, strategies_dir: Path) -> None:
+        session = await h.session(
+            write_strategy(strategies_dir, "paperonly", entry_long=ENTRY_AT_100)
+        )
+        await h.bar(session, "100")
+        assert await held(session) == D("1.00000")
+        assert self._gap(session) is None

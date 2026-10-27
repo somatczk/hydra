@@ -62,6 +62,16 @@ groups:
           summary: "Hydra engine is down"
           description: "The Hydra trading engine has been unreachable for over 2 minutes. All trading activity is halted."
 
+      - alert: HydraLiveProtectiveGap
+        expr: hydra_live_protective_gap == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Live position without a confirmed exchange-side stop"
+          description: "Session {{ $labels.session_id }} holds {{ $labels.symbol }} on {{ $labels.exchange_id }} with no confirmed exchange-side protective order. The position is unprotected: follow the dead-man checklist in README.md (Stop all, or flatten manually from the Binance app)."
+
   - name: hydra-system
     interval: 30s
     rules:

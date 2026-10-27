@@ -97,13 +97,20 @@ def spec_from_policy(
 
 @dataclass(slots=True)
 class ProtectiveGroup:
-    """The resting protective order of one symbol (the OCO id for an OCO)."""
+    """The resting protective order of one symbol (the OCO id for an OCO).
+
+    ``leg_ids`` and ``confirmed`` are the live convention: a live create response carries
+    the exchange legs (even a single-leg stop), and their presence is the exchange ack.
+    Paper responses never do, so both stay empty/False there.
+    """
 
     symbol: str
     order_id: str
     order_type: OrderType
     quantity: Decimal
     spec: ProtectionSpec
+    leg_ids: tuple[str, ...] = ()
+    confirmed: bool = False
 
 
 class ProtectiveOrderManager:
@@ -166,7 +173,7 @@ class ProtectiveOrderManager:
         symbol = str(event.symbol)
         position = await self._position(symbol)
         group = self._groups.get(symbol)
-        if group is not None and event.order_id == group.order_id:
+        if group is not None and event.order_id in (group.order_id, *group.leg_ids):
             del self._groups[symbol]
             if position is not None:
                 await self._arm(position, group.spec)
@@ -286,7 +293,7 @@ class ProtectiveOrderManager:
                 qty,
                 params={"trail_pct": str(spec.trailing_pct)},
             )
-            return ProtectiveGroup(symbol, str(resp["id"]), OrderType.TRAILING_STOP, qty, spec)
+            return self._group_from_response(symbol, OrderType.TRAILING_STOP, qty, spec, resp)
         if spec.stop_loss is None:
             spec = replace(spec, stop_loss=default_stop(position.avg_entry_price).stop_loss)
         order_type = OrderType.OCO if spec.take_profit is not None else OrderType.STOP_MARKET
@@ -307,7 +314,29 @@ class ProtectiveOrderManager:
         )
         if order_id is None:
             return None
-        return ProtectiveGroup(symbol, order_id, order_type, qty, spec)
+        return self._group_from_response(
+            symbol, order_type, qty, spec, self._om.order_response(order_id) or {}, order_id
+        )
+
+    def _group_from_response(
+        self,
+        symbol: str,
+        order_type: OrderType,
+        qty: Decimal,
+        spec: ProtectionSpec,
+        resp: dict[str, Any],
+        order_id: str | None = None,
+    ) -> ProtectiveGroup:
+        legs = tuple(str(leg["id"]) for leg in resp.get("legs") or [])
+        return ProtectiveGroup(
+            symbol=symbol,
+            order_id=str(resp.get("id") or order_id),
+            order_type=order_type,
+            quantity=qty,
+            spec=spec,
+            leg_ids=legs,
+            confirmed=bool(legs),
+        )
 
 
 def _spec_from_resting(orders: list[dict[str, Any]]) -> ProtectionSpec:

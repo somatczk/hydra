@@ -13,8 +13,9 @@ from decimal import Decimal
 from typing import Any
 
 from hydra.core.metrics import observe_exchange_call, record_ws_reconnect
-from hydra.core.types import Direction, ExchangeId, MarketType, Position, Symbol
+from hydra.core.types import Direction, ExchangeId, MarketType, OrderType, Position, Symbol
 from hydra.execution.client_factory import ccxt_class_for
+from hydra.execution.exchange_stops import normalize_exchange_leg
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,67 @@ class ExchangeClient:
             result: dict[str, Any] = await exchange.cancel_order(order_id, symbol)
         return result
 
+    async def create_oco(
+        self,
+        symbol: str,
+        side: str,
+        quantity: str,
+        take_profit: str,
+        stop_loss: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Place a spot OCO (POST /api/v3/orderList/oco); returns the paper OCO shape.
+
+        *quantity*, *take_profit* and *stop_loss* are pre-formatted exchange strings
+        (tick/lot aligned by the caller, ``exchange_stops``). The response is normalized to
+        the paper shape with ``id`` = the orderListId and per-leg dicts in ``legs``.
+        """
+        exchange = self._get_exchange()
+        request: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "quantity": quantity,
+            "aboveType": "LIMIT_MAKER",
+            "abovePrice": take_profit,
+            "belowType": "STOP_LOSS",
+            "belowStopPrice": stop_loss,
+            "newOrderRespType": "FULL",
+        }
+        if params:
+            request.update(params)
+        with observe_exchange_call(self._exchange_id, "create_oco"):
+            raw: dict[str, Any] = await exchange.privatePostOrderListOco(request)
+        order_list_id = str(raw.get("orderListId"))
+        return {
+            "id": order_list_id,
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": OrderType.OCO.value,
+            "amount": float(quantity),
+            "price": float(take_profit),
+            "stop_price": float(stop_loss),
+            "status": str(raw.get("listStatusType") or "EXEC_STARTED"),
+            "filled": False,
+            "oco_link": order_list_id,
+            "legs": [normalize_exchange_leg(r) for r in raw.get("orderReports") or []],
+        }
+
+    async def cancel_order_list(self, order_list_id: str, symbol: str) -> dict[str, Any]:
+        """Cancel a whole OCO list (DELETE /api/v3/orderList)."""
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "cancel_order_list"):
+            result: dict[str, Any] = await exchange.privateDeleteOrderList(
+                {"symbol": symbol, "orderListId": order_list_id}
+            )
+        return result
+
+    async def cancel_all_orders(self, symbol: str) -> dict[str, Any]:
+        """Cancel EVERY open order on *symbol* (DELETE /api/v3/openOrders), hydra's or not."""
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "cancel_all_orders"):
+            result: dict[str, Any] = await exchange.privateDeleteOpenOrders({"symbol": symbol})
+        return result
+
     # ------------------------------------------------------------------
     # Account queries
     # ------------------------------------------------------------------
@@ -145,6 +207,14 @@ class ExchangeClient:
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "fetch_open_orders"):
             result: list[dict[str, Any]] = await exchange.fetch_open_orders(symbol)
+        return result
+
+    async def fetch_open_order_lists(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Fetch open OCO lists (GET /api/v3/openOrderList): the A8 verification read."""
+        exchange = self._get_exchange()
+        request: dict[str, Any] = {"symbol": symbol} if symbol else {}
+        with observe_exchange_call(self._exchange_id, "fetch_open_order_lists"):
+            result: list[dict[str, Any]] = await exchange.privateGetOpenOrderList(request)
         return result
 
     async def fetch_positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
