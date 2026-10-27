@@ -1031,15 +1031,14 @@ wheels = [
 
 [[package]]
 name = "faker"
-version = "33.3.1"
+version = "40.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "python-dateutil" },
-    { name = "typing-extensions" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9c/50/48ab6ba3f07ee7d0eac367695aeb8bc9eb9c3debc0445a67cd07e2d62b44/faker-33.3.1.tar.gz", hash = "sha256:49dde3b06a5602177bc2ad013149b6f60a290b7154539180d37b6f876ae79b20", size = 1854895, upload-time = "2025-01-10T16:49:37.655Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/33/6c/b8793efc2f00a912ef17cf0b61b717cddf34607499efcb8a32238c119368/faker-40.43.0.tar.gz", hash = "sha256:02fae4327c03a4a6315e1b428a3878f435bfc276c93435ea349b95c0c9372361", size = 2032713, upload-time = "2026-10-09T20:06:29.652Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c2/01/6acc8b4dba4154cd93b444382a9ad3c099557aac577bdc7d66373e0a0c68/Faker-33.3.1-py3-none-any.whl", hash = "sha256:ac4cf2f967ce02c898efa50651c43180bd658a7707cfd676fcc5410ad1482c03", size = 1894842, upload-time = "2025-01-10T16:49:34.261Z" },
+    { url = "https://files.pythonhosted.org/packages/81/ed/0d6d0d6467ae3d009fb82fb411867c7fcfeadbdd25602cab0d7a7963f400/faker-40.43.0-py3-none-any.whl", hash = "sha256:9dd7c0ddfaf30c842b05502d3cf641c135e0120a3a19047008ba8525b72953ed", size = 2069082, upload-time = "2026-10-09T20:06:27.166Z" },
 ]
 
 [[package]]
@@ -1832,7 +1831,7 @@ requires-dist = [
     { name = "ccxt", extras = ["async"], specifier = ">=4.4,<5" },
     { name = "cryptography", specifier = ">=50.0.0,<51" },
     { name = "factory-boy", marker = "extra == 'dev'", specifier = ">=3.3,<4" },
-    { name = "faker", marker = "extra == 'dev'", specifier = ">=33.0,<34" },
+    { name = "faker", marker = "extra == 'dev'", specifier = ">=40.43.0,<41" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "finrl", marker = "extra == 'ml-training'", specifier = ">=0.3,<1" },
     { name = "httpx", specifier = ">=0.28.1,<1" },
