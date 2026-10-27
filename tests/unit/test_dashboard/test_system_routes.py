@@ -792,6 +792,16 @@ class TestExchangeReads:
         assert [o["id"] for o in resp.json()["orders"]] == ["o-BTC/USDT", "o-ETHUSDT"]
         assert FakeBinance.instances[-1].order_symbols == ["BTC/USDT", "ETHUSDT"]
 
+    def test_running_sessions_read_failure_is_a_503_envelope(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        assert _connect(client).status_code == 200
+        db.fail, db.fail_on = OSError("db went away"), "FROM trading_sessions"
+        resp = client.get("/api/system/exchanges/binance/orders")
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "database_unavailable"
+        assert FakeBinance.instances[-1].order_symbols == []
+
     def test_failed_read_is_502_and_closes_the_cached_client(
         self, app: FastAPI, client: TestClient
     ) -> None:

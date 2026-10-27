@@ -172,7 +172,7 @@ async def test_recovery_uses_snapshot(fresh_database: str, strategies_dir: Path)
             assert runtime is not None
             assert runtime.cfg.parameters["rsi_period"] == 14
 
-            detail = await svc.get_strategy(pool, sid, second)
+            detail = await svc.get_strategy(pool, sid)
             (running,) = detail["running_sessions"]
             assert running["session_id"] == session_id
             assert running["stale"] is True

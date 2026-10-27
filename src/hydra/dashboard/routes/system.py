@@ -874,7 +874,9 @@ async def _order_symbols(request: Request) -> list[str]:
     pool = require_pool(request)
     stored = await read_system_config(pool)
     symbols = [stored.default_pair]
-    for row in await session_store.load_running(pool):
+    async with db_errors_to_503("reading running sessions"):
+        rows = await session_store.load_running(pool)
+    for row in rows:
         symbols += [str(s) for s in row["symbols"]]
     unique: dict[str, str] = {}
     for symbol in symbols:

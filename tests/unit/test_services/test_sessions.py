@@ -571,13 +571,42 @@ async def test_webhook_trades_a_paper_target_row(h: Harness, strategies_dir: Pat
     assert await held(session) == D("0.01")
 
 
-async def test_webhook_degrades_when_the_gate_read_fails(h: Harness, strategies_dir: Path) -> None:
+async def test_webhook_refuses_when_the_gate_read_fails(h: Harness, strategies_dir: Path) -> None:
+    """R25: the gate fails closed — an unreadable mode refuses the order before it exists."""
     write_strategy(strategies_dir, "svc")
     assert h.mgr is not None
     session = await h.session("svc")
     await h.bar(session, "100")
 
-    d = await _webhook(h, _RowsPool(_RowsConn([], error=OSError("database down"))))
+    with pytest.raises(ServiceError) as raised:
+        await _webhook(h, _RowsPool(_RowsConn([], error=OSError("database down"))))
 
-    assert d["session_id"] == session.session_id
-    assert await held(session) == D("0.01")
+    detail = _detail(raised.value)
+    assert raised.value.status_code == 503
+    assert (detail["code"], detail["state"]) == ("live_gate_unreadable", "unavailable")
+    assert await held(session) == D("0")
+
+
+async def test_webhook_refuses_when_no_pool_is_bound(h: Harness, strategies_dir: Path) -> None:
+    """R25's other unreadable mode: no pool at all still never flows past the gate."""
+    write_strategy(strategies_dir, "svc")
+    assert h.mgr is not None
+    session = await h.session("svc")
+    await h.bar(session, "100")
+
+    with pytest.raises(ServiceError) as raised:
+        await sessions_svc.submit_webhook_order(
+            h.mgr,
+            symbol="BTCUSDT",
+            side="buy",
+            action="entry",
+            quantity=D("0.01"),
+            strategy_id="svc",
+            pool=None,
+            webhook_origin=True,
+        )
+
+    detail = _detail(raised.value)
+    assert raised.value.status_code == 503
+    assert (detail["code"], detail["state"]) == ("live_gate_unreadable", "unavailable")
+    assert await held(session) == D("0")

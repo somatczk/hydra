@@ -32,6 +32,41 @@ SECRET = secrets.token_hex(16)
 START = Decimal("500")
 
 
+class _GateConn:
+    """Serves the running-session rows the webhook live gate resolves the target from."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM trading_sessions" in sql and "running" in sql
+        return self.rows
+
+
+class _GatePool:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.conn = _GateConn(rows)
+
+    def acquire(self) -> _GatePool:
+        return self
+
+    async def __aenter__(self) -> _GateConn:
+        return self.conn
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _running_row(strategy_id: str, mode: str) -> dict[str, Any]:
+    return {
+        "id": f"s-{strategy_id}",
+        "strategy_id": strategy_id,
+        "trading_mode": mode,
+        "status": "running",
+        "symbols": ["BTCUSDT"],
+    }
+
+
 @pytest.fixture()
 async def sessions(
     strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -43,7 +78,8 @@ async def sessions(
         write_strategy(strategies_dir, sid)
         made[sid] = executor(await h.session(sid, str(START)))
     monkeypatch.setattr(app.state, "session_manager", mgr)
-    monkeypatch.setattr(app.state, "trader", LocalTrader(app.state.db_pool, mgr))
+    paper_rows = [_running_row(sid, "paper") for sid in ("momentum", "breakout")]
+    monkeypatch.setattr(app.state, "trader", LocalTrader(_GatePool(paper_rows), mgr))
     yield made
     await h.close()
 
@@ -254,38 +290,7 @@ class TestExecutionOutcome:
         assert await _untouched(sessions["momentum"])
 
 
-class _GateConn:
-    """Serves the running-session rows the webhook live gate resolves the target from."""
-
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self.rows = rows
-
-    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
-        assert "FROM trading_sessions" in sql and "running" in sql
-        return self.rows
-
-
-class _GatePool:
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self.conn = _GateConn(rows)
-
-    def acquire(self) -> _GatePool:
-        return self
-
-    async def __aenter__(self) -> _GateConn:
-        return self.conn
-
-    async def __aexit__(self, *exc: object) -> None:
-        return None
-
-
-_LIVE_ROW = {
-    "id": "s-live",
-    "strategy_id": "momentum",
-    "trading_mode": "live",
-    "status": "running",
-    "symbols": ["BTCUSDT"],
-}
+_LIVE_ROW = _running_row("momentum", "live")
 
 
 @pytest.fixture()
