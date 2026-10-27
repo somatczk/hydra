@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from hydra.dashboard.api import app
 from hydra.execution.session_manager import SessionManager, TradingSession
+from hydra.services.trader import LocalTrader
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -92,6 +93,7 @@ def mock_session_manager() -> MagicMock:
 @pytest.fixture()
 def client(mock_session_manager: MagicMock) -> TestClient:
     app.state.session_manager = mock_session_manager
+    app.state.trader = LocalTrader(None, mock_session_manager)
     return TestClient(app)
 
 

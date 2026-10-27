@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from decimal import Decimal
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -10,19 +9,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from hydra.dashboard.routes._db import (
     DB_ERRORS,
+    ServiceErrorRoute,
     api_error,
     db_errors_to_503,
+    request_trader,
     require_pool,
 )
-from hydra.risk.circuit_breakers import CircuitBreakerRestrictions, TierNotActiveError
-from hydra.risk.service import RiskService
-from hydra.risk.state import (
-    RiskStateNotPersistedError,
-    RiskStateUnavailableError,
-    fetch_risk_events,
-)
+from hydra.risk.state import RiskStateUnavailableError, fetch_risk_events
 
-router = APIRouter(prefix="/api/risk", tags=["risk"])
+router = APIRouter(prefix="/api/risk", tags=["risk"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
 
 _STORE_ERRORS: tuple[type[BaseException], ...] = (RiskStateUnavailableError, *DB_ERRORS)
@@ -150,32 +145,6 @@ def _risk_config_missing(scope: str = "global") -> HTTPException:
     )
 
 
-def _risk_service(request: Request) -> RiskService | None:
-    """The engine's RiskService, exposed as ``SessionManager.risk``."""
-    mgr = getattr(request.app.state, "session_manager", None)
-    svc = getattr(mgr, "risk", None) if mgr is not None else None
-    return svc if isinstance(svc, RiskService) else None
-
-
-def _require_risk(request: Request) -> RiskService:
-    svc = _risk_service(request)
-    if svc is None:
-        raise api_error(
-            503,
-            "risk_service_unavailable",
-            "The trading engine's risk service is not running",
-            "unavailable",
-        )
-    if not svc.available:
-        raise api_error(
-            503,
-            "risk_state_unavailable",
-            "Risk state could not be loaded or persisted; opening orders are refused",
-            "unavailable",
-        )
-    return svc
-
-
 def _paper_only(source: str | None) -> None:
     if source not in (None, "paper"):
         raise api_error(
@@ -194,41 +163,6 @@ def _actor(request: Request) -> str:
     if name:
         return f"{kind}:{name}" if kind else str(name)
     return "anonymous"
-
-
-def _f(value: Decimal | None) -> float | None:
-    return None if value is None else float(value)
-
-
-def _restrictions_model(
-    r: CircuitBreakerRestrictions,
-) -> CircuitBreakerRestrictionsModel:
-    return CircuitBreakerRestrictionsModel(
-        active_tier=r.tier,
-        can_open_new_trades=r.can_open_new_trades,
-        size_multiplier=float(r.position_size_multiplier),
-        must_flatten=r.must_flatten,
-        is_shutdown=r.is_shutdown,
-        daily_halt_until=r.daily_halt_until,
-        consecutive_pause_until=r.consecutive_pause_until,
-    )
-
-
-def _breakers(svc: RiskService) -> list[CircuitBreaker]:
-    drawdown_pct = round(float(svc.account().drawdown) * 100, 2)
-    return [
-        CircuitBreaker(
-            tier=b.tier,
-            label=b.label,
-            threshold=f"{float(b.threshold) * 100:.2f}% drawdown",
-            threshold_pct=round(float(b.threshold) * 100, 4),
-            current_value=drawdown_pct,
-            status=b.status,
-            active_since=b.active_since,
-            requires_manual_review=b.requires_manual_review,
-        )
-        for b in svc.breakers()
-    ]
 
 
 def _row_to_config(row: dict[str, Any]) -> dict[str, Any]:
@@ -293,44 +227,22 @@ async def _get_risk_config_from_db(pool: Any, scope: str = "global") -> dict[str
 
 
 @router.get("/status", response_model=RiskStatus)
-async def get_risk_status(request: Request, source: str | None = None) -> RiskStatus:
+async def get_risk_status(request: Request, source: str | None = None) -> dict[str, Any]:
     """Account drawdown, daily loss and breakers from the engine's RiskService (paper ledger)."""
     _paper_only(source)
-    svc = _require_risk(request)
-    view = svc.account()
-    cfg = view.config
-    start = view.day_start_equity
-    daily_loss = (
-        max(Decimal("0"), start - view.equity)
-        if start is not None and view.equity is not None
-        else None
-    )
-    return RiskStatus(
-        current_drawdown=round(float(view.drawdown) * 100, 2),
-        max_drawdown_limit=float(cfg.max_drawdown_pct) * 100,
-        daily_loss=None if daily_loss is None else round(float(daily_loss), 2),
-        daily_loss_limit=None if start is None else round(float(start * cfg.max_daily_loss_pct), 2),
-        equity=_f(view.equity),
-        peak_equity=_f(view.peak_equity),
-        day_start_equity=_f(start),
-        consecutive_losses=view.consecutive_losses,
-        max_consecutive_losses=cfg.max_consecutive_losses,
-        circuit_breakers=_breakers(svc),
-        circuit_breakers_state="live",
-        restrictions=_restrictions_model(view.restrictions),
-    )
+    return await request_trader(request).risk_status()
 
 
 @router.get("/circuit-breakers", response_model=list[CircuitBreaker])
-async def get_circuit_breakers(request: Request) -> list[CircuitBreaker]:
+async def get_circuit_breakers(request: Request) -> list[dict[str, Any]]:
     """The four drawdown tiers with live state from the RiskService."""
-    return _breakers(_require_risk(request))
+    return await request_trader(request).circuit_breakers()
 
 
 @router.post("/circuit-breakers/{tier}/reset", response_model=list[CircuitBreaker])
 async def reset_circuit_breaker(
     tier: int, body: BreakerResetRequest, request: Request
-) -> list[CircuitBreaker]:
+) -> list[dict[str, Any]]:
     """Reset the active tier (audited first; rebases the high-water mark to current equity)."""
     if tier not in range(1, 5):
         raise api_error(422, "invalid_tier", f"tier must be 1-4, got {tier}", "invalid")
@@ -341,58 +253,18 @@ async def reset_circuit_breaker(
             f"confirm_tier {body.confirm_tier} does not match tier {tier}",
             "invalid",
         )
-    svc = _require_risk(request)
-    try:
-        await svc.reset_breaker(
-            tier, actor=_actor(request), reason=body.reason, confirm_tier=body.confirm_tier
-        )
-    except TierNotActiveError as exc:
-        raise api_error(
-            409,
-            "tier_not_active",
-            str(exc),
-            "invalid",
-            active_tier=svc.account().tier,
-        ) from exc
-    except ValueError as exc:
-        raise api_error(422, "invalid_reset", str(exc), "invalid") from exc
-    except RiskStateNotPersistedError as exc:
-        logger.exception("Circuit breaker reset not persisted; rolled back")
-        raise api_error(
-            503,
-            "reset_not_persisted",
-            "The reset could not be saved and was rolled back; the breaker is unchanged",
-            "unavailable",
-        ) from exc
-    except _STORE_ERRORS as exc:
-        logger.exception("Circuit breaker reset not audited; state unchanged")
-        raise api_error(
-            503,
-            "audit_unavailable",
-            "The reset could not be written to the audit log; nothing changed",
-            "unavailable",
-        ) from exc
-    return _breakers(svc)
+    return await request_trader(request).reset_breaker(
+        tier, _actor(request), body.reason, body.confirm_tier
+    )
 
 
 @router.post("/paper-account/reset", response_model=RiskStatus)
-async def reset_paper_account(body: PaperResetRequest, request: Request) -> RiskStatus:
+async def reset_paper_account(body: PaperResetRequest, request: Request) -> dict[str, Any]:
     """Rebase the paper ledger (peak, day start, carried PnL) to current equity; audited first.
 
     Breaker tiers, halts and pauses are untouched (reset those through the breaker reset).
     """
-    svc = _require_risk(request)
-    try:
-        await svc.reset_paper_account(actor=_actor(request), reason=body.reason)
-    except _STORE_ERRORS as exc:
-        logger.exception("Paper account reset refused or not audited")
-        raise api_error(
-            503,
-            "paper_reset_unavailable",
-            "The paper account was not reset: risk state is recovering, a held position has no "
-            "mark yet, or the audit log could not be written",
-            "unavailable",
-        ) from exc
+    await request_trader(request).reset_paper_account(_actor(request), body.reason)
     return await get_risk_status(request)
 
 
@@ -420,47 +292,10 @@ async def get_risk_events(
 
 
 @router.get("/var", response_model=VarEstimate)
-async def get_var(request: Request, source: str | None = None) -> VarEstimate:
+async def get_var(request: Request, source: str | None = None) -> dict[str, Any]:
     """Historical-simulation VaR over daily paper PnL, sized against account equity."""
     _paper_only(source)
-    svc = _require_risk(request)
-    equity = svc.account().equity
-    if equity is None:
-        raise api_error(
-            503, "equity_unknown", "No account equity has been marked yet", "unavailable"
-        )
-    pool = require_pool(request)
-
-    var_95 = 0.0
-    var_99 = 0.0
-    cvar_95 = 0.0
-
-    async with db_errors_to_503("computing VaR"), pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT SUM(pnl - fee) AS daily_pnl FROM trades "
-            "WHERE source = 'paper' "
-            "GROUP BY date_trunc('day', timestamp) "
-            "ORDER BY date_trunc('day', timestamp)",
-        )
-
-    if len(rows) >= 5:
-        daily_pnls = sorted(float(r["daily_pnl"]) for r in rows)
-        n = len(daily_pnls)
-        idx_95 = max(0, int(n * 0.05))
-        idx_99 = max(0, int(n * 0.01))
-        var_95 = abs(min(daily_pnls[idx_95], 0))
-        var_99 = abs(min(daily_pnls[idx_99], 0))
-        tail = [v for v in daily_pnls[: idx_95 + 1] if v < 0]
-        cvar_95 = abs(sum(tail) / len(tail)) if tail else var_95
-
-    return VarEstimate(
-        var_95=round(var_95, 2),
-        var_99=round(var_99, 2),
-        cvar_95=round(cvar_95, 2),
-        portfolio_value=round(float(equity), 2),
-        calculation_method="historical_simulation",
-        sample_days=len(rows),
-    )
+    return await request_trader(request).var_estimate()
 
 
 # ---------------------------------------------------------------------------
@@ -494,18 +329,16 @@ async def update_risk_config(body: RiskConfigUpdate, request: Request) -> dict[s
     async with db_errors_to_503("updating risk config"):
         await _apply_risk_config_update(pool, "global", updates)
 
-    svc = _risk_service(request)
-    if svc is not None:
-        try:
-            await svc.reload_config(actor=_actor(request))
-        except _STORE_ERRORS as exc:
-            logger.exception("Risk config saved but the engine did not reload it")
-            raise api_error(
-                503,
-                "risk_reload_failed",
-                "Limits were saved but the running engine could not reload them",
-                "unavailable",
-            ) from exc
+    try:
+        await request_trader(request).reload_paper_capital(_actor(request))
+    except _STORE_ERRORS as exc:
+        logger.exception("Risk config saved but the engine did not reload it")
+        raise api_error(
+            503,
+            "risk_reload_failed",
+            "Limits were saved but the running engine could not reload them",
+            "unavailable",
+        ) from exc
 
     return await get_risk_config(request)
 
@@ -529,39 +362,6 @@ async def update_strategy_risk_config(strategy_id: str) -> None:
 
 
 @router.get("/live-status", response_model=RiskStatusLive)
-async def get_live_risk_status(request: Request) -> RiskStatusLive:
+async def get_live_risk_status(request: Request) -> dict[str, Any]:
     """Kill switch, sessions and breaker restrictions; unknown values are reported as unknown."""
-    kill_switch: bool | None = None
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is not None:
-        try:
-            cfg = await _get_risk_config_from_db(pool)
-        except DB_ERRORS:
-            logger.warning("Kill switch state unknown: risk_config read failed", exc_info=True)
-            cfg = None
-        if cfg is not None:
-            kill_switch = bool(cfg["kill_switch_active"])
-
-    svc = _risk_service(request)
-    if svc is not None and svc.kill_switch_active():
-        kill_switch = True
-
-    kill_state: Literal["active", "inactive", "unknown"] = (
-        "unknown" if kill_switch is None else ("active" if kill_switch else "inactive")
-    )
-
-    mgr = getattr(request.app.state, "session_manager", None)
-    running: int | None = None
-    if mgr is not None:
-        running = sum(1 for s in mgr.list_sessions() if s.status == "running")
-
-    live = svc is not None and svc.available
-    return RiskStatusLive(
-        kill_switch_active=kill_switch,
-        kill_switch_state=kill_state,
-        running_sessions=running,
-        circuit_breaker_restrictions=_restrictions_model(svc.restrictions())
-        if svc is not None and live
-        else None,
-        circuit_breakers_state="live" if live else "unavailable",
-    )
+    return await request_trader(request).live_status()

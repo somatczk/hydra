@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hydra.core.types import OrderType, Side
 from hydra.data.ingestion import InsufficientHistoryError
+from hydra.execution import session_store
 from hydra.execution.errors import (
     DuplicateSessionError,
     KillSwitchActiveError,
@@ -37,7 +38,13 @@ from hydra.execution.paper_trading import (
 )
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.risk.market_rules import MarketRulesUnavailableError
-from hydra.services.errors import ServiceError, error_detail, require_pool, service_error
+from hydra.services.errors import (
+    DB_ERRORS,
+    ServiceError,
+    error_detail,
+    require_pool,
+    service_error,
+)
 from hydra.services.strategies import build_strategy_name_map
 
 logger = logging.getLogger(__name__)
@@ -343,8 +350,121 @@ async def release_kill_switch(pool: Any, mgr: Any, actor: str, reason: str) -> d
 
 
 # ---------------------------------------------------------------------------
-# Quick trade
+# Quick trade and webhook signal
 # ---------------------------------------------------------------------------
+
+
+def _live_gate_unreadable() -> ServiceError:
+    """R25: a webhook-originated order never flows past an unreadable mode read."""
+    return service_error(
+        503,
+        "live_gate_unreadable",
+        "The target session's trading mode could not be read; webhook signals are refused",
+        "unavailable",
+    )
+
+
+async def _refuse_live_webhook_target(pool: Any, *, symbol: str, strategy_id: str) -> None:
+    """Refuse with 409 ``live_gate_required`` when the target's running row is live-mode.
+
+    The target's mode is read from the database — the truth the D5 process split shares.
+    An unreadable mode (no pool, or a failed read) fails closed with 503
+    ``live_gate_unreadable``: a webhook-originated order never flows past an unreadable
+    gate (R25).
+    """
+    if pool is None:
+        logger.error("Webhook live-gate unreadable for strategy %s: no database pool", strategy_id)
+        raise _live_gate_unreadable()
+    try:
+        rows = await session_store.load_running(pool)
+    except DB_ERRORS as exc:
+        logger.exception("Webhook live-gate read failed for strategy %s", strategy_id)
+        raise _live_gate_unreadable() from exc
+    for row in rows:
+        if (
+            row["strategy_id"] == strategy_id
+            and row["trading_mode"] == "live"
+            and symbol in row["symbols"]
+        ):
+            raise service_error(
+                409,
+                "live_gate_required",
+                f"Strategy '{strategy_id}' has a running live session; webhook signals "
+                "cannot place live orders",
+                "invalid",
+            )
+
+
+async def submit_webhook_order(
+    mgr: Any,
+    *,
+    symbol: str,
+    side: str,
+    action: str,
+    quantity: Decimal | None,
+    strategy_id: str,
+    pool: Any = None,
+    webhook_origin: bool = False,
+) -> dict[str, Any]:
+    """A webhook-originated signal on the first running session of *strategy_id*.
+
+    A call marked ``webhook_origin`` (the R3 seam) refuses a live-mode target with 409
+    ``live_gate_required`` before any order is placed: an external signal never trades a
+    live session — and when the mode cannot be read, it refuses with 503
+    ``live_gate_unreadable`` instead (R25: the gate fails closed). Unmarked calls keep
+    today's behaviour; nothing live can run before P3-A.
+
+    An entry is a buy, an exit a reduce-only sell; an entry without ``quantity`` is sized
+    like a strategy entry. Returns ``{"session_id", "order_id", "status"}``; unknown
+    failures propagate for the caller's 502.
+    """
+    if mgr is None:
+        raise service_error(
+            503, "engine_not_ready", "Trading engine not initialized", "unavailable"
+        )
+    if webhook_origin:
+        await _refuse_live_webhook_target(pool, symbol=symbol, strategy_id=strategy_id)
+    is_exit = action == "exit"
+    if not is_exit and side == "sell":
+        raise service_error(
+            422, "spot_short", "Short entries are not supported on spot sessions", "invalid"
+        )
+    try:
+        session, result = await mgr.submit_manual_order(
+            symbol=symbol,
+            side=Side.SELL if is_exit else Side.BUY,
+            order_type=OrderType.MARKET,
+            quantity=quantity,
+            strategy_id=strategy_id,
+        )
+    except SessionNotRunningError as exc:
+        raise service_error(
+            404,
+            "session_not_found",
+            f"No running session for strategy_id '{strategy_id}'",
+            "not_found",
+        ) from exc
+    except SpotShortError as exc:
+        if is_exit:
+            raise service_error(
+                409, "no_position", f"No open {symbol} position to exit", "no_data"
+            ) from exc
+        raise service_error(422, exc.code, str(exc), "invalid") from exc
+    except RiskRejectedError as exc:
+        raise service_error(
+            422, "risk_rejected", exc.reason, "invalid", check=exc.check, intent=exc.intent
+        ) from exc
+    except ValueError as exc:
+        raise service_error(422, "order_rejected", str(exc), "invalid") from exc
+    except PersistenceUnavailableError as exc:
+        raise service_error(503, "paper_state_unpersisted", str(exc), "unavailable") from exc
+    except PaperSessionHaltedError as exc:
+        raise service_error(503, "paper_session_halted", str(exc), "unavailable") from exc
+    return {
+        "session_id": session.session_id,
+        "order_id": result.order_id,
+        "status": result.status,
+    }
 
 
 async def submit_manual_order(mgr: Any, order: QuickTradeRequest) -> dict[str, Any]:

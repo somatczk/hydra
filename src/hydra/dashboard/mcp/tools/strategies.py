@@ -72,9 +72,7 @@ async def strategy_get(strategy_id: str) -> str:
     """Read one strategy in full: rules, timeframes, risk, symbols, config hash, running
     sessions and whether the file changed under them, plus paper performance."""
     try:
-        return _deps.json_text(
-            await strategy_svc.get_strategy(_deps.db_pool(), strategy_id, _deps.session_manager())
-        )
+        return _deps.json_text(await strategy_svc.get_strategy(_deps.db_pool(), strategy_id))
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
 
@@ -190,7 +188,7 @@ async def strategy_reload(strategy_id: str) -> str:
     list and nothing is applied.
     """
     try:
-        result = await strategy_svc.reload_strategy(_deps.session_manager(), strategy_id)
+        result = await _deps.trader().reload_strategy(strategy_id)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     audit(

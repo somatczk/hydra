@@ -27,6 +27,7 @@ from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.system import router
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore, LoadedConfig, RiskStateUnavailableError
+from hydra.services.trader import LocalTrader
 from tests.unit.test_risk.harness import Clock, rules_cache
 
 from .system_db import NOW, FakeSystemDb
@@ -47,6 +48,7 @@ def _make_app(pool: object | None = None) -> FastAPI:
     test_app.state.db_pool = pool
     test_app.state.system_config = None
     test_app.state.session_manager = None
+    test_app.state.trader = None
     test_app.state.exchange_credentials = {}
     test_app.state.exchange_credential_errors = {}
     return test_app
@@ -257,7 +259,7 @@ class _SystemConfigStore(InMemoryRiskStateStore):
 
 
 def _manager(risk: RiskService) -> SimpleNamespace:
-    """P1-E's SessionManager as the route sees it: only ``.risk`` (no reload hook)."""
+    """P1-E's SessionManager as the trader backend sees it: only ``.risk`` (no reload hook)."""
     return SimpleNamespace(risk=risk)
 
 
@@ -276,7 +278,7 @@ class TestPaperCapitalChange:
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _manager(svc)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
         assert resp.status_code == 200
         assert resp.json()["paper_capital"] == 25000.0
@@ -289,7 +291,7 @@ class TestPaperCapitalChange:
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=False)
-        app.state.session_manager = _manager(svc)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
         assert resp.status_code == 200
         assert resp.json()["paper_capital"] == 25000.0
@@ -299,7 +301,7 @@ class TestPaperCapitalChange:
 
     async def test_same_capital_does_not_reset(self, db: FakeSystemDb, app: FastAPI) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _manager(svc)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 10000})
         assert resp.json()["paper_capital_pending"] is None
         assert store.events == []
@@ -308,7 +310,7 @@ class TestPaperCapitalChange:
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _manager(svc)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
         store.fail = RiskStateUnavailableError("store down")
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
         assert resp.status_code == 503
@@ -320,7 +322,7 @@ class TestPaperCapitalChange:
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _manager(svc)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
         store.fail = AttributeError("contract drift")
         resp = TestClient(app).put("/api/system/config", json={"paper_capital": 25000})
         assert resp.status_code == 503
@@ -330,7 +332,7 @@ class TestPaperCapitalChange:
         self, db: FakeSystemDb, app: FastAPI
     ) -> None:
         svc, store = await _risk(db, recovered=True)
-        app.state.session_manager = _manager(svc)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
         client = TestClient(app)
         store.fail = RiskStateUnavailableError("store down")
         assert client.put("/api/system/config", json={"paper_capital": 25000}).status_code == 503
@@ -770,25 +772,35 @@ class TestExchangeConnect:
         assert _detail(resp)["code"] == "credentials_not_found"
 
 
-def _session(status: str, symbols: list[str]) -> SimpleNamespace:
-    return SimpleNamespace(status=status, symbols=symbols)
-
-
 @pytest.mark.usefixtures("binance")
 class TestExchangeReads:
-    def test_orders_are_fetched_per_symbol(self, app: FastAPI, client: TestClient) -> None:
+    def test_orders_are_fetched_per_symbol(self, db: FakeSystemDb, client: TestClient) -> None:
         assert _connect(client).status_code == 200
-        app.state.session_manager = SimpleNamespace(
-            list_sessions=lambda: [
-                _session("running", ["BTCUSDT", "ETHUSDT"]),
-                _session("stopped", ["SOLUSDT"]),
-            ]
-        )
+        # the load_running query answers running rows only (the SQL filters)
+        db.running_sessions = [
+            {
+                "id": "s-run",
+                "strategy_id": "saw",
+                "trading_mode": "paper",
+                "status": "running",
+                "symbols": ["BTCUSDT", "ETHUSDT"],
+            }
+        ]
         resp = client.get("/api/system/exchanges/binance/orders")
         assert resp.status_code == 200
         assert resp.json()["symbols"] == ["BTC/USDT", "ETHUSDT"]
         assert [o["id"] for o in resp.json()["orders"]] == ["o-BTC/USDT", "o-ETHUSDT"]
         assert FakeBinance.instances[-1].order_symbols == ["BTC/USDT", "ETHUSDT"]
+
+    def test_running_sessions_read_failure_is_a_503_envelope(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        assert _connect(client).status_code == 200
+        db.fail, db.fail_on = OSError("db went away"), "FROM trading_sessions"
+        resp = client.get("/api/system/exchanges/binance/orders")
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "database_unavailable"
+        assert FakeBinance.instances[-1].order_symbols == []
 
     def test_failed_read_is_502_and_closes_the_cached_client(
         self, app: FastAPI, client: TestClient

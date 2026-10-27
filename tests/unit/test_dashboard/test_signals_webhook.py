@@ -23,12 +23,48 @@ from hydra.dashboard import security
 from hydra.dashboard.api import app
 from hydra.dashboard.routes import signals
 from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.services.trader import LocalTrader
 from tests.unit.test_execution.session_harness import Harness, executor, write_strategy
 
 from .conftest import TEST_API_TOKEN
 
 SECRET = secrets.token_hex(16)
 START = Decimal("500")
+
+
+class _GateConn:
+    """Serves the running-session rows the webhook live gate resolves the target from."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM trading_sessions" in sql and "running" in sql
+        return self.rows
+
+
+class _GatePool:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.conn = _GateConn(rows)
+
+    def acquire(self) -> _GatePool:
+        return self
+
+    async def __aenter__(self) -> _GateConn:
+        return self.conn
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _running_row(strategy_id: str, mode: str) -> dict[str, Any]:
+    return {
+        "id": f"s-{strategy_id}",
+        "strategy_id": strategy_id,
+        "trading_mode": mode,
+        "status": "running",
+        "symbols": ["BTCUSDT"],
+    }
 
 
 @pytest.fixture()
@@ -42,6 +78,8 @@ async def sessions(
         write_strategy(strategies_dir, sid)
         made[sid] = executor(await h.session(sid, str(START)))
     monkeypatch.setattr(app.state, "session_manager", mgr)
+    paper_rows = [_running_row(sid, "paper") for sid in ("momentum", "breakout")]
+    monkeypatch.setattr(app.state, "trader", LocalTrader(_GatePool(paper_rows), mgr))
     yield made
     await h.close()
 
@@ -250,6 +288,63 @@ class TestExecutionOutcome:
         detail = resp.json()["detail"]
         assert (detail["code"], detail["state"]) == ("execution_failed", "unavailable")
         assert await _untouched(sessions["momentum"])
+
+
+_LIVE_ROW = _running_row("momentum", "live")
+
+
+@pytest.fixture()
+async def live_row_sessions(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[dict[str, Any]]:
+    """Real paper sessions in memory, but the database says momentum trades live."""
+    h = Harness(strategies_dir)
+    mgr = await h.start()
+    made: dict[str, Any] = {}
+    for sid in ("momentum", "breakout"):
+        write_strategy(strategies_dir, sid)
+        session = await h.session(sid, str(START))
+        made[sid] = {"executor": executor(session), "session_id": session.session_id}
+    monkeypatch.setattr(app.state, "session_manager", mgr)
+    monkeypatch.setattr(app.state, "trader", LocalTrader(_GatePool([_LIVE_ROW]), mgr))
+    yield made
+    await h.close()
+
+
+class TestLiveGate:
+    """R3: a webhook-originated order never reaches a live-mode target row."""
+
+    async def test_a_live_target_row_is_refused_409_before_any_order(
+        self, live_row_sessions: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        resp = await _post(secret=SECRET, quantity="0.01")
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert (detail["code"], detail["state"]) == ("live_gate_required", "invalid")
+        assert await _untouched(live_row_sessions["momentum"]["executor"])
+        assert await _untouched(live_row_sessions["breakout"]["executor"])
+
+    async def test_the_non_webhook_quick_trade_path_is_unchanged_on_the_same_row(
+        self, live_row_sessions: dict[str, Any]
+    ) -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://engine",
+            headers={"Authorization": f"Bearer {TEST_API_TOKEN}"},
+        ) as client:
+            resp = await client.post(
+                "/api/trading/quick-trade",
+                json={
+                    "session_id": live_row_sessions["momentum"]["session_id"],
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "quantity": "0.01",
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        positions = await live_row_sessions["momentum"]["executor"].fetch_positions("BTCUSDT")
+        assert [(p["side"], p["contracts"]) for p in positions] == [("long", 0.01)]
 
 
 def test_telegram_endpoint_is_gone() -> None:

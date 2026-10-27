@@ -50,6 +50,7 @@ from hydra.data.storage import MarketDataRepository
 from hydra.execution.client_factory import ClientFactory, bars_repository
 from hydra.execution.session_manager import SessionManager
 from hydra.risk.state import fetch_risk_events
+from hydra.services.trader import LocalTrader
 from tests.unit.test_execution.session_harness import Harness, write_strategy
 
 pytestmark = pytest.mark.integration
@@ -400,6 +401,7 @@ async def test_gated_kill_switch_release_writes_the_risk_event_rows(
     mgr = SessionManager(db_pool=pool, config=HydraConfig(), clients=_real_clients(h))
     await mgr.startup()
     monkeypatch.setattr(engine_app.state, "session_manager", mgr)
+    monkeypatch.setattr(engine_app.state, "trader", LocalTrader(pool, mgr))
     try:
         sid = write_strategy(strategies_dir, "pg-b2")
         session_id = await mgr.start_session(sid, "paper", Decimal("500"), actor="service:mcp")

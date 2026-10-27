@@ -21,6 +21,7 @@ from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.portfolio import router
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore
+from hydra.services.trader import LocalTrader
 from tests.unit.test_risk.harness import Clock, rules_cache
 
 
@@ -451,6 +452,7 @@ class TestPaperLedger:
         await svc.load()
         app = _make_app(pool=db)
         app.state.session_manager = SimpleNamespace(risk=svc)
+        app.state.trader = LocalTrader(db, SimpleNamespace(risk=svc))
         db.paper_capital = "25000"
         db.session("a", 5000)
         db.snapshot("a", 0, 5100)

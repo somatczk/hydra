@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 
-from hydra.dashboard.routes._db import ServiceErrorRoute, request_pool
+from hydra.dashboard.routes._db import ServiceErrorRoute, request_pool, request_trader
 from hydra.services import strategies as svc
 from hydra.services.strategies import (
     PreviewRequest,
@@ -97,8 +97,7 @@ async def list_comparators() -> list[dict[str, str]]:
 @router.get("/{strategy_id}", response_model=StrategyDetailResponse)
 async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
     """Get a single strategy detail with structured builder fields."""
-    manager = getattr(request.app.state, "session_manager", None)
-    return await svc.get_strategy(request_pool(request), strategy_id, manager)
+    return await svc.get_strategy(request_pool(request), strategy_id)
 
 
 @router.put("/{strategy_id}", response_model=SaveResponse)
@@ -132,8 +131,7 @@ async def reload_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
 
     Changes to rules, risk, sizing, symbols, timeframes or class return 409 (restart required).
     """
-    manager = getattr(request.app.state, "session_manager", None)
-    return await svc.reload_strategy(manager, strategy_id)
+    return await request_trader(request).reload_strategy(strategy_id)
 
 
 @router.post("/preview", response_model=PreviewResponse)

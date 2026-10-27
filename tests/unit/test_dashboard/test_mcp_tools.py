@@ -40,6 +40,7 @@ from hydra.dashboard.mcp.tools import _deps
 from hydra.dashboard.security import install_security
 from hydra.execution.errors import ConfigReloadRefusedError
 from hydra.services import strategies as strategy_svc
+from hydra.services.trader import LocalTrader
 from tests.unit.test_execution.session_harness import Harness, held, write_strategy
 
 from .conftest import TEST_API_TOKEN
@@ -426,7 +427,9 @@ def test_backtest_run_on_a_missing_strategy_is_the_404_envelope(mcp: _McpClient)
 def test_strategy_reload_409_keeps_restart_required_and_changed_fields(
     mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(engine_app.state, "session_manager", _RefusingManager(["risk", "symbols"]))
+    refusing = _RefusingManager(["risk", "symbols"])
+    monkeypatch.setattr(engine_app.state, "session_manager", refusing)
+    monkeypatch.setattr(engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, refusing))
     is_error, text = mcp.call("strategy_reload", {"strategy_id": "saw"})
     assert is_error
     assert "restart_required" in text
@@ -657,6 +660,9 @@ async def test_strategy_reload_round_trip_applies_a_params_only_change(
         sid = write_strategy(strategies_dir, "saw")
         session = await h.session(sid)
         monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+        monkeypatch.setattr(
+            engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+        )
         data = yaml.safe_load((strategies_dir / f"{sid}.yaml").read_text())
         data["parameters"]["required_history"] = 5
         (strategies_dir / f"{sid}.yaml").write_text(yaml.safe_dump(data))
@@ -718,6 +724,9 @@ class TestSessionTools:
             sid = write_strategy(strategies_dir, "saw")
             monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
             monkeypatch.setattr(engine_app.state, "db_pool", None, raising=False)
+            monkeypatch.setattr(
+                engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+            )
             assert h.mgr is not None
             async with _async_mcp(mcp_cfg) as mcp:
                 with capture_logs() as logs:
@@ -798,6 +807,9 @@ class TestSessionTools:
         try:
             write_strategy(strategies_dir, "saw")
             monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            monkeypatch.setattr(
+                engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+            )
             assert h.mgr is not None
             async with _async_mcp(mcp_cfg) as mcp:
                 is_error, text = await mcp.call(
@@ -826,6 +838,9 @@ class TestSessionTools:
             session = await h.session(write_strategy(strategies_dir, "unsaved"))
             await h.bar(session, "100")
             monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            monkeypatch.setattr(
+                engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+            )
             assert h.mgr is not None
             h.mgr._db_pool = _DownPool()
             async with _async_mcp(mcp_cfg) as mcp:
@@ -864,6 +879,9 @@ class TestSessionTools:
             sid = write_strategy(strategies_dir, "saw")
             monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
             monkeypatch.setattr(engine_app.state, "db_pool", None, raising=False)
+            monkeypatch.setattr(
+                engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+            )
             assert h.mgr is not None
             await h.session(sid)
             async with _async_mcp(mcp_cfg) as mcp:
@@ -897,6 +915,9 @@ class TestKillSwitchTools:
         await h.start()
         try:
             monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
+            monkeypatch.setattr(
+                engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+            )
             assert h.mgr is not None and not h.mgr.kill_switch_active()
             async with _async_mcp(mcp_cfg) as mcp:
                 is_error, text = await mcp.call("kill_switch_on", {"reason": "x" * 501})
@@ -932,6 +953,9 @@ class TestKillSwitchTools:
             monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
             # the release executor persists through whatever pool the engine state carries
             monkeypatch.setattr(engine_app.state, "db_pool", object(), raising=False)
+            monkeypatch.setattr(
+                engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+            )
             assert h.mgr is not None
             session = await h.session(sid)
             await h.bar(session, "100")
@@ -1029,6 +1053,9 @@ class TestKillSwitchTools:
         try:
             monkeypatch.setattr(engine_app.state, "session_manager", h.mgr)
             monkeypatch.setattr(engine_app.state, "db_pool", object(), raising=False)
+            monkeypatch.setattr(
+                engine_app.state, "trader", LocalTrader(engine_app.state.db_pool, h.mgr)
+            )
             assert h.mgr is not None and not h.mgr.kill_switch_active()
             async with _async_mcp(mcp_cfg) as mcp:
                 is_error, text = await mcp.call("kill_switch_release", {"reason": "not latched"})

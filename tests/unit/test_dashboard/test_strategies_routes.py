@@ -776,22 +776,6 @@ class TestStrategiesFallback:
         assert resp.status_code == 404
 
 
-class _FakeSession:
-    def __init__(self, strategy_id: str, status: str, session_id: str, config_hash: str) -> None:
-        self.strategy_id = strategy_id
-        self.status = status
-        self.session_id = session_id
-        self.config_hash = config_hash
-
-
-class _FakeManager:
-    def __init__(self, sessions: list[_FakeSession]) -> None:
-        self._sessions = sessions
-
-    def list_sessions(self) -> list[_FakeSession]:
-        return self._sessions
-
-
 class TestGetStrategyRunningSessions:
     def test_running_sessions_and_stale_flag(self, tmp_path: Path) -> None:
         yaml_file = tmp_path / "drift.yaml"
@@ -815,19 +799,25 @@ class TestGetStrategyRunningSessions:
                 parameters={"rsi_period": 14},
             )
         )
-        manager = _FakeManager(
-            [
-                _FakeSession("drift_1", "running", "s-stale", stale_hash),
-                _FakeSession("drift_1", "running", "s-fresh", file_hash),
-                _FakeSession("drift_1", "stopped", "s-stopped", stale_hash),
-                _FakeSession("other", "running", "s-other", stale_hash),
+        pool, conn = _make_mock_pool()
+        conn.fetchrow = AsyncMock(return_value=None)
+
+        async def fetch(sql: str, *args: Any) -> list[dict[str, Any]]:
+            if "FROM trades" in sql:
+                return []
+            assert "FROM trading_sessions" in sql
+            # the load_running query answers running rows only (the SQL filters)
+            return [
+                {"id": "s-stale", "strategy_id": "drift_1", "config_hash": stale_hash},
+                {"id": "s-fresh", "strategy_id": "drift_1", "config_hash": file_hash},
+                {"id": "s-other", "strategy_id": "other", "config_hash": stale_hash},
             ]
-        )
+
+        conn.fetch = AsyncMock(side_effect=fetch)
 
         app = FastAPI()
         app.include_router(router)
-        app.state.db_pool = None
-        app.state.session_manager = manager
+        app.state.db_pool = pool
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             resp = TestClient(app).get("/api/strategies/drift_1")
         assert resp.status_code == 200
@@ -843,7 +833,7 @@ class TestGetStrategyRunningSessions:
         assert by_id["s-fresh"]["stale"] is False
         assert data["file_changed"] is True
 
-    def test_no_session_manager_gives_empty_running_sessions(self, tmp_path: Path) -> None:
+    def test_no_pool_gives_empty_running_sessions(self, tmp_path: Path) -> None:
         yaml_file = tmp_path / "solo.yaml"
         yaml_file.write_text(
             "id: solo_1\nname: Solo\n"
@@ -870,10 +860,10 @@ class TestGetStrategyRunningSessions:
                 "total_trades": 0,
             }
         )
-        app = _make_app(pool=pool)
-        app.state.session_manager = _FakeManager(
-            [_FakeSession("dbonly", "running", "s-run", "abc123def456")]
+        conn.fetch = AsyncMock(
+            return_value=[{"id": "s-run", "strategy_id": "dbonly", "config_hash": "abc123def456"}]
         )
+        app = _make_app(pool=pool)
         resp = TestClient(app).get("/api/strategies/dbonly")
         assert resp.status_code == 200
         data = resp.json()

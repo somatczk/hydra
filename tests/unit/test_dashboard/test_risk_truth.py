@@ -19,6 +19,7 @@ from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.risk import router
 from hydra.risk.pretrade import RiskConfig
 from hydra.risk.state import RiskStateUnavailableError
+from hydra.services.trader import LocalTrader
 from tests.unit.test_risk.harness import Account, make_account
 
 _GLOBAL_ROW: dict[str, Any] = {
@@ -50,6 +51,7 @@ def _make_app(pool: Any = None, session_manager: Any = None) -> FastAPI:
     app = FastAPI()
     app.state.db_pool = pool
     app.state.session_manager = session_manager
+    app.state.trader = LocalTrader(pool, session_manager)
     install_error_handlers(app)
     app.include_router(router)
     return app
