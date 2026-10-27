@@ -162,7 +162,8 @@ class RestHandle:
         """Drop this reference; the last release closes the client.
 
         Raises ``RuntimeError`` on a second release of the same handle — a leak of
-        refcount bugs beats hiding one.
+        refcount bugs beats hiding one. Cancellation-safe: the reference drops
+        before the first suspension, so a cancelled release never leaks it.
         """
         if self._released:
             raise RuntimeError("RestHandle.release() called twice")
@@ -177,7 +178,8 @@ class SharedRestClients:
     the public entries), every later reference reuses it, and the last release closes it.
     The public entry (``creds=None``) and a credentials-scoped entry of the same exchange
     are distinct keys that coexist; constructing the trade-credentials client itself is
-    P3-A/P3-B's to add behind the same *rest_factory* seam.
+    P3-A/P3-B's to add behind the same *rest_factory* seam. Releases never wait on the
+    lock: the decrement is synchronous, so a cancelled release cannot leak a reference.
     """
 
     def __init__(self, rest_factory: RestPoolFactory = _public_rest_factory) -> None:
@@ -205,16 +207,21 @@ class SharedRestClients:
         return list(markets.values())
 
     async def _release(self, entry: _PoolEntry) -> None:
-        close: Any = None
-        async with self._lock:
-            entry.refs -= 1
-            if entry.refs == 0:
-                self._entries.pop(entry.key, None)
-                close = entry.client
-        if close is None:
+        # Synchronous: a cancelled release must never be able to skip the decrement.
+        entry.refs -= 1
+        if entry.refs != 0:
             return
+        self._entries.pop(entry.key, None)
         try:
-            await close.close()
+            await self._close_quietly(entry)
+        except asyncio.CancelledError:
+            # The reference already dropped; finish the interrupted close.
+            await self._close_quietly(entry)
+            raise
+
+    async def _close_quietly(self, entry: _PoolEntry) -> None:
+        try:
+            await entry.client.close()
         except Exception:
             logger.warning(
                 "Pooled REST client close failed", exchange=entry.key[0], creds=entry.key[1]

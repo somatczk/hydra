@@ -4,11 +4,17 @@ The pool and the feed/session wiring are real; only the ccxt boundary is faked. 
 release path is pinned: last release closes, double release is a hard error, a close
 failure never poisons the releaser, and a warm-up that fails mid-startup releases its
 handle. Two feeds (and two sessions) share exactly one public client per exchange.
+
+Concurrency tests force the real interleaving: the pool lock is held while the tasks
+start, so acquirers genuinely park inside ``handle()`` and the loser-release branch in
+``_ensure_rest`` runs. Cancellation tests pin that a cancelled release still drops the
+reference and closes the client exactly once.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -128,7 +134,14 @@ async def test_concurrent_acquires_construct_exactly_one_client() -> None:
     factory = RecordingFactory(_rows())
     pool = SharedRestClients(rest_factory=factory)
 
-    handles = await asyncio.gather(*[pool.handle("binance") for _ in range(8)])
+    # Contend the pool lock so every acquirer genuinely parks inside handle()
+    # before any of them runs (a plain gather would run them back to back).
+    async with pool._lock:
+        tasks = [asyncio.create_task(pool.handle("binance")) for _ in range(8)]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not any(task.done() for task in tasks)
+    handles = await asyncio.gather(*tasks)
 
     assert len(factory.calls) == 1
     assert {h.client for h in handles} == {factory.clients[0]}
@@ -137,6 +150,7 @@ async def test_concurrent_acquires_construct_exactly_one_client() -> None:
     assert factory.clients[0].close_calls == 0
     await handles[-1].release()
     assert factory.clients[0].close_calls == 1
+    assert pool._entries == {}
 
 
 async def test_reacquire_after_close_reconstructs() -> None:
@@ -267,6 +281,80 @@ async def test_markets_loader_releases_when_load_markets_raises() -> None:
 
 
 # ----------------------------------------------------------------------
+# Cancellation safety: a cancelled release never leaks the reference
+# ----------------------------------------------------------------------
+
+
+class _GatedCloseRest(FakeRestExchange):
+    """A REST stand-in whose ``close()`` parks on a gate before counting."""
+
+    def __init__(self, rows: list[list[Any]], gate: asyncio.Event) -> None:
+        super().__init__(rows)
+        self._gate = gate
+
+    async def close(self) -> None:
+        await self._gate.wait()
+        self.close_calls += 1
+
+
+class _GatedCloseFactory:
+    """Pool factory stand-in whose clients park inside ``close()``."""
+
+    def __init__(self, rows: list[list[Any]], gate: asyncio.Event) -> None:
+        self.rows = rows
+        self.gate = gate
+        self.clients: list[_GatedCloseRest] = []
+
+    def __call__(self, exchange_id: str, creds: str | None) -> _GatedCloseRest:
+        client = _GatedCloseRest(self.rows, self.gate)
+        self.clients.append(client)
+        return client
+
+
+async def test_release_survives_a_contended_pool_lock_and_cancellation() -> None:
+    """The D3 review window: cancelling a release between its released-flag and
+    the pool decrement used to leak the reference permanently (double-release on
+    retry, the client never closing, the entry never leaving the pool)."""
+    factory = RecordingFactory(_rows())
+    pool = SharedRestClients(rest_factory=factory)
+    handle = await pool.handle("binance")
+
+    async with pool._lock:  # the release must not need this lock
+        release = asyncio.create_task(handle.release())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        release.cancel()
+    # Completed or cancelled mid-release — either way the reference must be gone.
+    with contextlib.suppress(asyncio.CancelledError):
+        await release
+
+    assert handle._entry.refs == 0
+    assert pool._entries == {}
+    assert factory.clients[0].close_calls == 1
+    with pytest.raises(RuntimeError, match=r"release\(\) called twice"):
+        await handle.release()
+
+
+async def test_a_release_cancelled_mid_close_still_closes_the_client() -> None:
+    gate = asyncio.Event()
+    factory = _GatedCloseFactory(_rows(), gate)
+    pool = SharedRestClients(rest_factory=factory)
+    handle = await pool.handle("binance")
+
+    release = asyncio.create_task(handle.release())
+    await asyncio.sleep(0)  # the release parks inside the gated close
+    assert not release.done()
+    release.cancel()
+    gate.set()  # let the release finish the interrupted close
+
+    with pytest.raises(asyncio.CancelledError):
+        await release
+    assert factory.clients[0].close_calls == 1
+    assert handle._entry.refs == 0
+    assert pool._entries == {}
+
+
+# ----------------------------------------------------------------------
 # The feed seam: acquire on first REST use, release on disconnect
 # ----------------------------------------------------------------------
 
@@ -300,13 +388,24 @@ async def test_concurrent_cold_fetches_keep_the_refcount_balanced() -> None:
         client, _markets = await feed._ensure_rest("binance")
         await client.fetch_ohlcv("BTC/USDT", "1h", limit=1)
 
-    await asyncio.gather(cold_fetch(), cold_fetch(), cold_fetch())
+    # Contend the pool lock so the cold fetches genuinely interleave: every task
+    # acquires its own handle before any setdefault lands, so all but the winner
+    # take the loser-release path in _ensure_rest.
+    async with pool._lock:
+        tasks = [asyncio.create_task(cold_fetch()) for _ in range(3)]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not any(task.done() for task in tasks)
+    await asyncio.gather(*tasks)
 
     assert len(factory.calls) == 1
     assert len(feed._rest_handles) == 1
+    assert feed._rest_handles["binance"]._entry.refs == 1  # the losers released
 
     await feed.disconnect_all()
     assert factory.clients[0].close_calls == 1
+    assert not feed._rest_handles
+    assert pool._entries == {}
 
 
 async def test_feed_warm_up_failure_releases_its_handle() -> None:
