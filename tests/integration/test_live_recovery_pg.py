@@ -259,3 +259,124 @@ async def test_an_unrestorable_live_ledger_marks_the_session_error(
             await pool.close()
     finally:
         await infra.drop_database(db)
+
+
+async def test_live_capital_is_divided_between_running_live_sessions(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F6: a live start seeds the REMAINDER of the armed budget, never the full
+    live_capital again, and refuses when nothing is left (paper's _allocate model)."""
+    from tests import infra
+
+    db = await infra.create_database()
+    dsn = infra.dsn(db)
+    try:
+        await asyncio.to_thread(upgrade_to_head, dsn)
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=6)
+        try:
+            await _seed(pool, monkeypatch)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE system_config SET value = '10000'::jsonb WHERE key = 'live_capital'"
+                )
+            h = Harness(strategies_dir)
+            fake = FakeBinanceTradingClient(balances={"USDT": D("4000")})
+            mgr = _manager(h, pool, fake)
+            await mgr.startup()
+            try:
+                seeds = []
+                for i in range(3):
+                    sid = write_strategy(strategies_dir, f"pg-live-cap-{i}")
+                    session_id = await mgr.start_session(sid, "live")
+                    session = mgr.get_session(session_id)
+                    assert session is not None
+                    seeds.append(session.paper_capital)
+                assert seeds == [D("4000"), D("4000"), D("2000")]  # min(free, remainder)
+                with pytest.raises(ValueError, match="Insufficient live capital"):
+                    await mgr.start_session(write_strategy(strategies_dir, "pg-live-cap-3"), "live")
+            finally:
+                await mgr.graceful_shutdown()
+        finally:
+            await pool.close()
+    finally:
+        await infra.drop_database(db)
+
+
+async def test_two_live_sessions_on_one_account_book_only_their_own_fills(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1/F13's cross-session contract on real PG: one live_orders/live_fills table, one
+    Binance account, two sessions — each poller claims only its session's trades, so the
+    account-wide unique key never blocks the other session's fill."""
+    from tests import infra
+
+    db = await infra.create_database()
+    dsn = infra.dsn(db)
+    try:
+        await asyncio.to_thread(upgrade_to_head, dsn)
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=6)
+        try:
+            await _seed(pool, monkeypatch)
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE system_config SET value = '20000'::jsonb WHERE key = 'live_capital'"
+                )
+            h = Harness(strategies_dir)
+            fake = FakeBinanceTradingClient(balances={"USDT": D("9000")})
+            mgr = _manager(h, pool, fake)
+            await mgr.startup()
+            try:
+                sessions = []
+                for name in ("pg-live-x", "pg-live-y"):
+                    sid = write_strategy(strategies_dir, name, entry_long=rule(("less_than", 1000)))
+                    session_id = await mgr.start_session(sid, "live")
+                    session = mgr.get_session(session_id)
+                    assert session is not None
+                    sessions.append(session)
+                fake.set_mark("BTCUSDT", "100")
+                for session in sessions:
+                    await h.bar(session, "100")
+                # both pollers sweep on their own 1 s cadence, in any order
+                await asyncio.sleep(POLL_INTERVAL_S + 0.6)
+                await asyncio.sleep(POLL_INTERVAL_S + 0.6)
+
+                for session in sessions:
+                    executor = session._executor
+                    assert executor is not None
+                    positions = [
+                        p.quantity
+                        for p in await executor.get_positions("BTCUSDT")
+                        if p.quantity > 0
+                    ]
+                    assert positions, f"{session.session_id} booked no entry fill"
+                    async with pool.acquire() as conn:
+                        rows = await conn.fetch(
+                            "SELECT f.client_order_id, f.session_id FROM live_fills f"
+                            " JOIN live_orders o ON o.client_order_id = f.client_order_id"
+                            " WHERE f.session_id = $1",
+                            session.session_id,
+                        )
+                        own = {
+                            r["client_order_id"]
+                            for r in rows
+                            if r["session_id"] == session.session_id
+                        }
+                    assert rows and own, f"{session.session_id} claimed no fill of its own"
+                    # every fill row this session claimed belongs to one of ITS orders
+                    async with pool.acquire() as conn:
+                        others = await conn.fetchval(
+                            "SELECT count(*) FROM live_fills f"
+                            " JOIN live_orders o ON o.client_order_id = f.client_order_id"
+                            " WHERE f.session_id = $1 AND o.session_id <> $1",
+                            session.session_id,
+                        )
+                    assert others == 0, "a fill of another session's order was claimed"
+                async with pool.acquire() as conn:
+                    total = await conn.fetchval("SELECT count(*) FROM live_fills")
+                assert total == 2  # exactly one entry fill per session, nothing hijacked
+            finally:
+                await mgr.graceful_shutdown()
+        finally:
+            await pool.close()
+    finally:
+        await infra.drop_database(db)

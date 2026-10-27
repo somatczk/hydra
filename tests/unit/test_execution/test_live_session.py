@@ -19,7 +19,7 @@ import pytest
 
 from hydra.core.config import HydraConfig
 from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import EntrySignal
+from hydra.core.events import EntrySignal, ExitSignal
 from hydra.core.types import Direction, Symbol
 from hydra.execution.errors import ExchangeRateLimitedError, SubmitUnknownError
 from hydra.execution.live_executor import LiveOrderPoller, LiveTradingExecutor
@@ -206,7 +206,7 @@ async def test_signal_submits_with_unknown_outcomes_skip_the_order(
             async def broken(*args: Any, **kwargs: Any) -> dict[str, Any]:
                 raise error
 
-            executor.create_order = broken  # type: ignore[method-assign]
+            executor.create_order = broken
             with caplog.at_level(logging.WARNING, logger="hydra.execution.session_wiring"):
                 await runtime.bus.publish(
                     EntrySignal(
@@ -225,7 +225,7 @@ async def test_signal_submits_with_unknown_outcomes_skip_the_order(
             assert caplog.records, "the skip must be logged"
         finally:
             await runtime.shutdown()
-            executor.create_order = real  # type: ignore[method-assign]
+            executor.create_order = real
     finally:
         await h.close()
 
@@ -340,6 +340,145 @@ async def test_runtime_flatten_reports_zero_remaining_for_a_live_session(
             assert result.positions_remaining == 0
             assert not any(p.quantity > 0 for p in await executor.get_positions("BTCUSDT"))
             assert fake.open_orders_raw() == []  # the resting stop was cancelled
+        finally:
+            await runtime.shutdown()
+    finally:
+        await h.close()
+
+
+# ---------------------------------------------------------------------------
+# F3: a live exit never re-arms a stop over an in-flight sell
+# ---------------------------------------------------------------------------
+
+
+async def test_a_live_exit_does_not_rearm_over_an_in_flight_sell(
+    strategies_dir: Path,
+) -> None:
+    h = Harness(strategies_dir)
+    await h.start()
+    try:
+        fake = FakeBinanceTradingClient()
+        fake.commission_asset = "USDT"
+        fake.commission_amount = D("0")
+        fake.balances["BTC"] = D("0.02")  # the user's BTC: a re-armed stop would really land
+        runtime, executor, failures = await _runtime(h, strategies_dir, fake)
+        await runtime.build()
+        await runtime.wire()
+        try:
+            await _filled_position(runtime, executor)
+            group = runtime.protect.armed("BTCUSDT")
+            assert group is not None
+            stops_before = {oid for oid, o in fake.orders.items() if o["type"] == "STOP_LOSS"}
+            assert stops_before  # the old protective stop rests on the exchange
+
+            await runtime.bus.publish(
+                ExitSignal(
+                    symbol=Symbol("BTCUSDT"),
+                    strategy_id=runtime.cfg.id,
+                    exchange_id="binance",
+                )
+            )
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            # the exit sell went out and filled on the exchange, but NO fresh stop was
+            # placed over the sold position: the exchange still holds exactly the old one
+            stops_after = {oid for oid, o in fake.orders.items() if o["type"] == "STOP_LOSS"}
+            assert stops_after == stops_before
+            sells = [
+                o
+                for o in fake.orders.values()
+                if o["side"] == "SELL" and o["type"] == "MARKET" and o["status"] == "FILLED"
+            ]
+            assert len(sells) == 1
+            assert failures == []
+
+            # the poller books the sell: on_fill cancels the old stop, nothing re-arms
+            assert runtime._poller is not None
+            await runtime._poller.sweep()
+            assert runtime.protect.armed("BTCUSDT") is None
+            assert not any(p.quantity > 0 for p in await executor.get_positions("BTCUSDT"))
+            assert all(fake.orders[oid]["status"] == "CANCELED" for oid in stops_before)
+        finally:
+            await runtime.shutdown()
+    finally:
+        await h.close()
+
+
+# ---------------------------------------------------------------------------
+# F4: flatten never re-sells a lot whose sell outcome is unknown
+# ---------------------------------------------------------------------------
+
+
+async def test_flatten_never_re_sells_a_lot_with_an_unknown_sell_outcome(
+    strategies_dir: Path,
+) -> None:
+    """The om-path sell lands but its answer is lost: the user's co-mingled BTC on the
+    same account must not be sold by a second attempt (F4's red case)."""
+    h = Harness(strategies_dir)
+    await h.start()
+    try:
+        fake = FakeBinanceTradingClient()
+        fake.commission_asset = "USDT"
+        fake.commission_amount = D("0")
+        fake.balances["BTC"] = D("0.02")  # the user's own BTC on the same account
+        runtime, executor, _ = await _runtime(h, strategies_dir, fake)
+        await runtime.build()
+        await runtime.wire()
+        try:
+            await _filled_position(runtime, executor)  # the session's own 0.01 BTC
+            assert fake.balances["BTC"] == D("0.03")
+
+            fake.fail_create = "timeout_after_land"  # the flatten sell lands, answer lost
+            result = await runtime.flatten()
+
+            market_sells = [
+                o for o in fake.orders.values() if o["side"] == "SELL" and o["type"] == "MARKET"
+            ]
+            assert len(market_sells) == 1  # never a second sell of the same lot
+            assert market_sells[0]["status"] == "FILLED"
+            assert fake.balances["BTC"] == D("0.02")  # the user's BTC is untouched
+            # the landed sell was drained and booked: the report is honest either way
+            assert result.positions_remaining == 0
+            assert result.failures and "unknown" in result.failures[0]
+            assert not any(p.quantity > 0 for p in await executor.get_positions("BTCUSDT"))
+        finally:
+            await runtime.shutdown()
+    finally:
+        await h.close()
+
+
+# ---------------------------------------------------------------------------
+# F10: the flatten drain retries a REST-lagged fill within a bounded wait
+# ---------------------------------------------------------------------------
+
+
+async def test_the_flatten_drain_retries_a_rest_lagged_fill(strategies_dir: Path) -> None:
+    h = Harness(strategies_dir)
+    await h.start()
+    try:
+        fake = FakeBinanceTradingClient()
+        fake.commission_asset = "USDT"
+        fake.commission_amount = D("0")
+        runtime, executor, _ = await _runtime(h, strategies_dir, fake)
+        await runtime.build()
+        await runtime.wire()
+        try:
+            await _filled_position(runtime, executor)
+            real_trades = fake.fetch_my_trades
+            lagged = asyncio.Event()
+
+            async def lagging(symbol: str, since: Any = None) -> list[dict[str, Any]]:
+                if not lagged.is_set():  # the first read lags: REST not caught up yet
+                    lagged.set()
+                    raise RuntimeError("binance GET /api/v3/myTrades not caught up")
+                return await real_trades(symbol, since)
+
+            fake.fetch_my_trades = lagging
+            result = await runtime.flatten()
+
+            assert result.positions_remaining == 0  # booked within the bounded wait
+            assert not any(p.quantity > 0 for p in await executor.get_positions("BTCUSDT"))
         finally:
             await runtime.shutdown()
     finally:

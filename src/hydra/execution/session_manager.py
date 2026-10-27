@@ -444,7 +444,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             ) from exc
 
     async def _live_allocation(self) -> Decimal:
-        """``system_config.live_capital``, the single allocation baseline (R2: the read only)."""
+        """The live budget a NEW live session may seed (F6): ``live_capital`` minus every
+        other running-or-holding live session's allocation, mirroring paper's ``_allocate``
+        (R2: the live_capital read only — the write is the arm ceremony's)."""
         if self._db_pool is None:
             raise LiveCapitalUnavailableError("live trading needs system_config live_capital")
         async with self._db_pool.acquire() as conn:
@@ -465,7 +467,22 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             raise LiveCapitalUnavailableError(
                 f"system_config live_capital must be > 0, got {capital}"
             )
-        return capital
+        allocated = sum(
+            (
+                s.paper_capital
+                for s in self._sessions.values()
+                if s.trading_mode == "live"
+                and (s.status == "running" or s.holdings > 0)
+                and s.paper_capital
+            ),
+            Decimal("0"),
+        )
+        available = capital - allocated
+        if available <= 0:
+            raise ValueError(
+                f"Insufficient live capital: live_capital={capital}, allocated={allocated}"
+            )
+        return available
 
     async def _recover_live_one(self, session: TradingSession) -> None:
         """Restart recovery of a live row: restore the sleeve, rebuild the client, resume.

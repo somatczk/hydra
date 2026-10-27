@@ -11,9 +11,14 @@ The exchange is the locker of resting funds: the sleeve ledger never locks for a
 order, so wallet locks and ledger lots stay in their own layers.
 
 ``LiveOrderPoller`` is the single fill source (seam #1's runtime side): every sweep resolves
-mid-submit UNKNOWNs by client order id, refreshes open-order statuses and applies the
-session's OWN new trades (R5: a trade whose order id is not a known session order — the
-user's manual order — never enters the ledger). Replay is harmless: the live_fills unique
+mid-submit UNKNOWNs by POSITIVE evidence only — a plain order by its client order id (a
+single -2013 never terminalizes: rejection needs N consecutive not-founds across a window
+plus a myTrades cross-check, F8), an OCO through the list-aware reads (the open-order-lists
+lookup by ``listClientOrderId``, then its persisted leg ids, F9) — and applies the session's
+OWN new trades (R5: a trade whose order id is not a known session order — the user's manual
+order — never enters the ledger; lookups are session-scoped, F1). Fills are
+claim-apply-confirm (F2): a claimed row that fails to apply stays unapplied and is retried by
+every later sweep before new trades are claimed. Replay is harmless: the live_fills unique
 constraint refuses the same Binance trade id twice.
 """
 
@@ -83,11 +88,19 @@ def _order_not_found(exc: BaseException) -> bool:
 
 
 class _ClientIdClient:
-    """Wraps the keyed client so every ladder order carries hydra's ``newClientOrderId``."""
+    """Wraps the keyed client so every ladder order carries hydra's client ids.
 
-    def __init__(self, inner: Any, client_order_id: str) -> None:
+    Plain orders send ``newClientOrderId``; an OCO sends the REAL wire contract (F9):
+    ``listClientOrderId`` (the row's own id) plus explicit ``aboveClientOrderId`` /
+    ``belowClientOrderId`` leg ids, each a distinct 36-character ``hyd-`` id.
+    """
+
+    def __init__(
+        self, inner: Any, client_order_id: str, oco_leg_client_ids: tuple[str, ...] = ()
+    ) -> None:
         self._inner = inner
         self._client_order_id = client_order_id
+        self._oco_leg_client_ids = oco_leg_client_ids
 
     async def create_order(
         self,
@@ -113,7 +126,13 @@ class _ClientIdClient:
         stop_loss: str,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        merged = {**(params or {}), "newClientOrderId": self._client_order_id}
+        above, below = self._oco_leg_client_ids[0], self._oco_leg_client_ids[-1]
+        merged = {
+            **(params or {}),
+            "listClientOrderId": self._client_order_id,
+            "aboveClientOrderId": above,
+            "belowClientOrderId": below,
+        }
         return await self._inner.create_oco(symbol, side, quantity, take_profit, stop_loss, merged)
 
     def __getattr__(self, name: str) -> Any:
@@ -145,6 +164,8 @@ class LiveTradingExecutor(PaperTradingExecutor):
         else:
             store = InMemoryLiveOrderStore()
         self._live_orders = store
+        # one lock: a poller sweep and a flatten drain never apply one claimed fill twice
+        self._collect_lock = asyncio.Lock()
 
     @property
     def live_orders(self) -> LiveOrderStore:
@@ -193,6 +214,8 @@ class LiveTradingExecutor(PaperTradingExecutor):
         if otype == OrderType.LIMIT:
             if price is None or _d(price) <= 0:
                 raise OrderRejectedError("LIMIT orders need a positive price")
+            if side_u == "SELL":
+                quantity = self._floor_qty(canon, quantity)
             return await self._submit_plain(canon, side_u, otype, quantity, _d(price), params)
         if otype in _LADDER_TYPES and side_u == "SELL":
             return await self._submit_protective(canon, otype, quantity, price, stop_price, params)
@@ -297,6 +320,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
         # build_live_executor validated these are real MarketRules, not the paper trio
         rules = cast(MarketRules, self._market_rules[canon])
         cid = new_client_order_id()
+        leg_cids = (new_client_order_id(), new_client_order_id())
         await self._live_orders.create(
             LiveOrderRecord(
                 client_order_id=cid,
@@ -312,10 +336,11 @@ class LiveTradingExecutor(PaperTradingExecutor):
                 status=LiveOrderStatus.PENDING_SUBMIT,
                 reduce_only=True,
                 tag=tag,
+                leg_client_order_ids=leg_cids if otype == OrderType.OCO.value else (),
                 submitted_at=datetime.now(UTC),
             )
         )
-        wrapped = _ClientIdClient(self.exchange_client, cid)
+        wrapped = _ClientIdClient(self.exchange_client, cid, leg_cids)
         try:
             placement = await arm_exchange_stop(
                 wrapped, rules, self._name(canon), quantity, spec, mark, entry
@@ -328,7 +353,10 @@ class LiveTradingExecutor(PaperTradingExecutor):
                 # StopBreachedError and the ladder's own ValueErrors: the wiring decides (R18)
                 raise
             raise await self._fail_submit(cid, otype, exc) from exc
-        if not await self._live_orders.mark_ack(cid, str(placement.order_id), LiveOrderStatus.NEW):
+        list_id = str(placement.order_id) if placement.kind == "oco" else None
+        if not await self._live_orders.mark_ack(
+            cid, str(placement.order_id), LiveOrderStatus.NEW, order_list_id=list_id
+        ):
             logger.info("Live protective ack for %s refused: the row was already resolved", cid)
         return _placement_response(
             symbol=self._name(canon),
@@ -378,22 +406,46 @@ class LiveTradingExecutor(PaperTradingExecutor):
         """Floor a SELL quantity to the lot step: a base-commission buy leaves dust the
         step cannot express, and the exchange refuses any non-multiple."""
         rules = self._market_rules.get(canon)
-        if rules is not None and getattr(rules, "floor_qty", None) is not None:
-            return rules.floor_qty(quantity)  # type: ignore[attr-defined]
+        if rules is not None and rules.amount_step is not None:
+            return rules.floor_qty(quantity)
         return quantity
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        """Cancel on the exchange; an already-terminal row is a no-op success."""
-        row = await self._live_orders.by_exchange_order_id(order_id)
+        """Cancel on the exchange; an already-terminal row is a no-op success.
+
+        A submit still in flight answers AMBIGUOUS (F11): the row stays for the
+        resolution path — a definitive CANCELLED while the submit can still land would
+        hide a resting order. A row that never acked has no exchange id, so its cancel
+        goes out by client id and an OrderNotFound answer is ambiguous too.
+        """
+        row = await self._live_orders.by_exchange_order_id(order_id, self._session_id)
+        if row is None:
+            row = await self._live_orders.by_order_list_id(order_id, self._session_id)
+        if row is None:
+            by_client = await self._live_orders.by_client_order_id(order_id)
+            row = (
+                by_client
+                if by_client is not None and by_client.session_id == self._session_id
+                else None
+            )
         if row is not None and row.status in TERMINAL_STATUSES:
             return {"id": order_id, "status": "CANCELLED"}
+        if row is not None and row.status in (
+            LiveOrderStatus.PENDING_SUBMIT,
+            LiveOrderStatus.SUBMITTING,
+        ):
+            return {"id": order_id, "status": "AMBIGUOUS"}
+        target = order_id if row is None or row.exchange_order_id is None else row.exchange_order_id
         try:
             if row is not None and row.order_type == OrderType.OCO.value:
-                await self.exchange_client.cancel_order_list(order_id, self._name(row.symbol))
+                await self.exchange_client.cancel_order_list(target, self._name(row.symbol))
             else:
-                await self.exchange_client.cancel_order(order_id, symbol)
+                await self.exchange_client.cancel_order(target, symbol)
         except Exception as exc:
             if _order_not_found(exc):
+                if row is not None and row.exchange_order_id is None:
+                    # never acked: "not found" does not mean the submit cannot land
+                    return {"id": order_id, "status": "AMBIGUOUS"}
                 logger.info("Live cancel of %s: already gone on the exchange", order_id)
                 return {"id": order_id, "status": "CANCELLED"}
             raise
@@ -435,12 +487,30 @@ class LiveTradingExecutor(PaperTradingExecutor):
     # ------------------------------------------------------------------
 
     async def collect_exchange_fills(self, symbols: list[str] | None = None) -> list[PaperFill]:
-        """New trades of this session's own orders, recorded and applied to the ledger."""
+        """New trades of this session's own orders, claimed, applied and confirmed.
+
+        Claim-apply-confirm (F2): unapplied rows from an earlier failed sweep are retried
+        BEFORE new trades are claimed, so one transient bookkeeping failure never orphans
+        a real fill. The whole pipeline runs under the collect lock, so a poller sweep and
+        a flatten drain cannot apply the same claimed fill twice.
+        """
+        async with self._collect_lock:
+            return await self._collect_fills_locked(symbols)
+
+    async def _collect_fills_locked(self, symbols: list[str] | None) -> list[PaperFill]:
+        fills: list[PaperFill] = []
+        for claimed in await self._live_orders.unapplied_fills(self._session_id):
+            row = await self._live_orders.by_client_order_id(claimed.client_order_id)
+            if row is None or row.session_id != self._session_id:
+                continue
+            try:
+                fills.append(await self._apply_claimed_fill(claimed, row))
+            except Exception:
+                logger.exception("Live fill %s could not be re-applied", claimed.trade_id)
         wanted = None if symbols is None else {self._symbol(s) for s in symbols}
         tracked = {self._canon_of(s) for s in await self._live_orders.symbols(self._session_id)}
         tracked |= {c for c, lot in self._lots.items() if lot.base_qty > 0}
         targets = sorted(c for c in tracked if wanted is None or c in wanted)
-        fills: list[PaperFill] = []
         for canon in targets:
             name = self._name(canon)
             since = await self._live_orders.last_trade_ts(self._session_id, name)
@@ -472,11 +542,20 @@ class LiveTradingExecutor(PaperTradingExecutor):
         list_id = str(info.get("orderListId") or "")
         row = None
         if exchange_order_id:
-            row = await self._live_orders.by_exchange_order_id(exchange_order_id)
+            row = await self._live_orders.by_exchange_order_id(exchange_order_id, self._session_id)
         if row is None and list_id not in ("", "-1"):
-            row = await self._live_orders.by_exchange_order_id(list_id)
+            row = await self._live_orders.by_order_list_id(list_id, self._session_id)
         if row is None:
             return None  # R5: the user's orders never enter the session ledger
+        if row.session_id != self._session_id:
+            # F1: a trade of another session's order on the same account is never ours
+            logger.error(
+                "Live trade %s maps to session %s, not %s: skipped",
+                trade.get("id"),
+                row.session_id,
+                self._session_id,
+            )
+            return None
         raw_fee_obj = trade.get("fee")
         fee: Mapping[str, Any] = raw_fee_obj if isinstance(raw_fee_obj, Mapping) else {}
         raw_fee = _d(fee.get("cost") or info.get("commission") or 0)
@@ -499,10 +578,14 @@ class LiveTradingExecutor(PaperTradingExecutor):
             timestamp=datetime.fromtimestamp(timestamp / 1000, UTC),
         )
         if not await self._live_orders.record_fill(fill):
-            return None
+            return None  # already claimed: applied, or waiting for its own retry
+        return await self._apply_claimed_fill(fill, row)
+
+    async def _apply_claimed_fill(self, fill: LiveFillRecord, row: LiveOrderRecord) -> PaperFill:
+        """Apply one claimed fill to the ledger, then confirm it as applied (F2)."""
         parent = row.exchange_order_id if row.order_type == OrderType.OCO.value else None
-        return await self.apply_exchange_fill(
-            symbol=self._name(canon),
+        applied = await self.apply_exchange_fill(
+            symbol=fill.symbol,
             side=fill.side,
             order_type=row.order_type,
             quantity=fill.quantity,
@@ -511,10 +594,12 @@ class LiveTradingExecutor(PaperTradingExecutor):
             fee_currency=fill.fee_currency,
             liquidity=cast(Liquidity, fill.liquidity),
             reason=row.tag,
-            order_id=parent or exchange_order_id,
+            order_id=parent or row.exchange_order_id or fill.client_order_id,
             parent_order_id=parent,
             timestamp=fill.timestamp,
         )
+        await self._live_orders.mark_fill_applied(fill)
+        return applied
 
     # ------------------------------------------------------------------
     # Flatten and reads
@@ -709,7 +794,15 @@ def _row_reason(row: LiveOrderRecord) -> str:
 
 
 class LiveOrderPoller:
-    """The single fill source for one live session (started by the runtime's ``wire``)."""
+    """The single fill source for one live session (started by the runtime's ``wire``).
+
+    An unsettled row is only ever resolved by POSITIVE evidence. A plain order resolves by
+    its client id on the order endpoint; a single -2013 never terminalizes (F8): rejection
+    needs N consecutive not-founds across a window AND a myTrades cross-check that finds no
+    trade for the client id. An OCO row resolves ONLY through list-aware reads (F9): the
+    open-order-lists lookup by ``listClientOrderId``, then the legs by their client ids —
+    never ``fetch_order`` on the list id, and never a not-found off the order endpoint.
+    """
 
     def __init__(
         self,
@@ -718,11 +811,14 @@ class LiveOrderPoller:
         *,
         interval: float,
         resolve_grace: float,
+        not_found_window: float = 60.0,
     ) -> None:
         self._executor = executor
         self._om = om
         self._interval = interval
         self._resolve_grace = resolve_grace
+        self._not_found_window = not_found_window
+        self._missing: dict[str, tuple[datetime, int]] = {}
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -760,6 +856,9 @@ class LiveOrderPoller:
         client = self._executor.exchange_client
         deadline = datetime.now(UTC) - timedelta(seconds=self._resolve_grace)
         for row in await store.unsettled(self._executor._session_id, deadline):
+            if row.order_type == OrderType.OCO.value or row.order_list_id is not None:
+                await self._resolve_oco_row(row)
+                continue
             try:
                 resp = await client.fetch_order(
                     row.client_order_id,
@@ -768,17 +867,11 @@ class LiveOrderPoller:
                 )
             except Exception as exc:
                 if _order_not_found(exc):
-                    outcome = await store.apply_status(
-                        row.client_order_id,
-                        LiveOrderStatus.REJECTED,
-                        error="unresolved submit: not found on exchange",
-                    )
-                    logger.info(
-                        "Live submit %s resolved not-landed (%s)", row.client_order_id, outcome
-                    )
+                    await self._note_missing(row)
                 else:
                     logger.info("Live submit %s not resolvable yet: %s", row.client_order_id, exc)
                 continue
+            self._missing.pop(row.client_order_id, None)
             status = map_ccxt_status(resp.get("status"), resp.get("filled"))
             resolved = await store.resolve_unknown(
                 row.client_order_id,
@@ -792,10 +885,123 @@ class LiveOrderPoller:
                     "Live submit %s could not be resolved: the row moved on", row.client_order_id
                 )
 
+    async def _note_missing(self, row: LiveOrderRecord) -> None:
+        """One -2013 is evidence, not a verdict (F8): N consecutive across a window,
+        then a myTrades cross-check, before any 'unresolved submit' rejection."""
+        store = self._executor.live_orders
+        now = datetime.now(UTC)
+        first, count = self._missing.get(row.client_order_id, (now, 0))
+        count += 1
+        self._missing[row.client_order_id] = (first, count)
+        if count < _NOT_FOUND_REQUIRED or (now - first).total_seconds() < self._not_found_window:
+            logger.info(
+                "Live submit %s not found on exchange (%d consecutive)", row.client_order_id, count
+            )
+            return
+        if await self._trades_cross_check(row):
+            self._missing.pop(row.client_order_id, None)
+            return
+        outcome = await store.apply_status(
+            row.client_order_id,
+            LiveOrderStatus.REJECTED,
+            error="unresolved submit: not found on exchange",
+        )
+        logger.info("Live submit %s resolved not-landed (%s)", row.client_order_id, outcome)
+        self._missing.pop(row.client_order_id, None)
+
+    async def _resolve_oco_row(self, row: LiveOrderRecord) -> None:
+        """An OCO row resolves only through list-aware reads (F9), never the order
+        endpoint's word for a list id; with no positive evidence it stays unknown."""
+        store = self._executor.live_orders
+        client = self._executor.exchange_client
+        try:
+            lists = await client.fetch_open_order_lists(row.symbol)
+        except Exception as exc:
+            logger.info("Live OCO %s lists unreadable: %s", row.client_order_id, exc)
+            return
+        for entry in lists:
+            if str(entry.get("listClientOrderId") or "") == row.client_order_id:
+                list_id = str(entry.get("orderListId"))
+                resolved = await store.resolve_unknown(
+                    row.client_order_id, list_id, LiveOrderStatus.NEW, order_list_id=list_id
+                )
+                logger.info(
+                    "Live OCO %s resolved by its open list (%s)", row.client_order_id, resolved
+                )
+                return
+        for leg_cid in row.leg_client_order_ids:
+            try:
+                resp = await client.fetch_order(
+                    leg_cid, row.symbol, params={"clientOrderId": leg_cid}
+                )
+            except Exception:
+                logger.info("Live OCO %s leg %s unreadable", row.client_order_id, leg_cid)
+                continue
+            await self._resolve_from_order(row, resp)
+            return
+        if not await self._trades_cross_check(row):
+            logger.info(
+                "Live OCO %s has no list, legs or trades yet: stays unknown", row.client_order_id
+            )
+
+    async def _resolve_from_order(self, row: LiveOrderRecord, resp: Mapping[str, Any]) -> bool:
+        """Resolve an unsettled row from one exchange order of ours (a leg or the order)."""
+        store = self._executor.live_orders
+        info = resp.get("info")
+        list_id = ""
+        if row.order_type == OrderType.OCO.value and isinstance(info, Mapping):
+            list_id = str(info.get("orderListId") or "")
+        has_list = list_id not in ("", "-1")
+        exchange_id = list_id if has_list else str(resp.get("id") or "")
+        status = map_ccxt_status(resp.get("status"), resp.get("filled"))
+        resolved = await store.resolve_unknown(
+            row.client_order_id,
+            exchange_id,
+            status,
+            filled_quantity=_opt_d(resp.get("filled")),
+            average_fill_price=_opt_d(resp.get("average")),
+            order_list_id=list_id if has_list else None,
+        )
+        if resolved:
+            logger.info(
+                "Live submit %s resolved from its exchange order as %s",
+                row.client_order_id,
+                status.value,
+            )
+        return resolved
+
+    async def _trades_cross_check(self, row: LiveOrderRecord) -> bool:
+        """F8's guard before any rejection: a trade for this row's client id means the
+        submit landed and filled — resolve it as such, never reject."""
+        client = self._executor.exchange_client
+        # submitted_at precedes any fill (outbox-first); the buffer absorbs clock skew
+        since = None if row.submitted_at is None else row.submitted_at - timedelta(minutes=5)
+        try:
+            trades = await client.fetch_my_trades(row.symbol, since)
+        except Exception as exc:
+            logger.info("Live trades of %s unreadable for the cross-check: %s", row.symbol, exc)
+            return False
+        wanted = {row.client_order_id, *row.leg_client_order_ids}
+        for trade in trades:
+            order_id = str(trade.get("order") or "")
+            if not order_id:
+                continue
+            try:
+                resp = await client.fetch_order(order_id, row.symbol)
+            except Exception:
+                logger.info("Live trade order %s unreadable for the cross-check", order_id)
+                continue
+            if str(resp.get("clientOrderId") or "") in wanted:
+                return await self._resolve_from_order(row, resp)
+        return False
+
     async def _refresh_open_statuses(self) -> None:
         store = self._executor.live_orders
         client = self._executor.exchange_client
         for row in await store.refreshable(self._executor._session_id):
+            if row.order_list_id is not None:
+                await self._refresh_oco_row(row)
+                continue
             try:
                 resp = await client.fetch_order(str(row.exchange_order_id), row.symbol)
             except Exception as exc:
@@ -813,3 +1019,41 @@ class LiveOrderPoller:
                     "Live order %s status refresh refused: the row is resolved",
                     row.exchange_order_id,
                 )
+
+    async def _refresh_oco_row(self, row: LiveOrderRecord) -> None:
+        """An acked OCO refreshes list-aware (F9): resting while the list is open; the
+        legs say how it ended once it is not."""
+        store = self._executor.live_orders
+        client = self._executor.exchange_client
+        try:
+            lists = await client.fetch_open_order_lists(row.symbol)
+        except Exception as exc:
+            logger.info("Live OCO %s lists unreadable: %s", row.exchange_order_id, exc)
+            return
+        if any(str(entry.get("orderListId")) == str(row.exchange_order_id) for entry in lists):
+            return
+        legs: list[Mapping[str, Any]] = []
+        for leg_cid in row.leg_client_order_ids:
+            try:
+                resp = await client.fetch_order(
+                    leg_cid, row.symbol, params={"clientOrderId": leg_cid}
+                )
+            except Exception:
+                return  # the legs are unreadable: leave the row exactly as it is
+            legs.append(resp)
+        statuses = [map_ccxt_status(leg.get("status"), leg.get("filled")) for leg in legs]
+        if LiveOrderStatus.FILLED in statuses:
+            filled = next(
+                leg for leg, s in zip(legs, statuses, strict=False) if s == LiveOrderStatus.FILLED
+            )
+            await store.apply_status(
+                row.client_order_id,
+                LiveOrderStatus.FILLED,
+                filled_quantity=_opt_d(filled.get("filled")),
+                average_fill_price=_opt_d(filled.get("average")),
+            )
+        elif statuses and all(s == LiveOrderStatus.CANCELED for s in statuses):
+            await store.apply_status(row.client_order_id, LiveOrderStatus.CANCELED)
+
+
+_NOT_FOUND_REQUIRED = 3

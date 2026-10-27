@@ -4,20 +4,32 @@ Every number below is asserted exactly at the ledger seam: the wallet-truth mode
 commission nets the credited base and stays inside the entry basis; a quote commission is
 charged to the quote; BNB converts at the fill price), the weighted average on a two-part
 fill, and the replay lock (the same myTrades page applied once).
+
+The review round's money invariants (per R28): F1 — two sessions on one account book only
+their own fills; F2 — claim-apply-confirm retries a transiently failed apply; F5 — LIMIT
+sells floor to the lot step; F8 — a single -2013 never terminalizes and the myTrades
+cross-check resolves a filled submit; F9 — an OCO resolves through its list, never the
+order endpoint's word for a list id; F11 — cancelling a pending submit answers ambiguous.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
 from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.types import OHLCV
 from hydra.execution.errors import ExchangeRateLimitedError, SubmitUnknownError
-from hydra.execution.live_executor import LiveOrderPoller, LiveTradingExecutor
-from hydra.execution.live_orders import LiveOrderStatus
+from hydra.execution.live_executor import (
+    _NOT_FOUND_REQUIRED,
+    LiveOrderPoller,
+    LiveTradingExecutor,
+)
+from hydra.execution.live_orders import InMemoryLiveOrderStore, LiveOrderStatus
 from hydra.execution.order_manager import OrderManager
 from hydra.execution.paper_trading import InsufficientBalanceError, OrderRejectedError
 from hydra.risk.market_rules import MarketRules
@@ -60,7 +72,12 @@ def _executor(
 
 def _poller(ex: LiveTradingExecutor) -> tuple[LiveOrderPoller, OrderManager]:
     om = OrderManager(ex, InMemoryEventBus(), session_id=ex._session_id)
-    return LiveOrderPoller(ex, om, interval=0.05, resolve_grace=ex.resolve_grace), om
+    return (
+        LiveOrderPoller(
+            ex, om, interval=0.05, resolve_grace=ex.resolve_grace, not_found_window=0.0
+        ),
+        om,
+    )
 
 
 def _bar(close: str, ts: datetime) -> OHLCV:
@@ -86,12 +103,12 @@ async def test_the_outbox_row_exists_before_the_exchange_call() -> None:
     seen: list[str] = []
     original = fake.create_order
 
-    async def hook(*args: object, **kwargs: object) -> dict[str, object]:
+    async def hook(*args: Any, **kwargs: Any) -> dict[str, Any]:
         rows = await ex.live_orders.open_orders(ex._session_id)
         seen.extend(r.status.value for r in rows)
-        return await original(*args, **kwargs)  # type: ignore[misc]
+        return await original(*args, **kwargs)
 
-    fake.create_order = hook  # type: ignore[method-assign]
+    fake.create_order = hook
     await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"), params={"tag": "entry"})
     assert seen == ["pending_submit"]
 
@@ -186,7 +203,12 @@ async def test_timeout_not_landed_resolves_to_rejected_after_the_grace_window() 
 
     poller, _ = _poller(ex)
     await poller.sweep()
+    # F8: a single -2013 never terminalizes — the row is still unresolved
+    row = await ex.live_orders.by_client_order_id(cid)
+    assert row is not None and row.status is LiveOrderStatus.UNKNOWN
 
+    for _ in range(_NOT_FOUND_REQUIRED):
+        await poller.sweep()
     row = await ex.live_orders.by_client_order_id(cid)
     assert row is not None and row.status is LiveOrderStatus.REJECTED
     assert "not found on exchange" in (row.error or "")
@@ -206,6 +228,77 @@ async def test_a_fresh_unknown_row_waits_for_the_grace_window() -> None:
     rows = await ex.live_orders.unsettled(ex._session_id, datetime.now(UTC))
     assert len(rows) == 1 and rows[0].status is LiveOrderStatus.UNKNOWN
     assert fake.orders == {}
+
+
+async def test_a_late_landing_order_resolves_and_books_after_not_found_answers() -> None:
+    """F8's red case: the create lands LATE (exchange incident) after -2013s began; the
+    row must never have been rejected, so the fill still books."""
+    fake = FakeBinanceTradingClient()
+    fake.fail_create = "timeout_not_landed"
+    ex = _executor(fake)
+    with pytest.raises(SubmitUnknownError) as raised:
+        await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"), params={"tag": "entry"})
+    cid = raised.value.client_order_id
+    poller, _om = _poller(ex)
+
+    await poller.sweep()  # one -2013: still unknown, never rejected
+    row = await ex.live_orders.by_client_order_id(cid)
+    assert row is not None and row.status is LiveOrderStatus.UNKNOWN
+
+    # Binance finishes processing the create now: the order lands and fills
+    raw = fake._new_order("BTCUSDT", "BUY", "MARKET", D("0.01"), None, None, cid)
+    fake._apply_fill(raw, fake.last_prices["BTCUSDT"], D("0.01"))
+
+    await poller.sweep()
+    row = await ex.live_orders.by_client_order_id(cid)
+    assert row is not None
+    assert (row.status, row.exchange_order_id) == (LiveOrderStatus.FILLED, str(raw["orderId"]))
+    assert ex.get_account_snapshot().base_totals == {"BTC": D("0.00999")}
+    assert len(ex.get_fills()) == 1
+
+
+async def test_the_trades_cross_check_resolves_a_filled_submit_the_order_lookup_misses() -> None:
+    """F8: at rejection eligibility, a trade for the client id resolves as filled even
+    when the client-id order lookup keeps answering -2013."""
+    import ccxt
+
+    fake = FakeBinanceTradingClient()
+    fake.commission_asset = "USDT"
+    fake.commission_amount = D("0")
+    ex = _executor(fake)
+    poller, _om = _poller(ex)
+
+    fake.fail_create = "timeout_not_landed"
+    with pytest.raises(SubmitUnknownError) as raised:
+        await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"), params={"tag": "entry"})
+    cid = raised.value.client_order_id
+
+    # the create actually landed and filled while the answer was lost
+    raw = fake._new_order("BTCUSDT", "BUY", "MARKET", D("0.01"), None, None, cid)
+    fake._apply_fill(raw, fake.last_prices["BTCUSDT"], D("0.01"))
+    fake.trades[-1]["time"] = int(datetime.now(UTC).timestamp() * 1000)
+
+    # the client-id lookup answers -2013; the by-order-id read the cross-check uses works
+    real_fetch = fake.fetch_order
+
+    async def flaky_by_client(
+        order_id: str, symbol: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if params and params.get("clientOrderId"):
+            raise ccxt.OrderNotFound("binance {-2013} Order does not exist")
+        return await real_fetch(order_id, symbol, params)
+
+    fake.fetch_order = flaky_by_client
+    for _ in range(_NOT_FOUND_REQUIRED):
+        await poller.sweep()
+    fake.fetch_order = real_fetch
+
+    row = await ex.live_orders.by_client_order_id(cid)
+    assert row is not None
+    assert row.status is LiveOrderStatus.FILLED
+    assert row.exchange_order_id == str(raw["orderId"])
+    assert ex.get_account_snapshot().base_totals == {"BTC": D("0.01")}
+    assert len(ex.get_fills()) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -456,3 +549,224 @@ async def test_flatten_sells_for_real_and_drains_the_landed_fills() -> None:
     assert {o["type"] for o in sells} == {"STOP_LOSS", "MARKET"}  # cancelled stop + real sell
     assert all(o["status"] == "CANCELED" for o in sells if o["type"] == "STOP_LOSS")
     assert any(o["type"] == "MARKET" and o["status"] == "FILLED" for o in sells)
+
+
+# ---------------------------------------------------------------------------
+# F9/S1: the real OCO wire contract and its list-aware resolution
+# ---------------------------------------------------------------------------
+
+
+async def test_the_oco_wire_carries_the_list_and_leg_client_ids() -> None:
+    fake = FakeBinanceTradingClient()
+    ex = _executor(fake)
+    await _buy_filled(ex)
+    seen: dict[str, Any] = {}
+    original = fake.create_oco
+
+    async def hook(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        seen.update(args[5] or {})
+        return await original(*args, **kwargs)
+
+    fake.create_oco = hook
+    resp = await ex.create_order(
+        "BTCUSDT", "SELL", "OCO", D("0.00999"), price=D("103000"), stop_price=D("95000")
+    )
+    row = await ex.live_orders.by_client_order_id(resp["client_order_id"])
+    assert row is not None
+    assert seen["listClientOrderId"] == row.client_order_id
+    assert seen["aboveClientOrderId"] == row.leg_client_order_ids[0]
+    assert seen["belowClientOrderId"] == row.leg_client_order_ids[1]
+    assert len(set(seen.values())) == 3  # three distinct 36-char hyd- ids
+    assert all(len(str(cid)) <= 36 for cid in seen.values())
+    # the list id and the order ids are distinct spaces; fetch_order never resolves a list
+    assert (row.exchange_order_id, row.order_list_id) == (resp["id"], resp["id"])
+    import ccxt
+
+    with pytest.raises(ccxt.OrderNotFound):
+        await fake.fetch_order(resp["id"], "BTCUSDT")
+
+
+async def test_a_timed_out_oco_that_landed_resolves_by_its_list_and_books_its_fills() -> None:
+    """F9's red case: the OCO placement timed out after landing; the order endpoint
+    cannot speak for a list id, so the row resolves through the open-list lookup."""
+    fake = FakeBinanceTradingClient()
+    fake.commission_asset = "USDT"
+    fake.commission_amount = D("0")
+    ex = _executor(fake)
+    poller, _om = _poller(ex)
+    await _buy_filled(ex)
+
+    fake.fail_create = "timeout_after_land"
+    with pytest.raises(SubmitUnknownError) as raised:
+        await ex.create_order(
+            "BTCUSDT",
+            "SELL",
+            "OCO",
+            D("0.01"),
+            price=D("103000"),
+            stop_price=D("95000"),
+            params={"tag": "protective"},
+        )
+    cid = raised.value.client_order_id
+    row = await ex.live_orders.by_client_order_id(cid)
+    assert row is not None and row.status is LiveOrderStatus.UNKNOWN
+    list_id = next(iter(fake.lists))
+    assert all(fake.orders[leg]["status"] == "NEW" for leg in fake.lists[list_id])
+
+    await poller.sweep()
+    row = await ex.live_orders.by_client_order_id(cid)
+    assert row is not None
+    assert (row.status, row.exchange_order_id, row.order_list_id) == (
+        LiveOrderStatus.NEW,
+        str(list_id),
+        str(list_id),
+    )
+
+    # the stop leg fires while the row was unknown: the fill must still book
+    leg_below = fake.lists[list_id][1]
+    fake.set_mark("BTCUSDT", "94000")
+    fake._apply_fill(fake.orders[leg_below], D("94000"), D("0.01"))
+    await poller.sweep()
+
+    snap = ex.get_account_snapshot()
+    assert not any(q > 0 for q in snap.base_totals.values())
+    assert [f.side for f in ex.get_fills()] == ["BUY", "SELL"]
+
+
+# ---------------------------------------------------------------------------
+# F1: two live sessions on one account — each books only its own fills
+# ---------------------------------------------------------------------------
+
+
+async def test_two_sessions_on_one_account_book_only_their_own_fills() -> None:
+    """F1's red case with the shared store (what one PgLiveOrderStore table really is):
+    session B's poller must not claim session A's trade — the account-wide live_fills
+    unique key would then block A forever."""
+    fake = FakeBinanceTradingClient()
+    fake.commission_asset = "USDT"
+    fake.commission_amount = D("0")
+    shared = InMemoryLiveOrderStore()  # one live_orders/live_fills table
+    a = _executor(fake, session="session-a")
+    b = _executor(fake, session="session-b")
+    a._live_orders = shared
+    b._live_orders = shared
+    om_a = OrderManager(a, InMemoryEventBus(), session_id="session-a")
+    om_b = OrderManager(b, InMemoryEventBus(), session_id="session-b")
+
+    await a.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"), params={"tag": "entry"})
+    await b.create_order("BTCUSDT", "BUY", "MARKET", D("0.005"), params={"tag": "entry"})
+
+    pa = LiveOrderPoller(a, om_a, interval=0.05, resolve_grace=0.0, not_found_window=0.0)
+    pb = LiveOrderPoller(b, om_b, interval=0.05, resolve_grace=0.0, not_found_window=0.0)
+    await pb.sweep()  # B's poller wins the round: it sees both account trades
+    await pa.sweep()  # A's poller sees them too
+
+    assert a.get_account_snapshot().base_totals == {"BTC": D("0.01")}
+    assert b.get_account_snapshot().base_totals == {"BTC": D("0.005")}
+    assert [(f.side, f.quantity) for f in a.get_fills()] == [("BUY", D("0.01"))]
+    assert [(f.side, f.quantity) for f in b.get_fills()] == [("BUY", D("0.005"))]
+    recorded = sorted((fill.session_id, fill.quantity) for fill in shared._fills.values())
+    assert recorded == [("session-a", D("0.01")), ("session-b", D("0.005"))]
+
+
+# ---------------------------------------------------------------------------
+# F2: claim-apply-confirm — a transient apply failure is retried, never orphaned
+# ---------------------------------------------------------------------------
+
+
+async def test_a_transient_apply_failure_books_the_fill_on_the_next_sweep() -> None:
+    fake = FakeBinanceTradingClient()
+    ex = _executor(fake)
+    await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"), params={"tag": "entry"})
+    poller, _om = _poller(ex)
+
+    real = ex.apply_exchange_fill
+    failed = asyncio.Event()
+
+    async def flaky(*args: Any, **kwargs: Any) -> Any:
+        if not failed.is_set():  # one transient bookkeeping failure
+            failed.set()
+            raise RuntimeError("transient bookkeeping failure")
+        return await real(*args, **kwargs)
+
+    ex.apply_exchange_fill = flaky
+    await poller.sweep()  # the claim lands, the apply fails
+    ex.apply_exchange_fill = real
+    assert ex.get_account_snapshot().base_totals == {}
+
+    await poller.sweep()  # the unapplied row is retried before any new claim
+
+    assert ex.get_account_snapshot().base_totals == {"BTC": D("0.00999")}
+    assert len(ex.get_fills()) == 1
+    store = ex._live_orders
+    assert isinstance(store, InMemoryLiveOrderStore)
+    assert await store.unapplied_fills("sess") == []
+
+
+# ---------------------------------------------------------------------------
+# F5: LIMIT sells floor to the lot step like MARKET
+# ---------------------------------------------------------------------------
+
+
+async def test_a_dust_limit_sell_floors_to_the_lot_step() -> None:
+    fake = FakeBinanceTradingClient()
+    fake.commission_asset = "USDT"
+    fake.commission_amount = D("0")
+    rules = MarketRules(
+        symbol="BTCUSDT",
+        amount_step=D("0.001"),
+        min_qty=D("0.001"),
+        min_notional=D("5"),
+        price_tick=D("0.01"),
+    )
+    ex = LiveTradingExecutor(
+        fake,
+        exchange_id="binance",
+        initial_balances={"USDT": D("10000")},
+        db_pool=None,
+        strategy_id="strat",
+        session_id="sess",
+        market_rules={"BTCUSDT": rules},
+        resolve_grace=0.0,
+    )
+    ex.set_mark("BTCUSDT", D("100000"))
+    await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"))  # fills on the fake
+    poller, _ = _poller(ex)
+    await poller.sweep()
+    assert ex.get_account_snapshot().base_totals == {"BTC": D("0.01")}
+
+    resp = await ex.create_order("BTCUSDT", "SELL", "LIMIT", D("0.00999"), price=D("101000"))
+
+    assert D(str(resp["amount"])) == D("0.009")  # floored, not refused
+    leg = fake.orders[int(resp["id"])]
+    assert (leg["origQty"], leg["status"]) == ("0.009", "NEW")
+
+
+# ---------------------------------------------------------------------------
+# F11: cancelling a submit still in flight answers ambiguous
+# ---------------------------------------------------------------------------
+
+
+async def test_cancelling_a_pending_submit_answers_ambiguous_and_the_landing_wins() -> None:
+    fake = FakeBinanceTradingClient()
+    ex = _executor(fake)
+    answers: list[dict[str, Any]] = []
+    original = fake.create_order
+
+    async def hook(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        rows = await ex.live_orders.open_orders(ex._session_id)
+        cid = rows[0].client_order_id  # the row is pending_submit right now
+        answers.append(await ex.cancel_order(cid, "BTCUSDT"))
+        return await original(*args, **kwargs)
+
+    fake.create_order = hook
+    await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.01"), params={"tag": "entry"})
+    fake.create_order = original
+
+    assert answers == [{"id": answers[0]["id"], "status": "AMBIGUOUS"}]
+    # the submit landed anyway: the row acked, and the fill books on the sweep
+    poller, _ = _poller(ex)
+    await poller.sweep()
+    assert ex.get_account_snapshot().base_totals == {"BTC": D("0.00999")}
+    rows = await ex.live_orders.orders(ex._session_id)
+    assert len(rows) == 1 and rows[0].status is LiveOrderStatus.FILLED

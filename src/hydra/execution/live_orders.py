@@ -13,13 +13,25 @@ canceled|expired|rejected|unknown):
 * ``resolve_unknown`` — fetch_order answered for an unsettled row (pending_submit, submitting
   or unknown): it sets the exchange id and status in one step.
 * ``apply_status`` — monotonic: a terminal status is never left, ``filled_quantity`` never
-  decreases, and a same-status, same-quantity re-apply is the no-op ``unchanged``.
-* ``record_fill`` — the double-apply guard: UNIQUE (exchange_id, symbol, trade_id) at the DB
-  (ON CONFLICT DO NOTHING) and set membership in memory; True only when newly recorded.
+  decreases, and a same-status, same-quantity re-apply is the no-op ``unchanged``. One
+  conditional UPDATE at the DB: the WHERE clause is the invariant, so no read-plan-write
+  race can regress a terminal row (F7).
+* ``record_fill`` — the CLAIM of the claim-apply-confirm pipeline (F2): the INSERT with
+  ``applied=false`` and ``ON CONFLICT (exchange_id, symbol, trade_id) DO NOTHING``; True only
+  when newly claimed. ``unapplied_fills`` lists the rows a later sweep must re-apply before
+  claiming new ones; ``mark_fill_applied`` is the confirm.
+
+Every order lookup the fill collector uses is session-scoped (F1): a trade of another
+session's order on the same account is R5-filtered, never recorded. ``order_list_id`` is the
+F12 discriminator: non-NULL means this row's ``exchange_order_id`` is a Binance order LIST
+id (an OCO), so ``by_exchange_order_id`` (the trade-order-id lookup) never matches a list id
+to an order row — ``by_order_list_id`` is the OCO lookup.
 
 ``client_order_id`` is hydra's own ``newClientOrderId`` on the wire: ``hyd-`` + a uuid4 hex
 (36 characters, Binance's limit). The prefix is the ownership marker live adopt gates on
-(R5: the user's orders are never hijacked).
+(R5: the user's orders are never hijacked). An OCO additionally carries ``listClientOrderId``
+(the row's own id) and two explicit ``aboveClientOrderId``/``belowClientOrderId`` leg ids,
+persisted in ``leg_client_order_ids`` so the poller can resolve the legs (F9).
 """
 
 from __future__ import annotations
@@ -30,7 +42,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +130,10 @@ def _refused(order: LiveOrderRecord, what: str) -> str:
     return REFUSED
 
 
+def _terminal_now(status: LiveOrderStatus) -> datetime | None:
+    return datetime.now(UTC) if status in TERMINAL_STATUSES else None
+
+
 def _plan_status(
     order: LiveOrderRecord,
     status: LiveOrderStatus,
@@ -158,7 +174,11 @@ def _plan_status(
 
 @dataclass(frozen=True, slots=True)
 class LiveOrderRecord:
-    """One live order row; ``exchange_order_id`` is the orderListId for an OCO."""
+    """One live order row; ``exchange_order_id`` is the orderListId for an OCO.
+
+    ``order_list_id`` is the F12 discriminator (non-NULL: the row is an OCO list);
+    ``leg_client_order_ids`` are the wire ``aboveClientOrderId``/``belowClientOrderId``.
+    """
 
     client_order_id: str
     session_id: str
@@ -179,6 +199,8 @@ class LiveOrderRecord:
     tag: str = ""
     actor: str = "engine"
     exchange_order_id: str | None = None
+    order_list_id: str | None = None
+    leg_client_order_ids: tuple[str, ...] = ()
     submitted_at: datetime | None = None
     terminal_at: datetime | None = None
     updated_at: datetime | None = None
@@ -209,7 +231,12 @@ class LiveOrderStore(Protocol):
     async def create(self, order: LiveOrderRecord) -> None: ...
 
     async def mark_ack(
-        self, client_order_id: str, exchange_order_id: str, status: LiveOrderStatus
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+        status: LiveOrderStatus,
+        *,
+        order_list_id: str | None = None,
     ) -> bool: ...
 
     async def mark_submit_failed(self, client_order_id: str, error: str) -> bool: ...
@@ -222,6 +249,7 @@ class LiveOrderStore(Protocol):
         *,
         filled_quantity: Decimal | None = None,
         average_fill_price: Decimal | None = None,
+        order_list_id: str | None = None,
     ) -> bool: ...
 
     async def apply_status(
@@ -236,13 +264,23 @@ class LiveOrderStore(Protocol):
 
     async def record_fill(self, fill: LiveFillRecord) -> bool: ...
 
+    async def unapplied_fills(self, session_id: str) -> list[LiveFillRecord]: ...
+
+    async def mark_fill_applied(self, fill: LiveFillRecord) -> bool: ...
+
     async def open_orders(self, session_id: str) -> list[LiveOrderRecord]: ...
 
     async def orders(self, session_id: str, limit: int = 100) -> list[LiveOrderRecord]: ...
 
     async def by_client_order_id(self, client_order_id: str) -> LiveOrderRecord | None: ...
 
-    async def by_exchange_order_id(self, exchange_order_id: str) -> LiveOrderRecord | None: ...
+    async def by_exchange_order_id(
+        self, exchange_order_id: str, session_id: str
+    ) -> LiveOrderRecord | None: ...
+
+    async def by_order_list_id(
+        self, order_list_id: str, session_id: str
+    ) -> LiveOrderRecord | None: ...
 
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]: ...
 
@@ -269,13 +307,16 @@ class PgLiveOrderStore:
             await conn.execute(
                 """
                 INSERT INTO live_orders
-                    (client_order_id, exchange_order_id, session_id, strategy_id, exchange_id,
-                     symbol, side, order_type, quantity, price, stop_price, reduce_only, tag,
-                     status, actor, submitted_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    (client_order_id, exchange_order_id, order_list_id, session_id,
+                     strategy_id, exchange_id, symbol, side, order_type, quantity, price,
+                     stop_price, reduce_only, tag, status, actor, leg_client_order_ids,
+                     submitted_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                        $16, $17, $18)
                 """,
                 order.client_order_id,
                 order.exchange_order_id,
+                order.order_list_id,
                 order.session_id,
                 order.strategy_id,
                 order.exchange_id,
@@ -289,15 +330,22 @@ class PgLiveOrderStore:
                 order.tag,
                 order.status.value,
                 order.actor,
+                list(order.leg_client_order_ids) or None,
                 order.submitted_at,
             )
 
     async def mark_ack(
-        self, client_order_id: str, exchange_order_id: str, status: LiveOrderStatus
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+        status: LiveOrderStatus,
+        *,
+        order_list_id: str | None = None,
     ) -> bool:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "UPDATE live_orders SET exchange_order_id = $2, status = $3, error = NULL,"
+                "UPDATE live_orders SET exchange_order_id = $2, status = $3,"
+                " order_list_id = COALESCE($4, order_list_id), error = NULL,"
                 " terminal_at = CASE WHEN $3 ::text IN"
                 "   ('filled', 'canceled', 'expired', 'rejected') THEN now() ELSE NULL END,"
                 " updated_at = now()"
@@ -306,6 +354,7 @@ class PgLiveOrderStore:
                 client_order_id,
                 exchange_order_id,
                 status.value,
+                order_list_id,
             )
         return row is not None
 
@@ -329,10 +378,12 @@ class PgLiveOrderStore:
         *,
         filled_quantity: Decimal | None = None,
         average_fill_price: Decimal | None = None,
+        order_list_id: str | None = None,
     ) -> bool:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "UPDATE live_orders SET exchange_order_id = $2, status = $3, error = NULL,"
+                " order_list_id = COALESCE($6, order_list_id),"
                 " filled_quantity = GREATEST(COALESCE($4, 0), COALESCE(filled_quantity, 0)),"
                 " average_fill_price = COALESCE($5, average_fill_price),"
                 " terminal_at = CASE WHEN $3 ::text IN"
@@ -346,6 +397,7 @@ class PgLiveOrderStore:
                 status.value,
                 filled_quantity,
                 average_fill_price,
+                order_list_id,
             )
         return row is not None
 
@@ -358,39 +410,59 @@ class PgLiveOrderStore:
         average_fill_price: Decimal | None = None,
         error: str | None = None,
     ) -> str:
+        # one conditional UPDATE: the WHERE clause is the monotonic plan (F7)
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM live_orders WHERE client_order_id = $1", client_order_id
-            )
-            if row is None:
-                return REFUSED
-            updated, outcome = _plan_status(
-                _row_to_order(row), status, filled_quantity, average_fill_price, error
-            )
-            if outcome != APPLIED or updated is None:
-                return outcome
-            await conn.execute(
-                "UPDATE live_orders SET status = $2, filled_quantity = $3,"
-                " average_fill_price = $4, error = $5,"
-                " terminal_at = CASE WHEN $2 ::text IN"
-                "   ('filled', 'canceled', 'expired', 'rejected') THEN now() ELSE NULL END,"
-                " updated_at = now() WHERE client_order_id = $1",
+                """
+                UPDATE live_orders SET
+                    status = $2,
+                    filled_quantity = COALESCE($3 ::numeric, COALESCE(filled_quantity, 0)),
+                    average_fill_price = COALESCE($4 ::numeric, average_fill_price),
+                    error = $5 ::text,
+                    terminal_at = CASE WHEN $2 ::text IN
+                      ('filled', 'canceled', 'expired', 'rejected') THEN now() ELSE NULL END,
+                    updated_at = now()
+                WHERE client_order_id = $1
+                  AND status NOT IN ('filled', 'canceled', 'expired', 'rejected')
+                  AND ($3 ::numeric IS NULL OR $3 ::numeric >= COALESCE(filled_quantity, 0))
+                  AND NOT (status = $2
+                           AND ($3 ::numeric IS NULL
+                                OR $3 ::numeric = COALESCE(filled_quantity, 0))
+                           AND $5 ::text IS NULL)
+                RETURNING client_order_id
+                """,
                 client_order_id,
                 status.value,
-                updated.filled_quantity,
-                updated.average_fill_price,
+                filled_quantity,
+                average_fill_price,
                 error,
             )
-            return APPLIED
+            if row is not None:
+                return APPLIED
+            row = await conn.fetchrow(
+                "SELECT status, filled_quantity FROM live_orders WHERE client_order_id = $1",
+                client_order_id,
+            )
+        if row is None:
+            return REFUSED
+        regressing = (
+            filled_quantity is not None
+            and row["filled_quantity"] is not None
+            and (filled_quantity < row["filled_quantity"])
+        )
+        if str(row["status"]) in {s.value for s in TERMINAL_STATUSES} or regressing:
+            return REFUSED
+        return UNCHANGED
 
     async def record_fill(self, fill: LiveFillRecord) -> bool:
+        """The claim (F2): the row lands unapplied; the sweep applies then confirms."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO live_fills
                     (trade_id, client_order_id, session_id, exchange_id, symbol, side,
-                     price, quantity, fee, fee_currency, liquidity, timestamp)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     price, quantity, fee, fee_currency, liquidity, timestamp, applied)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, FALSE)
                 ON CONFLICT (exchange_id, symbol, trade_id) DO NOTHING
                 RETURNING id
                 """,
@@ -406,6 +478,26 @@ class PgLiveOrderStore:
                 fill.fee_currency,
                 fill.liquidity,
                 fill.timestamp,
+            )
+        return row is not None
+
+    async def unapplied_fills(self, session_id: str) -> list[LiveFillRecord]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM live_fills WHERE session_id = $1 AND NOT applied ORDER BY id",
+                session_id,
+            )
+        return [_row_to_fill(r) for r in rows]
+
+    async def mark_fill_applied(self, fill: LiveFillRecord) -> bool:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE live_fills SET applied = TRUE"
+                " WHERE exchange_id = $1 AND symbol = $2 AND trade_id = $3 AND NOT applied"
+                " RETURNING id",
+                fill.exchange_id,
+                fill.symbol,
+                fill.trade_id,
             )
         return row is not None
 
@@ -436,11 +528,26 @@ class PgLiveOrderStore:
             )
         return None if row is None else _row_to_order(row)
 
-    async def by_exchange_order_id(self, exchange_order_id: str) -> LiveOrderRecord | None:
+    async def by_exchange_order_id(
+        self, exchange_order_id: str, session_id: str
+    ) -> LiveOrderRecord | None:
+        # F1 + F12: session-scoped, and a list id never matches an order row
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM live_orders WHERE exchange_order_id = $1 ORDER BY id DESC LIMIT 1",
+                "SELECT * FROM live_orders WHERE exchange_order_id = $1 AND session_id = $2"
+                " AND order_list_id IS NULL ORDER BY id DESC LIMIT 1",
                 exchange_order_id,
+                session_id,
+            )
+        return None if row is None else _row_to_order(row)
+
+    async def by_order_list_id(self, order_list_id: str, session_id: str) -> LiveOrderRecord | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM live_orders WHERE order_list_id = $1 AND session_id = $2"
+                " ORDER BY id DESC LIMIT 1",
+                order_list_id,
+                session_id,
             )
         return None if row is None else _row_to_order(row)
 
@@ -511,10 +618,30 @@ def _row_to_order(row: Any) -> LiveOrderRecord:
         exchange_order_id=(
             None if raw.get("exchange_order_id") is None else str(raw["exchange_order_id"])
         ),
+        order_list_id=None if raw.get("order_list_id") is None else str(raw["order_list_id"]),
+        leg_client_order_ids=tuple(str(c) for c in raw.get("leg_client_order_ids") or ()),
         submitted_at=_ts(raw.get("submitted_at")),
         terminal_at=_ts(raw.get("terminal_at")),
         updated_at=_ts(raw.get("updated_at")),
         error=raw.get("error"),
+    )
+
+
+def _row_to_fill(row: Any) -> LiveFillRecord:
+    raw = dict(row)
+    return LiveFillRecord(
+        trade_id=str(raw["trade_id"]),
+        client_order_id=str(raw["client_order_id"]),
+        session_id=str(raw["session_id"]),
+        exchange_id=str(raw["exchange_id"]),
+        symbol=str(raw["symbol"]),
+        side=str(raw["side"]),
+        price=_dec(raw["price"]),
+        quantity=_dec(raw["quantity"]),
+        fee=_dec(raw["fee"]),
+        fee_currency=str(raw.get("fee_currency") or ""),
+        liquidity=str(raw.get("liquidity") or ""),
+        timestamp=cast("datetime", raw["timestamp"]),  # NOT NULL in the schema
     )
 
 
@@ -529,17 +656,29 @@ class InMemoryLiveOrderStore:
     def __init__(self) -> None:
         self._orders: dict[str, LiveOrderRecord] = {}
         self._by_exchange: dict[str, str] = {}
+        self._by_list: dict[str, str] = {}
         self._fills: dict[tuple[str, str, str], LiveFillRecord] = {}
+        self._applied: set[tuple[str, str, str]] = set()
+
+    def _index(self, order: LiveOrderRecord) -> None:
+        if order.order_list_id:
+            self._by_list[order.order_list_id] = order.client_order_id
+        elif order.exchange_order_id:
+            self._by_exchange[order.exchange_order_id] = order.client_order_id
 
     async def create(self, order: LiveOrderRecord) -> None:
         if order.client_order_id in self._orders:
             raise ValueError(f"duplicate client_order_id {order.client_order_id}")
         self._orders[order.client_order_id] = order
-        if order.exchange_order_id:
-            self._by_exchange[order.exchange_order_id] = order.client_order_id
+        self._index(order)
 
     async def mark_ack(
-        self, client_order_id: str, exchange_order_id: str, status: LiveOrderStatus
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+        status: LiveOrderStatus,
+        *,
+        order_list_id: str | None = None,
     ) -> bool:
         order = self._orders.get(client_order_id)
         if order is None:
@@ -548,9 +687,15 @@ class InMemoryLiveOrderStore:
             _refused(order, "ack")
             return False
         self._orders[client_order_id] = replace(
-            order, status=status, exchange_order_id=exchange_order_id, error=None
+            order,
+            status=status,
+            exchange_order_id=exchange_order_id,
+            order_list_id=order_list_id or order.order_list_id,
+            error=None,
+            terminal_at=_terminal_now(status),
+            updated_at=datetime.now(UTC),
         )
-        self._by_exchange[exchange_order_id] = client_order_id
+        self._index(self._orders[client_order_id])
         return True
 
     async def mark_submit_failed(self, client_order_id: str, error: str) -> bool:
@@ -560,7 +705,13 @@ class InMemoryLiveOrderStore:
         if order.status not in _ACKABLE:
             _refused(order, "submit-failed mark")
             return False
-        self._orders[client_order_id] = replace(order, status=LiveOrderStatus.REJECTED, error=error)
+        self._orders[client_order_id] = replace(
+            order,
+            status=LiveOrderStatus.REJECTED,
+            error=error,
+            terminal_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
         return True
 
     async def resolve_unknown(
@@ -571,6 +722,7 @@ class InMemoryLiveOrderStore:
         *,
         filled_quantity: Decimal | None = None,
         average_fill_price: Decimal | None = None,
+        order_list_id: str | None = None,
     ) -> bool:
         order = self._orders.get(client_order_id)
         if order is None or order.status not in UNSETTLED_STATUSES:
@@ -587,11 +739,14 @@ class InMemoryLiveOrderStore:
             order,
             status=status,
             exchange_order_id=exchange_order_id,
+            order_list_id=order_list_id or order.order_list_id,
             filled_quantity=quantity,
             average_fill_price=average,
             error=None,
+            terminal_at=_terminal_now(status),
+            updated_at=datetime.now(UTC),
         )
-        self._by_exchange[exchange_order_id] = client_order_id
+        self._index(self._orders[client_order_id])
         return True
 
     async def apply_status(
@@ -609,8 +764,7 @@ class InMemoryLiveOrderStore:
         updated, outcome = _plan_status(order, status, filled_quantity, average_fill_price, error)
         if outcome == APPLIED and updated is not None:
             self._orders[client_order_id] = updated
-            if updated.exchange_order_id:
-                self._by_exchange[updated.exchange_order_id] = client_order_id
+            self._index(updated)
         return outcome
 
     async def record_fill(self, fill: LiveFillRecord) -> bool:
@@ -618,6 +772,20 @@ class InMemoryLiveOrderStore:
         if key in self._fills:
             return False
         self._fills[key] = fill
+        return True
+
+    async def unapplied_fills(self, session_id: str) -> list[LiveFillRecord]:
+        return [
+            fill
+            for key, fill in self._fills.items()
+            if fill.session_id == session_id and key not in self._applied
+        ]
+
+    async def mark_fill_applied(self, fill: LiveFillRecord) -> bool:
+        key = (fill.exchange_id, fill.symbol, fill.trade_id)
+        if key not in self._fills or key in self._applied:
+            return False
+        self._applied.add(key)
         return True
 
     def _session(self, session_id: str) -> list[LiveOrderRecord]:
@@ -634,9 +802,21 @@ class InMemoryLiveOrderStore:
     async def by_client_order_id(self, client_order_id: str) -> LiveOrderRecord | None:
         return self._orders.get(client_order_id)
 
-    async def by_exchange_order_id(self, exchange_order_id: str) -> LiveOrderRecord | None:
+    async def by_exchange_order_id(
+        self, exchange_order_id: str, session_id: str
+    ) -> LiveOrderRecord | None:
         cid = self._by_exchange.get(exchange_order_id)
-        return None if cid is None else self._orders.get(cid)
+        order = None if cid is None else self._orders.get(cid)
+        if order is None or order.session_id != session_id:
+            return None
+        return order
+
+    async def by_order_list_id(self, order_list_id: str, session_id: str) -> LiveOrderRecord | None:
+        cid = self._by_list.get(order_list_id)
+        order = None if cid is None else self._orders.get(cid)
+        if order is None or order.session_id != session_id:
+            return None
+        return order
 
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]:
         return [

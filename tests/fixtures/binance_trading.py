@@ -3,12 +3,15 @@
 This is the ONLY exchange boundary the live tests see: no keys, no network, no keyed client
 construction. MARKET orders fill immediately against the settable last price; LIMIT orders
 and STOP_LOSS/trailing legs rest until a test fills them (``fill_order``); the OCO list
-answers the normalized paper shape ``ExchangeClient.create_oco`` returns. Failure modes are
-scriptable per call: ``timeout_after_land`` creates (and fills) the order but raises
-``ccxt.RequestTimeout`` anyway — the critical mid-submit case — plus ``timeout_not_landed``,
-``insufficient_funds`` (-2010), ``invalid_order`` (-1013) and ``rate_limit`` (ccxt
-``DDoSProtection``). Every method answers the same unified-plus-``info`` dicts ccxt 4.5.88
-would, so ``normalize_open_orders`` and the poller read real shapes.
+answers the normalized paper shape ``ExchangeClient.create_oco`` returns and models the REAL
+endpoint's client-id contract (``listClientOrderId`` + ``aboveClientOrderId`` /
+``belowClientOrderId``; the list id and the order ids are distinct spaces, and ``fetch_order``
+resolves order ids — legs included — never a list id), so CI catches wire-contract drift.
+Failure modes are scriptable per call: ``timeout_after_land`` creates (and fills) the order
+but raises ``ccxt.RequestTimeout`` anyway — the critical mid-submit case — plus
+``timeout_not_landed``, ``insufficient_funds`` (-2010), ``invalid_order`` (-1013) and
+``rate_limit`` (ccxt ``DDoSProtection``). Every method answers the same unified-plus-``info``
+dicts ccxt 4.5.88 would, so ``normalize_open_orders`` and the poller read real shapes.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ class FakeBinanceTradingClient:
     ) -> None:
         self.orders: dict[int, dict[str, Any]] = {}
         self.lists: dict[int, list[int]] = {}
+        self.list_client_ids: dict[int, str] = {}
         self.trades: list[dict[str, Any]] = []
         self.balances: dict[str, Decimal] = dict(balances or {"USDT": _D("10000")})
         self.last_prices: dict[str, Decimal] = {
@@ -295,6 +299,10 @@ class FakeBinanceTradingClient:
         stop_loss: str,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """POST /api/v3/orderList/oco with the REAL client-id params: the list id and the
+        two legs each carry the caller's explicit ids (listClientOrderId /
+        aboveClientOrderId / belowClientOrderId); anything else is auto-generated the way
+        Binance would, so a wire-contract drift fails the poller's list lookup in CI."""
         mode, self.fail_create = self.fail_create, None
         if mode == "timeout_not_landed":
             raise ccxt.RequestTimeout("binance POST /api/v3/orderList/oco request timed out")
@@ -304,7 +312,10 @@ class FakeBinanceTradingClient:
             raise ccxt.DDoSProtection("binance {418} IP has been auto-banned")
         list_id = self._next_list_id
         self._next_list_id += 1
-        cid = str((params or {}).get("newClientOrderId") or f"auto-list-{list_id}")
+        params = dict(params or {})
+        cid = str(params.get("listClientOrderId") or f"auto-list-{list_id}")
+        above_cid = str(params.get("aboveClientOrderId") or f"auto-above-{list_id}")
+        below_cid = str(params.get("belowClientOrderId") or f"auto-below-{list_id}")
         qty = _D(quantity)
         self._check_wallet(symbol, side.upper(), qty, _D(stop_loss))
         above = self._new_order(
@@ -314,7 +325,7 @@ class FakeBinanceTradingClient:
             qty,
             _D(take_profit),
             None,
-            cid + "-above",
+            above_cid,
             list_id,
         )
         below = self._new_order(
@@ -324,10 +335,11 @@ class FakeBinanceTradingClient:
             qty,
             None,
             _D(stop_loss),
-            cid + "-below",
+            below_cid,
             list_id,
         )
         self.lists[list_id] = [above["orderId"], below["orderId"]]
+        self.list_client_ids[list_id] = cid
         if mode == "timeout_after_land":
             raise ccxt.RequestTimeout("binance POST /api/v3/orderList/oco request timed out")
         return {
@@ -364,12 +376,21 @@ class FakeBinanceTradingClient:
         }
 
     async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        raw = self.orders.get(int(order_id)) if str(order_id).isdigit() else None
+        raw = self._order_by_any_id(order_id)
         if raw is None or raw["status"] not in ("NEW", "PARTIALLY_FILLED"):
             raise ccxt.OrderNotFound("binance {-2011} Unknown order sent")
         raw["status"] = "CANCELED"
         raw["updateTime"] = raw["time"] + 1
         return self._unified(raw)
+
+    def _order_by_any_id(self, order_id: str) -> dict[str, Any] | None:
+        """An order by numeric orderId or by clientOrderId (DELETE /api/v3/order accepts
+        origClientOrderId); a LIST id is never an order id."""
+        if str(order_id).isdigit():
+            if int(order_id) in self.lists:
+                return None
+            return self.orders.get(int(order_id))
+        return self.order_by_client_id(str(order_id))
 
     async def cancel_order_list(self, order_list_id: str, symbol: str) -> dict[str, Any]:
         legs = self.lists.get(int(order_list_id))
@@ -396,8 +417,8 @@ class FakeBinanceTradingClient:
         raw = None
         if client_id is not None:
             raw = self.order_by_client_id(str(client_id))
-        elif str(order_id).isdigit():
-            raw = self.orders.get(int(order_id))
+        else:
+            raw = self._order_by_any_id(order_id)
         if raw is None:
             raise ccxt.OrderNotFound("binance {-2013} Order does not exist")
         return self._unified(raw)
@@ -415,7 +436,7 @@ class FakeBinanceTradingClient:
             out.append(
                 {
                     "orderListId": list_id,
-                    "listClientOrderId": f"lcid-{list_id}",
+                    "listClientOrderId": self.list_client_ids.get(list_id, f"auto-list-{list_id}"),
                     "contingencyType": "OCO",
                     "symbol": symbol or self.orders[legs[0]]["symbol"],
                     "listStatusType": "EXECUTING",

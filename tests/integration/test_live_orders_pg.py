@@ -1,8 +1,10 @@
 """Migration 0009 on real TimescaleDB: the live ledger schema, the store round-trip,
-the DB double-apply guard, and the downgrade path."""
+the DB claim-apply-confirm guard, the concurrent apply_status invariant, the
+cross-session contract (F1/F13) and the downgrade path."""
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -18,6 +20,7 @@ from hydra.data.migrations.runner import (
 )
 from hydra.execution.live_orders import (
     APPLIED,
+    REFUSED,
     LiveOrderRecord,
     LiveOrderStatus,
     PgLiveOrderStore,
@@ -89,8 +92,8 @@ async def test_the_downgrade_drops_the_live_schema_and_the_seed(fresh_database: 
     assert await current_revision(fresh_database) == "0009_live_orders"
 
 
-def _order(cid: str, symbol: str = "BTCUSDT", **overrides: object) -> LiveOrderRecord:
-    fields: dict[str, object] = {
+def _order(cid: str, symbol: str = "BTCUSDT", **overrides: Any) -> LiveOrderRecord:
+    fields: dict[str, Any] = {
         "client_order_id": cid,
         "session_id": "sess",
         "strategy_id": "strat",
@@ -103,7 +106,7 @@ def _order(cid: str, symbol: str = "BTCUSDT", **overrides: object) -> LiveOrderR
         "submitted_at": NOW,
     }
     fields.update(overrides)
-    return LiveOrderRecord(**fields)  # type: ignore[arg-type]
+    return LiveOrderRecord(**fields)
 
 
 async def test_the_store_round_trips_on_the_real_schema(pool: Any) -> None:
@@ -133,13 +136,85 @@ async def test_the_store_round_trips_on_the_real_schema(pool: Any) -> None:
     assert await store.resolve_unknown(
         "hyd-rt-2", "201", LiveOrderStatus.FILLED, filled_quantity=D("0.01")
     )
-    row = await store.by_exchange_order_id("201")
+    row = await store.by_exchange_order_id("201", "sess")
     assert row is not None and row.status is LiveOrderStatus.FILLED
+    assert await store.by_exchange_order_id("201", "other") is None  # F1: session-scoped
 
     assert [r.client_order_id for r in await store.open_orders("sess")] == ["hyd-rt-1"]
     assert await store.symbols("sess") == ["BTCUSDT", "ETHUSDT"]
     unsettled = await store.unsettled("sess", NOW + timedelta(seconds=1))
     assert unsettled == []
+
+
+async def test_concurrent_apply_status_pairs_cannot_regress_a_terminal_row(pool: Any) -> None:
+    """F7: one conditional UPDATE — a filled/canceled pair racing on one row can never
+    leave the loser's status written over the winner's terminal one."""
+    store = PgLiveOrderStore(pool)
+    await store.create(_order("hyd-race"))
+    assert await store.mark_ack("hyd-race", "401", LiveOrderStatus.NEW)
+
+    outcomes = await asyncio.gather(
+        store.apply_status("hyd-race", LiveOrderStatus.FILLED, filled_quantity=D("0.01")),
+        store.apply_status("hyd-race", LiveOrderStatus.CANCELED),
+    )
+    assert all(outcome in (APPLIED, REFUSED, "unchanged") for outcome in outcomes)
+    row = await store.by_client_order_id("hyd-race")
+    assert row is not None
+    assert row.status in (LiveOrderStatus.FILLED, LiveOrderStatus.CANCELED)
+    assert row.terminal_at is not None
+    # whichever won, the loser is now refused and cannot overwrite the terminal status
+    loser = (
+        LiveOrderStatus.CANCELED
+        if row.status is LiveOrderStatus.FILLED
+        else (LiveOrderStatus.FILLED)
+    )
+    assert await store.apply_status("hyd-race", loser) == REFUSED
+    after = await store.by_client_order_id("hyd-race")
+    assert after is not None and after.status is row.status
+
+
+async def test_the_oco_discriminator_and_claim_columns_round_trip(pool: Any) -> None:
+    """F12 + F2: order_list_id/leg_client_order_ids land, the order-id lookup never
+    matches a list id, and live_fills rows claim unapplied then confirm."""
+    store = PgLiveOrderStore(pool)
+    await store.create(
+        _order(
+            "hyd-oco-rt",
+            side="SELL",
+            order_type="OCO",
+            leg_client_order_ids=("hyd-above", "hyd-below"),
+        )
+    )
+    assert await store.mark_ack("hyd-oco-rt", "777", LiveOrderStatus.NEW, order_list_id="777")
+    row = await store.by_order_list_id("777", "sess")
+    assert row is not None
+    assert (row.order_list_id, row.leg_client_order_ids) == ("777", ("hyd-above", "hyd-below"))
+    assert await store.by_exchange_order_id("777", "sess") is None  # F12
+
+    from hydra.execution.live_orders import LiveFillRecord
+
+    fill = LiveFillRecord(
+        trade_id="900100",
+        client_order_id="hyd-oco-rt",
+        session_id="sess",
+        exchange_id="binance",
+        symbol="BTCUSDT",
+        side="SELL",
+        price=D("94000"),
+        quantity=D("0.01"),
+        fee=D("0.01"),
+        fee_currency="USDT",
+        liquidity="taker",
+        timestamp=NOW,
+    )
+    assert await store.record_fill(fill)  # the claim
+    assert [f.trade_id for f in await store.unapplied_fills("sess")] == ["900100"]
+    assert await store.mark_fill_applied(fill)  # the confirm
+    assert await store.unapplied_fills("sess") == []
+    async with pool.acquire() as conn:
+        stored = await conn.fetchval("SELECT applied FROM live_fills WHERE trade_id = '900100'")
+    assert stored is True
+    assert not await store.mark_fill_applied(fill)  # idempotent
 
 
 async def test_live_fills_reject_a_duplicate_trade_id_at_the_db_level(pool: Any) -> None:

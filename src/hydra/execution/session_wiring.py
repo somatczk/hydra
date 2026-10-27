@@ -63,7 +63,9 @@ from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.live_executor import LiveOrderPoller, LiveTradingExecutor
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import (
+    InsufficientBalanceError,
     LedgerInvariantError,
+    OrderRejectedError,
     PaperFill,
     PaperSessionHaltedError,
     PaperTradingExecutor,
@@ -461,6 +463,12 @@ class SessionRuntime:
         symbol = str(order.symbol)
         if await self._fail_if_halted():
             return
+        if self._is_live():
+            # F3: the old group rests through the in-flight sell; on_fill cleans it up
+            order_id = await self.om.submit_order(order)
+            if order_id is None:
+                await self.protect.disarm(symbol)  # nothing to reduce: nothing to protect
+            return
         await self.protect.disarm(symbol)
         try:
             order_id = await self.om.submit_order(order)
@@ -710,16 +718,22 @@ class SessionRuntime:
         )
         if await self._fail_if_halted():
             raise PaperSessionHaltedError(f"session {self.session.session_id} ledger is halted")
-        await self.protect.disarm(symbol)
-        try:
+        if self._is_live():
+            # F3: never disarm-then-rearm around a live sell; on_fill cleans the group up
             order_id = await self.om.submit_order(order)
-        except BaseException:
-            if not await self._fail_if_halted():
+            if order_id is None:
+                await self.protect.disarm(symbol)
+        else:
+            await self.protect.disarm(symbol)
+            try:
+                order_id = await self.om.submit_order(order)
+            except BaseException:
+                if not await self._fail_if_halted():
+                    await self.protect.rearm(symbol)
+                raise
+            if order_id is None or self.om.get_order_status(order_id) != OrderStatus.FILLED:
                 await self.protect.rearm(symbol)
-            raise
         status = self.om.get_order_status(order_id) if order_id is not None else None
-        if status != OrderStatus.FILLED:
-            await self.protect.rearm(symbol)
         group = self.protect.armed(symbol)
         fill = self._market_fill(order_id) if status == OrderStatus.FILLED else None
         return ManualOrderResult(
@@ -799,13 +813,31 @@ class SessionRuntime:
                     tag=UNPROTECTED_TAG,
                 )
             )
-        except Exception as exc:
+        except (
+            OrderRejectedError,
+            InsufficientBalanceError,
+            PaperSessionHaltedError,
+            LedgerInvariantError,
+        ) as exc:
+            # definitive and raised before the wire: the executor's own flatten may still sell
             logger.warning("Reduce-only close of unprotected %s failed (%s)", symbol, exc)
             try:
                 for fill in await self.executor.flatten(symbol, reason=UNPROTECTED_TAG):
                     await self.om.on_external_fill(fill)
             except Exception as flatten_exc:
                 await self._fail(f"{symbol} is unprotected and could not be closed: {flatten_exc}")
+        except Exception as exc:
+            # an unknown close outcome is never re-sold (F4): fail the session honestly
+            logger.error(
+                "Close of unprotected %s in %s has an unknown outcome (%s)",
+                symbol,
+                self.session.session_id,
+                exc,
+            )
+            await self._fail(f"{symbol} is unprotected and its close outcome is unknown: {exc}")
+
+    def _is_live(self) -> bool:
+        return isinstance(self.executor, LiveTradingExecutor)
 
     async def _on_cancel(self, event: Event) -> None:
         if isinstance(event, OrderCancelEvent):

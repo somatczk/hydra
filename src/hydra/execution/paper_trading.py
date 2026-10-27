@@ -96,6 +96,8 @@ class SpotMarketRules(Protocol):
     @property
     def min_notional(self) -> Decimal | None: ...
 
+    def floor_qty(self, qty: Decimal) -> Decimal: ...
+
 
 PaperFillStatus = Literal["FILLED", "CANCELLED"]
 MarkSource = Literal["live", "stale_live", "last_close"]
