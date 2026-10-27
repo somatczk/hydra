@@ -48,7 +48,9 @@ class _FakeCcxt:
         return await self._call("cancel_order", {"id": order_id, "symbol": symbol})
 
     async def fetch_balance(self) -> dict[str, Any]:
-        return await self._call("fetch_balance", {"free": {"USDT": 1000.5, "BTC": 0}})
+        return await self._call(
+            "fetch_balance", {"free": {"USDT": 1000.5, "BTC": 0}, "total": {"USDT": 1500.5}}
+        )
 
     async def fetch_open_orders(self, symbol: str | None) -> list[dict[str, Any]]:
         return await self._call("fetch_open_orders", [])
@@ -166,6 +168,14 @@ async def test_successful_fetch_balance_records_ok_latency(clock: _Clock) -> Non
     assert REGISTRY.get_sample_value("hydra_exchange_api_errors_total", {}) is None
 
 
+async def test_fetch_balance_totals_reads_the_wallet_total(clock: _Clock) -> None:
+    """A2: the reconcile read is the wallet total (free + locked), not the free balance."""
+    totals = await _client(_FakeCcxt(clock)).fetch_balance_totals()
+
+    assert totals == {"USDT": Decimal("1500.5")}
+    assert _latency("fetch_balance", "ok", "count") == 1.0
+
+
 @pytest.mark.parametrize(("endpoint", "call"), CALLS, ids=[e for e, _ in CALLS])
 async def test_every_call_is_observed_on_success(
     clock: _Clock, endpoint: str, call: ClientCall
@@ -235,6 +245,7 @@ async def test_outcomes_accumulate_per_endpoint(clock: _Clock) -> None:
 CLIENT_METHOD = {"fetch_ticker": "get_last_price"}
 DELEGATES = {
     "get_balance": "fetch_balance",
+    "fetch_balance_totals": "fetch_balance",
     "get_equity": "fetch_balance",
     "get_positions": "fetch_positions",
 }

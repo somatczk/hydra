@@ -239,3 +239,64 @@ def test_forget_session_clears_the_gap_of_a_session_that_never_reported_position
     metrics.forget_session("s3", "saw", "live")
 
     assert _gap("s3") is None
+
+
+# ---------------------------------------------------------------------------
+# The live reconcile state (P3-A2): rule/producer agreement and the gauge lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _reconcile_state(session_id: str) -> float | None:
+    return REGISTRY.get_sample_value("hydra_live_reconcile_state", {"session_id": session_id})
+
+
+def test_live_reconcile_rule_matches_the_contract() -> None:
+    rules = _rules()
+    alert = rules["HydraLiveReconcileMismatch"]
+    assert alert["expr"].strip() == "hydra_live_reconcile_state == 1"
+    assert alert["for"] == "2m"
+    assert alert["labels"] == {"severity": "critical", "team": "trading"}
+    assert "never auto-corrected" in alert["annotations"]["description"]
+
+    (spec,) = [s for s in metrics.CONTRACT if s.name == "hydra_live_reconcile_state"]
+    assert spec.kind == "gauge"
+    assert set(spec.labels) == {"session_id"}
+    assert spec.samples == ("hydra_live_reconcile_state",)
+
+
+def test_live_reconcile_unknown_rule_matches_the_contract() -> None:
+    """A5: value 2 (unknown) gets the consumer it was exported for — the blind alert."""
+    rules = _rules()
+    alert = rules["HydraLiveReconcileUnknown"]
+    assert alert["expr"].strip() == "hydra_live_reconcile_state == 2"
+    assert alert["for"] == "10m"
+    assert alert["labels"] == {"severity": "warning", "team": "trading"}
+    assert "BLIND" in alert["annotations"]["description"]
+    assert "cannot be detected" in alert["annotations"]["description"]
+
+
+def test_the_reconcile_gauge_maps_the_states() -> None:
+    metrics.set_live_reconcile_state("s1", "ok")
+    assert _reconcile_state("s1") == 0.0
+    metrics.set_live_reconcile_state("s1", "mismatch")
+    assert _reconcile_state("s1") == 1.0
+    metrics.set_live_reconcile_state("s1", "unknown")
+    assert _reconcile_state("s1") == 2.0
+    metrics.set_live_reconcile_state("s1", "never")
+    assert _reconcile_state("s1") == 3.0
+    with pytest.raises(ValueError):
+        metrics.set_live_reconcile_state("s1", "bogus")
+
+
+def test_forget_session_clears_the_reconcile_state() -> None:
+    metrics.set_live_reconcile_state("s4", "mismatch")
+
+    metrics.forget_session("s4", "saw", "live")
+
+    assert _reconcile_state("s4") is None
+
+
+def test_forgetting_a_session_that_never_reconciled_is_quiet() -> None:
+    metrics.forget_session("s5", "saw", "paper")  # the series was never set
+
+    assert _reconcile_state("s5") is None

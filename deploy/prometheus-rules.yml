@@ -72,6 +72,26 @@ groups:
           summary: "Live position without a confirmed exchange-side stop"
           description: "Session {{ $labels.session_id }} holds {{ $labels.symbol }} on {{ $labels.exchange_id }} with no confirmed exchange-side protective order. The position is unprotected: follow the dead-man checklist in README.md (Stop all, or flatten manually from the Binance app)."
 
+      - alert: HydraLiveReconcileMismatch
+        expr: hydra_live_reconcile_state == 1
+        for: 2m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Live session reconcile mismatch"
+          description: "Session {{ $labels.session_id }} has reported drift between its ledger and the exchange for 2 minutes: untracked orders, an unresolved submit, a terminal status it had to apply, or balance drift. Read the session detail's reconcile detail; the ledger is never auto-corrected, so resolve it per the live trading notes in README.md."
+
+      - alert: HydraLiveReconcileUnknown
+        expr: hydra_live_reconcile_state == 2
+        for: 10m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Live session reconcile blind"
+          description: "Session {{ $labels.session_id }} has been unable to complete a reconcile pass for 10 minutes: the drift detector is BLIND — an exchange outage or credential revocation means drift cannot be detected. Restore the exchange read (connectivity, credentials) and confirm the session's next pass reports ok."
+
   - name: hydra-system
     interval: 30s
     rules:

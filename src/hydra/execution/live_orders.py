@@ -282,6 +282,10 @@ class LiveOrderStore(Protocol):
         self, order_list_id: str, session_id: str
     ) -> LiveOrderRecord | None: ...
 
+    async def tracked_by_exchange_order_id(self, exchange_order_id: str) -> bool: ...
+
+    async def tracked_by_order_list_id(self, order_list_id: str) -> bool: ...
+
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]: ...
 
     async def refreshable(self, session_id: str) -> list[LiveOrderRecord]: ...
@@ -551,6 +555,23 @@ class PgLiveOrderStore:
             )
         return None if row is None else _row_to_order(row)
 
+    async def tracked_by_exchange_order_id(self, exchange_order_id: str) -> bool:
+        # A1 (R29): account-wide — the untracked classification, never fill attribution
+        async with self._pool.acquire() as conn:
+            found = await conn.fetchval(
+                "SELECT 1 FROM live_orders WHERE exchange_order_id = $1"
+                " AND order_list_id IS NULL LIMIT 1",
+                exchange_order_id,
+            )
+        return found is not None
+
+    async def tracked_by_order_list_id(self, order_list_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            found = await conn.fetchval(
+                "SELECT 1 FROM live_orders WHERE order_list_id = $1 LIMIT 1", order_list_id
+            )
+        return found is not None
+
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -817,6 +838,15 @@ class InMemoryLiveOrderStore:
         if order is None or order.session_id != session_id:
             return None
         return order
+
+    async def tracked_by_exchange_order_id(self, exchange_order_id: str) -> bool:
+        return any(
+            o.exchange_order_id == exchange_order_id and o.order_list_id is None
+            for o in self._orders.values()
+        )
+
+    async def tracked_by_order_list_id(self, order_list_id: str) -> bool:
+        return any(o.order_list_id == order_list_id for o in self._orders.values())
 
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]:
         return [

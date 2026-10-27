@@ -121,6 +121,9 @@ Contract (name: type, unit / labels / producer):
 - hydra_live_protective_gap: gauge, 1
   labels: session_id, strategy_id, exchange_id, symbol
   producer: P3-B session_wiring live coverage hook
+- hydra_live_reconcile_state: gauge, 0 ok | 1 mismatch | 2 unknown | 3 never
+  labels: session_id
+  producer: P3-A2 reconcile loop
 - hydra_ready: gauge, 1
   labels: check
   producer: P1-G1 HealthMonitor
@@ -461,6 +464,14 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "1",
         "P3-B session_wiring live coverage hook",
         ("session_id", "strategy_id", "exchange_id", "symbol"),
+    ),
+    MetricSpec(
+        "hydra_live_reconcile_state",
+        "gauge",
+        "A live session's reconcile state: 0 ok, 1 mismatch, 2 unknown, 3 never",
+        "0 ok | 1 mismatch | 2 unknown | 3 never",
+        "P3-A2 reconcile loop",
+        ("session_id",),
     ),
     MetricSpec(
         "hydra_ready",
@@ -864,6 +875,8 @@ def forget_session(session_id: str, strategy_id: str, mode: str) -> None:
     _gauge("hydra_session_desired").remove(session_id, strategy_id, mode)
     _gauge("hydra_session_supervised").remove(session_id, strategy_id, mode)
     _gauge("hydra_paper_persist_dirty").remove(session_id)
+    with contextlib.suppress(KeyError):
+        _gauge("hydra_live_reconcile_state").remove(session_id)
     positions = _gauge("hydra_position_size")
     held = _session_positions.pop(session_id, {})
     for position_strategy, exchange_id, symbol in held:
@@ -902,6 +915,22 @@ def set_live_protective_gap(
     with contextlib.suppress(KeyError):
         _gauge("hydra_live_protective_gap").remove(session_id, *labels)
     _live_gaps.get(session_id, set()).discard(labels)
+
+
+LIVE_RECONCILE_STATES = {"ok": 0.0, "mismatch": 1.0, "unknown": 2.0, "never": 3.0}
+
+
+def set_live_reconcile_state(session_id: str, state: str) -> None:
+    """Set a live session's reconcile state (0 ok, 1 mismatch, 2 unknown, 3 never).
+
+    The mismatch value is the alert's; ``never`` is exported so an un-reconciled session
+    is visible as such, not as a missing series.
+    """
+    try:
+        value = LIVE_RECONCILE_STATES[state]
+    except KeyError:
+        raise ValueError(f"unknown reconcile state {state!r}") from None
+    _gauge("hydra_live_reconcile_state").labels(session_id=session_id).set(value)
 
 
 def set_ready(check: str, ok: bool) -> None:

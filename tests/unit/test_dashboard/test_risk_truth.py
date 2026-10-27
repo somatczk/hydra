@@ -256,11 +256,34 @@ class TestRiskStatus:
         assert data["restrictions"]["can_open_new_trades"] is False
         assert data["restrictions"]["size_multiplier"] == 0.5
 
-    async def test_live_source_is_503(self, client: httpx.AsyncClient) -> None:
-        for path in ("/api/risk/status?source=live", "/api/risk/var?source=live"):
+    async def test_live_source_without_a_live_service_is_the_seam_8_503(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """source=live is a real read now: with no live service built it fails closed."""
+        for path in ("/api/risk/status?source=live", "/api/risk/live-status?source=live"):
             resp = await client.get(path)
             assert resp.status_code == 503
-            assert resp.json()["detail"]["code"] == "live_disabled"
+            assert resp.json()["detail"]["code"] == "live_risk_unavailable"
+
+    async def test_an_unrecognized_source_is_refused_never_served_as_paper(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """A6≡S8: the source vocabulary is validated; a typo fails closed with 422."""
+        for path in ("/api/risk/status?source=liev", "/api/risk/live-status?source=liev"):
+            resp = await client.get(path)
+            assert resp.status_code == 422
+            detail = resp.json()["detail"]
+            assert (detail["code"], detail["state"], detail["source"]) == (
+                "invalid_source",
+                "invalid",
+                "liev",
+            )
+
+    async def test_var_source_live_stays_the_paper_read(self, client: httpx.AsyncClient) -> None:
+        resp = await client.get("/api/risk/var?source=live")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "live_disabled"
+        assert "live-scope risk reads" in resp.json()["detail"]["message"]
 
     def test_status_without_engine_is_503(self) -> None:
         pool, _ = _make_pool()
@@ -278,6 +301,87 @@ class TestRiskStatus:
             resp = await c.get("/api/risk/status")
         assert resp.status_code == 503
         assert resp.json()["detail"]["code"] == "risk_state_unavailable"
+
+
+class TestLiveScopeReads:
+    """source=live rides the live_status op (R11) and serves the live-scoped numbers."""
+
+    @staticmethod
+    async def _live_account() -> Account:
+        acct = await make_account(RiskConfig(max_daily_loss_pct=Decimal("0.5")), scope="live")
+        ex = await acct.add_session("s1", "10000")
+        await acct.mark("60000")
+        await ex.create_order("BTCUSDT", "BUY", "MARKET", Decimal("0.1"))
+        await acct.mark("54800")
+        assert acct.svc.account().tier == 2
+        return acct
+
+    @staticmethod
+    def _mgr(paper: Any, live: Any) -> Any:
+        class _Both:
+            risk = paper
+            live_risk = live
+
+            def list_sessions(self) -> list[Any]:
+                return [
+                    MagicMock(status="running", trading_mode="live"),
+                    MagicMock(status="running", trading_mode="paper"),
+                ]
+
+            async def reload_risk_config(self) -> None:  # pragma: no cover - unused here
+                return None
+
+        return _Both()
+
+    async def test_status_source_live_serves_the_live_scope_numbers(self) -> None:
+        paper = await make_account()
+        live = await self._live_account()
+        app = _make_app(session_manager=self._mgr(paper.svc, live.svc))
+        resp = TestClient(app).get("/api/risk/status?source=live")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["circuit_breakers_state"] == "live"
+        assert data["current_drawdown"] == 5.2
+        assert data["equity"] == 9480.0
+        assert data["peak_equity"] == 10000.0
+        assert data["daily_loss"] == 520.0
+        assert data["consecutive_losses"] == 0
+        assert data["restrictions"]["active_tier"] == 2
+        assert data["restrictions"]["can_open_new_trades"] is False
+
+    async def test_live_status_source_live_serves_the_live_operating_picture(self) -> None:
+        paper = await make_account()
+        live = await self._live_account()
+        app = _make_app(session_manager=self._mgr(paper.svc, live.svc))
+        resp = TestClient(app).get("/api/risk/live-status?source=live")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["kill_switch_active"] is False
+        assert data["kill_switch_state"] == "inactive"
+        assert data["running_sessions"] == 1  # the live sessions only
+        assert data["circuit_breakers_state"] == "live"
+        assert data["equity"] == 9480.0
+        assert data["current_drawdown"] == 5.2
+        assert data["active_tier"] == 2
+
+    async def test_paper_reads_are_unchanged_with_a_live_service_built(self) -> None:
+        paper = await make_account()
+        live = await self._live_account()
+        app = _make_app(session_manager=self._mgr(paper.svc, live.svc))
+        tc = TestClient(app)
+
+        paper_status = tc.get("/api/risk/status").json()
+        assert paper_status["equity"] == 10000.0  # the paper scope, not the live one
+        plain = tc.get("/api/risk/live-status").json()
+        assert plain["running_sessions"] == 2  # today's count: every running session
+        # the additive live-scope fields are null on a paper read
+        assert (plain["equity"], plain["current_drawdown"], plain["active_tier"]) == (
+            None,
+            None,
+            None,
+        )
 
 
 class TestEvents:

@@ -66,7 +66,7 @@ class TraderBackend(Protocol):
         self, tier: int, actor: str, reason: str, confirm_tier: int
     ) -> list[dict[str, Any]]: ...
     async def reset_paper_account(self, actor: str, reason: str) -> None: ...
-    async def live_status(self) -> dict[str, Any]: ...
+    async def live_status(self, source: str = "paper") -> dict[str, Any]: ...
     async def positions(self) -> list[dict[str, Any]]: ...
     async def reload_paper_capital(self, actor: str) -> None: ...
     async def health_snapshot(self) -> HealthSnapshot: ...
@@ -110,6 +110,34 @@ def _breakers(svc: RiskService) -> list[dict[str, Any]]:
     ]
 
 
+def _account_fields(svc: RiskService) -> dict[str, Any]:
+    """The RiskStatus-shaped fields of one scope's service (drawdown, daily loss, tiers)."""
+    view = svc.account()
+    cfg = view.config
+    start = view.day_start_equity
+    daily_loss = (
+        max(Decimal("0"), start - view.equity)
+        if start is not None and view.equity is not None
+        else None
+    )
+    return {
+        "current_drawdown": round(float(view.drawdown) * 100, 2),
+        "max_drawdown_limit": float(cfg.max_drawdown_pct) * 100,
+        "daily_loss": None if daily_loss is None else round(float(daily_loss), 2),
+        "daily_loss_limit": (
+            None if start is None else round(float(start * cfg.max_daily_loss_pct), 2)
+        ),
+        "equity": _f(view.equity),
+        "peak_equity": _f(view.peak_equity),
+        "day_start_equity": _f(start),
+        "consecutive_losses": view.consecutive_losses,
+        "max_consecutive_losses": cfg.max_consecutive_losses,
+        "circuit_breakers": _breakers(svc),
+        "circuit_breakers_state": "live",
+        "restrictions": _restrictions(view.restrictions),
+    }
+
+
 class LocalTrader:
     """The single-process backend: today's services calls and engine reads, verbatim.
 
@@ -128,6 +156,31 @@ class LocalTrader:
     def risk(self) -> RiskService | None:
         svc = getattr(self.session_manager, "risk", None)
         return svc if isinstance(svc, RiskService) else None
+
+    @property
+    def live_risk(self) -> RiskService | None:
+        """Q1's live-scoped service, when the engine built one (live_capital configured)."""
+        svc = getattr(self.session_manager, "live_risk", None)
+        return svc if isinstance(svc, RiskService) else None
+
+    def _require_live_risk(self) -> RiskService:
+        """The live-scoped service, or the seam #8 503 both transports answer."""
+        svc = self.live_risk
+        if svc is None:
+            raise service_error(
+                503,
+                "live_risk_unavailable",
+                "The live-scoped risk service is not built (no live_capital is configured)",
+                "unavailable",
+            )
+        if not svc.available:
+            raise service_error(
+                503,
+                "live_risk_unavailable",
+                "Live risk state could not be loaded; live-scope reads are refused",
+                "unavailable",
+            )
+        return svc
 
     def _require_risk(self) -> RiskService:
         """The engine's RiskService, or the 503 both transports answer."""
@@ -212,30 +265,7 @@ class LocalTrader:
 
     async def risk_status(self) -> dict[str, Any]:
         svc = self._require_risk()
-        view = svc.account()
-        cfg = view.config
-        start = view.day_start_equity
-        daily_loss = (
-            max(Decimal("0"), start - view.equity)
-            if start is not None and view.equity is not None
-            else None
-        )
-        return {
-            "current_drawdown": round(float(view.drawdown) * 100, 2),
-            "max_drawdown_limit": float(cfg.max_drawdown_pct) * 100,
-            "daily_loss": None if daily_loss is None else round(float(daily_loss), 2),
-            "daily_loss_limit": (
-                None if start is None else round(float(start * cfg.max_daily_loss_pct), 2)
-            ),
-            "equity": _f(view.equity),
-            "peak_equity": _f(view.peak_equity),
-            "day_start_equity": _f(start),
-            "consecutive_losses": view.consecutive_losses,
-            "max_consecutive_losses": cfg.max_consecutive_losses,
-            "circuit_breakers": _breakers(svc),
-            "circuit_breakers_state": "live",
-            "restrictions": _restrictions(view.restrictions),
-        }
+        return _account_fields(svc)
 
     async def var_estimate(self) -> dict[str, Any]:
         svc = self._require_risk()
@@ -324,8 +354,16 @@ class LocalTrader:
                 "unavailable",
             ) from exc
 
-    async def live_status(self) -> dict[str, Any]:
-        """Kill switch, sessions and breaker restrictions; unknown stays unknown."""
+    async def live_status(self, source: str = "paper") -> dict[str, Any]:
+        """Kill switch, sessions and breaker restrictions; unknown stays unknown.
+
+        ``source="live"`` (R11, additive) reads Q1's live-scoped service instead: the
+        same operating picture computed on live equity plus the live-scope account
+        numbers (equity, drawdown, active tier), so the risk routes' source=live reads
+        ride this one op (seam #5). No live service built is the 503 of seam #8.
+        """
+        if source == "live":
+            return await self._live_scope_status()
         kill_switch: bool | None = None
         pool = self.db_pool
         if pool is not None:
@@ -361,6 +399,30 @@ class LocalTrader:
                 _restrictions(svc.restrictions()) if svc is not None and live else None
             ),
             "circuit_breakers_state": "live" if live else "unavailable",
+        }
+
+    async def _live_scope_status(self) -> dict[str, Any]:
+        """The live scope's operating picture: the one global kill switch as the
+        live-scoped service sees it, the running live sessions, and the live account."""
+        svc = self._require_live_risk()
+        fields = _account_fields(svc)
+        mgr = self.session_manager
+        running = (
+            None
+            if mgr is None
+            else sum(
+                1 for s in mgr.list_sessions() if s.status == "running" and s.trading_mode == "live"
+            )
+        )
+        active = svc.kill_switch_active()
+        return {
+            "kill_switch_active": active,
+            "kill_switch_state": "active" if active else "inactive",
+            "running_sessions": running,
+            "circuit_breaker_restrictions": fields["restrictions"],
+            "circuit_breakers_state": "live",
+            "active_tier": fields["restrictions"]["active_tier"],
+            **fields,
         }
 
     async def positions(self) -> list[dict[str, Any]]:

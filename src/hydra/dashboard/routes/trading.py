@@ -51,6 +51,7 @@ class SessionResponse(BaseModel):
     persist_dirty: bool | None = None
     feed_live: bool | None = None
     created_by: str | None = None
+    reconcile_state: str | None = None
 
 
 class ExchangeStopState(BaseModel):
@@ -88,6 +89,8 @@ class TradeItem(BaseModel, extra="allow"):
     pnl: float = 0
     net_pnl: float | None = None
     timestamp: str | None = None
+    # R20: true once an ok|mismatch reconcile pass covered this fill; None for paper fills
+    reconciled: bool | None = None
 
     @field_validator("fee", mode="before")
     @classmethod
@@ -107,6 +110,54 @@ class OpenOrderItem(BaseModel, extra="allow"):
     stop_price: float | None
     reason: str
     protective: bool | None
+
+
+class LiveOrderItem(BaseModel, extra="allow"):
+    """One tracked live order row, the pinned seam #2 shape (newest first, cap 100).
+
+    ``status`` is the seam's vocabulary: pending_submit|submitting|new|partially_filled|
+    filled|canceled|expired|rejected|unknown; ``exchange_order_id`` is the orderListId
+    for an OCO; ``error`` carries a rejection or resolution reason, else null.
+    """
+
+    client_order_id: str
+    exchange_order_id: str | None = None
+    symbol: str
+    side: str
+    order_type: str
+    quantity: float
+    price: float | None = None
+    stop_price: float | None = None
+    filled_quantity: float = 0
+    average_fill_price: float | None = None
+    status: Literal[
+        "pending_submit",
+        "submitting",
+        "new",
+        "partially_filled",
+        "filled",
+        "canceled",
+        "expired",
+        "rejected",
+        "unknown",
+    ]
+    tag: str = ""
+    actor: str = ""
+    submitted_at: str | None = None
+    terminal_at: str | None = None
+    error: str | None = None
+
+
+class ReconcileStatus(BaseModel):
+    """A live session's reconcile state (pinned seam #2); None on a paper session.
+
+    A mismatch carries its findings in ``detail`` verbatim; ``unknown`` means the pass
+    could not read the exchange (fail-closed); ``never`` means no pass has run yet.
+    """
+
+    state: Literal["ok", "mismatch", "unknown", "never"]
+    last_reconciled_at: str | None = None
+    detail: str | None = None
 
 
 class SessionMetrics(BaseModel):
@@ -146,6 +197,9 @@ class SessionDetailResponse(BaseModel):
     trades: list[TradeItem] = Field(default_factory=list)
     open_orders: list[OpenOrderItem] = Field(default_factory=list)
     created_by: str | None = None
+    # A7 (live sessions): the tracked order rows + reconcile; paper answers the defaults
+    orders: list[LiveOrderItem] = Field(default_factory=list)
+    reconcile: ReconcileStatus | None = None
 
 
 class KillSwitchResponse(BaseModel):

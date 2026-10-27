@@ -205,6 +205,17 @@ class ExchangeClient:
                 balances[currency] = Decimal(str(amount))
         return balances
 
+    async def fetch_balance_totals(self) -> dict[str, Decimal]:
+        """Per-asset wallet totals (free + locked): the reconcile truth for resting funds."""
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "fetch_balance"):
+            raw: dict[str, Any] = await exchange.fetch_balance()
+        totals: dict[str, Decimal] = {}
+        for currency, amount in (raw.get("total") or {}).items():
+            if amount is not None and float(amount) > 0:
+                totals[currency] = Decimal(str(amount))
+        return totals
+
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Fetch open orders from the exchange."""
         exchange = self._get_exchange()

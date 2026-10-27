@@ -765,7 +765,9 @@ class _KeyedClient:
 class _LiveDetailManager:
     """Serves one live session's detail through the service's A8-live branch."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, status: Any = None, store: Any = None, trades: list[dict[str, Any]] | None = None
+    ) -> None:
         self.session = TradingSession(
             session_id="s1",
             strategy_id="saw",
@@ -775,13 +777,20 @@ class _LiveDetailManager:
             symbols=["BTCUSDT"],
             timeframe="1h",
         )
-        self.session._executor = types.SimpleNamespace(exchange_client=_KeyedClient())
+        self.session._executor = types.SimpleNamespace(
+            exchange_client=_KeyedClient(), live_orders=store
+        )
         self.session._runtime = types.SimpleNamespace(
             protect=types.SimpleNamespace(
                 armed=lambda symbol: types.SimpleNamespace(order_id="5", leg_ids=("11", "12")),
                 is_protective=lambda order_id: order_id in ("5", "11", "12"),
             )
         )
+        self.status = status
+        self.trades = trades or []
+
+    def reconcile_status(self, session_id: str) -> Any:
+        return self.status
 
     def get_session(self, session_id: str) -> Any:
         return self.session if session_id == "s1" else None
@@ -804,7 +813,7 @@ class _LiveDetailManager:
                     "unrealized_pnl": 0.0,
                 }
             ],
-            "trades": [],
+            "trades": list(self.trades),
         }
 
 
@@ -952,6 +961,65 @@ class TestSessionTools:
         assert stop["take_profit"] == 103.0
         assert stop["order_list_id"] == "5"
         assert datetime.fromisoformat(stop["checked_at"]).tzinfo is not None
+
+    async def test_session_detail_flows_the_a7_reconcile_reads(
+        self,
+        mcp_cfg: HydraConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The seam delegation: the tracked orders, the reconcile state and R20's
+        reconciled flag ride session_detail through the backend, not a new tool."""
+        from datetime import timedelta
+
+        from hydra.execution.live_orders import (
+            InMemoryLiveOrderStore,
+            LiveOrderRecord,
+            LiveOrderStatus,
+        )
+        from hydra.execution.reconcile import ReconcileStatus
+
+        store = InMemoryLiveOrderStore()
+        await store.create(
+            LiveOrderRecord(
+                client_order_id="hyd-1",
+                session_id="s1",
+                strategy_id="saw",
+                exchange_id="binance",
+                symbol="BTCUSDT",
+                side="BUY",
+                order_type="LIMIT",
+                quantity=Decimal("0.01"),
+                price=D("90000"),
+                status=LiveOrderStatus.NEW,
+                tag="entry",
+                actor="engine",
+                exchange_order_id="7",
+            )
+        )
+        covered = datetime.now(UTC) - timedelta(minutes=5)
+        mgr = _LiveDetailManager(
+            status=ReconcileStatus(state="ok", last_reconciled_at=covered, covered_at=covered),
+            store=store,
+            trades=[
+                {"id": "t1", "timestamp": (covered - timedelta(minutes=30)).isoformat()},
+                {"id": "t2", "timestamp": datetime.now(UTC).isoformat()},
+            ],
+        )
+        monkeypatch.setattr(engine_app.state, "trader", LocalTrader(None, mgr))
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call("session_detail", {"session_id": "s1"})
+
+        assert not is_error, text
+        detail = json.loads(text)
+        (order,) = detail["orders"]
+        assert (order["client_order_id"], order["exchange_order_id"], order["status"]) == (
+            "hyd-1",
+            "7",
+            "new",
+        )
+        assert detail["reconcile"]["state"] == "ok"
+        assert detail["reconcile"]["last_reconciled_at"] is not None
+        assert [t["reconciled"] for t in detail["trades"]] == [True, False]
 
     async def test_stop_that_cannot_be_persisted_is_503_and_audits(
         self,

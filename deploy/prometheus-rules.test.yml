@@ -551,6 +551,100 @@ tests:
         alertname: HydraLiveProtectiveGap
         exp_alerts: []
 
+  - name: live reconcile mismatch firing for 2m fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraLiveReconcileMismatch
+        exp_alerts:
+          - exp_labels:
+              session_id: s1
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "Live session reconcile mismatch"
+              description: "Session s1 has reported drift between its ledger and the exchange for 2 minutes: untracked orders, an unresolved submit, a terminal status it had to apply, or balance drift. Read the session detail's reconcile detail; the ledger is never auto-corrected, so resolve it per the live trading notes in README.md."
+
+  - name: live reconcile ok does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraLiveReconcileMismatch
+        exp_alerts: []
+
+  - name: live reconcile unknown state does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "2x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HydraLiveReconcileMismatch
+        exp_alerts: []
+
+  - name: live reconcile mismatch shorter than the for window does not fire yet
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "0 0 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HydraLiveReconcileMismatch
+        exp_alerts: []
+
+  - name: live reconcile unknown firing for 10m fires
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "2x15"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: HydraLiveReconcileUnknown
+        exp_alerts:
+          - exp_labels:
+              session_id: s1
+              severity: warning
+              team: trading
+            exp_annotations:
+              summary: "Live session reconcile blind"
+              description: "Session s1 has been unable to complete a reconcile pass for 10 minutes: the drift detector is BLIND — an exchange outage or credential revocation means drift cannot be detected. Restore the exchange read (connectivity, credentials) and confirm the session's next pass reports ok."
+
+  - name: live reconcile ok does not fire the unknown alert
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: HydraLiveReconcileUnknown
+        exp_alerts: []
+
+  - name: live reconcile mismatch does not fire the unknown alert
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "1x15"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: HydraLiveReconcileUnknown
+        exp_alerts: []
+
+  - name: live reconcile unknown shorter than the for window does not fire yet
+    interval: 1m
+    input_series:
+      - series: 'hydra_live_reconcile_state{session_id="s1"}'
+        values: "0 0 2 2 2 2 2 2 2 2 2"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HydraLiveReconcileUnknown
+        exp_alerts: []
+
   - name: event bus p99 0.95s fires
     interval: 1m
     input_series:

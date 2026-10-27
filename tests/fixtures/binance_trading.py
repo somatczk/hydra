@@ -42,6 +42,7 @@ class FakeBinanceTradingClient:
         self.list_client_ids: dict[int, str] = {}
         self.trades: list[dict[str, Any]] = []
         self.balances: dict[str, Decimal] = dict(balances or {"USDT": _D("10000")})
+        self.locked: dict[str, Decimal] = {}  # resting LIMIT locks: free drops, total keeps
         self.last_prices: dict[str, Decimal] = {
             "BTCUSDT": _D(last_price),
             "ETHUSDT": _D("1000"),
@@ -142,6 +143,7 @@ class FakeBinanceTradingClient:
         }
         self.trades.append(raw)
         self._move_balances(order, price, quantity, _D(raw["commission"]), asset)
+        self._release_lock(order, quantity)
         return raw
 
     def _move_balances(
@@ -169,6 +171,29 @@ class FakeBinanceTradingClient:
         for asset in list(self.balances):
             if self.balances[asset] <= 0:
                 del self.balances[asset]
+
+    def _lock_order(self, raw: dict[str, Any]) -> None:
+        """A resting LIMIT locks its funds the way Binance does (free drops, total keeps)."""
+        base = str(raw["symbol"]).removesuffix("USDT")
+        if raw["side"] == "BUY":
+            asset, amount = "USDT", _D(raw["price"]) * _D(raw["origQty"])
+        else:
+            asset, amount = base, _D(raw["origQty"])
+        self.locked[asset] = self.locked.get(asset, _D("0")) + amount
+
+    def _release_lock(self, raw: dict[str, Any], quantity: Decimal) -> None:
+        if raw["type"] != "LIMIT" or quantity <= 0:
+            return
+        base = str(raw["symbol"]).removesuffix("USDT")
+        if raw["side"] == "BUY":
+            asset, amount = "USDT", _D(raw["price"]) * quantity
+        else:
+            asset, amount = base, quantity
+        remaining = self.locked.get(asset, _D("0")) - amount
+        if remaining > 0:
+            self.locked[asset] = remaining
+        else:
+            self.locked.pop(asset, None)
 
     def _new_order(
         self,
@@ -282,6 +307,8 @@ class FakeBinanceTradingClient:
             cid,
             trailing_delta=params.get("trailingDelta"),
         )
+        if wire_type == "LIMIT":
+            self._lock_order(raw)
         if mode == "timeout_after_land":
             # the request landed and filled, but the answer never came back
             self._apply_fill(raw, self.last_prices[symbol], quantity)
@@ -381,6 +408,7 @@ class FakeBinanceTradingClient:
             raise ccxt.OrderNotFound("binance {-2011} Unknown order sent")
         raw["status"] = "CANCELED"
         raw["updateTime"] = raw["time"] + 1
+        self._release_lock(raw, _D(raw["origQty"]) - _D(raw["executedQty"]))
         return self._unified(raw)
 
     def _order_by_any_id(self, order_id: str) -> dict[str, Any] | None:
@@ -398,7 +426,9 @@ class FakeBinanceTradingClient:
             raise ccxt.OrderNotFound("binance {-2011} Unknown order list id")
         for leg_id in legs:
             if self.orders[leg_id]["status"] in ("NEW", "PARTIALLY_FILLED"):
-                self.orders[leg_id]["status"] = "CANCELED"
+                leg = self.orders[leg_id]
+                leg["status"] = "CANCELED"
+                self._release_lock(leg, _D(leg["origQty"]) - _D(leg["executedQty"]))
         return {"orderListId": int(order_list_id), "listStatusType": "ALL_DONE"}
 
     async def cancel_all_orders(self, symbol: str) -> list[dict[str, Any]]:
@@ -406,6 +436,7 @@ class FakeBinanceTradingClient:
         canceled = []
         for raw in self.open_orders_raw(symbol):
             raw["status"] = "CANCELED"
+            self._release_lock(raw, _D(raw["origQty"]) - _D(raw["executedQty"]))
             canceled.append(self._unified(raw))
         return canceled
 
@@ -470,6 +501,14 @@ class FakeBinanceTradingClient:
         return out
 
     async def fetch_balance(self) -> dict[str, Decimal]:
+        free = {
+            asset: amount - self.locked.get(asset, _D("0"))
+            for asset, amount in self.balances.items()
+            if amount - self.locked.get(asset, _D("0")) > 0
+        }
+        return free
+
+    async def fetch_balance_totals(self) -> dict[str, Decimal]:
         return {asset: amount for asset, amount in self.balances.items() if amount > 0}
 
     async def close(self) -> None:

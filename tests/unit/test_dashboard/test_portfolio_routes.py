@@ -173,6 +173,7 @@ class FakePortfolioDb:
 
     def __init__(self) -> None:
         self.paper_capital: str | None = "10000"
+        self.live_capital: str | None = "5000"
         self.sessions: dict[str, dict[str, Any]] = {}
         self.trades: list[dict[str, Any]] = []
         self.positions: list[dict[str, Any]] = []
@@ -262,6 +263,8 @@ class FakePortfolioDb:
         raise AssertionError(f"unexpected fetchval: {sql}")
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
+        if sql == "SELECT value FROM system_config WHERE key = 'live_capital'":
+            return {"value": self.live_capital} if self.live_capital is not None else None
         if sql.startswith("SELECT COUNT(*) AS cnt FROM trades"):
             return {"cnt": 0}
         assert sql == portfolio._TRADE_TOTALS_SQL
@@ -833,3 +836,66 @@ class TestCSVExport:
         # For a BUY: Sent Currency should be quote (USDT), Received Currency should be base (BTC)
         assert row_cols[2] == "USDT"  # Sent Currency
         assert row_cols[4] == "BTC"  # Received Currency
+
+
+class TestLiveSummary:
+    """source=live reads live-sourced rows with system_config live_capital as the baseline."""
+
+    def test_the_live_summary_falls_back_to_the_live_capital_baseline(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.live_capital = "5000"
+        data = client.get("/api/portfolio/summary?source=live").json()
+        assert data["total_value"] == 5000.0
+        assert data["paper_capital_pending"] is None
+
+    def test_live_trades_flow_the_source_filter_into_the_totals(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.live_capital = "5000"
+        now = datetime.now(UTC)
+        db.trade("s1", 100.0, 1.0, now, source="live")
+        db.trade("s2", 40.0, 0.0, now)  # a paper trade is not in the live totals
+
+        data = client.get("/api/portfolio/summary?source=live").json()
+
+        assert data["realized_pnl"] == 100.0
+        assert data["total_fees"] == 1.0
+
+    def test_live_positions_flow_the_source_filter(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.live_capital = "5000"
+        db.session("s1", 5000)
+        db.positions = [
+            {
+                "session_id": "s1",
+                "exchange_id": "binance",
+                "symbol": "BTCUSDT",
+                "direction": "LONG",
+                "quantity": 0.01,
+                "avg_entry_price": 100.0,
+                "unrealized_pnl": 5.0,
+                "realized_pnl": 0.0,
+                "source": "live",
+            }
+        ]
+        data = client.get("/api/portfolio/summary?source=live").json()
+        assert data["unrealized_pnl"] == 5.0
+
+    def test_the_live_equity_curve_reads_account_level_snapshots(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.snapshot(None, 0, 5000.0, source="live")
+        db.snapshot(None, 1, 5100.0, source="live")
+        curve = client.get("/api/portfolio/equity-curve?source=live").json()
+        assert [p["value"] for p in curve] == [5000.0, 5100.0]
+
+    def test_a_missing_live_capital_row_is_403_never_zero(
+        self, db: FakePortfolioDb, client: TestClient
+    ) -> None:
+        db.live_capital = None
+        resp = client.get("/api/portfolio/summary?source=live")
+        assert resp.status_code == 403  # seam #8: one code, one status, everywhere
+        assert resp.json()["detail"]["code"] == "live_capital_missing"
+        assert resp.json()["detail"]["state"] == "invalid"
