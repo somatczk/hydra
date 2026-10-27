@@ -14,7 +14,7 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "structlog>=26.1.0,<27",
     "msgpack>=1.2.1,<2",
-    "redis[hiredis]>=5.2,<6",
+    "redis[hiredis]>=8.1.0,<9",
     # Data
     "ccxt>=4.4,<5",
     "asyncpg>=0.30,<1",
