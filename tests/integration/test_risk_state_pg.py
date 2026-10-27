@@ -63,7 +63,7 @@ async def test_revision_is_idempotent_and_seeds_paper_scope(pool: asyncpg.Pool) 
             "SELECT max_portfolio_heat FROM risk_config WHERE scope = 'global'"
         )
         events = await conn.fetchval("SELECT count(*) FROM risk_events")
-    assert scopes == ["global", "paper"]
+    assert scopes == ["global", "live", "paper"]  # 0009 seeds the live scope
     assert heat == Decimal("0.3000")
     assert events == 0
 

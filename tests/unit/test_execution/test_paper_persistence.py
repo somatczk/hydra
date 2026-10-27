@@ -102,6 +102,7 @@ class RecordingConn:
             "liquidity",
             "reason",
             "order_type",
+            "source",
         ]
         rows = [
             dict(zip(names, args, strict=True))

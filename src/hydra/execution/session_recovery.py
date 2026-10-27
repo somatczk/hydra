@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LIVE_NOT_RESUMED = "Live session not resumed after restart (live trading disabled until P3)"
 PRE_P1_STATE = "paper state unavailable (pre-P1 session)"
 
 
@@ -98,6 +97,12 @@ class SessionRecoveryMixin:
     def _require_risk(self) -> RiskService:
         raise NotImplementedError
 
+    def _risk_for(self, session: TradingSession) -> RiskService:
+        raise NotImplementedError
+
+    async def _recover_live_one(self, session: TradingSession) -> None:
+        raise NotImplementedError
+
     def _find_strategy_config(self, strategy_id: str) -> StrategyConfig:
         raise NotImplementedError
 
@@ -151,9 +156,7 @@ class SessionRecoveryMixin:
     async def _recover_one(self, session: TradingSession) -> None:
         """Restore the paper account first; once restored it is either resumed or closed."""
         if session.trading_mode != "paper":
-            session.status = "stopped"
-            session.error_message = LIVE_NOT_RESUMED
-            session.stopped_at = datetime.now(UTC)
+            await self._recover_live_one(session)
             return
         risk = self._require_risk()
         exchange_id: ExchangeId = client_factory.validate_venue(session.exchange_id)
@@ -208,16 +211,17 @@ class SessionRecoveryMixin:
         self, session: TradingSession, reason: str, failure: str | None
     ) -> None:
         """A restored account that will not resume: sell its holdings at the restored marks."""
-        risk = self._require_risk()
         try:
-            await risk.register_session(
-                session.session_id,
-                session._executor,
-                allocated=session.paper_capital or Decimal("0"),
-                symbols=session.symbols,
-                exchange_id=session.exchange_id,
-                strategy_id=session.strategy_id,
-            )
+            if session._executor is not None:
+                risk = self._risk_for(session)
+                await risk.register_session(
+                    session.session_id,
+                    session._executor,
+                    allocated=session.paper_capital or Decimal("0"),
+                    symbols=session.symbols,
+                    exchange_id=session.exchange_id,
+                    strategy_id=session.strategy_id,
+                )
         except Exception:
             logger.exception("Session %s not registered for its PnL carry", session.session_id)
         result = await self._close_executor(session, reason)

@@ -174,6 +174,8 @@ class TradingConfig(_Section):
     testnet: bool = True
     paper_trading: bool = True
     default_symbols: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["BTCUSDT"])
+    live_poll_interval_s: int = Field(default=5, ge=1)
+    live_reconcile_interval_s: int = Field(default=60, ge=1)
 
     @field_validator("default_symbols", mode="before")
     @classmethod

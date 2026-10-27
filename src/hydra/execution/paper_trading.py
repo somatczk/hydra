@@ -4,7 +4,9 @@ The account is a per-asset ledger of free and locked balances. A BUY can only sp
 a SELL can only sell free base, so there are no naked shorts and no balance goes negative.
 Resting orders lock what they may spend (SELL locks base, BUY locks quote, an OCO locks once).
 Fees are always charged in the quote asset (a documented deviation from Binance, where a BUY
-fee is taken in base unless paid with BNB).
+fee is taken in base unless paid with BNB); the live ``apply_exchange_fill`` entry point books
+the real commission instead — base commissions net the credited base and BNB converts at the
+fill price.
 
 Market orders fill with slippage at the latest traded price set by ``set_mark`` since the last
 closed bar, else at that bar's close. Resting orders are evaluated only by ``on_closed_bar``
@@ -352,6 +354,8 @@ class PaperTradingExecutor:
         self._unconfirmed: set[str] = set()
         self._halted: str | None = None
         self._persist_lock = asyncio.Lock()
+        # how this account's trades/positions/snapshots rows are labelled (seam #6)
+        self._source = "paper"
 
     # ------------------------------------------------------------------
     # Symbols, rules, marks
@@ -800,6 +804,47 @@ class PaperTradingExecutor:
             mark_source,
         )
 
+    async def apply_exchange_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        price: Decimal,
+        fee: Decimal,
+        fee_currency: str,
+        liquidity: Liquidity,
+        reason: str,
+        order_id: str,
+        parent_order_id: str | None = None,
+        timestamp: datetime,
+    ) -> PaperFill:
+        """Apply one real exchange fill into the inherited ledger at the real price and fee.
+
+        The single entry point for live fills (the poll loop); the paper simulation never
+        calls it. A quote-currency commission is charged to the quote, a base-currency
+        commission nets the credited base (a BUY's ``price_basis`` keeps the full notional,
+        so the withheld base is inside the entry price), and anything else (BNB) converts
+        at the fill price — the raw commission lives on in ``live_fills``.
+        """
+        canon = self._symbol(symbol)
+        fp = FillPrice(price=_d(price), liquidity=liquidity)
+        fill = self._apply_fill(
+            canon,
+            side.upper(),
+            str(order_type),
+            _d(quantity),
+            fp,
+            reason,
+            order_id,
+            parent_order_id,
+            timestamp,
+            exchange_fee=(_d(fee), str(fee_currency)),
+        )
+        await self._persist(snapshot_at=fill.timestamp)
+        return fill
+
     def _apply_fill(
         self,
         canon: str,
@@ -812,36 +857,51 @@ class PaperTradingExecutor:
         parent_order_id: str | None,
         ts: datetime,
         mark_source: MarkSource | None = None,
+        exchange_fee: tuple[Decimal, str] | None = None,
     ) -> PaperFill:
         base = self._base(canon)
         notional = quantity * fp.price
-        fee = notional * self._fee_rate(fp.liquidity)
+        ledger_fee = notional * self._fee_rate(fp.liquidity)
+        fee_paid = ledger_fee
+        credit_qty = quantity
+        debit_qty = quantity
+        if exchange_fee is not None:
+            raw_fee, fee_currency = exchange_fee
+            ledger_fee = _ZERO
+            fee_paid = raw_fee if fee_currency.upper() == self._quote else raw_fee * fp.price
+            if fee_currency.upper() == base:
+                if side == "BUY":
+                    credit_qty = quantity - raw_fee
+                else:
+                    debit_qty = quantity + raw_fee
+            else:
+                ledger_fee = fee_paid
         lot = self._lots.setdefault(canon, _Lot())
         gross: Decimal | None = None
         net: Decimal | None = None
         if side == "BUY":
-            self._ledger.debit(self._quote, notional + fee)
-            self._ledger.credit(base, quantity)
-            lot.base_qty += quantity
+            self._ledger.debit(self._quote, notional + ledger_fee)
+            self._ledger.credit(base, credit_qty)
+            lot.base_qty += credit_qty
             lot.price_basis += notional
-            lot.entry_fees_open += fee
+            lot.entry_fees_open += ledger_fee
         else:
-            self._ledger.debit(base, quantity)
-            self._ledger.credit(self._quote, notional - fee)
-            if quantity == lot.base_qty:
+            self._ledger.debit(base, debit_qty)
+            self._ledger.credit(self._quote, notional - ledger_fee)
+            if debit_qty == lot.base_qty:
                 basis_out, entry_fee_out = lot.price_basis, lot.entry_fees_open
             else:
-                basis_out = lot.price_basis * quantity / lot.base_qty
-                entry_fee_out = lot.entry_fees_open * quantity / lot.base_qty
-            lot.base_qty -= quantity
+                basis_out = lot.price_basis * debit_qty / lot.base_qty
+                entry_fee_out = lot.entry_fees_open * debit_qty / lot.base_qty
+            lot.base_qty -= debit_qty
             lot.price_basis -= basis_out
             lot.entry_fees_open -= entry_fee_out
             gross = notional - basis_out
-            net = gross - fee - entry_fee_out
+            net = gross - ledger_fee - entry_fee_out
             lot.realized_net += net
             self._realized_gross += gross
             self._realized_net += net
-        self._fees_paid += fee
+        self._fees_paid += fee_paid
         self._fill_seq += 1
         fill = PaperFill(
             order_id=order_id,
@@ -851,7 +911,7 @@ class PaperTradingExecutor:
             order_type=str(order_type),
             quantity=quantity,
             price=fp.price,
-            fee=fee,
+            fee=fee_paid,
             fee_currency=self._quote,
             liquidity=fp.liquidity,
             gross_pnl=gross,
@@ -1098,7 +1158,9 @@ class PaperTradingExecutor:
             )
         try:
             async with self._db_pool.acquire() as conn:
-                await paper_store.save(conn, account, trades, positions, flat, snapshot)
+                await paper_store.save(
+                    conn, account, trades, positions, flat, snapshot, source=self._source
+                )
         except paper_store.StaleStateError:
             if await self._adopt_landed_write():
                 await self._write(snapshot_at)
@@ -1236,58 +1298,60 @@ class PaperTradingExecutor:
                 min_notional=_opt_d(state["min_notional"]),
                 market_rules=market_rules,
             )
-            ex._ledger = _Ledger(
-                free={a: _d(v) for a, v in state["free"].items()},
-                locked={a: _d(v) for a, v in state["locked"].items()},
-                locks={
-                    k: _Lock(str(v["asset"]), _d(v["amount"])) for k, v in state["locks"].items()
-                },
-            )
-            ex._lots = {
-                c: _Lot(
-                    base_qty=_d(v["base_qty"]),
-                    price_basis=_d(v["price_basis"]),
-                    entry_fees_open=_d(v["entry_fees_open"]),
-                    realized_net=_d(v["realized_net"]),
-                )
-                for c, v in state["lots"].items()
-            }
-            ex._pending = [
-                _PendingOrder(
-                    order_id=str(o["order_id"]),
-                    symbol=str(o["symbol"]),
-                    side=str(o["side"]),
-                    order_type=str(o["order_type"]),
-                    quantity=_d(o["quantity"]),
-                    price=_opt_d(o["price"]),
-                    stop_price=_opt_d(o["stop_price"]),
-                    lock_id=str(o["lock_id"]),
-                    seq=int(o["seq"]),
-                    reason=str(o["reason"]),
-                    created_after_ts=(
-                        None if o["created_after_ts"] is None else _parse_ts(o["created_after_ts"])
-                    ),
-                    trail_pct=_opt_d(o["trail_pct"]),
-                    extreme=_opt_d(o["extreme"]),
-                    oco_id=o["oco_id"],
-                    placed_at=_opt_d(o.get("placed_at")),
-                )
-                for o in state["pending"]
-            ]
-            ex._marks = {c: _d(v) for c, v in state["marks"].items()}
-            ex._last_bar_ts = {c: _parse_ts(v) for c, v in state["last_bar_ts"].items()}
-            ex._names = {str(k): str(v) for k, v in state["names"].items()}
-            ex._fill_seq = int(state["fill_seq"])
-            ex._order_seq = int(state["order_seq"])
-            ex._initial_equity = _d(state["initial_equity"])
-            ex._peak_equity = _d(state["peak_equity"])
-            ex._realized_gross = _d(state["realized_gross"])
-            ex._fees_paid = _d(state["fees_paid"])
-            ex._realized_net = _d(state["realized_net"])
-            ex._check_invariants()
+            ex._rebuild_from_state(state)
         except (KeyError, TypeError, ValueError, ArithmeticError, LedgerInvariantError) as exc:
             raise PaperStateCorruptError(f"paper state for session {session_id!r}: {exc}") from exc
         return ex
+
+    def _rebuild_from_state(self, state: Mapping[str, Any]) -> None:
+        """Overwrite this executor's ledger from a ``to_state`` dict (used by both restores)."""
+        self._ledger = _Ledger(
+            free={a: _d(v) for a, v in state["free"].items()},
+            locked={a: _d(v) for a, v in state["locked"].items()},
+            locks={k: _Lock(str(v["asset"]), _d(v["amount"])) for k, v in state["locks"].items()},
+        )
+        self._lots = {
+            c: _Lot(
+                base_qty=_d(v["base_qty"]),
+                price_basis=_d(v["price_basis"]),
+                entry_fees_open=_d(v["entry_fees_open"]),
+                realized_net=_d(v["realized_net"]),
+            )
+            for c, v in state["lots"].items()
+        }
+        self._pending = [
+            _PendingOrder(
+                order_id=str(o["order_id"]),
+                symbol=str(o["symbol"]),
+                side=str(o["side"]),
+                order_type=str(o["order_type"]),
+                quantity=_d(o["quantity"]),
+                price=_opt_d(o["price"]),
+                stop_price=_opt_d(o["stop_price"]),
+                lock_id=str(o["lock_id"]),
+                seq=int(o["seq"]),
+                reason=str(o["reason"]),
+                created_after_ts=(
+                    None if o["created_after_ts"] is None else _parse_ts(o["created_after_ts"])
+                ),
+                trail_pct=_opt_d(o["trail_pct"]),
+                extreme=_opt_d(o["extreme"]),
+                oco_id=o["oco_id"],
+                placed_at=_opt_d(o.get("placed_at")),
+            )
+            for o in state["pending"]
+        ]
+        self._marks = {c: _d(v) for c, v in state["marks"].items()}
+        self._last_bar_ts = {c: _parse_ts(v) for c, v in state["last_bar_ts"].items()}
+        self._names = {str(k): str(v) for k, v in state["names"].items()}
+        self._fill_seq = int(state["fill_seq"])
+        self._order_seq = int(state["order_seq"])
+        self._initial_equity = _d(state["initial_equity"])
+        self._peak_equity = _d(state["peak_equity"])
+        self._realized_gross = _d(state["realized_gross"])
+        self._fees_paid = _d(state["fees_paid"])
+        self._realized_net = _d(state["realized_net"])
+        self._check_invariants()
 
     @classmethod
     async def restore(
@@ -1303,15 +1367,7 @@ class PaperTradingExecutor:
         Raises PaperStateUnavailableError when positions exist without saved state or the DB cannot
         be read, and PaperStateCorruptError when the saved state fails the ledger invariants.
         """
-        try:
-            async with db_pool.acquire() as conn:
-                stored = await paper_store.load(conn, session_id)
-                orphaned = stored is None and await paper_store.has_open_positions(conn, session_id)
-                trades = [] if stored is None else await paper_store.load_trades(conn, session_id)
-        except Exception as exc:
-            raise PaperStateUnavailableError(
-                f"paper state for session {session_id!r} could not be read: {exc}"
-            ) from exc
+        stored, orphaned, trades = await read_stored_account(db_pool, session_id)
         if stored is None:
             if orphaned:
                 raise PaperStateUnavailableError(
@@ -1480,6 +1536,22 @@ def _stop_trigger(o: _PendingOrder) -> float | None:
     if o.extreme is not None and o.trail_pct is not None:
         return float(o.extreme * (_ONE - o.trail_pct if o.side == "SELL" else _ONE + o.trail_pct))
     return None if o.stop_price is None else float(o.stop_price)
+
+
+async def read_stored_account(
+    db_pool: Any, session_id: str
+) -> tuple[paper_store.StoredAccount | None, bool, list[paper_store.TradeRow]]:
+    """The stored paper account, whether positions exist without state, and its trade rows."""
+    try:
+        async with db_pool.acquire() as conn:
+            stored = await paper_store.load(conn, session_id)
+            orphaned = stored is None and await paper_store.has_open_positions(conn, session_id)
+            trades = [] if stored is None else await paper_store.load_trades(conn, session_id)
+    except Exception as exc:
+        raise PaperStateUnavailableError(
+            f"paper state for session {session_id!r} could not be read: {exc}"
+        ) from exc
+    return stored, orphaned, trades
 
 
 def _state_digest(state: dict[str, Any]) -> str:

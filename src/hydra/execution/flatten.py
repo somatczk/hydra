@@ -78,6 +78,17 @@ async def flatten_session(runtime: SessionRuntime, reason: str = FLATTEN_TAG) ->
                 )
                 await _executor_flatten(runtime, symbol, failures)
 
+    # A live executor's sells fill on the exchange, not in the local ledger: drain the
+    # landed fills now so positions_at_stop below reports the ledger's truth, not the
+    # pre-fill state (the poll loop owns fills; paper executors have no collector).
+    collect = getattr(executor, "collect_exchange_fills", None)
+    if collect is not None:
+        try:
+            for fill in await collect(list(session.symbols)):
+                await om.on_external_fill(fill)
+        except Exception as exc:
+            logger.warning("Draining live fills during flatten of %s failed: %s", reason, exc)
+
     remaining = 0
     for symbol in session.symbols:
         try:

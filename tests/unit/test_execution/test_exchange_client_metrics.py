@@ -53,6 +53,12 @@ class _FakeCcxt:
     async def fetch_open_orders(self, symbol: str | None) -> list[dict[str, Any]]:
         return await self._call("fetch_open_orders", [])
 
+    async def fetch_order(self, id: str, symbol: str, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._call("fetch_order", {"id": id, "status": "NEW"})
+
+    async def fetch_my_trades(self, symbol: str, since: int | None = None) -> list[dict[str, Any]]:
+        return await self._call("fetch_my_trades", [])
+
     async def fetch_positions(self, symbols: list[str] | None = None) -> list[dict[str, Any]]:
         return await self._call("fetch_positions", [])
 
@@ -108,6 +114,11 @@ CALLS: list[tuple[str, ClientCall]] = [
     ("fetch_balance", lambda c: c.fetch_balance()),
     ("fetch_open_orders", lambda c: c.fetch_open_orders("BTC/USDT")),
     ("fetch_open_order_lists", lambda c: c.fetch_open_order_lists("BTCUSDT")),
+    (
+        "fetch_order",
+        lambda c: c.fetch_order("o1", "BTCUSDT", params={"clientOrderId": "hyd-1"}),
+    ),
+    ("fetch_my_trades", lambda c: c.fetch_my_trades("BTCUSDT", since=None)),
     ("fetch_positions", lambda c: c.fetch_positions("BTC/USDT")),
     ("fetch_ticker", lambda c: c.get_last_price("BTC/USDT")),
     ("set_leverage", lambda c: c.set_leverage("BTC/USDT", 2)),

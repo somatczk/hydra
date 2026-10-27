@@ -23,7 +23,7 @@ from hydra.dashboard import lifespan
 from hydra.execution import session_manager as sm
 from hydra.execution.errors import DuplicateSessionError
 from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
-from hydra.execution.session_manager import LIVE_NOT_RESUMED, PRE_P1_STATE, SessionManager
+from hydra.execution.session_manager import PRE_P1_STATE, SessionManager
 from hydra.risk.state import InMemoryRiskStateStore
 from tests.unit.test_execution.session_harness import Harness, settle, write_strategy
 
@@ -43,6 +43,9 @@ class _Conn:
         if "LIMIT 50" in query:
             return list(self.rows)
         return []
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        return None
 
     async def execute(self, query: str, *args: Any) -> str:
         if "INSERT INTO trading_sessions" in query:
@@ -125,7 +128,7 @@ def restore_from(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
 
 async def _boot(h: Harness, rows: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch) -> Any:
     store = InMemoryRiskStateStore(paper_capital=D("1000"))
-    monkeypatch.setattr(sm, "PgRiskStateStore", lambda pool: store)
+    monkeypatch.setattr(sm, "PgRiskStateStore", lambda pool, **kwargs: store)
     app = FastAPI()
     app.state.db_pool = _Pool(rows)
     await lifespan._init_session_manager(app, HydraConfig(), h.clients())
@@ -135,7 +138,7 @@ async def _boot(h: Harness, rows: list[dict[str, Any]], monkeypatch: pytest.Monk
     return mgr, app.state.db_pool.conn
 
 
-async def test_recovery_resumes_paper_and_never_live(
+async def test_recovery_resumes_paper_and_errors_live_rows_without_credentials(
     strategies_dir: Path, restore_from: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     h = Harness(strategies_dir)
@@ -160,10 +163,8 @@ async def test_recovery_resumes_paper_and_never_live(
         assert s1.status == "running" and s1.task_alive
         assert s1.created_by == "service:mcp"  # the attribution survives the restart
         assert s1._runtime is not None and s1._runtime.engine._running
-        assert (sessions["s2"].status, sessions["s2"].error_message) == (
-            "stopped",
-            LIVE_NOT_RESUMED,
-        )
+        assert sessions["s2"].status == "error"
+        assert "live setup failed" in (sessions["s2"].error_message or "")
         assert not sessions["s2"].task_alive
         assert sessions["s3"].status == "error" and "binance SPOT" in sessions["s3"].error_message
         assert (sessions["s4"].status, sessions["s4"].error_message) == ("error", PRE_P1_STATE)
@@ -172,7 +173,7 @@ async def test_recovery_resumes_paper_and_never_live(
         assert not any(s.status == "running" and not s.task_alive for s in sessions.values())
         assert {r["id"]: r["status"] for r in rows} == {
             "s1": "running",
-            "s2": "stopped",
+            "s2": "error",
             "s3": "error",
             "s4": "error",
             "s5": "error",
@@ -251,7 +252,7 @@ async def test_kill_switch_latched_across_a_restart_flattens_and_does_not_resume
     write_strategy(strategies_dir, "paper-a")
     restore_from["s1"] = await _account_with_long(h.end)
     store = InMemoryRiskStateStore(paper_capital=D("1000"), kill_switch=True)
-    monkeypatch.setattr(sm, "PgRiskStateStore", lambda pool: store)
+    monkeypatch.setattr(sm, "PgRiskStateStore", lambda pool, **kwargs: store)
     app = FastAPI()
     app.state.db_pool = _Pool([_row("s1", "paper-a")])
     await lifespan._init_session_manager(app, HydraConfig(), h.clients())

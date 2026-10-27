@@ -1,16 +1,20 @@
 """Trading session registry and public API.
 
-``SessionManager`` lives on ``app.state.session_manager``. ``startup()`` loads the RiskService,
-recovers running paper sessions (live rows are stopped, never resumed), then loads recent rows
-for display. Only paper sessions on Binance SPOT run in P1; live start is refused (P3).
+``SessionManager`` lives on ``app.state.session_manager``. ``startup()`` loads both RiskServices
+(paper, and the live scope when ``system_config.live_capital`` exists), recovers running
+sessions — live rows resume through their own branch — then loads recent rows for display.
+The service layer refuses a live start before this manager sees it (the armed check, R1);
+this manager's live branch then checks credentials, ``live_capital`` and the kill switch.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -21,20 +25,21 @@ import yaml
 
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
-from hydra.core.types import OrderType, Side
+from hydra.core.types import ExchangeId, OrderType, Side
 from hydra.execution import client_factory, session_store
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import (
     ConfigReloadRefusedError,
     DuplicateSessionError,
     KillSwitchActiveError,
-    LiveTradingDisabledError,
+    LiveCapitalUnavailableError,
+    LiveCredentialsError,
     PaperCapitalUnavailableError,
     SessionNotRunningError,
     SessionPersistError,
 )
 from hydra.execution.flatten import FlattenResult
-from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
 from hydra.execution.session_health import (
     HealthSnapshot as HealthSnapshot,
 )
@@ -43,9 +48,6 @@ from hydra.execution.session_health import (
 )
 from hydra.execution.session_health import (
     SessionHealthMixin,
-)
-from hydra.execution.session_recovery import (
-    LIVE_NOT_RESUMED as LIVE_NOT_RESUMED,
 )
 from hydra.execution.session_recovery import (
     PRE_P1_STATE as PRE_P1_STATE,
@@ -57,7 +59,12 @@ from hydra.execution.session_recovery import TradingSession as TradingSession
 from hydra.execution.session_wiring import ManualOrderResult, SessionRuntime, probe_strategy
 from hydra.risk.market_rules import MarketRulesCache
 from hydra.risk.service import RiskService
-from hydra.risk.state import InMemoryRiskStateStore, PgRiskStateStore, RiskStateStore
+from hydra.risk.state import (
+    InMemoryRiskStateStore,
+    PgRiskStateStore,
+    RiskStateStore,
+    RiskStateUnavailableError,
+)
 from hydra.strategy.config import StrategyConfig, config_hash, load_strategy_config
 from hydra.strategy.engine import validate_strategy_config
 
@@ -68,6 +75,8 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 _STRATEGY_DIR = _CONFIG_DIR / "strategies"
+
+_QUOTE = "USDT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +109,24 @@ def _non_parameter_changes(old: StrategyConfig, new: StrategyConfig) -> list[str
     return changed
 
 
+async def _close_client_quietly(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if close is not None:
+        try:
+            await close()
+        except Exception:
+            logger.debug("Live client close failed", exc_info=True)
+
+
+def _scope_flatten(mgr: SessionManager, scope: str) -> Callable[[str], Awaitable[list[str]]]:
+    """A tier-3 flatten callback bound to one scope's sessions (Q1: per-scope targets)."""
+
+    async def _flatten(reason: str) -> list[str]:
+        return await mgr._flatten_for_risk(reason, scope=scope)
+
+    return _flatten
+
+
 class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
     """Registry of trading sessions; the only owner of session runtimes."""
 
@@ -112,6 +139,7 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         risk: RiskService | None = None,
         risk_store: RiskStateStore | None = None,
         paper_capital: Decimal | None = None,
+        live_risk: RiskService | None = None,
     ) -> None:
         self._sessions: dict[str, TradingSession] = {}
         self._db_pool = db_pool
@@ -123,6 +151,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         self._risk_store = risk_store
         self._paper_capital = paper_capital
         self.risk: RiskService | None = risk
+        self.live_risk: RiskService | None = live_risk
+        self._live_risk_loaded = False
         self._stale_cleanup_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
@@ -134,7 +164,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         """Load risk state, recover running sessions, then load recent rows for display.
 
         A missing ``system_config.paper_capital`` or unreadable risk state raises: there is no
-        default capital to fall back to.
+        default capital to fall back to. The live-scoped service loads only when
+        ``system_config.live_capital`` exists; paper behaviour is unaffected without it.
         """
         risk = self._build_risk()
         if risk is not None:
@@ -146,9 +177,18 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             )
         else:
             logger.warning("No database and no paper_capital: sessions cannot start")
+        live = self._build_live_risk()
+        if live is not None and await self._live_capital_configured():
+            try:
+                await live.load()
+                self._live_risk_loaded = True
+            except RiskStateUnavailableError as exc:
+                logger.info("Live risk service not loaded yet: %s", exc)
         await self._recover()
         if risk is not None:
             await risk.recovery_complete()
+        if live is not None and self._live_risk_loaded:
+            await live.recovery_complete()
         await self._load_recent()
         self._ensure_cleanup_loop()
 
@@ -163,10 +203,64 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 return None
             self.risk = RiskService(store, market_rules=self._market_rules)
         if self.risk.on_must_flatten is None:
-            self.risk.on_must_flatten = self._flatten_for_risk
+            self.risk.on_must_flatten = _scope_flatten(self, "paper")
         if self.risk.on_kill_switch is None:
             self.risk.on_kill_switch = self._kill_switch_for_risk
         return self.risk
+
+    def _build_live_risk(self) -> RiskService | None:
+        """Q1's second, live-scoped service; the kill switch stays one global row."""
+        if self.live_risk is None:
+            if self._db_pool is None:
+                return None
+            self.live_risk = RiskService(
+                PgRiskStateStore(self._db_pool, scope="live", capital_key="live_capital"),
+                scope="live",
+                market_rules=self._market_rules,
+            )
+        if self.live_risk.on_must_flatten is None:
+            self.live_risk.on_must_flatten = _scope_flatten(self, "live")
+        if self.live_risk.on_kill_switch is None:
+            self.live_risk.on_kill_switch = self._kill_switch_for_risk
+        return self.live_risk
+
+    async def _live_capital_configured(self) -> bool:
+        """True when the system_config 'live_capital' row exists (the live load needs it)."""
+        if self._db_pool is None:
+            return False
+        try:
+            async with self._db_pool.acquire() as conn:
+                found = await conn.fetchval(
+                    "SELECT 1 FROM system_config WHERE key = 'live_capital'"
+                )
+        except Exception:
+            logger.debug("live_capital probe failed", exc_info=True)
+            return False
+        return found is not None
+
+    async def _ensure_live_risk(self) -> RiskService:
+        """The live-scoped service, loaded and evaluating; 403 when its baseline is missing."""
+        live = self._build_live_risk()
+        if live is None:
+            raise LiveCapitalUnavailableError(
+                "live trading needs the database (live_capital and credentials live there)"
+            )
+        if not self._live_risk_loaded:
+            try:
+                await live.load()
+            except RiskStateUnavailableError as exc:
+                raise LiveCapitalUnavailableError(str(exc)) from exc
+            self._live_risk_loaded = True
+            await live.recovery_complete()
+        return live
+
+    def _risk_for(self, session: TradingSession) -> RiskService:
+        """The service a session registers its sleeve in: the live scope for live rows."""
+        if session.trading_mode == "live":
+            live = self.live_risk
+            if live is not None:
+                return live
+        return self._require_risk()
 
     def _require_risk(self) -> RiskService:
         if self.risk is None:
@@ -178,7 +272,10 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
     # -- Public API ----------------------------------------------------------
 
     def kill_switch_active(self) -> bool:
-        return self.risk is not None and self.risk.kill_switch_active()
+        """The one global switch, as either scope's service sees it (they latch in lockstep)."""
+        return any(
+            svc is not None and svc.kill_switch_active() for svc in (self.risk, self.live_risk)
+        )
 
     async def start_session(
         self,
@@ -187,13 +284,15 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         paper_capital: Decimal | None = None,
         actor: str | None = None,
     ) -> str:
-        """Start a paper session; returns its id. Raises the typed errors in ``errors``.
+        """Start a paper or live session; returns its id. Raises the typed errors in ``errors``.
 
+        The service layer refuses a live start first (the armed check, R1); this live branch
+        then checks stored credentials, ``live_capital`` and the kill switch, builds the keyed
+        client and launches the same runtime path with the live-scoped RiskService (Q1).
         *actor* names the starting principal (``user:<name>`` / ``service:mcp``) and is
         persisted as the row's ``created_by``.
         """
-        risk = self._require_risk()
-        if risk.kill_switch_active():
+        if self.kill_switch_active():
             raise KillSwitchActiveError("Kill switch is active: new sessions cannot start")
         if trading_mode not in ("paper", "live"):
             raise ValueError("trading_mode must be 'paper' or 'live'")
@@ -208,7 +307,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 cfg.exchange.exchange_id, cfg.exchange.market_type
             )
             if trading_mode == "live":
-                raise LiveTradingDisabledError("live trading is disabled until P3")
+                return await self._start_live_session(cfg, exchange_id, actor)
+            risk = self._require_risk()
             required_history = await probe_strategy(cfg, self._config)
             capital = self._allocate(risk, paper_capital)
 
@@ -244,6 +344,187 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             await session_store.persist_session(self._db_pool, session)
         logger.info("Started paper session %s for strategy %s", session_id, strategy_id)
         return session_id
+
+    # -- Live sessions ---------------------------------------------------------
+
+    async def _start_live_session(
+        self, cfg: StrategyConfig, exchange_id: ExchangeId, actor: str | None
+    ) -> str:
+        """Credentials, capital, the keyed client, then the same launch path (Q1's live scope)."""
+        creds = await self._live_credentials(exchange_id)
+        allocation = await self._live_allocation()
+        await self._ensure_live_risk()
+        client = self._clients.trading_client_factory(
+            exchange_id, creds, self._config.trading.testnet
+        )
+        try:
+            free = (await client.fetch_balance()).get(_QUOTE, Decimal("0"))
+        except Exception as exc:
+            await _close_client_quietly(client)
+            raise LiveCredentialsError(
+                f"stored {exchange_id} credentials could not read the account: {exc}"
+            ) from exc
+        seed = min(free, allocation)
+        if seed <= 0:
+            await _close_client_quietly(client)
+            raise ValueError(
+                f"no free {_QUOTE} to allocate for a live session (free {free}, "
+                f"live_capital {allocation})"
+            )
+        required_history = await probe_strategy(cfg, self._config)
+        session_id = str(uuid.uuid4())
+        session = TradingSession(
+            session_id=session_id,
+            strategy_id=cfg.id,
+            trading_mode="live",
+            exchange_id=exchange_id,
+            symbols=list(cfg.symbols),
+            timeframe=str(cfg.timeframes.primary),
+            paper_capital=seed,
+            strategy_config=cfg.model_dump(mode="json"),
+            config_hash=config_hash(cfg),
+            created_by=actor,
+        )
+        rules = await self._market_rules.get(exchange_id, cfg.symbols)
+        executor = client_factory.build_live_executor(
+            exchange_id,
+            client=client,
+            market_rules=rules,
+            db_pool=self._db_pool,
+            strategy_id=cfg.id,
+            session_id=session_id,
+            initial_quote=seed,
+            poll_interval=float(self._config.trading.live_poll_interval_s),
+        )
+        await executor.checkpoint()
+        runtime = self._runtime(session, cfg, executor, required_history)
+        await self._launch(runtime, seed, recovering=False)
+        session.status = "running"
+        session.started_at = datetime.now(UTC)
+        self._sessions[session_id] = session
+        self._ensure_cleanup_loop()
+        await session_store.persist_session(self._db_pool, session)
+        logger.info("Started live session %s for strategy %s", session_id, cfg.id)
+        return session_id
+
+    async def _live_credentials(self, exchange_id: ExchangeId) -> dict[str, str | None]:
+        """Stored, decryptable, environment-validated keys; 403 when any leg is missing."""
+        pool = self._db_pool
+        if pool is None:
+            raise LiveCredentialsError("live trading needs stored credentials (no database)")
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT encrypted_key, encrypted_secret, encrypted_passphrase, validated_at,"
+                " validated_environment FROM exchange_credentials WHERE exchange_id = $1",
+                exchange_id,
+            )
+        if row is None:
+            raise LiveCredentialsError(f"no stored credentials for {exchange_id}")
+        environment = "testnet" if self._config.trading.testnet else "mainnet"
+        if row["validated_at"] is None or str(row["validated_environment"]) != environment:
+            raise LiveCredentialsError(
+                f"stored {exchange_id} credentials are not validated for the {environment} "
+                "environment; reconnect them in Settings"
+            )
+        from cryptography.fernet import InvalidToken
+
+        from hydra.core.encryption import CredentialKeyError, decrypt
+
+        try:
+            return {
+                "api_key": decrypt(row["encrypted_key"]),
+                "api_secret": decrypt(row["encrypted_secret"]),
+                "passphrase": (
+                    decrypt(row["encrypted_passphrase"]) if row["encrypted_passphrase"] else None
+                ),
+            }
+        except (InvalidToken, CredentialKeyError) as exc:
+            raise LiveCredentialsError(
+                f"stored {exchange_id} credentials cannot be decrypted: {exc}"
+            ) from exc
+
+    async def _live_allocation(self) -> Decimal:
+        """``system_config.live_capital``, the single allocation baseline (R2: the read only)."""
+        if self._db_pool is None:
+            raise LiveCapitalUnavailableError("live trading needs system_config live_capital")
+        async with self._db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM system_config WHERE key = 'live_capital'")
+        if row is None:
+            raise LiveCapitalUnavailableError(
+                "system_config has no 'live_capital' row; it is set by the arm ceremony"
+            )
+        raw = row["value"]
+        try:
+            value = json.loads(raw) if isinstance(raw, str) else raw
+            capital = Decimal(str(value))
+        except (ValueError, ArithmeticError) as exc:
+            raise LiveCapitalUnavailableError(
+                f"system_config live_capital is unreadable: {exc}"
+            ) from exc
+        if capital <= 0:
+            raise LiveCapitalUnavailableError(
+                f"system_config live_capital must be > 0, got {capital}"
+            )
+        return capital
+
+    async def _recover_live_one(self, session: TradingSession) -> None:
+        """Restart recovery of a live row: restore the sleeve, rebuild the client, resume.
+
+        Restore or rebuild failure marks the session error and flattens exactly like the
+        paper path; fills that happened while down are applied exactly once by the
+        poller's first sweep (the live_fills unique constraint is the guard) and the
+        protective group is re-adopted from the tracked rows.
+        """
+        from hydra.execution.live_executor import LiveTradingExecutor
+
+        exchange_id = client_factory.validate_venue(session.exchange_id)
+        rules_error: Exception | None = None
+        rules: dict[str, Any] | None = None
+        try:
+            rules = await self._market_rules.get(exchange_id, session.symbols)
+        except Exception as exc:
+            rules_error = exc
+        try:
+            creds = await self._live_credentials(exchange_id)
+            await self._ensure_live_risk()
+            client = self._clients.trading_client_factory(
+                exchange_id, creds, self._config.trading.testnet
+            )
+        except Exception as exc:
+            logger.exception("Live session %s cannot rebuild its client", session.session_id)
+            await self._close_restored(session, "recovery_failed", f"live setup failed: {exc}")
+            return
+        try:
+            if rules_error is not None:
+                raise rules_error
+            executor = await LiveTradingExecutor.restore_live(
+                self._db_pool,
+                session.session_id,
+                client=client,
+                market_rules=rules,
+                poll_interval=float(self._config.trading.live_poll_interval_s),
+            )
+            if executor is None:
+                raise PaperStateUnavailableError(f"no stored live state for {session.session_id!r}")
+            if self.kill_switch_active():
+                session._executor = executor
+                await self._close_restored(session, "kill_switch", None)
+                return
+            if session.paper_capital is None or session.paper_capital <= 0:
+                raise LiveCapitalUnavailableError("the session row has no live allocation")
+            cfg = self._recovery_config(session)
+            client_factory.validate_venue(session.exchange_id, cfg.exchange.market_type)
+            required_history = await probe_strategy(cfg, self._config)
+            session._executor = executor
+            runtime = self._runtime(session, cfg, executor, required_history)
+            await self._launch(runtime, session.paper_capital, recovering=True)
+        except Exception as exc:
+            logger.exception("Restored live session %s cannot resume", session.session_id)
+            await self._close_restored(session, "recovery_failed", f"recovery failed: {exc}")
+            return
+        logger.info(
+            "Recovered live session %s for strategy %s", session.session_id, session.strategy_id
+        )
 
     async def reload_config(self, strategy_id: str) -> ReloadResult:
         """Queue the strategy file's plain ``parameters`` for the session's next closed bar.
@@ -288,12 +569,17 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
     async def stop_all(
         self, actor: str = "operator", reason: str = "kill switch"
     ) -> KillSwitchReport:
-        """Kill switch: latch first, then flatten and stop every running or errored session."""
-        if self.risk is not None:
-            latched = await self.risk.activate_kill_switch(actor, reason)
-            persisted = latched.persisted
-        else:
-            persisted = False
+        """Kill switch: latch first, then flatten and stop every running or errored session.
+
+        Both scope services latch (Q1): each writes the one global switch row and audits
+        its own ``kill_switch_on`` row, so paper and live stay in lockstep.
+        """
+        persisted = False
+        for svc in (self.risk, self.live_risk):
+            if svc is None:
+                continue
+            latched = await svc.activate_kill_switch(actor, reason)
+            persisted = persisted or latched.persisted
         return await self._stop_targets(persisted, reason)
 
     async def _stop_targets(self, persisted: bool, reason: str) -> KillSwitchReport:
@@ -381,8 +667,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
 
     async def release_kill_switch(self, actor: str = "operator", reason: str = "") -> None:
         """Release the kill switch (raises when it cannot be persisted; stays latched)."""
-        if self.risk is not None:
-            await self.risk.release_kill_switch(actor, reason)
+        for svc in (self.risk, self.live_risk):
+            if svc is not None:
+                await svc.release_kill_switch(actor, reason)
         logger.info("Kill switch released by %s", actor)
 
     def list_sessions(self) -> list[TradingSession]:
@@ -510,6 +797,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             if session._runtime is not None and session.status == "running":
                 await session._runtime.shutdown()
                 await self._await_task(session)
+        for session in list(self._sessions.values()):
+            await _close_client_quietly(getattr(session._executor, "exchange_client", None))
         for task in list(self._background):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -592,6 +881,23 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         executor: PaperTradingExecutor,
         required_history: int,
     ) -> SessionRuntime:
+        if session.trading_mode == "live":
+            live = self.live_risk
+            if live is None:
+                raise LiveCapitalUnavailableError(
+                    "a live session needs the live-scoped risk service"
+                )
+            return SessionRuntime(
+                session,
+                cfg,
+                executor=executor,
+                risk=live,
+                clients=self._clients,
+                hydra_config=self._config,
+                db_pool=self._db_pool,
+                required_history=required_history,
+                on_failure=self._on_runtime_failure,
+            )
         return SessionRuntime(
             session,
             cfg,
@@ -606,8 +912,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
 
     async def _launch(self, runtime: SessionRuntime, capital: Decimal, *, recovering: bool) -> None:
         """build -> warm-up -> register -> wire -> (adopt) -> prime -> connect -> task."""
-        risk = self._require_risk()
         session = runtime.session
+        risk = self._risk_for(session)
         registered = False
         await runtime.build()
         try:
@@ -627,12 +933,13 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 await runtime.protect.adopt(session.symbols)
             await runtime.prime(warm)
             await runtime.connect()
-            if risk.kill_switch_active():
+            if self.kill_switch_active():
                 raise KillSwitchActiveError("Kill switch latched while the session was starting")
         except BaseException:
             await runtime.shutdown()
             if registered:
                 await risk.unregister_session(session.session_id)
+            await _close_client_quietly(getattr(session._executor, "exchange_client", None))
             session._runtime = None
             raise
         session._task = asyncio.create_task(runtime.run(), name=f"session-{session.session_id}")
@@ -684,8 +991,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             result = await runtime.flatten()
             await runtime.shutdown()
             await self._await_task(session)
-            if self.risk is not None and session.session_id in self.risk.registered_sessions():
-                await self.risk.unregister_session(session.session_id)
+            risk = self._risk_for(session)
+            if session.session_id in risk.registered_sessions():
+                await risk.unregister_session(session.session_id)
             if session.status == "running":
                 session.status = "stopped"
             session.stopped_at = datetime.now(UTC)
@@ -708,6 +1016,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
     async def _close_executor(self, session: TradingSession, reason: str) -> FlattenResult:
         """Flatten a paper account that has no runtime (cancel resting orders, sell base)."""
         executor = session._executor
+        if executor is None:
+            # nothing was restored: no sleeve to flatten, nothing to carry
+            return FlattenResult(positions_remaining=session.holdings)
         failures: list[str] = []
         try:
             await executor.flatten(reason=reason)
@@ -717,8 +1028,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         remaining = session.holdings
         session.positions_at_stop = remaining
         session.flatten_incomplete = remaining > 0
-        risk = self.risk
-        if remaining == 0 and risk is not None and session.session_id in risk.registered_sessions():
+        risk = self._risk_for(session)
+        if remaining == 0 and session.session_id in risk.registered_sessions():
             await risk.unregister_session(session.session_id)
         return FlattenResult(positions_remaining=remaining, failures=tuple(failures))
 
@@ -756,12 +1067,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             result = await runtime.flatten()
             await runtime.shutdown()
             await self._await_task(session)
-            if (
-                result.positions_remaining == 0
-                and self.risk is not None
-                and session.session_id in self.risk.registered_sessions()
-            ):
-                await self.risk.unregister_session(session.session_id)
+            risk = self._risk_for(session)
+            if result.positions_remaining == 0 and session.session_id in risk.registered_sessions():
+                await risk.unregister_session(session.session_id)
         await self._set_live_stop_gap(session)
         await self._persist_terminal(session)
         if runtime is not None:
@@ -776,10 +1084,12 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
 
     # -- Internal: risk callbacks ---------------------------------------------
 
-    async def _flatten_for_risk(self, reason: str) -> list[str]:
-        """Tier-3 breaker: flatten every session (they keep running; entries stay blocked)."""
+    async def _flatten_for_risk(self, reason: str, *, scope: str = "paper") -> list[str]:
+        """Tier-3 breaker: flatten the sessions of *scope* (they keep running; entries blocked)."""
         failures: list[str] = []
         for session in list(self._sessions.values()):
+            if session.trading_mode != scope:
+                continue
             runtime = session._runtime
             if runtime is None and session.status == "error" and session.holdings > 0:
                 result = await self._close_executor(session, reason)

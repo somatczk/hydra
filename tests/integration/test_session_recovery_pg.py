@@ -19,7 +19,7 @@ from hydra.dashboard import lifespan
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.execution.client_factory import ClientFactory, bars_repository
 from hydra.execution.paper_trading import PaperTradingExecutor
-from hydra.execution.session_manager import LIVE_NOT_RESUMED, SessionManager
+from hydra.execution.session_manager import SessionManager
 from hydra.services import strategies as svc
 from hydra.strategy.config import StrategyConfig, config_hash
 from tests.unit.test_execution.session_harness import (
@@ -89,7 +89,9 @@ async def restart_scenario(dsn: str, strategies_dir: Path) -> None:
                 ("STOP_MARKET", 1.0, 95.095)
             ]
             live = second.get_session("live-1")
-            assert live is not None and live.status == "stopped" and not live.task_alive
+            # live rows now resume when they can; without stored credentials this one
+            # fails its rebuild and is marked error (never a zombie)
+            assert live is not None and live.status == "error" and not live.task_alive
             async with pool.acquire() as conn:
                 rows = {
                     r["id"]: (r["status"], r["error_message"])
@@ -102,7 +104,8 @@ async def restart_scenario(dsn: str, strategies_dir: Path) -> None:
                     session_id,
                 )
             assert rows[session_id] == ("running", None)
-            assert rows["live-1"] == ("stopped", LIVE_NOT_RESUMED)
+            assert rows["live-1"][0] == "error"
+            assert "live setup failed" in rows["live-1"][1]
             assert position is not None
             assert (position["quantity"], position["avg_entry_price"]) == (D("1"), D("100.1"))
 

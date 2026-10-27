@@ -6,6 +6,8 @@ fields, quick-trade result) are pinned on the real session seam.
 
 from __future__ import annotations
 
+import contextlib
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -22,7 +24,9 @@ from hydra.data.ingestion import InsufficientHistoryError
 from hydra.execution.errors import (
     DuplicateSessionError,
     KillSwitchActiveError,
-    LiveTradingDisabledError,
+    LiveCapitalUnavailableError,
+    LiveCredentialsError,
+    LiveNotArmedError,
     PaperCapitalUnavailableError,
     SessionNotRunningError,
     SessionPersistError,
@@ -36,6 +40,7 @@ from hydra.execution.protective_orders import ProtectionSpec
 from hydra.execution.session_manager import KillSwitchReport, TradingSession
 from hydra.execution.session_wiring import ManualOrderResult
 from hydra.risk.market_rules import MarketRulesUnavailableError
+from hydra.risk.state import RiskStateUnavailableError
 from hydra.services import sessions as sessions_svc
 from hydra.services.errors import ServiceError
 from hydra.services.sessions import (
@@ -162,11 +167,14 @@ async def _start(mgr: _Manager, **body: Any) -> dict[str, Any]:
     [
         (KillSwitchActiveError("Kill switch is active"), 409, "kill_switch_active", "invalid"),
         (DuplicateSessionError("already running"), 409, "session_already_running", "invalid"),
+        (LiveNotArmedError("not armed"), 409, "live_not_armed", "invalid"),
+        (LiveCredentialsError("no keys"), 403, "live_credentials_missing", "invalid"),
+        (LiveCapitalUnavailableError("no live capital"), 403, "live_capital_missing", "invalid"),
         (
-            LiveTradingDisabledError("live trading is disabled until P3"),
-            403,
-            "live_trading_disabled",
-            "not_implemented",
+            RiskStateUnavailableError("live risk unreadable"),
+            503,
+            "live_risk_unavailable",
+            "unavailable",
         ),
         (UnsupportedVenueError("only binance spot"), 400, "unsupported_venue", "invalid"),
         (UnsupportedStrategyError("bad class"), 400, "strategy_unsupported", "not_implemented"),
@@ -231,6 +239,63 @@ async def test_start_without_a_manager_is_the_503_envelope() -> None:
         await sessions_svc.start_session(None, "user:soma", StartSessionRequest(strategy_id="saw"))
     assert raised.value.status_code == 503
     assert _detail(raised.value)["code"] == "engine_not_ready"
+
+
+# ---------------------------------------------------------------------------
+# The live gate: the armed row is the single master switch (R1)
+# ---------------------------------------------------------------------------
+
+
+class _GateConn:
+    def __init__(self, armed: Any) -> None:
+        self._armed = armed
+
+    async def fetchrow(self, query: str, *args: Any) -> Any:
+        if "system_config" in query:
+            return None if self._armed is _ABSENT else {"value": self._armed}
+        return None
+
+
+class _GatePool:
+    def __init__(self, armed: Any) -> None:
+        self._conn = _GateConn(armed)
+
+    @contextlib.asynccontextmanager
+    async def acquire(self) -> AsyncIterator[_GateConn]:
+        yield self._conn
+
+
+_ABSENT = object()
+_ARMED_ROW = json.dumps({"armed": True, "by": "user:soma", "at": "2026-10-27T00:00:00Z"})
+
+
+async def test_live_start_refuses_when_there_is_no_pool() -> None:
+    """Pool None is disarmed: the live start dies at the gate, never reaching the manager."""
+    mgr = _Manager()
+    with pytest.raises(ServiceError) as raised:
+        await _start(mgr, trading_mode="live")
+    assert raised.value.status_code == 409
+    assert _detail(raised.value)["code"] == "live_not_armed"
+    assert mgr.start_actor is None
+
+
+async def test_live_start_refuses_when_the_armed_row_is_absent_or_off() -> None:
+    for armed in (_ABSENT, json.dumps({"armed": False, "by": "user:soma"}), '{"nonsense"'):
+        mgr = _Manager()
+        mgr._db_pool = _GatePool(armed)
+        with pytest.raises(ServiceError) as raised:
+            await _start(mgr, trading_mode="live")
+        assert raised.value.status_code == 409
+        assert _detail(raised.value)["code"] == "live_not_armed"
+        assert mgr.start_actor is None
+
+
+async def test_live_start_delegates_once_armed() -> None:
+    mgr = _Manager()
+    mgr._db_pool = _GatePool(_ARMED_ROW)
+    d = await _start(mgr, trading_mode="live")
+    assert mgr.start_actor == "user:soma"
+    assert d["session_id"] == "s1"
 
 
 # ---------------------------------------------------------------------------

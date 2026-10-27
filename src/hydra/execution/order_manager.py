@@ -295,6 +295,7 @@ class OrderManager:
         raise RiskRejectedError(decision.reason, decision.check, decision.intent)
 
     async def _create(self, order: OrderRequest) -> dict[str, Any]:
+        # tag/reduce_only ride in params: the live executor's outbox row labels the order
         return await self._executor.create_order(
             symbol=str(order.symbol),
             side=str(order.side),
@@ -302,6 +303,7 @@ class OrderManager:
             quantity=order.quantity,
             price=order.price,
             stop_price=order.stop_price,
+            params={"tag": order.tag, "reduce_only": order.reduce_only},
         )
 
     async def _track_and_publish(
