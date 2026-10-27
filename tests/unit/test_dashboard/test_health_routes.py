@@ -34,7 +34,7 @@ from hydra.dashboard.routes import health as health_routes
 from hydra.dashboard.routes import system as system_routes
 from hydra.data.bars import last_closed_open
 from hydra.data.migrations.runner import head_revision
-from hydra.execution.client_factory import ClientFactory
+from hydra.execution.client_factory import ClientFactory, SharedRestClients
 from hydra.execution.session_manager import HealthSnapshot, SessionHealth, TradingSession
 from tests.fixtures.binance_kline import FakeRestExchange, FakeWsExchange
 from tests.unit.test_execution.session_harness import (
@@ -141,7 +141,7 @@ class MinuteHarness(Harness):
 
         return ClientFactory(
             ws_factory=ws_factory,
-            rest_factory=lambda _eid: FakeRestExchange(rows),
+            rest_pool=SharedRestClients(rest_factory=lambda eid, creds: FakeRestExchange(rows)),
             markets_loader=markets_loader,
             repository_factory=lambda _pool: None,
             history_window=20,

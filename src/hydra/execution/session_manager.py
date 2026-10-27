@@ -117,7 +117,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         self._db_pool = db_pool
         self._config = config
         self._clients = clients or ClientFactory()
-        self._market_rules = MarketRulesCache(loader=self._clients.markets_loader)
+        self._market_rules = MarketRulesCache(
+            loader=self._clients.markets_loader or self._clients.rest_pool.markets_loader
+        )
         self._risk_store = risk_store
         self._paper_capital = paper_capital
         self.risk: RiskService | None = risk

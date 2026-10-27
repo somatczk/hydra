@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from hydra.core.types import OHLCV
-from hydra.execution.client_factory import ClientFactory, bars_repository
+from hydra.execution.client_factory import ClientFactory, SharedRestClients, bars_repository
 
 FIXTURE = Path(__file__).parent / "data" / "binance_btcusdt_1m.json"
 MINUTE = timedelta(minutes=1)
@@ -187,7 +187,7 @@ class ReplayMarket:
 
         return ClientFactory(
             ws_factory=ws_factory,
-            rest_factory=lambda _eid: ReplayRest(self),
+            rest_pool=SharedRestClients(rest_factory=lambda eid, creds: ReplayRest(self)),
             markets_loader=markets_loader,
             repository_factory=bars_repository,
             history_window=history_window,
