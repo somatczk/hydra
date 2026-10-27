@@ -333,15 +333,17 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         """After every flatten, cancel ALL orders on each live-traded symbol (Q2).
 
         Blast radius: every open order on the symbol's account, hydra's or not; a
-        single-session stop stays scoped to its own order lists. The duck-typed gate is the
-        executor's ``cancel_all_orders`` (only the live executor exposes it).
+        single-session stop stays scoped to its own order lists. The duck-typed gate is
+        the executor's ``cancel_all_orders`` (only the live executor exposes it), and
+        the swept symbols are the ones the executor actually traded — held positions or
+        tracked open orders — not the configured superset (A9).
         """
         sweep: dict[Any, set[str]] = {}
         for session in sessions:
             executor = session._executor
             if getattr(executor, "cancel_all_orders", None) is None:
                 continue
-            sweep.setdefault(executor, set()).update(session.symbols)
+            sweep.setdefault(executor, set()).update(await self._traded_symbols(session, executor))
         failures: list[str] = []
         for executor, symbols in sweep.items():
             for symbol in sorted(symbols):
@@ -351,6 +353,31 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                     logger.exception("Kill-switch sweep failed for %s", symbol)
                     failures.append(f"{symbol}: cancel-all failed ({exc})")
         return failures
+
+    async def _traded_symbols(self, session: TradingSession, executor: Any) -> set[str]:
+        """The symbols a live session actually traded (held, or with tracked open orders).
+
+        An executor exposing neither read keeps the configured superset — the sweep
+        errs toward cancelling, never toward skipping.
+        """
+        get_positions = getattr(executor, "get_positions", None)
+        fetch_open_orders = getattr(executor, "fetch_open_orders", None)
+        if get_positions is None and fetch_open_orders is None:
+            return set(session.symbols)
+        traded: set[str] = set()
+        for symbol in session.symbols:
+            try:
+                held = get_positions is not None and any(
+                    p.quantity > 0 for p in await get_positions(symbol)
+                )
+                tracked = fetch_open_orders is not None and bool(await fetch_open_orders(symbol))
+            except Exception:
+                logger.exception("Traded-symbol read failed for %s; sweeping it", symbol)
+                traded.add(symbol)
+                continue
+            if held or tracked:
+                traded.add(symbol)
+        return traded
 
     async def release_kill_switch(self, actor: str = "operator", reason: str = "") -> None:
         """Release the kill switch (raises when it cannot be persisted; stays latched)."""
@@ -610,6 +637,43 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             raise
         session._task = asyncio.create_task(runtime.run(), name=f"session-{session.session_id}")
 
+    async def _set_live_stop_gap(self, session: TradingSession) -> None:
+        """Complete the gauge lifecycle at stop time (R27).
+
+        The per-bar hook of a running session owns ``hydra_live_protective_gap``
+        otherwise, and a stopped session runs no more bars: a live stop that leaves
+        positions sets the gap for the symbols still held (the alert keeps firing —
+        R13), while a clean flatten clears the series.
+        """
+        if session.trading_mode != "live":
+            return
+        symbols = list(session.symbols)
+        gap = session.positions_at_stop > 0
+        if gap:
+            symbols = await self._live_held_symbols(session)
+        for symbol in symbols:
+            metrics.set_live_protective_gap(
+                session.session_id, session.strategy_id, session.exchange_id, symbol, gap
+            )
+
+    async def _live_held_symbols(self, session: TradingSession) -> list[str]:
+        """The symbols a stopped live session still holds; unreadable means all of them."""
+        get_positions = getattr(session._executor, "get_positions", None)
+        if get_positions is None:
+            return list(session.symbols)
+        held: list[str] = []
+        for symbol in session.symbols:
+            try:
+                positions = await get_positions(symbol)
+            except Exception:
+                logger.exception(
+                    "Held symbols of %s unreadable; paging every symbol", session.session_id
+                )
+                return list(session.symbols)
+            if any(p.quantity > 0 for p in positions):
+                held.append(symbol)
+        return held or list(session.symbols)
+
     async def _stop_session_internal(
         self, session: TradingSession, reason: str = "stop"
     ) -> FlattenResult:
@@ -637,6 +701,7 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             session.status = "stopped"
             session.stopped_at = datetime.now(UTC)
             await self._persist_terminal(session)
+        await self._set_live_stop_gap(session)
         logger.info("Session %s stopped (%s)", session.session_id, reason)
         return result
 
@@ -697,6 +762,7 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 and session.session_id in self.risk.registered_sessions()
             ):
                 await self.risk.unregister_session(session.session_id)
+        await self._set_live_stop_gap(session)
         await self._persist_terminal(session)
         if runtime is not None:
             await runtime.broadcast_status()

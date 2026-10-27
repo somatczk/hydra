@@ -322,8 +322,9 @@ class SessionRuntime:
 
         The live executor build (P3-A) sets ``_live_coverage``, an async callable returning
         per session symbol the verified ``ExchangeStopState`` — ``None`` for a symbol with
-        nothing held. Paper runtimes never set it, so they never enter this branch. A raised
-        check is logged and never fails the bar.
+        nothing held. Paper runtimes never set it, so they never enter this branch. A
+        check that raises or answers garbage fails LOUD: the gap is set for every held
+        symbol (can't confirm = unconfirmed), and the bar still completes.
         """
         coverage: (
             Callable[[], Coroutine[Any, Any, Mapping[str, ExchangeStopState | None]]] | None
@@ -332,18 +333,37 @@ class SessionRuntime:
             return
         try:
             states = await coverage()
+            for symbol, state in states.items():
+                metrics.set_live_protective_gap(
+                    self.session.session_id,
+                    self.cfg.id,
+                    self.exchange_id,
+                    symbol,
+                    state is not None and state.state != "confirmed",
+                )
         except Exception:
             logger.exception(
                 "Live protective coverage check failed for %s", self.session.session_id
             )
-            return
-        for symbol, state in states.items():
-            metrics.set_live_protective_gap(
+            await self._set_live_gap_for_held_symbols()
+
+    async def _set_live_gap_for_held_symbols(self) -> None:
+        """A failed coverage check counts every held symbol as unconfirmed (R27)."""
+        symbols = list(self.cfg.symbols)
+        try:
+            symbols = [
+                symbol
+                for symbol in symbols
+                if any(p.quantity > 0 for p in await self.executor.get_positions(symbol))
+            ]
+        except Exception:
+            logger.exception(
+                "Held positions of %s unreadable; every configured symbol counts as unconfirmed",
                 self.session.session_id,
-                self.cfg.id,
-                self.exchange_id,
-                symbol,
-                state is not None and state.state != "confirmed",
+            )
+        for symbol in symbols:
+            metrics.set_live_protective_gap(
+                self.session.session_id, self.cfg.id, self.exchange_id, symbol, True
             )
 
     async def _on_price(self, event: Event) -> None:

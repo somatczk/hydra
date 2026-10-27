@@ -15,6 +15,7 @@ from typing import Any
 import ccxt
 import pytest
 
+from hydra.core.types import OrderType
 from hydra.execution.exchange_client import ExchangeClient
 from hydra.execution.exchange_stops import (
     ExchangeStopPlacement,
@@ -297,6 +298,7 @@ class TestLadder:
             "status": "EXEC_STARTED",
             "filled": False,
             "oco_link": "5",
+            "client_order_id": "lcid",
             "legs": [
                 {
                     "id": "11",
@@ -311,6 +313,7 @@ class TestLadder:
                     "reason": "take_profit",
                     "oco_id": "5",
                     "trail_pct": None,
+                    "client_order_id": "a",
                 },
                 {
                     "id": "12",
@@ -325,6 +328,7 @@ class TestLadder:
                     "reason": "stop_loss",
                     "oco_id": "5",
                     "trail_pct": None,
+                    "client_order_id": "b",
                 },
             ],
         }
@@ -457,6 +461,43 @@ class TestLadder:
             await arm(fake, STOP_SPEC, qty="0.000004")
         assert fake.calls == []
 
+    async def test_a_stop_that_rounds_to_or_above_the_last_price_breaches(self) -> None:
+        """A4: the boundary pre-checks run on the ROUNDED wire values — SL 98.001
+        rounds UP to 98.01, above the last 98.005, so the wire request is never sent."""
+        fake = FakeCcxt()
+
+        with pytest.raises(StopBreachedError, match="close at market"):
+            await arm_exchange_stop(
+                client(fake),
+                rules(),
+                "BTCUSDT",
+                D("0.01"),
+                ProtectionSpec(stop_loss=D("98.001")),
+                D("98.005"),
+                D("100"),
+            )
+
+        assert fake.calls == []  # never a doomed ORDER_WOULD_IMMEDIATELY_TRIGGER request
+
+    async def test_a_take_profit_that_rounds_to_the_last_price_is_dropped(self) -> None:
+        """A4: TP 103.004 rounds DOWN to 103.00, not above the last 103.001 — the
+        OCO rung is dropped locally instead of rejected on the wire."""
+        fake = FakeCcxt()
+
+        placement = await arm_exchange_stop(
+            client(fake),
+            rules(),
+            "BTCUSDT",
+            D("0.01"),
+            ProtectionSpec(stop_loss=D("98"), take_profit=D("103.004")),
+            D("103.001"),
+            D("100"),
+        )
+
+        assert [name for name, _ in fake.calls] == ["create_order"]
+        assert fake.calls[0][1]["params"] == {"stopLossPrice": "98.00"}
+        assert placement.kind == "stop" and placement.take_profit is None
+
 
 class TestCancel:
     async def test_cancel_cancels_the_whole_order_list(self) -> None:
@@ -497,6 +538,7 @@ class TestNormalize:
                 "reason": "take_profit",
                 "oco_id": "5",
                 "trail_pct": None,
+                "client_order_id": "a",
             },
             {
                 "id": "12",
@@ -511,6 +553,7 @@ class TestNormalize:
                 "reason": "stop_loss",
                 "oco_id": "5",
                 "trail_pct": None,
+                "client_order_id": "b",
             },
         ]
 
@@ -530,7 +573,42 @@ class TestNormalize:
             "reason": "trailing_stop",
             "oco_id": None,
             "trail_pct": 0.02,
+            "client_order_id": "c",
         }
+
+    async def test_a_leg_without_a_client_order_id_carries_none(self) -> None:
+        (normalized,) = normalize_open_orders([{"info": {**trailing_leg(), "clientOrderId": ""}}])
+
+        assert normalized["client_order_id"] is None
+
+    async def test_raw_take_profit_legs_are_take_profits_never_stops(self) -> None:
+        def tp_leg(raw_type: str) -> dict[str, Any]:
+            return {
+                "info": {
+                    "symbol": "BTCUSDT",
+                    "orderId": 14,
+                    "orderListId": "-1",
+                    "clientOrderId": "d",
+                    "price": "0.00000000",
+                    "origQty": "0.01000000",
+                    "status": "NEW",
+                    "type": raw_type,
+                    "side": "SELL",
+                    "stopPrice": "103.00000000",
+                    "trailingDelta": "0",
+                }
+            }
+
+        (market_tp,) = normalize_open_orders([tp_leg("TAKE_PROFIT")])
+        assert (market_tp["type"], market_tp["reason"]) == (
+            OrderType.TAKE_PROFIT_MARKET,
+            "take_profit",
+        )
+        (limit_tp,) = normalize_open_orders([tp_leg("TAKE_PROFIT_LIMIT")])
+        assert (limit_tp["type"], limit_tp["reason"]) == (OrderType.LIMIT, "take_profit")
+        for leg in (market_tp, limit_tp):
+            assert leg["stop_price"] == 103.0  # the trigger stays visible
+            assert leg["client_order_id"] == "d"
 
     async def test_raw_binance_legs_normalize_the_same_way(self) -> None:
         assert normalize_open_orders(oco_legs()) == normalize_open_orders(
@@ -590,6 +668,57 @@ class TestVerify:
         state = await verify_exchange_stop(client(fake), "BTCUSDT")
 
         assert state.state == "missing"
+
+    async def test_without_an_expectation_a_raw_take_profit_stop_leg_never_confirms(
+        self,
+    ) -> None:
+        """A3: a raw TAKE_PROFIT leg is not downside protection; the dead-man must
+        not read a position as protected off a take-profit."""
+        fake = FakeCcxt()
+        fake.lists = []
+        fake.legs = [
+            {
+                "symbol": "BTCUSDT",
+                "orderId": 14,
+                "orderListId": "-1",
+                "clientOrderId": "d",
+                "price": "0.00000000",
+                "origQty": "0.01000000",
+                "status": "NEW",
+                "type": "TAKE_PROFIT",
+                "side": "SELL",
+                "stopPrice": "103.00000000",
+                "trailingDelta": "0",
+            }
+        ]
+
+        state = await verify_exchange_stop(client(fake), "BTCUSDT")
+
+        assert state.state == "missing"
+
+    async def test_without_an_expectation_a_plain_stop_loss_leg_confirms(self) -> None:
+        fake = FakeCcxt()
+        fake.lists = []
+        fake.legs = [
+            {
+                "symbol": "BTCUSDT",
+                "orderId": 15,
+                "orderListId": "-1",
+                "clientOrderId": "e",
+                "price": "0.00000000",
+                "origQty": "0.01000000",
+                "status": "NEW",
+                "type": "STOP_LOSS",
+                "side": "SELL",
+                "stopPrice": "98.00000000",
+                "trailingDelta": "0",
+            }
+        ]
+
+        state = await verify_exchange_stop(client(fake), "BTCUSDT")
+
+        assert state.state == "confirmed"
+        assert state.kind == "stop" and state.stop_price == 98.0
 
     async def test_a_single_order_expected_confirms_from_its_resting_leg(self) -> None:
         fake = FakeCcxt()

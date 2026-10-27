@@ -224,7 +224,13 @@ class ProtectiveOrderManager:
     # -- Recovery --------------------------------------------------------------------
 
     async def adopt(self, symbols: list[str]) -> None:
-        """After a restore: take over the executor's resting SELL protection, arm any gap."""
+        """After a restore: take over the executor's resting SELL protection, arm any gap.
+
+        A live executor's resting SELLs are adopted only when they carry hydra's own
+        ``client_order_id`` (R5: the user's orders are never hijacked — a later disarm
+        would cancel them); paper orders are all hydra's, so paper adopt is unchanged.
+        """
+        live = getattr(self._executor, "exchange_client", None) is not None
         for symbol in symbols:
             position = await self._position(symbol)
             if position is None:
@@ -232,7 +238,7 @@ class ProtectiveOrderManager:
             resting = [
                 o
                 for o in await self._executor.fetch_open_orders(symbol)
-                if str(o.get("side")) == "SELL"
+                if str(o.get("side")) == "SELL" and (not live or o.get("client_order_id"))
             ]
             if resting:
                 order = resting[0]
@@ -263,22 +269,25 @@ class ProtectiveOrderManager:
             logger.debug("protective order %s already gone", group.order_id)
 
     async def _arm(self, position: Position, spec: ProtectionSpec) -> None:
+        """Arm *spec*; only the ladder's definitive exhaustion is recorded here.
+
+        ``StopUnplaceableError`` (every rung definitively rejected, ``exchange_stops``)
+        records a failure and leaves no group, so the wiring's armed-is-None check
+        market-closes. Anything else re-raises — an unknown-outcome network error or a
+        breached stop propagates to the wiring's decision-17 market-close path instead
+        of a second placement (R18: no double-stop).
+        """
+        # local import: exchange_stops imports this module at its own top level
+        from hydra.execution.exchange_stops import StopUnplaceableError
+
         symbol = str(position.symbol)
         try:
             group = await self._place(position, spec)
-        except Exception as exc:
+        except StopUnplaceableError as exc:
             msg = f"{symbol}: protective order {spec} rejected ({exc})"
             logger.error("Protective order failed: %s", msg)
             self.failures.append(msg)
-            fallback = default_stop(position.avg_entry_price)
-            if spec == fallback:
-                return
-            try:
-                group = await self._place(position, fallback)
-            except Exception:
-                logger.exception("Default protective stop failed for %s", symbol)
-                self.failures.append(f"{symbol}: default stop rejected")
-                return
+            return
         if group is not None:
             self._groups[symbol] = group
 

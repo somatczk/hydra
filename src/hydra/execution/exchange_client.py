@@ -156,6 +156,7 @@ class ExchangeClient:
         with observe_exchange_call(self._exchange_id, "create_oco"):
             raw: dict[str, Any] = await exchange.privatePostOrderListOco(request)
         order_list_id = str(raw.get("orderListId"))
+        list_client_id = raw.get("listClientOrderId")
         return {
             "id": order_list_id,
             "symbol": symbol,
@@ -167,6 +168,7 @@ class ExchangeClient:
             "status": str(raw.get("listStatusType") or "EXEC_STARTED"),
             "filled": False,
             "oco_link": order_list_id,
+            "client_order_id": None if list_client_id in (None, "") else str(list_client_id),
             "legs": [normalize_exchange_leg(r) for r in raw.get("orderReports") or []],
         }
 

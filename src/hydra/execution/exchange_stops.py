@@ -11,7 +11,8 @@ keys a client (the keyed acquisition is P3-A's). It owns four contracts the live
   market-close path instead of falling through the ladder. No double-stop scenario.
 * ``normalize_open_orders`` — the ONE open-orders shape (paper dicts) for adopt, flatten,
   the A8 live read and P3-A's reconcile; live fills carry ``parent_order_id`` = the
-  orderListId of their OCO.
+  orderListId of their OCO, and every leg carries its ``client_order_id`` — the
+  ownership marker live adopt gates on (R5: the user's orders are never hijacked).
 * ``verify_exchange_stop`` — the A8-live read per held position. ``confirmed`` only from a
   real openOrderList / resting-leg match at ``checked_at``; an unreadable exchange is
   ``unknown``, never ``missing``.
@@ -128,17 +129,21 @@ class ExpectedStop(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def format_price(rules: MarketRules, price: Decimal, direction: Literal["sl", "tp"]) -> str:
-    """Decimal -> exchange string; a SELL stop rounds UP to the tick, a TP limit DOWN.
+def _round_price(rules: MarketRules, price: Decimal, direction: Literal["sl", "tp"]) -> Decimal:
+    """The wire value of *price*: a SELL stop rounds UP to the tick, a TP limit DOWN.
 
     Up keeps the stop closer to the market (it triggers no later than asked for); down
     keeps a maker take-profit marketable.
     """
     tick = rules.price_tick
     if tick is None or tick <= 0:
-        return format(price, "f")
-    rounded = price.quantize(tick, rounding=ROUND_DOWN if direction == "tp" else ROUND_UP)
-    return format(rounded, "f")
+        return price
+    return price.quantize(tick, rounding=ROUND_DOWN if direction == "tp" else ROUND_UP)
+
+
+def format_price(rules: MarketRules, price: Decimal, direction: Literal["sl", "tp"]) -> str:
+    """Decimal -> exchange string (the tick-rounded wire value)."""
+    return format(_round_price(rules, price, direction), "f")
 
 
 def format_qty(rules: MarketRules, quantity: Decimal) -> str:
@@ -173,11 +178,13 @@ async def arm_exchange_stop(
 ) -> ExchangeStopPlacement:
     """Place the protective exit for a held long, safest resting form first.
 
-    Pre-checks: a take-profit at or below the last price is dropped (Binance refuses an OCO
-    whose above leg is not above the market); a stop at or above the last price raises
-    ``StopBreachedError`` (the wiring market-closes); a trailing percentage outside the
-    symbol's TRAILING_DELTA filter falls back to the default fixed stop. A quantity that
-    floors to zero at the lot step raises ``StopUnplaceableError``.
+    Pre-checks run on the ROUNDED wire values (A4: round first, then compare): a
+    take-profit that would not rest above the last price after tick rounding is dropped
+    (Binance refuses an OCO whose above leg is not above the market); a stop that would
+    not rest below the last price raises ``StopBreachedError`` (the wiring
+    market-closes); a trailing percentage outside the symbol's TRAILING_DELTA filter
+    falls back to the default fixed stop. A quantity that floors to zero at the lot
+    step raises ``StopUnplaceableError``.
     """
     steps: list[str] = []
     qty = format_qty(rules, quantity)
@@ -215,16 +222,17 @@ async def arm_exchange_stop(
                 "using the default fixed stop"
             )
     stop_loss = spec.stop_loss if spec.stop_loss is not None else _default_stop_price(entry)
-    take_profit = (
-        spec.take_profit
-        if spec.take_profit is not None and (spec.take_profit > last_price)
-        else None
-    )
-    if spec.take_profit is not None and take_profit is None:
-        steps.append(
-            f"take-profit {spec.take_profit} not above the last price {last_price}; "
-            "placing the stop only"
-        )
+    stop_loss = _round_price(rules, stop_loss, "sl")
+    take_profit: Decimal | None = None
+    if spec.take_profit is not None:
+        rounded_tp = _round_price(rules, spec.take_profit, "tp")
+        if rounded_tp > last_price:
+            take_profit = rounded_tp
+        else:
+            steps.append(
+                f"take-profit {spec.take_profit} would not rest above the last price "
+                f"{last_price}; placing the stop only"
+            )
     _require_below_last(stop_loss, last_price, symbol)
     if take_profit is not None:
         try:
@@ -269,7 +277,7 @@ async def arm_exchange_stop(
             quantity=Decimal(qty),
             stop_price=stop_loss,
         )
-    default_sl = _default_stop_price(entry)
+    default_sl = _round_price(rules, _default_stop_price(entry), "sl")
     _require_below_last(default_sl, last_price, symbol)
     try:
         resp = await client.create_order(
@@ -346,6 +354,12 @@ def _price(value: Any) -> float | None:
     return float(dec) if dec is not None and dec > 0 else None
 
 
+def _client_order_id(order: Mapping[str, Any]) -> str | None:
+    """The leg's clientOrderId — the ownership marker for live adopt (R5)."""
+    raw = _leg_field(order, "clientOrderId", order.get("clientOrderId"))
+    return None if raw in (None, "") else str(raw)
+
+
 def normalize_exchange_leg(order: Mapping[str, Any]) -> dict[str, Any]:
     """One raw Binance order (an ``openOrders`` leg or an OCO ``orderReport``) -> paper dict."""
     raw_type = str(_leg_field(order, "type", "") or "").upper()
@@ -360,8 +374,10 @@ def normalize_exchange_leg(order: Mapping[str, Any]) -> dict[str, Any]:
         order_type, reason, trail_pct = OrderType.LIMIT, "take_profit", None
     elif raw_type in ("STOP_LOSS", "STOP_LOSS_LIMIT"):
         order_type, reason, trail_pct = OrderType.STOP_MARKET, "stop_loss", None
-    elif raw_type in ("TAKE_PROFIT", "TAKE_PROFIT_LIMIT"):
-        order_type, reason, trail_pct = OrderType.STOP_MARKET, "take_profit", None
+    elif raw_type == "TAKE_PROFIT":
+        order_type, reason, trail_pct = OrderType.TAKE_PROFIT_MARKET, "take_profit", None
+    elif raw_type == "TAKE_PROFIT_LIMIT":
+        order_type, reason, trail_pct = OrderType.LIMIT, "take_profit", None
     else:
         order_type, reason, trail_pct = OrderType.LIMIT, "limit", None
     amount = _dec(_leg_field(order, "origQty", order.get("amount")))
@@ -378,6 +394,7 @@ def normalize_exchange_leg(order: Mapping[str, Any]) -> dict[str, Any]:
         "reason": reason,
         "oco_id": oco_id,
         "trail_pct": trail_pct,
+        "client_order_id": _client_order_id(order),
     }
 
 
@@ -397,8 +414,10 @@ async def verify_exchange_stop(
     """Is a protective order resting on the exchange for *symbol* right now?
 
     Matches the expected placement/group by its order-list or order id (leg ids included),
-    or — with no expectation, e.g. a stopped session — any resting SELL stop leg on the
-    symbol. Exchange read errors answer ``unknown`` with the error, never ``missing``.
+    or — with no expectation, e.g. a stopped session — any resting SELL stop-family leg
+    on the symbol (reason ``stop_loss``/``trailing_stop``: a take-profit leg is not
+    downside protection). Exchange read errors answer ``unknown`` with the error, never
+    ``missing``.
     """
     checked_at = datetime.now(UTC)
     try:
@@ -416,7 +435,13 @@ async def verify_exchange_stop(
         and (o["oco_id"] == expected_id or o["id"] == expected_id or o["id"] in expected_legs)
     ]
     if not matched and expected_id is None:
-        matched = [o for o in legs if o["side"] == "SELL" and o["type"] in _STOP_TYPES]
+        matched = [
+            o
+            for o in legs
+            if o["side"] == "SELL"
+            and o["type"] in _STOP_TYPES
+            and o["reason"] in ("stop_loss", "trailing_stop")
+        ]
     if not matched:
         if expected_id is not None and expected_id in list_ids:
             return ExchangeStopState(

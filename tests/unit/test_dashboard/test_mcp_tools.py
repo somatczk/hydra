@@ -39,6 +39,7 @@ from hydra.dashboard.mcp import mount_mcp
 from hydra.dashboard.mcp.tools import _deps
 from hydra.dashboard.security import install_security
 from hydra.execution.errors import ConfigReloadRefusedError
+from hydra.execution.session_manager import TradingSession
 from hydra.services import strategies as strategy_svc
 from hydra.services.trader import LocalTrader
 from tests.unit.test_execution.session_harness import Harness, held, write_strategy
@@ -710,6 +711,103 @@ def mcp_cfg(bind_api_config: Bind) -> HydraConfig:
     )
 
 
+_LIVE_LEGS: list[dict[str, Any]] = [
+    {
+        "info": {
+            "symbol": "BTCUSDT",
+            "orderId": 11,
+            "orderListId": "5",
+            "clientOrderId": "a",
+            "price": "103.00000000",
+            "origQty": "0.01000000",
+            "status": "NEW",
+            "type": "LIMIT_MAKER",
+            "side": "SELL",
+            "stopPrice": "0.00000000",
+            "trailingDelta": "0",
+        }
+    },
+    {
+        "info": {
+            "symbol": "BTCUSDT",
+            "orderId": 12,
+            "orderListId": "5",
+            "clientOrderId": "b",
+            "price": "0.00000000",
+            "origQty": "0.01000000",
+            "status": "NEW",
+            "type": "STOP_LOSS",
+            "side": "SELL",
+            "stopPrice": "98.00000000",
+            "trailingDelta": "0",
+        }
+    },
+]
+
+
+class _KeyedClient:
+    """The live executor's keyed exchange client (the A8 fetch surface)."""
+
+    async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        return _LIVE_LEGS
+
+    async def fetch_open_order_lists(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "orderListId": 5,
+                "contingencyType": "OCO",
+                "listStatusType": "EXEC_STARTED",
+            }
+        ]
+
+
+class _LiveDetailManager:
+    """Serves one live session's detail through the service's A8-live branch."""
+
+    def __init__(self) -> None:
+        self.session = TradingSession(
+            session_id="s1",
+            strategy_id="saw",
+            trading_mode="live",
+            status="running",
+            exchange_id="binance",
+            symbols=["BTCUSDT"],
+            timeframe="1h",
+        )
+        self.session._executor = types.SimpleNamespace(exchange_client=_KeyedClient())
+        self.session._runtime = types.SimpleNamespace(
+            protect=types.SimpleNamespace(
+                armed=lambda symbol: types.SimpleNamespace(order_id="5", leg_ids=("11", "12")),
+                is_protective=lambda order_id: order_id in ("5", "11", "12"),
+            )
+        )
+
+    def get_session(self, session_id: str) -> Any:
+        return self.session if session_id == "s1" else None
+
+    async def get_session_detail(self, session_id: str) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "strategy_id": self.session.strategy_id,
+            "trading_mode": "live",
+            "status": "running",
+            "exchange_id": "binance",
+            "symbols": ["BTCUSDT"],
+            "timeframe": "1h",
+            "positions": [
+                {
+                    "symbol": "BTCUSDT",
+                    "direction": "long",
+                    "quantity": 0.01,
+                    "avg_entry_price": 100.0,
+                    "unrealized_pnl": 0.0,
+                }
+            ],
+            "trades": [],
+        }
+
+
 class TestSessionTools:
     async def test_round_trip_start_list_detail_quick_trade_and_stop(
         self,
@@ -771,6 +869,15 @@ class TestSessionTools:
                     )
                     assert await held(session) == D("0.2")
 
+                    is_error, text = await mcp.call(
+                        "session_detail", {"session_id": session.session_id}
+                    )
+                    assert not is_error
+                    detail = json.loads(text)
+                    assert [p["symbol"] for p in detail["positions"]] == ["BTCUSDT"]
+                    # S1: paper positions never carry a live exchange stop
+                    assert all(p.get("exchange_stop") is None for p in detail["positions"])
+
                     is_error, text = await mcp.call("positions")
                     assert not is_error
                     held_rows = json.loads(text)
@@ -823,6 +930,28 @@ class TestSessionTools:
             assert "price" in envelope["detail"]["message"]
         finally:
             await h.close()
+
+    async def test_session_detail_carries_the_live_exchange_stop(
+        self,
+        mcp_cfg: HydraConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S1: the A8-live exchange_stop read (the pinned seam #3 names) flows through
+        the MCP session_detail tool, not only through the REST route's response model."""
+        mgr = _LiveDetailManager()
+        monkeypatch.setattr(engine_app.state, "trader", LocalTrader(None, mgr))
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call("session_detail", {"session_id": "s1"})
+
+        assert not is_error, text
+        (position,) = json.loads(text)["positions"]
+        stop = position["exchange_stop"]
+        assert stop["state"] == "confirmed"
+        assert stop["kind"] == "oco"
+        assert stop["stop_price"] == 98.0
+        assert stop["take_profit"] == 103.0
+        assert stop["order_list_id"] == "5"
+        assert datetime.fromisoformat(stop["checked_at"]).tzinfo is not None
 
     async def test_stop_that_cannot_be_persisted_is_503_and_audits(
         self,

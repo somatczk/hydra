@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from prometheus_client import REGISTRY
 
 from hydra.core.types import OrderStatus
 from hydra.execution.errors import KillSwitchActiveError, SessionPersistError
@@ -233,28 +235,39 @@ class _Pool:
 
 
 class _FakeLiveExecutor:
-    """Exposes the live executor's duck-typed sweep method (R4a)."""
+    """Exposes the live executor's duck-typed sweep method (R4a) and held positions."""
 
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(self, *, error: Exception | None = None, held: list[str] | None = None) -> None:
         self.cancel_all: list[str] = []
         self.error = error
+        self.held = held or []
 
     async def cancel_all_orders(self, symbol: str) -> None:
         self.cancel_all.append(symbol)
         if self.error is not None:
             raise self.error
 
+    async def get_positions(self, symbol: str | None = None) -> list[Any]:
+        if symbol is None:
+            return []
+        return [SimpleNamespace(quantity=D("0.01"))] if symbol in self.held else []
+
 
 class _StubRuntime:
     """The flatten/shutdown surface ``_stop_session_internal`` needs of a live runtime."""
 
-    def __init__(self) -> None:
+    def __init__(self, session: Any = None, remaining: int = 0) -> None:
         self.closing = False
         self.flattens = 0
+        self._session = session
+        self._remaining = remaining
 
     async def flatten(self) -> Any:
         self.flattens += 1
-        return FlattenResult(0)
+        if self._session is not None:
+            self._session.positions_at_stop = self._remaining
+            self._session.flatten_incomplete = self._remaining > 0
+        return FlattenResult(self._remaining)
 
     async def shutdown(self) -> None:
         return None
@@ -263,7 +276,14 @@ class _StubRuntime:
         return None
 
 
-def _live_session(mgr: SessionManager, session_id: str, executor: Any, symbols: list[str]) -> Any:
+def _live_session(
+    mgr: SessionManager,
+    session_id: str,
+    executor: Any,
+    symbols: list[str],
+    *,
+    remaining: int = 0,
+) -> Any:
     session = TradingSession(
         session_id=session_id,
         strategy_id=f"strat-{session_id}",
@@ -274,7 +294,7 @@ def _live_session(mgr: SessionManager, session_id: str, executor: Any, symbols: 
         timeframe="1h",
     )
     session._executor = executor
-    session._runtime = _StubRuntime()
+    session._runtime = _StubRuntime(session, remaining)
     mgr._sessions[session_id] = session
     return session
 
@@ -284,10 +304,10 @@ class TestKillSwitchSweep:
         self, h: Harness, strategies_dir: Path
     ) -> None:
         assert h.mgr is not None
-        shared = _FakeLiveExecutor()
+        shared = _FakeLiveExecutor(held=["BTCUSDT", "ETHUSDT"])
         first = _live_session(h.mgr, "live-a", shared, ["BTCUSDT", "ETHUSDT"])
         second = _live_session(h.mgr, "live-b", shared, ["BTCUSDT"])
-        other = _live_session(h.mgr, "live-c", _FakeLiveExecutor(), ["ETHUSDT"])
+        other = _live_session(h.mgr, "live-c", _FakeLiveExecutor(held=["ETHUSDT"]), ["ETHUSDT"])
         paper = await h.session(write_strategy(strategies_dir, "sweep-paper"))
         await h.mgr.stop_all(actor="test", reason="drill")
 
@@ -310,13 +330,75 @@ class TestKillSwitchSweep:
 
     async def test_a_failing_sweep_is_reported(self, h: Harness) -> None:
         assert h.mgr is not None
-        executor = _FakeLiveExecutor(error=RuntimeError("binance down"))
+        executor = _FakeLiveExecutor(error=RuntimeError("binance down"), held=["BTCUSDT"])
         _live_session(h.mgr, "live-stuck", executor, ["BTCUSDT"])
 
         report = await h.mgr.stop_all(actor="test", reason="drill")
 
         assert executor.cancel_all == ["BTCUSDT"]
         assert any("BTCUSDT" in f and "binance down" in f for f in report.flatten_failures)
+
+    async def test_the_sweep_covers_only_symbols_the_session_traded(self, h: Harness) -> None:
+        """A9: the blast radius is each live-traded symbol, not the configured superset."""
+        assert h.mgr is not None
+        executor = _FakeLiveExecutor(held=["BTCUSDT"])
+        _live_session(h.mgr, "live-traded", executor, ["BTCUSDT", "ETHUSDT"])
+
+        await h.mgr.stop_all(actor="test", reason="drill")
+
+        assert executor.cancel_all == ["BTCUSDT"]  # ETHUSDT was configured, never traded
+
+
+class TestLiveStopGap:
+    """R27(5): a live stop that leaves positions sets the protective gap at stop time."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_gauge(self) -> Iterator[None]:
+        from hydra.core import metrics
+
+        metrics._reset_metrics()
+        yield
+        metrics._reset_metrics()
+
+    def _gap(self, session: Any) -> float | None:
+        return REGISTRY.get_sample_value(
+            "hydra_live_protective_gap",
+            {
+                "session_id": session.session_id,
+                "strategy_id": session.strategy_id,
+                "exchange_id": "binance",
+                "symbol": "BTCUSDT",
+            },
+        )
+
+    async def test_a_live_stop_with_a_remaining_position_sets_the_gap(self, h: Harness) -> None:
+        """R13's battery expectation: the flatten sell was definitively rejected, the
+        session holds on with no stop — the alert must keep firing from stop time on."""
+        assert h.mgr is not None
+        executor = _FakeLiveExecutor(held=["BTCUSDT"])
+        session = _live_session(h.mgr, "live-gap", executor, ["BTCUSDT"], remaining=1)
+
+        await h.mgr.stop_session(session.session_id)
+
+        assert session.status == "stopped"
+        assert session.positions_at_stop == 1
+        assert self._gap(session) == 1.0
+
+    async def test_a_clean_live_flatten_clears_the_gap(self, h: Harness) -> None:
+        from hydra.core import metrics
+
+        assert h.mgr is not None
+        executor = _FakeLiveExecutor()
+        session = _live_session(h.mgr, "live-clean", executor, ["BTCUSDT"])
+        metrics.set_live_protective_gap(
+            session.session_id, session.strategy_id, "binance", "BTCUSDT", True
+        )
+        assert self._gap(session) == 1.0
+
+        await h.mgr.stop_session(session.session_id)
+
+        assert session.positions_at_stop == 0
+        assert self._gap(session) is None
 
 
 class TestRaces:

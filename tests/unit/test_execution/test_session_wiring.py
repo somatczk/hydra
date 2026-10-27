@@ -334,6 +334,53 @@ class TestLiveCoverage:
         assert session.status == "running"
         assert session.last_bar_at is not None
 
+    async def test_a_raising_hook_sets_the_gap_for_held_symbols(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """A6: a producer that cannot answer leaves every held symbol unconfirmed —
+        the gauge goes to 1 and the alert fires, never silently keeps its last value."""
+        session = await h.session(
+            write_strategy(strategies_dir, "covheld", entry_long=ENTRY_AT_100)
+        )
+        runtime = session._runtime
+        assert runtime is not None
+
+        async def broken() -> dict[str, None]:
+            raise RuntimeError("exchange unreadable")
+
+        runtime._live_coverage = broken
+        await h.bar(session, "100")
+        assert await held(session) == D("1.00000")
+        # the hook runs before this bar's entry fill, so nothing was held yet
+        assert self._gap(session) is None
+
+        await h.bar(session, "101")
+        assert self._gap(session) == 1.0  # can't confirm = unconfirmed
+        assert session.status == "running"
+
+    async def test_a_malformed_producer_answer_sets_the_gap_and_completes_the_bar(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """A5: the whole hook is guarded — a garbage answer sets the gap for held
+        symbols and still leaves last_bar_at and the risk mark written for the bar."""
+        session = await h.session(
+            write_strategy(strategies_dir, "covmalformed", entry_long=ENTRY_AT_100)
+        )
+        runtime = session._runtime
+        assert runtime is not None
+
+        async def malformed() -> dict[str, Any]:
+            return {"BTCUSDT": {"state": "missing"}}  # a plain dict, not the state
+
+        runtime._live_coverage = malformed
+        await h.bar(session, "100")
+        await h.bar(session, "101")
+
+        assert self._gap(session) == 1.0
+        assert session.status == "running"
+        assert session.last_bar_at is not None
+        assert runtime.risk.mark("binance", "BTCUSDT") == D("101")
+
     async def test_paper_never_sets_the_gauge(self, h: Harness, strategies_dir: Path) -> None:
         session = await h.session(
             write_strategy(strategies_dir, "paperonly", entry_long=ENTRY_AT_100)
