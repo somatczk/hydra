@@ -136,6 +136,7 @@ describe('ExchangeConnectDialog errors', () => {
 
 describe('the L4 delete for trade-capable keys (UI-4c)', () => {
   const l4Exchange = { id: 'binance', name: 'Binance', connected: true, environment: 'testnet' as const, tradeEnabled: true };
+  const DENY_PATH = '/api/activity/approvals/3f0b9e2a-2000-4000-8000-000000000001/deny';
 
   function showL4(mutations: Mutations = {}) {
     fetchApi.mockImplementation(
@@ -207,5 +208,44 @@ describe('the L4 delete for trade-capable keys (UI-4c)', () => {
     const [path, init] = fetchApi.mock.calls[0] as [string, RequestInit];
     expect(path).toBe('/api/system/exchanges/binance/connect');
     expect(init.method).toBe('DELETE');
+  });
+
+  it('Keep keys denies the still-pending delete challenge so it cannot linger (A1)', async () => {
+    page = await showL4();
+    await click(buttonByText(page.container, 'Keep keys'));
+    expect(calls.some((c) => c.path === DENY_PATH && c.init?.method === 'POST')).toBe(true);
+  });
+
+  it('a failed deny never blocks the close — the entry expires server-side anyway (A1)', async () => {
+    const onClose = vi.fn();
+    fetchApi.mockImplementation(
+      routeFetch({}, calls, {
+        'POST /api/live/credential-delete': liveChallenge({ note: 'Enter this code once to delete the keys.' }),
+        [`POST ${DENY_PATH}`]: new TypeError('Failed to fetch'),
+      }),
+    );
+    page = await mount(<ExchangeConnectDialog open onClose={onClose} onUpdated={vi.fn()} exchange={l4Exchange} />);
+    await click(buttonByText(page.container, 'Keep keys'));
+    expect(calls.some((c) => c.path === DENY_PATH)).toBe(true);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('Close while the delete is being decided places no deny — closing cannot stop the delete (A1)', async () => {
+    page = await showL4({ [`POST ${APPROVE_PATH}`]: new Promise(() => {}) });
+    await typeInto(inputByLabel(page.container, 'Type BINANCE to confirm'), 'BINANCE');
+    await typeInto(inputByLabel(page.container, 'One-time code'), '482913');
+    await click(primary());
+    await click(buttonByText(page.container, 'Close'));
+    expect(calls.filter((c) => c.path === DENY_PATH)).toHaveLength(0);
+  });
+
+  it('a definite create refusal renders the failure without the stale getting-the-code line (A3≡S4)', async () => {
+    page = await showL4({
+      'POST /api/live/credential-delete': envelope(409, 'credential_delete_gated', 'A live session is running', 'invalid'),
+    });
+    const d = dialog();
+    expect(d.textContent).toContain("The keys weren't deleted.");
+    expect(d.textContent).toContain('A live session is running');
+    expect(d.textContent).not.toContain('Getting the one-time code…');
   });
 });

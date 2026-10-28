@@ -164,6 +164,45 @@ describe('approval review: the ask', () => {
   });
 });
 
+describe('approval review: your own challenge (must-fix 7, A2≡S1)', () => {
+  const USER_EVENT = {
+    id: 4,
+    ts: '2026-10-21T13:45:00Z',
+    scope: 'live',
+    kind: 'approval_requested',
+    tier: null,
+    actor: 'user:soma',
+    reason: 'Manual live order: buy 0.0015 BTC in SMA cross',
+    details: { approval_id: ID, action: 'live_order' },
+  };
+
+  it('reads a user-initiated live order as your own ask throughout, never Claude phrasing', async () => {
+    setup(
+      approvalDetail({
+        actor: 'user:soma',
+        action: 'live_order',
+        reason: 'Manual live order: buy 0.0015 BTC in SMA cross',
+        params: { session_id: 'a1b2c3d4-0000-4000-8000-000000000001', symbol: 'BTCUSDT', side: 'buy', quantity: '0.0015' },
+      }),
+      {},
+      { '/api/activity?actor=user:soma&limit=10': [USER_EVENT] },
+    );
+    m = await page();
+    expect(m.container.querySelector('h1')?.textContent).toBe('You asked to place a live order');
+    expect(text()).toContain('You wrote: “Manual live order: buy 0.0015 BTC in SMA cross”');
+    expect(text()).toContain('Your recent activity');
+    expect(text()).toContain('The 6 digits shown to you. Single use.');
+    expect(text()).toContain('Approving runs it now, recorded as approved by you.');
+    expect(text()).not.toContain('Claude asks to');
+    expect(text()).not.toContain("Claude's recent activity");
+    expect(text()).not.toContain('Claude wrote');
+    expect(text()).not.toContain('The 6 digits Claude shows you');
+    expect(text()).not.toContain('Approving runs it as Claude');
+    expect(calls.some((c) => c.path === '/api/activity?actor=user:soma&limit=10')).toBe(true);
+    expect(calls.some((c) => c.path === '/api/activity?actor=service:mcp&limit=10')).toBe(false);
+  });
+});
+
 describe('approval review: the one-time code', () => {
   it('cannot submit without a full code and enables the primary only at 6 digits', async () => {
     setup(approvalDetail());

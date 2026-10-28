@@ -14,6 +14,7 @@ vi.mock('@/lib/api', async (orig) => ({
 const { LiveOrderReview } = await import('./LiveOrderReview');
 
 const APPROVE_PATH = '/api/activity/approvals/3f0b9e2a-2000-4000-8000-000000000001/approve';
+const DENY_PATH = '/api/activity/approvals/3f0b9e2a-2000-4000-8000-000000000001/deny';
 const R19 =
   "Live sessions place real orders on Binance with real money. Paper sessions keep running. Every live order you place needs the one-time code; once a live session starts, its strategy trades under that start's authorization — bounded by the kill switch, risk limits and exchange stops.";
 const REQ: QuickTradeRequest = { symbol: 'BTCUSDT', side: 'buy', order_type: 'MARKET', quantity: '0.0015', session_id: detail().session_id };
@@ -42,11 +43,13 @@ let calls: Array<{ path: string; init?: RequestInit }>;
 let placed: Mock;
 let sent: Mock;
 let outcome: Mock;
+let back: Mock;
 
 function show(mutations: Mutations = {}) {
   placed = vi.fn();
   sent = vi.fn();
   outcome = vi.fn();
+  back = vi.fn();
   fetchApi.mockImplementation(
     routeFetch({}, calls, {
       'POST /api/live/order': liveChallenge({ note: 'Enter this code once to place the live order.' }),
@@ -61,7 +64,7 @@ function show(mutations: Mutations = {}) {
       onOutcome={outcome}
       onSent={sent}
       onPlaced={placed}
-      onBack={vi.fn()}
+      onBack={back}
     />,
   );
 }
@@ -179,5 +182,48 @@ describe('LiveOrderReview', () => {
     expect(m.container.textContent).toContain('Live actions are hidden until the code service recovers.');
     expect(() => primary()).toThrow();
     expect(buttonByText(m.container, 'Back')).toBeTruthy();
+  });
+
+  it('Back denies the still-pending challenge so it cannot linger as a needsYou row (A1)', async () => {
+    m = await show();
+    await click(buttonByText(m.container, 'Back'));
+    expect(calls.some((c) => c.path === DENY_PATH && c.init?.method === 'POST')).toBe(true);
+    expect(back).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed deny never blocks the close — the entry expires server-side anyway (A1)', async () => {
+    m = await show({ [`POST ${DENY_PATH}`]: new TypeError('Failed to fetch') });
+    await click(buttonByText(m.container, 'Back'));
+    expect(calls.some((c) => c.path === DENY_PATH)).toBe(true);
+    expect(back).toHaveBeenCalledTimes(1);
+  });
+
+  it('Back after the challenge was spent places no deny on the decided entry (A1)', async () => {
+    m = await show({
+      [`POST ${APPROVE_PATH}`]: envelope(503, 'approval_execution_failed', "The approved action 'live_order' did not run: exchange unreachable", 'unavailable'),
+    });
+    await typeAmount('0.0015');
+    await typeInto(codeField(), '482913');
+    await click(primary());
+    expect(m.container.textContent).toContain('Not confirmed.');
+    await click(buttonByText(m.container, 'Back'));
+    expect(calls.filter((c) => c.path === DENY_PATH)).toHaveLength(0);
+  });
+
+  it('after the code expires the failure renders without the stale getting-the-code line (A3≡S4)', async () => {
+    m = await show({ [`POST ${APPROVE_PATH}`]: envelope(410, 'approval_expired', 'This approval expired', 'invalid') });
+    await typeAmount('0.0015');
+    await typeInto(codeField(), '482913');
+    await click(primary());
+    expect(m.container.textContent).toContain('The one-time code expired');
+    expect(m.container.textContent).toContain('Nothing was placed.');
+    expect(m.container.textContent).not.toContain('Getting the one-time code…');
+  });
+
+  it('a definite create refusal renders the failure without the getting-the-code line (A3≡S4)', async () => {
+    m = await show({ 'POST /api/live/order': envelope(409, 'kill_switch_active', 'The kill switch is on', 'invalid') });
+    expect(m.container.textContent).toContain('No order was placed.');
+    expect(m.container.textContent).toContain('The kill switch is on');
+    expect(m.container.textContent).not.toContain('Getting the one-time code…');
   });
 });

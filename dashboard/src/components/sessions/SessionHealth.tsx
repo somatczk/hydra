@@ -68,7 +68,8 @@ export function SessionHealth({ detail: d, push, now }: SessionHealthProps) {
       </Row>
       {liveStops !== null && liveStops.length > 0 && (
         <Row label="Stops" tone={stopTone}>
-          {liveStops.map((r) => r?.text ?? 'UNKNOWN').join(' · ')}
+          {/* S2: an unreadable verify names the server's error when it reported one. */}
+          {d.positions.map((p, i) => liveStops[i]?.text ?? p.exchange_stop?.error ?? 'UNKNOWN').join(' · ')}
         </Row>
       )}
       {!live && stops.length > 0 && (

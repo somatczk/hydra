@@ -37,7 +37,8 @@ export default function ApprovalReviewPage() {
   const { id } = useParams<{ id: string }>();
   const shell = useShellStatus();
   const detail = usePoll<ApprovalDetail>(`/api/activity/approvals/${id}`, 15_000);
-  const trail = usePoll<RiskEvent[]>(`/api/activity?actor=service:mcp&limit=10`, 30_000);
+  // A2≡S1: the trail follows the asker — the MCP query stays byte-identical, your own entry reads your own trail.
+  const trail = usePoll<RiskEvent[]>(detail.data ? `/api/activity?actor=${detail.data.actor}&limit=10` : null, 30_000);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [inline, setInline] = useState<string | null>(null);
   const [busy, setBusy] = useState<'approve' | 'deny' | null>(null);

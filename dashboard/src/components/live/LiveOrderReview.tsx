@@ -8,12 +8,14 @@ import { settle } from '@/components/sessions/useOutcomeSlot';
 import { fetchApi } from '@/lib/api';
 import { parseErrorDetail } from '@/lib/apiState';
 import { sessionName, type SessionDetail } from '@/lib/derive';
+import { logger } from '@/lib/logger';
 import { utc } from '@/lib/format';
 import {
   LIVE_FACTS,
   baseAsset,
   liveOrderOutcome,
   type ApproveResponse,
+  type DenyResponse,
   type LiveApprovalChallenge,
   type Outcome,
   type QuickTradeRequest,
@@ -73,6 +75,7 @@ export function LiveOrderReview({ session, req, about, onOutcome, onSent, onPlac
   const [code, setCode] = useState('');
   const [codeError, setCodeError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [creating, setCreating] = useState(true);
   const codeRef = useRef<HTMLInputElement>(null);
   const hadCodeError = useRef(false);
   const sending = useRef(false);
@@ -82,8 +85,10 @@ export function LiveOrderReview({ session, req, about, onOutcome, onSent, onPlac
 
   useEffect(() => {
     let alive = true;
+    setCreating(true);
     void settle(fetchApi<LiveApprovalChallenge>('/api/live/order', { method: 'POST', body })).then((result) => {
       if (!alive) return;
+      setCreating(false);
       if ('ok' in result) {
         setChallenge(result.ok);
         return;
@@ -146,6 +151,17 @@ export function LiveOrderReview({ session, req, about, onOutcome, onSent, onPlac
     setFailure(outcome);
   };
 
+  const back = () => {
+    // A1: a still-pending challenge (never one being decided) is denied on abandon; it expires server-side anyway.
+    const id = challenge?.approval_id;
+    if (id && !sending.current) {
+      void settle(fetchApi<DenyResponse>(`/api/activity/approvals/${id}/deny`, { method: 'POST', body: '{}' })).then((r) => {
+        if ('err' in r) logger.warn('LiveOrder', `Denying the abandoned challenge ${id} failed`, r.err);
+      });
+    }
+    onBack();
+  };
+
   if (down) {
     return (
       <div className="flex flex-col gap-3">
@@ -156,7 +172,7 @@ export function LiveOrderReview({ session, req, about, onOutcome, onSent, onPlac
           <p className="text-sm text-ink-2">Live actions are hidden until the code service recovers.</p>
         </div>
         <div>
-          <Button variant="secondary" onClick={onBack}>
+          <Button variant="secondary" onClick={back}>
             Back
           </Button>
         </div>
@@ -186,7 +202,8 @@ export function LiveOrderReview({ session, req, about, onOutcome, onSent, onPlac
           <p className="text-xs text-ink-2">The code expires {utc(challenge.expires_at) ?? '—'}.</p>
         </>
       ) : (
-        <p className="text-sm text-ink-2">Getting the one-time code…</p>
+        // A3≡S4: the getting-the-code line only shows while the create is actually in flight.
+        creating ? <p className="text-sm text-ink-2">Getting the one-time code…</p> : null
       )}
       <Input
         label={`Type ${req.quantity} to confirm`}
@@ -224,7 +241,7 @@ export function LiveOrderReview({ session, req, about, onOutcome, onSent, onPlac
             {pending ? 'Placing live order…' : 'Place live order'}
           </Button>
         )}
-        <Button type="button" variant="secondary" size="lg" className="max-lg:w-full" onClick={onBack}>
+        <Button type="button" variant="secondary" size="lg" className="max-lg:w-full" onClick={back}>
           Back
         </Button>
       </div>

@@ -10,7 +10,7 @@ import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 import { utc } from '@/lib/format';
-import { credentialDeleteOutcome, type ApproveResponse, type LiveApprovalChallenge, type Outcome } from '@/lib/outcomes';
+import { credentialDeleteOutcome, type ApproveResponse, type DenyResponse, type LiveApprovalChallenge, type Outcome } from '@/lib/outcomes';
 
 interface Exchange {
   id: string;
@@ -59,8 +59,10 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
   const [challenge, setChallenge] = useState<LiveApprovalChallenge | null>(null);
   const [down, setDown] = useState(false);
   const [deleteFailure, setDeleteFailure] = useState<Outcome | null>(null);
+  const [creating, setCreating] = useState(true);
   const codeRef = useRef<HTMLInputElement>(null);
   const hadCodeError = useRef(false);
+  const deciding = useRef(false);
 
   const l4 = open && exchange !== null && exchange.connected && exchange.tradeEnabled === true;
   const deleteBody = l4 && exchange !== null ? JSON.stringify({ exchange_id: exchange.id, reason: `Delete the stored ${exchange.name} keys` }) : null;
@@ -84,8 +86,10 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
   useEffect(() => {
     if (deleteBody === null) return;
     let alive = true;
+    setCreating(true);
     void settle(fetchApi<LiveApprovalChallenge>('/api/live/credential-delete', { method: 'POST', body: deleteBody })).then((result) => {
       if (!alive) return;
+      setCreating(false);
       if ('ok' in result) {
         setChallenge(result.ok);
         return;
@@ -149,41 +153,57 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
 
   const confirmDelete = async () => {
     if (!challenge) return;
-    const result = await settle(
-      fetchApi<ApproveResponse>(`/api/activity/approvals/${challenge.approval_id}/approve`, {
-        method: 'POST',
-        body: JSON.stringify({ code }),
-      }),
-    );
-    const d = 'err' in result ? parseErrorDetail(result.err) : null;
-    if (d?.code === 'approval_expired') {
+    deciding.current = true;
+    try {
+      const result = await settle(
+        fetchApi<ApproveResponse>(`/api/activity/approvals/${challenge.approval_id}/approve`, {
+          method: 'POST',
+          body: JSON.stringify({ code }),
+        }),
+      );
+      const d = 'err' in result ? parseErrorDetail(result.err) : null;
+      if (d?.code === 'approval_expired') {
+        setChallenge(null);
+        setCode('');
+        setCodeError(null);
+        setDeleteFailure({
+          tone: 'caution',
+          title: `The one-time code expired at ${utc(challenge.expires_at) ?? 'its expiry'}. Nothing changed.`,
+          lines: ['Close this and delete again for a fresh code.'],
+          actions: [],
+        });
+        return;
+      }
+      const outcome = credentialDeleteOutcome(result, 'approve');
+      if ('ok' in result && result.ok.executed && !outcome.unanswered) {
+        logger.info('Settings', `Exchange ${exchange.name} disconnected`);
+        toast('info', `${exchange.name} disconnected`);
+        onUpdated();
+        onClose();
+        return;
+      }
+      if (outcome.inline) {
+        setCodeError([outcome.title, ...outcome.lines].join(' '));
+        return;
+      }
       setChallenge(null);
       setCode('');
       setCodeError(null);
-      setDeleteFailure({
-        tone: 'caution',
-        title: `The one-time code expired at ${utc(challenge.expires_at) ?? 'its expiry'}. Nothing changed.`,
-        lines: ['Close this and delete again for a fresh code.'],
-        actions: [],
+      setDeleteFailure(outcome);
+    } finally {
+      deciding.current = false;
+    }
+  };
+
+  // A1: Keep keys (or a dialog close) denies a still-pending challenge — never one being decided.
+  const keepKeys = () => {
+    const id = challenge?.approval_id;
+    if (id && !deciding.current) {
+      void settle(fetchApi<DenyResponse>(`/api/activity/approvals/${id}/deny`, { method: 'POST', body: '{}' })).then((r) => {
+        if ('err' in r) logger.warn('Settings', `Denying the abandoned delete challenge ${id} failed`, r.err);
       });
-      return;
     }
-    const outcome = credentialDeleteOutcome(result, 'approve');
-    if ('ok' in result && result.ok.executed && !outcome.unanswered) {
-      logger.info('Settings', `Exchange ${exchange.name} disconnected`);
-      toast('info', `${exchange.name} disconnected`);
-      onUpdated();
-      onClose();
-      return;
-    }
-    if (outcome.inline) {
-      setCodeError([outcome.title, ...outcome.lines].join(' '));
-      return;
-    }
-    setChallenge(null);
-    setCode('');
-    setCodeError(null);
-    setDeleteFailure(outcome);
+    onClose();
   };
 
   const failure = error && (
@@ -204,7 +224,7 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
         pendingHint="Closing this won't stop the delete."
         primaryDisabled={challenge === null || token !== exchange.name.toUpperCase() || !CODE_RE.test(code)}
         onConfirm={confirmDelete}
-        onClose={onClose}
+        onClose={keepKeys}
       >
         <p>
           Balance and open orders stop showing here. Paper sessions aren&apos;t affected. You&apos;ll need the keys to
@@ -226,7 +246,8 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
             deleted.
           </p>
         ) : (
-          <p className="text-sm text-ink-2">Getting the one-time code…</p>
+          // A3≡S4: the getting-the-code line only shows while the create is actually in flight.
+          creating ? <p className="text-sm text-ink-2">Getting the one-time code…</p> : null
         )}
         <Input
           label={`Type ${exchange.name.toUpperCase()} to confirm`}

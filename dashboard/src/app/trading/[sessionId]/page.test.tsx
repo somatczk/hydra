@@ -254,6 +254,14 @@ describe('session detail: the live reads (UI-4c)', () => {
     expect(text()).not.toContain('No exchange stop for BTCUSDT');
   });
 
+  it('an unreadable verify names the server error it reported, on both A8 surfaces (S2)', async () => {
+    setup(detail({ trading_mode: 'live', positions: [{ ...HELD, exchange_stop: exchangeStop({ state: 'unknown', error: 'Binance unreachable during the verify' }) }] }));
+    m = await page();
+    const stops = Array.from(m.container.querySelectorAll('dt')).find((n) => n.textContent === 'Stops')?.nextElementSibling?.textContent ?? '';
+    expect(stops).toContain('Binance unreachable during the verify');
+    expect(m.container.querySelector('tbody [data-state="unknown"]')?.getAttribute('title')).toBe('Binance unreachable during the verify');
+  });
+
   it('never shows the exchange-stop cell or its danger for a paper position (the live-only gate)', async () => {
     setup(detail({ positions: [HELD] }));
     m = await page();

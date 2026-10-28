@@ -112,7 +112,8 @@ function Positions({ d }: { d: SessionDetail }) {
                         {r.text}
                       </span>
                     ) : (
-                      <DataStateBadge state="unknown" reason="The exchange stop couldn't be verified" />
+                      // S2: an unreadable verify names the server's error when it reported one.
+                      <DataStateBadge state="unknown" reason={p.exchange_stop?.error ?? "The exchange stop couldn't be verified"} />
                     );
                   },
                 },

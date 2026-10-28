@@ -8,7 +8,7 @@ import { cn } from '@/components/ui/cn';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { Section } from '@/components/ui/Section';
 import { usePoll } from '@/hooks/usePoll';
-import { actionPhrase } from '@/lib/derive';
+import { askPhrase } from '@/lib/derive';
 import { utc } from '@/lib/format';
 
 const TRAIL_PATH = '/api/activity?limit=500';
@@ -73,7 +73,7 @@ export default function ActivityPage() {
                   href={`/activity/approvals/${a.id}`}
                   className="flex min-h-12 items-center px-3 py-2 text-sm text-ink-1 hover:bg-hover"
                 >
-                  Claude asks to {actionPhrase(a.action)} · requested {utc(a.requested_at, now) ?? 'time not reported'} · Review
+                  {askPhrase(a.actor, a.action)} · requested {utc(a.requested_at, now) ?? 'time not reported'} · Review
                 </Link>
               </li>
             ))}
