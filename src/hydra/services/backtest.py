@@ -51,6 +51,8 @@ class BacktestStatus(BaseModel):
     error: str | None = None
     result_id: str | None = None
     fetch_error: str | None = None
+    # informational: a terminal row's status/error columns are authoritative, not fetch.state
+    fetch: dict[str, Any] | None = None
 
 
 class CancelJobResponse(BaseModel):
@@ -231,8 +233,17 @@ async def _preflight(
     end: datetime,
     *,
     require_data: bool = True,
+    auto_fetch: bool = False,
+    read_span: bool = False,
 ) -> Preflight:
-    """Validate a job before it is queued: 404 strategy, 422 config/data, 503 database."""
+    """Validate a job before it is queued: 404 strategy, 422 config/data, 503 database.
+
+    The data leg is config-gated: with ``auto_fetch`` on (``data.auto_fetch_enabled``)
+    a missing range never 422s — the job is queued and the worker owns availability;
+    off, the exact P0-B 422 ``no_market_data`` with the available range. ``read_span``
+    keeps the stored-span read for callers that size from it (the walk-forward
+    fast-fail) even while fetching.
+    """
     strategy_cls, config = _load_backtest_strategy(strategy_id)
     tf = timeframe or config.timeframes.primary
     if tf != config.timeframes.primary:
@@ -243,11 +254,11 @@ async def _preflight(
     exchange = config.exchange.exchange_id
     symbol = config.symbols[0]
     stored = None
-    if require_data:
+    if require_data or read_span:
         repo = MarketDataRepository.from_pool(pool)
         async with db_errors("checking stored market data"):
             stored = await repo.get_bar_range(exchange, symbol, tf, start, end)
-            if stored is None:
+            if stored is None and require_data and not auto_fetch:
                 missing = await no_market_data(repo, exchange, symbol, tf, start, end)
                 raise ServiceError(422, missing.to_detail())
     return Preflight(strategy_cls, config, exchange, symbol, tf, pool, stored)
@@ -258,8 +269,14 @@ async def _preflight(
 # ---------------------------------------------------------------------------
 
 
-async def submit_backtest(pool: Any, body: BacktestRunRequest) -> dict[str, Any]:
-    """Queue a backtest on the worker. Returns a task_id to poll for status."""
+async def submit_backtest(
+    pool: Any, body: BacktestRunRequest, *, auto_fetch: bool = False
+) -> dict[str, Any]:
+    """Queue a backtest on the worker. Returns a task_id to poll for status.
+
+    With ``auto_fetch`` on, a range with no stored data is queued anyway — the
+    worker fetches its missing bars before the run.
+    """
     pf = await _preflight(
         pool,
         body.strategy_id,
@@ -267,6 +284,7 @@ async def submit_backtest(pool: Any, body: BacktestRunRequest) -> dict[str, Any]
         body.start_date,
         body.end_date,
         require_data=not body.fetch_fresh,
+        auto_fetch=auto_fetch,
     )
     async with db_errors("queueing the job"):
         task_id = await jobs.enqueue(
@@ -296,6 +314,7 @@ async def get_backtest_status(pool: Any, task_id: str) -> dict[str, Any]:
         "error": row["error"],
         "result_id": row["result_id"],
         "fetch_error": detail.get("fetch_error"),
+        "fetch": detail.get("fetch"),
     }
 
 

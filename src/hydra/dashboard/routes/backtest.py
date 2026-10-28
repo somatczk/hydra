@@ -5,7 +5,11 @@ from typing import Any, Literal
 from fastapi import APIRouter, Query, Request, status
 
 from hydra.backtest.jobs import BacktestRunRequest, HyperoptRunRequest, WalkForwardRunRequest
-from hydra.dashboard.routes._db import ServiceErrorRoute, request_pool
+from hydra.dashboard.routes._db import (
+    ServiceErrorRoute,
+    request_auto_fetch,
+    request_pool,
+)
 from hydra.services import backtest as svc
 from hydra.services import research
 from hydra.services.backtest import (
@@ -34,8 +38,14 @@ router = APIRouter(prefix="/api/backtest", tags=["backtest"], route_class=Servic
 
 @router.post("/run", response_model=BacktestRunResponse, status_code=status.HTTP_202_ACCEPTED)
 async def run_backtest(body: BacktestRunRequest, request: Request) -> dict[str, Any]:
-    """Start a backtest on stored bars. Returns a task_id to poll for status."""
-    return await svc.submit_backtest(request_pool(request), body)
+    """Start a backtest on stored bars. Returns a task_id to poll for status.
+
+    A range with no stored data is auto-fetched by the worker before the run
+    (``data.auto_fetch_enabled``).
+    """
+    return await svc.submit_backtest(
+        request_pool(request), body, auto_fetch=request_auto_fetch(request)
+    )
 
 
 @router.get("/status/{task_id}", response_model=BacktestStatus)
@@ -126,7 +136,9 @@ async def start_hyperopt(body: HyperoptRunRequest, request: Request) -> dict[str
 
     Returns a ``task_id`` to poll for progress and results.
     """
-    return await research.submit_hyperopt(request_pool(request), body)
+    return await research.submit_hyperopt(
+        request_pool(request), body, auto_fetch=request_auto_fetch(request)
+    )
 
 
 @router.get(
@@ -157,7 +169,9 @@ async def start_walkforward(body: WalkForwardRunRequest, request: Request) -> di
 
     Returns a ``task_id`` to poll for results.
     """
-    return await research.submit_walkforward(request_pool(request), body)
+    return await research.submit_walkforward(
+        request_pool(request), body, auto_fetch=request_auto_fetch(request)
+    )
 
 
 @router.get(

@@ -250,6 +250,9 @@ async def test_data_coverage_returns_the_exact_stored_range(
 async def test_backtest_run_on_an_empty_range_is_the_honest_no_data_envelope(
     pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The moved P0-B pin: under the kill switch the submit-time 422 envelope is
+    byte-identical to the pre-P6 behaviour."""
+    monkeypatch.setenv("HYDRA_DATA__AUTO_FETCH_ENABLED", "false")
     cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
     async with _mcp_session(cfg) as mcp:
         is_error, text = await mcp.call(
@@ -263,6 +266,24 @@ async def test_backtest_run_on_an_empty_range_is_the_honest_no_data_envelope(
     assert envelope["detail"]["symbol"] == "BTCUSDT"
     assert envelope["detail"]["timeframe"] == "1h"
     assert "No market data for binance BTCUSDT 1h" in envelope["detail"]["message"]
+
+
+async def test_backtest_run_on_an_empty_range_is_queued_when_auto_fetch_is_enabled(
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The enabled default: a range with no data is queued (the worker fetches before
+    the run) — the docstring copy's behaviour, zero egress in the test."""
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    assert cfg.data.auto_fetch_enabled
+    async with _mcp_session(cfg) as mcp:
+        is_error, text = await mcp.call(
+            "backtest_run",
+            {"strategy_id": "saw", "start_date": "2026-03-01", "end_date": "2026-03-02"},
+        )
+    assert not is_error
+    queued = json.loads(text)
+    assert queued["status"] == "queued"
+    assert queued["task_id"].startswith("task-")
 
 
 async def test_backtest_run_on_stored_bars_queues_a_durable_job(

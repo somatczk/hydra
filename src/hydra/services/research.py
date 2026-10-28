@@ -16,6 +16,8 @@ from hydra.backtest.jobs import (
     walkforward_months,
     window_fits,
 )
+from hydra.core.types import Timeframe
+from hydra.data.bars import ceil_to_tf, floor_to_tf, timeframe_seconds
 from hydra.services import strategies as strategy_files
 from hydra.services.backtest import (
     DataProvenanceModel,
@@ -242,6 +244,8 @@ class HyperoptProgressResponse(BaseModel):
     start_date: str = ""
     end_date: str = ""
     error: str | None = None
+    # informational: a terminal row's status/error columns are authoritative, not fetch.state
+    fetch: dict[str, Any] | None = None
     provenance: JobProvenanceModel | None = None
 
 
@@ -329,15 +333,25 @@ def _check_param_names(space: ParameterSpace, config: StrategyConfig) -> None:
         )
 
 
-async def submit_hyperopt(pool: Any, body: HyperoptRunRequest) -> dict[str, Any]:
+async def submit_hyperopt(
+    pool: Any, body: HyperoptRunRequest, *, auto_fetch: bool = False
+) -> dict[str, Any]:
     """Queue a hyperparameter optimisation run on the worker.
 
-    Returns a ``task_id`` to poll for progress and results.
+    Returns a ``task_id`` to poll for progress and results. With ``auto_fetch``
+    on, a range with no stored data is queued anyway — the worker fetches it.
     """
     space = _validated_space(body.param_space)
     _, config = _load_backtest_strategy(body.strategy_id)
     _check_param_names(space, config)
-    pf = await _preflight(pool, body.strategy_id, body.timeframe, body.start_date, body.end_date)
+    pf = await _preflight(
+        pool,
+        body.strategy_id,
+        body.timeframe,
+        body.start_date,
+        body.end_date,
+        auto_fetch=auto_fetch,
+    )
     async with db_errors("queueing the job"):
         task_id = await jobs.enqueue(
             pool,
@@ -376,6 +390,7 @@ async def get_hyperopt_progress(pool: Any, task_id: str) -> dict[str, Any]:
         "start_date": request.get("start_date", ""),
         "end_date": request.get("end_date", ""),
         "error": row["error"],
+        "fetch": detail.get("fetch"),
         "provenance": detail.get("provenance"),
     }
 
@@ -469,16 +484,46 @@ class WalkForwardResultResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def submit_walkforward(pool: Any, body: WalkForwardRunRequest) -> dict[str, Any]:
+def _span_covers(
+    stored: tuple[datetime, datetime, int], body: WalkForwardRunRequest, timeframe: Timeframe
+) -> bool:
+    """True when no fetch could change the window sizing: the stored span covers the
+    requested grid's ends AND its bar count saturates that span's grid. A covered span
+    with a sparse interior still defers — ``window_fits`` sizes from the bar count, and
+    the worker fetches the gaps first, then sizes from the real bars."""
+    first, last, bar_count = stored
+    if first > ceil_to_tf(body.start_date, timeframe) or last < floor_to_tf(
+        body.end_date, timeframe
+    ):
+        return False
+    grid_bars = int((last - first).total_seconds() // timeframe_seconds(timeframe)) + 1
+    return bar_count >= grid_bars
+
+
+async def submit_walkforward(
+    pool: Any, body: WalkForwardRunRequest, *, auto_fetch: bool = False
+) -> dict[str, Any]:
     """Queue a walk-forward validation run on the worker.
 
-    Returns a ``task_id`` to poll for results.
+    Returns a ``task_id`` to poll for results. The submit-time ``range_too_short``
+    fast-fail fires only when the stored span already fully covers the requested
+    range AND its bars saturate the span's grid (no fetch could change the window
+    sizing); anything shorter or sparser defers to the worker's post-load decision
+    on the really-loaded span.
     """
     space = _validated_space(body.param_space)
     _, config = _load_backtest_strategy(body.strategy_id)
     _check_param_names(space, config)
-    pf = await _preflight(pool, body.strategy_id, body.timeframe, body.start_date, body.end_date)
-    if pf.stored is not None:
+    pf = await _preflight(
+        pool,
+        body.strategy_id,
+        body.timeframe,
+        body.start_date,
+        body.end_date,
+        auto_fetch=auto_fetch,
+        read_span=True,
+    )
+    if pf.stored is not None and _span_covers(pf.stored, body, pf.timeframe):
         first, last, bar_count = pf.stored
         in_sample, out_of_sample = walkforward_months(first, last, body.fold_count, body.train_pct)
         if not window_fits(first, last, bar_count, in_sample, out_of_sample):

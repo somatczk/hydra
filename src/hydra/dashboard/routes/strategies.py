@@ -136,11 +136,16 @@ async def reload_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/preview", response_model=PreviewResponse)
 async def preview_signals(body: PreviewRequest, request: Request) -> PreviewResponse:
-    """Run a quick backtest on the latest stored bars and return signals and metrics.
+    """Run a quick backtest on the latest stored bars; a cold market is fetched first.
 
     ``metrics.win_rate`` is a fraction (0-1), unlike the percentage in backtest results.
     """
-    return await svc.preview_signals(request_pool(request), body)
+    # an engine bound on the state (the test seam) wins over the lazy process engine
+    engine = getattr(request.app.state, "fetch_engine", None)
+    if engine is None:
+        cfg = getattr(request.app.state, "config", None)
+        engine = svc.preview_fetch_engine(cfg.data) if cfg is not None else None
+    return await svc.preview_signals(request_pool(request), body, fetch_engine=engine)
 
 
 @router.post("/save", response_model=SaveResponse, status_code=201)
