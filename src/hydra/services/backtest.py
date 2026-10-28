@@ -13,6 +13,7 @@ from hydra.backtest import jobs
 from hydra.backtest.data import no_market_data
 from hydra.backtest.jobs import (
     LIST_SUMMARIES_SQL,
+    MAX_RESULT_SUMMARIES,
     ONE_RESULT_SQL,
     RENAME_SQL,
     TERMINAL_STATUSES,
@@ -360,11 +361,11 @@ async def list_jobs(
 # ---------------------------------------------------------------------------
 
 
-async def list_results(pool: Any) -> list[dict[str, Any]]:
-    """List all persisted backtest result summaries."""
+async def list_results(pool: Any, limit: int = MAX_RESULT_SUMMARIES) -> list[dict[str, Any]]:
+    """Persisted result summaries, newest first; the SQL read stops at ``limit`` rows."""
     pool = require_pool(pool)
     async with db_errors("listing backtest results"), pool.acquire() as conn:
-        rows = await conn.fetch(LIST_SUMMARIES_SQL)
+        rows = await conn.fetch(LIST_SUMMARIES_SQL, limit)
     return [summary_from_row(row) for row in rows]
 
 
