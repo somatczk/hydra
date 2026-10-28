@@ -121,6 +121,16 @@ def request_pool(request: Request) -> Any:
     return getattr(request.app.state, "db_pool", None)
 
 
+def request_auto_fetch(request: Request) -> bool:
+    """``data.auto_fetch_enabled`` of the bound config; a lifespan-less app never fetches.
+
+    The lifespan always binds the config in production; an app without one (the test
+    layouts) keeps the exact pre-P6B submit behaviour — no on-demand fetch anywhere.
+    """
+    cfg = getattr(request.app.state, "config", None)
+    return cfg is not None and cfg.data.auto_fetch_enabled
+
+
 def request_trader(request: Request) -> Any:
     """The app's TraderBackend; an unbound state reads like a manager-less local engine.
 

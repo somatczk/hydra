@@ -6,6 +6,7 @@ import logging
 import re
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,13 @@ from hydra.backtest.data import (
     NoMarketDataError,
     load_latest_bars,
 )
-from hydra.core.types import ExchangeId, Timeframe
+from hydra.core.config import DataConfig
+from hydra.core.types import OHLCV, ExchangeId, Timeframe
+from hydra.data.bars import timeframe_seconds
+from hydra.data.errors import DataFetchError
+from hydra.data.on_demand import OnDemandFetchService
 from hydra.data.storage import MarketDataRepository
-from hydra.execution.client_factory import validate_venue
+from hydra.execution.client_factory import RestHandle, SharedRestClients, validate_venue
 from hydra.execution.errors import (
     ConfigReloadRefusedError,
     SessionNotRunningError,
@@ -750,10 +755,94 @@ def toggle_strategy(strategy_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def preview_signals(pool: Any, body: PreviewRequest) -> PreviewResponse:
+class _PreviewFetchClients:
+    """The engine process's REST clients behind the preview fetch engine.
+
+    One refcounted pool for the process lifetime (the worker's pattern): the first
+    preview fetch constructs the exchange client — ``load_markets`` is paid once per
+    process, not per preview — and the handles are held until the process exits.
+    """
+
+    def __init__(self) -> None:
+        self._pool = SharedRestClients()
+        self._handles: dict[ExchangeId, RestHandle] = {}
+
+    async def client(self, exchange_id: ExchangeId) -> Any:
+        handle = self._handles.get(exchange_id)
+        if handle is None:
+            handle = await self._pool.handle(exchange_id)
+            # Two concurrent cold fetches both acquire; the loser must not leak its reference.
+            existing = self._handles.setdefault(exchange_id, handle)
+            if existing is not handle:
+                await handle.release()
+                handle = existing
+        return handle.client
+
+
+_PREVIEW_ENGINE: OnDemandFetchService | None = None
+
+
+def preview_fetch_engine(cfg: DataConfig) -> OnDemandFetchService | None:
+    """The engine process's one preview fetch engine; ``None`` while the kill switch is on.
+
+    Constructed exactly once per process (the one-instance contract: one weight budget,
+    one set of per-dataset write locks). The check-and-set is synchronous, so under
+    asyncio no two previews can ever build an engine each. The worker process builds
+    its own engine in ``hydra.backtest.worker`` — the two never share one.
+    """
+    global _PREVIEW_ENGINE
+    if not cfg.auto_fetch_enabled:
+        return None
+    if _PREVIEW_ENGINE is None:
+        clients = _PreviewFetchClients()
+        _PREVIEW_ENGINE = OnDemandFetchService.from_config(cfg, clients.client)
+    return _PREVIEW_ENGINE
+
+
+async def _fetched_latest_bars(
+    repo: MarketDataRepository, body: PreviewRequest, fetch_engine: OnDemandFetchService
+) -> tuple[list[OHLCV], DataProvenance]:
+    """Fetch the preview's latest-bars window on demand, then re-load the stored rows.
+
+    The window is exactly ``bars_count`` bars (one page) ending now; the bars are
+    re-loaded from the store, so provenance keeps ``data_source='db'``. A fetch past
+    patience is the retryable 503 ``data_fetch_failed``; a market the exchange
+    genuinely has none of keeps today's 422 ``no_market_data``.
+    """
+    now = datetime.now(UTC)
+    step = timedelta(seconds=timeframe_seconds(body.timeframe))
+    try:
+        await fetch_engine.ensure_available(
+            repo,
+            body.exchange_id,
+            body.symbol,
+            body.timeframe,
+            now - body.bars_count * step,
+            now,
+        )
+    except DataFetchError as exc:
+        raise ServiceError(503, exc.to_detail()) from exc
+    except NoMarketDataError as exc:
+        raise ServiceError(422, exc.to_detail()) from exc
+    try:
+        async with db_errors("re-loading market data for preview"):
+            return await load_latest_bars(
+                repo, body.exchange_id, body.symbol, body.timeframe, body.bars_count
+            )
+    except NoMarketDataError as exc:
+        raise ServiceError(422, exc.to_detail()) from exc
+    except InvalidMarketDataError as exc:
+        raise service_error(422, "invalid_market_data", str(exc), "invalid") from exc
+
+
+async def preview_signals(
+    pool: Any, body: PreviewRequest, *, fetch_engine: OnDemandFetchService | None = None
+) -> PreviewResponse:
     """Run a quick backtest on the latest stored bars and return signals and metrics.
 
-    ``metrics.win_rate`` is a fraction (0-1), unlike the percentage in backtest results.
+    A market with no stored bars is fetched first — the latest ``bars_count`` bars,
+    one page — and re-loaded from the store. ``metrics.win_rate`` is a fraction
+    (0-1), unlike the percentage in backtest results.
     """
     try:
         rule_set = _validate_rules(body.rules)
@@ -772,7 +861,9 @@ async def preview_signals(pool: Any, body: PreviewRequest) -> PreviewResponse:
                 repo, body.exchange_id, body.symbol, body.timeframe, body.bars_count
             )
     except NoMarketDataError as exc:
-        raise ServiceError(422, exc.to_detail()) from exc
+        if fetch_engine is None:
+            raise ServiceError(422, exc.to_detail()) from exc
+        bars, provenance = await _fetched_latest_bars(repo, body, fetch_engine)
     except InvalidMarketDataError as exc:
         raise service_error(422, "invalid_market_data", str(exc), "invalid") from exc
 

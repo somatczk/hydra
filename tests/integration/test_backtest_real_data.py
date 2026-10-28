@@ -11,6 +11,7 @@ import importlib
 import json
 import re
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from importlib.metadata import version
@@ -25,9 +26,13 @@ from alembic import command
 from fastapi import FastAPI
 
 from hydra.backtest import worker
+from hydra.core.config import DataConfig, HydraConfig
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes import backtest, strategies
 from hydra.dashboard.routes._db import install_error_handlers
+from hydra.data.backfill import GapRange
+from hydra.data.bars import timeframe_seconds
+from hydra.data.errors import DataFetchError, NoMarketDataError
 from hydra.data.migrations.runner import alembic_config, upgrade_to_head
 from hydra.data.storage import MarketDataRepository
 
@@ -127,15 +132,34 @@ async def pool(database_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AsyncItera
         await db_pool.close()
 
 
-@pytest.fixture()
-async def client(pool: Any) -> AsyncIterator[httpx.AsyncClient]:
+def _app(pool: Any) -> FastAPI:
     app = FastAPI()
     app.include_router(backtest.router)
     app.include_router(strategies.router)
     install_error_handlers(app)
     app.state.db_pool = pool
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    return app
+
+
+def _client_on(pool: Any, **state: Any) -> AbstractAsyncContextManager[httpx.AsyncClient]:
+    """A client whose app binds *state* on ``app.state`` (config, fetch_engine).
+
+    A lifespan-less app without a bound config reads like the kill switch, so every
+    test that wants the auto-fetch surfaces binds its own config (or engine) here —
+    no test ever reaches the network.
+    """
+    app = _app(pool)
+    for key, value in state.items():
+        setattr(app.state, key, value)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+_NO_FETCH_CONFIG = HydraConfig(data=DataConfig(auto_fetch_enabled=False))
+
+
+@pytest.fixture()
+async def client(pool: Any) -> AsyncIterator[httpx.AsyncClient]:
+    async with _client_on(pool) as c:
         yield c
 
 
@@ -314,16 +338,17 @@ async def test_results_survive_a_restart(
     assert (await client.delete(f"/api/backtest/results/{result_id}")).status_code == 404
 
 
-async def test_no_stored_bars_is_422_with_available_range(
-    client: httpx.AsyncClient, pool: Any, strategies_dir: Path
-) -> None:
+async def test_no_stored_bars_is_422_with_available_range(pool: Any, strategies_dir: Path) -> None:
+    """The moved P0-B pin: under the kill switch (data.auto_fetch_enabled=false) the
+    submit-time 422 is byte-identical to the pre-P6 behaviour."""
     seed = await _seed_hourly(pool)
     _write_strategy(strategies_dir, "saw")
 
-    resp = await client.post(
-        "/api/backtest/run",
-        json={"strategy_id": "saw", "start_date": "2020-01-01", "end_date": "2020-02-01"},
-    )
+    async with _client_on(pool, config=_NO_FETCH_CONFIG) as client:
+        resp = await client.post(
+            "/api/backtest/run",
+            json={"strategy_id": "saw", "start_date": "2020-01-01", "end_date": "2020-02-01"},
+        )
 
     assert resp.status_code == 422
     detail = resp.json()["detail"]
@@ -335,6 +360,51 @@ async def test_no_stored_bars_is_422_with_available_range(
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT count(*) FROM backtest_jobs") == 0
         assert await conn.fetchval("SELECT count(*) FROM backtest_results") == 0
+
+
+class _NeverEngine:
+    """A stand-in at the app seam: any submit-time fetch attempt fails the test."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ensure_available(self, *args: Any, **kw: Any) -> None:  # pragma: no cover
+        self.calls += 1
+        raise AssertionError("the submit path must never fetch — the worker owns availability")
+
+
+async def test_a_cold_submit_is_queued_when_auto_fetch_is_enabled(
+    pool: Any, strategies_dir: Path
+) -> None:
+    """The enabled default: a zero-data range never 422s at submit; the job is queued
+    and the worker owns availability (zero egress through the app — the engine at the
+    app seam is never called, and the drain runs without one)."""
+    _write_strategy(strategies_dir, "saw")
+    never = _NeverEngine()
+
+    async with _client_on(pool, config=HydraConfig(), fetch_engine=never) as client:
+        resp = await client.post(
+            "/api/backtest/run",
+            json={"strategy_id": "saw", "start_date": "2026-01-01", "end_date": "2026-01-31"},
+        )
+        assert resp.status_code == 202, resp.text
+        task_id = resp.json()["task_id"]
+        assert resp.json()["status"] == "queued"
+    assert never.calls == 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT status, error FROM backtest_jobs WHERE id = $1", task_id)
+    assert row["status"] == "queued"
+
+    # the drain runs with no engine: the worker answers today's honest vocabulary
+    await _drain(pool)
+    async with _client_on(pool, config=HydraConfig()) as client:
+        status = (await client.get(f"/api/backtest/status/{task_id}")).json()
+    assert status["status"] == "failed"
+    assert status["error"] == (
+        "No market data for binance BTCUSDT 1h between 2026-01-01T00:00:00+00:00 "
+        "and 2026-01-31T23:59:59.999999+00:00; available: none stored"
+    )
+    assert status["fetch"] is None
 
 
 async def test_bars_are_filtered_by_exchange(
@@ -537,6 +607,53 @@ async def test_walkforward_uses_the_real_span(
     assert "range too short for 2 folds" in short.json()["detail"]["message"]
 
 
+async def test_walkforward_fast_fail_fires_only_when_the_stored_span_covers_the_request(
+    pool: Any, strategies_dir: Path
+) -> None:
+    """The fast-fail predicate, both ways under the enabled default: a stored span that
+    already covers the request (no fetch could extend it) fails 422 range_too_short at
+    submit; a span that does not defers to the worker's post-load decision (202)."""
+    daily = _saw(D1_START, D1_COUNT, timedelta(days=1))
+    await _seed(pool, "binance", Timeframe.D1, daily)
+    _write_strategy(strategies_dir, "saw_d", timeframes={"primary": "1d"})
+    body = {"strategy_id": "saw_d", "fold_count": 2, "train_pct": 0.75}
+
+    async with _client_on(pool, config=HydraConfig()) as client:
+        covered = await client.post(
+            "/api/backtest/walkforward",
+            json={
+                **body,
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-31",
+                "param_space": [{"name": "sma_period", "type": "int", "low": 4, "high": 5}],
+            },
+        )
+        assert covered.status_code == 422
+        assert covered.json()["detail"]["code"] == "range_too_short"
+        assert "range too short for 2 folds" in covered.json()["detail"]["message"]
+
+        # the request reaches past the stored span: a fetch could extend it, so the
+        # worker's post-load decision owns the answer
+        beyond = await client.post(
+            "/api/backtest/walkforward",
+            json={
+                **body,
+                "start_date": "2024-01-01",
+                "end_date": "2026-06-01",
+                "param_space": [{"name": "sma_period", "type": "int", "low": 4, "high": 5}],
+            },
+        )
+        assert beyond.status_code == 202, beyond.text
+        task_id = beyond.json()["task_id"]
+
+    # no engine in the drain: the worker sizes the windows from the really-loaded span
+    await _drain(pool)
+    async with _client_on(pool, config=HydraConfig()) as client:
+        result = (await client.get(f"/api/backtest/walkforward/{task_id}/results")).json()
+    assert len(result["folds"]) == 4
+    assert result["provenance"]["bar_count"] == D1_COUNT
+
+
 # ---------------------------------------------------------------------------
 # Builder preview
 # ---------------------------------------------------------------------------
@@ -565,9 +682,172 @@ async def test_preview_uses_the_latest_stored_bars(client: httpx.AsyncClient, po
         assert datetime.fromisoformat(signal["timestamp"]) >= window_start
         assert 900 < signal["price"] < 1200
 
-    missing = await client.post("/api/strategies/preview", json={**body, "symbol": "ETHUSDT"})
+    # the moved P0-B pin: under the kill switch a cold market keeps today's 422
+    async with _client_on(pool, config=_NO_FETCH_CONFIG) as no_fetch:
+        missing = await no_fetch.post("/api/strategies/preview", json={**body, "symbol": "ETHUSDT"})
     assert missing.status_code == 422
     assert missing.json()["detail"]["code"] == "no_market_data"
+
+
+class _FakePreviewEngine:
+    """A stand-in engine at the app seam: "fetches" by storing bars, or raises."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._error = error
+
+    async def ensure_available(
+        self,
+        repo: MarketDataRepository,
+        exchange: str,
+        symbol: str,
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime,
+        *,
+        force: bool = False,
+        on_progress: Any = None,
+    ) -> None:
+        self.calls.append(
+            {
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "start": start,
+                "end": end,
+            }
+        )
+        if self._error is not None:
+            raise self._error
+        count = int((end - start).total_seconds() // timeframe_seconds(timeframe))
+        first = end - timedelta(seconds=count * timeframe_seconds(timeframe))
+        bars = _flat(first, count, timedelta(seconds=timeframe_seconds(timeframe)), "1000")
+        await repo.store_bars([(exchange, symbol, timeframe, bar) for bar in bars])
+
+
+async def test_preview_fetches_a_cold_market_one_page(pool: Any, strategies_dir: Path) -> None:
+    """No stored bars + the engine: the latest bars_count bars are fetched (one page)
+    and the preview runs on the re-loaded stored rows — data_source stays 'db'."""
+    _write_strategy(strategies_dir, "saw")
+    engine = _FakePreviewEngine()
+    body = {
+        "rules": _SAW_RULES,
+        "timeframe": "1h",
+        "exchange_id": "binance",
+        "symbol": "ETHUSDT",
+        "bars_count": 100,
+    }
+
+    async with _client_on(pool, config=HydraConfig(), fetch_engine=engine) as client:
+        resp = await client.post("/api/strategies/preview", json=body)
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["provenance"]["bar_count"] == 100
+    assert data["provenance"]["data_source"] == "db"
+    assert data["provenance"]["symbol"] == "ETHUSDT"
+    assert data["provenance"]["gap_count"] == 0
+    assert len(engine.calls) == 1
+    call = engine.calls[0]
+    assert (call["exchange"], call["symbol"], call["timeframe"]) == ("binance", "ETHUSDT", "1h")
+    assert call["end"] - call["start"] == timedelta(hours=100)
+
+
+async def test_preview_fetch_past_patience_is_the_retryable_503(
+    pool: Any, strategies_dir: Path
+) -> None:
+    """DataFetchError maps to the retryable 503 data_fetch_failed envelope."""
+    _write_strategy(strategies_dir, "saw")
+    engine = _FakePreviewEngine(
+        error=DataFetchError(
+            "rate_limited",
+            "binance",
+            "ETHUSDT",
+            Timeframe.H1,
+            weight_spent=2,
+            elapsed_s=31.2,
+            remaining_ranges=[
+                GapRange(
+                    start=datetime(2026, 1, 1, tzinfo=UTC), end=datetime(2026, 1, 5, tzinfo=UTC)
+                )
+            ],
+        )
+    )
+    body = {
+        "rules": _SAW_RULES,
+        "timeframe": "1h",
+        "exchange_id": "binance",
+        "symbol": "ETHUSDT",
+        "bars_count": 100,
+    }
+
+    async with _client_on(pool, config=HydraConfig(), fetch_engine=engine) as client:
+        resp = await client.post("/api/strategies/preview", json=body)
+
+    assert resp.status_code == 503, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "data_fetch_failed"
+    assert detail["state"] == "fetch_failed"
+    assert detail["reason"] == "rate_limited"
+    assert detail["symbol"] == "ETHUSDT"
+
+
+async def test_preview_when_the_exchange_has_none_keeps_the_422(
+    pool: Any, strategies_dir: Path
+) -> None:
+    """A market the exchange genuinely has no bars for keeps today's 422 vocabulary."""
+    _write_strategy(strategies_dir, "saw")
+    engine = _FakePreviewEngine(
+        error=NoMarketDataError("binance", "ETHUSDT", Timeframe.H1, None, None, None, None)
+    )
+    body = {
+        "rules": _SAW_RULES,
+        "timeframe": "1h",
+        "exchange_id": "binance",
+        "symbol": "ETHUSDT",
+        "bars_count": 100,
+    }
+
+    async with _client_on(pool, config=HydraConfig(), fetch_engine=engine) as client:
+        resp = await client.post("/api/strategies/preview", json=body)
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "no_market_data"
+    assert detail["state"] == "no_data"
+    assert "No market data for binance ETHUSDT 1h" in detail["message"]
+
+
+async def test_backtest_status_surfaces_the_fetch_detail_and_tolerates_stale_fetching(
+    pool: Any,
+) -> None:
+    """BacktestStatus carries detail.fetch verbatim; on a terminal row the status and
+    error columns stay authoritative even when the stale fetch state says 'fetching'
+    (the B2 requeue-skip and non-typed-exception paths both leave it behind)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO backtest_jobs (id, kind, request, strategy_config, detail, "
+            "status, progress, error) VALUES "
+            "($1, 'backtest', '{}'::jsonb, '{}'::jsonb, $2::jsonb, 'completed', 100, NULL), "
+            "($3, 'backtest', '{}'::jsonb, '{}'::jsonb, $4::jsonb, 'failed', 12.0, $5)",
+            "task-fetched",
+            json.dumps({"fetch": {"state": "fetched", "bars_fetched": 60, "weight_spent": 4}}),
+            "task-stale",
+            json.dumps({"fetch": {"state": "fetching", "bars_fetched": 30, "weight_spent": 2}}),
+            "on-demand fetch for binance BTCUSDT 1h failed (rate_limited)",
+        )
+
+    async with _client_on(pool, config=HydraConfig()) as client:
+        fetched = (await client.get("/api/backtest/status/task-fetched")).json()
+        stale = (await client.get("/api/backtest/status/task-stale")).json()
+
+    assert fetched["status"] == "completed"
+    assert fetched["fetch"] == {"state": "fetched", "bars_fetched": 60, "weight_spent": 4}
+    # the terminal row renders honestly: the columns decide, the fetch state is
+    # informational and never overrides them
+    assert stale["status"] == "failed"
+    assert stale["error"] == "on-demand fetch for binance BTCUSDT 1h failed (rate_limited)"
+    assert stale["fetch"] == {"state": "fetching", "bars_fetched": 30, "weight_spent": 2}
 
 
 # ---------------------------------------------------------------------------

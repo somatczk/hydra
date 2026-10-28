@@ -166,7 +166,10 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   `src/hydra/dashboard/routes/_db.py`; services raise `hydra.services.errors.ServiceError` with the same detail and
   `ServiceErrorRoute` turns it into the HTTP error. The frontend reads it with `dashboard/src/lib/apiState.ts`.
   Reuse both.
-- Backtests run only on stored bars (`hydra.backtest.data`); no data means 422, never a synthetic fallback.
+- Backtests run only on bars stored in `ts.ohlcv_1m` (`hydra.backtest.data`): a job's missing ranges are
+  auto-fetched into it before the run (the submit surfaces never 422 on missing data; the worker and the
+  preview each own one budgeted on-demand fetch engine per process, `data.auto_fetch_enabled=false` restores
+  the submit-time 422), and a genuinely-unavailable range fails `no_market_data`. Nothing is ever synthesised.
   `BacktestRunner` publishes them on a paper `SessionRuntime` bus (in-memory RiskService on bar time, drawdown tiers
   off, metrics muted), so backtest and paper share one execution path; `test_execution_parity.py` keeps them equal.
 - The app version comes from `importlib.metadata.version("hydra")`, so `pyproject.toml` is the single source.

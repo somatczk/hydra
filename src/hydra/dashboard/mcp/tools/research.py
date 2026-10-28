@@ -35,6 +35,12 @@ from hydra.services import universe as universe_svc
 from hydra.services.errors import ServiceError
 
 
+def _auto_fetch() -> bool:
+    """``data.auto_fetch_enabled`` of the engine's config; an unbound state never fetches."""
+    cfg = getattr(_deps.engine_state(), "config", None)
+    return cfg is not None and cfg.data.auto_fetch_enabled
+
+
 @server.tool(name="backtest_run", structured_output=False)
 async def backtest_run(
     strategy_id: str,
@@ -49,8 +55,9 @@ async def backtest_run(
 
     Dates are ISO strings (a bare YYYY-MM-DD is the whole UTC day). Returns
     ``{"task_id", "status": "queued"}``; poll ``backtest_status`` with the task_id.
-    Nothing is simulated without stored bars: a range with no data is a 422
-    ``no_market_data`` error carrying the stored coverage.
+    Nothing is simulated without stored bars: a range with no data is auto-fetched
+    before the run; a genuinely-unavailable range fails the job with
+    ``no_market_data``.
     """
     try:
         body = BacktestRunRequest(
@@ -62,7 +69,7 @@ async def backtest_run(
             timeframe=timeframe,
             fetch_fresh=fetch_fresh,
         )
-        result = await backtest_svc.submit_backtest(_deps.db_pool(), body)
+        result = await backtest_svc.submit_backtest(_deps.db_pool(), body, auto_fetch=_auto_fetch())
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     except ValidationError as exc:
@@ -141,7 +148,7 @@ async def hyperopt_run(
             timeframe=timeframe,
             initial_capital=initial_capital,
         )
-        result = await research_svc.submit_hyperopt(_deps.db_pool(), body)
+        result = await research_svc.submit_hyperopt(_deps.db_pool(), body, auto_fetch=_auto_fetch())
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     except ValidationError as exc:
@@ -210,7 +217,9 @@ async def walkforward_run(
             timeframe=timeframe,
             initial_capital=initial_capital,
         )
-        result = await research_svc.submit_walkforward(_deps.db_pool(), body)
+        result = await research_svc.submit_walkforward(
+            _deps.db_pool(), body, auto_fetch=_auto_fetch()
+        )
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     except ValidationError as exc:

@@ -445,6 +445,16 @@ def test_backtest_run_on_a_missing_strategy_is_the_404_envelope(mcp: _McpClient)
     }
 
 
+def test_backtest_run_description_pins_the_auto_fetch_copy(mcp: _McpClient) -> None:
+    """The copy: cold ranges are auto-fetched before the run; a genuinely-unavailable
+    range fails the job (no new tool — the pin stays at 34)."""
+    [tool] = [t for t in mcp.list_tools() if t["name"] == "backtest_run"]
+    description = " ".join(tool["description"].split())
+    assert "a range with no data is auto-fetched before the run" in description
+    assert "a genuinely-unavailable range fails the job with" in description
+    assert "no_market_data" in description
+
+
 def test_strategy_reload_409_keeps_restart_required_and_changed_fields(
     mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
