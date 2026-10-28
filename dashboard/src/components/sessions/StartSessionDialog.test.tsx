@@ -141,4 +141,56 @@ describe('StartSessionDialog live door', () => {
     expect(body).toEqual({ strategy_id: 'sma-cross-btc-1h', trading_mode: 'paper' });
     expect(calls.some((c) => c.path === '/api/live/session-start')).toBe(false);
   });
+
+  it('renders a 503 engine_unreachable approve as not-confirmed with the Open Sessions link (R30(1))', async () => {
+    const CHALLENGE = liveChallenge({ approval_id: '3f0b9e2a-3000-4000-8000-000000000009', code: '482913' });
+    const timedOut = new ApiError(
+      503,
+      JSON.stringify({
+        detail: {
+          code: 'engine_unreachable',
+          message:
+            'The trading engine did not answer within 20s — the operation may still be executing; check the session or order state before re-submitting',
+          state: 'unavailable',
+        },
+      }),
+    );
+    m = await show(liveStatus({ live_armed: true }), {
+      'POST /api/live/session-start': CHALLENGE,
+      'POST /api/activity/approvals/3f0b9e2a-3000-4000-8000-000000000009/approve': timedOut,
+    });
+    await click(buttonByText(m.container, 'live'));
+    await click(buttonByText(m.container, 'Start live session'));
+    await typeInto(inputByLabel(m.container, 'One-time code'), '482913');
+    await click(buttonByText(m.container, 'Start live session'));
+    expect(text()).toContain('Not confirmed.');
+    expect(text()).toContain(
+      "We couldn't reach the engine, so we don't know whether the live session started. Check the sessions list before trying again.",
+    );
+    expect(text()).toContain('the operation may still be executing');
+    expect(m.container.querySelector('a[href="/trading"]')?.textContent).toBe('Open Sessions');
+    expect(text()).not.toContain('Nothing was started.');
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it('resets to the form after a definite refused live start, for a fresh challenge', async () => {
+    const CHALLENGE = liveChallenge({ approval_id: '3f0b9e2a-3000-4000-8000-000000000009', code: '482913' });
+    const APPROVE = 'POST /api/activity/approvals/3f0b9e2a-3000-4000-8000-000000000009/approve';
+    m = await show(liveStatus({ live_armed: true }), {
+      'POST /api/live/session-start': CHALLENGE,
+      [APPROVE]: { executed: false, result: null, actor: 'user:soma', approved_by: 'user:soma' },
+    });
+    await click(buttonByText(m.container, 'live'));
+    await click(buttonByText(m.container, 'Start live session'));
+    expect(text()).toContain('482913');
+    await typeInto(inputByLabel(m.container, 'One-time code'), '482913');
+    await click(buttonByText(m.container, 'Start live session'));
+    expect(text()).toContain('Nothing was started.');
+    expect(Array.from(m.container.querySelectorAll('label')).map((l) => l.textContent)).not.toContain('One-time code');
+    expect(inputByLabel(m.container, 'Live capital for this session (USDT)').disabled).toBe(false);
+    await click(buttonByText(m.container, 'Start live session'));
+    expect(calls.filter((c) => c.path === '/api/live/session-start')).toHaveLength(2);
+    expect(calls.filter((c) => c.path === '/api/activity/approvals/3f0b9e2a-3000-4000-8000-000000000009/approve')).toHaveLength(1);
+    expect(text()).toContain('482913');
+  });
 });

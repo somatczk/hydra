@@ -499,6 +499,16 @@ describe('liveGateOutcome', () => {
     expect(text(o)).toContain("we don't know whether live trading was turned on");
   });
 
+  it('a 503 engine_unreachable on the approve leg is in-flight-unknown, never claimed off (R30(1))', () => {
+    const msg =
+      'The trading engine did not answer within 20s — the operation may still be executing; check the session or order state before re-submitting';
+    const o = liveGateOutcome({ err: envelope(503, 'engine_unreachable', msg, 'unavailable') });
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(text(o)).toContain("we don't know whether live trading was turned on");
+    expect(o.lines).toContain(msg);
+  });
+
   it("a definite executor refusal (R8's credentials_not_live_capable) says why, never 'couldn't reach'", () => {
     const msg = 'The stored Binance keys can withdraw; connect trade-only keys before arming';
     const o = liveGateOutcome({ err: envelope(409, 'credentials_not_live_capable', msg, 'invalid') });
@@ -647,6 +657,28 @@ describe('liveStartOutcome', () => {
     const o = liveStartOutcome(startReq, { err: envelope(409, 'kill_switch_active', 'Kill switch is on', 'invalid') });
     expect(o.title).toBe('Nothing was started.');
     expect(o.lines).toEqual(['The kill switch is on. Release it on Risk before starting a session.']);
+  });
+
+  it('a 503 engine_unreachable on the approve leg is in-flight-unknown, never "Nothing was started." (R30(1))', () => {
+    const msg =
+      'The trading engine did not answer within 20s — the operation may still be executing; check the session or order state before re-submitting';
+    const o = liveStartOutcome(startReq, { err: envelope(503, 'engine_unreachable', msg, 'unavailable') });
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(text(o)).toContain(
+      "We couldn't reach the engine, so we don't know whether the live session started. Check the sessions list before trying again.",
+    );
+    expect(o.lines).toContain(msg);
+    expect(o.actions).toEqual([{ kind: 'open', label: 'Open Sessions', href: '/trading' }]);
+  });
+
+  it('a 504 or a raw network error stays not-confirmed on the approve leg', () => {
+    const gateway = liveStartOutcome(startReq, { err: envelope(504, 'http_504', 'gateway timeout', 'unavailable') });
+    expect(gateway.title).toBe('Not confirmed.');
+    expect(gateway.unanswered).toBe(true);
+    const net = liveStartOutcome(startReq, { err: new TypeError('Failed to fetch') });
+    expect(net.title).toBe('Not confirmed.');
+    expect(net.unanswered).toBe(true);
   });
 
   it('an executed approve without a session answer stays unknown — the session may exist unwatched', () => {

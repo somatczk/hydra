@@ -182,7 +182,7 @@ describe('LiveGate', () => {
     expect(sectionNode().querySelectorAll('a[href="/trading/live-1"]')).toHaveLength(2);
   });
 
-  it('still names the sessions R10 confirmed while the session list cannot be read', async () => {
+  it('never says no live session over an unreadable list, and still names the sessions R10 confirmed', async () => {
     armed = true;
     m = await gate(
       { '/api/trading/sessions': unavailable('sessions unreadable') },
@@ -194,11 +194,26 @@ describe('LiveGate', () => {
       },
     );
     await click(offButton());
-    expect(dialog().textContent).toContain('No live session is running.');
+    expect(dialog().textContent).toContain('The sessions list is unreadable — live sessions may be running. Check /trading before disarming.');
+    expect(dialog().textContent).not.toContain('No live session is running.');
     await click(buttonByText(dialog(), 'Turn off live trading'));
     expect(text()).toContain('2 live sessions keep running');
     expect(text()).toContain('live-1');
     expect(text()).toContain('live-2');
+  });
+
+  it('says no live session is running only over a readable empty list', async () => {
+    armed = true;
+    m = await gate({}, {
+      'POST /api/live/disarm': () => {
+        armed = false;
+        return disarmResponse();
+      },
+    });
+    await click(offButton());
+    expect(dialog().textContent).toContain('No live session is running.');
+    await click(buttonByText(dialog(), 'Turn off live trading'));
+    expect(text()).toContain('Paper. Every live order will need a one-time code.');
   });
 
   it('never hides a running live session in the paper state, with its Stop link', async () => {

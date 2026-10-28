@@ -32,6 +32,13 @@ function Failure({ outcome }: { outcome: Outcome }) {
       {outcome.lines.map((l) => (
         <p key={l}>{l}</p>
       ))}
+      {outcome.actions.map((a) =>
+        a.href ? (
+          <Link key={a.label} href={a.href} className="underline">
+            {a.label}
+          </Link>
+        ) : null,
+      )}
     </div>
   );
 }
@@ -314,6 +321,8 @@ export function LiveGate() {
               ))}
             </ul>
           </>
+        ) : sessions.data === null ? (
+          <p className="text-caution">The sessions list is unreadable — live sessions may be running. Check /trading before disarming.</p>
         ) : (
           <p>No live session is running.</p>
         )}

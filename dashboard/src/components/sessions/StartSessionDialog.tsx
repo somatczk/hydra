@@ -137,6 +137,15 @@ export function StartSessionDialog({ strategyId, onClose }: StartSessionDialogPr
         router.push(outcome.navigate);
         return;
       }
+      if ('ok' in result && !result.ok.executed) {
+        // The refusal consumed the code; a fresh start needs a fresh challenge.
+        setFailure(outcome);
+        setPhase('form');
+        setChallenge(null);
+        setCode('');
+        setCodeError(null);
+        return;
+      }
       const d = 'err' in result ? parseErrorDetail(result.err) : null;
       if (d && DECIDED.has(d.code)) {
         const expired = d.code === 'approval_expired';

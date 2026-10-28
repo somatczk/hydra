@@ -665,8 +665,9 @@ export function liveGateOutcome(result: Result<ApproveResponse>, phase: LivePhas
     };
   }
   if (d?.code === 'principal_not_allowed') return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
-  // A definite refusal the engine did answer (R8's credentials_not_live_capable, a live_capital_missing
-  // 403, a kill_switch_active 409 …) — never "we couldn't reach the engine" for a 4xx that arrived.
+  // R30(1): a timed-out call may still be arming on the trader — in-flight-unknown, never claimed off.
+  if (d?.code === 'engine_unreachable') return notConfirmed('live trading was turned on', err);
+  // A definite 4xx refusal the engine answered — never "couldn't reach the engine" for one that arrived.
   if (d && !unreachable(err)) return { tone: 'caution', title: "Live trading wasn't turned on.", lines: [d.message], actions: [] };
   return notConfirmed('live trading was turned on', err);
 }
@@ -831,8 +832,13 @@ export function liveStartOutcome(
     };
   }
   if (d?.code === 'principal_not_allowed') return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
-  // A definite executor refusal (kill_switch_active, session_already_running, live_not_armed …) after
-  // R22 re-raises with its own code; the start vocabulary already carries the sentence.
+  // R30(1): a timed-out call may still be starting the session on the trader — it may run unwatched.
+  if (d?.code === 'engine_unreachable') {
+    return notConfirmed('the live session started', err, 'Check the sessions list before trying again.', [
+      { kind: 'open', label: 'Open Sessions', href: '/trading' },
+    ]);
+  }
+  // A definite executor refusal after R22 re-raises its own code; the start vocabulary carries the sentence.
   if (d && !unreachable(err)) {
     return { tone: 'caution', title: 'Nothing was started.', lines: [copyForCode(d.code, d)], actions: [] };
   }
