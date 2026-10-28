@@ -5,6 +5,11 @@ only while the heartbeat file is fresh. Jobs run directly on the worker's event 
 yields every 100 bars and hyperopt yields per trial, so ``cancel()`` and the job timeout apply
 natively. The worker never runs migrations (the engine owns them): it waits until the schema is
 at the Alembic head, then requeues rows a dead worker left running (up to three attempts).
+
+A job never fails "data unavailable": the worker holds ONE on-demand fetch engine (and one
+refcounted REST client pool) for its whole lifetime, and every job fetches exactly its missing
+bars before the run — the fetch phase maps to progress 0→20 and the engine's progress dict rides
+the job detail, flushed live by the 10 s tick.
 """
 
 from __future__ import annotations
@@ -20,9 +25,10 @@ import tempfile
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hydra.backtest import jobs
 from hydra.backtest.hyperopt import HyperoptRunner, ParamDef, ParameterSpace
@@ -35,9 +41,17 @@ from hydra.backtest.jobs import (
 )
 from hydra.backtest.runner import BacktestRunner
 from hydra.backtest.walkforward import WalkForwardAnalyzer
+from hydra.core.types import ExchangeId, Timeframe
+from hydra.data.bars import timeframe_seconds
+from hydra.data.errors import DataFetchError, NoMarketDataError
 from hydra.data.migrations.runner import current_revision, head_revision
+from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
+from hydra.execution.client_factory import RestHandle, RestPoolFactory, SharedRestClients
 from hydra.risk.state import PgRiskStateStore
 from hydra.strategy.config import StrategyConfig
+
+if TYPE_CHECKING:
+    from hydra.core.config import HydraConfig
 
 logger = logging.getLogger(__name__)
 
@@ -65,23 +79,134 @@ class JobRun:
 
 
 # ---------------------------------------------------------------------------
+# The fetch engine: exactly one instance per worker process
+# ---------------------------------------------------------------------------
+
+
+class _WorkerFetchClients:
+    """The worker-lifetime REST clients behind the on-demand fetch engine.
+
+    One refcounted pool per worker process: the first fetching job constructs the
+    exchange client — ``load_markets`` is paid once per worker, not per job — and
+    shutdown releases the held handle, which closes the client.
+    """
+
+    def __init__(self, rest_factory: RestPoolFactory | None = None) -> None:
+        if rest_factory is None:
+            self._pool = SharedRestClients()
+        else:
+            self._pool = SharedRestClients(rest_factory)
+        self._handles: dict[ExchangeId, RestHandle] = {}
+
+    async def client(self, exchange_id: ExchangeId) -> Any:
+        """The pooled client for one exchange, constructed on first use."""
+        handle = self._handles.get(exchange_id)
+        if handle is None:
+            handle = await self._pool.handle(exchange_id)
+            # Two concurrent cold fetches both acquire; the loser must not leak its reference.
+            existing = self._handles.setdefault(exchange_id, handle)
+            if existing is not handle:
+                await handle.release()
+                handle = existing
+        return handle.client
+
+    def fetch_engine(self, cfg: HydraConfig) -> OnDemandFetchService | None:
+        """The one engine per worker process; ``None`` while the kill switch is off."""
+        if not cfg.data.auto_fetch_enabled:
+            return None
+        return OnDemandFetchService.from_config(cfg.data, self.client)
+
+    async def close(self) -> None:
+        for handle in self._handles.values():
+            await handle.release()
+        self._handles.clear()
+
+
+# ---------------------------------------------------------------------------
+# The fetch phase: progress 0→20, the engine's dict live on the job detail
+# ---------------------------------------------------------------------------
+
+
+def _bars_owed(ranges: list[list[str]], timeframe: Timeframe) -> int:
+    """Bars the engine is fetching over its grid-aligned ranges (inclusive bounds)."""
+    step = timeframe_seconds(timeframe)
+    return sum(
+        int((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() // step)
+        + 1
+        for start, end in ranges
+    )
+
+
+def _fetch_progress(run: JobRun, timeframe: Timeframe) -> ProgressCallback:
+    """Map the engine's progress stream onto the 0→20 band and ``detail['fetch']``."""
+
+    def on_progress(progress: dict[str, Any]) -> None:
+        run.detail["fetch"] = progress
+        owed = _bars_owed(progress["ranges"], timeframe)
+        if owed:
+            run.progress = min(20.0, round(20.0 * progress["bars_fetched"] / owed, 1))
+
+    return on_progress
+
+
+def _fetch_failed(run: JobRun, **extra: Any) -> None:
+    """Stamp the terminal failure on the fetch detail, keeping the last counters."""
+    run.detail["fetch"] = {**(run.detail.get("fetch") or {}), "state": "failed", **extra}
+
+
+async def _ensure_bars(
+    pool: Any,
+    fetch_engine: OnDemandFetchService | None,
+    config: StrategyConfig,
+    start: datetime,
+    end: datetime,
+    run: JobRun,
+    *,
+    force: bool = False,
+) -> None:
+    """The fetch phase: make the range's bars available before the handlers load them.
+
+    ``fetch_engine=None`` (the kill switch) skips the phase — today's behaviour. A
+    fetch past patience fails the job retryable with the reason on the row; a range
+    the exchange genuinely lacks re-raises the P0-B no-market-data vocabulary.
+    """
+    if fetch_engine is None:
+        return
+    try:
+        await jobs.ensure_job_bars(
+            pool,
+            fetch_engine,
+            config,
+            start,
+            end,
+            force=force,
+            on_progress=_fetch_progress(run, config.timeframes.primary),
+        )
+    except DataFetchError as exc:
+        _fetch_failed(run, reason=exc.reason)
+        raise JobError(exc.message) from exc
+    except NoMarketDataError:
+        _fetch_failed(run)
+        raise
+    run.progress = 20.0
+
+
+# ---------------------------------------------------------------------------
 # Job handlers
 # ---------------------------------------------------------------------------
 
 
-async def run_backtest_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> JobOutcome:
+async def run_backtest_job(
+    pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
+) -> JobOutcome:
     """Execute a backtest on stored bars and persist it as ``bt-{job_id}``."""
     body = BacktestRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
 
-    if body.fetch_fresh:
-        run.progress = 10.0
-        fetch_error = await jobs.fetch_fresh_bars(pool, config, body.start_date, body.end_date)
-        if fetch_error is not None:
-            run.detail["fetch_error"] = fetch_error
-    run.progress = 20.0
-
+    await _ensure_bars(
+        pool, fetch_engine, config, body.start_date, body.end_date, run, force=body.fetch_fresh
+    )
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
     run.detail["provenance"] = jobs.provenance_payload(provenance, config)
     run.progress = 30.0
@@ -112,12 +237,15 @@ async def run_backtest_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> Jo
     return JobOutcome(result_id=result_id)
 
 
-async def run_hyperopt_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> JobOutcome:
+async def run_hyperopt_job(
+    pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
+) -> JobOutcome:
     """Execute a hyperopt run on stored bars; the result payload is stored on the row."""
     body = HyperoptRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
 
+    await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
     provenance_dict = jobs.provenance_payload(provenance, config)
     run.detail["provenance"] = provenance_dict
@@ -158,12 +286,15 @@ async def run_hyperopt_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> Jo
     return JobOutcome(result=payload)
 
 
-async def run_walkforward_job(pool: Any, job: Mapping[str, Any], run: JobRun) -> JobOutcome:
+async def run_walkforward_job(
+    pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
+) -> JobOutcome:
     """Execute a walk-forward analysis on stored bars; the folds are stored on the row."""
     body = WalkForwardRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
 
+    await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
     run.detail["provenance"] = jobs.provenance_payload(provenance, config)
 
@@ -199,7 +330,10 @@ async def run_walkforward_job(pool: Any, job: Mapping[str, Any], run: JobRun) ->
     return JobOutcome(result=result.to_dict())
 
 
-Handler = Callable[[Any, Mapping[str, Any], JobRun], Coroutine[Any, Any, JobOutcome]]
+Handler = Callable[
+    [Any, OnDemandFetchService | None, Mapping[str, Any], JobRun],
+    Coroutine[Any, Any, JobOutcome],
+]
 
 _HANDLERS: dict[str, Handler] = {
     "backtest": run_backtest_job,
@@ -298,6 +432,7 @@ async def _run_claimed(
     timeout_s: float = JOB_TIMEOUT_S,
     tick_s: float = TICK_S,
     stop: asyncio.Event | None = None,
+    fetch_engine: OnDemandFetchService | None = None,
 ) -> None:
     """Run one claimed job to a terminal row state (or requeue it when shutting down)."""
     job_id = job["id"]
@@ -309,7 +444,7 @@ async def _run_claimed(
         return
 
     run = JobRun(detail=jobs.json_value(job["detail"]) or {})
-    job_task = asyncio.create_task(handler(pool, job, run))
+    job_task = asyncio.create_task(handler(pool, fetch_engine, job, run))
     tick_task = asyncio.create_task(_tick_loop(pool, job_id, run, job_task, tick_s))
     stop_task = asyncio.create_task(_cancel_on_stop(stop, job_task)) if stop is not None else None
     try:
@@ -361,12 +496,13 @@ async def run_once(
     timeout_s: float = JOB_TIMEOUT_S,
     tick_s: float = TICK_S,
     worker_id: str = WORKER_ID,
+    fetch_engine: OnDemandFetchService | None = None,
 ) -> str | None:
     """Claim and run exactly one job; its id, or None when the queue is empty."""
     job = await jobs.claim(pool, worker_id)
     if job is None:
         return None
-    await _run_claimed(pool, job, timeout_s=timeout_s, tick_s=tick_s)
+    await _run_claimed(pool, job, timeout_s=timeout_s, tick_s=tick_s, fetch_engine=fetch_engine)
     return str(job["id"])
 
 
@@ -412,7 +548,7 @@ async def _create_pool(dsn: str) -> Any:
             delay = min(delay * 2, 5.0)
 
 
-async def _serve_forever(pool: Any) -> None:
+async def _serve_forever(pool: Any, fetch_engine: OnDemandFetchService | None) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -430,7 +566,7 @@ async def _serve_forever(pool: Any) -> None:
                 await asyncio.wait_for(stop.wait(), IDLE_SLEEP_S)
             continue
         try:
-            await _run_claimed(pool, job, stop=stop)
+            await _run_claimed(pool, job, stop=stop, fetch_engine=fetch_engine)
         except Exception:
             logger.exception(
                 "Job %s could not reach a terminal state; it stays running and is requeued "
@@ -452,13 +588,18 @@ async def main() -> None:
         raise SystemExit(2)
 
     pool = await _create_pool(dsn)
+    fetch_clients = _WorkerFetchClients()
     try:
         await wait_for_schema(dsn)
         await jobs.requeue_abandoned(pool)
-        logger.info("Backtest worker started")
-        await _serve_forever(pool)
+        fetch_engine = fetch_clients.fetch_engine(cfg)
+        logger.info(
+            "Backtest worker started (auto-fetch %s)", "on" if fetch_engine is not None else "off"
+        )
+        await _serve_forever(pool, fetch_engine)
     finally:
         await pool.close()
+        await fetch_clients.close()
 
 
 if __name__ == "__main__":
