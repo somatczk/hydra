@@ -218,3 +218,27 @@ async def test_bulk_download_auto_pages_accumulate_the_ledger(pool: Any) -> None
     assert (entries[0].first_ts, entries[0].last_ts) == (G0, G0 + 9 * H)
     assert set((await _sources(pool, timeframe="1h")).values()) == {"auto"}
     assert await cache_totals(pool) == (10, 1)
+
+
+async def test_set_cache_status_flips_only_the_status(pool: Any) -> None:
+    """The fetch engine's status writes: only the flag moves, never range or count."""
+    repo = MarketDataRepository.from_pool(pool)
+    bars = [("binance", "BTCUSDT", Timeframe.M1, _bar(T0 + i * M)) for i in range(5)]
+    assert await repo.upsert_closed_bars(bars, source="auto") == (5, 0)
+
+    await repo.set_cache_status("binance", "BTCUSDT", Timeframe.M1, "fetching", T0, T0 + 9 * M)
+    entry = (await list_cache_entries(pool))[0]
+    assert entry.status == "fetching"
+    assert entry.rows == 5
+    assert (entry.first_ts, entry.last_ts) == (T0, T0 + 4 * M)
+
+    await repo.set_cache_status("binance", "BTCUSDT", Timeframe.M1, "ready", T0, T0 + 9 * M)
+    assert (await list_cache_entries(pool))[0].status == "ready"
+
+    # A dataset with no bars and no ledger row is seeded over the requested range.
+    await repo.set_cache_status("binance", "ETHUSDT", Timeframe.M1, "fetching", T0, T0 + 9 * M)
+    seeded = [e for e in await list_cache_entries(pool) if e.symbol == "ETHUSDT"]
+    assert len(seeded) == 1
+    assert seeded[0].status == "fetching"
+    assert seeded[0].rows == 0
+    assert (seeded[0].first_ts, seeded[0].last_ts) == (T0, T0 + 9 * M)

@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
@@ -88,7 +88,7 @@ async def iter_closed_bar_pages(
     max_retries: int = 5,
     sleep: Sleep = asyncio.sleep,
     normalizer: DataNormalizer | None = None,
-) -> AsyncIterator[list[OHLCV]]:
+) -> AsyncGenerator[list[OHLCV], None]:
     """Yield pages of closed bars with open time in ``[start, end]``, oldest first.
 
     ``start`` is rounded up and ``end`` down to the bar grid. Rows outside the range and the
@@ -317,7 +317,7 @@ class ExchangeBackfillService:
         now: datetime | None = None,
         max_retries: int = 5,
         sleep: Sleep = asyncio.sleep,
-        source: str = "feed",
+        source: Literal["feed", "auto"] = "feed",
     ) -> int:
         """Download closed bars via paginated CCXT REST calls and upsert them.
 
