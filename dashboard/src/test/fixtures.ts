@@ -12,6 +12,7 @@ import type {
   SessionResponse,
   TradeItem,
 } from '@/lib/derive';
+import type { DisarmResponse, LiveApprovalChallenge } from '@/lib/outcomes';
 
 /** trading.py:56-75 SessionResponse, filled by `_session_to_dict` (trading.py:250-265) — no A3+ fields. */
 export function session(over: Partial<SessionResponse> = {}): SessionResponse {
@@ -152,4 +153,28 @@ export function pendingApproval(over: Partial<PendingApproval> = {}): PendingApp
 /** routes/activity.py ApprovalDetail (activity.py:91-95). */
 export function approvalDetail(over: Partial<ApprovalDetail> = {}): ApprovalDetail {
   return { ...pendingApproval(), attempts_left: 5, approved_by: null, decided_at: null, error: null, ...over };
+}
+
+/** R9: the single create-route answer for /api/live/arm, /session-start, /order and /credential-delete —
+ * the engine-issued challenge the L4 dialog shows once; the code is typed into the approve endpoint. */
+export function liveChallenge(over: Partial<LiveApprovalChallenge> = {}): LiveApprovalChallenge {
+  return {
+    status: 'approval_required',
+    approval_id: '3f0b9e2a-2000-4000-8000-000000000001',
+    code: '482913',
+    expires_at: '2026-10-21T14:10:04+00:00',
+    params: { live_capital: 5000 },
+    note: 'Enter this code once to turn on live trading.',
+    ...over,
+  };
+}
+
+/** R10: POST /api/live/disarm names the live sessions that keep running (ids + count). */
+export function disarmResponse(over: Partial<DisarmResponse> = {}): DisarmResponse {
+  return {
+    live_armed: false,
+    running_live_sessions: [],
+    running_live_sessions_count: 0,
+    ...over,
+  };
 }

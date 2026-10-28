@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { advance, mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
-import { liveStatus, platformConfig, session } from '@/test/fixtures';
+import { liveSession, liveStatus, platformConfig, session } from '@/test/fixtures';
 
 vi.mock('next/navigation', () => ({ usePathname: () => '/trading/abc' }));
 const fetchApi = vi.fn();
@@ -139,11 +139,43 @@ describe('Header', () => {
     expect(header()).toContain('PAPER');
   });
 
-  it('keeps PAPER and states the stored mode when the config says live (case 11)', async () => {
+  it('ignores the stored config mode entirely: config live, gate off, no live session -> PAPER (case 11 reworked)', async () => {
     setup({ '/api/system/config': platformConfig({ trading_mode: 'live' }) });
     m = await shell();
     expect(header()).toContain('PAPER');
-    expect(header()).toContain('Stored mode is live; live trading is refused until a later release. Showing paper.');
+    expect(header()).not.toContain('Stored mode is live');
+    expect(header()).not.toContain('LIVE');
+  });
+
+  it('shows LIVE with real money when the gate is armed, before any session runs', async () => {
+    setup({ '/api/risk/live-status': liveStatus({ live_armed: true }) });
+    m = await shell();
+    expect(header()).toContain('LIVE');
+    expect(header()).toContain('real money');
+    expect(header()).not.toContain('PAPER');
+  });
+
+  it('shows LIVE over a running live session even while the config says paper (the safety reading)', async () => {
+    setup({ '/api/trading/sessions': [liveSession()] });
+    m = await shell();
+    expect(header()).toContain('LIVE');
+    expect(header()).not.toContain('PAPER');
+  });
+
+  it('keeps LIVE over a stopped live session still holding real positions (R23)', async () => {
+    setup({
+      '/api/trading/sessions': [liveSession({ session_id: 'h1', status: 'stopped', positions_at_stop: 1 })],
+    });
+    m = await shell();
+    expect(header()).toContain('LIVE');
+    expect(header()).not.toContain('PAPER');
+  });
+
+  it('renders "?" and never PAPER while the live status cannot be read (R23, fail-closed)', async () => {
+    setup({ '/api/risk/live-status': unavailable() });
+    m = await shell();
+    expect(header()).toContain('Trading mode unknown');
+    expect(header()).not.toContain('PAPER');
   });
 
   it('polls live-status, sessions, config and pending approvals from the shell only', async () => {

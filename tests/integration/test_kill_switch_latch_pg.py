@@ -255,7 +255,14 @@ class TestLatchApplicationFailure:
                     break
                 await asyncio.sleep(0.05)
             assert mgr.kill_switch_active() is True
+            # the flag flips on the first service's memory latch, before either scope's
+            # audit row is written (each activation latches, persists, then audits): poll
             rows = await _latch_events(pool, "kill_switch_on")
+            for _ in range(200):
+                if len(rows) >= 3:
+                    break
+                await asyncio.sleep(0.05)
+                rows = await _latch_events(pool, "kill_switch_on")
             assert [r["actor"] for r in rows] == ["user:ada", "db-latch", "db-latch"]
             assert [r["scope"] for r in rows] == ["global", "paper", "live"]
 

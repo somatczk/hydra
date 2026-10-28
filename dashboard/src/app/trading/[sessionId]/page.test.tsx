@@ -128,6 +128,23 @@ describe('session detail', () => {
     expect(text()).not.toContain('Stop session…');
   });
 
+  it('shows the LIVE chip by the h1 and the real-money account note for a live session', async () => {
+    setup(detail({ trading_mode: 'live' }));
+    m = await page();
+    const heading = m.container.querySelector('h1')?.parentElement?.textContent ?? '';
+    expect(heading).toContain('LIVE');
+    expect(heading).toContain('real money');
+    const account = document.getElementById('account-heading')?.parentElement?.textContent ?? '';
+    expect(account).toContain('Real money on Binance.');
+  });
+
+  it('shows neither the LIVE chip nor the real-money note on a paper session', async () => {
+    setup(detail());
+    m = await page();
+    expect(m.container.querySelector('h1')?.parentElement?.textContent ?? '').not.toContain('LIVE');
+    expect(text()).not.toContain('Real money on Binance');
+  });
+
   it('names the positions at stake in the stop confirm and sends one DELETE', async () => {
     setup(detail({ positions: [HELD] }), { [`DELETE /api/trading/sessions/${ID}`]: session({ status: 'stopped' }) });
     m = await page();

@@ -17,6 +17,7 @@ import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDialog';
+import { LiveGate } from '@/components/live/LiveGate';
 
 /* ---------- Types ---------- */
 
@@ -49,7 +50,6 @@ interface ApiExchange {
 }
 
 interface PlatformConfig {
-  trading_mode: string;
   default_pair: string;
   default_timeframe: string;
   max_concurrent_strategies: number;
@@ -163,7 +163,6 @@ export default function SettingsPage() {
   const [exchanges, setExchanges] = useState<Exchange[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
-  const [tradingMode, setTradingMode] = useState<string | null>(null);
   const [defaultPair, setDefaultPair] = useState('BTC/USDT');
   const [defaultTimeframe, setDefaultTimeframe] = useState('1h');
   const [maxStrategies, setMaxStrategies] = useState('5');
@@ -205,7 +204,6 @@ export default function SettingsPage() {
         .catch((err) => { setFetchErrors((prev) => ({ ...prev, exchanges: err ?? true })); }),
       fetchApi<PlatformConfig>('/api/system/config')
         .then((cfg) => {
-          setTradingMode(cfg.trading_mode);
           setDefaultPair(cfg.default_pair);
           setDefaultTimeframe(cfg.default_timeframe);
           setMaxStrategies(cfg.max_concurrent_strategies.toString());
@@ -533,6 +531,8 @@ export default function SettingsPage() {
         )}
       </Section>
 
+      <LiveGate />
+
       <Section title="Alerts">
         <div className="space-y-2 text-sm text-ink-1">
           <p>Alerts are sent by Alertmanager to Telegram. Change them in the alert rules, not here.</p>
@@ -668,14 +668,6 @@ export default function SettingsPage() {
                 value={defaultTimeframe}
                 onChange={(e) => setDefaultTimeframe(e.target.value)}
               />
-              <div>
-                <p className="text-sm font-medium text-ink-2">Trading mode</p>
-                <p className="mt-1.5 text-sm text-ink-1" data-testid="trading-mode">
-                  {tradingMode === 'paper'
-                    ? 'Paper. Live trading arrives with a later release and will need a one-time code to turn on.'
-                    : `Stored mode is ${tradingMode ?? 'unknown'}; live trading is refused until a later release. Showing paper.`}
-                </p>
-              </div>
               <Input
                 label="Max Concurrent Strategies"
                 type="number"

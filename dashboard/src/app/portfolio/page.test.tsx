@@ -158,7 +158,7 @@ describe('PortfolioPage as the Performance screen', () => {
 });
 
 describe('PortfolioPage source pinning, export scope and chart data', () => {
-  it('pins source=paper and says so when the stored mode is live', async () => {
+  it('pins source=paper even when a stored mode says live (the mode no longer derives from config)', async () => {
     const routes = { ...paperRoutes(), '/api/system/config': { trading_mode: 'live' } };
     fetchApi.mockImplementation(routeFetch(routes, calls));
     page = await mount(<PortfolioPage />);
@@ -167,9 +167,7 @@ describe('PortfolioPage source pinning, export scope and chart data', () => {
     expect(portfolioCalls.length).toBeGreaterThanOrEqual(6);
     expect(portfolioCalls.every((c) => c.path.includes('source=paper'))).toBe(true);
     expect(calls.some((c) => c.path.includes('source=live'))).toBe(false);
-    expect(page.container.querySelector('[data-testid="stored-mode-note"]')?.textContent).toContain(
-      'Stored mode is live',
-    );
+    expect(page.container.querySelector('[data-testid="stored-mode-note"]')).toBeNull();
   });
 
   it('scopes the export to the paper source', async () => {

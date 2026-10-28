@@ -152,7 +152,6 @@ export default function PortfolioPage() {
   const [attribution, setAttribution] = useState<AttributionItem[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [source, setSource] = useState<'paper' | null>(null);
-  const [storedMode, setStoredMode] = useState<string | null>(null);
   const [isDark, setIsDark] = useState(false);
   const [fetchErrors, setFetchErrors] = useState<Record<string, unknown>>({});
 
@@ -194,9 +193,8 @@ export default function PortfolioPage() {
     let source: 'paper' | null = null;
     let configError: unknown = null;
     try {
-      const cfg = await fetchApi<{ trading_mode: string }>('/api/system/config');
+      await fetchApi('/api/system/config');
       source = 'paper'; // live is refused until P3; Settings says the same
-      setStoredMode(cfg.trading_mode);
     } catch (err) {
       logger.warn('Portfolio', 'Trading mode unknown; portfolio data not requested', err);
       configError = err ?? true;
@@ -514,12 +512,6 @@ export default function PortfolioPage() {
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-xl font-semibold text-ink-1">Performance</h1>
-      {storedMode !== null && storedMode !== 'paper' && (
-        <p className="text-xs text-ink-2" data-testid="stored-mode-note">
-          Stored mode is {storedMode}; live trading is refused until a later release. Showing paper.
-        </p>
-      )}
-
       {summary?.paper_capital_pending != null && (
         <p className="rounded-lg border border-caution/30 bg-caution-soft p-3 text-xs text-ink-1" data-testid="capital-pending">
           Paper capital change to {summary.paper_capital_pending.toLocaleString('en-US')} USDT is pending: the

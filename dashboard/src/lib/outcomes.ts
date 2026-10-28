@@ -62,6 +62,26 @@ export interface LiveApprovalChallenge {
   note: string;
 }
 
+/** R10: POST /api/live/disarm answers the armed state plus the live sessions that keep running
+ * (ids + count) so the UI can never hide real money behind a disarmed gate. */
+export interface DisarmResponse {
+  live_armed: boolean;
+  running_live_sessions: string[];
+  running_live_sessions_count: number;
+}
+
+/** POST /api/live/session-start (R9's create-route): the same facts as a paper start, plus the reason
+ * the approval store needs; the challenge params bind them. */
+export interface LiveSessionStartRequest {
+  strategy_id: string;
+  paper_capital?: string;
+  reason: string;
+}
+
+/** R19 (the amended 06 §10 body, verbatim): the facts block of the L4 arm and live-start ceremonies. */
+export const LIVE_FACTS =
+  "Live sessions place real orders on Binance with real money. Paper sessions keep running. Every live order you place needs the one-time code; once a live session starts, its strategy trades under that start's authorization — bounded by the kill switch, risk limits and exchange stops.";
+
 /** trading.py:213-226 QuickTradeResponse: no stop price anywhere. */
 export interface QuickTradeResponse {
   order_id: string | null;
@@ -645,6 +665,10 @@ export function liveGateOutcome(result: Result<ApproveResponse>, phase: LivePhas
     };
   }
   if (d?.code === 'principal_not_allowed') return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
+  // R30(1): a timed-out call may still be arming on the trader — in-flight-unknown, never claimed off.
+  if (d?.code === 'engine_unreachable') return notConfirmed('live trading was turned on', err);
+  // A definite 4xx refusal the engine answered — never "couldn't reach the engine" for one that arrived.
+  if (d && !unreachable(err)) return { tone: 'caution', title: "Live trading wasn't turned on.", lines: [d.message], actions: [] };
   return notConfirmed('live trading was turned on', err);
 }
 
@@ -749,4 +773,74 @@ export function liveOrderOutcome(
   }
   // risk_rejected lands here only after R22 (approvals.py re-raises ServiceError); kept for seam #8
   return quickTradeOutcome(req, { err }, selectedSessionId);
+}
+
+/** POST /api/live/session-start (the challenge, R9), then the existing approve endpoint whose `result`
+ * is the started SessionResponse (seam #1: the executor calls sessions_svc.start_session). A failed
+ * challenge started nothing, so it can say so; a definite executor refusal names why; an approve the
+ * engine never answered stays not-confirmed — the session may exist unwatched (R24's start line). */
+export function liveStartOutcome(
+  req: LiveSessionStartRequest,
+  result: Result<ApproveResponse>,
+  phase: LivePhase = 'approve',
+  now: number = Date.now(),
+): Outcome {
+  if ('ok' in result) {
+    if (result.ok.executed === false) return { tone: 'caution', title: 'Nothing was started.', lines: [], actions: [] };
+    const r = result.ok.result;
+    if (typeof r !== 'object' || r === null || typeof (r as SessionResponse).session_id !== 'string') {
+      return {
+        tone: 'danger',
+        title: 'Not confirmed.',
+        lines: ["We don't know whether the session started. Check the sessions list before trying again."],
+        actions: [{ kind: 'open', label: 'Open Sessions', href: '/trading' }],
+        unanswered: true,
+      };
+    }
+    const s = r as SessionResponse;
+    const asked = req.paper_capital !== undefined ? Number(req.paper_capital) : null;
+    const clamped =
+      asked !== null && s.paper_capital !== null && s.paper_capital < asked
+        ? [`Asked ${money(asked)}; started with ${money(s.paper_capital)} (all that was unallocated).`]
+        : [];
+    return {
+      ...ok(`Started ${utc(s.started_at ?? now, now)}.`, [
+        `Warming up. Waiting for the first closed ${s.timeframe} bar.`,
+        'This session places real orders on Binance with real money.',
+        ...clamped,
+      ]),
+      navigate: `/trading/${s.session_id}`,
+    };
+  }
+  const err = result.err;
+  if (isSignedOut(err)) return signedOut('start the session again');
+  const d = parseErrorDetail(err);
+  if (phase === 'challenge') return challengeOutcome('Nothing was started.', err);
+  if (d?.code === 'code_mismatch') return liveCodeMismatch('Nothing was started.', d);
+  if (d?.code === 'approval_execution_failed') {
+    return { tone: 'caution', title: 'Nothing was started.', lines: [d.message], actions: [retry] };
+  }
+  if (d?.code === 'already_decided' || d?.code === 'approval_expired' || d?.code === 'approval_failed') {
+    return { tone: 'caution', title: d.message, lines: ['Nothing was started from this screen.'], actions: [] };
+  }
+  if (d?.code === 'executor_not_registered') {
+    return {
+      tone: 'caution',
+      title: 'The engine cannot execute this action yet.',
+      lines: [d.message, 'The code was not used. Wait for the engine, or deny this request.'],
+      actions: [],
+    };
+  }
+  if (d?.code === 'principal_not_allowed') return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
+  // R30(1): a timed-out call may still be starting the session on the trader — it may run unwatched.
+  if (d?.code === 'engine_unreachable') {
+    return notConfirmed('the live session started', err, 'Check the sessions list before trying again.', [
+      { kind: 'open', label: 'Open Sessions', href: '/trading' },
+    ]);
+  }
+  // A definite executor refusal after R22 re-raises its own code; the start vocabulary carries the sentence.
+  if (d && !unreachable(err)) {
+    return { tone: 'caution', title: 'Nothing was started.', lines: [copyForCode(d.code, d)], actions: [] };
+  }
+  return notConfirmed('the live session started', err);
 }
