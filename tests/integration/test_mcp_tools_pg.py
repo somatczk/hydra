@@ -38,6 +38,7 @@ from structlog.testing import capture_logs
 
 from hydra.backtest import jobs
 from hydra.backtest.data import DataProvenance
+from hydra.core import metrics
 from hydra.core.config import HydraConfig, load_config
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
@@ -244,7 +245,116 @@ async def test_data_coverage_returns_the_exact_stored_range(
         "first_ts": "2026-01-01T00:00:00+00:00",
         "last_ts": "2026-01-01T04:00:00+00:00",
         "bar_count": 5,
+        "sources": {"feed": 5, "auto": 0},
+        "estimated_bytes": 5 * 160,
+        "cache": None,
     }
+
+
+async def test_data_inventory_lists_the_cache_with_the_coverage_semantics(
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inventory and the coverage's ledger block on real PG: the LRU datasets with
+    their requested coverage ranges (the pre-listing tail stays while rows credits only
+    inserted bars), the honest rows=0 "no bars" seed, and the totals over the ledger."""
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    metrics.mark_data_sweep(at=1_761_628_200.0)
+    async with _mcp_session(cfg) as mcp:
+        repo = MarketDataRepository.from_pool(pool)
+        # an unfetchable pair's permanent seed: a requested grid, no bars
+        await repo.set_cache_status(
+            "binance",
+            "ETHUSDT",
+            Timeframe.H1,
+            "ready",
+            datetime(2025, 12, 1, tzinfo=UTC),
+            datetime(2026, 2, 1, tzinfo=UTC),
+        )
+        # a fetched dataset: the wide requested grid first, then 5 inserted bars
+        await repo.set_cache_status(
+            "binance",
+            "BTCUSDT",
+            Timeframe.M1,
+            "fetching",
+            datetime(2025, 12, 1, tzinfo=UTC),
+            datetime(2026, 2, 1, tzinfo=UTC),
+        )
+        assert await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _bar(i)) for i in range(5)],
+            source="auto",
+        ) == (5, 0)
+        await repo.set_cache_status(
+            "binance",
+            "BTCUSDT",
+            Timeframe.M1,
+            "ready",
+            datetime(2025, 12, 1, tzinfo=UTC),
+            datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+        is_error, text = await mcp.call("data_inventory", {})
+        assert not is_error
+        inventory = json.loads(text)
+        seed, fetched = inventory["datasets"]
+        assert [d["symbol"] for d in inventory["datasets"]] == ["ETHUSDT", "BTCUSDT"]
+        assert {k: v for k, v in seed.items() if k != "last_used_at"} == {
+            "exchange": "binance",
+            "symbol": "ETHUSDT",
+            "timeframe": "1h",
+            "coverage": {
+                "first_ts": "2025-12-01T00:00:00+00:00",
+                "last_ts": "2026-02-01T00:00:00+00:00",
+            },
+            "rows": 0,
+            "estimated_bytes": 0,
+            "status": "ready",
+        }
+        assert {k: v for k, v in fetched.items() if k != "last_used_at"} == {
+            "exchange": "binance",
+            "symbol": "BTCUSDT",
+            "timeframe": "1m",
+            "coverage": {
+                "first_ts": "2025-12-01T00:00:00+00:00",
+                "last_ts": "2026-02-01T00:00:00+00:00",
+            },
+            "rows": 5,
+            "estimated_bytes": 5 * 160,
+            "status": "ready",
+        }
+        for dataset in inventory["datasets"]:
+            used = datetime.fromisoformat(dataset["last_used_at"])
+            assert abs(datetime.now(UTC) - used) < timedelta(minutes=5)
+        assert inventory["totals"] == {
+            "bytes": 5 * 160,
+            "rows": 5,
+            "pairs": 2,
+            "budget_bytes": 10 * 2**30,
+            "last_sweep": "2025-10-28T05:10:00+00:00",
+        }
+
+        is_error, text = await mcp.call(
+            "data_coverage", {"exchange_id": "binance", "symbol": "BTCUSDT", "timeframe": "1m"}
+        )
+        assert not is_error
+        coverage = json.loads(text)
+        assert coverage["sources"] == {"feed": 0, "auto": 5}
+        assert coverage["bar_count"] == 5
+        assert coverage["estimated_bytes"] == 5 * 160
+        assert {
+            k: v
+            for k, v in coverage["cache"].items()
+            if k not in ("last_used_at", "last_fetched_at")
+        } == {
+            "status": "ready",
+            "rows": 5,
+            "coverage": {
+                "first_ts": "2025-12-01T00:00:00+00:00",
+                "last_ts": "2026-02-01T00:00:00+00:00",
+            },
+        }
+        for key in ("last_used_at", "last_fetched_at"):
+            used = datetime.fromisoformat(coverage["cache"][key])
+            assert abs(datetime.now(UTC) - used) < timedelta(minutes=5)
 
 
 async def test_backtest_run_on_an_empty_range_is_the_honest_no_data_envelope(

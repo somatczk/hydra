@@ -1,8 +1,9 @@
 """MCP tools, registered on the shared server instance (``hydra.dashboard.mcp.server``).
 
-``research`` and ``strategies`` carry the 22 research/CRUD tools (B1, plus
-``universe_list`` from P6-A1); ``sessions`` and ``risk`` the 10 session/risk tools (B2);
-``live`` the two code-gated live tools (P3-C) — 34 total, with
+``research`` and ``strategies`` carry the 23 research/CRUD tools (B1, plus
+``universe_list`` from P6-A1 and ``data_inventory`` from P6-C4); ``sessions`` and
+``risk`` the 10 session/risk tools (B2); ``live`` the two code-gated live tools
+(P3-C) — 35 total, with
 ``kill_switch_release``, ``live_session_start`` and ``live_order``
 the gated actions.
 """

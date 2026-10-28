@@ -1,7 +1,7 @@
-"""Research tools (backtest, hyperopt, walk-forward, strategy params, data coverage,
-the trading universe).
+"""Research tools (backtest, hyperopt, walk-forward, strategy params, data coverage
+and the auto-cache inventory, the trading universe).
 
-Thirteen tools registered on the shared server instance, each a thin call into the
+Fourteen tools registered on the shared server instance, each a thin call into the
 service layer (the same functions the REST routes call). Inputs mirror the service
 request models' fields — dates as ISO strings, ``param_space`` in the
 ``ParamDefRequest`` wire shape — and the models are constructed inside the tool so
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+from prometheus_client import REGISTRY
 from pydantic import ValidationError
 
 from hydra.backtest.jobs import (
@@ -24,6 +25,7 @@ from hydra.backtest.jobs import (
     ParamDefRequest,
     WalkForwardRunRequest,
 )
+from hydra.core.config import DataConfig
 from hydra.core.types import ExchangeId, Timeframe
 from hydra.dashboard.mcp import server
 from hydra.dashboard.mcp.tools import _deps
@@ -39,6 +41,12 @@ def _auto_fetch() -> bool:
     """``data.auto_fetch_enabled`` of the engine's config; an unbound state never fetches."""
     cfg = getattr(_deps.engine_state(), "config", None)
     return cfg is not None and cfg.data.auto_fetch_enabled
+
+
+def _data_config() -> DataConfig:
+    """The engine's ``data`` section; the section's defaults while the state is unbound."""
+    cfg = getattr(_deps.engine_state(), "config", None)
+    return cfg.data if cfg is not None else DataConfig()
 
 
 @server.tool(name="backtest_run", structured_output=False)
@@ -255,12 +263,49 @@ async def strategy_params(strategy_id: str) -> str:
 
 @server.tool(name="data_coverage", structured_output=False)
 async def data_coverage(exchange_id: ExchangeId, symbol: str, timeframe: Timeframe) -> str:
-    """The stored bar coverage for one market: first/last bar timestamp (ISO, UTC) and
-    bar count — what backtests can actually run on. 404 ``no_stored_data`` when
-    nothing is stored for the market."""
+    """The stored bar coverage for one market: first/last bar timestamp (ISO, UTC),
+    bar count, the feed/auto source split, the estimated on-disk bytes (rows x
+    data.row_bytes_estimate) and the auto-cache ledger row — status, rows, the
+    requested coverage range, last use and last fetch — or null when the market was
+    never auto-fetched. The ledger's coverage range spans the fetch grid the market
+    was asked to fill (it can predate the first listed bar), so it is never an
+    "auto-cached since" bound. 404 ``no_stored_data`` when nothing is stored for
+    the market."""
     try:
         return _deps.json_text(
-            await data_svc.bar_coverage(_deps.db_pool(), exchange_id, symbol, timeframe)
+            await data_svc.bar_coverage(
+                _deps.db_pool(),
+                exchange_id,
+                symbol,
+                timeframe,
+                row_bytes_estimate=_data_config().row_bytes_estimate,
+            )
+        )
+    except ServiceError as exc:
+        raise _deps.tool_error(exc) from exc
+
+
+@server.tool(name="data_inventory", structured_output=False)
+async def data_inventory() -> str:
+    """Every auto-cached dataset, least-recently-used first — the sweeper's eviction
+    candidates lead the list — plus the cache totals.
+
+    Each dataset carries its market, its coverage range (the fetch grid the ledger
+    was asked to fill; it can predate the first listed bar, so it is never an
+    "auto-cached since" bound), its bar rows (0 is an honest "no bars" — a requested
+    range the exchange never served), its estimated bytes (rows x
+    data.row_bytes_estimate), its fetch status (fetching or ready) and its last
+    use. The totals carry the whole cache's rows, estimated bytes, distinct pairs,
+    the configured budget (data.cache_max_gb) and when the sweeper last completed
+    a cycle. An empty cache lists no datasets.
+    """
+    try:
+        return _deps.json_text(
+            await data_svc.cache_inventory(
+                _deps.db_pool(),
+                _data_config(),
+                REGISTRY.get_sample_value("hydra_data_sweep_last_timestamp_seconds"),
+            )
         )
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
