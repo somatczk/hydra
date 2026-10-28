@@ -26,6 +26,7 @@ from hydra.services.approvals import (
     write_approval_event,
 )
 from hydra.services.errors import ServiceError
+from hydra.services.live_gate import read_live_state
 from hydra.services.sessions import (
     KillSwitchNotPersistedError,
     activate_kill_switch_fail_safe,
@@ -39,9 +40,13 @@ from hydra.services.sessions import (
 
 @server.tool(name="risk_live_status", structured_output=False)
 async def risk_live_status() -> str:
-    """Kill switch, running-session count and breaker restrictions — the operating
-    picture. Unknown values are reported as unknown, never guessed."""
-    return _deps.json_text(await _deps.trader().live_status())
+    """Kill switch, running-session count, breaker restrictions and the live-gate
+    armed state — the operating picture. Unknown values are reported as unknown,
+    never guessed; ``live_armed`` reads false when the row is absent or unreadable
+    (fail-safe)."""
+    body = await _deps.trader().live_status()
+    state = await read_live_state(_deps.db_pool())
+    return _deps.json_text({**body, "live_armed": state["armed"]})
 
 
 @server.tool(name="risk_status", structured_output=False)

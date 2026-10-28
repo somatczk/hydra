@@ -19,6 +19,7 @@ from hydra.dashboard.mcp.tools import _deps
 from hydra.dashboard.security import audit
 from hydra.services.approvals import APPROVAL_ACTOR
 from hydra.services.errors import ServiceError
+from hydra.services.live_gate import live_gate_required, session_trading_mode
 from hydra.services.sessions import (
     QuickTradeRequest,
     SessionStopNotPersistedError,
@@ -51,8 +52,9 @@ async def session_start(strategy_id: str, paper_capital: str | None = None) -> s
     """Start a paper session for a strategy.
 
     ``paper_capital`` is a decimal string allocated from the paper account; omit it to
-    use whatever is available. Live trading does not exist here: sessions are paper-only
-    and live is refused server-side. Returns the session (status 'running').
+    use whatever is available. Live sessions do not start here: live is code-gated —
+    call ``live_session_start`` (the platform must be armed first) and a human must
+    type the one-time code. Returns the session (status 'running').
     """
     try:
         body = StartSessionRequest(
@@ -98,12 +100,14 @@ async def quick_trade(
     stop_loss: str | None = None,
     trailing_stop_pct: str | None = None,
 ) -> str:
-    """Place a risk-checked manual paper order on a running session.
+    """Place a risk-checked manual PAPER order on a running session.
 
     ``quantity``/``price``/``take_profit``/``stop_loss``/``trailing_stop_pct`` are decimal
     strings. SL/TP (or a trailing stop) are placed reduce-only when the entry fills;
     without them the strategy's protective stop is placed. A SELL only reduces the held
     position. The order is refused by the same pre-trade checks the REST route applies.
+    A live session is refused (409 ``live_gate_required``): manual live orders go
+    through the gated ``live_order`` tool.
     """
     try:
         body = QuickTradeRequest(
@@ -117,6 +121,8 @@ async def quick_trade(
             trailing_stop_pct=trailing_stop_pct,
             session_id=session_id,
         )
+        if await session_trading_mode(_deps.trader(), session_id) == "live":
+            raise live_gate_required("live_order")
         result = await _deps.trader().quick_trade(body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc

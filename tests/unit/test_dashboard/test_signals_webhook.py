@@ -79,6 +79,7 @@ async def sessions(
         made[sid] = executor(await h.session(sid, str(START)))
     monkeypatch.setattr(app.state, "session_manager", mgr)
     paper_rows = [_running_row(sid, "paper") for sid in ("momentum", "breakout")]
+    monkeypatch.setattr(app.state, "db_pool", _GatePool(paper_rows))
     monkeypatch.setattr(app.state, "trader", LocalTrader(_GatePool(paper_rows), mgr))
     yield made
     await h.close()
@@ -306,6 +307,7 @@ async def live_row_sessions(
         session = await h.session(sid, str(START))
         made[sid] = {"executor": executor(session), "session_id": session.session_id}
     monkeypatch.setattr(app.state, "session_manager", mgr)
+    monkeypatch.setattr(app.state, "db_pool", _GatePool([_LIVE_ROW]))
     monkeypatch.setattr(app.state, "trader", LocalTrader(_GatePool([_LIVE_ROW]), mgr))
     yield made
     await h.close()

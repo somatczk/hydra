@@ -2,9 +2,10 @@
 
 ## Overview
 Bitcoin trading platform under active rebuild (phases P0 to P5, plus MCP after P2). Today it runs paper-trading
-sessions with rule-based strategies on Binance market data, and backtests on bars stored in TimescaleDB. Live trading
-is not supported until P3. What works and what does not is kept in one place, the **Status** table in `README.md`. Do
-not duplicate it here; update that table in the PR that changes a row.
+sessions with rule-based strategies on Binance market data, backtests on bars stored in TimescaleDB, and live
+sessions behind a code-gated arming ceremony (P3-C: the persisted `live_armed` row, per-session and per-order
+one-time codes, trade-only Binance keys). What works and what does not is kept in one place, the **Status**
+table in `README.md`. Do not duplicate it here; update that table in the PR that changes a row.
 
 ## Working rules (every agent session in this repo)
 - **Commits**: Conventional Commits. No `Co-Authored-By` trailer, no Claude or session lines.
@@ -71,6 +72,9 @@ not duplicate it here; update that table in the PR that changes a row.
   - `services`: backtest, research and strategy operations the routes (and later MCP) call; no FastAPI.
     `services/sessions.py` is the session/kill-switch/quick-trade seam both `routes/trading.py` and the
     MCP session/risk tools call; the routes keep only their models, audit lines and principals.
+    `services/live_gate.py` is the live gate: the `live_armed` row, trade-only credential checks
+    (the R8 live re-fetch) and the four code-gated live executors `routes/live.py` and the MCP live
+    tools issue challenges against.
   - `ops`: Discord/Slack webhook notifier.
 - `dashboard/`: Next.js app (see `dashboard/README.md`).
 - `config/`: `base.yaml`, `strategies/`, `templates/`.
@@ -106,22 +110,31 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   Redis is only health-pinged; it is not on the trading path.
 - Signal path: ccxt.pro closed bar → the session's bar handler (paper executor fills resting orders and marks) →
   StrategyEngine → OrderManager (check by the process-wide RiskService) → PaperTradingExecutor. Every exchange client is
-  built by `hydra.execution.client_factory` (Binance spot only); live sessions are refused until P3.
+  built by `hydra.execution.client_factory` (Binance spot only); live sessions are code-gated — the four
+  ApprovalStore executors in `services/live_gate.py` (`live_arming`, `live_session_start`, `live_order`,
+  `credential_delete`) are the only live paths, and every API surface refuses live 409 `live_gate_required`.
 - Persisted (the engine has a DB pool whenever `DATABASE_URL` is set; startup fails without one): risk config and
   kill-switch flag, trading sessions, paper trades, positions and balance snapshots, backtest results and trades with
   data provenance, backtest/hyperopt/walk-forward job state (`backtest_jobs`, run by the `hydra-backtest-worker`
   container: durable across engine and worker restarts, requeued up to 3 attempts, cancellable, 6 h timeout, heartbeat
-  file + Docker healthcheck), exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`), and `system_config` rows (`PUT
-  /api/system/config` writes them, secrets Fernet-encrypted; a missing row is a 503, never a default; a
-  `paper_capital` change goes through `RiskService.reload_config`). In memory only: the backtest share-link tokens.
-  Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`;
+  file + Docker healthcheck), exchange credentials (Fernet, `HYDRA_CREDENTIAL_KEY`; `validated_permissions` is the
+  connect-time Binance apiRestrictions record), and `system_config` rows (`PUT /api/system/config` writes them,
+  secrets Fernet-encrypted; a missing row is a 503, never a default; a `paper_capital` change goes through
+  `RiskService.reload_config`; the legacy `trading_mode` row is frozen at `paper` and unwritable — the `live_armed`
+  row is the single live gate, written only by the arm executor). In memory only: the backtest share-link tokens and
+  the approval store. Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`;
   paper sessions are restored from `paper_accounts` by `SessionManager.startup()`.
 - Gated MCP actions go through one in-memory approval store (`services/approvals.py`, served by
   `routes/activity.py` on `app.state`): at most 20 pending, one-time 6-digit codes with a
   10-minute expiry and 5 wrong attempts, a second request for the same action returns the
-  pending approval, and every lifecycle transition is a best-effort `risk_events` `approval_*`
-  row plus a `hydra.audit` line (nothing persists across a restart). Only `user`/`dev`
-  principals can decide one.
+  pending approval (a different same-action request answers 409 `approval_conflict`), and
+  every lifecycle transition is a best-effort `risk_events` `approval_*` row plus a `hydra.audit`
+  line (nothing persists across a restart). Only `user`/`dev` principals can decide one;
+  `requested_by` attributes the executed action to whoever asked (`service:mcp` from the tools,
+  the signed-in principal from `/api/live`). Executors run in the API process through the
+  `TraderBackend` and re-validate their target state at execution time; a `ServiceError` they
+  raise reaches the deciding caller unchanged (R22), anything else answers 503
+  `approval_execution_failed`.
 - Every paper entry gets a protective stop (strategy `risk:` block, 5 % default). Exchange-side stop placement for
   Binance spot exists (`execution/exchange_stops.py`: the OCO order-list + fallback ladder, `normalize_open_orders`,
   the A8 verify and the dead-man gauge/alert); live sessions place real exchange stops once P3-A lands the live

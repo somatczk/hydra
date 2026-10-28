@@ -101,6 +101,8 @@ B2_TOOLS = frozenset(
     }
 )
 
+LIVE_TOOLS = frozenset({"live_session_start", "live_order"})
+
 _RULES = {
     "entry_long": {
         "operator": "AND",
@@ -399,13 +401,17 @@ def test_engine_state_falls_back_to_the_imported_module_app(
     assert _deps.db_pool() is sentinel
 
 
-def test_tools_list_advertises_the_31_tools(mcp: _McpClient) -> None:
+def test_tools_list_advertises_the_33_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
-    assert names == B1_TOOLS | B2_TOOLS
-    assert len(names) == 31
-    # the live pin: no live-prefixed tool, and B2's read-only risk_live_status is allowed
+    assert names == B1_TOOLS | B2_TOOLS | LIVE_TOOLS
+    assert len(names) == 33
+    # the live pin: exactly the two gated live tools, and no live_arm/live_disarm tool
+    # (arming is the operator's Settings ceremony; risk_live_status carries the state)
     assert "risk_live_status" in names
-    assert not [name for name in names if name.startswith("live_")]
+    assert {name for name in names if name.startswith("live_")} == {
+        "live_session_start",
+        "live_order",
+    }
 
 
 def test_backtest_run_on_a_missing_strategy_is_the_404_envelope(mcp: _McpClient) -> None:
@@ -1340,3 +1346,204 @@ class TestKillSwitchTools:
                 }
         finally:
             await h.close()
+
+
+# ---------------------------------------------------------------------------
+# P3-C: the two gated live tools
+# ---------------------------------------------------------------------------
+
+_ARMED_ROW = json.dumps({"armed": True, "by": "user:soma", "at": "2026-10-28T00:00:00+00:00"})
+
+
+class _GateConn:
+    """Serves the armed system_config row the live tools' fail-fast read resolves."""
+
+    def __init__(self, armed: bool) -> None:
+        self.row = {"value": _ARMED_ROW} if armed else None
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        assert sql == "SELECT value FROM system_config WHERE key = $1", sql
+        return self.row
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        return "INSERT 0 1"  # the store's best-effort event rows
+
+
+class _GatePool:
+    def __init__(self, armed: bool) -> None:
+        self.conn = _GateConn(armed)
+
+    def acquire(self) -> _GatePool:
+        return self
+
+    async def __aenter__(self) -> _GateConn:
+        return self.conn
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _RecordingBackend:
+    """Records the live executors' calls through the seam."""
+
+    def __init__(self, sessions: list[dict[str, Any]] | None = None) -> None:
+        self.sessions = sessions or []
+        self.start_calls: list[tuple[str, Any]] = []
+        self.order_calls: list[Any] = []
+
+    async def kill_switch_active(self) -> bool:
+        return False
+
+    async def live_status(self, source: str = "paper") -> dict[str, Any]:
+        return {
+            "kill_switch_active": False,
+            "kill_switch_state": "inactive",
+            "running_sessions": len(self.sessions),
+            "circuit_breaker_restrictions": None,
+            "circuit_breakers_state": "unavailable",
+        }
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        return [dict(s) for s in self.sessions]
+
+    async def start_session(self, actor: str, body: Any) -> dict[str, Any]:
+        self.start_calls.append((actor, body))
+        return {
+            "session_id": "s-live",
+            "trading_mode": body.trading_mode,
+            "status": "running",
+            "created_by": actor,
+        }
+
+    async def quick_trade(self, order: Any) -> dict[str, Any]:
+        self.order_calls.append(order)
+        return {"order_id": "o-1", "session_id": order.session_id, "status": "SUBMITTED"}
+
+
+_LIVE_SESSION = {"session_id": "s-live", "trading_mode": "live", "status": "running"}
+
+
+class TestLiveTools:
+    async def _approve(self, mcp_cfg: HydraConfig, approval_id: str, code: str) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=engine_app),
+            base_url="http://engine",
+            headers={"X-Hydra-Request": "1"},
+        ) as ui:
+            return await ui.post(
+                f"/api/activity/approvals/{approval_id}/approve", json={"code": code}
+            )
+
+    async def test_live_session_start_is_gated_then_executes_on_approval(
+        self, mcp_cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = _RecordingBackend()
+        monkeypatch.setattr(engine_app.state, "db_pool", _GatePool(armed=True))
+        monkeypatch.setattr(engine_app.state, "trader", backend)
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call(
+                "live_session_start", {"strategy_id": "momentum", "reason": "claude goes live"}
+            )
+            assert not is_error, text
+            result = json.loads(text)
+            assert result["status"] == "approval_required"
+            assert re.fullmatch(r"[0-9]{6}", result["code"])
+            assert "Hydra UI Activity page" in result["note"]
+            assert backend.start_calls == []  # gated: nothing started by the tool
+
+            resp = await self._approve(mcp_cfg, result["approval_id"], result["code"])
+            assert resp.status_code == 200, resp.text
+            approved = resp.json()
+            assert approved["executed"] is True
+            assert (approved["actor"], approved["approved_by"]) == ("service:mcp", "dev:dev")
+            assert approved["result"]["trading_mode"] == "live"
+        [(actor, body)] = backend.start_calls
+        assert (actor, body.trading_mode, body.strategy_id) == (
+            "service:mcp",
+            "live",
+            "momentum",
+        )
+
+    async def test_live_session_start_refuses_when_disarmed(
+        self, mcp_cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(engine_app.state, "db_pool", _GatePool(armed=False))
+        monkeypatch.setattr(engine_app.state, "trader", _RecordingBackend())
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call(
+                "live_session_start", {"strategy_id": "momentum", "reason": "claude goes live"}
+            )
+            assert is_error, text
+            envelope = json.loads(text.removeprefix("Error executing tool live_session_start: "))
+            assert (envelope["status"], envelope["detail"]["code"]) == (409, "live_not_armed")
+
+    async def test_live_order_is_gated_then_places_on_approval(
+        self, mcp_cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = _RecordingBackend(sessions=[_LIVE_SESSION])
+        monkeypatch.setattr(engine_app.state, "db_pool", _GatePool(armed=True))
+        monkeypatch.setattr(engine_app.state, "trader", backend)
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call(
+                "live_order",
+                {
+                    "session_id": "s-live",
+                    "side": "buy",
+                    "quantity": "0.01",
+                    "reason": "claude buys one lot",
+                },
+            )
+            assert not is_error, text
+            result = json.loads(text)
+            assert result["status"] == "approval_required"
+            assert backend.order_calls == []  # gated: nothing placed by the tool
+
+            resp = await self._approve(mcp_cfg, result["approval_id"], result["code"])
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["executed"] is True
+            assert resp.json()["result"]["order_id"] == "o-1"
+        [order] = backend.order_calls
+        assert (order.session_id, order.side, order.quantity) == ("s-live", "buy", D("0.01"))
+
+    async def test_live_order_on_a_paper_session_is_refused(
+        self, mcp_cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(engine_app.state, "db_pool", _GatePool(armed=True))
+        monkeypatch.setattr(
+            engine_app.state,
+            "trader",
+            _RecordingBackend(
+                sessions=[{"session_id": "s-paper", "trading_mode": "paper", "status": "running"}]
+            ),
+        )
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call(
+                "live_order",
+                {"session_id": "s-paper", "side": "buy", "quantity": "0.01", "reason": "one buy"},
+            )
+            assert is_error, text
+            envelope = json.loads(text.removeprefix("Error executing tool live_order: "))
+            assert (envelope["status"], envelope["detail"]["code"]) == (409, "not_a_live_session")
+
+    async def test_quick_trade_on_a_live_session_is_the_409_envelope(
+        self, mcp_cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(engine_app.state, "trader", _RecordingBackend(sessions=[_LIVE_SESSION]))
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call(
+                "quick_trade", {"session_id": "s-live", "side": "buy", "quantity": "0.01"}
+            )
+            assert is_error, text
+            envelope = json.loads(text.removeprefix("Error executing tool quick_trade: "))
+            assert (envelope["status"], envelope["detail"]["code"]) == (409, "live_gate_required")
+            assert "live_order" in envelope["detail"]["message"]
+
+    async def test_risk_live_status_reports_the_armed_state(
+        self, mcp_cfg: HydraConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(engine_app.state, "db_pool", _GatePool(armed=True))
+        monkeypatch.setattr(engine_app.state, "trader", _RecordingBackend())
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call("risk_live_status")
+            assert not is_error, text
+            assert json.loads(text)["live_armed"] is True

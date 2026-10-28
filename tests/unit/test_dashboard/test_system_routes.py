@@ -8,6 +8,7 @@ Fernet encryption, P1-E's ``build_readonly_client`` and ``ExchangeClient``, and 
 
 from __future__ import annotations
 
+import json
 import secrets
 from decimal import Decimal
 from types import SimpleNamespace
@@ -179,16 +180,30 @@ class TestUpdateConfig:
 
     def test_full_update_round_trips(self, db: FakeSystemDb, client: TestClient) -> None:
         payload = {
-            "trading_mode": "live",
             "default_pair": "SOL/USDT",
             "default_timeframe": "4h",
             "max_concurrent_strategies": 7,
             "paper_capital": 2500.0,
+            "live_capital": 5000.0,
         }
         assert client.put("/api/system/config", json=payload).status_code == 200
         assert {k: db.value(k) for k in payload} == payload
         fresh = TestClient(_make_app(pool=db)).get("/api/system/config").json()
-        assert {k: fresh[k] for k in payload} == payload
+        assert {k: fresh[k] for k in payload if k != "live_capital"} == {
+            k: v for k, v in payload.items() if k != "live_capital"
+        }
+        assert db.value("live_capital") == 5000.0
+
+    def test_trading_mode_is_ignored_and_stays_paper(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        """Must-fix #3: the legacy row is unwritable via the API (the armed row is the
+        single live gate) — a PUT carrying trading_mode writes nothing at all."""
+        resp = client.put("/api/system/config", json={"trading_mode": "live"})
+        assert resp.status_code == 200
+        assert resp.json()["trading_mode"] == "paper"
+        assert db.value("trading_mode") == "paper"
+        assert not any(sql.startswith("INSERT") for sql in db.statements)
 
     def test_empty_update_returns_current_without_writing(
         self, db: FakeSystemDb, client: TestClient
@@ -486,12 +501,18 @@ class FakeBinance:
     """Stand-in for ``ccxt.async_support.binance``: the network boundary."""
 
     error: ClassVar[BaseException | None] = None
+    restrictions: ClassVar[dict[str, Any] | BaseException | None] = {
+        "ipRestrict": False,
+        "enableWithdrawals": False,
+        "enableSpotAndMarginTrading": True,
+    }
     instances: ClassVar[list[FakeBinance]] = []
 
     def __init__(self, opts: dict[str, Any]) -> None:
         self.opts = opts
         self.closed = False
         self.balance_calls = 0
+        self.restriction_calls = 0
         self.order_symbols: list[str] = []
         FakeBinance.instances.append(self)
 
@@ -513,9 +534,28 @@ class FakeBinance:
         self.closed = True
 
 
+async def _fake_get_account_api_restrictions(fake: FakeBinance, *args: Any) -> dict[str, Any]:
+    fake.restriction_calls += 1
+    if FakeBinance.error is not None:
+        raise FakeBinance.error
+    restrictions = FakeBinance.restrictions
+    if isinstance(restrictions, BaseException):
+        raise restrictions
+    return dict(restrictions)
+
+
+# ccxt's camelCase implicit API name, bound as an attribute (pep8-naming flags the def)
+FakeBinance.privateGetAccountApiRestrictions = _fake_get_account_api_restrictions
+
+
 @pytest.fixture()
 def binance(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinance]:
     FakeBinance.error = None
+    FakeBinance.restrictions = {
+        "ipRestrict": False,
+        "enableWithdrawals": False,
+        "enableSpotAndMarginTrading": True,
+    }
     FakeBinance.instances = []
     monkeypatch.setattr(ccxt.async_support, "binance", FakeBinance)
     return FakeBinance
@@ -612,9 +652,12 @@ class TestExchangeConnect:
             "message": "Binance testnet accepted these keys; they are stored",
             "validated_at": "2026-10-20T12:00:00+00:00",
             "environment": "testnet",
+            "trade_enabled": None,
+            "ip_restrict": None,
         }
         [probe] = FakeBinance.instances
         assert probe.balance_calls == 1
+        assert probe.restriction_calls == 0  # the apiRestrictions read is mainnet-only
         assert probe.closed is True
         assert probe.opts["apiKey"] == API_KEY
         assert probe.opts["secret"] == API_SECRET
@@ -624,10 +667,11 @@ class TestExchangeConnect:
         assert decrypt(stored["encrypted_key"]) == API_KEY
         assert stored["validated_at"] == NOW
         assert stored["validated_environment"] == "testnet"
+        assert stored["validated_permissions"] is None
         assert app.state.exchange_credentials["binance"]["api_key"] == API_KEY
 
     def test_mainnet_when_testnet_is_off(
-        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         cfg = system.current_config().model_copy(deep=True)
         cfg.trading.testnet = False
@@ -636,7 +680,56 @@ class TestExchangeConnect:
         assert resp.status_code == 200
         assert resp.json()["environment"] == "mainnet"
         assert resp.json()["message"].startswith("Binance mainnet accepted")
+        assert (resp.json()["trade_enabled"], resp.json()["ip_restrict"]) == (True, False)
         assert "sandbox" not in FakeBinance.instances[0].opts
+        [probe] = FakeBinance.instances
+        assert probe.restriction_calls == 1
+        assert json.loads(db.credentials["binance"]["validated_permissions"]) == {
+            "enable_spot_and_margin_trading": True,
+            "enable_withdrawals": False,
+            "ip_restrict": False,
+        }
+
+    def test_mainnet_withdrawal_keys_are_refused_and_nothing_is_stored(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = system.current_config().model_copy(deep=True)
+        cfg.trading.testnet = False
+        monkeypatch.setattr(system, "current_config", lambda: cfg)
+        FakeBinance.restrictions = {
+            "ipRestrict": True,
+            "enableWithdrawals": True,
+            "enableSpotAndMarginTrading": True,
+        }
+        resp = _connect(client)
+        assert resp.status_code == 422
+        assert _detail(resp)["code"] == "credentials_can_withdraw"
+        assert _detail(resp)["state"] == "invalid"
+        assert "can withdraw" in _detail(resp)["message"]
+        assert db.credentials == {}
+        assert not any(sql.startswith("INSERT") for sql in db.statements)
+        assert app.state.exchange_credentials == {}
+        assert FakeBinance.instances[0].closed is True
+
+    def test_mainnet_read_only_keys_connect_with_the_record(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = system.current_config().model_copy(deep=True)
+        cfg.trading.testnet = False
+        monkeypatch.setattr(system, "current_config", lambda: cfg)
+        FakeBinance.restrictions = {
+            "ipRestrict": True,
+            "enableWithdrawals": False,
+            "enableSpotAndMarginTrading": False,
+        }
+        resp = _connect(client)
+        assert resp.status_code == 200
+        assert (resp.json()["trade_enabled"], resp.json()["ip_restrict"]) == (False, True)
+        assert json.loads(db.credentials["binance"]["validated_permissions"]) == {
+            "enable_spot_and_margin_trading": False,
+            "enable_withdrawals": False,
+            "ip_restrict": True,
+        }
 
     @pytest.mark.parametrize(
         "error", [ccxt.AuthenticationError("bad key"), ccxt.PermissionDenied("no read")]

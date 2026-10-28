@@ -68,13 +68,15 @@ class FakeSystemDb:
         if sql == "SELECT key, value FROM system_config":
             return [{"key": k, "value": row["value"]} for k, row in self.config.items()]
         if sql == (
-            "SELECT exchange_id, validated_at, validated_environment FROM exchange_credentials"
+            "SELECT exchange_id, validated_at, validated_environment, validated_permissions "
+            "FROM exchange_credentials"
         ):
             return [
                 {
                     "exchange_id": eid,
                     "validated_at": row["validated_at"],
                     "validated_environment": row.get("validated_environment"),
+                    "validated_permissions": row.get("validated_permissions"),
                 }
                 for eid, row in self.credentials.items()
             ]
@@ -90,16 +92,26 @@ class FakeSystemDb:
         if sql == "SELECT 1":
             return 1
         if sql.startswith("INSERT INTO exchange_credentials"):
-            exchange_id, key, secret, passphrase, environment = args
+            exchange_id, key, secret, passphrase, environment, permissions = args
             self.credentials[exchange_id] = {
                 "encrypted_key": key,
                 "encrypted_secret": secret,
                 "encrypted_passphrase": passphrase,
                 "validated_at": NOW,
                 "validated_environment": environment,
+                "validated_permissions": permissions,
             }
             return NOW
         raise AssertionError(f"unexpected fetchval: {sql}")
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        self._check(sql)
+        if sql == ("SELECT validated_permissions FROM exchange_credentials WHERE exchange_id = $1"):
+            row = self.credentials.get(args[0])
+            return (
+                None if row is None else {"validated_permissions": row.get("validated_permissions")}
+            )
+        raise AssertionError(f"unexpected fetchrow: {sql}")
 
     async def execute(self, sql: str, *args: Any) -> str:
         self._check(sql)

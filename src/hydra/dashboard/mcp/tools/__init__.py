@@ -1,12 +1,13 @@
 """MCP tools, registered on the shared server instance (``hydra.dashboard.mcp.server``).
 
 ``research`` and ``strategies`` carry the 21 research/CRUD tools (B1); ``sessions`` and
-``risk`` the 10 session/risk tools (B2) — 31 total, with ``kill_switch_release`` the one
-gated action.
+``risk`` the 10 session/risk tools (B2); ``live`` the two code-gated live tools (P3-C)
+— 33 total, with ``kill_switch_release``, ``live_session_start`` and ``live_order``
+the gated actions.
 """
 
 from __future__ import annotations
 
-from hydra.dashboard.mcp.tools import research, risk, sessions, strategies
+from hydra.dashboard.mcp.tools import live, research, risk, sessions, strategies
 
-__all__ = ["research", "risk", "sessions", "strategies"]
+__all__ = ["live", "research", "risk", "sessions", "strategies"]

@@ -92,11 +92,21 @@ async def _fake_get_open_order_lists(
     return await fake._call("fetch_open_order_lists", [{"orderListId": 5}])
 
 
+async def _fake_get_account_api_restrictions(
+    fake: _FakeCcxt, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return await fake._call(
+        "fetch_api_restrictions",
+        {"ipRestrict": False, "enableWithdrawals": False, "enableSpotAndMarginTrading": True},
+    )
+
+
 # ccxt's camelCase implicit API names, bound as attributes (pep8-naming flags the defs)
 _FakeCcxt.privatePostOrderListOco = _fake_post_oco
 _FakeCcxt.privateDeleteOrderList = _fake_delete_order_list
 _FakeCcxt.privateDeleteOpenOrders = _fake_delete_open_orders
 _FakeCcxt.privateGetOpenOrderList = _fake_get_open_order_lists
+_FakeCcxt.privateGetAccountApiRestrictions = _fake_get_account_api_restrictions
 
 
 ClientCall = Callable[[ExchangeClient], Awaitable[Any]]
@@ -116,6 +126,10 @@ CALLS: list[tuple[str, ClientCall]] = [
     ("fetch_balance", lambda c: c.fetch_balance()),
     ("fetch_open_orders", lambda c: c.fetch_open_orders("BTC/USDT")),
     ("fetch_open_order_lists", lambda c: c.fetch_open_order_lists("BTCUSDT")),
+    (
+        "fetch_api_restrictions",
+        lambda c: c.fetch_api_restrictions(),
+    ),
     (
         "fetch_order",
         lambda c: c.fetch_order("o1", "BTCUSDT", params={"clientOrderId": "hyd-1"}),

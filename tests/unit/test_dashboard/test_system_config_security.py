@@ -107,8 +107,10 @@ class TestValidation:
     @pytest.mark.parametrize(
         "payload",
         [
-            {"trading_mode": "yolo"},
-            {"trading_mode": "testnet"},
+            {"live_capital": 0},
+            {"live_capital": -1},
+            {"live_capital": "inf"},
+            {"live_capital": "nan"},
             {"paper_capital": 0},
             {"paper_capital": -1},
             {"paper_capital": "inf"},
@@ -145,13 +147,17 @@ class TestValidation:
                 "trading_mode": "live",
                 "paper_capital": 2500.5,
                 "max_concurrent_strategies": 100,
+                "live_capital": 5000,
             },
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["trading_mode"] == "live"
+        # trading_mode is not writable via the API (must-fix #3): the sent value is
+        # ignored and the legacy row stays frozen at 'paper'; live_capital persists.
+        assert data["trading_mode"] == "paper"
         assert data["paper_capital"] == 2500.5
         assert data["max_concurrent_strategies"] == 100
+        assert db.value("live_capital") == 5000
 
     def test_bad_stored_trading_mode_is_503_not_coerced(self, db: FakeSystemDb) -> None:
         db.config["trading_mode"]["value"] = '"testnet"'
