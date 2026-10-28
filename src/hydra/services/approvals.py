@@ -52,13 +52,14 @@ ApprovalExecutor = Callable[[Any, dict[str, Any], str], Awaitable[Any]]
 """Registered per action: ``await executor(deps, params, actor) -> result``.
 
 ``deps`` is opaque engine context (the dashboard routes pass ``app.state``); ``params`` is a
-copy of the approval's params; ``actor`` is ``APPROVAL_ACTOR``, so the executed action is
-always attributed to the service that asked, while ``approved_by`` names the human who said
-yes. Executors must re-validate their target state and stay idempotent: the approval is
-already recorded as approved when they run, and their result is returned to the approving
-caller verbatim. An executor that raises (any exception, ``ServiceError`` included) marks
-the approval ``failed`` — the decision is answered with ``approval_execution_failed`` and
-a fresh request can be made.
+copy of the approval's params; ``actor`` is the requester (``APPROVAL_ACTOR`` from the MCP
+tools, the signed-in principal from the UI's live-gate routes), so the executed action is
+always attributed to the service or person that asked, while ``approved_by`` names the human
+who said yes. Executors must re-validate their target state and stay idempotent: the
+approval is already recorded as approved when they run, and their result is returned to the
+approving caller verbatim. An executor that raises marks the approval ``failed`` — a
+:class:`ServiceError` reaches the caller unchanged (R22), anything else is answered with
+``approval_execution_failed`` — and a fresh request can be made.
 """
 ApprovalEventWriter = Callable[[RiskEventRecord], Awaitable[None]]
 
@@ -92,6 +93,7 @@ class Approval:
     status: ApprovalStatus
     requested_at: datetime
     expires_at: datetime
+    requested_by: str = APPROVAL_ACTOR
     attempts: int = 0
     approved_by: str | None = None
     decided_at: datetime | None = None
@@ -142,9 +144,20 @@ class ApprovalStore:
         self._executors[action] = executor
 
     async def create(
-        self, action: str, reason: str, params: dict[str, Any] | None = None
+        self,
+        action: str,
+        reason: str,
+        params: dict[str, Any] | None = None,
+        *,
+        requested_by: str = APPROVAL_ACTOR,
     ) -> Approval:
-        """Request a gated action; dedupes while one is pending for the same action."""
+        """Request a gated action; dedupes while one is pending for the same action.
+
+        *requested_by* names who asked (``service:mcp`` from the tools, the signed-in
+        principal from the UI's live-gate routes); it rides the ``requested`` event and
+        the executor call so the executed action is attributed to the requester while
+        ``approved_by`` names the human who said yes.
+        """
         async with self._lock:
             await self._sweep()
             for approval in self._approvals.values():
@@ -168,9 +181,10 @@ class ApprovalStore:
                 status="pending",
                 requested_at=now,
                 expires_at=now + CODE_TTL,
+                requested_by=requested_by,
             )
             self._approvals[approval.id] = approval
-            await self._emit("requested", approval, actor=APPROVAL_ACTOR)
+            await self._emit("requested", approval, actor=requested_by)
             return approval
 
     async def get(self, approval_id: str) -> Approval:
@@ -228,7 +242,16 @@ class ApprovalStore:
         # the flip above already settled exactly-once: run the executor unlocked so a slow
         # action cannot stall deny, the pending list or other decisions
         try:
-            result = await executor(deps, dict(approval.params), APPROVAL_ACTOR)
+            result = await executor(deps, dict(approval.params), approval.requested_by)
+        except ServiceError as exc:
+            # R22: the executor's envelope reaches the caller unchanged; others answer 503 below.
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            error = f"{detail.get('code', 'error')}: {detail.get('message', str(exc.detail))}"
+            async with self._lock:
+                approval.status = "failed"
+                approval.error = error
+                await self._emit("failed", approval, actor=approved_by)
+            raise
         except Exception as exc:
             async with self._lock:
                 approval.status = "failed"

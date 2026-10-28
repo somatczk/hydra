@@ -17,6 +17,7 @@ from hydra.dashboard.routes import (
     activity,
     backtest,
     health,
+    live,
     market_data,
     metrics,
     models,
@@ -66,6 +67,7 @@ app.include_router(models.router)
 app.include_router(system.router)
 app.include_router(trading.router)
 app.include_router(signals.router)
+app.include_router(live.router)
 app.include_router(templates.router)
 app.include_router(market_data.router)
 app.include_router(activity.router)

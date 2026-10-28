@@ -18,9 +18,16 @@ from typing import Any
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from hydra.dashboard.routes._db import ServiceErrorRoute, api_error, request_trader, unauthenticated
+from hydra.dashboard.routes._db import (
+    ServiceErrorRoute,
+    api_error,
+    request_pool,
+    request_trader,
+    unauthenticated,
+)
 from hydra.dashboard.security import audit
 from hydra.services.errors import ServiceError
+from hydra.services.sessions import refuse_live_webhook_target
 
 router = APIRouter(prefix="/api/signals", tags=["signals"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
@@ -84,8 +91,13 @@ async def receive_webhook(body: WebhookSignal, request: Request) -> dict[str, An
     """Receive a trading signal via webhook (TradingView, custom, etc).
 
     The signal goes only to the running session(s) of ``strategy_id``; there is no symbol fan-out.
+    A live-mode target is refused here, before anything is delegated (R3: an external
+    signal is never a live path); the backend op repeats the check as the backstop.
     """
     _require_webhook_secret(request, body.secret)
+    await refuse_live_webhook_target(
+        request_pool(request), symbol=body.symbol, strategy_id=body.strategy_id
+    )
 
     signal_id = f"sig-{uuid.uuid4().hex[:8]}"
 

@@ -19,6 +19,7 @@ from hydra.dashboard.routes._db import (
     request_trader,
 )
 from hydra.dashboard.security import audit
+from hydra.services.live_gate import live_gate_required, session_trading_mode
 from hydra.services.sessions import (
     KillSwitchNotPersistedError,
     QuickTradeRequest,
@@ -261,7 +262,11 @@ def _actor(request: Request) -> str:
 
 @router.post("/sessions", response_model=SessionResponse, status_code=201)
 async def start_session(body: StartSessionRequest, request: Request) -> dict[str, Any]:
-    """Start a paper session. Live is 403 until P3; only Binance SPOT is accepted."""
+    """Start a paper session. Live is refused here (409 ``live_gate_required``): the
+    code-gated ``POST /api/live/session-start`` ceremony is the only live path; only
+    Binance SPOT is accepted."""
+    if body.trading_mode == "live":
+        raise live_gate_required("POST /api/live/session-start")
     d = await request_trader(request).start_session(_actor(request), body)
     audit(
         getattr(request.state, "principal", None),
@@ -360,9 +365,14 @@ async def quick_trade(body: QuickTradeRequest, request: Request) -> dict[str, An
     """A risk-checked manual order on the running session ``session_id``.
 
     SL/TP (or a trailing stop) are placed reduce-only when the entry fills; without them the
-    strategy's protective stop (default 5 %) is placed. A SELL only reduces the held position.
+    strategy's protective stop (default 5 %) is placed. A SELL only reduces the held
+    position. A live session is refused (409 ``live_gate_required``): the code-gated
+    ``POST /api/live/order`` ceremony is the only manual live-order path.
     """
-    d = await request_trader(request).quick_trade(body)
+    backend = request_trader(request)
+    if await session_trading_mode(backend, body.session_id) == "live":
+        raise live_gate_required("POST /api/live/order")
+    d = await backend.quick_trade(body)
     audit(
         getattr(request.state, "principal", None),
         "manual_order",

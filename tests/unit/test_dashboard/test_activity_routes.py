@@ -172,6 +172,21 @@ class TestPendingApprovals:
         assert rows[0]["params"] == {"reason": "calm"}
         assert rows[0]["status"] == "pending"
 
+    async def test_the_actor_is_the_requester_not_the_constant(
+        self, browser: httpx.AsyncClient
+    ) -> None:
+        """A UI-created live approval attributes to the signed-in principal (R9):
+        MCP-created approvals still render ``service:mcp`` (needsYou is UI-4c's)."""
+        approval = await get_approval_store(app).create(
+            "live_arming",
+            "arm live trading",
+            {"live_capital": 500.0, "reason": "arm live trading"},
+            requested_by="user:soma",
+        )
+        rows = (await browser.get("/api/activity/approvals")).json()
+        assert rows[0]["id"] == approval.id
+        assert rows[0]["actor"] == "user:soma"
+
     async def test_detail_carries_attempts_left_and_404s_unknown(
         self, browser: httpx.AsyncClient
     ) -> None:

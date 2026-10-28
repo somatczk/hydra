@@ -195,20 +195,54 @@ class TestExecutorFailure:
         store = make_store(recorder, FakeClock())
 
         async def refuses(deps: Any, params: dict[str, Any], actor: str) -> Any:
-            raise service_error(422, "kill_switch_not_engaged", "it is engaged", "invalid")
+            raise service_error(
+                422,
+                "kill_switch_not_engaged",
+                "it is engaged",
+                "invalid",
+                client_order_id="hyd-42",
+            )
 
         store.register("kill_switch_release", refuses)
         approval = await _created(store)
 
         with pytest.raises(ServiceError) as exc:
             await store.approve(approval.id, approval.code, approved_by="user:soma")
-        assert (exc.value.status_code, exc.value.detail["code"]) == (
-            503,
-            "approval_execution_failed",
-        )
-        assert "kill_switch_not_engaged" in exc.value.detail["message"]
+        # R22: the executor's own envelope reaches the deciding caller unchanged —
+        # status, code and every extra field (client_order_id included) survive.
+        assert (exc.value.status_code, exc.value.detail["code"]) == (422, "kill_switch_not_engaged")
+        assert exc.value.detail["client_order_id"] == "hyd-42"
         assert approval.status == "failed"
         assert "approval_failed" in recorder.kinds()
+
+
+class TestRequestedBy:
+    async def test_create_defaults_requested_by_to_the_mcp_actor(self) -> None:
+        """The default keeps every MCP-created approval byte-identical to before."""
+        store = make_store(Recorder(), FakeClock())
+        approval = await store.create("kill_switch_release", "why", {"reason": "calm"})
+        assert approval.requested_by == APPROVAL_ACTOR
+
+    async def test_requested_by_flows_to_events_and_executor(self) -> None:
+        recorder = Recorder()
+        store = make_store(recorder, FakeClock())
+        executor = Exec()
+        store.register("live_arming", executor)
+        approval = await store.create(
+            "live_arming", "arm live trading", {"live_capital": 500.0}, requested_by="user:soma"
+        )
+
+        assert approval.requested_by == "user:soma"
+        requested = [e for e in recorder.events if e.kind == "approval_requested"]
+        assert requested and requested[0].actor == "user:soma"
+
+        outcome = await store.approve(approval.id, approval.code, approved_by="dev:dev")
+        # the executed action is attributed to the requester, the approval to the human
+        assert executor.calls[0][2] == "user:soma"
+        assert outcome.approval.requested_by == "user:soma"
+        assert outcome.approval.approved_by == "dev:dev"
+        approved = [e for e in recorder.events if e.kind == "approval_approved"]
+        assert approved and approved[0].actor == "dev:dev"
 
 
 class TestApproveDenyConcurrency:

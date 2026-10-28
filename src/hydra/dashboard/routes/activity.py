@@ -24,7 +24,6 @@ from hydra.dashboard.routes._db import ServiceErrorRoute, api_error, db_errors_t
 from hydra.dashboard.security import current_principal
 from hydra.risk.state import RiskEventRecord, fetch_risk_events
 from hydra.services.approvals import (
-    APPROVAL_ACTOR,
     CODE_PATTERN,
     ApprovalStore,
     write_approval_event,
@@ -122,7 +121,7 @@ class DenyResponse(BaseModel):
 def _pending_model(approval: Any) -> PendingApproval:
     return PendingApproval(
         id=approval.id,
-        actor=APPROVAL_ACTOR,
+        actor=approval.requested_by,
         action=approval.action,
         reason=approval.reason,
         params=approval.params,
@@ -197,7 +196,7 @@ async def approve(approval_id: str, body: ApproveRequest, request: Request) -> A
     return ApproveResponse(
         executed=outcome.executed,
         result=outcome.result,
-        actor=APPROVAL_ACTOR,
+        actor=outcome.approval.requested_by,
         approved_by=approved_by,
     )
 

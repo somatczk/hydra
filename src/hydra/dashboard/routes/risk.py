@@ -12,10 +12,12 @@ from hydra.dashboard.routes._db import (
     ServiceErrorRoute,
     api_error,
     db_errors_to_503,
+    request_pool,
     request_trader,
     require_pool,
 )
 from hydra.risk.state import RiskStateUnavailableError, fetch_risk_events
+from hydra.services.live_gate import read_live_state
 
 router = APIRouter(prefix="/api/risk", tags=["risk"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
@@ -132,6 +134,8 @@ class RiskStatusLive(BaseModel):
     equity: float | None = None
     current_drawdown: float | None = None
     active_tier: int | None = None
+    # additive (R9): the armed gate; fail-safe false when the row is unreadable
+    live_armed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +397,12 @@ async def get_live_risk_status(request: Request, source: str | None = None) -> d
     ``source=live`` answers the same picture on the live scope plus its account numbers
     (equity, current drawdown, active tier); 503 ``live_risk_unavailable`` when no live
     service is built. An unrecognized source is refused 422, never silently served as
-    paper (A6≡S8).
+    paper (A6≡S8). ``live_armed`` is the master gate's row, merged here (R9): it reads
+    disarmed when the row is absent or unreadable (fail-safe) — and a false row never
+    means running live sessions stopped: they keep running under their start's
+    authorization until stopped or the kill switch fires (R10).
     """
     _validate_source(source)
-    return await request_trader(request).live_status(source=source or "paper")
+    body = await request_trader(request).live_status(source=source or "paper")
+    state = await read_live_state(request_pool(request))
+    return {**body, "live_armed": state["armed"]}

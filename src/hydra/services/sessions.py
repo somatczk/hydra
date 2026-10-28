@@ -647,13 +647,14 @@ def _live_gate_unreadable() -> ServiceError:
     )
 
 
-async def _refuse_live_webhook_target(pool: Any, *, symbol: str, strategy_id: str) -> None:
+async def refuse_live_webhook_target(pool: Any, *, symbol: str, strategy_id: str) -> None:
     """Refuse with 409 ``live_gate_required`` when the target's running row is live-mode.
 
     The target's mode is read from the database — the truth the D5 process split shares.
     An unreadable mode (no pool, or a failed read) fails closed with 503
     ``live_gate_unreadable``: a webhook-originated order never flows past an unreadable
-    gate (R25).
+    gate (R25). The signals route calls this before delegating (R3) and the backend op
+    calls it again with ``webhook_origin=True`` — one truth, two layers.
     """
     if pool is None:
         logger.error("Webhook live-gate unreadable for strategy %s: no database pool", strategy_id)
@@ -706,7 +707,7 @@ async def submit_webhook_order(
             503, "engine_not_ready", "Trading engine not initialized", "unavailable"
         )
     if webhook_origin:
-        await _refuse_live_webhook_target(pool, symbol=symbol, strategy_id=strategy_id)
+        await refuse_live_webhook_target(pool, symbol=symbol, strategy_id=strategy_id)
     is_exit = action == "exit"
     if not is_exit and side == "sell":
         raise service_error(

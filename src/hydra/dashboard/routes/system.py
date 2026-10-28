@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from hydra.dashboard.deps import current_config
 from hydra.dashboard.routes._db import (
+    ServiceErrorRoute,
     api_error,
     db_errors_to_503,
     request_trader,
@@ -24,8 +25,9 @@ from hydra.dashboard.routes._db import (
 )
 from hydra.dashboard.security import Principal, audit
 from hydra.execution import session_store
+from hydra.services.live_gate import is_trade_capable, running_live_sessions, stored_permissions
 
-router = APIRouter(prefix="/api/system", tags=["system"])
+router = APIRouter(prefix="/api/system", tags=["system"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
 
 
@@ -296,6 +298,9 @@ class ExchangeStatus(BaseModel):
     last_sync: str | None
     environment: Environment
     validated_environment: Environment | None = None
+    # R9: the connect-time permission record (None before P3-C or on testnet)
+    trade_enabled: bool | None = None
+    ip_restrict: bool | None = None
 
 
 class PlatformConfig(BaseModel):
@@ -313,13 +318,18 @@ class PlatformConfig(BaseModel):
 
 
 class PlatformConfigUpdate(BaseModel):
-    """Omitted or null fields are unchanged; an empty string clears a secret."""
+    """Omitted or null fields are unchanged; an empty string clears a secret.
 
-    trading_mode: TradingMode | None = None
+    ``trading_mode`` is deliberately absent (the legacy row is frozen at ``paper`` and
+    unwritable via the API — the armed row is the single live gate), and
+    ``live_capital`` is the live baseline (R2: also written by the arm ceremony).
+    """
+
     default_pair: str | None = Field(None, min_length=1)
     default_timeframe: str | None = Field(None, min_length=1)
     max_concurrent_strategies: int | None = Field(None, ge=1, le=100)
     paper_capital: float | None = Field(None, gt=0, allow_inf_nan=False)
+    live_capital: float | None = Field(None, gt=0, allow_inf_nan=False)
     webhook_secret: str | None = None
     discord_webhook_url: str | None = None
     slack_webhook_url: str | None = None
@@ -359,6 +369,8 @@ class ExchangeConnectResponse(BaseModel):
     message: str
     validated_at: str | None = None
     environment: Environment
+    trade_enabled: bool | None = None
+    ip_restrict: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +472,8 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
     pool = require_pool(request)
     async with db_errors_to_503("reading exchange credentials"), pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT exchange_id, validated_at, validated_environment FROM exchange_credentials"
+            "SELECT exchange_id, validated_at, validated_environment, validated_permissions "
+            "FROM exchange_credentials"
         )
     stored = {row["exchange_id"]: row for row in rows}
     errors = _get_credential_errors(request)
@@ -478,6 +491,7 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
         row = stored.get(exchange_id)
         validated_at = row["validated_at"] if row is not None else None
         validated_env = row["validated_environment"] if row is not None else None
+        permissions = stored_permissions(row["validated_permissions"]) if row is not None else None
         results.append(
             {
                 "id": exchange_id,
@@ -491,6 +505,14 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
                 "last_sync": _iso(validated_at),
                 "environment": environment,
                 "validated_environment": validated_env,
+                "trade_enabled": (
+                    None
+                    if permissions is None
+                    else bool(permissions.get("enable_spot_and_margin_trading"))
+                ),
+                "ip_restrict": None
+                if permissions is None
+                else bool(permissions.get("ip_restrict")),
             }
         )
     return results
@@ -519,7 +541,7 @@ async def connect_exchange(
         "passphrase": body.passphrase or None,
     }
     environment = current_environment()
-    await _check_credentials(exchange, creds, environment)
+    restrictions = await _check_credentials(exchange, creds, environment)
 
     from hydra.core.encryption import encrypt
 
@@ -527,20 +549,22 @@ async def connect_exchange(
         validated_at = await conn.fetchval(
             "INSERT INTO exchange_credentials "
             "(exchange_id, encrypted_key, encrypted_secret, encrypted_passphrase, updated_at, "
-            "validated_at, validated_environment) "
-            "VALUES ($1, $2, $3, $4, now(), now(), $5) "
+            "validated_at, validated_environment, validated_permissions) "
+            "VALUES ($1, $2, $3, $4, now(), now(), $5, $6::jsonb) "
             "ON CONFLICT (exchange_id) DO UPDATE SET "
             "encrypted_key = EXCLUDED.encrypted_key, "
             "encrypted_secret = EXCLUDED.encrypted_secret, "
             "encrypted_passphrase = EXCLUDED.encrypted_passphrase, "
             "updated_at = now(), validated_at = now(), "
-            "validated_environment = EXCLUDED.validated_environment "
+            "validated_environment = EXCLUDED.validated_environment, "
+            "validated_permissions = EXCLUDED.validated_permissions "
             "RETURNING validated_at",
             exchange,
             encrypt(body.api_key),
             encrypt(body.api_secret),
             encrypt(body.passphrase) if body.passphrase else None,
             environment,
+            None if restrictions is None else json.dumps(restrictions),
         )
 
     _get_exchange_credentials(request)[exchange] = creds
@@ -555,17 +579,51 @@ async def connect_exchange(
         "message": f"{_venue(exchange, environment)} accepted these keys; they are stored",
         "validated_at": _iso(validated_at),
         "environment": environment,
+        "trade_enabled": (
+            None if restrictions is None else restrictions["enable_spot_and_margin_trading"]
+        ),
+        "ip_restrict": None if restrictions is None else restrictions["ip_restrict"],
     }
 
 
 @router.delete("/exchanges/{exchange_id}/connect", response_model=ExchangeConnectResponse)
 async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, Any]:
-    """Remove stored exchange credentials; 503 (and no change) if the DB delete fails."""
+    """Remove stored exchange credentials; 503 (and no change) if the DB delete fails.
+
+    Trade-capable keys need the code-gated ``POST /api/live/credential-delete``
+    ceremony, and BOTH paths refuse while any live session runs (the stored
+    snapshot is not the arm truth — R8 re-fetches live — so a pre-P3-C
+    null-permission row must not delete under live money); read-only keys delete
+    directly once no live session runs.
+    """
     if exchange_id not in _EXCHANGE_DEFS:
         raise _unknown_exchange(exchange_id)
     display_name = _EXCHANGE_DEFS[exchange_id]
 
     pool = require_pool(request)
+    async with db_errors_to_503("reading exchange credentials"), pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT validated_permissions FROM exchange_credentials WHERE exchange_id = $1",
+            exchange_id,
+        )
+    if row is not None and is_trade_capable(row["validated_permissions"]):
+        raise api_error(
+            409,
+            "credential_delete_gated",
+            f"The stored {display_name} keys can trade; deleting them needs the code-gated "
+            "POST /api/live/credential-delete ceremony",
+            "invalid",
+        )
+    running = await running_live_sessions(request_trader(request))
+    if running:
+        raise api_error(
+            409,
+            "credential_delete_gated",
+            f"Credentials cannot be deleted while a live session runs "
+            f"({', '.join(running)}); stop it first",
+            "invalid",
+            running_live_sessions=running,
+        )
     async with db_errors_to_503("deleting exchange credentials"), pool.acquire() as conn:
         await conn.execute(
             "DELETE FROM exchange_credentials WHERE exchange_id = $1",
@@ -800,16 +858,13 @@ def _readonly_client(exchange_id: str, creds: dict[str, Any], environment: Envir
     return build_readonly_client(exchange_id, creds, testnet=environment == "testnet")
 
 
-async def _check_credentials(
-    exchange_id: str, creds: dict[str, Any], environment: Environment
-) -> None:
-    """One read-only balance call; 422 when the exchange rejects the keys, 502 when unreachable."""
+async def _keyed_read(read: Any, name: str) -> Any:
+    """One keyed read with the key-check error mapping; 422 on rejection, 502 on
+    unreachability or refusal, both with nothing stored."""
     import ccxt
 
-    name = _venue(exchange_id, environment)
-    client = _readonly_client(exchange_id, creds, environment)
     try:
-        await asyncio.wait_for(client.fetch_balance(), CONNECT_TIMEOUT_S)
+        return await asyncio.wait_for(read, CONNECT_TIMEOUT_S)
     except ccxt.AuthenticationError as exc:
         logger.info("%s rejected the submitted API keys (%s)", name, type(exc).__name__)
         raise api_error(
@@ -834,6 +889,37 @@ async def _check_credentials(
             f"{name} returned an error while checking the keys; nothing was stored",
             "unavailable",
         ) from exc
+
+
+async def _check_credentials(
+    exchange_id: str, creds: dict[str, Any], environment: Environment
+) -> dict[str, Any] | None:
+    """One read-only balance call, then the key's permissions on mainnet (never trades).
+
+    Returns the normalized ``validated_permissions`` record for storage, or ``None``
+    on testnet (the apiRestrictions read is a mainnet-only check). A
+    withdrawals-enabled key is refused 422 ``credentials_can_withdraw`` — nothing is
+    stored — so a connected key is trade-only.
+    """
+    from hydra.services.live_gate import normalize_restrictions
+
+    name = _venue(exchange_id, environment)
+    client = _readonly_client(exchange_id, creds, environment)
+    try:
+        await _keyed_read(client.fetch_balance(), name)
+        restrictions: dict[str, Any] | None = None
+        if environment == "mainnet":
+            raw = await _keyed_read(client.fetch_api_restrictions(), name)
+            restrictions = normalize_restrictions(raw)
+            if restrictions["enable_withdrawals"]:
+                raise api_error(
+                    422,
+                    "credentials_can_withdraw",
+                    f"{name} reports these keys can withdraw; live trading needs "
+                    "trade-only keys (disable withdrawals on the key); nothing was stored",
+                    "invalid",
+                )
+        return restrictions
     finally:
         try:
             await client.close()

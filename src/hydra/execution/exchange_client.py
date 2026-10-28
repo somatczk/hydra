@@ -216,6 +216,14 @@ class ExchangeClient:
                 totals[currency] = Decimal(str(amount))
         return totals
 
+    async def fetch_api_restrictions(self) -> dict[str, Any]:
+        """The key's permissions (GET /sapi/v1/account/apiRestrictions): a read-only
+        sapi call that never trades; the caller maps ccxt errors."""
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "fetch_api_restrictions"):
+            result: dict[str, Any] = await exchange.privateGetAccountApiRestrictions()
+        return result
+
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Fetch open orders from the exchange."""
         exchange = self._get_exchange()
