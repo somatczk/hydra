@@ -151,7 +151,7 @@ export function StrategyNameDialog({
       onClose={onClose}
     >
       <Input
-        label="Strategy Name"
+        label="Strategy name"
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder="My RSI Strategy"
