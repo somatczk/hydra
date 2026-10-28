@@ -14,12 +14,16 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
+from tests.fixtures.universe import offline_universe_value
+
 SEEDED: dict[str, Any] = {
     "trading_mode": "paper",
     "default_pair": "BTC/USDT",
     "default_timeframe": "1h",
     "max_concurrent_strategies": 5,
     "paper_capital": 10000,
+    # the running engine's steady state: the refresher has landed its first ranking
+    "universe": offline_universe_value(),
 }
 
 NOW = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
@@ -111,6 +115,9 @@ class FakeSystemDb:
             return (
                 None if row is None else {"validated_permissions": row.get("validated_permissions")}
             )
+        if sql == "SELECT value FROM system_config WHERE key = $1":
+            row = self.config.get(args[0])
+            return None if row is None else {"value": row["value"]}
         raise AssertionError(f"unexpected fetchrow: {sql}")
 
     async def execute(self, sql: str, *args: Any) -> str:

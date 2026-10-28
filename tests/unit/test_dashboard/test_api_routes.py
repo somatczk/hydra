@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hydra.dashboard.api import app
+from tests.fixtures.universe import seeded_universe_pool
 
 
 @pytest.fixture()
@@ -48,7 +49,7 @@ class TestStrategies:
         resp = client.post("/api/strategies/strat-1/toggle")
         assert resp.status_code == 404
 
-    def test_update_strategy_config(self, tmp_path: Path) -> None:
+    def test_update_strategy_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         yaml_file = tmp_path / "test.yaml"
         yaml_file.write_text(
             "id: test_strat_api\n"
@@ -74,6 +75,7 @@ class TestStrategies:
             "          value: 30\n"
         )
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            monkeypatch.setattr(app.state, "db_pool", seeded_universe_pool())
             client = TestClient(app)
             resp = client.put(
                 "/api/strategies/test_strat_api",
@@ -211,7 +213,8 @@ class TestBuilder:
         assert resp.status_code == 503
         assert resp.json()["detail"]["state"] == "unavailable"
 
-    def test_save_strategy(self, client: TestClient) -> None:
+    def test_save_strategy(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(app.state, "db_pool", seeded_universe_pool())
         resp = client.post(
             "/api/strategies/save",
             json={

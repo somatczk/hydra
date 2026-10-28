@@ -24,6 +24,7 @@ from starlette.datastructures import UploadFile
 
 from hydra.dashboard.routes.strategies import router
 from hydra.services.strategies import _row_to_strategy, _status_from_enabled
+from tests.fixtures.universe import OFFLINE_RANKED_AT, seeded_universe_pool
 
 _INVALID_INDICATOR_RULES: dict[str, Any] = {
     "entry_long": {
@@ -199,7 +200,7 @@ class TestStrategiesFallback:
         yaml_file.write_text(yaml_content)
 
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
-            client = TestClient(_make_app(pool=None))
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
             resp = client.put(
                 "/api/strategies/test_strat_001",
                 json={
@@ -420,7 +421,7 @@ class TestStrategiesFallback:
 
     def test_save_strategy_with_ml_overlay(self, tmp_path: Path) -> None:
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
-            client = TestClient(_make_app(pool=None))
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
             resp = client.post(
                 "/api/strategies/save",
                 json={
@@ -542,7 +543,7 @@ class TestStrategiesFallback:
         yaml_file.write_text(yaml_content)
 
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
-            client = TestClient(_make_app(pool=None))
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
             resp = client.put(
                 "/api/strategies/original_id_123",
                 json={
@@ -674,7 +675,7 @@ class TestStrategiesFallback:
         self, tmp_path: Path, rules: dict[str, Any]
     ) -> None:
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
-            client = TestClient(_make_app(pool=None))
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
             resp = client.post(
                 "/api/strategies/save",
                 json={
@@ -733,7 +734,7 @@ class TestStrategiesFallback:
             )
         )
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
-            client = TestClient(_make_app(pool=None))
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
             resp = client.put(
                 "/api/strategies/valid_1",
                 json={
@@ -1112,3 +1113,129 @@ class TestBacktestShare:
         assert resp.status_code == 200
         token = resp.json()["token"]
         assert resp.json()["share_url"] == f"/api/backtest/shared/{token}"
+
+
+# ---------------------------------------------------------------------------
+# P6-A2: the top-100 write gate on builder symbols
+# ---------------------------------------------------------------------------
+
+
+def _save_body(symbol: str = "BTCUSDT") -> dict[str, Any]:
+    """A valid builder save payload for *symbol*."""
+    return {
+        "name": "Universe Gate",
+        "description": "",
+        "exchange_id": "binance",
+        "symbol": symbol,
+        "rules": {
+            "entry_long": {
+                "operator": "AND",
+                "conditions": [
+                    {
+                        "indicator": "rsi",
+                        "params": {"period": 14},
+                        "comparator": "less_than",
+                        "value": 30,
+                    }
+                ],
+            },
+            "exit_long": None,
+            "entry_short": None,
+            "exit_short": None,
+        },
+        "timeframes": {"primary": "1h"},
+        "risk": {
+            "stop_loss_method": "atr",
+            "stop_loss_value": 2.0,
+            "take_profit_method": "atr",
+            "take_profit_value": 3.0,
+            "sizing_method": "fixed_fractional",
+            "sizing_params": {"risk_per_trade_pct": 1.0, "max_position_pct": 10.0},
+        },
+        "enable_immediately": False,
+    }
+
+
+def _rule_based_yaml(strategy_id: str) -> str:
+    return yaml.safe_dump(
+        {
+            "id": strategy_id,
+            "name": "Gate Target",
+            "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+            "enabled": False,
+            "symbols": ["BTCUSDT"],
+            "exchange": {"exchange_id": "binance", "market_type": "SPOT"},
+            "timeframes": {"primary": "1h"},
+            "parameters": {"required_history": 50},
+        }
+    )
+
+
+class TestUniverseWriteGate:
+    def test_save_with_a_non_member_symbol_is_422_and_writes_nothing(self, tmp_path: Path) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post("/api/strategies/save", json=_save_body(symbol="FOOBAR"))
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {
+            "code": "symbol_not_in_universe",
+            "message": (
+                "FOOBAR is not in the current top-100 universe "
+                f"(ranked at {OFFLINE_RANKED_AT.isoformat()}); running sessions and stored "
+                "strategies are unaffected"
+            ),
+            "state": "invalid",
+            "symbol": "FOOBAR",
+            "universe_ranked_at": OFFLINE_RANKED_AT.isoformat(),
+            "universe_count": 3,
+        }
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    def test_save_with_a_member_symbol_writes_the_yaml(self, tmp_path: Path) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post("/api/strategies/save", json=_save_body(symbol="BTCUSDT"))
+        assert resp.status_code == 201
+        (written,) = tmp_path.glob("*.yaml")
+        assert yaml.safe_load(written.read_text())["symbols"] == ["BTCUSDT"]
+
+    def test_update_with_a_member_symbol_round_trips(self, tmp_path: Path) -> None:
+        (tmp_path / "gate.yaml").write_text(_rule_based_yaml("gate_1"))
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.put("/api/strategies/gate_1", json=_save_body(symbol="ETHUSDT"))
+        assert resp.status_code == 200
+        assert resp.json()["id"] == "gate_1"
+        written = yaml.safe_load((tmp_path / "gate.yaml").read_text())
+        assert written["symbols"] == ["ETHUSDT"]
+
+    def test_update_with_a_non_member_symbol_writes_nothing(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "gate.yaml"
+        yaml_file.write_text(_rule_based_yaml("gate_1"))
+        before = yaml_file.read_bytes()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.put("/api/strategies/gate_1", json=_save_body(symbol="FOOBAR"))
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "symbol_not_in_universe"
+        assert yaml_file.read_bytes() == before
+
+
+def test_shipped_strategy_and_template_symbols_stay_savable() -> None:
+    """No shipped config may be stranded by the write gate: every committed strategy
+    and template symbol (all BTCUSDT — rank 1 in the offline ranking) still saves."""
+    repo = Path(__file__).resolve().parents[3]
+    files = sorted((repo / "config" / "strategies").glob("*.yaml"))
+    files += sorted((repo / "config" / "templates").glob("*.yaml"))
+    assert len(files) == 16  # the 11 shipped strategies + the 5 templates
+    client = TestClient(_make_app(pool=seeded_universe_pool()))
+    for path in files:
+        data = yaml.safe_load(path.read_text())
+        body = _save_body(symbol=data["symbols"][0])
+        body["name"] = data["name"]
+        body["description"] = data.get("parameters", {}).get("description", "")
+        body["exchange_id"] = data["exchange"]["exchange_id"]
+        body["rules"] = data["parameters"]["rules"]
+        body["timeframes"] = data["timeframes"]
+        resp = client.post("/api/strategies/save", json=body)
+        assert resp.status_code == 201, (path.name, resp.text)

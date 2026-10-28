@@ -92,7 +92,10 @@ async def strategy_save(
     """Validate and save a new strategy as a YAML config file; returns its new id.
 
     ``rules`` is the builder's rule set (entry/exit long/short condition groups);
-    ``enable_immediately`` also marks it enabled for paper sessions.
+    ``enable_immediately`` also marks it enabled for paper sessions. ``symbol``
+    must be a member of the current top-100 universe (``universe_list``): a
+    non-member is a 422 ``symbol_not_in_universe`` naming the ranking's
+    ``ranked_at`` (running sessions and stored strategies are unaffected).
     """
     try:
         body = _save_request(
@@ -106,7 +109,7 @@ async def strategy_save(
             enable_immediately,
             ml_overlay,
         )
-        result = strategy_svc.save_strategy(body)
+        result = await strategy_svc.save_strategy(_deps.db_pool(), body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     except ValidationError as exc:
@@ -129,7 +132,10 @@ async def strategy_update(
     ml_overlay: dict[str, Any] | None = None,
 ) -> str:
     """Update an existing rule-based strategy's YAML config; only rule-based strategies
-    can be edited (400 otherwise)."""
+    can be edited (400 otherwise). ``symbol`` must be a member of the current
+    top-100 universe (``universe_list``): a non-member is a 422
+    ``symbol_not_in_universe`` naming the ranking's ``ranked_at`` (the running
+    sessions and the stored file are unaffected)."""
     try:
         body = _save_request(
             name,
@@ -142,7 +148,7 @@ async def strategy_update(
             enable_immediately,
             ml_overlay,
         )
-        result = strategy_svc.update_strategy(strategy_id, body)
+        result = await strategy_svc.update_strategy(_deps.db_pool(), strategy_id, body)
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
     except ValidationError as exc:

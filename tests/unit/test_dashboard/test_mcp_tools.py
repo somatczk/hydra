@@ -44,6 +44,7 @@ from hydra.execution.session_manager import TradingSession
 from hydra.services import strategies as strategy_svc
 from hydra.services.errors import ServiceError, error_detail
 from hydra.services.trader import LocalTrader
+from tests.fixtures.universe import OFFLINE_RANKED_AT, seeded_universe_pool
 from tests.unit.test_execution.session_harness import Harness, held, write_strategy
 
 from .conftest import TEST_API_TOKEN
@@ -731,6 +732,47 @@ def test_strategy_save_with_an_empty_name_names_the_offending_field(mcp: _McpCli
     assert envelope["status"] == 422
     assert envelope["detail"]["code"] == "validation_error"
     assert envelope["detail"]["message"].startswith("name:")
+
+
+def test_strategy_save_with_a_non_member_symbol_is_the_422_envelope(
+    mcp: _McpClient, strategies_dir: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    is_error, text = mcp.call(
+        "strategy_save", {"name": "Ghost Pair", "symbol": "FOOBAR", "rules": _RULES}
+    )
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool strategy_save: "))
+    assert envelope == {
+        "status": 422,
+        "detail": {
+            "code": "symbol_not_in_universe",
+            "message": (
+                "FOOBAR is not in the current top-100 universe "
+                f"(ranked at {OFFLINE_RANKED_AT.isoformat()}); running sessions and stored "
+                "strategies are unaffected"
+            ),
+            "state": "invalid",
+            "symbol": "FOOBAR",
+            "universe_ranked_at": OFFLINE_RANKED_AT.isoformat(),
+            "universe_count": 3,
+        },
+    }
+    assert list(strategies_dir.glob("*.yaml")) == []
+
+
+def test_strategy_save_with_a_member_symbol_saves(
+    mcp: _McpClient, strategies_dir: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    is_error, text = mcp.call(
+        "strategy_save", {"name": "Member Pair", "symbol": "BTCUSDT", "rules": _RULES}
+    )
+    assert not is_error
+    result = json.loads(text)
+    assert result["name"] == "Member Pair"
+    written = strategies_dir / f"{result['id']}.yaml"
+    assert yaml.safe_load(written.read_text())["symbols"] == ["BTCUSDT"]
 
 
 def test_strategy_export_on_a_file_deleted_after_the_scan_is_the_404_envelope(

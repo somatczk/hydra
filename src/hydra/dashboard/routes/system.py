@@ -25,6 +25,7 @@ from hydra.dashboard.routes._db import (
 )
 from hydra.dashboard.security import Principal, audit
 from hydra.execution import session_store
+from hydra.services import universe
 from hydra.services.live_gate import is_trade_capable, running_live_sessions, stored_permissions
 
 router = APIRouter(prefix="/api/system", tags=["system"], route_class=ServiceErrorRoute)
@@ -416,9 +417,16 @@ async def get_config(request: Request) -> dict[str, Any]:
 
 @router.put("/config", response_model=PlatformConfig)
 async def update_config(body: PlatformConfigUpdate, request: Request) -> dict[str, Any]:
-    """Persist the given fields; a paper_capital change goes through the audited paper reset."""
+    """Persist the given fields; a paper_capital change goes through the audited paper reset.
+
+    A ``default_pair`` update must be a member of the current top-100 universe
+    (422 ``symbol_not_in_universe`` naming the ranking's ``ranked_at``); the
+    stored universe row itself is only ever read here.
+    """
     pool = require_pool(request)
     updates = body.model_dump(exclude_none=True)
+    if "default_pair" in updates:
+        await universe.validate_symbol(pool, updates["default_pair"])
     if updates:
         await _save_system_config(pool, updates, _actor(request))
         async with db_errors_to_503("reading system config"):

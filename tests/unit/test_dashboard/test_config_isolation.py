@@ -18,6 +18,7 @@ import hydra
 import hydra.core.config as config_module
 from hydra.dashboard.api import app
 from hydra.dashboard.routes.models import _models_dir
+from tests.fixtures.universe import seeded_universe_pool
 
 REPO = Path(__file__).resolve().parents[3]
 REPO_STRATEGIES = REPO / "config" / "strategies"
@@ -42,8 +43,11 @@ def _snapshot(directory: Path) -> dict[str, str]:
     }
 
 
-def test_strategy_writes_land_in_isolated_dir(strategies_dir: Path) -> None:
+def test_strategy_writes_land_in_isolated_dir(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     before = _snapshot(REPO_STRATEGIES)
+    monkeypatch.setattr(app.state, "db_pool", seeded_universe_pool())
     client = TestClient(app)
 
     saved = client.post("/api/strategies/save", json={"name": "Iso Check", "rules": _RULES})

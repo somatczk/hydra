@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hydra.dashboard.routes.strategies import router
+from tests.fixtures.universe import seeded_universe_pool
 
 
 @pytest.fixture()
@@ -126,6 +127,12 @@ class TestListComparators:
 
 class TestSaveStrategy:
     """Tests for the strategy save endpoint."""
+
+    @pytest.fixture()
+    def client(self, app: FastAPI) -> TestClient:
+        """The builder app with the stored universe row every save now reads."""
+        app.state.db_pool = seeded_universe_pool()
+        return TestClient(app)
 
     def _valid_save_request(self) -> dict[str, Any]:
         """Return a valid save request body."""
