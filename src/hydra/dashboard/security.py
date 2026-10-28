@@ -43,7 +43,7 @@ from hydra.dashboard.routes._db import ErrorState, error_detail, unauthenticated
 logger = logging.getLogger(__name__)
 audit_logger = get_logger("hydra.audit")
 
-PUBLIC_PATHS: frozenset[str] = frozenset({"/health", "/livez", "/readyz", "/metrics"})
+PUBLIC_PATHS: frozenset[str] = frozenset({"/livez", "/readyz", "/metrics"})
 MCP_PATH_PREFIX = "/mcp"
 SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 CSRF_HEADER = "x-hydra-request"

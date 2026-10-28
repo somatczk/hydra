@@ -110,14 +110,14 @@ def test_uvicorn_loggers_are_routed_to_root_as_json(capsys: pytest.CaptureFixtur
     setup_logging("INFO", "json")
 
     logging.getLogger("uvicorn.access").info(
-        '%s - "%s %s HTTP/%s" %d', "127.0.0.1:5000", "GET", "/health", "1.1", 200
+        '%s - "%s %s HTTP/%s" %d', "127.0.0.1:5000", "GET", "/livez", "1.1", 200
     )
     logging.getLogger("uvicorn.error").info("Application startup complete.")
 
     captured = capsys.readouterr()
     access, startup = _json_lines(captured.out)
     _assert_envelope(access, "info", "uvicorn.access")
-    assert access["event"] == '127.0.0.1:5000 - "GET /health HTTP/1.1" 200'
+    assert access["event"] == '127.0.0.1:5000 - "GET /livez HTTP/1.1" 200'
     _assert_envelope(startup, "info", "uvicorn.error")
     assert captured.err == ""
     for name in _UVICORN:

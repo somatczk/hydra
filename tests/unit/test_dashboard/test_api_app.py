@@ -1,7 +1,6 @@
 """Tests for the main dashboard FastAPI application module.
 
 Tests cover:
-- /health is the /livez alias (behaviour: test_health_routes.py)
 - strategy_builder router is included (not legacy builder)
 - Lifespan without DATABASE_URL runs with no pool (startup failures: test_lifespan.py)
 - All expected route prefixes are registered
@@ -35,10 +34,9 @@ def client() -> TestClient:
 
 
 class TestHealthEndpoint:
-    def test_health_is_the_livez_alias_and_503_without_a_lifespan(self, client: TestClient) -> None:
-        resp = client.get("/health")
+    def test_livez_is_503_without_a_lifespan(self, client: TestClient) -> None:
+        resp = client.get("/livez")
         assert resp.status_code == 503
-        assert resp.json() == client.get("/livez").json()
         assert resp.json()["status"] == "down"
 
 
@@ -83,9 +81,10 @@ class TestRouterRegistration:
         paths = self._route_paths()
         assert any("/api/system" in p for p in paths)
 
-    def test_health_route_present(self) -> None:
+    def test_probe_routes_present(self) -> None:
         paths = self._route_paths()
-        assert {"/health", "/livez", "/readyz"} <= paths
+        assert {"/livez", "/readyz"} <= paths
+        assert "/health" not in paths
 
     def test_metrics_route_present(self) -> None:
         paths = self._route_paths()
@@ -138,7 +137,7 @@ class TestDbPoolLifecycle:
 class TestCORS:
     def test_cors_allows_localhost_3000(self, client: TestClient) -> None:
         resp = client.options(
-            "/health",
+            "/livez",
             headers={
                 "Origin": "http://localhost:3000",
                 "Access-Control-Request-Method": "GET",

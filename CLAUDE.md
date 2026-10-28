@@ -143,11 +143,11 @@ those packages, because `mypy src/` alone does not catch everything it catches.
 - Probes (`src/hydra/dashboard/health.py`, `routes/health.py`): a `HealthMonitor` started last by the lifespan runs
   every 15 s and sets `hydra_ready{check}`, the per-session desired/supervised gauges and its heartbeat; `/readyz`
   serves its last result while it is at most 30 s old and never writes gauges. `/livez`
-  (Docker healthcheck; `/health` is its alias until P3) needs startup done and a recent monitor run; `/readyz` (alerts,
+  (Docker healthcheck) needs startup done and a recent monitor run; `/readyz` (alerts,
   never restarts) needs the DB, the Alembic head, no zombie session (running in the DB without a live task), fresh
   feeds for supervised sessions and the RiskService. Session health comes from `SessionManager.health_snapshot()`.
 - API auth lives in one pure-ASGI middleware, `src/hydra/dashboard/security.py`: every route and WebSocket except
-  `PUBLIC_PATHS` (`/health`, `/livez`, `/readyz`, `/metrics`) needs a principal (Authelia `Remote-User` from a peer in
+  `PUBLIC_PATHS` (`/livez`, `/readyz`, `/metrics`) needs a principal (Authelia `Remote-User` from a peer in
   `api.trusted_proxy_cidrs`, bearer `HYDRA_API_TOKEN`, or anyone in `api.auth_mode: dev`), and browser principals
   must send `X-Hydra-Request: 1` on non-GET requests. `api.trusted_proxy_cidrs` lists Traefik's static /32, never
   the hydra-edge subnet (its bridge gateway is the host). Routes need no auth code; read the caller with
