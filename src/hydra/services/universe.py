@@ -105,12 +105,13 @@ async def read_universe(pool: Any) -> dict[str, Any]:
 async def validate_symbol(pool: Any, symbol: str) -> None:
     """The write-time membership gate: return iff *symbol* is a current member.
 
-    The comparison normalizes like ``MarketRulesCache`` (``BTC/USDT`` → ``BTCUSDT``).
-    A non-member is a 422 ``symbol_not_in_universe`` naming the ranking's ``ranked_at``
+    The comparison normalizes exactly like ``MarketRulesCache`` (``BTC/USDT`` →
+    ``BTCUSDT``; it never case-folds, so ``solusdt`` is a non-member here). A non-member
+    is a 422 ``symbol_not_in_universe`` naming the ranking's ``ranked_at``
     (write-time only: running sessions and stored strategies are unaffected); no stored
     row fails closed with the 503 above — nothing is writable without a universe.
     """
-    normalized = symbol.replace("/", "").upper()
+    normalized = symbol.replace("/", "")
     data = await read_universe(pool)
     members = {str(entry["symbol"]) for entry in data["symbols"]}
     if normalized not in members:

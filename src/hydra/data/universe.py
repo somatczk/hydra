@@ -1,15 +1,15 @@
 """The top-100 trading universe: Binance SPOT USDT pairs by rolling-24h quote volume.
 
 ``rank_universe`` is the pure ranking: eligible markets are spot, active, USDT-quoted,
-tradable bases (no stablecoin or fiat base, no leveraged-token suffix) with positive
-rolling-24h quote volume; sorted by volume descending with the exchange symbol ascending
-as the deterministic tie-break, capped at 100 (fewer only when the exchange offers
-fewer). ``compute_universe`` makes the two public REST calls — one ``load_markets`` and
-one whole-exchange ``fetch_tickers`` (weight 80; ``GET /api/v3/ticker/24hr``) — on the
-pooled client it is given, never a bespoke one. ``UniverseRefresher`` is the background
-loop around an injected refresh callable: the first refresh runs immediately, then every
-24 h; a failure logs a warning and retries hourly, so it never raises into the lifespan
-and is not a readiness check.
+tradable bases (no stablecoin or fiat base, none of the exact historic leveraged-token
+bases) with positive rolling-24h quote volume; sorted by volume descending with the
+exchange symbol ascending as the deterministic tie-break, capped at 100 (fewer only
+when the exchange offers fewer). ``compute_universe`` makes the two public REST calls —
+one ``load_markets`` and one whole-exchange ``fetch_tickers`` (weight 80;
+``GET /api/v3/ticker/24hr``) — on the pooled client it is given, never a bespoke one.
+``UniverseRefresher`` is the background loop around an injected refresh callable: the
+first refresh runs immediately, then every 24 h; a failure logs a warning and retries
+hourly, so it never raises into the lifespan and is not a readiness check.
 """
 
 from __future__ import annotations
@@ -45,6 +45,9 @@ _NON_TRADING_BASES = frozenset(
         "USD1",
         "USDP",
         "BUSD",
+        "USDE",
+        "USDS",
+        "USDG",
         "AEUR",
         "EURI",
         "EUR",
@@ -69,8 +72,59 @@ _NON_TRADING_BASES = frozenset(
         "CHF",
     }
 )
-# Delisted exchange-wide in 2022; kept as one-line defense.
-_LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
+# The exact historic Binance leveraged-token bases (all delisted 2022-2024); no suffix heuristic.
+_LEVERAGED_BASES = frozenset(
+    {
+        "BTCUP",
+        "BTCDOWN",
+        "ETHUP",
+        "ETHDOWN",
+        "BNBUP",
+        "BNBDOWN",
+        "XRPUP",
+        "XRPDOWN",
+        "ADAUP",
+        "ADADOWN",
+        "TRXUP",
+        "TRXDOWN",
+        "LTCUP",
+        "LTCDOWN",
+        "BCHUP",
+        "BCHDOWN",
+        "DOTUP",
+        "DOTDOWN",
+        "LINKUP",
+        "LINKDOWN",
+        "XTZUP",
+        "XTZDOWN",
+        "ATOMUP",
+        "ATOMDOWN",
+        "EOSUP",
+        "EOSDOWN",
+        "UNIUP",
+        "UNIDOWN",
+        "SXPUP",
+        "SXPDOWN",
+        "FILUP",
+        "FILDOWN",
+        "AAVEUP",
+        "AAVEDOWN",
+        "SUSHIUP",
+        "SUSHIDOWN",
+        "XLMUP",
+        "XLMDOWN",
+        "1INCHUP",
+        "1INCHDOWN",
+        "YFIUP",
+        "YFIDOWN",
+        "BANDUP",
+        "BANDDOWN",
+        "DOGEUP",
+        "DOGEDOWN",
+        "SOLUP",
+        "SOLDOWN",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +157,7 @@ def rank_universe(
         symbol = market.get("symbol")
         if not base or not symbol or base in _NON_TRADING_BASES:
             continue
-        if base.endswith(_LEVERAGED_SUFFIXES):
+        if base in _LEVERAGED_BASES:
             continue
         volume = ticker_by_symbol.get(str(symbol), {}).get("quoteVolume")
         if not isinstance(volume, int | float) or not math.isfinite(volume) or volume <= 0:

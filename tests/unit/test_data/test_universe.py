@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from hydra.data.universe import (
+    _LEVERAGED_BASES,
     _NON_TRADING_BASES,
     UniverseEntry,
     UniverseRefresher,
@@ -101,6 +102,14 @@ class TestRankUniverse:
         assert entries[0].rank == 1
         assert entries[1].rank == 2
 
+    def test_the_live_usde_stablecoin_base_is_excluded(self) -> None:
+        """USDE (Ethena USDe, a live pair) is a stablecoin, not a tradable base."""
+        entries = rank_universe(
+            [_market("USDE/USDT"), _market("BTC/USDT")],
+            [_ticker("USDE/USDT", 9_999_999.0), _ticker("BTC/USDT", 1.0)],
+        )
+        assert [entry.symbol for entry in entries] == ["BTCUSDT"]
+
     def test_the_fiat_offramp_base_is_excluded(self) -> None:
         entries = rank_universe(
             [_market("EUR/USDT", base="EUR"), _market("BTC/USDT")],
@@ -114,6 +123,21 @@ class TestRankUniverse:
             [_ticker("BTCUP/USDT", 9_999_999.0), _ticker("BTC/USDT", 1.0)],
         )
         assert [entry.symbol for entry in entries] == ["BTCUSDT"]
+
+    def test_the_live_jup_base_is_not_excluded(self) -> None:
+        """JUP (Jupiter, a 2024 listing) merely ends in UP; it was never a BLVT."""
+        entries = rank_universe(
+            [_market("JUP/USDT"), _market("BTC/USDT")],
+            [_ticker("JUP/USDT", 9_999_999.0), _ticker("BTC/USDT", 1.0)],
+        )
+        assert [entry.symbol for entry in entries] == ["JUPUSDT", "BTCUSDT"]
+
+    def test_a_top_volume_jup_ranks_with_its_rank_and_volume(self) -> None:
+        markets, tickers = _eligible(3, 300.0)
+        markets.append(_market("JUP/USDT"))
+        tickers.append(_ticker("JUP/USDT", 299.5))
+        entries = rank_universe(markets, tickers)
+        assert entries[1] == UniverseEntry(rank=2, symbol="JUPUSDT", quote_volume=299.5)
 
     def test_a_non_usdt_quote_is_excluded(self) -> None:
         entries = rank_universe(
@@ -174,6 +198,9 @@ class TestRankUniverse:
                     "USD1",
                     "USDP",
                     "BUSD",
+                    "USDE",
+                    "USDS",
+                    "USDG",
                     "AEUR",
                     "EURI",
                     "EUR",
@@ -199,6 +226,63 @@ class TestRankUniverse:
                 }
             )
             == _NON_TRADING_BASES
+        )
+
+    def test_the_leveraged_base_list_is_the_decided_one(self) -> None:
+        assert (
+            frozenset(
+                {
+                    "BTCUP",
+                    "BTCDOWN",
+                    "ETHUP",
+                    "ETHDOWN",
+                    "BNBUP",
+                    "BNBDOWN",
+                    "XRPUP",
+                    "XRPDOWN",
+                    "ADAUP",
+                    "ADADOWN",
+                    "TRXUP",
+                    "TRXDOWN",
+                    "LTCUP",
+                    "LTCDOWN",
+                    "BCHUP",
+                    "BCHDOWN",
+                    "DOTUP",
+                    "DOTDOWN",
+                    "LINKUP",
+                    "LINKDOWN",
+                    "XTZUP",
+                    "XTZDOWN",
+                    "ATOMUP",
+                    "ATOMDOWN",
+                    "EOSUP",
+                    "EOSDOWN",
+                    "UNIUP",
+                    "UNIDOWN",
+                    "SXPUP",
+                    "SXPDOWN",
+                    "FILUP",
+                    "FILDOWN",
+                    "AAVEUP",
+                    "AAVEDOWN",
+                    "SUSHIUP",
+                    "SUSHIDOWN",
+                    "XLMUP",
+                    "XLMDOWN",
+                    "1INCHUP",
+                    "1INCHDOWN",
+                    "YFIUP",
+                    "YFIDOWN",
+                    "BANDUP",
+                    "BANDDOWN",
+                    "DOGEUP",
+                    "DOGEDOWN",
+                    "SOLUP",
+                    "SOLDOWN",
+                }
+            )
+            == _LEVERAGED_BASES
         )
 
 

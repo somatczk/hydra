@@ -124,8 +124,24 @@ class TestValidateSymbol:
     async def test_the_slash_form_normalizes_like_market_rules(self) -> None:
         assert await validate_symbol(await _seeded(datetime.now(UTC)), "BTC/USDT") is None
 
-    async def test_the_lowercase_form_normalizes(self) -> None:
-        assert await validate_symbol(await _seeded(datetime.now(UTC)), "solusdt") is None
+    async def test_the_lowercase_form_is_rejected_like_market_rules(self) -> None:
+        """MarketRules never case-folds, so a lowercase member is an honest write-time 422."""
+        ranked_at = datetime.now(UTC) - timedelta(minutes=30)
+        with pytest.raises(ServiceError) as err:
+            await validate_symbol(await _seeded(ranked_at), "solusdt")
+        assert err.value.status_code == 422
+        assert err.value.detail == {
+            "code": "symbol_not_in_universe",
+            "message": (
+                "solusdt is not in the current top-100 universe "
+                f"(ranked at {ranked_at.isoformat()}); running sessions and stored "
+                "strategies are unaffected"
+            ),
+            "state": "invalid",
+            "symbol": "solusdt",
+            "universe_ranked_at": ranked_at.isoformat(),
+            "universe_count": 3,
+        }
 
     async def test_a_non_member_is_the_422_envelope_with_the_ranking_provenance(self) -> None:
         ranked_at = datetime.now(UTC) - timedelta(minutes=30)
