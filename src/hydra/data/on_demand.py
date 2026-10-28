@@ -56,7 +56,7 @@ LOAD_MARKETS_WEIGHT = 20
 _WINDOW_S = 60.0
 
 
-class _WeightBudget:
+class WeightBudget:
     """Fixed-window request-weight budget: at most ``weight_per_min`` per 60 s window.
 
     The first acquire opens a window; a request that would exceed the window's limit
@@ -150,7 +150,7 @@ class OnDemandFetchService:
         self._clock = clock
         self._sleep = sleep
         self._now = now
-        self._budget = _WeightBudget(weight_per_min, clock=clock, sleep=sleep)
+        self._budget = WeightBudget(weight_per_min, clock=clock, sleep=sleep)
         self._locks: dict[tuple[ExchangeId, str, Timeframe], asyncio.Lock] = {}
 
     @classmethod

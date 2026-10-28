@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -123,6 +124,15 @@ class TestOrderBook:
         assert resp.status_code == 422
         assert resp.json()["detail"]["code"] == "exchange_not_allowed"
         assert factory.created == []
+
+    def test_binanceusdm_order_book_is_allowed(self, factory: _Factory) -> None:
+        """P4-B: the USD⌂-M perps venue serves order books too (public fapi depth)."""
+        resp = TestClient(_make_app()).get(
+            "/api/market/orderbook?exchange=binanceusdm&symbol=BTCUSDT"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["exchange"] == "binanceusdm"
+        assert len(factory.created) == 1
 
     def test_depth_cap(self, factory: _Factory) -> None:
         client = TestClient(_make_app())
@@ -330,6 +340,66 @@ class TestFundingRates:
         resp = TestClient(_make_app(pool=pool)).get("/api/market/funding-rates")
         assert resp.status_code == 200
         assert resp.json() == []
+
+    def test_funding_rates_serve_the_ingested_binanceusdm_rows(self) -> None:
+        """The read side of the P4-B writer: exchange=binanceusdm serves ts.funding_rates."""
+        conn = MagicMock()
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"timestamp": datetime(2026, 1, 1, 0, tzinfo=UTC), "rate": Decimal("0.0001")},
+                {"timestamp": datetime(2026, 1, 1, 8, tzinfo=UTC), "rate": Decimal("-0.00005")},
+            ]
+        )
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+        pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = TestClient(_make_app(pool=pool)).get(
+            "/api/market/funding-rates?exchange=binanceusdm&symbol=BTCUSDT"
+        )
+        assert resp.status_code == 200
+        assert resp.json() == [
+            {
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "rate": 0.0001,
+                "annualized_rate": 10.95,
+            },
+            {
+                "timestamp": "2026-01-01T08:00:00+00:00",
+                "rate": -5e-05,
+                "annualized_rate": -5.475,
+            },
+        ]
+        assert conn.fetch.call_args[0][1:3] == ("binanceusdm", "BTCUSDT")
+
+    def test_current_funding_rates_serve_the_ingested_binanceusdm_rows(self) -> None:
+        conn = MagicMock()
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "exchange": "binanceusdm",
+                    "symbol": "BTCUSDT",
+                    "rate": Decimal("0.0001"),
+                    "next_funding_time": None,
+                    "timestamp": datetime(2026, 1, 1, 0, tzinfo=UTC),
+                }
+            ]
+        )
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+        pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = TestClient(_make_app(pool=pool)).get(
+            "/api/market/funding-rates/current?symbol=BTCUSDT"
+        )
+        assert resp.status_code == 200
+        assert resp.json() == [
+            {
+                "exchange": "binanceusdm",
+                "symbol": "BTCUSDT",
+                "rate": 0.0001,
+                "annualized_rate": 10.95,
+                "next_funding_time": None,
+            }
+        ]
 
 
 def test_mock_order_book_is_gone() -> None:

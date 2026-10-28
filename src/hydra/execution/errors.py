@@ -19,7 +19,7 @@ class DuplicateSessionError(ValueError):
 
 
 class UnsupportedVenueError(ValueError):
-    """Only Binance SPOT is accepted until P4 (D10)."""
+    """Only an allowed venue pair is accepted: binance SPOT, binanceusdm FUTURES."""
 
     code = "unsupported_venue"
 

@@ -155,7 +155,7 @@ async def get_universe(request: Request) -> dict[str, Any]:
 # Order book: one cached public CCXT client per exchange, stored on app.state
 # ---------------------------------------------------------------------------
 
-_ALLOWED_EXCHANGES = frozenset({"binance"})
+_ALLOWED_EXCHANGES = frozenset({"binance", "binanceusdm"})
 
 
 def _default_exchange_factory(exchange_id: str) -> Any:

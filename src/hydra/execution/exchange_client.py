@@ -37,7 +37,8 @@ class ExchangeClient:
     testnet:
         Whether to connect to the testnet/sandbox endpoint.
     market_type:
-        Selects the ccxt class through ``client_factory.ccxt_class_for`` (Binance SPOT only).
+        Selects the ccxt class through ``client_factory.ccxt_class_for`` (binance SPOT,
+        binanceusdm FUTURES).
     """
 
     def __init__(
