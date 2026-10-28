@@ -27,6 +27,8 @@ from hydra.dashboard.routes import portfolio, system
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.risk.state import PgRiskStateStore
+from hydra.services.universe import refresh_universe
+from tests.fixtures.universe import offline_compute
 
 HOOK = "hook-" + Fernet.generate_key().decode()[:16]
 T0 = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
@@ -90,6 +92,8 @@ async def test_schema_and_seeded_rows(pool: asyncpg.Pool) -> None:
 async def test_config_survives_a_restart_with_secrets_encrypted(
     pool: asyncpg.Pool, fresh_database: str
 ) -> None:
+    # the running engine's steady state: the universe refresher has landed its ranking
+    await refresh_universe(pool, offline_compute)
     async with _client(_app(pool)) as client:
         resp = await client.put(
             "/api/system/config",

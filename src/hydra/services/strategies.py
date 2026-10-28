@@ -27,6 +27,7 @@ from hydra.execution.errors import (
     SessionNotRunningError,
     UnsupportedVenueError,
 )
+from hydra.services import universe
 from hydra.services.errors import (
     DB_ERRORS,
     ServiceError,
@@ -639,8 +640,13 @@ async def reload_strategy(manager: Any, strategy_id: str) -> dict[str, Any]:
     }
 
 
-def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
-    """Update a rule-based strategy config (structured payload -> YAML)."""
+async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> SaveResponse:
+    """Update a rule-based strategy config (structured payload -> YAML).
+
+    The symbol must be a member of the current top-100 universe (422
+    ``symbol_not_in_universe`` otherwise); running sessions and the stored file
+    are never retro-invalidated.
+    """
     path = find_strategy_file(strategy_id)
     if path is None:
         raise ServiceError(404, f"Strategy '{strategy_id}' not found")
@@ -659,6 +665,8 @@ def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
 
     if body.timeframes.primary not in _VALID_TIMEFRAMES:
         raise ServiceError(422, f"Invalid timeframe: {body.timeframes.primary}")
+
+    await universe.validate_symbol(pool, body.symbol)
 
     existing_enabled = data.get("enabled", False)
     existing_required_history = data.get("parameters", {}).get("required_history", 50)
@@ -838,8 +846,13 @@ def _preview_provenance(provenance: DataProvenance) -> PreviewProvenance:
     )
 
 
-def save_strategy(request: SaveRequest) -> SaveResponse:
-    """Validate and save a strategy as a YAML config file."""
+async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
+    """Validate and save a strategy as a YAML config file.
+
+    The symbol must be a member of the current top-100 universe (422
+    ``symbol_not_in_universe`` otherwise); nothing already stored or running
+    is ever retro-invalidated.
+    """
     try:
         rule_set = _validate_rules(request.rules)
     except (ValueError, KeyError) as exc:
@@ -850,6 +863,8 @@ def save_strategy(request: SaveRequest) -> SaveResponse:
 
     if request.timeframes.primary not in _VALID_TIMEFRAMES:
         raise ServiceError(422, f"Invalid timeframe: {request.timeframes.primary}")
+
+    await universe.validate_symbol(pool, request.symbol)
 
     strategy_id = _name_to_id(request.name)
     unique_suffix = uuid.uuid4().hex[:6]
