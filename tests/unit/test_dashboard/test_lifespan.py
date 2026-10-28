@@ -494,9 +494,11 @@ async def test_the_sweeper_starts_after_the_refresher_and_stops_before_the_pool(
         ("_start_health_monitor", "start-monitor"),
         ("_start_universe_refresher", "start-refresher"),
         ("_start_data_cache_sweeper", "start-sweeper"),
+        ("_start_funding_refresher", "start-funding"),
     ):
         monkeypatch.setattr(lifespan, name, _recorder(order, label))
     for name, label in (
+        ("_stop_funding_refresher", "stop-funding"),
         ("_stop_universe_refresher", "stop-refresher"),
         ("_stop_data_cache_sweeper", "stop-sweeper"),
         ("_close_db_pool", "close-pool"),
@@ -507,15 +509,84 @@ async def test_the_sweeper_starts_after_the_refresher_and_stops_before_the_pool(
     monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
     app = FastAPI()
     async with lifespan.run(app):
-        assert order == ["start-monitor", "start-refresher", "start-sweeper"]
+        assert order == ["start-monitor", "start-refresher", "start-sweeper", "start-funding"]
     assert order == [
         "start-monitor",
         "start-refresher",
         "start-sweeper",
+        "start-funding",
+        "stop-funding",
         "stop-refresher",
         "stop-sweeper",
         "close-pool",
     ]
+
+
+# ---------------------------------------------------------------------------
+# The funding-rate refresher: after the sweeper, cancelled first on shutdown
+# ---------------------------------------------------------------------------
+
+
+class _FakeFundingRefresher:
+    """The ``funding_refresher_factory`` seam's test double."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def test_funding_refresher_starts_with_a_pool_and_stops_on_shutdown() -> None:
+    app = FastAPI()
+    app.state.db_pool = object()
+    fake = _FakeFundingRefresher()
+    app.state.funding_refresher_factory = lambda _app: fake
+    await lifespan._start_funding_refresher(app)
+    assert fake.started
+    assert app.state.funding_refresher is fake
+    await lifespan._stop_funding_refresher(app)
+    assert fake.stopped
+
+
+async def test_without_a_pool_no_funding_refresher_starts() -> None:
+    app = FastAPI()
+    app.state.db_pool = None
+    calls: list[FastAPI] = []
+
+    def factory(target: FastAPI) -> _FakeFundingRefresher:
+        calls.append(target)
+        return _FakeFundingRefresher()
+
+    app.state.funding_refresher_factory = factory
+    await lifespan._start_funding_refresher(app)
+    assert calls == []
+    assert getattr(app.state, "funding_refresher", None) is None
+
+
+async def test_the_default_factory_builds_the_real_funding_refresher() -> None:
+    from hydra.data.funding import FundingRefresher
+
+    app = FastAPI()
+    app.state.db_pool = object()
+    refresher = lifespan._default_funding_refresher(app)
+    assert isinstance(refresher, FundingRefresher)
+    await refresher.stop()  # never started: stopping is safe
+
+
+async def test_a_running_lifespan_leaves_no_funding_refresher_without_a_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dev mode (no DATABASE_URL) starts no funding task; state stays None."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert getattr(app.state, "funding_refresher", None) is None
 
 
 def _recorder(order: list[str], label: str) -> Any:

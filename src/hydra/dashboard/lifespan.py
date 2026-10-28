@@ -11,8 +11,11 @@ green — the engine-side full set, or the split set with the remote-trader chec
 universe refresher (the daily top-100 ranking, only with a pool; a refresh failure logs a
 warning and retries hourly, never blocking startup or readiness), then the data-cache
 sweeper (the bounded LRU over auto-fetched bars, only with a pool; a failed sweep counts
-one metric and yields to the next cycle, never blocking startup or a read). Shutdown
-cancels the universe refresher first, then the cache sweeper, then closes the MCP session
+one metric and yields to the next cycle, never blocking startup or a read), then the
+funding-rate refresher (the binanceusdm top-up for the running perp sessions' symbols,
+only with a pool; with no running perp sessions each cycle is a no-op, and a failed cycle
+is a warning retried hourly, never blocking startup). Shutdown cancels the funding
+refresher first, then the universe refresher, then the cache sweeper, then closes the MCP session
 manager, unmounts ``/mcp`` and
 resets ``app.state.mcp`` (the session manager is
 single-use, so a re-entered lifespan remounts a fresh transport instead of finding the closed
@@ -22,8 +25,9 @@ no pool, no migration and no key requirement. ``app.state.session_clients`` (a
 ``ClientFactory``), when set before startup, replaces the public exchange clients of every
 session, and ``app.state.health_monitor_factory`` builds the ``HealthMonitor`` (the paper smoke
 test injects its fakes and a monitor clock there), as does
-``app.state.universe_refresher_factory`` for the universe refresher and
-``app.state.data_cache_sweeper_factory`` for the cache sweeper.
+``app.state.universe_refresher_factory`` for the universe refresher,
+``app.state.data_cache_sweeper_factory`` for the cache sweeper and
+``app.state.funding_refresher_factory`` for the funding-rate refresher.
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     app.state.health_monitor = None
     app.state.universe_refresher = None
     app.state.data_cache_sweeper = None
+    app.state.funding_refresher = None
     clients: ClientFactory | None = getattr(app.state, "session_clients", None)
     mcp_stack: AsyncExitStack | None = None
     try:
@@ -94,8 +99,10 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
         await _start_health_monitor(app)
         await _start_universe_refresher(app)
         await _start_data_cache_sweeper(app)
+        await _start_funding_refresher(app)
         yield
     finally:
+        await _stop_funding_refresher(app)
         await _stop_universe_refresher(app)
         await _stop_data_cache_sweeper(app)
         if mcp_stack is not None:
@@ -281,6 +288,31 @@ async def _start_data_cache_sweeper(app: FastAPI) -> None:
     await sweeper.start()
 
 
+def _default_funding_refresher(app: FastAPI) -> Any:
+    from hydra.data.funding import FundingRefresher
+
+    return FundingRefresher(app.state.db_pool)
+
+
+async def _start_funding_refresher(app: FastAPI) -> None:
+    """Start the background funding-rate refresher; only with a pool, never a check.
+
+    Each cycle tops up the funding rows of the running perp sessions' symbols;
+    with no running perp sessions (today: none exist) the cycle is a no-op. A
+    failed cycle is caught inside the refresher's loop (warning + retry), so
+    startup and readiness never depend on it. Tests install their own through
+    ``app.state.funding_refresher_factory`` — the ``health_monitor_factory`` pattern.
+    """
+    if getattr(app.state, "db_pool", None) is None:
+        return
+    factory: Callable[[FastAPI], Any] = (
+        getattr(app.state, "funding_refresher_factory", None) or _default_funding_refresher
+    )
+    refresher = factory(app)
+    app.state.funding_refresher = refresher
+    await refresher.start()
+
+
 # ---------------------------------------------------------------------------
 # Shutdown steps
 # ---------------------------------------------------------------------------
@@ -318,6 +350,12 @@ async def _stop_data_cache_sweeper(app: FastAPI) -> None:
     sweeper = getattr(app.state, "data_cache_sweeper", None)
     if sweeper is not None:
         await sweeper.stop()
+
+
+async def _stop_funding_refresher(app: FastAPI) -> None:
+    refresher = getattr(app.state, "funding_refresher", None)
+    if refresher is not None:
+        await refresher.stop()
 
 
 async def _shutdown_session_manager(app: FastAPI) -> None:

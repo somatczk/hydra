@@ -2,7 +2,9 @@
 
 P3-A opens the live path behind the service-layer armed gate: ``build_trading_client`` builds
 the keyed client from stored credentials and ``build_live_executor`` the live session executor
-(Binance SPOT only, D10).
+(Binance SPOT only, D10). P4-B adds the second venue: Binance USD⌂-M linear perps as
+``binanceusdm`` FUTURES — public market data, market rules and funding rates; the live perps
+executor stays P4-D's.
 """
 
 from __future__ import annotations
@@ -25,11 +27,27 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-ALLOWED_VENUES: frozenset[tuple[str, MarketType]] = frozenset({("binance", MarketType.SPOT)})
+ALLOWED_VENUES: frozenset[tuple[str, MarketType]] = frozenset(
+    {("binance", MarketType.SPOT), ("binanceusdm", MarketType.FUTURES)}
+)
 
 SPOT_EXCHANGE_CLASS_MAP: dict[str, str] = {"binance": "binance"}
 
+USDM_EXCHANGE_CLASS_MAP: dict[str, str] = {"binanceusdm": "binanceusdm"}
+
 SPOT_OPTIONS: dict[str, Any] = {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}}
+
+USDM_OPTIONS: dict[str, Any] = {
+    "defaultType": "swap",
+    "defaultSubType": "linear",
+    "fetchMarkets": {"types": ["linear"]},
+}
+"""Verified against the installed ccxt's ``binanceusdm.describe()`` (4.5.88: swap/linear)."""
+
+_EXCHANGE_CLASS_MAPS: dict[MarketType, dict[str, str]] = {
+    MarketType.SPOT: SPOT_EXCHANGE_CLASS_MAP,
+    MarketType.FUTURES: USDM_EXCHANGE_CLASS_MAP,
+}
 
 
 def _market_type(market_type: MarketType | str) -> MarketType:
@@ -40,19 +58,32 @@ def _market_type(market_type: MarketType | str) -> MarketType:
 
 
 def validate_venue(exchange_id: str, market_type: MarketType | str = MarketType.SPOT) -> ExchangeId:
-    """Return *exchange_id* typed; raise UnsupportedVenueError unless it is Binance SPOT."""
+    """Return *exchange_id* typed; raise UnsupportedVenueError unless the pair is allowed."""
     mt = _market_type(market_type)
     if (exchange_id, mt) not in ALLOWED_VENUES:
         raise UnsupportedVenueError(
-            f"{exchange_id} {mt.value} is not supported: only binance SPOT until P4"
+            f"{exchange_id} {mt.value} is not supported: "
+            "only binance SPOT and binanceusdm FUTURES (USD⌂-M perps) are"
         )
     return cast(ExchangeId, exchange_id)
 
 
 def ccxt_class_for(exchange_id: str, market_type: MarketType | str = MarketType.SPOT) -> str:
-    """The ccxt class name for an allowed venue (``binance`` SPOT -> ``binance``)."""
+    """The ccxt class for an allowed venue (binance SPOT -> ``binance``, binanceusdm FUTURES
+    -> ``binanceusdm``)."""
+    mt = _market_type(market_type)
+    validate_venue(exchange_id, mt)
+    return _EXCHANGE_CLASS_MAPS[mt][exchange_id]
+
+
+def _venue_market_type(exchange_id: str) -> MarketType:
+    """The market type an allowed exchange id trades: binanceusdm is the USD⌂-M perps venue."""
+    return MarketType.FUTURES if exchange_id in USDM_EXCHANGE_CLASS_MAP else MarketType.SPOT
+
+
+def _venue_options(exchange_id: str, market_type: MarketType) -> dict[str, Any]:
     validate_venue(exchange_id, market_type)
-    return SPOT_EXCHANGE_CLASS_MAP[exchange_id]
+    return dict(SPOT_OPTIONS if market_type is MarketType.SPOT else USDM_OPTIONS)
 
 
 def map_credentials(stored: Mapping[str, Any]) -> dict[str, str]:
@@ -67,32 +98,42 @@ def map_credentials(stored: Mapping[str, Any]) -> dict[str, str]:
 
 
 def build_readonly_client(
-    exchange_id: str, stored_creds: Mapping[str, Any], *, testnet: bool
+    exchange_id: str,
+    stored_creds: Mapping[str, Any],
+    *,
+    testnet: bool,
+    market_type: MarketType | str = MarketType.SPOT,
 ) -> ExchangeClient:
-    """Account-read client (balance, orders) on the spot class; the sandbox only if *testnet*."""
+    """Account-read client (balance, orders); the sandbox only if *testnet*."""
     from hydra.execution.exchange_client import ExchangeClient
 
-    eid = validate_venue(exchange_id, MarketType.SPOT)
+    mt = _market_type(market_type)
+    eid = validate_venue(exchange_id, mt)
     return ExchangeClient(
         exchange_id=eid,
         config=map_credentials(stored_creds),
         testnet=testnet,
-        market_type=MarketType.SPOT,
+        market_type=mt,
     )
 
 
 def build_trading_client(
-    exchange_id: str, stored_creds: Mapping[str, Any], *, testnet: bool
+    exchange_id: str,
+    stored_creds: Mapping[str, Any],
+    *,
+    testnet: bool,
+    market_type: MarketType | str = MarketType.SPOT,
 ) -> ExchangeClient:
     """The keyed live client (orders, trades, balance); same class the read-only path uses."""
     from hydra.execution.exchange_client import ExchangeClient
 
-    eid = validate_venue(exchange_id, MarketType.SPOT)
+    mt = _market_type(market_type)
+    eid = validate_venue(exchange_id, mt)
     return ExchangeClient(
         exchange_id=eid,
         config=map_credentials(stored_creds),
         testnet=testnet,
-        market_type=MarketType.SPOT,
+        market_type=mt,
     )
 
 
@@ -154,24 +195,26 @@ def build_live_executor(
 
 
 def feed_exchange_factory(exchange_id: str) -> Callable[[], Any]:
-    """Factory for the ccxt.pro spot client of a session's market-data feed."""
-    cls_name = ccxt_class_for(exchange_id, MarketType.SPOT)
+    """Factory for the ccxt.pro client of a session's market-data feed (the venue's class)."""
+    mt = _venue_market_type(exchange_id)
+    cls_name = ccxt_class_for(exchange_id, mt)
 
     def _ccxt_factory() -> Any:
         import ccxt.pro
 
         cls = getattr(ccxt.pro, cls_name)
-        return cls({"enableRateLimit": True, "options": dict(SPOT_OPTIONS)})
+        return cls({"enableRateLimit": True, "options": _venue_options(exchange_id, mt)})
 
     return _ccxt_factory
 
 
 def rest_exchange_factory(exchange_id: str) -> Any:
-    """Public ccxt async spot REST client for feed warm-up and gap fills (no keys)."""
+    """Public ccxt async REST client for feed warm-up and gap fills (no keys)."""
     import ccxt.async_support as ccxt_async
 
-    cls = getattr(ccxt_async, ccxt_class_for(exchange_id, MarketType.SPOT))
-    return cls({"enableRateLimit": True, "options": dict(SPOT_OPTIONS)})
+    mt = _venue_market_type(exchange_id)
+    cls = getattr(ccxt_async, ccxt_class_for(exchange_id, mt))
+    return cls({"enableRateLimit": True, "options": _venue_options(exchange_id, mt)})
 
 
 type PoolKey = tuple[str, str | None]
@@ -247,7 +290,7 @@ class SharedRestClients:
             return RestHandle(self, entry)
 
     async def markets_loader(self, exchange_id: str) -> list[Mapping[str, Any]]:
-        """Public spot ``load_markets`` for ``MarketRulesCache`` through a pooled handle."""
+        """Public ``load_markets`` for ``MarketRulesCache`` through a pooled handle."""
         handle = await self.handle(exchange_id)
         try:
             markets = await handle.client.load_markets()

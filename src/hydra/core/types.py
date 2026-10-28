@@ -22,6 +22,7 @@ Symbol = NewType("Symbol", str)
 
 ExchangeId = Literal[
     "binance",
+    "binanceusdm",
     "bybit",
     "kraken",
     "okx",
@@ -31,7 +32,7 @@ ExchangeId = Literal[
     "mexc",
     "bitget",
 ]
-"""Supported exchange identifiers."""
+"""Supported exchange identifiers (binanceusdm = Binance USD⌂-M futures)."""
 
 
 # ---------------------------------------------------------------------------

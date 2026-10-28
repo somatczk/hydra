@@ -38,6 +38,13 @@ FAPI_IMPLICIT_METHODS: tuple[str, ...] = (
     "fapiPrivateDeleteAllOpenOrders",
 )
 
+# The funding writer (P4-B) fetches history through the unified fetchFundingRateHistory,
+# which resolves to the fapi public fundingRate endpoint for linear markets.
+FUNDING_IMPLICIT_METHODS: tuple[str, ...] = (
+    "fapiPublicGetFundingRate",
+    "fetchFundingRateHistory",
+)
+
 
 def _missing(exchange: Any, names: tuple[str, ...]) -> list[str]:
     return [name for name in names if not hasattr(exchange, name)]
@@ -70,5 +77,23 @@ async def test_binanceusdm_fapi_implicit_methods_exist_async() -> None:
     try:
         missing = _missing(exchange, FAPI_IMPLICIT_METHODS)
         assert not missing, f"ccxt {ccxt.__version__} async binanceusdm lacks: {missing}"
+    finally:
+        await exchange.close()
+
+
+def test_binanceusdm_funding_surface_exists_sync() -> None:
+    """The funding writer's names on a fresh real binanceusdm (construction-only)."""
+    exchange = ccxt.binanceusdm()
+    missing = _missing(exchange, FUNDING_IMPLICIT_METHODS)
+    assert not missing, f"ccxt {ccxt.__version__} binanceusdm lacks funding surface: {missing}"
+    assert exchange.has.get("fetchFundingRateHistory") is True
+
+
+async def test_binanceusdm_funding_surface_exists_async() -> None:
+    exchange = ccxt.async_support.binanceusdm()
+    try:
+        missing = _missing(exchange, FUNDING_IMPLICIT_METHODS)
+        assert not missing, f"ccxt {ccxt.__version__} async binanceusdm lacks funding: {missing}"
+        assert exchange.has.get("fetchFundingRateHistory") is True
     finally:
         await exchange.close()

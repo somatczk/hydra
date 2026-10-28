@@ -1,4 +1,4 @@
-"""size_entry and MarketRules from a ccxt-shaped Binance spot market (no network)."""
+"""size_entry and MarketRules from ccxt-shaped Binance markets (spot and USD⌂-M, no network)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,13 @@ from typing import Any
 import pytest
 
 from hydra.risk.market_rules import (
+    USDM_CALLBACK_RATE_PCT,
     MarketRules,
     MarketRulesCache,
     MarketRulesUnavailableError,
     UnsupportedExchangeError,
+    binance_spot_markets,
+    binance_usdm_markets,
     load_market_rules,
 )
 from hydra.risk.sizing import size_entry
@@ -27,6 +30,41 @@ BINANCE_BTCUSDT: dict[str, Any] = {
         "amount": {"min": 1e-05, "max": 9000.0},
         "market": {"min": 0.0, "max": 120.5},
         "cost": {"min": 5.0, "max": 9000000.0},
+    },
+}
+
+# The real mainnet Binance USD⌂-M BTCUSDT perpetual filters (fapi exchangeInfo):
+# tick 0.10, lot step 0.001, market lot max 120, MIN_NOTIONAL 20 USDT. Futures
+# exchangeInfo has no trailing filter — spot's TRAILING_DELTA sits in the dict to
+# pin that it is never mapped onto the perp rules.
+BINANCEUSDM_BTCUSDT_PERP: dict[str, Any] = {
+    "id": "BTCUSDT",
+    "symbol": "BTC/USDT:USDT",
+    "spot": False,
+    "swap": True,
+    "linear": True,
+    "inverse": False,
+    "type": "swap",
+    "precision": {"amount": 0.001, "price": 0.1},
+    "limits": {
+        "amount": {"min": 0.001, "max": 1000.0},
+        "market": {"min": 0.001, "max": 120.0},
+        "cost": {"min": 20.0, "max": None},
+    },
+    "info": {
+        "symbol": "BTCUSDT",
+        "contractType": "PERPETUAL",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+            {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001", "maxQty": "120"},
+            {"filterType": "MIN_NOTIONAL", "notional": "20"},
+            {
+                "filterType": "TRAILING_DELTA",
+                "minTrailingBelowDelta": "10",
+                "maxTrailingBelowDelta": "2000",
+            },
+        ],
     },
 }
 
@@ -167,3 +205,106 @@ class TestLoader:
         now[0] += timedelta(hours=1)
         await cache.get("binance", ["BTCUSDT"])
         assert loader.calls == 2
+
+
+class TestUsdmMarketRules:
+    """The binanceusdm venue: the fapi filter mapping and the percent trailing bounds."""
+
+    def test_from_ccxt_market_maps_the_fapi_filters(self) -> None:
+        rules = MarketRules.from_ccxt_market(BINANCEUSDM_BTCUSDT_PERP, "binanceusdm")
+        assert rules.symbol == "BTCUSDT"
+        assert rules.amount_step == Decimal("0.001")
+        assert rules.min_qty == Decimal("0.001")
+        assert rules.min_notional == Decimal("20.0")
+        assert rules.max_market_qty == Decimal("120.0")
+        assert rules.price_tick == Decimal("0.1")
+
+    def test_spot_trailing_delta_bips_never_map_onto_usdm_rules(self) -> None:
+        """The red pin: usdm trailing stops are the fapi callbackRate PERCENT bounds,
+        never spot's TRAILING_DELTA bips — even when the raw filter is present."""
+        rules = MarketRules.from_ccxt_market(BINANCEUSDM_BTCUSDT_PERP, "binanceusdm")
+        assert rules.trailing_delta_bips is None
+        assert rules.trailing_callback_rate_pct == USDM_CALLBACK_RATE_PCT
+        assert rules.trailing_callback_rate_pct == (Decimal("0.1"), Decimal("10"))
+
+    def test_spot_rules_never_get_the_callback_rate_bounds(self) -> None:
+        rules = MarketRules.from_ccxt_market(
+            {
+                **BINANCE_BTCUSDT,
+                "info": {
+                    "filters": [
+                        {
+                            "filterType": "TRAILING_DELTA",
+                            "minTrailingBelowDelta": "10",
+                            "maxTrailingBelowDelta": "2000",
+                        }
+                    ]
+                },
+            }
+        )
+        assert rules.trailing_callback_rate_pct is None
+        assert rules.trailing_delta_bips == (Decimal("10"), Decimal("2000"))
+
+    def test_validate_open_enforces_the_fapi_min_notional(self) -> None:
+        rules = MarketRules.from_ccxt_market(BINANCEUSDM_BTCUSDT_PERP, "binanceusdm")
+        assert rules.validate_open(Decimal("0.001"), Decimal("60000")) is None
+        reason = rules.validate_open(Decimal("0.001"), Decimal("15000"))
+        assert reason is not None and "below min notional 20.0" in reason
+
+
+class _UsdmLoader:
+    """The usdm loader test double: linear swap markets only, as binanceusdm loads."""
+
+    def __init__(self, markets: list[Mapping[str, Any]]) -> None:
+        self._markets = markets
+
+    async def __call__(self, exchange_id: str) -> Iterable[Mapping[str, Any]]:
+        assert exchange_id == "binanceusdm"
+        return self._markets
+
+
+class TestUsdmLoader:
+    async def test_usdm_cache_keeps_only_linear_swap_markets(self) -> None:
+        loader = _UsdmLoader(
+            [
+                BINANCEUSDM_BTCUSDT_PERP,
+                {**BINANCEUSDM_BTCUSDT_PERP, "id": "ETHUSDT", "linear": False},
+                {**BINANCEUSDM_BTCUSDT_PERP, "id": "SOLUSDT", "swap": False},
+                {**BINANCE_BTCUSDT, "id": "SPOTUSDT", "spot": True, "linear": True},
+            ]
+        )
+        cache = MarketRulesCache(loader=loader)
+        rules = await cache.get("binanceusdm", ["BTCUSDT", "BTC/USDT"])
+        assert rules["BTCUSDT"] == MarketRules.from_ccxt_market(
+            BINANCEUSDM_BTCUSDT_PERP, "binanceusdm"
+        )
+        for unknown in ("ETHUSDT", "SOLUSDT", "SPOTUSDT"):
+            with pytest.raises(MarketRulesUnavailableError, match=f"linear market '{unknown}'"):
+                await cache.get("binanceusdm", [unknown])
+
+    async def test_usdm_rules_flow_through_the_default_loader(self) -> None:
+        rules = await load_market_rules(
+            "binanceusdm", ["BTCUSDT"], loader=_UsdmLoader([BINANCEUSDM_BTCUSDT_PERP])
+        )
+        assert rules["BTCUSDT"].trailing_callback_rate_pct == USDM_CALLBACK_RATE_PCT
+
+    async def test_the_public_loaders_refuse_the_other_venue(self) -> None:
+        with pytest.raises(UnsupportedExchangeError, match="no binanceusdm market rules"):
+            await binance_usdm_markets("binance")
+        with pytest.raises(UnsupportedExchangeError, match="no binance spot market rules"):
+            await binance_spot_markets("binanceusdm")
+
+    async def test_the_default_cache_loader_dispatches_per_exchange(self) -> None:
+        """The undecorated cache (the backtest runner's) dispatches per exchange id."""
+        from hydra.risk import market_rules
+
+        cache = MarketRulesCache()
+        assert cache._loader is market_rules.load_public_markets
+        assert market_rules._DEFAULT_MARKETS_LOADERS["binance"] is (
+            market_rules.binance_spot_markets
+        )
+        assert market_rules._DEFAULT_MARKETS_LOADERS["binanceusdm"] is (
+            market_rules.binance_usdm_markets
+        )
+        with pytest.raises(UnsupportedExchangeError):
+            await market_rules.load_public_markets("bybit")

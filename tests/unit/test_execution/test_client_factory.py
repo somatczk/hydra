@@ -1,4 +1,5 @@
-"""client_factory: Binance SPOT venue gate, credential mapping, offline client construction."""
+"""client_factory: the venue gate (binance SPOT, binanceusdm FUTURES), credential mapping,
+offline client construction."""
 
 from __future__ import annotations
 
@@ -31,10 +32,17 @@ def test_binance_spot_is_the_only_venue() -> None:
     assert client_factory.ccxt_class_for("binance", MarketType.SPOT) == "binance"
 
 
+def test_binanceusdm_futures_is_the_second_venue() -> None:
+    assert client_factory.validate_venue("binanceusdm", MarketType.FUTURES) == "binanceusdm"
+    assert client_factory.validate_venue("binanceusdm", "futures") == "binanceusdm"
+    assert client_factory.ccxt_class_for("binanceusdm", MarketType.FUTURES) == "binanceusdm"
+
+
 @pytest.mark.parametrize(
     ("exchange_id", "market_type"),
     [
         ("binance", MarketType.FUTURES),
+        ("binanceusdm", MarketType.SPOT),
         ("bybit", MarketType.SPOT),
         ("kraken", MarketType.SPOT),
         ("okx", MarketType.FUTURES),
@@ -47,6 +55,14 @@ def test_other_venues_are_refused(exchange_id: str, market_type: Any) -> None:
     assert err.value.code == "unsupported_venue"
     with pytest.raises(UnsupportedVenueError):
         client_factory.ccxt_class_for(exchange_id, market_type)
+
+
+def test_the_refusal_names_both_venues() -> None:
+    with pytest.raises(UnsupportedVenueError, match="binance FUTURES is not supported") as err:
+        client_factory.validate_venue("binance", MarketType.FUTURES)
+    assert "binance SPOT and binanceusdm FUTURES" in str(err.value)
+    with pytest.raises(UnsupportedVenueError, match="binanceusdm SPOT is not supported"):
+        client_factory.validate_venue("binanceusdm", MarketType.SPOT)
 
 
 def test_map_credentials() -> None:
@@ -80,6 +96,40 @@ def test_readonly_client_refuses_other_venues() -> None:
         client_factory.build_readonly_client(
             "bybit", {"api_key": "k", "api_secret": "s"}, testnet=True
         )
+
+
+@pytest.mark.parametrize("testnet", [True, False])
+async def test_usdm_clients_build_the_binanceusdm_class(testnet: bool) -> None:
+    """The FUTURES venue builds the binanceusdm class; sandbox means the futures testnet."""
+    for client in (
+        client_factory.build_readonly_client(
+            "binanceusdm",
+            {"api_key": "k", "api_secret": "s"},
+            testnet=testnet,
+            market_type=MarketType.FUTURES,
+        ),
+        client_factory.build_trading_client(
+            "binanceusdm",
+            {"api_key": "k", "api_secret": "s"},
+            testnet=testnet,
+            market_type=MarketType.FUTURES,
+        ),
+    ):
+        exchange = client._get_exchange()
+        try:
+            assert type(exchange).__name__ == "binanceusdm"
+            assert (exchange.apiKey, exchange.secret) == ("k", "s")
+            assert exchange.isSandboxModeEnabled is testnet
+            host = str(exchange.urls["api"]["fapiPublic"])
+            assert ("testnet.binancefuture.com" in host) is testnet
+        finally:
+            await client.close()
+
+
+def test_usdm_clients_refuse_the_spot_market_type() -> None:
+    for builder in (client_factory.build_readonly_client, client_factory.build_trading_client):
+        with pytest.raises(UnsupportedVenueError, match="binanceusdm SPOT is not supported"):
+            builder("binanceusdm", {"api_key": "k", "api_secret": "s"}, testnet=True)
 
 
 def test_build_live_executor_constructs_the_live_executor() -> None:
@@ -160,6 +210,20 @@ def test_feed_and_rest_factories_build_spot_classes() -> None:
         assert inst.options["fetchMarkets"]["types"] == ["spot"]
     with pytest.raises(UnsupportedVenueError):
         client_factory.feed_exchange_factory("kraken")
+
+
+def test_feed_and_rest_factories_build_the_usdm_class_for_binanceusdm() -> None:
+    """The usdm factory path: the binanceusdm class with the linear-swap-only options
+    (verified against the installed ccxt's binanceusdm describe())."""
+    feed = client_factory.feed_exchange_factory("binanceusdm")()
+    rest = client_factory.rest_exchange_factory("binanceusdm")
+    for inst in (feed, rest):
+        assert inst.id == "binanceusdm"
+        assert inst.options["defaultType"] == "swap"
+        assert inst.options["defaultSubType"] == "linear"
+        assert inst.options["fetchMarkets"]["types"] == ["linear"]
+    with pytest.raises(UnsupportedVenueError):
+        client_factory.rest_exchange_factory("binanceusd")
 
 
 class _Ccxt:
