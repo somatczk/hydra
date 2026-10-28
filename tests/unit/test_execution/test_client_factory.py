@@ -6,6 +6,7 @@ from __future__ import annotations
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -120,8 +121,9 @@ async def test_usdm_clients_build_the_binanceusdm_class(testnet: bool) -> None:
             assert type(exchange).__name__ == "binanceusdm"
             assert (exchange.apiKey, exchange.secret) == ("k", "s")
             assert exchange.isSandboxModeEnabled is testnet
-            host = str(exchange.urls["api"]["fapiPublic"])
-            assert ("testnet.binancefuture.com" in host) is testnet
+            fapi_url = str(exchange.urls["api"]["fapiPublic"])
+            expected_host = "testnet.binancefuture.com" if testnet else "fapi.binance.com"
+            assert urlsplit(fapi_url).hostname == expected_host
         finally:
             await client.close()
 
