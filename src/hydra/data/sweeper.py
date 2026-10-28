@@ -152,7 +152,7 @@ class DataCacheSweeper:
                 pool, entry.exchange, entry.symbol, Timeframe(entry.timeframe)
             )
             deleted_rows += removed
-            total_rows -= removed
+            total_rows = max(0, total_rows - removed)  # a concurrent fetch may commit mid-sweep
             deleted_datasets += 1
             evicted.add((entry.exchange, entry.symbol, entry.timeframe))
 

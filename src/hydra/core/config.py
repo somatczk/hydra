@@ -295,7 +295,7 @@ class DataConfig(_Section):
     fetch_weight_per_min: int = Field(900, gt=0, le=6000)
     fetch_patience_s: int = Field(900, gt=0)
     fetch_max_bars: int = Field(2_000_000, gt=0)
-    cache_max_gb: float = Field(10.0, ge=0)
+    cache_max_gb: float = Field(10.0, ge=0, allow_inf_nan=False)
     sweep_interval_s: int = Field(3600, gt=0)
     row_bytes_estimate: int = Field(160, gt=0)
 

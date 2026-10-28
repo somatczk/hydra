@@ -51,6 +51,7 @@ from hydra.data.bars import last_closed_open
 from hydra.data.storage import MarketDataRepository
 from hydra.execution.session_manager import SessionManager
 from tests.e2e.replay_exchange import ReplayMarket
+from tests.fixtures.sweeper import no_op_sweeper_factory
 from tests.fixtures.universe import offline_refresher_factory
 
 WARMUP = 30
@@ -309,6 +310,7 @@ async def engine(dsn: str, market: ReplayMarket, clock: MonitorClock) -> AsyncIt
     app.state.session_clients = market.clients(history_window=WARMUP)
     app.state.health_monitor_factory = monitor
     app.state.universe_refresher_factory = offline_refresher_factory
+    app.state.data_cache_sweeper_factory = no_op_sweeper_factory
     try:
         async with lifespan.run(app):
             token = app.state.config.api_token
@@ -323,6 +325,7 @@ async def engine(dsn: str, market: ReplayMarket, clock: MonitorClock) -> AsyncIt
         app.state.session_clients = None
         app.state.health_monitor_factory = None
         app.state.universe_refresher_factory = None
+        app.state.data_cache_sweeper_factory = None
 
 
 async def anchored_market(app: FastAPI, market: ReplayMarket) -> None:

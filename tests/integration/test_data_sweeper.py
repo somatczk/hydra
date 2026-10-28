@@ -178,6 +178,36 @@ async def test_a_stale_fetching_row_is_swept_and_a_fresh_one_is_skipped(pool: An
     assert await _bar_count(pool, "ETHUSDT") == 20
 
 
+async def test_a_flip_to_fetching_on_an_existing_row_is_fresh_fetch_activity(pool: Any) -> None:
+    """The flip-rail inversion (W3 A1): the flip refreshes the fetch clock.
+
+    A resident dataset re-fetched days after its last page: the flip to
+    ``fetching`` is itself fetch activity, so the crash-aging must measure from
+    the flip — not from the old page, or the active fetch's own dataset is aged
+    out as the crash victim and swept mid-write.
+    """
+    repo = MarketDataRepository.from_pool(pool)
+    await _seed_auto(pool, "BTCUSDT", 100, Timeframe.M1)
+    async with pool.acquire() as conn:
+        # the last page landed two days ago: any re-fetch flips this row next
+        await conn.execute(
+            "UPDATE data_cache_entries "
+            "SET last_fetched_at = now() - interval '2 days' WHERE symbol = 'BTCUSDT'"
+        )
+    await repo.set_cache_status("binance", "BTCUSDT", Timeframe.M1, "fetching", T0, T0 + 99 * M)
+
+    entry = (await list_cache_entries(pool))[0]
+    assert entry.status == "fetching"
+    assert entry.last_fetched_at > datetime.now(UTC) - timedelta(seconds=30)
+
+    # budget 0 deletes every eligible dataset; a mid-fetch dataset is never eligible
+    sweeper = DataCacheSweeper(pool, _cfg(cache_max_gb=0.0))
+    assert await sweeper.sweep_once(pool) == (0, 0)
+
+    assert await _bar_count(pool, "BTCUSDT") == 100
+    assert [e.symbol for e in await list_cache_entries(pool)] == ["BTCUSDT"]
+
+
 async def test_the_eviction_input_is_recomputed_from_the_bars_not_the_ledger(pool: Any) -> None:
     await _seed_auto(pool, "BTCUSDT", 50, Timeframe.M1)
     async with pool.acquire() as conn:

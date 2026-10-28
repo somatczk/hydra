@@ -60,12 +60,13 @@ _UPSERT_CACHE_ENTRY_SQL = """
         last_fetched_at = now()
 """
 
-# The fetch engine's race rail: only status flips, never the range or the row count.
+# The fetch engine's race rail: the status and its fetch clock move, never range or count.
 _SET_CACHE_STATUS_SQL = """
     INSERT INTO data_cache_entries AS entry
         (exchange, symbol, timeframe, first_ts, last_ts, rows, status)
     VALUES ($1, $2, $3, $4, $5, 0, $6)
-    ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET status = EXCLUDED.status
+    ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET
+        status = EXCLUDED.status, last_fetched_at = now()
 """
 
 # The sweeper's LRU freshness write, issued by the backtest loaders (best effort).
@@ -296,7 +297,9 @@ class MarketDataRepository:
         The on-demand engine writes ``fetching`` before its first page and ``ready``
         when it stops, so the sweeper never evicts a dataset mid-write. A dataset
         without a ledger row gets one over the requested range with ``rows = 0``; an
-        existing row keeps its range and count untouched.
+        existing row keeps its range and count, while its fetch clock moves to now —
+        the flip is fetch activity, so the sweeper's crash-aging (``2 x
+        fetch_patience_s``) measures from the flip, never from a page days ago.
         """
         async with self._ensure_pool().acquire() as conn:
             await conn.execute(

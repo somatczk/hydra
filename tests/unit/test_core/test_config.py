@@ -488,6 +488,7 @@ class TestDataFields:
             pytest.param("fetch_patience_s", 0, id="patience-zero"),
             pytest.param("fetch_max_bars", 0, id="max-bars-zero"),
             pytest.param("cache_max_gb", -0.1, id="cache-negative"),
+            pytest.param("cache_max_gb", float("inf"), id="cache-infinite"),
             pytest.param("sweep_interval_s", 0, id="sweep-interval-zero"),
             pytest.param("row_bytes_estimate", 0, id="row-bytes-zero"),
         ],

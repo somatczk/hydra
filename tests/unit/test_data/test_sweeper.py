@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from prometheus_client import REGISTRY
+from structlog.testing import capture_logs
 
 from hydra.core import metrics
 from hydra.core.config import DataConfig
@@ -53,6 +54,7 @@ class _Dataset:
     status: str = "ready"
     last_fetched_at: datetime | None = None
     swept: bool = False
+    concurrent_commit: int = 0  # bars a fetch commits between the recount and the delete
 
 
 @dataclass
@@ -131,7 +133,7 @@ class _FakeConn:
         if "DELETE FROM ts.ohlcv_1m" in sql:
             removed = pool._find(exchange, symbol, timeframe)
             removed.swept = True
-            return f"DELETE {removed.auto_bars}"
+            return f"DELETE {removed.auto_bars + removed.concurrent_commit}"
         if "DELETE FROM data_cache_entries" in sql:
             return "DELETE 1"
         raise AssertionError(f"unexpected execute: {sql}")
@@ -323,6 +325,65 @@ class TestRecompute:
         assert (deleted_rows, deleted_datasets) == (0, 0)
         assert _metric("hydra_data_cache_rows") == 50.0
         assert _metric("hydra_data_cache_bytes") == 50 * 160.0
+
+
+class TestConcurrentCommitRace:
+    async def test_an_overshooting_delete_never_negates_the_accounting(self) -> None:
+        """A fetch commits 15 bars between the recount (10) and the delete (25).
+
+        The deletes already committed stand; the totals clamp at zero so the
+        sweep is never counted as failed by its own metric guard, and the
+        deleted counter still reports every row that went.
+        """
+        racing = _Dataset("binance", "BTCUSDT", "1m", 10, 10, NOW, concurrent_commit=15)
+        pool = _FakePool(datasets=[racing])
+        cfg = _cfg(cache_max_gb=0.0)
+
+        deleted_rows, deleted_datasets = await _sweeper(pool, cfg).sweep_once(pool)
+
+        assert (deleted_rows, deleted_datasets) == (25, 1)
+        assert pool.ledger_rows() == []
+        assert _metric("hydra_data_sweep_deleted_rows_total") == 25.0
+        assert _metric("hydra_data_cache_rows") == 0.0
+        assert _metric("hydra_data_cache_bytes") == 0.0
+        assert _metric("hydra_data_cache_pairs") == 0.0
+        assert _metric("hydra_data_sweep_errors_total") == 0.0  # pre-zeroed by the contract
+
+
+class TestOverBudgetNothingEligible:
+    async def test_over_budget_with_nothing_eligible_warns_writes_gauges_and_exits(self) -> None:
+        """Every dataset protected or mid-fetch, budget exceeded: warn, exit, no spin."""
+        protected = _Dataset("binance", "DOGEUSDT", "1m", 1000, 1000, NOW)
+        mid_fetch = _Dataset(
+            "binance",
+            "BTCUSDT",
+            "1m",
+            2000,
+            2000,
+            NOW + timedelta(hours=1),
+            status="fetching",
+            last_fetched_at=datetime.now(UTC),
+        )
+        pool = _FakePool(datasets=[protected, mid_fetch], running={("binance", "DOGEUSDT")})
+        # 3000 rows x 160 B = 480_000 bytes against a 10_000-byte budget
+        cfg = _cfg(cache_max_gb=10_000 / 2**30)
+
+        with capture_logs() as logs:
+            assert await _sweeper(pool, cfg).sweep_once(pool) == (0, 0)
+
+        assert pool.ledger_rows() == [protected, mid_fetch]
+        assert logs == [
+            {
+                "event": "data cache still over budget with nothing eligible",
+                "log_level": "warning",
+                "estimated_bytes": 3000 * 160,
+                "budget_bytes": 10_000,
+            }
+        ]
+        assert _metric("hydra_data_cache_rows") == 3000.0
+        assert _metric("hydra_data_cache_bytes") == 3000 * 160.0
+        assert _metric("hydra_data_cache_pairs") == 2.0
+        assert _metric("hydra_data_sweep_deleted_rows_total") == 0.0
 
 
 class TestFailuresAndLifecycle:
