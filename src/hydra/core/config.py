@@ -280,18 +280,24 @@ class MlConfig(_Section):
 
 
 class DataConfig(_Section):
-    """On-demand market-data fetching (the backtest data guarantee).
+    """On-demand market-data fetching and the auto-cache budget (the backtest data guarantee).
 
     ``auto_fetch_enabled`` is the kill switch: false restores the exact P0-B
     submit-time 422 behaviour. The fetch budget is a static split — the engine's
     bucket is capped, feeds and warm-ups stay uncapped — and ``fetch_max_bars`` is
-    the per-job disk safety net until the cache sweeper lands.
+    the per-job disk safety net. ``cache_max_gb`` is the hard byte cap the sweeper
+    enforces over auto-fetched bars (0 = delete-after-run: every eligible dataset
+    is deleted each sweep); ``row_bytes_estimate`` converts recomputed bar counts
+    to the estimate the budget compares against.
     """
 
     auto_fetch_enabled: bool = True
     fetch_weight_per_min: int = Field(900, gt=0, le=6000)
     fetch_patience_s: int = Field(900, gt=0)
     fetch_max_bars: int = Field(2_000_000, gt=0)
+    cache_max_gb: float = Field(10.0, ge=0)
+    sweep_interval_s: int = Field(3600, gt=0)
+    row_bytes_estimate: int = Field(160, gt=0)
 
 
 class PlatformConfig(_Section):

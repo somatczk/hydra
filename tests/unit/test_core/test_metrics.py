@@ -115,6 +115,8 @@ class TestContract:
             "hydra_risk_lock_wait_seconds_sum",
             "hydra_risk_state_persist_failures_total",
             "hydra_risk_lock_timeouts_total",
+            "hydra_data_sweep_errors_total",
+            "hydra_data_sweep_deleted_rows_total",
         }
         assert all(value == 0.0 for _, _, value in rest)
         assert all(set(labels) <= {"le"} for _, labels, _ in rest)
@@ -343,6 +345,47 @@ class TestRiskAndHealthSetters:
         assert _value("hydra_order_fill_latency_seconds_bucket", {"le": "0.5"}) == 1.0
         assert _value("hydra_ml_inference_latency_seconds_count", {"model_name": "xgb"}) == 1.0
         assert _value("hydra_ws_reconnects_total", {"exchange_id": "binance"}) == 1.0
+
+
+class TestDataCacheSweep:
+    def test_set_data_cache_writes_through_every_gauge(self) -> None:
+        metrics.set_data_cache(480_000, 3_000, 2, 10 * 2**30)
+        assert _value("hydra_data_cache_rows") == 480_000.0
+        assert _value("hydra_data_cache_bytes") == 3_000.0
+        assert _value("hydra_data_cache_pairs") == 2.0
+        assert _value("hydra_data_cache_budget_bytes") == 10 * 2**30
+
+    def test_set_data_cache_rejects_negative_values(self) -> None:
+        with pytest.raises(ValueError, match="rows must be >= 0"):
+            metrics.set_data_cache(-1, 0, 0, 0)
+        with pytest.raises(ValueError, match="budget_bytes must be >= 0"):
+            metrics.set_data_cache(0, 0, 0, -5)
+        assert _value("hydra_data_cache_rows") is None
+
+    def test_sweep_timestamp_error_and_deleted_counters(self) -> None:
+        metrics.mark_data_sweep(at=1_760_000_321.0)
+        metrics.record_data_sweep_error()
+        metrics.record_data_sweep_deleted(3_000)
+        assert _value("hydra_data_sweep_last_timestamp_seconds") == 1_760_000_321.0
+        assert _value("hydra_data_sweep_errors_total") == 1.0
+        assert _value("hydra_data_sweep_deleted_rows_total") == 3_000.0
+        with pytest.raises(ValueError, match="rows must be >= 0"):
+            metrics.record_data_sweep_deleted(-1)
+
+    def test_the_seven_data_cache_families_match_the_contract(self) -> None:
+        """The P6-C2 families: declared kinds, units and the docstring table in sync."""
+        expected = {
+            "hydra_data_cache_bytes": "gauge",
+            "hydra_data_cache_rows": "gauge",
+            "hydra_data_cache_pairs": "gauge",
+            "hydra_data_cache_budget_bytes": "gauge",
+            "hydra_data_sweep_last_timestamp_seconds": "gauge",
+            "hydra_data_sweep_errors_total": "counter",
+            "hydra_data_sweep_deleted_rows_total": "counter",
+        }
+        contract = {s.name: s.kind for s in metrics.CONTRACT}
+        assert {name: contract[name] for name in expected} == expected
+        assert all(name in metrics.__doc__ for name in expected)
 
 
 class TestReconciliation:

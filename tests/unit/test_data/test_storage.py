@@ -452,6 +452,19 @@ class TestDataCacheFunctions:
             )
         ]
 
+    async def test_touch_cache_entry_bumps_last_used_at(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = mock_pool._conn
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        await repo.touch_cache_entry("binance", "BTCUSDT", Timeframe.H1)
+
+        sql, *params = conn.execute.call_args[0]
+        assert "UPDATE data_cache_entries SET last_used_at = now()" in sql
+        assert "WHERE exchange = $1 AND symbol = $2 AND timeframe = $3" in sql
+        assert params == ["binance", "BTCUSDT", "1h"]
+
     async def test_cache_totals_sums_rows_and_datasets(self, mock_pool: MagicMock) -> None:
         conn = mock_pool._conn
         conn.fetch = AsyncMock(return_value=[_fake_record({"rows": 42, "datasets": 3})])

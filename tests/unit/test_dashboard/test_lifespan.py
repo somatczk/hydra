@@ -425,3 +425,103 @@ async def test_single_process_mode_still_builds_the_local_engine(
         assert app.state.trader.session_manager is app.state.session_manager
         monitor = app.state.health_monitor
         assert monitor is not None and monitor._checks == REQUIRED_CHECKS
+
+
+# ---------------------------------------------------------------------------
+# The data-cache sweeper: after the refresher, cancelled before it on shutdown
+# ---------------------------------------------------------------------------
+
+
+class _FakeSweeper:
+    """The ``data_cache_sweeper_factory`` seam's test double."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def test_cache_sweeper_starts_with_a_pool_and_stops_on_shutdown() -> None:
+    app = FastAPI()
+    app.state.db_pool = object()
+    fake = _FakeSweeper()
+    app.state.data_cache_sweeper_factory = lambda _app: fake
+    await lifespan._start_data_cache_sweeper(app)
+    assert fake.started
+    assert app.state.data_cache_sweeper is fake
+    await lifespan._stop_data_cache_sweeper(app)
+    assert fake.stopped
+
+
+async def test_without_a_pool_no_cache_sweeper_starts() -> None:
+    app = FastAPI()
+    app.state.db_pool = None
+    calls: list[FastAPI] = []
+
+    def factory(target: FastAPI) -> _FakeSweeper:
+        calls.append(target)
+        return _FakeSweeper()
+
+    app.state.data_cache_sweeper_factory = factory
+    await lifespan._start_data_cache_sweeper(app)
+    assert calls == []
+    assert getattr(app.state, "data_cache_sweeper", None) is None
+
+
+async def test_the_default_factory_builds_the_real_sweeper_from_the_data_config() -> None:
+    from hydra.core.config import load_config
+    from hydra.data.sweeper import DataCacheSweeper
+
+    app = FastAPI()
+    app.state.db_pool = object()
+    app.state.config = load_config()
+    sweeper = lifespan._default_data_cache_sweeper(app)
+    assert isinstance(sweeper, DataCacheSweeper)
+    await sweeper.stop()  # never started: stopping is safe
+
+
+async def test_the_sweeper_starts_after_the_refresher_and_stops_before_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The R27(5) slot: start last of the background loops, stop before _close_db_pool."""
+    order: list[str] = []
+    for name, label in (
+        ("_start_health_monitor", "start-monitor"),
+        ("_start_universe_refresher", "start-refresher"),
+        ("_start_data_cache_sweeper", "start-sweeper"),
+    ):
+        monkeypatch.setattr(lifespan, name, _recorder(order, label))
+    for name, label in (
+        ("_stop_universe_refresher", "stop-refresher"),
+        ("_stop_data_cache_sweeper", "stop-sweeper"),
+        ("_close_db_pool", "close-pool"),
+    ):
+        monkeypatch.setattr(lifespan, name, _recorder(order, label))
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert order == ["start-monitor", "start-refresher", "start-sweeper"]
+    assert order == [
+        "start-monitor",
+        "start-refresher",
+        "start-sweeper",
+        "stop-refresher",
+        "stop-sweeper",
+        "close-pool",
+    ]
+
+
+def _recorder(order: list[str], label: str) -> Any:
+    """An async stand-in for a lifespan step that records its call order."""
+
+    async def step(_app: FastAPI) -> None:
+        order.append(label)
+
+    return step

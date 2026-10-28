@@ -68,6 +68,12 @@ _SET_CACHE_STATUS_SQL = """
     ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET status = EXCLUDED.status
 """
 
+# The sweeper's LRU freshness write, issued by the backtest loaders (best effort).
+_TOUCH_CACHE_ENTRY_SQL = """
+    UPDATE data_cache_entries SET last_used_at = now()
+    WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
+"""
+
 _EXISTING_KEYS_SQL = """
     SELECT o.exchange, o.symbol, o.timeframe, o.timestamp
     FROM ts.ohlcv_1m AS o
@@ -302,6 +308,21 @@ class MarketDataRepository:
                 last_ts,
                 status,
             )
+
+    async def touch_cache_entry(
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+    ) -> None:
+        """Bump the dataset's ``last_used_at`` — the LRU freshness write.
+
+        No row exists until the first auto fetch; an unmatched key is a silent
+        no-op, and the caller (the backtest loader) treats any failure as
+        best-effort.
+        """
+        async with self._ensure_pool().acquire() as conn:
+            await conn.execute(_TOUCH_CACHE_ENTRY_SQL, exchange_id, symbol, str(timeframe))
 
     async def get_bars(
         self,

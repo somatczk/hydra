@@ -130,6 +130,27 @@ Contract (name: type, unit / labels / producer):
 - hydra_health_monitor_last_run_timestamp_seconds: gauge, unix seconds
   labels: -
   producer: P1-G1 HealthMonitor
+- hydra_data_cache_bytes: gauge, bytes
+  labels: -
+  producer: P6-C2 DataCacheSweeper
+- hydra_data_cache_rows: gauge, rows
+  labels: -
+  producer: P6-C2 DataCacheSweeper
+- hydra_data_cache_pairs: gauge, pairs
+  labels: -
+  producer: P6-C2 DataCacheSweeper
+- hydra_data_cache_budget_bytes: gauge, bytes
+  labels: -
+  producer: P6-C2 DataCacheSweeper
+- hydra_data_sweep_last_timestamp_seconds: gauge, unix seconds
+  labels: -
+  producer: P6-C2 DataCacheSweeper
+- hydra_data_sweep_errors_total: counter, errors
+  labels: -
+  producer: P6-C2 DataCacheSweeper
+- hydra_data_sweep_deleted_rows_total: counter, rows
+  labels: -
+  producer: P6-C2 DataCacheSweeper
 """
 
 from __future__ import annotations
@@ -489,6 +510,55 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "unix seconds",
         "P1-G1 HealthMonitor",
     ),
+    MetricSpec(
+        "hydra_data_cache_bytes",
+        "gauge",
+        "Estimated bytes of auto-fetched cached bars (rows x data.row_bytes_estimate)",
+        "bytes",
+        "P6-C2 DataCacheSweeper",
+    ),
+    MetricSpec(
+        "hydra_data_cache_rows",
+        "gauge",
+        "Auto-fetched bar rows held by every cached dataset",
+        "rows",
+        "P6-C2 DataCacheSweeper",
+    ),
+    MetricSpec(
+        "hydra_data_cache_pairs",
+        "gauge",
+        "Distinct exchange and symbol pairs with cached auto-fetched data",
+        "pairs",
+        "P6-C2 DataCacheSweeper",
+    ),
+    MetricSpec(
+        "hydra_data_cache_budget_bytes",
+        "gauge",
+        "The configured cache budget in bytes that sweeps hold the auto cache under",
+        "bytes",
+        "P6-C2 DataCacheSweeper",
+    ),
+    MetricSpec(
+        "hydra_data_sweep_last_timestamp_seconds",
+        "gauge",
+        "Wall-clock Unix time the cache sweeper last completed a cycle",
+        "unix seconds",
+        "P6-C2 DataCacheSweeper",
+    ),
+    MetricSpec(
+        "hydra_data_sweep_errors_total",
+        "counter",
+        "Cache sweep cycles that failed or were cancelled after hanging past their interval",
+        "errors",
+        "P6-C2 DataCacheSweeper",
+    ),
+    MetricSpec(
+        "hydra_data_sweep_deleted_rows_total",
+        "counter",
+        "Auto-fetched bar rows deleted by cache sweeps",
+        "rows",
+        "P6-C2 DataCacheSweeper",
+    ),
 )
 
 _SPECS: dict[str, MetricSpec] = {spec.name: spec for spec in CONTRACT}
@@ -813,6 +883,45 @@ def record_feed_anomaly(exchange_id: str, symbol: str, kind: str) -> None:
 def record_feed_persist_error(exchange_id: str) -> None:
     """Count one failed closed-bar persist attempt."""
     _counter("hydra_feed_persist_errors_total").labels(exchange_id=exchange_id).inc()
+
+
+# ---------------------------------------------------------------------------
+# Auto-fetched data cache (P6-C2)
+# ---------------------------------------------------------------------------
+
+
+def set_data_cache(rows: int, bytes: int, pairs: int, budget_bytes: int) -> None:
+    """Set the cache snapshot a sweep leaves behind: rows, estimated bytes, pairs, budget."""
+    for name, value in (
+        ("rows", rows),
+        ("bytes", bytes),
+        ("pairs", pairs),
+        ("budget_bytes", budget_bytes),
+    ):
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+    _gauge("hydra_data_cache_rows").set(rows)
+    _gauge("hydra_data_cache_bytes").set(bytes)
+    _gauge("hydra_data_cache_pairs").set(pairs)
+    _gauge("hydra_data_cache_budget_bytes").set(budget_bytes)
+
+
+def mark_data_sweep(*, at: float | None = None) -> None:
+    """Record that the cache sweeper completed a cycle now (or at ``at``)."""
+    ts = _unix_seconds(_wall_clock() if at is None else at, "at")
+    _gauge("hydra_data_sweep_last_timestamp_seconds").set(ts)
+
+
+def record_data_sweep_error() -> None:
+    """Count one cache sweep cycle that failed or hung past its interval."""
+    _counter("hydra_data_sweep_errors_total").inc()
+
+
+def record_data_sweep_deleted(rows: int) -> None:
+    """Count the auto-fetched bar rows one sweep deleted."""
+    if rows < 0:
+        raise ValueError(f"rows must be >= 0, got {rows}")
+    _counter("hydra_data_sweep_deleted_rows_total").inc(rows)
 
 
 # ---------------------------------------------------------------------------

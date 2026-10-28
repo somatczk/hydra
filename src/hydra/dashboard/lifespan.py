@@ -9,8 +9,11 @@ rows) with its ``LocalTrader`` backend. Then the MCP mount (only when ``HYDRA_MC
 no token, no ``/mcp`` surface) and the HealthMonitor (first readiness run; ``/livez`` turns
 green — the engine-side full set, or the split set with the remote-trader check), then the
 universe refresher (the daily top-100 ranking, only with a pool; a refresh failure logs a
-warning and retries hourly, never blocking startup or readiness). Shutdown cancels the
-universe refresher first, then closes the MCP session manager, unmounts ``/mcp`` and
+warning and retries hourly, never blocking startup or readiness), then the data-cache
+sweeper (the bounded LRU over auto-fetched bars, only with a pool; a failed sweep counts
+one metric and yields to the next cycle, never blocking startup or a read). Shutdown
+cancels the universe refresher first, then the cache sweeper, then closes the MCP session
+manager, unmounts ``/mcp`` and
 resets ``app.state.mcp`` (the session manager is
 single-use, so a re-entered lifespan remounts a fresh transport instead of finding the closed
 mount shadowing it), then stops the monitor. Any startup error propagates, so uvicorn exits
@@ -19,7 +22,8 @@ no pool, no migration and no key requirement. ``app.state.session_clients`` (a
 ``ClientFactory``), when set before startup, replaces the public exchange clients of every
 session, and ``app.state.health_monitor_factory`` builds the ``HealthMonitor`` (the paper smoke
 test injects its fakes and a monitor clock there), as does
-``app.state.universe_refresher_factory`` for the universe refresher.
+``app.state.universe_refresher_factory`` for the universe refresher and
+``app.state.data_cache_sweeper_factory`` for the cache sweeper.
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     app.state.trader = None
     app.state.health_monitor = None
     app.state.universe_refresher = None
+    app.state.data_cache_sweeper = None
     clients: ClientFactory | None = getattr(app.state, "session_clients", None)
     mcp_stack: AsyncExitStack | None = None
     try:
@@ -88,9 +93,11 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             await mcp_stack.enter_async_context(app.state.mcp.session_manager.run())
         await _start_health_monitor(app)
         await _start_universe_refresher(app)
+        await _start_data_cache_sweeper(app)
         yield
     finally:
         await _stop_universe_refresher(app)
+        await _stop_data_cache_sweeper(app)
         if mcp_stack is not None:
             await mcp_stack.aclose()
         _unmount_mcp(app)
@@ -250,6 +257,30 @@ async def _start_universe_refresher(app: FastAPI) -> None:
     await refresher.start()
 
 
+def _default_data_cache_sweeper(app: FastAPI) -> Any:
+    from hydra.data.sweeper import DataCacheSweeper
+
+    return DataCacheSweeper(app.state.db_pool, app.state.config.data)
+
+
+async def _start_data_cache_sweeper(app: FastAPI) -> None:
+    """Start the background cache sweeper; only with a pool, never a check.
+
+    A failed or hung sweep is caught inside the sweeper's loop (error counter +
+    warning, retried next cycle), so startup and readiness never depend on it.
+    Tests and the smoke install their own through
+    ``app.state.data_cache_sweeper_factory`` — the ``health_monitor_factory`` pattern.
+    """
+    if getattr(app.state, "db_pool", None) is None:
+        return
+    factory: Callable[[FastAPI], Any] = (
+        getattr(app.state, "data_cache_sweeper_factory", None) or _default_data_cache_sweeper
+    )
+    sweeper = factory(app)
+    app.state.data_cache_sweeper = sweeper
+    await sweeper.start()
+
+
 # ---------------------------------------------------------------------------
 # Shutdown steps
 # ---------------------------------------------------------------------------
@@ -281,6 +312,12 @@ async def _stop_universe_refresher(app: FastAPI) -> None:
     refresher = getattr(app.state, "universe_refresher", None)
     if refresher is not None:
         await refresher.stop()
+
+
+async def _stop_data_cache_sweeper(app: FastAPI) -> None:
+    sweeper = getattr(app.state, "data_cache_sweeper", None)
+    if sweeper is not None:
+        await sweeper.stop()
 
 
 async def _shutdown_session_manager(app: FastAPI) -> None:

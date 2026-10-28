@@ -7,9 +7,12 @@ from datetime import datetime
 from itertools import pairwise
 from typing import Any, Literal
 
+from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
 from hydra.data.errors import NoMarketDataError as NoMarketDataError
 from hydra.data.storage import MarketDataRepository
+
+logger = get_logger(__name__)
 
 TIMEFRAME_SECONDS: dict[Timeframe, int] = {
     Timeframe.M1: 60,
@@ -112,6 +115,22 @@ def _provenance(
     )
 
 
+async def _touch_last_used(
+    repo: MarketDataRepository, exchange: str, symbol: str, timeframe: Timeframe
+) -> None:
+    """The LRU freshness hook: a failed touch is logged and never fails the read."""
+    try:
+        await repo.touch_cache_entry(exchange, symbol, timeframe)
+    except Exception:
+        logger.warning(
+            "cache last_used_at update failed",
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=str(timeframe),
+            exc_info=True,
+        )
+
+
 async def load_bars(
     repo: MarketDataRepository,
     exchange: str,
@@ -124,6 +143,7 @@ async def load_bars(
     bars = await repo.get_bars(exchange, symbol, timeframe, start, end)
     if not bars:
         raise await no_market_data(repo, exchange, symbol, timeframe, start, end)
+    await _touch_last_used(repo, exchange, symbol, timeframe)
     return bars, _provenance(bars, exchange, symbol, timeframe, start, end)
 
 
@@ -138,4 +158,5 @@ async def load_latest_bars(
     bars = await repo.get_latest_bars(exchange, symbol, timeframe, limit)
     if not bars:
         raise await no_market_data(repo, exchange, symbol, timeframe, None, None)
+    await _touch_last_used(repo, exchange, symbol, timeframe)
     return bars, _provenance(bars, exchange, symbol, timeframe, None, None)
