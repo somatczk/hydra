@@ -3,10 +3,11 @@
 The row key is ``universe``; the value carries the full provenance — the exchange, the
 quote asset, the ranking source, ``ranked_at``, the count and the ranked symbols with
 rank and rolling-24h quote volume. ``read_universe`` serves the stored truth however
-stale (stale-OK reads) and is a 503 on every surface before the first refresh lands —
-never a fabricated or partial list. ``validate_symbol`` is the write-time membership
-gate (enforced at the callers from P6-A2) with the MarketRules slash-stripping
-normalization; with no stored row it fails closed with the same 503.
+stale (stale-OK reads) and is a 503 on every surface before the first refresh lands or
+when the stored row is corrupt (unreadable = unavailable) — never a fabricated, partial
+or raw-500 answer. ``validate_symbol`` is the write-time membership gate (enforced at
+the callers from P6-A2) with the MarketRules slash-stripping normalization; with no
+stored row — or an unreadable one — it fails closed with the same 503.
 """
 
 from __future__ import annotations
@@ -75,8 +76,9 @@ async def refresh_universe(pool: Any, compute: ComputeUniverse) -> dict[str, Any
 async def read_universe(pool: Any) -> dict[str, Any]:
     """The stored universe plus its ``age_hours`` in hours since ``ranked_at``.
 
-    503 ``universe_unavailable`` when the row is missing (before the first refresh) or
-    the process has no pool; the ranking is served as stored however stale.
+    503 ``universe_unavailable`` when the row is missing (before the first refresh),
+    corrupt (unreadable — never a raw 500) or the process has no pool; the ranking is
+    served as stored however stale.
     """
     pool = require_pool(pool)
     async with db_errors("reading the universe"), pool.acquire() as conn:
@@ -88,8 +90,17 @@ async def read_universe(pool: Any) -> dict[str, Any]:
             "The top-100 universe has not been computed yet",
             "unavailable",
         )
-    value = _stored_value(row)
-    ranked_at = datetime.fromisoformat(str(value["ranked_at"]))
+    try:
+        value = _stored_value(row)
+        ranked_at = datetime.fromisoformat(str(value["ranked_at"]))
+    except ValueError as exc:  # a corrupt row: json.JSONDecodeError is a ValueError
+        logger.exception("The stored universe row is unreadable")
+        raise service_error(
+            503,
+            "universe_unavailable",
+            "The stored top-100 universe is unreadable",
+            "unavailable",
+        ) from exc
     age_hours = (datetime.now(UTC) - ranked_at).total_seconds() / 3600
     return {
         "exchange_id": value["exchange_id"],
@@ -108,8 +119,9 @@ async def validate_symbol(pool: Any, symbol: str) -> None:
     The comparison normalizes exactly like ``MarketRulesCache`` (``BTC/USDT`` →
     ``BTCUSDT``; it never case-folds, so ``solusdt`` is a non-member here). A non-member
     is a 422 ``symbol_not_in_universe`` naming the ranking's ``ranked_at``
-    (write-time only: running sessions and stored strategies are unaffected); no stored
-    row fails closed with the 503 above — nothing is writable without a universe.
+    (write-time only: running sessions and stored strategies are unaffected); no
+    stored row — or an unreadable one — fails closed with the 503 above: nothing is
+    writable without a universe.
     """
     normalized = symbol.replace("/", "")
     data = await read_universe(pool)

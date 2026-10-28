@@ -110,6 +110,32 @@ class TestReadUniverse:
             "state": "unavailable",
         }
 
+    async def test_a_corrupt_json_row_is_the_503_universe_unavailable_envelope(self) -> None:
+        """A corrupt row is unreadable: unreadable = unavailable, never a raw 500."""
+        conn = _UniverseConn(None)
+        conn.row = {"value": "{not json"}
+        with pytest.raises(ServiceError) as err:
+            await read_universe(_Pool(conn))
+        assert err.value.status_code == 503
+        assert err.value.detail == {
+            "code": "universe_unavailable",
+            "message": "The stored top-100 universe is unreadable",
+            "state": "unavailable",
+        }
+        assert conn.executed == []
+
+    async def test_a_bad_ranked_at_row_is_the_503_universe_unavailable_envelope(self) -> None:
+        conn = _UniverseConn({**_value(datetime.now(UTC)), "ranked_at": "not-a-timestamp"})
+        with pytest.raises(ServiceError) as err:
+            await read_universe(_Pool(conn))
+        assert err.value.status_code == 503
+        assert err.value.detail == {
+            "code": "universe_unavailable",
+            "message": "The stored top-100 universe is unreadable",
+            "state": "unavailable",
+        }
+        assert conn.executed == []
+
     async def test_no_pool_is_the_503_database_envelope(self) -> None:
         with pytest.raises(ServiceError) as err:
             await read_universe(None)
@@ -166,6 +192,16 @@ class TestValidateSymbol:
             await validate_symbol(_Pool(_UniverseConn(None)), "BTCUSDT")
         assert err.value.status_code == 503
         assert err.value.detail["code"] == "universe_unavailable"
+
+    async def test_a_corrupt_row_fails_closed_with_the_503(self) -> None:
+        """The gate never opens on a corrupt row: the same 503, nothing written."""
+        conn = _UniverseConn(None)
+        conn.row = {"value": "{not json"}
+        with pytest.raises(ServiceError) as err:
+            await validate_symbol(_Pool(conn), "BTCUSDT")
+        assert err.value.status_code == 503
+        assert err.value.detail["code"] == "universe_unavailable"
+        assert conn.executed == []
 
 
 class TestRefreshUniverse:
