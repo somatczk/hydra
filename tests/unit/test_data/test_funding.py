@@ -167,6 +167,32 @@ class _FakeConn:
         raise AssertionError(f"unexpected fetchval: {sql}")
 
 
+class _LockSpyPool(_FakePool):
+    """Records every advisory-lock key the writer asks for; *contested* keys are denied."""
+
+    def __init__(
+        self,
+        *args: Any,
+        contested: frozenset[str] = frozenset(),
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.lock_keys: list[str] = []
+        self.contested = contested
+
+    def acquire(self) -> _FakeConn:
+        return _LockSpyConn(self)
+
+
+class _LockSpyConn(_FakeConn):
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        if "pg_try_advisory_xact_lock" in sql:
+            self._pool.lock_keys.append(str(args[0]))
+            if str(args[0]) in self._pool.contested:
+                return False
+        return await super().fetchval(sql, *args)
+
+
 class _Clock:
     def __init__(self, now: float = 0.0) -> None:
         self.now = now
@@ -235,6 +261,44 @@ class TestUpsert:
         rows = parse_funding_rate_history(ENTRIES, symbol="BTCUSDT")
         assert await upsert_funding_rates(pool, rows) == 0
         assert pool.stored == {}
+
+    async def test_a_mixed_symbol_batch_locks_and_inserts_every_symbol(self) -> None:
+        """One lock per distinct symbol: mixed rows never insert another symbol unlocked."""
+        pool = _LockSpyPool()
+        rows = [
+            FundingRate("ETHUSDT", Decimal("0.0001"), TIMES[0]),
+            FundingRate("BTCUSDT", Decimal("0.0002"), TIMES[0]),
+            FundingRate("BTCUSDT", Decimal("-0.00005"), TIMES[1]),
+        ]
+        assert await upsert_funding_rates(pool, rows) == 3
+        assert pool.lock_keys == [
+            f"funding_rates:{EXCHANGE_ID}:BTCUSDT",
+            f"funding_rates:{EXCHANGE_ID}:ETHUSDT",
+        ]
+        assert sorted(pool.stored) == [
+            ("BTCUSDT", TIMES[0]),
+            ("BTCUSDT", TIMES[1]),
+            ("ETHUSDT", TIMES[0]),
+        ]
+
+    async def test_a_single_symbol_batch_takes_one_lock_in_the_same_format(self) -> None:
+        pool = _LockSpyPool()
+        rows = parse_funding_rate_history(ENTRIES, symbol="BTCUSDT")
+        assert await upsert_funding_rates(pool, rows) == 5
+        assert pool.lock_keys == [f"funding_rates:{EXCHANGE_ID}:BTCUSDT"]
+
+    async def test_a_mixed_batch_that_misses_one_symbol_lock_defers_entirely(self) -> None:
+        pool = _LockSpyPool(contested={f"funding_rates:{EXCHANGE_ID}:ETHUSDT"})
+        rows = [
+            FundingRate("BTCUSDT", Decimal("0.0002"), TIMES[0]),
+            FundingRate("ETHUSDT", Decimal("0.0001"), TIMES[0]),
+        ]
+        assert await upsert_funding_rates(pool, rows) == 0
+        assert pool.stored == {}
+        assert pool.lock_keys == [
+            f"funding_rates:{EXCHANGE_ID}:BTCUSDT",
+            f"funding_rates:{EXCHANGE_ID}:ETHUSDT",
+        ]
 
 
 class TestEnsure:

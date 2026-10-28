@@ -163,24 +163,27 @@ async def upsert_funding_rates(
 
     Funding history is immutable, so an existing ``(exchange, symbol, timestamp)``
     row is never rewritten and a re-fetch inserts nothing. The 0001 schema has no
-    unique constraint on the hypertable, so a per-symbol advisory transaction lock
-    keeps two concurrent writers (the engine's refresher and a backtest preflight)
-    from double-inserting; a writer that does not get the lock defers to the one
-    that holds it.
+    unique constraint on the hypertable, so per-symbol advisory transaction locks
+    keep two concurrent writers (the engine's refresher and a backtest preflight)
+    from double-inserting; a batch takes one lock per distinct symbol, in sorted
+    order (no AB/BA between concurrent mixed batches), and a writer that does not
+    get every lock defers to the one that holds it.
     """
-    unique: dict[datetime, FundingRate] = {}
+    unique: dict[tuple[str, datetime], FundingRate] = {}
     for row in rows:
-        unique.setdefault(row.timestamp, row)
+        unique.setdefault((row.symbol, row.timestamp), row)
     if not unique:
         return 0
-    batch = sorted(unique.values(), key=lambda row: row.timestamp)
+    batch = sorted(unique.values(), key=lambda row: (row.symbol, row.timestamp))
+    symbols = sorted({row.symbol for row in batch})
     async with pool.acquire() as conn, conn.transaction():
-        locked = await conn.fetchval(
-            "SELECT pg_try_advisory_xact_lock(hashtext($1))",
-            f"funding_rates:{exchange}:{batch[0].symbol}",
-        )
-        if not locked:
-            return 0
+        for symbol in symbols:
+            locked = await conn.fetchval(
+                "SELECT pg_try_advisory_xact_lock(hashtext($1))",
+                f"funding_rates:{exchange}:{symbol}",
+            )
+            if not locked:
+                return 0
         inserted = await conn.fetch(
             _UPSERT_FUNDING_SQL,
             [exchange] * len(batch),

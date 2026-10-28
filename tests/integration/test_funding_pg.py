@@ -124,6 +124,31 @@ class TestUpsert:
         assert sorted(inserted) == [0, 3]
         assert len(await _stored(pool)) == 3
 
+    async def test_a_mixed_symbol_batch_locks_and_writes_every_symbol(self, pool: Any) -> None:
+        batch = [
+            FundingRate("ETHUSDT", Decimal("0.00010000"), T0),
+            FundingRate("BTCUSDT", Decimal("-0.00005000"), T0),
+            FundingRate("BTCUSDT", Decimal("0.00020000"), T0 + H8),
+        ]
+        assert await upsert_funding_rates(pool, batch) == 3
+        assert await _stored(pool, "BTCUSDT") == [
+            (Decimal("-0.00005000"), T0),
+            (Decimal("0.00020000"), T0 + H8),
+        ]
+        assert await _stored(pool, "ETHUSDT") == [(Decimal("0.00010000"), T0)]
+
+    async def test_two_concurrent_mixed_writers_never_double_insert(self, pool: Any) -> None:
+        batch = [
+            FundingRate("BTCUSDT", Decimal("0.00010000"), T0),
+            FundingRate("ETHUSDT", Decimal("-0.00005000"), T0),
+        ]
+        inserted = await asyncio.gather(
+            upsert_funding_rates(pool, batch), upsert_funding_rates(pool, batch)
+        )
+        assert sorted(inserted) == [0, 2]
+        assert len(await _stored(pool, "BTCUSDT")) == 1
+        assert len(await _stored(pool, "ETHUSDT")) == 1
+
     async def test_the_newest_timestamp_is_the_resume_cursor(self, pool: Any) -> None:
         assert await newest_funding_timestamp(pool, "BTCUSDT") is None
         await upsert_funding_rates(pool, ROWS[:2])

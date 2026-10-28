@@ -90,7 +90,10 @@ class BacktestRunner:
 
         Equity has one point per traded bar (the last after the end-of-data close-out) and
         ``Trade.pnl`` is net of both fees. Raises StrategyError when the strategy raises,
-        UnsupportedVenueError for anything but Binance SPOT.
+        UnsupportedVenueError for any pair ``validate_venue`` refuses — everything but
+        Binance SPOT and Binance USD⌂-M FUTURES (``binanceusdm``). Whatever it accepts
+        still runs SPOT semantics (spot fees, the spot paper executor); the service layer
+        refuses FUTURES submissions until perp backtests land (P4-C).
         """
         cfg = strategy_config.model_copy(
             update={
