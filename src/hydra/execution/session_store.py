@@ -131,3 +131,21 @@ async def running_ids(db_pool: Any) -> set[str]:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT id FROM trading_sessions WHERE status = 'running'")
     return {str(r["id"]) for r in rows}
+
+
+async def kill_switch_latched(db_pool: Any) -> bool | None:
+    """The global kill-switch row's state, or None when the read fails (the D5/R7 latch).
+
+    The trader's cleanup loop reads this to apply a switch the API latched in the
+    database while the trader could not be reached; ``None`` (unreadable) retries on
+    the next tick and is never treated as latched or released.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT kill_switch_active FROM risk_config WHERE scope = 'global'"
+            )
+    except Exception:
+        logger.warning("Kill-switch latch row unreadable", exc_info=True)
+        return None
+    return None if value is None else bool(value)

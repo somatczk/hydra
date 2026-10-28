@@ -13,13 +13,19 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from hydra.dashboard.routes._db import ServiceErrorRoute, request_trader
+from hydra.dashboard.routes._db import (
+    ServiceErrorRoute,
+    request_pool,
+    request_trader,
+)
 from hydra.dashboard.security import audit
 from hydra.services.sessions import (
     KillSwitchNotPersistedError,
     QuickTradeRequest,
     SessionStopNotPersistedError,
     StartSessionRequest,
+    activate_kill_switch_fail_safe,
+    release_kill_switch_fail_safe,
 )
 
 router = APIRouter(prefix="/api/trading", tags=["trading"], route_class=ServiceErrorRoute)
@@ -302,11 +308,15 @@ async def get_session_detail(session_id: str, request: Request) -> dict[str, Any
 
 @router.post("/kill-switch", response_model=KillSwitchResponse)
 async def activate_kill_switch(request: Request) -> dict[str, Any]:
-    """Latch the kill switch, then flatten and stop every running or errored session."""
+    """Latch the kill switch, then flatten and stop every running or errored session.
+
+    In the split layout an unreachable trader falls back to the DB latch (R7): the
+    switch is latched durably, the answer is an honest 503 and the trader applies it
+    within its 60 s cleanup tick once it returns.
+    """
     try:
-        body = await request_trader(request).activate_kill_switch(
-            _actor(request),
-            "kill switch (api)",
+        body = await activate_kill_switch_fail_safe(
+            request_trader(request), request_pool(request), _actor(request), "kill switch (api)"
         )
     except KillSwitchNotPersistedError as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {}
@@ -330,8 +340,12 @@ async def activate_kill_switch(request: Request) -> dict[str, Any]:
 
 @router.delete("/kill-switch", response_model=KillSwitchResponse)
 async def release_kill_switch(body: KillSwitchRelease, request: Request) -> dict[str, Any]:
-    """Release the kill switch (``{"confirm": "RELEASE", "reason": ...}``)."""
-    d = await request_trader(request).release_kill_switch(_actor(request), body.reason)
+    """Release the kill switch (``{"confirm": "RELEASE", "reason": ...}``).
+
+    In the split layout an unreachable trader keeps the switch latched: the honest 503
+    says so (R30/A7) instead of implying the release might have landed.
+    """
+    d = await release_kill_switch_fail_safe(request_trader(request), _actor(request), body.reason)
     audit(getattr(request.state, "principal", None), "kill_switch_off", reason=body.reason)
     return d
 

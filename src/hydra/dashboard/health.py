@@ -13,6 +13,12 @@ Prometheus rules can alert on a failing check, a zombie session or a stalled mon
   is at most ``CACHE_INTERVALS`` intervals old, else one evaluation runs (one at a time); only the
   background run writes the gauges.
 
+Two check sets (D5): the engine-side set (``REQUIRED_CHECKS``: db, migrations, sessions, feeds,
+risk — the full set the trader process and the single-process app run, with the engine reads
+routed through the backend) and the split-API set (``SPLIT_CHECKS``: db, migrations, trader),
+where the ``trader`` check embeds the remote trader's own ``/readyz`` body — the API process
+beside a remote trader has no engine to check.
+
 Feed freshness uses the same thresholds as ``HydraFeedStale`` and ``HydraClosedBarOverdue``,
 measured against the monitor's clock from the feed gauges.
 """
@@ -27,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from prometheus_client import REGISTRY
 
 import hydra
@@ -51,6 +58,7 @@ CLOSED_BAR_GRACE_S = 60.0
 CLOSED_BAR_MAX_BARS = 2
 
 REQUIRED_CHECKS = ("db", "migrations", "sessions", "feeds", "risk")
+SPLIT_CHECKS = ("db", "migrations", "trader")
 
 type Clock = Callable[[], float]
 type SessionKey = tuple[str, str, str]
@@ -96,7 +104,13 @@ def _holds_state(health: SessionHealth) -> bool:
 
 
 class HealthMonitor:
-    """Background readiness checks for one app (``app.state.health_monitor``)."""
+    """Background readiness checks for one app (``app.state.health_monitor``).
+
+    ``checks`` selects the set: ``REQUIRED_CHECKS`` (default — the engine-side full set)
+    or ``SPLIT_CHECKS``. Unset, it follows the app's config: an app whose
+    ``trader.url`` is set runs beside a remote trader and has no engine of its own, so it
+    runs the split set with the remote-trader check.
+    """
 
     def __init__(
         self,
@@ -105,11 +119,17 @@ class HealthMonitor:
         interval_s: float = HEALTH_INTERVAL_S,
         clock: Clock = time.time,
         monotonic: Clock = time.monotonic,
+        checks: tuple[str, ...] | None = None,
     ) -> None:
         self._app = app
         self._interval_s = interval_s
         self._clock = clock
         self._monotonic = monotonic
+        if checks is None:
+            cfg = getattr(app.state, "config", None)
+            url = getattr(getattr(cfg, "trader", None), "url", None)
+            checks = SPLIT_CHECKS if url is not None else REQUIRED_CHECKS
+        self._checks = checks
         self._task: asyncio.Task[None] | None = None
         self._started = False
         self._last_run: float | None = None
@@ -193,6 +213,19 @@ class HealthMonitor:
     # Checks
     # ------------------------------------------------------------------
 
+    def _engine(self) -> Any:
+        """The engine handle, routed through the backend (A6): the seam, not the state.
+
+        A bound backend (the lifespan binds ``LocalTrader`` beside the engine, and the
+        trader's own app binds one) owns the engine; the direct ``session_manager`` read
+        stays as the fallback for the tests that bind the manager alone.
+        """
+        backend = getattr(self._app.state, "trader", None)
+        mgr = getattr(backend, "session_manager", None)
+        if mgr is not None:
+            return mgr
+        return getattr(self._app.state, "session_manager", None)
+
     async def check(self) -> Readiness:
         now = self._clock()
         pool = getattr(self._app.state, "db_pool", None)
@@ -200,26 +233,29 @@ class HealthMonitor:
             "db": await self._check_db(pool),
             "migrations": await self._check_migrations(pool),
         }
-        mgr = getattr(self._app.state, "session_manager", None)
         snap: HealthSnapshot | None = None
-        snap_error: str | None = None
-        if mgr is None:
-            snap_error = "session manager not started"
+        if "trader" in self._checks:
+            checks["trader"] = await self._check_trader()
         else:
-            try:
-                snap = await asyncio.wait_for(mgr.health_snapshot(), SNAPSHOT_TIMEOUT_S)
-            except Exception as exc:
-                logger.warning("Health snapshot failed", exc_info=True)
-                snap_error = _error(exc)
-        checks["sessions"] = await self._check_sessions(snap, snap_error, pool)
-        checks["feeds"] = self._check_feeds(snap, snap_error, now)
-        checks["risk"] = self._check_risk(snap, snap_error)
-        checks["kill_switch"] = {
-            "ok": snap is not None and not snap.kill_switch,
-            "required": False,
-            "active": None if snap is None else snap.kill_switch,
-        }
-        ready = all(checks[name]["ok"] for name in REQUIRED_CHECKS)
+            engine = self._engine()
+            snap_error: str | None = None
+            if engine is None:
+                snap_error = "session manager not started"
+            else:
+                try:
+                    snap = await asyncio.wait_for(engine.health_snapshot(), SNAPSHOT_TIMEOUT_S)
+                except Exception as exc:
+                    logger.warning("Health snapshot failed", exc_info=True)
+                    snap_error = _error(exc)
+            checks["sessions"] = await self._check_sessions(snap, snap_error, pool)
+            checks["feeds"] = self._check_feeds(snap, snap_error, now, engine)
+            checks["risk"] = self._check_risk(snap, snap_error)
+            checks["kill_switch"] = {
+                "ok": snap is not None and not snap.kill_switch,
+                "required": False,
+                "active": None if snap is None else snap.kill_switch,
+            }
+        ready = all(checks[name]["ok"] for name in self._checks)
         return Readiness(
             ready=ready, checked_at=now, checks=checks, sessions_known=snap is not None
         )
@@ -296,12 +332,46 @@ class HealthMonitor:
             return {}
         return {str(r["id"]): (str(r["strategy_id"]), str(r["trading_mode"])) for r in rows}
 
+    async def _check_trader(self) -> dict[str, Any]:
+        """The remote trader's own readiness, embedded verbatim (R27(5)/A6).
+
+        A transport failure is an error string; an answer embeds the trader's
+        ``/readyz`` body under ``detail`` whatever its status, so the API's 503 names
+        the remote cause. The bearer token rides along when one is configured.
+        """
+        cfg = getattr(self._app.state, "config", None)
+        url = getattr(getattr(cfg, "trader", None), "url", None)
+        if url is None:
+            return {"ok": False, "required": True, "error": "trader url not configured"}
+        headers: dict[str, str] = {}
+        token = getattr(cfg, "api_token", None)
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token.get_secret_value()}"
+        try:
+            async with httpx.AsyncClient(timeout=DB_TIMEOUT_S) as client:
+                response = await client.get(f"{url}/readyz", headers=headers)
+        except Exception as exc:
+            return {"ok": False, "required": True, "error": _error(exc)}
+        try:
+            body: Any = response.json()
+        except ValueError:
+            body = None
+        out: dict[str, Any] = {"ok": response.status_code == 200, "required": True}
+        if body is not None:
+            out["detail"] = body
+        else:
+            out["status_code"] = response.status_code
+        return out
+
     def _check_feeds(
-        self, snap: HealthSnapshot | None, error: str | None, now: float
+        self,
+        snap: HealthSnapshot | None,
+        error: str | None,
+        now: float,
+        mgr: Any,
     ) -> dict[str, Any]:
         if snap is None:
             return {"ok": False, "required": True, "error": error, "streams": []}
-        mgr = self._app.state.session_manager
         streams: list[dict[str, Any]] = []
         supervised = {s.session_id for s in snap.sessions if s.supervised}
         for sid in list(self._first_supervised):
@@ -368,10 +438,10 @@ class HealthMonitor:
     # ------------------------------------------------------------------
 
     def _publish_ready(self, result: Readiness) -> None:
-        for name in REQUIRED_CHECKS:
+        for name in self._checks:
             metrics.set_ready(name, bool(result.checks[name]["ok"]))
         current: set[SessionKey] = set()
-        for item in result.checks["sessions"].get("sessions", []):
+        for item in result.checks.get("sessions", {}).get("sessions", []):
             key = (item["session_id"], item["strategy_id"], item["mode"])
             metrics.set_session_state(*key, desired=item["desired"], supervised=item["supervised"])
             current.add(key)

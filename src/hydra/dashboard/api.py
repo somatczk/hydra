@@ -6,7 +6,6 @@ Main entry point for the dashboard REST API and WebSocket endpoints.
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -19,6 +18,7 @@ from hydra.dashboard.routes import (
     backtest,
     health,
     market_data,
+    metrics,
     models,
     portfolio,
     risk,
@@ -30,6 +30,7 @@ from hydra.dashboard.routes import (
 )
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.security import install_security
+from hydra.dashboard.ws_relay import TradesRelay
 
 # ---------------------------------------------------------------------------
 # Application factory
@@ -68,41 +69,24 @@ app.include_router(signals.router)
 app.include_router(templates.router)
 app.include_router(market_data.router)
 app.include_router(activity.router)
-
-
-# ---------------------------------------------------------------------------
-# Metrics (probes: routes/health.py)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/metrics", tags=["observability"])
-async def metrics() -> Any:
-    """Expose Prometheus metrics in OpenMetrics / text format.
-
-    Uses lazy import to avoid pulling ``prometheus_client`` at module level.
-    Returns a ``Response`` with the correct ``Content-Type`` header so that
-    Prometheus can scrape the endpoint without issues.
-    """
-    try:
-        import prometheus_client
-        from starlette.responses import Response
-
-        # Ensure metric collectors are registered before generating output
-        from hydra.core.metrics import _ensure_initialized
-
-        _ensure_initialized()
-
-        return Response(
-            content=prometheus_client.generate_latest(),
-            media_type=prometheus_client.CONTENT_TYPE_LATEST,
-        )
-    except ImportError:
-        return {"error": "prometheus_client not installed"}
+app.include_router(metrics.router)
 
 
 # ---------------------------------------------------------------------------
 # WebSocket connection manager (imported from hydra.core to avoid circular deps)
 # ---------------------------------------------------------------------------
+
+
+def _ensure_trades_relay(app: FastAPI) -> TradesRelay | None:
+    """The app's trades relay, built on first use from its pool (None without one)."""
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        return None
+    relay = getattr(app.state, "trades_relay", None)
+    if relay is None:
+        relay = TradesRelay(pool)
+        app.state.trades_relay = relay
+    return relay
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +115,17 @@ async def ws_market(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/trades")
 async def ws_trades(websocket: WebSocket) -> None:
-    """Real-time trade notifications. Accepts ?session_id= query param."""
+    """Real-time trade notifications. Accepts ?session_id= query param.
+
+    The relay task (started here, one per app) polls ``trades`` and sends the R6 fill
+    tick per new row, so fills cross the process boundary of the split layout through
+    the database; in single-process mode the engine's own fill broadcast still arrives.
+    """
     session_id = websocket.query_params.get("session_id")
     channel = f"trades:{session_id}" if session_id else "trades"
+    relay = _ensure_trades_relay(websocket.app)
+    if relay is not None:
+        await relay.ensure_started()
     await manager.connect(channel, websocket)
     try:
         while True:

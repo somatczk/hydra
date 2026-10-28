@@ -52,9 +52,11 @@ not duplicate it here; update that table in the PR that changes a row.
 - **ML**: onnxruntime, plus xgboost/torch/mlflow in the `ml-training` extra. Not wired into trading (P5).
 
 ## Project structure
-- `src/hydra/`: 12 modules.
+- `src/hydra/`: 13 modules.
   - `core`: config, domain types, events, event buses, WebSocket manager, the Prometheus metric contract
     (`metrics.py`).
+  - `trader`: the trader process entry point (`python -m hydra.trader [run|check]`): the worker-pattern
+    startup plus the internal bearer-gated API over the 19 `TraderBackend` ops (D5).
   - `data`: ingestion, bar storage, backfill, news and sentiment.
   - `indicators`: TA-Lib wrappers and custom indicators.
   - `strategy`: base class, engine, rule engine, YAML config, `builtin/`.
@@ -95,8 +97,13 @@ src/hydra/backtest/ src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ --
 those packages, because `mypy src/` alone does not catch everything it catches.
 
 ## Architecture (as is)
-- One engine process holds FastAPI, the SessionManager and an `InMemoryEventBus` per session. Redis is only
-  health-pinged; it is not on the trading path.
+- One engine process holds FastAPI, the SessionManager and an `InMemoryEventBus` per session, **unless
+  `trader.url` (env `HYDRA_TRADER__URL`) is set (P3-D5)**: then the dashboard/API process never constructs a
+  SessionManager and binds a `RemoteTrader` (`hydra.dashboard.trader_client`) that calls one endpoint per
+  `TraderBackend` op on the trader process (`python -m hydra.trader`: the engine behind its internal
+  bearer-gated FastAPI on :8000 with `HYDRA_API_TOKEN`, no MCP, no CORS; the wire format is the shared
+  error envelope; transport errors are 503 `engine_unreachable`; the DB is the only durable shared state).
+  Redis is only health-pinged; it is not on the trading path.
 - Signal path: ccxt.pro closed bar → the session's bar handler (paper executor fills resting orders and marks) →
   StrategyEngine → OrderManager (check by the process-wide RiskService) → PaperTradingExecutor. Every exchange client is
   built by `hydra.execution.client_factory` (Binance spot only); live sessions are refused until P3.
@@ -190,6 +197,8 @@ romulus (homelab infra repo) runs the `hydra` stack on a ZimaCube with Ubuntu 26
 from `ghcr.io/somatczk/hydra-*`; romulus Dependabot opens the tag-bump PRs. Romulus P0-E2 (in progress) holds hydra
 bumps back from auto-merge, drops the public `/health` + `/metrics` router and removes the Telegram env. The engine
 reads infra only from `DATABASE_URL`, `REDIS_URL`, `HYDRA_CREDENTIAL_KEY` (required with a DB; comma list = rotation)
-and `HYDRA_API_TOKEN`, and behaviour overrides as `HYDRA_<SECTION>__<KEY>` (e.g. `HYDRA_API__CORS_ORIGINS`). Until the
+and `HYDRA_API_TOKEN`, and behaviour overrides as `HYDRA_<SECTION>__<KEY>` (e.g. `HYDRA_API__CORS_ORIGINS`;
+`HYDRA_TRADER__URL` turns the engine container into the split API — the trader runs beside it as the same
+image with `command: python -m hydra.trader`, D6). Until the
 P1 release romulus bind-mounts its own `/app/config` over the image's; from then on it mounts only
 `config/strategies`. `HYDRA_DB_*` and `HYDRA_REDIS_URL` are test-infra env only (`tests/infra.py`).

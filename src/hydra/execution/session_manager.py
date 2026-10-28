@@ -148,10 +148,13 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         risk_store: RiskStateStore | None = None,
         paper_capital: Decimal | None = None,
         live_risk: RiskService | None = None,
+        cleanup_tick_s: float = 60.0,
     ) -> None:
         self._sessions: dict[str, TradingSession] = {}
         self._db_pool = db_pool
         self._config = config
+        self._cleanup_tick_s = cleanup_tick_s
+        self._sweep_lock = asyncio.Lock()
         self._clients = clients or ClientFactory()
         self._market_rules = MarketRulesCache(
             loader=self._clients.markets_loader or self._clients.rest_pool.markets_loader
@@ -610,37 +613,39 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         return await self._stop_targets(persisted, reason)
 
     async def _stop_targets(self, persisted: bool, reason: str) -> KillSwitchReport:
-        targets = [
-            s
-            for s in list(self._sessions.values())
-            if s.status == "running"
-            or (s.status == "error" and (s._runtime is not None or s.holdings > 0))
-        ]
-        failures: list[str] = []
-        remaining = 0
-        for session in targets:
-            result = await self._stop_session_internal(session, reason=reason)
-            remaining += result.positions_remaining
-            if result.positions_remaining:
-                failures.append(
-                    f"{session.session_id}: {result.positions_remaining} position(s) remain"
-                    + (f" ({'; '.join(result.failures)})" if result.failures else "")
-                )
-            if session.persist_error is not None:
-                failures.append(f"{session.session_id}: {session.persist_error}")
-        failures.extend(await self._sweep_live_orders(targets))
-        logger.warning(
-            "Kill switch: stopped %d session(s), %d position(s) remain",
-            len(targets),
-            remaining,
-        )
-        return KillSwitchReport(
-            active=True,
-            persisted=persisted,
-            sessions_stopped=len(targets),
-            positions_remaining=remaining,
-            flatten_failures=tuple(failures),
-        )
+        # serialized: the API path, the DB latch and a tier-4 breaker never interleave sweeps
+        async with self._sweep_lock:
+            targets = [
+                s
+                for s in list(self._sessions.values())
+                if s.status == "running"
+                or (s.status == "error" and (s._runtime is not None or s.holdings > 0))
+            ]
+            failures: list[str] = []
+            remaining = 0
+            for session in targets:
+                result = await self._stop_session_internal(session, reason=reason)
+                remaining += result.positions_remaining
+                if result.positions_remaining:
+                    failures.append(
+                        f"{session.session_id}: {result.positions_remaining} position(s) remain"
+                        + (f" ({'; '.join(result.failures)})" if result.failures else "")
+                    )
+                if session.persist_error is not None:
+                    failures.append(f"{session.session_id}: {session.persist_error}")
+            failures.extend(await self._sweep_live_orders(targets))
+            logger.warning(
+                "Kill switch: stopped %d session(s), %d position(s) remain",
+                len(targets),
+                remaining,
+            )
+            return KillSwitchReport(
+                active=True,
+                persisted=persisted,
+                sessions_stopped=len(targets),
+                positions_remaining=remaining,
+                flatten_failures=tuple(failures),
+            )
 
     async def _sweep_live_orders(self, sessions: list[TradingSession]) -> list[str]:
         """After every flatten, cancel ALL orders on each live-traded symbol (Q2).
@@ -1163,12 +1168,53 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         if self._stale_cleanup_task is None or self._stale_cleanup_task.done():
             self._stale_cleanup_task = asyncio.create_task(self._stale_order_cleanup_loop())
 
+    async def _apply_db_kill_switch_latch(self) -> None:
+        """R7: apply the DB kill-switch latch — once — when memory has not latched it.
+
+        The API latches the switch in the database when the trader process cannot be
+        reached; this loop applies it within one 60 s tick. The application is
+        idempotent by construction: ``stop_all`` latches the in-memory services, so
+        later ticks with the same DB row never sweep again. A failed application
+        surfaces as a ``kill_switch_latch_failed`` risk_events row; the in-memory
+        gate decides the retry: memory still OFF retries on the next tick, memory
+        ON (latched before the sweep) leaves the event as the operator's signal.
+        """
+        pool = self._db_pool
+        if pool is None or self.kill_switch_active():
+            return
+        latched = await session_store.kill_switch_latched(pool)
+        if not latched:
+            return
+        logger.warning("Kill switch latched in the database; applying stop_all")
+        try:
+            await self.stop_all(actor="db-latch", reason="kill switch latched in the database")
+        except Exception as exc:
+            logger.exception("Applying the DB kill-switch latch failed")
+            await self._record_latch_failure(pool, exc)
+
+    async def _record_latch_failure(self, pool: Any, exc: Exception) -> None:
+        """The operator's signal for a failed latch application (R30/A2)."""
+        try:
+            store = PgRiskStateStore(pool, scope="global")
+            await store.append_event(
+                RiskEventRecord(
+                    kind="kill_switch_latch_failed",
+                    actor="db-latch",
+                    reason=str(exc)[:500],
+                    scope="global",
+                )
+            )
+        except Exception:
+            logger.exception("The kill-switch latch failure could not be recorded")
+
     async def _stale_order_cleanup_loop(self) -> None:
-        """Cancel stale non-protective orders of running sessions every minute, and
-        reconcile every running live session (the A2 drift detector)."""
+        """Cancel stale non-protective orders of running sessions every minute, apply
+        the DB kill-switch latch (R7), and reconcile every running live session (the
+        A2 drift detector)."""
         while True:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(self._cleanup_tick_s)
+                await self._apply_db_kill_switch_latch()
                 await self.retry_unpersisted()
                 await self._reconcile_live_sessions()
                 for session in list(self._sessions.values()):

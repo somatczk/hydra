@@ -18,6 +18,7 @@ from hydra.dashboard.api import app
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
 from hydra.execution.session_manager import TradingSession
 from hydra.risk.state import RiskStateUnavailableError
+from hydra.services.errors import ServiceError, error_detail
 from hydra.services.trader import LocalTrader
 from tests.unit.test_execution.session_harness import (
     Harness,
@@ -735,3 +736,93 @@ class TestA7AdditiveSurfaces:
         assert detail["orders"] == []
         assert detail["reconcile"] is None
         assert detail["trades"][0]["reconciled"] is None
+
+
+class _LatchPool:
+    """Records the kill-switch latch writes (the real SQL is pinned in integration)."""
+
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[Any]:
+        yield self
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.statements.append(sql)
+        return "UPDATE 1" if sql.lstrip().startswith("UPDATE") else "INSERT 0 1"
+
+
+class _UnreachableTrader:
+    """A RemoteTrader whose trader process cannot be reached (seam #8)."""
+
+    async def activate_kill_switch(self, actor: str, reason: str) -> dict[str, Any]:
+        raise ServiceError(
+            503,
+            error_detail("engine_unreachable", "The trading engine is unreachable", "unavailable"),
+        )
+
+
+class TestKillSwitchDbLatch:
+    """R7: an unreachable trader latches the switch in the database and answers honestly."""
+
+    async def test_an_unreachable_trader_latches_in_the_db_and_answers_503(
+        self, api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pool = _LatchPool()
+        monkeypatch.setattr(app.state, "db_pool", pool)
+        monkeypatch.setattr(app.state, "trader", _UnreachableTrader())
+        resp = await api.post("/api/trading/kill-switch")
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert detail["code"] == "engine_unreachable"
+        assert detail["latched"] is True
+        assert detail["apply_window_s"] == 60
+        assert "latched in the database" in detail["message"]
+        assert "60 seconds" in detail["message"]
+        # honest about what a down trader does: nothing applies until it returns
+        assert "once it returns" in detail["message"]
+        assert "nothing applies while it is down" in detail["message"]
+        assert any("kill_switch_active = TRUE" in s for s in pool.statements)
+        assert any("INSERT INTO risk_events" in s for s in pool.statements)
+
+    async def test_other_503s_pass_through_without_latching(
+        self, api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pool = _LatchPool()
+        monkeypatch.setattr(app.state, "db_pool", pool)
+        monkeypatch.setattr(
+            app.state,
+            "trader",
+            LocalTrader(app.state.db_pool, None),  # the local engine-not-ready 503
+        )
+        resp = await api.post("/api/trading/kill-switch")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "engine_not_ready"
+        assert pool.statements == []
+
+    async def test_the_release_through_an_unreachable_trader_stays_latched(
+        self, api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Unreachable:
+            async def release_kill_switch(self, actor: str, reason: str) -> dict[str, Any]:
+                raise ServiceError(
+                    503,
+                    error_detail(
+                        "engine_unreachable",
+                        "The trading engine is unreachable",
+                        "unavailable",
+                    ),
+                )
+
+        monkeypatch.setattr(app.state, "trader", _Unreachable())
+        resp = await api.request(
+            "DELETE", "/api/trading/kill-switch", json={"confirm": "RELEASE", "reason": "drill"}
+        )
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert detail["code"] == "engine_unreachable"
+        # the release leg is honest the same way the activate leg is (R30/A7)
+        assert detail["latched"] is True
+        assert "stays LATCHED" in detail["message"]
+        assert "re-release it once the trader returns" in detail["message"]

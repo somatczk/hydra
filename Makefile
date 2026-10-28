@@ -21,9 +21,9 @@ integration:
 e2e:
 	uv run pytest tests/e2e/ -v -m e2e
 
-# Paper smoke: real lifespan on TimescaleDB (HYDRA_DB_*, HYDRA_REDIS_URL), replayed Binance bars
+# Paper smoke: real lifespan on TimescaleDB (HYDRA_DB_*, HYDRA_REDIS_URL), replayed Binance bars; the split smoke adds the two-process layout (HYDRA_TRADER__URL)
 smoke:
-	uv run pytest tests/e2e/test_paper_smoke.py -v -m e2e
+	uv run pytest tests/e2e/test_paper_smoke.py tests/e2e/test_split_smoke.py -v -m e2e
 
 perf:
 	uv run pytest tests/performance/ -v -m performance --benchmark-json=benchmark.json

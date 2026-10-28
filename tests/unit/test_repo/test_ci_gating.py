@@ -144,8 +144,12 @@ def test_paper_smoke_is_its_own_required_job() -> None:
     assert _pytest_step(job)["run"] == "make smoke"
     makefile = (_ROOT / "Makefile").read_text()
     [recipe] = re.findall(r"^smoke:\n\t(.+)$", makefile, re.M)
-    assert recipe == "uv run pytest tests/e2e/test_paper_smoke.py -v -m e2e"
+    # both process modes of the D5 layout: single-process first, the split second
+    assert recipe == (
+        "uv run pytest tests/e2e/test_paper_smoke.py tests/e2e/test_split_smoke.py -v -m e2e"
+    )
     assert (_ROOT / "tests" / "e2e" / "test_paper_smoke.py").is_file()
+    assert (_ROOT / "tests" / "e2e" / "test_split_smoke.py").is_file()
 
 
 def test_import_contract_runs_in_ci_and_make_check() -> None:

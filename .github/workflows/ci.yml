@@ -385,6 +385,40 @@ jobs:
                 | jq -e 'select(.logger == "uvicorn.error" and .level == "info" and .timestamp != null)'
               docker logs smoke 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
               docker exec smoke python -c "import hydra.dashboard.api"
+              # the two-process split (R15): a user-defined network (both bind :8000, so no --network host)
+              docker rm -f smoke
+              docker network create hydra-smoke
+              SPLIT_DB="-e DATABASE_URL=postgresql://hydra:test@host.docker.internal:${PG_PORT}/hydra_test -e REDIS_URL=redis://host.docker.internal:${REDIS_PORT}/0"
+              SPLIT_KEY="$(openssl rand -base64 32 | tr '+/' '-_')"
+              SPLIT_TOKEN="ci-split-token-0123456789abcdef0123456789abcdef"
+              docker run -d --name hydra-trader --network hydra-smoke \
+                --add-host=host.docker.internal:host-gateway \
+                $SPLIT_DB -e HYDRA_CREDENTIAL_KEY="$SPLIT_KEY" -e HYDRA_API_TOKEN="$SPLIT_TOKEN" \
+                "$IMAGE:smoke" python -m hydra.trader
+              docker run -d --name hydra-api --network hydra-smoke \
+                --add-host=host.docker.internal:host-gateway -p 8000:8000 \
+                $SPLIT_DB -e HYDRA_CREDENTIAL_KEY="$SPLIT_KEY" -e HYDRA_API_TOKEN="$SPLIT_TOKEN" \
+                -e HYDRA_API__AUTH_MODE=token \
+                -e HYDRA_MCP_TOKEN="ci-split-mcp-0123456789abcdef0123456789abcdef" \
+                -e HYDRA_MCP__ALLOWED_HOSTS="localhost:8000" \
+                -e HYDRA_TRADER__URL="http://hydra-trader:8000" \
+                "$IMAGE:smoke"
+              wait_for curl -fsS -o /dev/null http://localhost:8000/livez
+              # the trader boots after the API (it waits for the migrations), so readiness needs the wait
+              wait_for curl -fsS -o /dev/null http://localhost:8000/readyz
+              ready=$(curl -fsS http://localhost:8000/readyz)
+              echo "$ready"
+              # the split API's readiness embeds the trader's own /readyz body
+              jq -e '.status == "ok" and .checks.db.ok == true and .checks.migrations.ok == true
+                      and .checks.trader.ok == true
+                      and .checks.trader.detail.checks.sessions.ok == true
+                      and .checks.trader.detail.checks.feeds.ok == true
+                      and .checks.trader.detail.checks.risk.ok == true' <<<"$ready"
+              docker exec hydra-trader python -m hydra.trader check
+              docker exec -i hydra-api python - < .github/scripts/mcp_image_smoke.py
+              docker logs hydra-api 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
+              docker logs hydra-trader 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
+              docker exec hydra-api python -c "from hydra.dashboard.trader_client import RemoteTrader; import hydra.trader.server"
               ;;
             hydra-backtest)
               # romulus env shape: DATABASE_URL, REDIS_URL and a throwaway HYDRA_CREDENTIAL_KEY

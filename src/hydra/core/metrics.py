@@ -148,7 +148,8 @@ MetricKind = Literal["counter", "gauge", "histogram"]
 EXCHANGE_CALL_OUTCOMES = ("ok", "error", "timeout", "cancelled")
 FEED_BAR_SOURCES = ("ws", "rest_gap", "warmup")
 RISK_INTENTS = ("open", "reduce")
-READY_CHECKS = ("db", "migrations", "sessions", "feeds", "risk")
+# trader: the split-API monitor's remote-trader check (D5)
+READY_CHECKS = ("db", "migrations", "sessions", "feeds", "risk", "trader")
 SPOT_SHORT_SIGNALS = ("entry_short", "exit_short")
 CIRCUIT_BREAKER_TIERS = range(5)
 
@@ -476,7 +477,7 @@ CONTRACT: tuple[MetricSpec, ...] = (
     MetricSpec(
         "hydra_ready",
         "gauge",
-        "1 when a readiness check passes (db, migrations, sessions, feeds, risk)",
+        "1 when a readiness check passes (db, migrations, sessions, feeds, risk, trader)",
         "1",
         "P1-G1 HealthMonitor",
         ("check",),

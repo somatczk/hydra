@@ -304,3 +304,55 @@ async def test_startup_failure_after_mount_still_unmounts(
             pytest.fail("startup must not complete")
     assert _mcp_mounts(app) == []
     assert getattr(app.state, "mcp", None) is None
+
+
+# ---------------------------------------------------------------------------
+# The D5 process split: HYDRA_TRADER__URL set binds a RemoteTrader, no engine
+# ---------------------------------------------------------------------------
+
+
+async def test_remote_mode_binds_a_remote_trader_and_never_builds_an_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the trader url set the API process skips the engine entirely: no
+    SessionManager is constructed, a RemoteTrader is bound and its client is closed."""
+    from hydra.dashboard.health import SPLIT_CHECKS
+    from hydra.dashboard.trader_client import RemoteTrader
+    from hydra.execution import session_manager as session_manager_mod
+
+    def no_engine(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("a SessionManager was constructed in the API process")
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.setenv("HYDRA_TRADER__URL", "http://trader:8000")
+    monkeypatch.setenv("HYDRA_API_TOKEN", "t" * 48)
+    monkeypatch.setattr(session_manager_mod, "SessionManager", no_engine)
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert app.state.session_manager is None
+        assert isinstance(app.state.trader, RemoteTrader)
+        assert not app.state.trader._client.is_closed
+        monitor = app.state.health_monitor
+        assert monitor is not None and monitor._checks == SPLIT_CHECKS
+    assert app.state.trader._client.is_closed
+
+
+async def test_single_process_mode_still_builds_the_local_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the trader url the startup path is today's: the engine and LocalTrader."""
+    from hydra.dashboard.health import REQUIRED_CHECKS
+    from hydra.execution.session_manager import SessionManager
+    from hydra.services.trader import LocalTrader
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_TRADER__URL", raising=False)
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert isinstance(app.state.session_manager, SessionManager)
+        assert isinstance(app.state.trader, LocalTrader)
+        assert app.state.trader.session_manager is app.state.session_manager
+        monitor = app.state.health_monitor
+        assert monitor is not None and monitor._checks == REQUIRED_CHECKS

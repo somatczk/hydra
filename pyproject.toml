@@ -164,6 +164,8 @@ root_packages = ["hydra"]
 name = "Module boundaries"
 type = "layers"
 layers = [
+    # the trader is the split's composition root: the engine behind its own app
+    "hydra.trader",
     "hydra.dashboard",
     "hydra.services",
     "hydra.portfolio | hydra.backtest",

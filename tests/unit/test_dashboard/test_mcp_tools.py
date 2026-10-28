@@ -41,6 +41,7 @@ from hydra.dashboard.security import install_security
 from hydra.execution.errors import ConfigReloadRefusedError
 from hydra.execution.session_manager import TradingSession
 from hydra.services import strategies as strategy_svc
+from hydra.services.errors import ServiceError, error_detail
 from hydra.services.trader import LocalTrader
 from tests.unit.test_execution.session_harness import Harness, held, write_strategy
 
@@ -1133,6 +1134,68 @@ class TestKillSwitchTools:
                 assert h.mgr.kill_switch_active()
         finally:
             await h.close()
+
+    async def test_on_through_an_unreachable_trader_latches_the_db_and_answers_503(
+        self,
+        mcp_cfg: HydraConfig,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R7 through the MCP tool too: engine_unreachable latches the DB row, the tool
+        error carries the honest 503 envelope (latched + the apply window)."""
+
+        class _LatchPool:
+            def __init__(self) -> None:
+                self.statements: list[str] = []
+
+            class _Conn:
+                def __init__(self, pool: _LatchPool) -> None:
+                    self._pool = pool
+
+                async def execute(self, sql: str, *args: object) -> str:
+                    self._pool.statements.append(sql)
+                    return "UPDATE 1" if sql.lstrip().startswith("UPDATE") else "INSERT 0 1"
+
+            class _Ctx:
+                def __init__(self, pool: _LatchPool) -> None:
+                    self._pool = pool
+
+                async def __aenter__(self) -> _LatchPool._Conn:
+                    return _LatchPool._Conn(self._pool)
+
+                async def __aexit__(self, *exc: object) -> None:
+                    return None
+
+            def acquire(self) -> _LatchPool._Ctx:
+                return _LatchPool._Ctx(self)
+
+        class _Unreachable:
+            async def activate_kill_switch(self, actor: str, reason: str) -> dict[str, Any]:
+                raise ServiceError(
+                    503,
+                    error_detail(
+                        "engine_unreachable",
+                        "The trading engine is unreachable (HYDRA_TRADER__URL)",
+                        "unavailable",
+                    ),
+                )
+
+        pool = _LatchPool()
+        monkeypatch.setattr(engine_app.state, "db_pool", pool)
+        monkeypatch.setattr(engine_app.state, "trader", _Unreachable())
+        async with _async_mcp(mcp_cfg) as mcp:
+            is_error, text = await mcp.call("kill_switch_on", {"reason": "claude drill"})
+            assert is_error, text
+            envelope = json.loads(text.removeprefix("Error executing tool kill_switch_on: "))
+            assert envelope["status"] == 503
+            detail = envelope["detail"]
+            assert (detail["code"], detail["latched"], detail["apply_window_s"]) == (
+                "engine_unreachable",
+                True,
+                60,
+            )
+        assert any("kill_switch_active = TRUE" in s for s in pool.statements)
+        assert any("INSERT INTO risk_events" in s for s in pool.statements)
 
     async def test_on_is_immediate_latches_and_is_attributed_then_release_is_gated(
         self,
