@@ -324,6 +324,7 @@ _EXTENDED_METRICS = (
     "profit_factor",
     "max_drawdown_duration_s",
 )
+MAX_RESULT_SUMMARIES = 200
 LIST_SUMMARIES_SQL = (
     "SELECT "
     "id, strategy, period, status, total_trades, win_rate, total_pnl, max_drawdown, "
@@ -332,7 +333,7 @@ LIST_SUMMARIES_SQL = (
     "calmar_ratio, profit_factor, max_drawdown_duration_s, name, strategy_id, initial_capital, "
     "data_source, data_exchange, data_symbol, data_timeframe, bar_count, first_ts, "
     "last_ts, gap_count, requested_start, requested_end "
-    "FROM backtest_results ORDER BY created_at DESC"
+    "FROM backtest_results ORDER BY created_at DESC LIMIT $1"
 )
 ONE_RESULT_SQL = (
     "SELECT "
