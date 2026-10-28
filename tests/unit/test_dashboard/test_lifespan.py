@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import socket
 from pathlib import Path
@@ -304,6 +305,74 @@ async def test_startup_failure_after_mount_still_unmounts(
             pytest.fail("startup must not complete")
     assert _mcp_mounts(app) == []
     assert getattr(app.state, "mcp", None) is None
+
+
+# ---------------------------------------------------------------------------
+# The universe refresher: started last with a pool, cancelled first on shutdown
+# ---------------------------------------------------------------------------
+
+
+class _FakeUniverseRefresher:
+    """The ``universe_refresher_factory`` seam's test double."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def test_universe_refresher_starts_with_a_pool_and_stops_on_shutdown() -> None:
+    app = FastAPI()
+    app.state.db_pool = object()
+    fake = _FakeUniverseRefresher()
+    app.state.universe_refresher_factory = lambda _app: fake
+    await lifespan._start_universe_refresher(app)
+    assert fake.started
+    assert app.state.universe_refresher is fake
+    await lifespan._stop_universe_refresher(app)
+    assert fake.stopped
+
+
+async def test_without_a_pool_no_universe_refresher_starts() -> None:
+    app = FastAPI()
+    app.state.db_pool = None
+    calls: list[FastAPI] = []
+
+    def factory(target: FastAPI) -> _FakeUniverseRefresher:
+        calls.append(target)
+        return _FakeUniverseRefresher()
+
+    app.state.universe_refresher_factory = factory
+    await lifespan._start_universe_refresher(app)
+    assert calls == []
+    assert getattr(app.state, "universe_refresher", None) is None
+
+
+async def test_a_raising_refresh_never_fails_startup() -> None:
+    """The refresh runs in the background loop: its failure is a warning there,
+    never a startup error, and shutdown still cancels it cleanly."""
+    from hydra.data.universe import UniverseRefresher
+
+    attempts: list[int] = []
+
+    async def refresh() -> None:
+        attempts.append(1)
+        raise RuntimeError("binance unreachable")
+
+    app = FastAPI()
+    app.state.db_pool = object()
+    refresher = UniverseRefresher(refresh, retry_s=3600.0)
+    app.state.universe_refresher_factory = lambda _app: refresher
+    await lifespan._start_universe_refresher(app)
+    await asyncio.sleep(0)  # the first refresh runs (and fails) in the background
+    assert attempts == [1]
+    assert app.state.universe_refresher is refresher
+    await lifespan._stop_universe_refresher(app)
 
 
 # ---------------------------------------------------------------------------

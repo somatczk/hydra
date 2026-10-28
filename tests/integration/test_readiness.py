@@ -14,6 +14,7 @@ from prometheus_client.parser import text_string_to_metric_families
 from hydra.core import metrics
 from hydra.dashboard import api, lifespan
 from hydra.data.migrations.runner import head_revision
+from tests.fixtures.universe import offline_refresher_factory
 
 
 @pytest.fixture()
@@ -30,10 +31,14 @@ def romulus_env(fresh_database: str, redis_url: str, monkeypatch: pytest.MonkeyP
 @pytest.fixture()
 async def engine(romulus_env: str) -> AsyncIterator[httpx.AsyncClient]:
     metrics._reset_metrics()
-    async with lifespan.run(api.app):
-        transport = httpx.ASGITransport(app=api.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://engine") as client:
-            yield client
+    api.app.state.universe_refresher_factory = offline_refresher_factory
+    try:
+        async with lifespan.run(api.app):
+            transport = httpx.ASGITransport(app=api.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://engine") as client:
+                yield client
+    finally:
+        api.app.state.universe_refresher_factory = None
     metrics._reset_metrics()
 
 
