@@ -309,15 +309,23 @@ def test_forgetting_a_session_that_never_reconciled_is_quiet() -> None:
 
 
 def test_data_cache_alerts_read_the_sweeper_gauges() -> None:
-    """The two alerts read C2's unlabelled gauges; absent series never fire either."""
+    """The two alerts read C2's unlabelled gauges; absent series never fire either.
+
+    The budget guard keeps the documented zero-budget mode (cache_max_gb=0,
+    delete-after-run) silent: its protected bars are a working config, not a page.
+    """
     rules = _rules()
     over_budget = rules["HydraDataCacheOverBudget"]
-    assert over_budget["expr"].strip() == "hydra_data_cache_bytes > hydra_data_cache_budget_bytes"
+    assert over_budget["expr"].strip() == (
+        "hydra_data_cache_bytes > hydra_data_cache_budget_bytes"
+        " and hydra_data_cache_budget_bytes > 0"
+    )
     assert over_budget["for"] == "1h"
     assert over_budget["labels"] == {"severity": "warning", "team": "infra"}
     description = over_budget["annotations"]["description"]
     assert "over its configured budget" in description
     assert "sweep interval" in description
+    assert "one default sweep interval" in description
 
     stalled = rules["HydraDataSweepStalled"]
     assert stalled["expr"].strip() == "time() - hydra_data_sweep_last_timestamp_seconds > 7200"
@@ -326,7 +334,7 @@ def test_data_cache_alerts_read_the_sweeper_gauges() -> None:
 
 
 def test_the_over_budget_window_gives_the_sweeper_a_full_cycle() -> None:
-    """1h for is one sweep interval: the sweeper reclaims the excess before the page lands."""
+    """1h for is one default sweep interval: the sweeper reclaims it before the page lands."""
     interval = HydraConfig().data.sweep_interval_s
     assert interval <= 3600
     assert 2 * interval <= 7200  # the stall threshold: two missed cycles

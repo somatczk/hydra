@@ -133,14 +133,15 @@ groups:
           description: "Exchange {{ $labels.exchange_id }} {{ $labels.endpoint }}: {{ $value | humanizePercentage }} of calls failed or timed out over 5 minutes."
 
       - alert: HydraDataCacheOverBudget
-        expr: hydra_data_cache_bytes > hydra_data_cache_budget_bytes
+        # budget 0 = the delete-after-run config (cache_max_gb=0): a working mode, never a page
+        expr: hydra_data_cache_bytes > hydra_data_cache_budget_bytes and hydra_data_cache_budget_bytes > 0
         for: 1h
         labels:
           severity: warning
           team: infra
         annotations:
           summary: "Auto-fetched data cache over budget"
-          description: "The auto-fetched bar cache holds {{ $value | humanize1024 }}B, over its configured budget for 1h — one sweep interval (data.sweep_interval_s) — so the sweeper has not reclaimed the excess. Check hydra_data_sweep_errors_total and the sweeper logs."
+          description: "The auto-fetched bar cache holds {{ $value | humanize1024 }}B, over its configured budget for 1h — one default sweep interval (1h; data.sweep_interval_s overrides may shift the response window) — so the sweeper has not reclaimed the excess. Check hydra_data_sweep_errors_total and the sweeper logs."
 
       - alert: HydraDataSweepStalled
         # absent series never fire (no sweeper: dev, the trader process) — the feed-staleness shape
