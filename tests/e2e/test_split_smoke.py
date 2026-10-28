@@ -47,6 +47,7 @@ from hydra.trader import main as trader_main
 from hydra.trader.server import build_app
 from tests.e2e.replay_exchange import ReplayMarket
 from tests.e2e.test_paper_smoke import WARMUP, BarWatch, Reference, write_strategy
+from tests.fixtures.universe import offline_refresher_factory
 
 STRATEGY_ID = "split-sma5"
 POLL_TIMEOUT_S = 30.0
@@ -133,6 +134,7 @@ async def test_the_split_serves_the_ui_while_the_trader_holds_the_sessions(
     monkeypatch.setenv("HYDRA_TRADER__URL", f"http://127.0.0.1:{trader_port}")
 
     app.state.health_monitor_factory = lambda target: HealthMonitor(target, interval_s=1.0)
+    app.state.universe_refresher_factory = offline_refresher_factory
     try:
         async with _served(app, api_port):
             write_strategy(strategies_dir, STRATEGY_ID)
@@ -149,6 +151,7 @@ async def test_the_split_serves_the_ui_while_the_trader_holds_the_sessions(
                 await trader.close()
     finally:
         app.state.health_monitor_factory = None
+        app.state.universe_refresher_factory = None
 
 
 @asynccontextmanager

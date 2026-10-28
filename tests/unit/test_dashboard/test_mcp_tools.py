@@ -1,5 +1,5 @@
-"""The 31 MCP tools (21 research + strategy, 10 session + risk), called through the
-mounted transport.
+"""The 34 MCP tools (22 research + strategy, 10 session + risk, 2 code-gated live),
+called through the mounted transport.
 
 Every test drives the real JSON-RPC surface — initialize, notifications/initialized,
 tools/list, tools/call — over the real mount (token gate, SDK streamable-HTTP app)
@@ -74,6 +74,7 @@ B1_TOOLS = frozenset(
         "walkforward_results",
         "strategy_params",
         "data_coverage",
+        "universe_list",
         "strategy_list",
         "strategy_get",
         "strategy_save",
@@ -324,14 +325,25 @@ class _CoverageConn:
         return self.row
 
 
+class _UniverseConn:
+    """Serves the system_config universe row for the universe_list read."""
+
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self.row = row
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        assert "FROM system_config" in query
+        return self.row
+
+
 class _FakePool:
-    def __init__(self, conn: _CoverageConn) -> None:
+    def __init__(self, conn: Any) -> None:
         self.conn = conn
 
     def acquire(self) -> _FakePool:
         return self
 
-    async def __aenter__(self) -> _CoverageConn:
+    async def __aenter__(self) -> Any:
         return self.conn
 
     async def __aexit__(self, *exc: object) -> None:
@@ -401,10 +413,10 @@ def test_engine_state_falls_back_to_the_imported_module_app(
     assert _deps.db_pool() is sentinel
 
 
-def test_tools_list_advertises_the_33_tools(mcp: _McpClient) -> None:
+def test_tools_list_advertises_the_34_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
     assert names == B1_TOOLS | B2_TOOLS | LIVE_TOOLS
-    assert len(names) == 33
+    assert len(names) == 34
     # the live pin: the two gated live tools; no live_arm/live_disarm (the operator's ceremony)
     assert "risk_live_status" in names
     assert {name for name in names if name.startswith("live_")} == {
@@ -479,6 +491,78 @@ def test_data_coverage_round_trips_the_stored_range(
         "first_ts": "2026-01-01T00:00:00+00:00",
         "last_ts": "2026-01-02T23:00:00+00:00",
         "bar_count": 48,
+    }
+
+
+def test_universe_list_returns_the_seeded_ranking(
+    mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ranked_at = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
+    row = {
+        "value": json.dumps(
+            {
+                "exchange_id": "binance",
+                "quote_asset": "USDT",
+                "source": "binance spot rolling-24h quote volume (GET /api/v3/ticker/24hr)",
+                "ranked_at": ranked_at.isoformat(),
+                "count": 2,
+                "symbols": [
+                    {"rank": 1, "symbol": "BTCUSDT", "quote_volume": 1000.0},
+                    {"rank": 2, "symbol": "ETHUSDT", "quote_volume": 500.0},
+                ],
+            }
+        )
+    }
+    monkeypatch.setattr(engine_app.state, "db_pool", _FakePool(_UniverseConn(row)))
+    is_error, text = mcp.call("universe_list", {})
+    assert not is_error
+    assert json.loads(text) == {
+        "exchange_id": "binance",
+        "quote_asset": "USDT",
+        "source": "binance spot rolling-24h quote volume (GET /api/v3/ticker/24hr)",
+        "ranked_at": ranked_at.isoformat(),
+        "age_hours": pytest.approx(
+            (datetime.now(UTC) - ranked_at).total_seconds() / 3600, abs=0.01
+        ),
+        "count": 2,
+        "symbols": [
+            {"rank": 1, "symbol": "BTCUSDT", "quote_volume": 1000.0},
+            {"rank": 2, "symbol": "ETHUSDT", "quote_volume": 500.0},
+        ],
+    }
+
+
+def test_universe_list_before_the_first_refresh_is_the_503_envelope(
+    mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", _FakePool(_UniverseConn(None)))
+    is_error, text = mcp.call("universe_list", {})
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool universe_list: "))
+    assert envelope == {
+        "status": 503,
+        "detail": {
+            "code": "universe_unavailable",
+            "message": "The top-100 universe has not been computed yet",
+            "state": "unavailable",
+        },
+    }
+
+
+def test_universe_list_without_a_pool_is_the_503_database_envelope(
+    mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", None)
+    is_error, text = mcp.call("universe_list", {})
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool universe_list: "))
+    assert envelope == {
+        "status": 503,
+        "detail": {
+            "code": "database_unavailable",
+            "message": "Database is not available",
+            "state": "unavailable",
+        },
     }
 
 

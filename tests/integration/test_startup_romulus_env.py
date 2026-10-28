@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from hydra.core.encryption import encrypt
 from hydra.dashboard import lifespan
 from hydra.data.migrations.runner import current_revision, head_revision, upgrade_to_head
+from tests.fixtures.universe import offline_refresher_factory
 
 
 @pytest.fixture()
@@ -56,6 +57,7 @@ async def test_fresh_database_boots_from_seeded_rows(
     romulus_env: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     app = FastAPI()
+    app.state.universe_refresher_factory = offline_refresher_factory
     async with lifespan.run(app):
         mgr = app.state.session_manager
         assert app.state.db_pool is not None
@@ -102,6 +104,7 @@ async def test_db_values_win_over_defaults_and_survive_restart(
 
     for _boot in range(2):
         app = FastAPI()
+        app.state.universe_refresher_factory = offline_refresher_factory
         async with lifespan.run(app):
             mgr = app.state.session_manager
             assert mgr.risk.paper_capital == Decimal("2500")

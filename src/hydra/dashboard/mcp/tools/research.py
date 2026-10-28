@@ -1,6 +1,7 @@
-"""Research tools (backtest, hyperopt, walk-forward, strategy params, data coverage).
+"""Research tools (backtest, hyperopt, walk-forward, strategy params, data coverage,
+the trading universe).
 
-Twelve tools registered on the shared server instance, each a thin call into the
+Thirteen tools registered on the shared server instance, each a thin call into the
 service layer (the same functions the REST routes call). Inputs mirror the service
 request models' fields — dates as ISO strings, ``param_space`` in the
 ``ParamDefRequest`` wire shape — and the models are constructed inside the tool so
@@ -30,6 +31,7 @@ from hydra.dashboard.security import audit
 from hydra.services import backtest as backtest_svc
 from hydra.services import data as data_svc
 from hydra.services import research as research_svc
+from hydra.services import universe as universe_svc
 from hydra.services.errors import ServiceError
 
 
@@ -251,5 +253,22 @@ async def data_coverage(exchange_id: ExchangeId, symbol: str, timeframe: Timefra
         return _deps.json_text(
             await data_svc.bar_coverage(_deps.db_pool(), exchange_id, symbol, timeframe)
         )
+    except ServiceError as exc:
+        raise _deps.tool_error(exc) from exc
+
+
+@server.tool(name="universe_list", structured_output=False)
+async def universe_list() -> str:
+    """The top-100 tradable universe: Binance SPOT USDT-quoted pairs ranked by
+    rolling-24h quote volume (GET /api/v3/ticker/24hr), refreshed daily.
+
+    Every entry carries its rank, its exchange symbol (no slash) and its 24h quote
+    volume, with the ranking's ``ranked_at`` and ``age_hours``. Strategy symbols
+    must be members of this universe (the builder's write gate); a pair that has
+    dropped out keeps its running sessions and stored strategies valid. 503
+    ``universe_unavailable`` before the first refresh has landed.
+    """
+    try:
+        return _deps.json_text(await universe_svc.read_universe(_deps.db_pool()))
     except ServiceError as exc:
         raise _deps.tool_error(exc) from exc
