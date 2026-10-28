@@ -172,6 +172,14 @@ class OnDemandFetchService:
             sleep=sleep,
         )
 
+    def client_provider(self) -> ClientFactory:
+        """The pooled client factory this engine fetches through (shared, caller-owned).
+
+        The perp backtest's funding preflight (P4-C) reuses the same worker-lifetime
+        client instead of building its own.
+        """
+        return self._client_factory
+
     async def ensure_available(
         self,
         repo: MarketDataRepository,

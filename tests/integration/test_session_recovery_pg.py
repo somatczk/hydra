@@ -7,6 +7,7 @@ only the ccxt clients are fakes (no exchange is called).
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from hydra.dashboard import lifespan
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.execution.client_factory import ClientFactory, bars_repository
 from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.execution.session_manager import SessionManager
 from hydra.services import strategies as svc
 from hydra.strategy.config import StrategyConfig, config_hash
@@ -257,3 +259,90 @@ async def test_recovery_of_pre_snapshot_row_falls_back_to_the_file(
             await mgr.graceful_shutdown()
     finally:
         await pool.close()
+
+
+async def perp_restart_scenario(dsn: str, strategies_dir: Path) -> None:
+    """P4-C / the #211 A1 fix: a hand-written binanceusdm/FUTURES YAML starts AND recovers.
+
+    Pre-fix the start rode the SPOT PaperTradingExecutor while recovery's default-SPOT
+    ``validate_venue`` errored the same row after a restart; post-fix both paths run the
+    perp executor — with leverage, margin and funding accrual from ``ts.funding_rates``.
+    """
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    try:
+        h = Harness(strategies_dir)
+        sid = write_strategy(
+            strategies_dir,
+            "pg-perp",
+            entry_long=rule(("less_than", 100.5), ("greater_than", 99.5)),
+            exchange_id="binanceusdm",
+            market_type="FUTURES",
+            leverage=2,
+        )
+        first = SessionManager(db_pool=pool, config=HydraConfig(), clients=_clients(h))
+        await first.startup()
+        session_id = await first.start_session(sid, "paper", D("1000"))
+        session = first.get_session(session_id)
+        assert session is not None
+        ex = session._executor
+        assert isinstance(ex, PerpPaperTradingExecutor)
+        await h.bar(session, "100", exchange_id="binanceusdm")
+        snap = ex.get_account_snapshot()
+        # 10% sizing x 2x leverage: 2 BTC at ~100 (slipped taker), half the notional as margin
+        assert snap.leverage == 2 and snap.base_totals == {"BTC": D("2.00000")}
+        wallet_after_entry = snap.wallet_available
+        margin_after_entry = snap.margin_used
+
+        # a settled funding row inside the next bar's window: the PG reader accrues it
+        settled = h.end + timedelta(hours=1, minutes=30)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO ts.funding_rates (exchange, symbol, rate, next_funding_time,"
+                " timestamp) VALUES ('binanceusdm', 'BTCUSDT', 0.0001, NULL, $1)",
+                settled,
+            )
+        await h.bar(session, "100", exchange_id="binanceusdm")
+        snap = ex.get_account_snapshot()
+        assert snap.funding_applied == 1
+        # 2 BTC x 0.0001 x 100 (the mark carried into the bar) = 0.02 paid by the long
+        assert snap.margin_used == margin_after_entry - D("0.02")
+        assert snap.wallet_available == wallet_after_entry
+        await first.graceful_shutdown()
+
+        app = FastAPI()
+        app.state.db_pool = pool
+        await lifespan._init_session_manager(app, HydraConfig(), _clients(h))
+        second: SessionManager = app.state.session_manager
+        await settle()
+        try:
+            resumed = second.get_session(session_id)
+            assert resumed is not None
+            assert resumed.status == "running" and resumed.task_alive  # the A1 asymmetry is dead
+            ex2 = resumed._executor
+            assert isinstance(ex2, PerpPaperTradingExecutor)
+            snap2 = ex2.get_account_snapshot()
+            assert (snap2.leverage, snap2.funding_applied) == (2, 1)
+            assert snap2.base_totals == {"BTC": D("2.00000")}
+            assert snap2.margin_used == margin_after_entry - D("0.02")
+            stops = await ex2.fetch_open_orders("BTCUSDT")
+            assert stops and all(o["side"] == "SELL" for o in stops)
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT status, error_message FROM trading_sessions WHERE id = $1",
+                    session_id,
+                )
+            assert row is not None and row["status"] == "running" and row["error_message"] is None
+            await second.stop_session(session_id)
+            snap3 = ex2.get_account_snapshot()
+            assert snap3.base_totals == {"BTC": D("0")} and snap3.margin_used == D("0")
+        finally:
+            await second.graceful_shutdown()
+    finally:
+        await pool.close()
+
+
+async def test_perp_session_starts_and_recovers_consistently(
+    fresh_database: str, strategies_dir: Path
+) -> None:
+    await asyncio.to_thread(upgrade_to_head, fresh_database)
+    await perp_restart_scenario(fresh_database, strategies_dir)

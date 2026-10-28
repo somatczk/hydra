@@ -12,6 +12,7 @@ create and drop their own databases, so the target server's data is never touche
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -585,3 +586,130 @@ async def test_worker_waits_for_schema(fresh_database: str) -> None:
 
     await asyncio.to_thread(upgrade_to_head, fresh_database)
     await asyncio.wait_for(worker.wait_for_schema(fresh_database, poll_s=0.01), 0.3)
+
+
+# ---------------------------------------------------------------------------
+# Perp backtests (P4-C): the futures 422 lifted, the job runs the perp executor
+# ---------------------------------------------------------------------------
+
+
+_PERP_SAW_RULES = {
+    "entry_long": _SAW_RULES["entry_long"],
+    "exit_long": _SAW_RULES["exit_long"],
+    "entry_short": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "close",
+                "params": {},
+                "comparator": "crosses_below",
+                "value": "sma:period=5",
+            }
+        ],
+    },
+    "exit_short": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "close",
+                "params": {},
+                "comparator": "crosses_above",
+                "value": "sma:period=5",
+            }
+        ],
+    },
+}
+
+
+def _write_perp_strategy(directory: Path, strategy_id: str, leverage: int = 2) -> None:
+    data: dict[str, Any] = {
+        "id": strategy_id,
+        "name": f"Perp {strategy_id}",
+        "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        "symbols": ["BTCUSDT"],
+        "exchange": {
+            "exchange_id": "binanceusdm",
+            "market_type": "FUTURES",
+            "leverage": leverage,
+            "margin_mode": "isolated",
+        },
+        "timeframes": {"primary": "1h"},
+        "parameters": {"rules": _PERP_SAW_RULES, "required_history": 10},
+    }
+    (directory / f"{strategy_id}.yaml").write_text(yaml.safe_dump(data))
+
+
+async def _seed_perp_funding(pool: Any, count: int) -> int:
+    """Settled rows every 8 hours from H1_START at +0.01 % (longs pay)."""
+    rows = [
+        (
+            "binanceusdm",
+            "BTCUSDT",
+            Decimal("0.0001"),
+            H1_START + timedelta(hours=8 * i),
+        )
+        for i in range(1, count)
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO ts.funding_rates (exchange, symbol, rate, next_funding_time,"
+            " timestamp) VALUES ($1, $2, $3, NULL, $4)",
+            rows,
+        )
+    return len(rows)
+
+
+async def test_a_perp_backtest_job_runs_through_the_queue(
+    client: httpx.AsyncClient, pool: Any, strategies_dir: Path
+) -> None:
+    seed = _saw(H1_START, H1_COUNT, timedelta(hours=1))
+    await _seed(pool, "binanceusdm", Timeframe.H1, seed)
+    funding_rows = await _seed_perp_funding(pool, H1_COUNT // 8)
+    _write_perp_strategy(strategies_dir, "perp-saw")
+
+    task_id = await _submit(
+        client, strategy_id="perp-saw", start_date="2026-01-01", end_date="2026-01-31"
+    )
+    assert await worker.run_once(pool) == task_id  # fetch_engine=None: stored funding only
+    status = (await client.get(f"/api/backtest/status/{task_id}")).json()
+    assert status["status"] == "completed", status
+
+    async with pool.acquire() as conn:
+        detail = await conn.fetchrow("SELECT detail FROM backtest_jobs WHERE id = $1", task_id)
+    job_detail = detail["detail"]
+    if isinstance(job_detail, str):
+        job_detail = json.loads(job_detail)
+    assert job_detail["funding"] == {"state": "fetch_skipped", "rows_loaded": funding_rows}
+
+    result = (await client.get(f"/api/backtest/results/{status['result_id']}")).json()
+    assert result["provenance"]["exchange"] == "binanceusdm"
+    directions = {t["side"] for t in result["trades"]}
+    assert directions <= {"LONG", "SHORT"} and len(result["trades"]) > 0
+    persisted = None
+    async with pool.acquire() as conn:
+        persisted = await conn.fetchval(
+            "SELECT count(*) FROM backtest_result_trades WHERE backtest_id = $1",
+            status["result_id"],
+        )
+    assert persisted == len(result["trades"])
+
+
+async def test_a_spot_hyperopt_still_refuses_futures_strategies(
+    client: httpx.AsyncClient, pool: Any, strategies_dir: Path
+) -> None:
+    await _seed_hourly(pool)
+    _write_perp_strategy(strategies_dir, "perp-ho")
+    resp = await client.post(
+        "/api/backtest/hyperopt",
+        json={
+            "strategy_id": "perp-ho",
+            "param_space": [
+                {"name": "sma_period", "type": "int", "low": 2, "high": 6},
+            ],
+            "max_trials": 2,
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-31",
+        },
+    )
+    assert resp.status_code == 422
+    assert "plain backtests only" in resp.text

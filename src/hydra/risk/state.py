@@ -97,6 +97,7 @@ def risk_config_from_row(row: Any) -> RiskConfig:
         max_drawdown_pct=d("max_drawdown_pct"),
         max_consecutive_losses=i("max_consecutive_losses"),
         max_concurrent_positions=i("max_concurrent_positions"),
+        max_perp_leverage=i("max_perp_leverage"),
     )
 
 

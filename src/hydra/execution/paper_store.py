@@ -53,6 +53,7 @@ class PositionRow:
     avg_entry_price: Decimal
     unrealized_pnl: Decimal
     realized_pnl: Decimal
+    direction: str = "LONG"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +99,7 @@ _UPSERT_POSITION = """
     INSERT INTO positions
         (strategy_id, session_id, exchange_id, symbol, direction, quantity, avg_entry_price,
          unrealized_pnl, realized_pnl, source, updated_at)
-    VALUES ($1, $2, $3, $4, 'LONG', $5, $6, $7, $8, $9, now())
+    VALUES ($1, $2, $3, $4, $10, $5, $6, $7, $8, $9, now())
     ON CONFLICT (session_id, symbol) DO UPDATE SET
         direction = EXCLUDED.direction,
         quantity = EXCLUDED.quantity,
@@ -193,6 +194,7 @@ async def save(
                 p.unrealized_pnl,
                 p.realized_pnl,
                 source,
+                p.direction,
             )
         for symbol in flat_symbols:
             await conn.execute(

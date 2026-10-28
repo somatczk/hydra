@@ -136,6 +136,7 @@ class _Session:
     strategy_id: str
     rules: dict[str, MarketRules]
     openings: deque[datetime] = field(default_factory=deque)
+    leverage: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,10 +324,18 @@ class RiskService:
         symbols: Iterable[str],
         exchange_id: str,
         strategy_id: str = "",
+        leverage: int = 1,
     ) -> None:
-        """Add a session to the account; loads its market rules (failure aborts the start)."""
+        """Add a session to the account; loads its market rules (failure aborts the start).
+
+        ``leverage`` is the perp session's strategy leverage (1 for spot): it relaxes the
+        per-position notional cap proportionally, while ``_check_leverage`` stays the
+        account-wide backstop against the ``max_perp_leverage`` cap.
+        """
         if allocated <= 0:
             raise ValueError(f"allocated capital must be > 0, got {allocated}")
+        if leverage < 1:
+            raise ValueError(f"leverage must be >= 1, got {leverage}")
         syms = [str(s) for s in symbols]
         rules = await self._rules.get(exchange_id, syms)
         async with self._state_lock:
@@ -338,6 +347,7 @@ class RiskService:
                 exchange_id=exchange_id,
                 strategy_id=strategy_id,
                 rules=rules,
+                leverage=leverage,
             )
 
     async def unregister_session(self, session_id: str, actor: str = ENGINE_ACTOR) -> Decimal:
@@ -595,6 +605,7 @@ class RiskService:
             opening_orders_last_minute=self._openings(session, now),
             market_rules=session.rules,
             quote_currency=QUOTE,
+            leverage=session.leverage,
         )
 
     def _openings(self, session: _Session, now: datetime) -> int:
@@ -638,9 +649,12 @@ class RiskService:
         if mark is None or rules is None:
             return None
         sleeve, _, balances = await self._session_equity(session)
+        cap = self._config.max_position_pct * (
+            Decimal(session.leverage) if session.leverage > 1 else Decimal("1")
+        )
         return size_entry(
             sleeve_equity=sleeve,
-            fraction=min(strategy_fraction, self._config.max_position_pct),
+            fraction=min(strategy_fraction, cap),
             mark=mark,
             size_multiplier=self._cb.restrictions(self._clock()).position_size_multiplier,
             rules=rules,

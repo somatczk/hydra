@@ -26,7 +26,7 @@ import yaml
 
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
-from hydra.core.types import ExchangeId, OrderType, Side
+from hydra.core.types import ExchangeId, MarketType, OrderType, Side
 from hydra.execution import client_factory, session_store
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import (
@@ -41,6 +41,7 @@ from hydra.execution.errors import (
 )
 from hydra.execution.flatten import FlattenResult
 from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
+from hydra.execution.perp_trading import PaperExecutor, PerpPaperTradingExecutor
 from hydra.execution.reconcile import (
     NEVER_STATUS,
     ReconcileStatus,
@@ -124,6 +125,17 @@ async def _close_client_quietly(client: Any) -> None:
             await close()
         except Exception:
             logger.debug("Live client close failed", exc_info=True)
+
+
+def _validate_perp_leverage(cfg: StrategyConfig, risk: RiskService) -> None:
+    """The strategy's leverage against the live risk-service cap (fail-closed at start)."""
+    cap = risk.config.max_perp_leverage
+    leverage = cfg.exchange.leverage
+    if not 1 <= leverage <= cap:
+        raise ValueError(
+            f"strategy {cfg.id} leverage {leverage}x is outside 1-{cap}x "
+            "(the perp leverage cap); edit the strategy before starting the session"
+        )
 
 
 def _scope_flatten(mgr: SessionManager, scope: str) -> Callable[[str], Awaitable[list[str]]]:
@@ -322,6 +334,8 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             if trading_mode == "live":
                 return await self._start_live_session(cfg, exchange_id, actor)
             risk = self._require_risk()
+            if cfg.exchange.market_type is MarketType.FUTURES:
+                _validate_perp_leverage(cfg, risk)
             required_history = await probe_strategy(cfg, self._config)
             capital = self._allocate(risk, paper_capital)
 
@@ -339,14 +353,27 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 created_by=actor,
             )
             rules = await self._market_rules.get(exchange_id, cfg.symbols)
-            executor = client_factory.build_paper_executor(
-                exchange_id=exchange_id,
-                initial_balances={"USDT": capital},
-                db_pool=self._db_pool,
-                strategy_id=strategy_id,
-                session_id=session_id,
-                market_rules=rules,
-            )
+            executor: PaperExecutor
+            if cfg.exchange.market_type is MarketType.FUTURES:
+                executor = client_factory.build_perp_paper_executor(
+                    exchange_id=exchange_id,
+                    initial_balances={"USDT": capital},
+                    db_pool=self._db_pool,
+                    strategy_id=strategy_id,
+                    session_id=session_id,
+                    market_rules=rules,
+                    leverage=cfg.exchange.leverage,
+                    funding_reader=self._clients.funding_reader_factory(self._db_pool, exchange_id),
+                )
+            else:
+                executor = client_factory.build_paper_executor(
+                    exchange_id=exchange_id,
+                    initial_balances={"USDT": capital},
+                    db_pool=self._db_pool,
+                    strategy_id=strategy_id,
+                    session_id=session_id,
+                    market_rules=rules,
+                )
             await executor.checkpoint()
             runtime = self._runtime(session, cfg, executor, required_history)
             await self._launch(runtime, capital, recovering=False)
@@ -792,7 +819,7 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         positions: list[dict[str, Any]] = []
         account: dict[str, float] = {}
         executor = session._executor
-        if isinstance(executor, PaperTradingExecutor):
+        if isinstance(executor, (PaperTradingExecutor, PerpPaperTradingExecutor)):
             snap = executor.get_account_snapshot()
             balance = {k: float(v) for k, v in (await executor.fetch_balance()).items()}
             positions = [
@@ -813,6 +840,17 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 "fees": float(snap.fees_paid),
                 "drawdown": float(snap.drawdown),
             }
+            if isinstance(executor, PerpPaperTradingExecutor):
+                perp_snap = executor.get_account_snapshot()
+                detail["perps"] = {
+                    "leverage": perp_snap.leverage,
+                    "margin_mode": "isolated",
+                    "funding_applied": perp_snap.funding_applied,
+                    "funding_missing": perp_snap.funding_missing,
+                    "liquidations": perp_snap.liquidations,
+                    "wallet_available": float(perp_snap.wallet_available),
+                    "margin_used": float(perp_snap.margin_used),
+                }
         else:
             trades = await session_store.load_session_trades(self._db_pool, session)
         closing = [t for t in trades if t.get("net_pnl") is not None]
@@ -921,7 +959,7 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         self,
         session: TradingSession,
         cfg: StrategyConfig,
-        executor: PaperTradingExecutor,
+        executor: PaperExecutor,
         required_history: int,
     ) -> SessionRuntime:
         if session.trading_mode == "live":
@@ -968,6 +1006,7 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 symbols=session.symbols,
                 exchange_id=runtime.exchange_id,
                 strategy_id=session.strategy_id,
+                leverage=runtime.cfg.exchange.leverage,
             )
             registered = True
             await runtime.seed_context()

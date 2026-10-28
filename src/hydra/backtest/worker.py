@@ -30,7 +30,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from hydra.backtest import jobs
+from hydra.backtest import jobs, perp_funding
 from hydra.backtest.hyperopt import HyperoptRunner, ParamDef, ParameterSpace
 from hydra.backtest.jobs import (
     BacktestRunRequest,
@@ -41,7 +41,7 @@ from hydra.backtest.jobs import (
 )
 from hydra.backtest.runner import BacktestRunner
 from hydra.backtest.walkforward import WalkForwardAnalyzer
-from hydra.core.types import ExchangeId, Timeframe
+from hydra.core.types import ExchangeId, MarketType, Timeframe
 from hydra.data.bars import timeframe_seconds
 from hydra.data.errors import DataFetchError, NoMarketDataError
 from hydra.data.migrations.runner import current_revision, head_revision
@@ -199,7 +199,13 @@ async def _ensure_bars(
 async def run_backtest_job(
     pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
 ) -> JobOutcome:
-    """Execute a backtest on stored bars and persist it as ``bt-{job_id}``."""
+    """Execute a backtest on stored bars and persist it as ``bt-{job_id}``.
+
+    A FUTURES config runs the perp paper executor (P4-C): its funding preflight tops the
+    stored ``ts.funding_rates`` rows up for the window through the fetch engine's pooled
+    client (skipped while auto-fetch is off) and loads what is stored — the executor
+    accrues only from those rows.
+    """
     body = BacktestRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
@@ -210,6 +216,17 @@ async def run_backtest_job(
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
     run.detail["provenance"] = jobs.provenance_payload(provenance, config)
     run.progress = 30.0
+
+    funding: dict[str, list[Any]] | None = None
+    if config.exchange.market_type is MarketType.FUTURES:
+        provider = fetch_engine.client_provider() if fetch_engine is not None else None
+        funding, funding_state = await perp_funding.prepare_backtest_funding(
+            pool, provider, config.symbols[0], body.start_date, body.end_date
+        )
+        run.detail["funding"] = {
+            "state": funding_state,
+            "rows_loaded": sum(len(rows) for rows in funding.values()),
+        }
 
     def _report(pct: float) -> None:
         run.progress = round(30.0 + pct * 60.0, 1)
@@ -224,6 +241,7 @@ async def run_backtest_job(
         timeframe=config.timeframes.primary,
         on_progress=_report,
         risk_config=risk_config,
+        funding=funding,
     )
     run.progress = 90.0
 

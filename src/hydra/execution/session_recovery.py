@@ -12,11 +12,13 @@ from typing import TYPE_CHECKING, Any
 
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
-from hydra.core.types import ExchangeId, Timeframe
+from hydra.core.types import ExchangeId, MarketType, Timeframe
 from hydra.execution import client_factory, session_store
+from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import PaperCapitalUnavailableError
 from hydra.execution.flatten import FlattenResult
 from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
+from hydra.execution.perp_trading import PaperExecutor, PerpPaperTradingExecutor
 from hydra.execution.session_wiring import SessionRuntime, probe_strategy
 from hydra.risk.market_rules import MarketRulesCache
 from hydra.risk.service import RiskService
@@ -73,9 +75,9 @@ class TradingSession:
 
     @property
     def holdings(self) -> int:
-        """Symbols with base held by this session's paper account (resting stops included)."""
+        """Symbols with a position held by this session's paper account (stops included)."""
         ex = self._executor
-        if not isinstance(ex, PaperTradingExecutor):
+        if not isinstance(ex, (PaperTradingExecutor, PerpPaperTradingExecutor)):
             return 0
         return sum(1 for q in ex.get_account_snapshot().base_totals.values() if q > 0)
 
@@ -92,6 +94,7 @@ class SessionRecoveryMixin:
     _sessions: dict[str, TradingSession]
     _config: HydraConfig
     _market_rules: MarketRulesCache
+    _clients: ClientFactory
 
     # Provided by the host; mypy's override checks keep these signatures in sync.
     def _require_risk(self) -> RiskService:
@@ -110,7 +113,7 @@ class SessionRecoveryMixin:
         self,
         session: TradingSession,
         cfg: StrategyConfig,
-        executor: PaperTradingExecutor,
+        executor: PaperExecutor,
         required_history: int,
     ) -> SessionRuntime:
         raise NotImplementedError
@@ -154,22 +157,39 @@ class SessionRecoveryMixin:
             await session_store.persist_session(self._db_pool, session)
 
     async def _recover_one(self, session: TradingSession) -> None:
-        """Restore the paper account first; once restored it is either resumed or closed."""
+        """Restore the paper account first; once restored it is either resumed or closed.
+
+        The venue is validated against the row's own market type (the A1 fix: a
+        ``binanceusdm`` row recovers through the perp pair, never the default-SPOT
+        validation that errored it), and a FUTURES row restores through the perp
+        executor — the same one its session started on.
+        """
         if session.trading_mode != "paper":
             await self._recover_live_one(session)
             return
         risk = self._require_risk()
-        exchange_id: ExchangeId = client_factory.validate_venue(session.exchange_id)
+        exchange_id: ExchangeId = client_factory.validate_venue(
+            session.exchange_id, client_factory.venue_market_type(session.exchange_id)
+        )
         rules_error: Exception | None = None
         rules: Any = None
         try:
             rules = await self._market_rules.get(exchange_id, session.symbols)
         except Exception as exc:
             rules_error = exc
+        executor: PaperExecutor | None
         try:
-            executor = await PaperTradingExecutor.restore(
-                self._db_pool, session.session_id, market_rules=rules
-            )
+            if client_factory.venue_market_type(session.exchange_id) is MarketType.FUTURES:
+                executor = await PerpPaperTradingExecutor.restore(
+                    self._db_pool,
+                    session.session_id,
+                    market_rules=rules,
+                    funding_reader=self._clients.funding_reader_factory(self._db_pool, exchange_id),
+                )
+            else:
+                executor = await PaperTradingExecutor.restore(
+                    self._db_pool, session.session_id, market_rules=rules
+                )
         except PaperStateUnavailableError as exc:
             self._mark_error(session, f"paper state could not be restored: {exc}")
             return
@@ -221,6 +241,7 @@ class SessionRecoveryMixin:
                     symbols=session.symbols,
                     exchange_id=session.exchange_id,
                     strategy_id=session.strategy_id,
+                    leverage=getattr(session._executor, "leverage", 1),
                 )
         except Exception:
             logger.exception("Session %s not registered for its PnL carry", session.session_id)

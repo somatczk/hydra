@@ -24,10 +24,24 @@ logger = logging.getLogger(__name__)
 
 
 class ExchangeStrategyConfig(BaseModel):
-    """Exchange settings scoped to a single strategy."""
+    """Exchange settings scoped to a single strategy.
+
+    ``leverage`` and ``margin_mode`` are the USD⌂-M perp fields: they apply to
+    ``binanceusdm`` FUTURES strategies only (isolated margin is the sole mode in
+    2.8.0; the 1-3 range is the pydantic half — session start re-validates
+    against the ``risk_config`` cap).
+    """
 
     exchange_id: ExchangeId = "binance"
     market_type: MarketType = MarketType.SPOT
+    leverage: int = Field(1, ge=1, le=3)
+    margin_mode: Literal["isolated"] = "isolated"
+
+    @model_validator(mode="after")
+    def _spot_never_leverages(self) -> ExchangeStrategyConfig:
+        if self.market_type == MarketType.SPOT and self.leverage != 1:
+            raise ValueError("leverage applies to futures strategies only (spot is 1x)")
+        return self
 
 
 class TimeframeConfig(BaseModel):

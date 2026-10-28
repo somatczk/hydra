@@ -65,6 +65,8 @@ class PortfolioState:
     daily_pnl: Decimal = Decimal("0")
     consecutive_losses: int = 0
     current_drawdown: Decimal = Decimal("0")
+    leverage: int = 1
+    """The ordering session's strategy leverage: 1 for spot; perp margin checks divide by it."""
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,9 @@ class RiskConfig:
     max_concurrent_positions: int = 10
     max_orders_per_minute: int = 6
     fee_buffer: Decimal = Decimal("0.002")
+    max_perp_leverage: int = 3
+    """The account-wide leverage cap for USD⌂-M perp entries (the user's answer 3; the
+    column arrives with a later migration when the cap is first raised — P4-C adds none)."""
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +370,9 @@ class PreTradeRiskManager:
             if state.restrictions is not None
             else Decimal("1")
         )
+        # a perp entry's notional carries the session's leverage; spot stays at 1x
+        if order.market_type == MarketType.FUTURES:
+            multiplier *= Decimal(state.leverage)
         cap = self._config.max_position_pct * multiplier * sleeve
         if sleeve <= 0 or notional > cap:
             return "position_size", (
@@ -420,6 +428,16 @@ class PreTradeRiskManager:
         return None
 
     def _check_balance(self, order: OrderRequest, state: PortfolioState) -> tuple[str, str] | None:
+        if order.market_type == MarketType.FUTURES:
+            # an opening perp order (either side) posts notional / leverage of margin
+            margin = order.quantity * self._ref(order, state) / Decimal(max(state.leverage, 1))
+            cost = margin * (1 + self._config.fee_buffer)
+            have = state.balances.get(state.quote_currency, Decimal("0"))
+            if cost > have:
+                return "balance", (
+                    f"insufficient {state.quote_currency} margin: need {cost:f}, have {have:f}"
+                )
+            return None
         if order.side != Side.BUY:
             return None
         cost = order.quantity * self._ref(order, state) * (1 + self._config.fee_buffer)
@@ -440,8 +458,13 @@ class PreTradeRiskManager:
     def _check_leverage(self, order: OrderRequest, state: PortfolioState) -> tuple[str, str] | None:
         gross = gross_exposure(self._account_positions(state), state.marks)
         leverage = (gross + order.quantity * self._ref(order, state)) / state.portfolio_value
-        if leverage > SPOT_MAX_LEVERAGE:
-            return "leverage", f"spot leverage {leverage:.2f} exceeds {SPOT_MAX_LEVERAGE}"
+        if order.market_type == MarketType.SPOT:
+            if leverage > SPOT_MAX_LEVERAGE:
+                return "leverage", f"spot leverage {leverage:.2f} exceeds {SPOT_MAX_LEVERAGE}"
+            return None
+        cap = Decimal(self._config.max_perp_leverage)
+        if leverage > cap:
+            return "leverage", f"perp leverage {leverage:.4f} exceeds the cap {cap}"
         return None
 
     def _check_liquidity(

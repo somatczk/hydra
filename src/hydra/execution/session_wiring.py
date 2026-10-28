@@ -68,9 +68,9 @@ from hydra.execution.paper_trading import (
     OrderRejectedError,
     PaperFill,
     PaperSessionHaltedError,
-    PaperTradingExecutor,
     PersistenceUnavailableError,
 )
+from hydra.execution.perp_trading import PaperExecutor
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.risk.service import RiskService
 from hydra.strategy.base import BaseStrategy
@@ -135,7 +135,7 @@ class SessionRuntime:
         session: TradingSession,
         cfg: StrategyConfig,
         *,
-        executor: PaperTradingExecutor,
+        executor: PaperExecutor,
         risk: RiskService,
         clients: ClientFactory,
         hydra_config: HydraConfig,
@@ -559,7 +559,12 @@ class SessionRuntime:
     # ------------------------------------------------------------------
 
     async def entry_order(self, event: EntrySignal) -> OrderRequest | None:
-        """An opening order, or None: wrong symbol, spot short, paused, held, or no size."""
+        """An opening order, or None: wrong symbol, spot short, paused, held, or no size.
+
+        On perps a SHORT entry is a SELL and the sizing fraction carries the strategy's
+        leverage (the account-wide ``_check_leverage`` stays the cap); on spot SHORTs are
+        ignored exactly as before.
+        """
         symbol = str(event.symbol)
         if symbol not in self.cfg.symbols or self.closing:
             return None
@@ -572,25 +577,31 @@ class SessionRuntime:
         if await self._holding(symbol):
             return None
         fraction = Decimal(str(self.cfg.position_sizing.max_position_pct)) / _HUNDRED
+        if self.market_type == MarketType.FUTURES:
+            fraction *= self.cfg.exchange.leverage
         quantity = await self.risk.size_entry(self.session.session_id, symbol, fraction)
         if quantity is None:
             logger.info("Entry on %s skipped: no tradable size", symbol)
             return None
         mark = self.risk.mark(self.exchange_id, symbol)
+        direction = event.direction
         return OrderRequest(
             symbol=Symbol(symbol),
-            side=Side.BUY,
+            side=Side.BUY if direction == Direction.LONG else Side.SELL,
             order_type=OrderType.MARKET,
             quantity=quantity,
             strategy_id=self.cfg.id,
             exchange_id=self.exchange_id,
             market_type=self.market_type,
-            stop_price=self.protect.planned_stop(symbol, mark) if mark is not None else None,
+            stop_price=(
+                self.protect.planned_stop(symbol, mark, direction) if mark is not None else None
+            ),
             tag=ENTRY_TAG,
         )
 
     async def exit_order(self, event: ExitSignal) -> OrderRequest | None:
-        """A reduce-only SELL of ``close_pct`` of the long, floored to the lot step."""
+        """A reduce-only close of ``close_pct`` of the position (SELL a long, BUY back a
+        short), floored to the lot step."""
         symbol = str(event.symbol)
         if symbol not in self.cfg.symbols:
             return None
@@ -604,7 +615,7 @@ class SessionRuntime:
             return None
         return OrderRequest(
             symbol=Symbol(symbol),
-            side=Side.SELL,
+            side=Side.SELL if pos.direction == Direction.LONG else Side.BUY,
             order_type=OrderType.MARKET,
             quantity=quantity,
             strategy_id=self.cfg.id,
@@ -636,6 +647,17 @@ class SessionRuntime:
             return await self._manual_exit(symbol, order_type, quantity, protection)
         if self.entries_paused is not None:
             raise ValueError(f"entries are paused ({self.entries_paused})")
+        if self.market_type == MarketType.FUTURES and any(
+            p.direction == Direction.SHORT
+            for p in await self.executor.get_positions(symbol)
+            if p.quantity > 0
+        ):
+            # the same 2.8.0 cut: a manual BUY over a strategy short would need short-side
+            # protection semantics quick-trade does not carry — the strategy closes its own
+            raise ValueError(
+                f"{symbol} is held short by the strategy: manual orders on perpetual "
+                "sessions are long-only in 2.8.0"
+            )
         if quantity is None:
             fraction = Decimal(str(self.cfg.position_sizing.max_position_pct)) / _HUNDRED
             quantity = await self.risk.size_entry(self.session.session_id, symbol, fraction)
@@ -701,6 +723,13 @@ class SessionRuntime:
         if order_type != OrderType.MARKET:
             raise ValueError("manual exits are MARKET orders (a resting SELL would unprotect)")
         positions = [p for p in await self.executor.get_positions(symbol) if p.quantity > 0]
+        if not positions and self.market_type == MarketType.FUTURES:
+            # the 2.8.0 cut (§4(2)): quick-trade on perps is long-only — strategy exits
+            # and the kill switch still close shorts, manual SHORT entries do not exist
+            raise ValueError(
+                f"no {symbol} long held: manual SHORT entries on perpetual sessions are "
+                "long-only in 2.8.0 (use a strategy session to trade shorts)"
+            )
         if not positions:
             raise SpotShortError(f"no {symbol} held: a spot SELL cannot open a short")
         held = positions[0].quantity
@@ -787,6 +816,10 @@ class SessionRuntime:
 
     async def _close_unprotected(self, symbol: str, quantity: Decimal) -> None:
         """Decision 17: a position whose protective stop cannot be placed is closed."""
+        positions = [p for p in await self.executor.get_positions(symbol) if p.quantity > 0]
+        if not positions:
+            return
+        side = Side.SELL if positions[0].direction == Direction.LONG else Side.BUY
         reason = self.protect.failures[-1] if self.protect.failures else "no protective order"
         logger.error("Closing unprotected %s in %s: %s", symbol, self.session.session_id, reason)
         await self._broadcast(
@@ -803,7 +836,7 @@ class SessionRuntime:
             await self.om.submit_order(
                 OrderRequest(
                     symbol=Symbol(symbol),
-                    side=Side.SELL,
+                    side=side,
                     order_type=OrderType.MARKET,
                     quantity=quantity,
                     strategy_id=self.cfg.id,

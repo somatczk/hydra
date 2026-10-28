@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -26,6 +26,12 @@ from hydra.core.types import OHLCV, Direction, MarketType, Symbol, Timeframe
 from hydra.data.bars import timeframe_seconds
 from hydra.execution.client_factory import ClientFactory, validate_venue
 from hydra.execution.paper_trading import PaperFill, PaperTradingExecutor
+from hydra.execution.perp_trading import (
+    FundingRow,
+    PaperExecutor,
+    PerpPaperTradingExecutor,
+    static_funding_reader,
+)
 from hydra.execution.session_manager import TradingSession
 from hydra.execution.session_wiring import SessionRuntime
 from hydra.risk.market_rules import MarketRulesCache
@@ -85,15 +91,17 @@ class BacktestRunner:
         # shortcut: fixed slippage, no participation cap or partials; revisit with P3 live fills
         slippage_pct: Decimal = Decimal("0.001"),
         risk_config: RiskConfig | None = None,
+        funding: Mapping[str, Sequence[FundingRow]] | None = None,
     ) -> BacktestResult:
         """Replay ``bars[warmup_bars:]``; the first ``warmup_bars`` only seed the context.
 
         Equity has one point per traded bar (the last after the end-of-data close-out) and
         ``Trade.pnl`` is net of both fees. Raises StrategyError when the strategy raises,
         UnsupportedVenueError for any pair ``validate_venue`` refuses — everything but
-        Binance SPOT and Binance USD⌂-M FUTURES (``binanceusdm``). Whatever it accepts
-        still runs SPOT semantics (spot fees, the spot paper executor); the service layer
-        refuses FUTURES submissions until perp backtests land (P4-C).
+        Binance SPOT and Binance USD⌂-M FUTURES (``binanceusdm``). A FUTURES config runs
+        on the perp paper executor (P4-C): the strategy's leverage, isolated margin,
+        liquidation, and funding only from the rows *funding* carries (skip-when-absent);
+        a SPOT config runs the spot executor exactly as before.
         """
         cfg = strategy_config.model_copy(
             update={
@@ -125,16 +133,31 @@ class BacktestRunner:
             )
             await risk.load()
             await risk.recovery_complete()
-            executor = PaperTradingExecutor(
-                exchange_id=exchange_id,
-                initial_balances={"USDT": initial_capital},
-                slippage_pct=slippage_pct,
-                strategy_id=cfg.id,
-                session_id=session_id,
-                maker_fee=comm.fee_rate(MarketType.SPOT, is_maker=True),
-                taker_fee=comm.fee_rate(MarketType.SPOT, is_maker=False),
-                market_rules=await self._market_rules.get(exchange_id, [symbol]),
-            )
+            executor: PaperExecutor
+            if cfg.exchange.market_type is MarketType.FUTURES:
+                executor = PerpPaperTradingExecutor(
+                    exchange_id=exchange_id,
+                    initial_balances={"USDT": initial_capital},
+                    slippage_pct=slippage_pct,
+                    strategy_id=cfg.id,
+                    session_id=session_id,
+                    maker_fee=comm.fee_rate(MarketType.FUTURES, is_maker=True),
+                    taker_fee=comm.fee_rate(MarketType.FUTURES, is_maker=False),
+                    market_rules=await self._market_rules.get(exchange_id, [symbol]),
+                    leverage=cfg.exchange.leverage,
+                    funding_reader=static_funding_reader(funding or {}),
+                )
+            else:
+                executor = PaperTradingExecutor(
+                    exchange_id=exchange_id,
+                    initial_balances={"USDT": initial_capital},
+                    slippage_pct=slippage_pct,
+                    strategy_id=cfg.id,
+                    session_id=session_id,
+                    maker_fee=comm.fee_rate(MarketType.SPOT, is_maker=True),
+                    taker_fee=comm.fee_rate(MarketType.SPOT, is_maker=False),
+                    market_rules=await self._market_rules.get(exchange_id, [symbol]),
+                )
             failures: list[str] = []
 
             async def on_failure(_session: TradingSession, reason: str) -> None:
@@ -172,6 +195,7 @@ class BacktestRunner:
                 symbols=[symbol],
                 exchange_id=exchange_id,
                 strategy_id=cfg.id,
+                leverage=cfg.exchange.leverage,
             )
             await runtime.seed_context()
             try:
@@ -232,31 +256,39 @@ class BacktestRunner:
 
 
 def _trades(fills: list[PaperFill]) -> tuple[list[Trade], list[TransactionRecord]]:
-    """Round trips and per-fill transactions; a trade is one SELL against the open lot."""
+    """Round trips and per-fill transactions, long or short (a SELL can open a short).
+
+    A fill that closes position carries ``net_pnl`` (both executors' convention: opening
+    fills never do) — that is the exit test, so a perp short's SELL entry is an entry.
+    The direction is the sign held between entry and exit. FUNDING accruals ride the
+    account but are not order fills and are skipped.
+    """
     trades: list[Trade] = []
     transactions: list[TransactionRecord] = []
     held = Decimal("0")
     entry_time: datetime | None = None
     trade_id = 0
     for f in fills:
-        if f.status != "FILLED":
+        if f.status != "FILLED" or f.side == "FUNDING":
             continue
-        if f.side == "BUY":
-            if held == 0:
-                trade_id += 1
-                entry_time = f.timestamp
-            held += f.quantity
-        else:
-            held -= f.quantity
+        signed = f.quantity if f.side == "BUY" else -f.quantity
+        if held == 0:
+            trade_id += 1
+            entry_time = f.timestamp
+        closing = f.net_pnl is not None
+        held += signed
+        if closing:
             gross = f.gross_pnl or Decimal("0")
             net = f.net_pnl if f.net_pnl is not None else gross - f.fee
+            direction = Direction.LONG if held - signed > 0 else Direction.SHORT
+            sign = Decimal("1") if direction == Direction.LONG else Decimal("-1")
             trades.append(
                 Trade(
                     entry_time=entry_time or f.timestamp,
                     exit_time=f.timestamp,
                     symbol=f.symbol,
-                    direction=str(Direction.LONG),
-                    entry_price=f.price - gross / f.quantity,
+                    direction=str(direction),
+                    entry_price=f.price - sign * gross / f.quantity,
                     exit_price=f.price,
                     quantity=f.quantity,
                     pnl=net,
@@ -266,13 +298,13 @@ def _trades(fills: list[PaperFill]) -> tuple[list[Trade], list[TransactionRecord
         transactions.append(
             {
                 "trade_id": trade_id,
-                "type": "entry" if f.side == "BUY" else "exit",
+                "type": "exit" if closing else "entry",
                 "time": f.timestamp.isoformat(),
                 "side": "Buy" if f.side == "BUY" else "Sell",
                 "price": float(f.price),
                 "quantity": float(f.quantity),
                 "fee": float(f.fee),
-                "pnl": None if f.side == "BUY" else float(trades[-1].pnl),
+                "pnl": None if not closing or not trades else float(trades[-1].pnl),
             }
         )
         if held == 0:
