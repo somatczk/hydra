@@ -182,6 +182,14 @@ describe('Activity page', () => {
     expect(c.textContent).toContain('Waiting for you');
   });
 
+  it('phrases a user-initiated approval as your own ask, never "Claude asks to" (must-fix 7)', async () => {
+    const approval = pendingApproval({ actor: 'user:soma', action: 'live_order' });
+    const c = await show({ '/api/activity/approvals': [approval] });
+    const link = c.querySelector(`a[href="/activity/approvals/${approval.id}"]`);
+    expect(link?.textContent).toBe('You asked to place a live order · requested 13:50:04 UTC · Review');
+    expect(c.textContent).not.toContain('Claude asks to');
+  });
+
   it('says no approvals waiting only when the source was read, unknown when it was not', async () => {
     const c = await show();
     expect(c.textContent).toContain('No approvals waiting.');

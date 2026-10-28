@@ -164,6 +164,45 @@ describe('approval review: the ask', () => {
   });
 });
 
+describe('approval review: your own challenge (must-fix 7, A2≡S1)', () => {
+  const USER_EVENT = {
+    id: 4,
+    ts: '2026-10-21T13:45:00Z',
+    scope: 'live',
+    kind: 'approval_requested',
+    tier: null,
+    actor: 'user:soma',
+    reason: 'Manual live order: buy 0.0015 BTC in SMA cross',
+    details: { approval_id: ID, action: 'live_order' },
+  };
+
+  it('reads a user-initiated live order as your own ask throughout, never Claude phrasing', async () => {
+    setup(
+      approvalDetail({
+        actor: 'user:soma',
+        action: 'live_order',
+        reason: 'Manual live order: buy 0.0015 BTC in SMA cross',
+        params: { session_id: 'a1b2c3d4-0000-4000-8000-000000000001', symbol: 'BTCUSDT', side: 'buy', quantity: '0.0015' },
+      }),
+      {},
+      { '/api/activity?actor=user:soma&limit=10': [USER_EVENT] },
+    );
+    m = await page();
+    expect(m.container.querySelector('h1')?.textContent).toBe('You asked to place a live order');
+    expect(text()).toContain('You wrote: “Manual live order: buy 0.0015 BTC in SMA cross”');
+    expect(text()).toContain('Your recent activity');
+    expect(text()).toContain('The 6 digits shown to you. Single use.');
+    expect(text()).toContain('Approving runs it now, recorded as approved by you.');
+    expect(text()).not.toContain('Claude asks to');
+    expect(text()).not.toContain("Claude's recent activity");
+    expect(text()).not.toContain('Claude wrote');
+    expect(text()).not.toContain('The 6 digits Claude shows you');
+    expect(text()).not.toContain('Approving runs it as Claude');
+    expect(calls.some((c) => c.path === '/api/activity?actor=user:soma&limit=10')).toBe(true);
+    expect(calls.some((c) => c.path === '/api/activity?actor=service:mcp&limit=10')).toBe(false);
+  });
+});
+
 describe('approval review: the one-time code', () => {
   it('cannot submit without a full code and enables the primary only at 6 digits', async () => {
     setup(approvalDetail());
@@ -271,6 +310,21 @@ describe('approval review: the one-time code', () => {
     expect(text()).not.toContain("couldn't reach the engine");
     expect(text()).toContain('One-time code');
   });
+
+  it('a failed live order renders the unknown-live copy, never "Ask for a new one." (R24 caller half)', async () => {
+    const msg = "The approved action 'live_order' did not run: exchange unreachable";
+    setup(approvalDetail({ action: 'live_order', params: { session_id: 'a1b2c3d4-0000-4000-8000-000000000001', symbol: 'BTCUSDT', side: 'buy', quantity: '0.0015' } }), {
+      [`POST /api/activity/approvals/${ID}/approve`]: envelope(503, 'approval_execution_failed', msg, 'unavailable'),
+    });
+    m = await page();
+    expect(m.container.querySelector('h1')?.textContent).toBe('Claude asks to place a live order');
+    await typeCode('424242');
+    await click(buttonByText(m.container, 'Approve and place a live order'));
+    expect(text()).toContain('Not confirmed.');
+    expect(text()).toContain("We don't know whether the order was placed. Check this session's fills and positions before trying again.");
+    expect(text()).toContain(msg);
+    expect(text()).not.toContain('Ask for a new one.');
+  });
 });
 
 describe('approval review: a lost answer', () => {
@@ -357,6 +411,14 @@ describe('approval review: states that need no code', () => {
     m = await page();
     expect(text()).toContain('This approval was invalidated: too many wrong codes, or the action failed to run. Ask for a new one.');
     expect(text()).toContain('executor raised');
+  });
+
+  it('a failed live order never says "Ask for a new one." — the order may exist unwatched (R24)', async () => {
+    setup(approvalDetail({ status: 'failed', action: 'live_order', error: 'exchange unreachable', decided_at: '2026-10-21T13:54:00+00:00' }));
+    m = await page();
+    expect(text()).toContain('This approval was invalidated: too many wrong codes, or the action failed to run.');
+    expect(text()).toContain("We don't know whether the order was placed. Check this session's fills and positions before trying again.");
+    expect(text()).not.toContain('Ask for a new one.');
   });
 
   it('shows a decision that happened elsewhere after the POST, instead of an error', async () => {

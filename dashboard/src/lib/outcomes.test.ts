@@ -4,6 +4,7 @@ import {
   approvalOutcome,
   breakerResetOutcome,
   copyForCode,
+  credentialDeleteOutcome,
   killSwitchOutcome,
   ledgerResetOutcome,
   limitsOutcome,
@@ -687,5 +688,47 @@ describe('liveStartOutcome', () => {
     expect(o.unanswered).toBe(true);
     expect(text(o)).toBe("Not confirmed. We don't know whether the session started. Check the sessions list before trying again.");
     expect(o.actions).toEqual([{ kind: 'open', label: 'Open Sessions', href: '/trading' }]);
+  });
+});
+
+describe('credentialDeleteOutcome', () => {
+  it('a decided delete says the keys are gone', () => {
+    const o = credentialDeleteOutcome({ ok: { executed: true, result: null, actor: 'user:soma', approved_by: 'user:soma' } });
+    expect(o.tone).toBe('none');
+    expect(o.title).toBe('The stored keys were deleted.');
+    expect(o.lines).toEqual(['Balance and open orders stop showing here.']);
+  });
+
+  it('a wrong code keeps the frozen sentence inline with the attempts left', () => {
+    const o = credentialDeleteOutcome({ err: envelope(422, 'code_mismatch', "That code didn't match. Nothing changed.", 'invalid', { attempts_left: 2 }) });
+    expect(o.inline).toBe(true);
+    expect(o.title).toBe("That code didn't match. Nothing changed.");
+    expect(o.lines).toEqual(['2 attempts left.']);
+  });
+
+  it('the gated 409 while a live session runs is definite — the server reason, never not-confirmed', () => {
+    const msg = 'A live session is running on these keys; stop it before deleting them';
+    const o = credentialDeleteOutcome({ err: envelope(409, 'credential_delete_gated', msg, 'invalid') });
+    expect(o.tone).toBe('caution');
+    expect(o.title).toBe("The keys weren't deleted.");
+    expect(o.lines).toEqual([msg]);
+    expect(o.unanswered).toBeUndefined();
+  });
+
+  it('an executor failure is not-confirmed — the keys may already be gone', () => {
+    const msg = "The approved action 'credential_delete' did not run: db write failed";
+    const o = credentialDeleteOutcome({ err: envelope(503, 'approval_execution_failed', msg, 'unavailable') });
+    expect(o.tone).toBe('danger');
+    expect(o.title).toBe('Not confirmed.');
+    expect(o.unanswered).toBe(true);
+    expect(o.lines).toContain("We don't know whether the keys were deleted. Check the exchange list; if they are still there, delete them again.");
+    expect(o.lines).toContain(msg);
+  });
+
+  it('a challenge the code service could not create deleted nothing and hides live actions', () => {
+    const o = credentialDeleteOutcome({ err: envelope(503, 'engine_unreachable', 'trader unreachable', 'unavailable') }, 'challenge');
+    expect(o.title).toBe("The keys weren't deleted.");
+    expect(o.lines).toEqual(['Live actions are hidden until the code service recovers.']);
+    expect(o.actions).toEqual([{ kind: 'retry', label: 'Try again' }]);
   });
 });

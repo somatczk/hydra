@@ -7,7 +7,8 @@ import { Button } from '@/components/ui/Button';
 import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { Input } from '@/components/ui/Input';
 import { Section } from '@/components/ui/Section';
-import { actionPhrase, type ApprovalDetail } from '@/lib/derive';
+import { actionPhrase, askPhrase, type ApprovalDetail } from '@/lib/derive';
+import { liveUnknownLine } from '@/lib/outcomes';
 import { duration, utc } from '@/lib/format';
 
 const CODE_LENGTH = 6;
@@ -15,7 +16,7 @@ const CODE_RE = /^\d{6}$/;
 
 export interface ApprovalReviewProps {
   approval: ApprovalDetail;
-  /** Claude's last actions (`?actor=service:mcp`); null while loading. */
+  /** The asker's last actions (`?actor={actor}`); null while loading. */
   trail: RiskEvent[] | null;
   /** Set when the last trail read failed (then `trail` is null). */
   trailError: unknown;
@@ -33,7 +34,7 @@ export interface ApprovalReviewProps {
   onDeny: () => void;
 }
 
-/** F8: What (the ask), Why (Claude's own words), Context, Claude's trail, the expiry, the one-time code. */
+/** F8: What (the ask), Why (the asker's own words), Context, the asker's trail, the expiry, the one-time code. */
 export function ApprovalReview({
   approval,
   trail,
@@ -67,6 +68,7 @@ export function ApprovalReview({
   }, [error]);
 
   const action = actionPhrase(approval.action);
+  const isClaude = approval.actor === 'service:mcp';
   const pending = approval.status === 'pending';
   const at = (iso: string | null) => utc(iso, now) ?? 'time not reported';
   const decided = pending
@@ -82,14 +84,18 @@ export function ApprovalReview({
             : approval.status === 'expired'
               ? `This request expired at ${at(approval.expires_at)}. Nothing changed.`
               : approval.status === 'failed'
-                ? 'This approval was invalidated: too many wrong codes, or the action failed to run. Ask for a new one.'
+                ? // R24: a live order or start may exist unwatched — never "Ask for a new one."
+                  [
+                    'This approval was invalidated: too many wrong codes, or the action failed to run.',
+                    liveUnknownLine(approval.action) ?? 'Ask for a new one.',
+                  ].join(' ')
                 : 'This approval is no longer waiting for you.';
 
   return (
     <div className="flex flex-col gap-4">
       <header className="flex flex-col gap-2">
-        <h1 className="text-xl font-semibold text-ink-1">Claude asks to {action}</h1>
-        <p className="text-sm text-ink-1">Claude wrote: “{approval.reason}”</p>
+        <h1 className="text-xl font-semibold text-ink-1">{askPhrase(approval.actor, approval.action)}</h1>
+        <p className="text-sm text-ink-1">{isClaude ? 'Claude' : 'You'} wrote: “{approval.reason}”</p>
         {decided && <p className="text-sm font-medium text-ink-1">{decided}</p>}
         {approval.status === 'failed' && approval.error && <p className="text-sm text-ink-2">{approval.error}</p>}
       </header>
@@ -113,11 +119,11 @@ export function ApprovalReview({
         </dl>
       </Section>
 
-      <Section title="Claude's recent activity">
+      <Section title={isClaude ? "Claude's recent activity" : 'Your recent activity'}>
         {trailError !== null && trailError !== undefined ? (
           <DataStateErrorCard
             error={trailError}
-            fallback="Claude's recent activity couldn't be read."
+            fallback={isClaude ? "Claude's recent activity couldn't be read." : "Your recent activity couldn't be read."}
             onRetry={onRetryTrail}
           />
         ) : trail === null ? (
@@ -140,7 +146,7 @@ export function ApprovalReview({
               inputMode="numeric"
               pattern="[0-9]*"
               maxLength={CODE_LENGTH}
-              hint="The 6 digits Claude shows you. Single use."
+              hint={isClaude ? 'The 6 digits Claude shows you. Single use.' : 'The 6 digits shown to you. Single use.'}
               error={error ?? undefined}
               className="font-mono tracking-widest"
             />
@@ -167,7 +173,9 @@ export function ApprovalReview({
               </Button>
             </div>
             <p className="text-xs text-ink-2">
-              Approving runs it as Claude, recorded as approved by you.{' '}
+              {isClaude
+                ? 'Approving runs it as Claude, recorded as approved by you.'
+                : 'Approving runs it now, recorded as approved by you.'}{' '}
               <Link href="/activity" className="text-accent hover:underline">
                 Activity ›
               </Link>

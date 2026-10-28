@@ -2,6 +2,7 @@ import axe from 'axe-core';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { dialogPolyfill, mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
+import { liveStatus } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
 
@@ -173,7 +174,16 @@ const populated: Array<[string, () => Promise<{ default: () => ReactNode }>, Rou
   ],
 ];
 
-async function axeViolations(load: () => Promise<{ default: () => ReactNode }>) {
+/** The populated pages' paper fixtures in one route set, plus the shell's own paper sources. */
+function paperRoutes(): Routes {
+  return {
+    '/api/risk/live-status': liveStatus(),
+    '/api/trading/sessions': [],
+    ...Object.assign({}, ...populated.map(([, , routes]) => routes)),
+  };
+}
+
+async function mountPage(load: () => Promise<{ default: () => ReactNode }>) {
   const { default: Page } = await load();
   page = await mount(
     <ThemeProvider>
@@ -184,7 +194,11 @@ async function axeViolations(load: () => Promise<{ default: () => ReactNode }>) 
       </ShellStatusProvider>
     </ThemeProvider>,
   );
-  const results = await axe.run(page.container, {
+}
+
+async function axeViolations(load: () => Promise<{ default: () => ReactNode }>) {
+  await mountPage(load);
+  const results = await axe.run(page!.container, {
     rules: { 'color-contrast': { enabled: false }, region: { enabled: false } },
   });
   return results.violations.map((v) => `${v.id}: ${v.nodes.map((n) => n.target.join(' ')).join(' | ')}`);
@@ -204,5 +218,26 @@ describe('axe (jsdom: structure, names and roles; contrast and layout are checke
     fetchApi.mockImplementation(routeFetch(routes, []));
     expect(await axeViolations(load)).toEqual([]);
     expect(page?.container.textContent).toContain(marker);
+  });
+});
+
+/** The all-paper world (08 §6): every page's paper data, no live-mode claim in the rendered copy.
+ * A non-open <dialog> is display:none, so its content is not rendered copy; the 'armed' scan is over
+ * rendered text only — the word exists in code (protection === 'armed'). */
+describe('the all-paper world (08 §6)', () => {
+  it.each(pages)('%s renders no LIVE, real-money or armed copy', async (_route, load) => {
+    dialogPolyfill();
+    fetchApi.mockReset();
+    fetchApi.mockImplementation(routeFetch(paperRoutes(), []));
+    await mountPage(load);
+    const rendered = page!.container.cloneNode(true) as HTMLElement;
+    rendered.querySelectorAll('dialog:not([open])').forEach((d) => d.remove());
+    const text = rendered.textContent ?? '';
+    expect(text).not.toMatch(/\bLIVE\b/);
+    expect(text).not.toContain('real money');
+    expect(text).not.toContain('Live trading is on');
+    expect(text).not.toMatch(/\barmed\b/);
+    page?.unmount();
+    page = null;
   });
 });

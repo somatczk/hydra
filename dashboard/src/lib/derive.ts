@@ -63,6 +63,8 @@ export interface ExchangeStopState {
   take_profit: number | null;
   order_list_id: string | null;
   checked_at: string;
+  /** S2: the server's own error string for an unreadable verify; null/absent when it reported none. */
+  error?: string | null;
 }
 
 export interface PositionItem {
@@ -147,7 +149,8 @@ export interface PlatformConfig {
   paper_capital_pending: number | null;
 }
 
-/** `routes/activity.py` PendingApproval (actor is always `service:mcp`). */
+/** `routes/activity.py` PendingApproval; the actor is the requester (C's requested_by) —
+ * 'service:mcp' is Claude, any other principal is your own challenge. */
 export interface PendingApproval {
   id: string;
   actor: string;
@@ -309,6 +312,11 @@ export function actionPhrase(action: string): string {
   return action.replaceAll('_', ' ');
 }
 
+/** Must-fix 7: the asker's phrase — only the MCP actor is Claude; any other principal is your own challenge. */
+export function askPhrase(actor: string, action: string): string {
+  return actor === 'service:mcp' ? `Claude asks to ${actionPhrase(action)}` : `You asked to ${actionPhrase(action)}`;
+}
+
 /** Current, self-clearing conditions only (R-P1-4); protection failures are not one.
  * `approvals` is null when the source couldn't be read (count "?" then, never "none"); `now` ages the rows. */
 export function needsYou(src: {
@@ -329,7 +337,7 @@ export function needsYou(src: {
       const when = age(now - Date.parse(a.requested_at), now);
       approvalItems.push({
         kind: 'approval',
-        text: `Claude asks to ${actionPhrase(a.action)}${when ? ` · ${when}` : ''}`,
+        text: `${askPhrase(a.actor, a.action)}${when ? ` · ${when}` : ''}`,
         href: `/activity/approvals/${a.id}`,
       });
     }

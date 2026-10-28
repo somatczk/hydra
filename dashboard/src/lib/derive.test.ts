@@ -298,6 +298,21 @@ describe('needsYou', () => {
     expect(actionPhrase('live_order')).toBe('place a live order');
     expect(actionPhrase('credential_delete')).toBe('delete the stored exchange keys');
   });
+
+  it('renders a user-initiated approval as your own action, never "Claude asks to" (must-fix 7)', () => {
+    const mine = pendingApproval({ actor: 'user:soma', action: 'live_arming', requested_at: ago(2 * MIN) });
+    const order = pendingApproval({ id: '3f0b9e2a-1000-4000-8000-000000000002', actor: 'user:soma', action: 'live_order', requested_at: ago(MIN) });
+    const r = needsYou({ ...base, approvals: [mine, order], now: NOW });
+    expect(r.items.map((i) => i.text)).toEqual([
+      'You asked to turn on live trading · 2 min ago',
+      'You asked to place a live order · 1 min ago',
+    ]);
+  });
+
+  it('keeps "Claude asks to" for the MCP actor only', () => {
+    const r = needsYou({ ...base, approvals: [pendingApproval({ requested_at: ago(3 * MIN) })], now: NOW });
+    expect(r.items[0].text).toBe('Claude asks to release the kill switch · 3 min ago');
+  });
 });
 
 describe('fills, sides and stop rules', () => {

@@ -135,7 +135,8 @@ export function platformConfig(over: Partial<PlatformConfig> = {}): PlatformConf
   return { trading_mode: 'paper', paper_capital: 10000, paper_capital_pending: null, ...over };
 }
 
-/** routes/activity.py PendingApproval (activity.py:80-88); the actor is always 'service:mcp'. */
+/** routes/activity.py PendingApproval (activity.py:80-88); the actor is the requester (C's requested_by):
+ * 'service:mcp' is Claude, a user principal is your own challenge. */
 export function pendingApproval(over: Partial<PendingApproval> = {}): PendingApproval {
   return {
     id: '3f0b9e2a-1000-4000-8000-000000000001',

@@ -19,7 +19,7 @@ import { Table } from '@/components/ui/Table';
 import { usePoll } from '@/hooks/usePoll';
 import { connectWebSocket } from '@/lib/api';
 import { stateFromError } from '@/lib/apiState';
-import { fillQty, plural, sessionName, sideLabel, winRate, type PositionItem, type SessionDetail, type TradeItem } from '@/lib/derive';
+import { exchangeStopRow, fillQty, plural, sessionName, sideLabel, winRate, type PositionItem, type SessionDetail, type TradeItem } from '@/lib/derive';
 import { money, pct, price, qty, signed, utc } from '@/lib/format';
 import { baseAsset } from '@/lib/outcomes';
 import { classifySessionWsMessage, debounce } from '@/lib/sessionWs';
@@ -89,6 +89,7 @@ function Account({ d }: { d: SessionDetail }) {
 
 function Positions({ d }: { d: SessionDetail }) {
   const base = baseAsset(d.symbols[0] ?? '');
+  const live = d.trading_mode === 'live';
   if (d.positions.length > 0) {
     return (
       <Table<PositionItem>
@@ -98,6 +99,26 @@ function Positions({ d }: { d: SessionDetail }) {
           { key: 'quantity', header: `Qty (${base})`, render: (p) => qty(p.quantity) },
           { key: 'avg_entry_price', header: 'Avg entry', render: (p) => price(p.avg_entry_price) },
           { key: 'unrealized_pnl', header: 'Unrealised (USDT)', render: (p) => signed(p.unrealized_pnl) },
+          // The A8-live cell is live-only: a paper position's null exchange_stop is not a danger (R26's note).
+          ...(live
+            ? [
+                {
+                  key: 'exchange_stop',
+                  header: 'Exchange stop',
+                  render: (p: PositionItem) => {
+                    const r = exchangeStopRow(p);
+                    return r ? (
+                      <span className={r.tone === 'danger' ? 'text-danger' : r.tone === 'caution' ? 'text-caution' : 'text-ink-1'}>
+                        {r.text}
+                      </span>
+                    ) : (
+                      // S2: an unreadable verify names the server's error when it reported one.
+                      <DataStateBadge state="unknown" reason={p.exchange_stop?.error ?? "The exchange stop couldn't be verified"} />
+                    );
+                  },
+                },
+              ]
+            : []),
         ]}
         data={d.positions}
         keyExtractor={(p) => p.symbol}
@@ -139,6 +160,16 @@ function Fills({ d }: { d: SessionDetail }) {
         { key: 'fee', header: 'Fee', render: (t) => money(t.fee) ?? '—' },
         { key: 'net_pnl', header: 'Net P&L', render: (t) => signed(t.net_pnl) ?? '—' },
         { key: 'reason', header: 'Reason', render: (t) => t.reason ?? '—' },
+        // R20: only a live fill carries `reconciled`; the label flags a fill no reconcile pass has covered.
+        ...(d.trading_mode === 'live'
+          ? [
+              {
+                key: 'reconciled',
+                header: 'Reconciled',
+                render: (t: TradeItem) => (t.reconciled === false ? <span className="text-caution">not reconciled</span> : null),
+              },
+            ]
+          : []),
       ]}
       data={d.trades}
       keyExtractor={(t) => t.id ?? `${t.timestamp}-${t.price}`}

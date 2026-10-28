@@ -554,7 +554,7 @@ export function limitsOutcome(result: Result<unknown>): Outcome {
 
 /** R24: the live executors' failure copy — never 'Ask for a new one.' (a re-request would place a
  * second live order while the first may exist unwatched); null for every other action. */
-function liveUnknownLine(action: string | undefined): string | null {
+export function liveUnknownLine(action: string | undefined): string | null {
   if (action === 'live_order') return "We don't know whether the order was placed. Check this session's fills and positions before trying again.";
   if (action === 'live_session_start') return "We don't know whether the session started. Check the sessions list before trying again.";
   return null;
@@ -843,4 +843,44 @@ export function liveStartOutcome(
     return { tone: 'caution', title: 'Nothing was started.', lines: [copyForCode(d.code, d)], actions: [] };
   }
   return notConfirmed('the live session started', err);
+}
+
+/** POST /api/live/credential-delete (the challenge), then the existing approve endpoint whose executor
+ * deletes the stored keys. A failed challenge deleted nothing; a definite refusal is safe to state
+ * (the gated 409 names the running live sessions); an approve the engine never answered stays
+ * not-confirmed — the keys may already be gone, and a re-request is safe (no double-delete risk). */
+export function credentialDeleteOutcome(result: Result<ApproveResponse>, phase: LivePhase = 'approve'): Outcome {
+  if ('ok' in result) {
+    if (result.ok.executed === false) return { tone: 'caution', title: "The keys weren't deleted.", lines: [], actions: [] };
+    return ok('The stored keys were deleted.', ['Balance and open orders stop showing here.']);
+  }
+  const err = result.err;
+  if (isSignedOut(err)) return signedOut('delete them again');
+  const d = parseErrorDetail(err);
+  if (phase === 'challenge') return challengeOutcome("The keys weren't deleted.", err);
+  if (d?.code === 'code_mismatch') return liveCodeMismatch('Nothing changed.', d);
+  if (d?.code === 'approval_execution_failed') {
+    return {
+      tone: 'danger',
+      title: 'Not confirmed.',
+      lines: ["We don't know whether the keys were deleted. Check the exchange list; if they are still there, delete them again.", d.message],
+      actions: [],
+      unanswered: true,
+    };
+  }
+  if (d?.code === 'already_decided' || d?.code === 'approval_expired' || d?.code === 'approval_failed') {
+    return { tone: 'caution', title: d.message, lines: ['Nothing changed from this screen.'], actions: [] };
+  }
+  if (d?.code === 'executor_not_registered') {
+    return {
+      tone: 'caution',
+      title: 'The engine cannot execute this action yet.',
+      lines: [d.message, 'The code was not used. Wait for the engine, or deny this request.'],
+      actions: [],
+    };
+  }
+  if (d?.code === 'principal_not_allowed') return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
+  // A definite refusal the engine did answer (credential_delete_gated while a live session runs).
+  if (d && !unreachable(err)) return { tone: 'caution', title: "The keys weren't deleted.", lines: [d.message], actions: [] };
+  return notConfirmed('the keys were deleted', err);
 }
