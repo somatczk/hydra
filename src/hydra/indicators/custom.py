@@ -1,32 +1,13 @@
 """Crypto-specific indicators for the Hydra trading platform.
 
-Functions tailored to cryptocurrency market data such as funding rates,
-taker buy/sell ratios, and liquidation intensity.
+Functions tailored to cryptocurrency market data such as taker buy/sell
+ratios and liquidation intensity.
 """
 
 from __future__ import annotations
 
 import numpy as np
 from numpy import ndarray
-
-from hydra.indicators.library import sma
-
-
-def funding_rate_sma(funding_rates: ndarray, period: int = 24) -> ndarray:
-    """Simple Moving Average of funding rates.
-
-    Useful for identifying persistent positive/negative funding (crowd
-    positioning) in perpetual futures markets.
-
-    Parameters
-    ----------
-    funding_rates:
-        Array of funding rate values (e.g. 0.0001 = 0.01%).
-    period:
-        SMA window, default 24 (one day of 8-hour funding intervals
-        on most exchanges maps to 3, but 24 is used for a wider window).
-    """
-    return sma(funding_rates.astype(np.float64), period)
 
 
 def taker_buy_ratio(buy_volume: ndarray, total_volume: ndarray) -> ndarray:

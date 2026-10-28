@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from numpy import ndarray
@@ -22,7 +23,7 @@ from numpy import ndarray
 class _LoadedModel:
     """Internal wrapper for a loaded ONNX model session."""
 
-    session: object  # onnxruntime.InferenceSession
+    session: Any  # onnxruntime.InferenceSession (ships no type stubs)
     model_path: Path
     model_name: str
     input_name: str
@@ -115,7 +116,7 @@ class ModelInference:
                 input_data = input_data.reshape(1, -1)
 
             t0 = time.monotonic()
-            results = session.run(None, {loaded.input_name: input_data})  # type: ignore[union-attr]
+            results = session.run(None, {loaded.input_name: input_data})
             try:
                 from hydra.core.metrics import observe_ml_inference_latency
 
@@ -127,7 +128,7 @@ class ModelInference:
             # Fallback: strategy continues without ML
             return None
 
-    def get_model_info(self, model_name: str) -> dict | None:
+    def get_model_info(self, model_name: str) -> dict[str, Any] | None:
         """Return metadata for a loaded model, or ``None`` if not found."""
         loaded = self._models.get(model_name)
         if loaded is None:

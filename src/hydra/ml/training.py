@@ -1,38 +1,65 @@
-"""ML model training with walk-forward/CPCV cross-validation.
+"""Honest training of the up/down classifier.
 
-Supports XGBoost, LightGBM, and Random Forest. All ML library imports are lazy
-(inside methods) so the module can be imported without heavy dependencies installed.
+The objective is classification on the sign of the forward return (rows whose
+target is zero or undefined are dropped); ``predict_proba`` is the confidence the
+serving overlay consumes. Evaluation is walk-forward with an embargo of one
+horizon between each train end and test start, and it reports only what the data
+can honestly support: per-fold OOS accuracy next to the OOS base rate, and the
+mean signed forward return of trading the predicted direction. The ML library
+imports are lazy so the module imports without the ml-training extra installed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 from numpy import ndarray
 
-from hydra.ml.features import FeatureMatrix
+from hydra.ml.features import (
+    FeatureMatrix,
+    FeatureSpec,
+    reference_deciles,
+)
 
-# ---------------------------------------------------------------------------
-# TrainedModel dataclass
-# ---------------------------------------------------------------------------
+DEFAULT_PARAMS: dict[str, object] = {
+    "max_depth": 6,
+    "learning_rate": 0.1,
+    "n_estimators": 100,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "random_state": 42,
+}
+"""The XGBClassifier defaults; callers may override any of them."""
+
+
+@runtime_checkable
+class SupportsPredict(Protocol):
+    """The fitted-model contract: class predictions on a feature matrix."""
+
+    def predict(self, x: Any) -> Any: ...
 
 
 @dataclass
 class TrainedModel:
-    """Container for a trained model and its metadata."""
+    """A fitted classifier, its honest OOS metrics and the spec it was trained on."""
 
-    model: object
+    model: SupportsPredict
     model_type: str
-    metrics: dict[str, float]
-    feature_names: list[str]
+    metrics: dict[str, Any]
+    feature_spec: FeatureSpec
     train_timestamp: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     params: dict[str, object] = field(default_factory=dict)
 
+    @property
+    def feature_names(self) -> list[str]:
+        return list(self.feature_spec.feature_names)
+
 
 # ---------------------------------------------------------------------------
-# Cross-validation helpers
+# Walk-forward split with embargo
 # ---------------------------------------------------------------------------
 
 
@@ -40,50 +67,68 @@ def _walk_forward_split(
     n_samples: int,
     n_splits: int = 5,
     min_train_size: int = 100,
+    embargo: int = 0,
 ) -> list[tuple[ndarray, ndarray]]:
-    """Generate walk-forward (expanding window) train/test index splits.
+    """Expanding-window train/test splits with ``embargo`` quarantined rows.
 
-    Each fold uses all data up to a cutoff for training and the next block
-    for testing.  This avoids look-ahead bias inherent in k-fold on
-    time-series.
+    Each fold trains on everything up to a cutoff and tests on the next block,
+    skipping ``embargo`` rows after the cutoff so no test row's forward-return
+    window overlaps a train row's.
     """
+    if embargo < 0:
+        msg = f"embargo must be >= 0, got {embargo}"
+        raise ValueError(msg)
     if n_samples < min_train_size + n_splits:
-        # Fallback: single split at 80/20
         cut = int(n_samples * 0.8)
-        return [(np.arange(cut), np.arange(cut, n_samples))]
+        train_idx = np.arange(cut)
+        test_idx = np.arange(cut + embargo, n_samples)
+        return [(train_idx, test_idx)] if cut > 0 and len(test_idx) > 0 else []
 
     test_size = (n_samples - min_train_size) // n_splits
     splits: list[tuple[ndarray, ndarray]] = []
     for i in range(n_splits):
         train_end = min_train_size + i * test_size
+        test_start = train_end + embargo
         test_end = min(train_end + test_size, n_samples)
-        if train_end >= n_samples or test_end <= train_end:
+        if train_end >= n_samples or test_start >= test_end:
             break
-        train_idx = np.arange(train_end)
-        test_idx = np.arange(train_end, test_end)
-        splits.append((train_idx, test_idx))
+        splits.append((np.arange(train_end), np.arange(test_start, test_end)))
     return splits
 
 
-def _evaluate_predictions(y_true: ndarray, y_pred: ndarray) -> dict[str, float]:
-    """Compute classification and regression metrics for model evaluation."""
+# ---------------------------------------------------------------------------
+# Honest evaluation
+# ---------------------------------------------------------------------------
+
+
+def _evaluate_predictions(
+    y_true: ndarray,
+    y_pred: ndarray,
+    forward_returns: ndarray,
+) -> dict[str, float]:
+    """OOS sign accuracy next to the base rate, and the mean signed forward return."""
     if len(y_true) == 0:
-        return {"accuracy": 0.0, "sharpe": 0.0, "mean_return": 0.0}
-
-    signs_true = np.sign(y_true)
-    signs_pred = np.sign(y_pred)
-    accuracy = float(np.mean(signs_true == signs_pred))
-
-    # Simulated returns: trade in predicted direction, earn actual return
-    returns = y_pred * y_true
-    mean_ret = float(np.mean(returns))
-    std_ret = float(np.std(returns)) if len(returns) > 1 else 1.0
-    sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
-
+        return {"accuracy": 0.0, "base_rate": 0.0, "mean_signed_return": 0.0}
     return {
-        "accuracy": accuracy,
-        "sharpe": sharpe,
-        "mean_return": mean_ret,
+        "accuracy": float(np.mean(y_true == y_pred)),
+        "base_rate": float(np.mean(y_true == 1.0)),
+        "mean_signed_return": float(np.mean(y_pred * forward_returns)),
+    }
+
+
+def _summarize_folds(fold_metrics: list[dict[str, float]], embargo: int) -> dict[str, Any]:
+    """Average the per-fold metrics and keep the per-fold values."""
+    if not fold_metrics:
+        return {"folds": 0, "embargo": embargo}
+    return {
+        "folds": len(fold_metrics),
+        "embargo": embargo,
+        "oos_accuracy": float(np.mean([m["accuracy"] for m in fold_metrics])),
+        "oos_base_rate": float(np.mean([m["base_rate"] for m in fold_metrics])),
+        "oos_mean_signed_return": float(np.mean([m["mean_signed_return"] for m in fold_metrics])),
+        "fold_accuracy": [m["accuracy"] for m in fold_metrics],
+        "fold_base_rate": [m["base_rate"] for m in fold_metrics],
+        "fold_mean_signed_return": [m["mean_signed_return"] for m in fold_metrics],
     }
 
 
@@ -93,262 +138,64 @@ def _evaluate_predictions(y_true: ndarray, y_pred: ndarray) -> dict[str, float]:
 
 
 class ModelTrainer:
-    """Train and evaluate ML models with walk-forward cross-validation."""
+    """Walk-forward trainer of the up/down classifier."""
 
     def train_xgboost(
         self,
         features: FeatureMatrix,
-        target: ndarray,
-        params: dict | None = None,
+        params: dict[str, object] | None = None,
     ) -> TrainedModel:
-        """Train an XGBoost model with walk-forward CV evaluation."""
+        """Train an XGBClassifier on the up/down target with embargoed walk-forward OOS metrics.
+
+        ``predict_proba`` on the returned model is the confidence in the up
+        class; the OOS metrics come from the folds only, never from the final
+        in-sample fit.
+        """
         import xgboost as xgb
 
-        default_params: dict[str, object] = {
-            "objective": "reg:squarederror",
-            "max_depth": 6,
-            "learning_rate": 0.1,
-            "n_estimators": 100,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "random_state": 42,
-        }
-        if params:
-            default_params.update(params)
+        if features.target is None or features.forward_returns is None:
+            msg = (
+                "training needs a matrix with target and forward_returns "
+                "(build it via the DatasetBuilder)"
+            )
+            raise ValueError(msg)
 
-        feat = features.features
-        n_samples = min(len(feat), len(target))
-        feat = feat[:n_samples]
-        y = target[:n_samples]
+        merged_params = {**DEFAULT_PARAMS, **(params or {})}
+        rows = np.flatnonzero((features.target == 1.0) | (features.target == -1.0))
+        if len(rows) == 0:
+            msg = "the target has no up/down rows to train on"
+            raise ValueError(msg)
 
-        splits = _walk_forward_split(n_samples)
-        all_metrics: list[dict[str, float]] = []
+        feat = features.features[rows]
+        signs = features.target[rows]
+        forward = features.forward_returns[rows]
+        y = (signs + 1.0) / 2.0  # classes {0, 1}; 1 = up
+        if np.unique(y).size < 2:
+            msg = "the target has a single class; nothing to classify"
+            raise ValueError(msg)
 
-        model = xgb.XGBRegressor(**default_params)
+        embargo = features.spec.horizon
+        splits = _walk_forward_split(len(y), embargo=embargo)
+        model = xgb.XGBClassifier(**merged_params)
 
+        fold_metrics: list[dict[str, float]] = []
         for train_idx, test_idx in splits:
             model.fit(feat[train_idx], y[train_idx])
-            preds = model.predict(feat[test_idx])
-            fold_metrics = _evaluate_predictions(y[test_idx], preds)
-            all_metrics.append(fold_metrics)
+            preds = np.asarray(model.predict(feat[test_idx]), dtype=np.float64)
+            pred_signs = 2.0 * preds - 1.0
+            fold_metrics.append(
+                _evaluate_predictions(signs[test_idx], pred_signs, forward[test_idx])
+            )
 
-        # Train final model on all data
         model.fit(feat, y)
-
-        # Average metrics across folds
-        avg_metrics = _average_metrics(all_metrics)
-
+        trained_spec = replace(
+            features.spec,
+            reference_quantiles=tuple(reference_deciles(feat[:, i]) for i in range(feat.shape[1])),
+        )
         return TrainedModel(
             model=model,
             model_type="xgboost",
-            metrics=avg_metrics,
-            feature_names=features.feature_names,
-            params=default_params,
+            metrics=_summarize_folds(fold_metrics, embargo),
+            feature_spec=trained_spec,
+            params=dict(merged_params),
         )
-
-    def train_lightgbm(
-        self,
-        features: FeatureMatrix,
-        target: ndarray,
-        params: dict | None = None,
-    ) -> TrainedModel:
-        """Train a LightGBM model with walk-forward CV evaluation."""
-        import lightgbm as lgb
-
-        default_params: dict[str, object] = {
-            "objective": "regression",
-            "num_leaves": 31,
-            "learning_rate": 0.1,
-            "n_estimators": 100,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "random_state": 42,
-            "verbose": -1,
-        }
-        if params:
-            default_params.update(params)
-
-        feat = features.features
-        n_samples = min(len(feat), len(target))
-        feat = feat[:n_samples]
-        y = target[:n_samples]
-
-        splits = _walk_forward_split(n_samples)
-        all_metrics: list[dict[str, float]] = []
-
-        model = lgb.LGBMRegressor(**default_params)
-
-        for train_idx, test_idx in splits:
-            model.fit(feat[train_idx], y[train_idx])
-            preds = model.predict(feat[test_idx])
-            fold_metrics = _evaluate_predictions(y[test_idx], preds)
-            all_metrics.append(fold_metrics)
-
-        # Train final model on all data
-        model.fit(feat, y)
-
-        avg_metrics = _average_metrics(all_metrics)
-
-        return TrainedModel(
-            model=model,
-            model_type="lightgbm",
-            metrics=avg_metrics,
-            feature_names=features.feature_names,
-            params=default_params,
-        )
-
-    def train_random_forest(
-        self,
-        features: FeatureMatrix,
-        target: ndarray,
-        params: dict | None = None,
-    ) -> TrainedModel:
-        """Train a Random Forest model with walk-forward CV evaluation."""
-        from sklearn.ensemble import RandomForestRegressor
-
-        default_params: dict[str, object] = {
-            "n_estimators": 100,
-            "max_depth": 10,
-            "min_samples_split": 5,
-            "min_samples_leaf": 2,
-            "random_state": 42,
-            "n_jobs": -1,
-        }
-        if params:
-            default_params.update(params)
-
-        feat = features.features
-        n_samples = min(len(feat), len(target))
-        feat = feat[:n_samples]
-        y = target[:n_samples]
-
-        splits = _walk_forward_split(n_samples)
-        all_metrics: list[dict[str, float]] = []
-
-        model = RandomForestRegressor(**default_params)
-
-        for train_idx, test_idx in splits:
-            model.fit(feat[train_idx], y[train_idx])
-            preds = model.predict(feat[test_idx])
-            fold_metrics = _evaluate_predictions(y[test_idx], preds)
-            all_metrics.append(fold_metrics)
-
-        # Train final model on all data
-        model.fit(feat, y)
-
-        avg_metrics = _average_metrics(all_metrics)
-
-        return TrainedModel(
-            model=model,
-            model_type="random_forest",
-            metrics=avg_metrics,
-            feature_names=features.feature_names,
-            params=default_params,
-        )
-
-    def hyperparameter_search(
-        self,
-        model_type: str,
-        features: FeatureMatrix,
-        target: ndarray,
-        n_trials: int = 100,
-    ) -> dict:
-        """Optuna-based hyperparameter search optimizing deflated Sharpe ratio.
-
-        Parameters
-        ----------
-        model_type:
-            One of ``"xgboost"``, ``"lightgbm"``, ``"random_forest"``.
-        features:
-            Feature matrix for training.
-        target:
-            Target array.
-        n_trials:
-            Number of Optuna trials.
-
-        Returns
-        -------
-        dict
-            Best hyperparameters found.
-        """
-        import optuna
-
-        feat = features.features
-        n_samples = min(len(feat), len(target))
-        feat = feat[:n_samples]
-        y = target[:n_samples]
-
-        splits = _walk_forward_split(n_samples)
-
-        def objective(trial: optuna.Trial) -> float:
-            model = _build_trial_model(trial, model_type)
-
-            sharpe_values: list[float] = []
-            for train_idx, test_idx in splits:
-                model.fit(feat[train_idx], y[train_idx])
-                preds = model.predict(feat[test_idx])
-                metrics = _evaluate_predictions(y[test_idx], preds)
-                sharpe_values.append(metrics["sharpe"])
-
-            return float(np.mean(sharpe_values)) if sharpe_values else 0.0
-
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=n_trials)
-
-        return dict(study.best_params)
-
-
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
-
-
-def _average_metrics(all_metrics: list[dict[str, float]]) -> dict[str, float]:
-    """Average a list of metric dicts."""
-    if not all_metrics:
-        return {}
-    avg: dict[str, float] = {}
-    for key in all_metrics[0]:
-        avg[key] = float(np.mean([m[key] for m in all_metrics]))
-    return avg
-
-
-def _build_trial_model(trial: object, model_type: str) -> object:
-    """Build a model with Optuna-suggested hyperparameters."""
-    if model_type == "xgboost":
-        import xgboost as xgb
-
-        return xgb.XGBRegressor(
-            max_depth=trial.suggest_int("max_depth", 3, 10),  # type: ignore[union-attr]
-            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),  # type: ignore[union-attr]
-            n_estimators=trial.suggest_int("n_estimators", 50, 300),  # type: ignore[union-attr]
-            subsample=trial.suggest_float("subsample", 0.6, 1.0),  # type: ignore[union-attr]
-            colsample_bytree=trial.suggest_float("colsample_bytree", 0.6, 1.0),  # type: ignore[union-attr]
-            random_state=42,
-        )
-    if model_type == "lightgbm":
-        import lightgbm as lgb
-
-        return lgb.LGBMRegressor(
-            num_leaves=trial.suggest_int("num_leaves", 15, 63),  # type: ignore[union-attr]
-            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),  # type: ignore[union-attr]
-            n_estimators=trial.suggest_int("n_estimators", 50, 300),  # type: ignore[union-attr]
-            subsample=trial.suggest_float("subsample", 0.6, 1.0),  # type: ignore[union-attr]
-            colsample_bytree=trial.suggest_float("colsample_bytree", 0.6, 1.0),  # type: ignore[union-attr]
-            random_state=42,
-            verbose=-1,
-        )
-    if model_type == "random_forest":
-        from sklearn.ensemble import RandomForestRegressor
-
-        return RandomForestRegressor(
-            n_estimators=trial.suggest_int("n_estimators", 50, 300),  # type: ignore[union-attr]
-            max_depth=trial.suggest_int("max_depth", 3, 15),  # type: ignore[union-attr]
-            min_samples_split=trial.suggest_int("min_samples_split", 2, 10),  # type: ignore[union-attr]
-            min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 5),  # type: ignore[union-attr]
-            random_state=42,
-        )
-
-    msg = f"Unknown model type: {model_type}"
-    raise ValueError(msg)

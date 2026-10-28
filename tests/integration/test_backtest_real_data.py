@@ -126,7 +126,7 @@ async def pool(database_dsn: str, monkeypatch: pytest.MonkeyPatch) -> AsyncItera
             assert set(await _columns(conn)) >= _NEW_COLUMNS, "migration did not apply"
             await conn.execute("TRUNCATE ts.ohlcv_1m")
             await conn.execute("TRUNCATE backtest_results CASCADE")
-            await conn.execute("TRUNCATE backtest_jobs")
+            await conn.execute("TRUNCATE backtest_jobs CASCADE")
         yield db_pool
     finally:
         await db_pool.close()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from hydra.indicators.custom import (
-    funding_rate_sma,
     liquidation_intensity,
     taker_buy_ratio,
 )
@@ -32,7 +31,6 @@ __all__ = [
     "cci",
     "ema",
     # Crypto-specific
-    "funding_rate_sma",
     "ichimoku",
     "keltner_channels",
     "liquidation_intensity",

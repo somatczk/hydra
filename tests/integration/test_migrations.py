@@ -217,6 +217,104 @@ async def test_0011_data_cache_entries_is_unique_per_dataset(fresh_database: str
         )
 
 
+_ML_MODELS_INSERT = """
+    INSERT INTO ml_models (id, name, version, model_type, feature_spec,
+                           artifact_file, artifact_sha256, trained_at, created_by)
+    VALUES ('7d5c7e34-1f3e-4f8e-9d34-a91b64f00001', 'alpha', {version}, 'xgboost',
+            '{{"spec_version": 3}}', 'alpha-v{version}.onnx', '{sha}', '2026-10-28T12:00:00Z',
+            'job:task-abc12345')
+"""
+
+_ML_MODELS_INSERT_WITH_JOB = """
+    INSERT INTO ml_models (id, name, version, model_type, feature_spec,
+                           artifact_file, artifact_sha256, trained_at, created_by,
+                           training_job_id)
+    VALUES ('7d5c7e34-1f3e-4f8e-9d34-a91b64f00002', 'alpha', {version}, 'xgboost',
+            '{{"spec_version": 3}}', 'alpha-v{version}.onnx', '{sha}', '2026-10-28T12:00:00Z',
+            'job:task-abc12345', '{job_id}')
+"""
+
+
+async def test_0012_ml_models_upgrade_creates_the_registry_table(fresh_database: str) -> None:
+    await _upgrade(fresh_database)
+    columns = await _fetch(
+        fresh_database,
+        "SELECT column_name, data_type, is_nullable, column_default "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'ml_models' ORDER BY ordinal_position",
+    )
+    assert [tuple(r) for r in columns] == [
+        ("id", "uuid", "NO", None),
+        ("name", "text", "NO", None),
+        ("version", "integer", "NO", None),
+        ("stage", "text", "NO", "'staging'::text"),
+        ("model_type", "text", "NO", None),
+        ("metrics", "jsonb", "NO", "'{}'::jsonb"),
+        ("feature_spec", "jsonb", "NO", None),
+        ("drift", "jsonb", "YES", None),
+        ("artifact_file", "text", "NO", None),
+        ("artifact_sha256", "text", "NO", None),
+        ("trained_at", "timestamp with time zone", "NO", None),
+        ("created_by", "text", "NO", None),
+        ("training_job_id", "text", "YES", None),
+        ("archived_at", "timestamp with time zone", "YES", None),
+    ]
+
+    await _execute(fresh_database, _ML_MODELS_INSERT.format(version=1, sha="a" * 64))
+
+    # the stage CHECK refuses anything outside staging|production|archived
+    with pytest.raises(asyncpg.CheckViolationError):
+        await _execute(
+            fresh_database,
+            "INSERT INTO ml_models (id, name, version, stage, model_type, feature_spec, "
+            "artifact_file, artifact_sha256, trained_at, created_by) VALUES ("
+            "'7d5c7e34-1f3e-4f8e-9d34-a91b64f00003', 'alpha', 2, 'bogus', 'xgboost', "
+            "'{}', 'alpha-v2.onnx', '" + "b" * 64 + "', '2026-10-28T12:00:00Z', 'dev')",
+        )
+    # versions are immutable: (name, version) is unique
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await _execute(fresh_database, _ML_MODELS_INSERT.format(version=1, sha="c" * 64))
+    # training_job_id references backtest_jobs(id), a TEXT key
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await _execute(
+            fresh_database,
+            _ML_MODELS_INSERT_WITH_JOB.format(version=3, sha="d" * 64, job_id="task-nope"),
+        )
+
+
+async def test_0012_training_job_fk_accepts_a_real_job(fresh_database: str) -> None:
+    await _upgrade(fresh_database)
+    await _execute(
+        fresh_database,
+        "INSERT INTO backtest_jobs (id, kind, request, strategy_config) "
+        "VALUES ('task-abc12345', 'ml_train', '{}', '{}')",
+    )
+    await _execute(
+        fresh_database,
+        _ML_MODELS_INSERT_WITH_JOB.format(version=1, sha="a" * 64, job_id="task-abc12345"),
+    )
+    row = await _fetch(fresh_database, "SELECT training_job_id, stage FROM ml_models")
+    assert [tuple(r) for r in row] == [("task-abc12345", "staging")]
+
+
+async def test_0012_downgrade_drops_the_registry_table(fresh_database: str) -> None:
+    await _upgrade(fresh_database)
+    await _execute(fresh_database, _ML_MODELS_INSERT.format(version=1, sha="a" * 64))
+
+    await asyncio.to_thread(
+        command.downgrade, alembic_config(fresh_database), "0011_data_source_and_cache"
+    )
+
+    leftovers = await _fetch(fresh_database, "SELECT to_regclass('public.ml_models')")
+    assert [tuple(r) for r in leftovers] == [(None,)]
+    assert await current_revision(fresh_database) == "0011_data_source_and_cache"
+
+    await _upgrade(fresh_database)
+    assert await current_revision(fresh_database) == head_revision()
+    counts = await _fetch(fresh_database, "SELECT count(*) AS n FROM ml_models")
+    assert [r["n"] for r in counts] == [0]
+
+
 async def test_legacy_2_1_10_schema_upgrades_in_place(fresh_database: str) -> None:
     await _execute(fresh_database, LEGACY_SCHEMA.read_text())
     await _execute(
