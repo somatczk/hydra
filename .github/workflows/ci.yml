@@ -372,7 +372,6 @@ jobs:
               live=$(curl -fsS http://localhost:8000/livez)
               echo "$live"
               jq -e '.status == "ok"' <<<"$live"
-              test "$(curl -fsS http://localhost:8000/health)" = "$live"
               ready=$(curl -fsS http://localhost:8000/readyz)
               echo "$ready"
               jq -e '.status == "ok" and .checks.db.ok == true and .checks.migrations.ok == true' <<<"$ready"

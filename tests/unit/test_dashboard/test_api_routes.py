@@ -22,8 +22,8 @@ def client() -> TestClient:
 
 
 class TestHealth:
-    def test_health_reports_liveness_with_the_version(self, client: TestClient) -> None:
-        resp = client.get("/health")
+    def test_livez_reports_liveness_with_the_version(self, client: TestClient) -> None:
+        resp = client.get("/livez")
         assert resp.status_code == 503
         assert set(resp.json()) == {"status", "version"}
 

@@ -1,4 +1,4 @@
-"""/livez, /readyz and /health over a real SessionManager (no DB: tests/integration covers it).
+"""/livez and /readyz over a real SessionManager (no DB: tests/integration covers it).
 
 The session side is the real seam (``SessionManager.health_snapshot`` on running paper sessions
 with fake ccxt clients); the DB pool is an in-memory trading_sessions table plus the readiness
@@ -502,7 +502,6 @@ class TestLiveness:
 
         probe.clock.mono += 3 * probe.monitor.interval_s + 1
         assert (await probe.client.get("/livez")).status_code == 503
-        assert (await probe.client.get("/health")).status_code == 503
 
         await probe.monitor.run_once()
         assert (await probe.client.get("/livez")).status_code == 200
@@ -517,16 +516,14 @@ class TestLiveness:
 class TestRealApp:
     def test_probes_are_503_before_the_lifespan_and_public(self) -> None:
         client = TestClient(real_app, headers={"Authorization": ""})
-        for path in ("/livez", "/health", "/readyz"):
+        for path in ("/livez", "/readyz"):
             assert client.get(path).status_code == 503, path
 
-    def test_livez_after_startup_and_health_is_an_alias(self) -> None:
+    def test_livez_after_startup_and_readyz_needs_a_db(self) -> None:
         with TestClient(real_app) as client:
             livez = client.get("/livez")
-            health = client.get("/health")
             readyz = client.get("/readyz")
         assert livez.status_code == 200
-        assert (health.status_code, health.json()) == (livez.status_code, livez.json())
         assert readyz.status_code == 503
         assert readyz.json()["checks"]["db"] == {
             "ok": False,
