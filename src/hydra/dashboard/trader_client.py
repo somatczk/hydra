@@ -22,6 +22,10 @@ from hydra.services.errors import ServiceError, error_detail, service_error
 from hydra.services.sessions import QuickTradeRequest, StartSessionRequest
 
 _UNREACHABLE = "The trading engine is unreachable (HYDRA_TRADER__URL)"
+_TIMED_OUT = (
+    "The trading engine did not answer within {timeout}s — the operation may still be "
+    "executing; check the session or order state before re-submitting"
+)
 
 
 def _snapshot_from_body(body: dict[str, Any]) -> HealthSnapshot:
@@ -49,6 +53,7 @@ class RemoteTrader:
         if url is None:
             raise ValueError("RemoteTrader needs trader.url (HYDRA_TRADER__URL)")
         token = cfg.api_token.get_secret_value() if cfg.api_token is not None else None
+        self._timeout_s = cfg.trader.timeout_s
         self._client = httpx.AsyncClient(
             base_url=url,
             timeout=cfg.trader.timeout_s,
@@ -75,6 +80,11 @@ class RemoteTrader:
     ) -> Any:
         try:
             response = await self._client.request(method, path, json=json, params=params)
+        except httpx.TimeoutException as exc:
+            # a timeout is in-flight-unknown, not a not-applied — the op may be executing
+            raise service_error(
+                503, "engine_unreachable", _TIMED_OUT.format(timeout=self._timeout_s), "unavailable"
+            ) from exc
         except httpx.RequestError as exc:
             raise service_error(503, "engine_unreachable", _UNREACHABLE, "unavailable") from exc
         if response.status_code >= 400:
@@ -137,7 +147,8 @@ class RemoteTrader:
                 "symbol": symbol,
                 "side": side,
                 "action": action,
-                "quantity": None if quantity is None else float(quantity),
+                # the Decimal-as-string shape model_dump(mode="json") uses — never float()
+                "quantity": None if quantity is None else str(quantity),
                 "strategy_id": strategy_id,
             },
         )

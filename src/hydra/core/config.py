@@ -262,7 +262,7 @@ class TraderConfig(_Section):
     """
 
     url: str | None = None
-    timeout_s: float = Field(10.0, gt=0)
+    timeout_s: float = Field(20.0, gt=0)
 
     @field_validator("url")
     @classmethod

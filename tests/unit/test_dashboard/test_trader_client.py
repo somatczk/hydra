@@ -10,6 +10,7 @@ network timeouts to hit).
 
 from __future__ import annotations
 
+import json
 import socket
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -200,6 +201,44 @@ class TestRemoteTrader:
                 await remote.list_sessions()
         assert exc_info.value.status_code == 503
         assert exc_info.value.detail["code"] == "engine_unreachable"
+
+    async def test_a_timeout_says_the_op_may_still_be_executing(self) -> None:
+        class Slow(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                raise httpx.ReadTimeout("read timed out")
+
+        async with RemoteTrader(_cfg(timeout_s=7.5), transport=Slow()) as remote:
+            with pytest.raises(ServiceError) as exc_info:
+                await remote.list_sessions()
+        message = exc_info.value.detail["message"]
+        assert "within 7.5s" in message
+        assert "may still be executing" in message
+        assert "check the session or order state before re-submitting" in message
+
+    async def test_a_refused_connection_is_genuinely_unreachable(self) -> None:
+        class Refused(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("connection refused")
+
+        async with RemoteTrader(_cfg(), transport=Refused()) as remote:
+            with pytest.raises(ServiceError) as exc_info:
+                await remote.list_sessions()
+        message = exc_info.value.detail["message"]
+        assert "unreachable" in message
+        assert "may still be executing" not in message
+
+    async def test_the_webhook_quantity_round_trips_exactly(self) -> None:
+        quantity = Decimal("0.123456789012345678901234")
+
+        class Echo(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, json={"sent": json.loads(request.content)})
+
+        async with RemoteTrader(_cfg(), transport=Echo()) as remote:
+            body = await remote.webhook_signal(
+                symbol="BTCUSDT", side="buy", action="entry", quantity=quantity, strategy_id="s"
+            )
+        assert body["sent"]["quantity"] == "0.123456789012345678901234"
 
     async def test_aclose_closes_the_client(self, remote: RemoteTrader) -> None:
         client = remote._client

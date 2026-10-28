@@ -385,11 +385,7 @@ jobs:
                 | jq -e 'select(.logger == "uvicorn.error" and .level == "info" and .timestamp != null)'
               docker logs smoke 2>&1 | jq -s -e 'all(has("level") and has("timestamp"))' >/dev/null
               docker exec smoke python -c "import hydra.dashboard.api"
-              # the two-process split (R15): a user-defined network (the trader and the API
-              # both bind :8000, so --network host cannot host both), HYDRA_TRADER__URL wired
-              # to the trader's hostname, and the PG/Redis host ports reached through the
-              # host gateway. Both boots run in this one job: the single-container flow above
-              # (unset = today) and the split below (set = RemoteTrader).
+              # the two-process split (R15): a user-defined network (both bind :8000, so no --network host)
               docker rm -f smoke
               docker network create hydra-smoke
               SPLIT_DB="-e DATABASE_URL=postgresql://hydra:test@host.docker.internal:${PG_PORT}/hydra_test -e REDIS_URL=redis://host.docker.internal:${REDIS_PORT}/0"
@@ -408,8 +404,7 @@ jobs:
                 -e HYDRA_TRADER__URL="http://hydra-trader:8000" \
                 "$IMAGE:smoke"
               wait_for curl -fsS -o /dev/null http://localhost:8000/livez
-              # the trader finishes booting after the API (it waits for the migrations),
-              # so readiness — unlike liveness — needs the wait
+              # the trader boots after the API (it waits for the migrations), so readiness needs the wait
               wait_for curl -fsS -o /dev/null http://localhost:8000/readyz
               ready=$(curl -fsS http://localhost:8000/readyz)
               echo "$ready"

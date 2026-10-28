@@ -780,6 +780,9 @@ class TestKillSwitchDbLatch:
         assert detail["apply_window_s"] == 60
         assert "latched in the database" in detail["message"]
         assert "60 seconds" in detail["message"]
+        # honest about what a down trader does: nothing applies until it returns
+        assert "once it returns" in detail["message"]
+        assert "nothing applies while it is down" in detail["message"]
         assert any("kill_switch_active = TRUE" in s for s in pool.statements)
         assert any("INSERT INTO risk_events" in s for s in pool.statements)
 
@@ -817,4 +820,9 @@ class TestKillSwitchDbLatch:
             "DELETE", "/api/trading/kill-switch", json={"confirm": "RELEASE", "reason": "drill"}
         )
         assert resp.status_code == 503
-        assert resp.json()["detail"]["code"] == "engine_unreachable"
+        detail = resp.json()["detail"]
+        assert detail["code"] == "engine_unreachable"
+        # the release leg is honest the same way the activate leg is (R30/A7)
+        assert detail["latched"] is True
+        assert "stays LATCHED" in detail["message"]
+        assert "re-release it once the trader returns" in detail["message"]

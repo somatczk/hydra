@@ -401,6 +401,32 @@ class TestLiveStopGap:
         assert self._gap(session) is None
 
 
+class TestConcurrentStopAll:
+    async def test_two_concurrent_stop_alls_never_interleave_their_sweeps(self, h: Harness) -> None:
+        """R30/A4: a concurrent second caller waits — it must not sweep the same session."""
+
+        assert h.mgr is not None
+        session = _live_session(h.mgr, "swept-twice", _FakeLiveExecutor(), ["BTCUSDT"])
+        runtime = session._runtime
+        assert runtime is not None
+        real_flatten = runtime.flatten
+
+        async def slow_flatten() -> Any:
+            await asyncio.sleep(0.05)  # an unserialized second sweep would enter here
+            return await real_flatten()
+
+        runtime.flatten = slow_flatten
+
+        first = asyncio.create_task(h.mgr.stop_all(actor="operator", reason="drill"))
+        second = asyncio.create_task(h.mgr.stop_all(actor="db-latch", reason="drill"))
+        reports = await asyncio.gather(first, second)
+
+        assert runtime.flattens == 1  # one sweep: the second waited, then found it stopped
+        assert session.status == "stopped"
+        assert sorted(r.sessions_stopped for r in reports) == [0, 1]
+        assert [r.positions_remaining for r in reports] == [0, 0]
+
+
 class TestRaces:
     async def test_kill_switch_during_a_start_refuses_the_new_session(
         self, h: Harness, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch

@@ -29,6 +29,7 @@ from hydra.services.errors import ServiceError
 from hydra.services.sessions import (
     KillSwitchNotPersistedError,
     activate_kill_switch_fail_safe,
+    release_kill_switch_fail_safe,
 )
 
 # ---------------------------------------------------------------------------
@@ -122,7 +123,7 @@ async def _release_executor(deps: Any, params: dict[str, Any], actor: str) -> di
     """
     reason = str(params.get("reason") or "kill switch release")
     backend = _deps.trader_from(deps)
-    return await backend.release_kill_switch(actor, reason)
+    return await release_kill_switch_fail_safe(backend, actor, reason)
 
 
 def _approval_store() -> ApprovalStore:

@@ -68,8 +68,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             await _load_exchange_credentials(app)
             await _load_system_config(app)
         if cfg.trader.url is not None:
-            # the split (D5): the trader process owns the engine; this process never
-            # constructs a SessionManager, and every engine op goes through RemoteTrader
+            # the split (D5): no SessionManager here — every engine op goes through RemoteTrader
             from hydra.dashboard.trader_client import RemoteTrader
 
             app.state.session_manager = None

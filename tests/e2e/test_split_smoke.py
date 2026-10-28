@@ -181,7 +181,10 @@ async def _start_trader(dsn: str, token: str, port: int, market: ReplayMarket) -
         assert await current_revision(dsn) == head_revision()  # the API migrated first
         await trader_main.wait_for_schema(dsn)
         mgr = SessionManager(
-            db_pool=pool, config=cfg, clients=market.clients(history_window=WARMUP)
+            db_pool=pool,
+            config=cfg,
+            clients=market.clients(history_window=WARMUP),
+            cleanup_tick_s=0.1,  # the test drives the real cleanup tick, not a direct call
         )
         await mgr.startup()
         trader = Trader(cfg, pool, mgr)
@@ -273,9 +276,13 @@ async def _the_split_story(split: Split, market: ReplayMarket) -> None:
     )
     assert release.status_code == 503
     assert release.json()["detail"]["code"] == "engine_unreachable"
+    assert release.json()["detail"]["latched"] is True
 
-    # the trader's cleanup tick applies the latch exactly once, to the running session
-    await trader.mgr._apply_db_kill_switch_latch()
+    # the trader's real cleanup tick applies the latch exactly once, to the running session
+    for _ in range(300):
+        if trader.mgr.kill_switch_active() and session.status == "stopped":
+            break
+        await asyncio.sleep(0.1)
     assert trader.mgr.kill_switch_active() is True
     assert (session.status, session.positions_at_stop) == ("stopped", 0)
     rows = await _fetch(
@@ -283,7 +290,7 @@ async def _the_split_story(split: Split, market: ReplayMarket) -> None:
         "SELECT scope FROM risk_events WHERE kind = 'kill_switch_on' AND actor = 'db-latch'",
     )
     assert [r["scope"] for r in rows] == ["paper", "live"]  # both scope services (Q1)
-    await trader.mgr._apply_db_kill_switch_latch()
+    await asyncio.sleep(0.5)  # several real ticks: still exactly one application
     assert (
         len(
             await _fetch(

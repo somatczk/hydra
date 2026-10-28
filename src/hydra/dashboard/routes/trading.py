@@ -25,6 +25,7 @@ from hydra.services.sessions import (
     SessionStopNotPersistedError,
     StartSessionRequest,
     activate_kill_switch_fail_safe,
+    release_kill_switch_fail_safe,
 )
 
 router = APIRouter(prefix="/api/trading", tags=["trading"], route_class=ServiceErrorRoute)
@@ -311,7 +312,7 @@ async def activate_kill_switch(request: Request) -> dict[str, Any]:
 
     In the split layout an unreachable trader falls back to the DB latch (R7): the
     switch is latched durably, the answer is an honest 503 and the trader applies it
-    within its 60 s cleanup tick.
+    within its 60 s cleanup tick once it returns.
     """
     try:
         body = await activate_kill_switch_fail_safe(
@@ -339,8 +340,12 @@ async def activate_kill_switch(request: Request) -> dict[str, Any]:
 
 @router.delete("/kill-switch", response_model=KillSwitchResponse)
 async def release_kill_switch(body: KillSwitchRelease, request: Request) -> dict[str, Any]:
-    """Release the kill switch (``{"confirm": "RELEASE", "reason": ...}``)."""
-    d = await request_trader(request).release_kill_switch(_actor(request), body.reason)
+    """Release the kill switch (``{"confirm": "RELEASE", "reason": ...}``).
+
+    In the split layout an unreachable trader keeps the switch latched: the honest 503
+    says so (R30/A7) instead of implying the release might have landed.
+    """
+    d = await release_kill_switch_fail_safe(request_trader(request), _actor(request), body.reason)
     audit(getattr(request.state, "principal", None), "kill_switch_off", reason=body.reason)
     return d
 

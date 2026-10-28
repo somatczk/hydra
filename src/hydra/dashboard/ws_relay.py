@@ -10,7 +10,9 @@ is connected to. The relay closes the gap through the only durable shared state:
 ``{"event": "order_fill", "session_id": ..., "trade_id": ...}``
 
 Status transitions are not relayed (a trades cursor cannot see them); the session page's
-15 s detail poll covers them.
+15 s detail poll covers them — as does the serial-cursor late-commit window: a lower id
+committing after a higher one the relay already consumed is announced only by that poll,
+and the database stays the truth.
 """
 
 from __future__ import annotations

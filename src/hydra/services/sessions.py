@@ -488,6 +488,11 @@ def live_order_row(row: LiveOrderRecord) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 LATCH_APPLY_WINDOW_S = 60
+_LATCH_WINDOW_NOTE = (
+    "The trading engine could not be reached; the kill switch was latched in the database "
+    f"and the trader applies it within {LATCH_APPLY_WINDOW_S} seconds once it returns "
+    "(nothing applies while it is down)"
+)
 
 
 async def latch_kill_switch_db(pool: Any, actor: str, reason: str) -> None:
@@ -526,8 +531,8 @@ async def activate_kill_switch_fail_safe(
     """Activate through the backend; on ``engine_unreachable`` latch in the DB and 503.
 
     The 503 answers honestly: the latch is durable and the trader applies it within one
-    cleanup tick, but this call does NOT report sessions stopped — the engine never
-    answered, so nobody knows whether it is still running.
+    cleanup tick once it returns — but this call does NOT report sessions stopped — the
+    engine never answered, so nobody knows whether it is still running.
     """
     try:
         body: dict[str, Any] = await backend.activate_kill_switch(actor, reason)
@@ -541,12 +546,35 @@ async def activate_kill_switch_fail_safe(
             503,
             error_detail(
                 "engine_unreachable",
-                "The trading engine could not be reached; the kill switch was latched in "
-                f"the database and the trader applies it within {LATCH_APPLY_WINDOW_S} "
-                "seconds",
+                _LATCH_WINDOW_NOTE,
                 "unavailable",
                 latched=True,
                 apply_window_s=LATCH_APPLY_WINDOW_S,
+            ),
+        ) from exc
+
+
+async def release_kill_switch_fail_safe(backend: Any, actor: str, reason: str) -> dict[str, Any]:
+    """Release through the backend; an unreachable trader keeps the switch LATCHED (503).
+
+    Mirrors the activate leg's honest shape: nothing about the switch changes through a
+    dead trader — it stays ON until the trader returns and the release is re-fired.
+    """
+    try:
+        body: dict[str, Any] = await backend.release_kill_switch(actor, reason)
+        return body
+    except ServiceError as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        if exc.status_code != 503 or detail.get("code") != "engine_unreachable":
+            raise
+        raise ServiceError(
+            503,
+            error_detail(
+                "engine_unreachable",
+                "The trading engine could not be reached; the kill switch stays LATCHED "
+                "— re-release it once the trader returns",
+                "unavailable",
+                latched=True,
             ),
         ) from exc
 
