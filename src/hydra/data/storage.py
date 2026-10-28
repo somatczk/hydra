@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
@@ -58,6 +58,14 @@ _UPSERT_CACHE_ENTRY_SQL = """
         last_ts = GREATEST(entry.last_ts, EXCLUDED.last_ts),
         rows = entry.rows + EXCLUDED.rows,
         last_fetched_at = now()
+"""
+
+# The fetch engine's race rail: only status flips, never the range or the row count.
+_SET_CACHE_STATUS_SQL = """
+    INSERT INTO data_cache_entries AS entry
+        (exchange, symbol, timeframe, first_ts, last_ts, rows, status)
+    VALUES ($1, $2, $3, $4, $5, 0, $6)
+    ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET status = EXCLUDED.status
 """
 
 _EXISTING_KEYS_SQL = """
@@ -212,7 +220,7 @@ class MarketDataRepository:
     async def upsert_closed_bars(
         self,
         bars: list[tuple[str, str, Timeframe, OHLCV]],
-        source: str = "feed",
+        source: Literal["feed", "auto"] = "feed",
     ) -> tuple[int, int]:
         """Insert closed bars, correcting stored rows whose values differ.
 
@@ -267,6 +275,33 @@ class MarketDataRepository:
             source=source,
         )
         return (inserted, updated)
+
+    async def set_cache_status(
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+        status: Literal["fetching", "ready"],
+        first_ts: datetime,
+        last_ts: datetime,
+    ) -> None:
+        """Mark a dataset's cache-ledger row ``fetching`` or ``ready``.
+
+        The on-demand engine writes ``fetching`` before its first page and ``ready``
+        when it stops, so the sweeper never evicts a dataset mid-write. A dataset
+        without a ledger row gets one over the requested range with ``rows = 0``; an
+        existing row keeps its range and count untouched.
+        """
+        async with self._ensure_pool().acquire() as conn:
+            await conn.execute(
+                _SET_CACHE_STATUS_SQL,
+                exchange_id,
+                symbol,
+                str(timeframe),
+                first_ts,
+                last_ts,
+                status,
+            )
 
     async def get_bars(
         self,

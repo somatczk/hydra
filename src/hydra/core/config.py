@@ -279,6 +279,21 @@ class MlConfig(_Section):
     inference_timeout_ms: int = Field(50, gt=0)
 
 
+class DataConfig(_Section):
+    """On-demand market-data fetching (the backtest data guarantee).
+
+    ``auto_fetch_enabled`` is the kill switch: false restores the exact P0-B
+    submit-time 422 behaviour. The fetch budget is a static split — the engine's
+    bucket is capped, feeds and warm-ups stay uncapped — and ``fetch_max_bars`` is
+    the per-job disk safety net until the cache sweeper lands.
+    """
+
+    auto_fetch_enabled: bool = True
+    fetch_weight_per_min: int = Field(900, gt=0, le=6000)
+    fetch_patience_s: int = Field(900, gt=0)
+    fetch_max_bars: int = Field(2_000_000, gt=0)
+
+
 class PlatformConfig(_Section):
     """Platform metadata. The version is the package version, never a config value."""
 
@@ -311,6 +326,7 @@ class HydraConfig(BaseSettings):
     mcp: McpConfig = Field(default_factory=McpConfig)
     ml: MlConfig = Field(default_factory=MlConfig)
     trader: TraderConfig = Field(default_factory=TraderConfig)
+    data: DataConfig = Field(default_factory=DataConfig)
 
     database_url: SecretStr | None = Field(None, validation_alias="DATABASE_URL")
     redis_url: SecretStr | None = Field(None, validation_alias="REDIS_URL")

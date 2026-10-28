@@ -8,6 +8,7 @@ from itertools import pairwise
 from typing import Any, Literal
 
 from hydra.core.types import OHLCV, Timeframe
+from hydra.data.errors import NoMarketDataError as NoMarketDataError
 from hydra.data.storage import MarketDataRepository
 
 TIMEFRAME_SECONDS: dict[Timeframe, int] = {
@@ -52,59 +53,6 @@ class DataProvenance:
             "requested_start": _iso(self.requested_start),
             "requested_end": _iso(self.requested_end),
             "data_source": self.data_source,
-        }
-
-
-class NoMarketDataError(Exception):
-    """No stored bars for the exchange/symbol/timeframe in the requested range."""
-
-    def __init__(
-        self,
-        exchange: str,
-        symbol: str,
-        timeframe: Timeframe,
-        requested_start: datetime | None,
-        requested_end: datetime | None,
-        available_first_ts: datetime | None,
-        available_last_ts: datetime | None,
-    ) -> None:
-        self.exchange = exchange
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.requested_start = requested_start
-        self.requested_end = requested_end
-        self.available_first_ts = available_first_ts
-        self.available_last_ts = available_last_ts
-        super().__init__(self.message)
-
-    @property
-    def message(self) -> str:
-        where = f"{self.exchange} {self.symbol} {self.timeframe}"
-        if self.requested_start is not None and self.requested_end is not None:
-            wanted = f" between {_iso(self.requested_start)} and {_iso(self.requested_end)}"
-        else:
-            wanted = ""
-        if self.available_first_ts is not None and self.available_last_ts is not None:
-            available = (
-                f"available: {_iso(self.available_first_ts)} to {_iso(self.available_last_ts)}"
-            )
-        else:
-            available = "available: none stored"
-        return f"No market data for {where}{wanted}; {available}"
-
-    def to_detail(self) -> dict[str, Any]:
-        """Body for the shared error envelope (``state`` = ``no_data``)."""
-        return {
-            "code": "no_market_data",
-            "message": self.message,
-            "state": "no_data",
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "timeframe": str(self.timeframe),
-            "requested_start": _iso(self.requested_start),
-            "requested_end": _iso(self.requested_end),
-            "available_first_ts": _iso(self.available_first_ts),
-            "available_last_ts": _iso(self.available_last_ts),
         }
 
 

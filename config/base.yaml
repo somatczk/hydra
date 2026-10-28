@@ -25,3 +25,9 @@ api:
 ml:
   models_dir: /app/models
   inference_timeout_ms: 5
+
+data:
+  auto_fetch_enabled: true
+  fetch_weight_per_min: 900
+  fetch_patience_s: 900
+  fetch_max_bars: 2000000
