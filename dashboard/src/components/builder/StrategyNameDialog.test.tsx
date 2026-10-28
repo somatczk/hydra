@@ -77,7 +77,7 @@ describe('StrategyNameDialog', () => {
 
     expect(dialog().open).toBe(true);
     expect(dialog().tagName).toBe('DIALOG');
-    const name = inputByLabel(dialog(), 'Strategy Name');
+    const name = inputByLabel(dialog(), 'Strategy name');
     expect(document.activeElement).toBe(name);
     expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(true);
 

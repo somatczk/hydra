@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
+import { signed, signedLabel } from '@/lib/format';
 import { formatUtc, type DataProvenance } from '@/components/backtest/DataProvenance';
 import type { PreviewResponse, PreviewSignal, BuilderState, SerializedConditionGroup } from './types';
 
@@ -112,36 +113,34 @@ export function SignalPreview({ state }: SignalPreviewProps) {
                 {preview.provenance.gap_count ? ` (${preview.provenance.gap_count} gaps)` : ''}
               </p>
             )}
-            {/* Metrics */}
+            {/* Metric values truncate: a large PnL is one unbreakable token that would overflow the ~76px cell at 320px. */}
             <div className="grid grid-cols-3 gap-3">
-              <div className="rounded-lg border border-line bg-surface p-3 text-center">
+              <div className="min-w-0 rounded-lg border border-line bg-surface p-3 text-center">
                 <BarChart3 className="mx-auto h-5 w-5 text-ink-2 mb-1" />
-                <p className="text-lg font-bold text-ink-1 font-display">
+                <p className="truncate text-lg font-bold text-ink-1 font-display">
                   {preview.metrics.trades}
                 </p>
                 <p className="text-xs text-ink-2">Trades</p>
               </div>
-              <div className="rounded-lg border border-line bg-surface p-3 text-center">
+              <div className="min-w-0 rounded-lg border border-line bg-surface p-3 text-center">
                 <TrendingUp className="mx-auto h-5 w-5 text-ink-2 mb-1" />
-                <p className="text-lg font-bold text-ink-1 font-display">
+                <p className="truncate text-lg font-bold text-ink-1 font-display">
                   {(preview.metrics.win_rate * 100).toFixed(1)}%
                 </p>
                 <p className="text-xs text-ink-2">Win Rate</p>
               </div>
-              <div className="rounded-lg border border-line bg-surface p-3 text-center">
+              <div className="min-w-0 rounded-lg border border-line bg-surface p-3 text-center">
                 {preview.metrics.pnl >= 0 ? (
-                  <TrendingUp className="mx-auto h-5 w-5 text-ink-1 mb-1" />
+                  <TrendingUp className="mx-auto h-5 w-5 text-ink-2 mb-1" />
                 ) : (
-                  <TrendingDown className="mx-auto h-5 w-5 text-danger mb-1" />
+                  <TrendingDown className="mx-auto h-5 w-5 text-ink-2 mb-1" />
                 )}
-                <p
-                  className={`text-lg font-bold font-display ${
-                    preview.metrics.pnl >= 0 ? 'text-ink-1' : 'text-danger'
-                  }`}
-                >
-                  ${preview.metrics.pnl.toFixed(2)}
+                <p className="truncate text-lg font-bold text-ink-1 font-display">
+                  {/* Signed money carries no colour; AT hears gain/loss (05 §5). */}
+                  <span aria-hidden="true">{signed(preview.metrics.pnl)}</span>
+                  <span className="sr-only">{signedLabel(preview.metrics.pnl) ?? 'not available'}</span>
                 </p>
-                <p className="text-xs text-ink-2">PnL</p>
+                <p className="text-xs text-ink-2">PnL (USDT)</p>
               </div>
             </div>
 

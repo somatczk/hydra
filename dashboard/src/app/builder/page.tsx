@@ -560,7 +560,7 @@ function BuilderPageContent() {
           onClick={() => setSaveDialogOpen(true)}
         >
           <Save className="h-4 w-4" />
-          {state.editingId ? 'Update Strategy' : 'Save Strategy'}
+          {state.editingId ? 'Update strategy' : 'Save strategy'}
         </Button>
         <Button
           variant="outline"
@@ -568,7 +568,7 @@ function BuilderPageContent() {
           onClick={handleSaveAndBacktest}
         >
           <FlaskConical className="h-4 w-4" />
-          Save & Backtest
+          Save & backtest
         </Button>
       </div>
 

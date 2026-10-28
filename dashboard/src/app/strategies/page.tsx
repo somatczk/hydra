@@ -12,22 +12,15 @@ import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBad
 import { describeApiError, stateFromError } from '@/lib/apiState';
 import { usePoll } from '@/hooks/usePoll';
 import { logger } from '@/lib/logger';
-import { signed, signedLabel, utc } from '@/lib/format';
+import { pct, signed, signedLabel, utc } from '@/lib/format';
+import type { SessionResponse } from '@/lib/derive';
+import { useShellStatus } from '@/components/shell/ShellStatusProvider';
 import { ResearchNav } from '@/components/research/ResearchNav';
 import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { StrategyDriftPanel, type StrategyDrift } from '@/components/strategies/StrategyDriftPanel';
 
 /* ---------- Types ---------- */
-
-interface TradingSession {
-  session_id: string;
-  strategy_id: string;
-  trading_mode: string;
-  status: string;
-  started_at: string | null;
-  stopped_at: string | null;
-}
 
 interface StrategyPerformance {
   total_pnl: number;
@@ -48,14 +41,14 @@ interface BuilderStrategy {
 
 /* ---------- Helpers ---------- */
 
-function sessionStatusLabel(session: TradingSession | null): string {
+function sessionStatusLabel(session: SessionResponse | null): string {
   if (!session) return '';
   const mode = session.trading_mode === 'paper' ? 'Paper Running' : 'Live Running';
   const at = session.started_at ? utc(session.started_at) : null;
   return at ? `${mode} · ${at}` : mode;
 }
 
-function sessionStatusVariant(session: TradingSession | null): 'success' | 'warning' | 'info' | 'neutral' {
+function sessionStatusVariant(session: SessionResponse | null): 'success' | 'warning' | 'info' | 'neutral' {
   if (!session) return 'neutral';
   return session.trading_mode === 'paper' ? 'info' : 'warning';
 }
@@ -70,9 +63,9 @@ function sharpeClass(v: number | null): string {
 export default function StrategiesPage() {
   const router = useRouter();
   const { toast } = useToast();
+  // The shell already polls the session list and system config; this page reads its context (A3-second).
+  const { sessions, config } = useShellStatus();
   const list = usePoll<BuilderStrategy[]>('/api/strategies', 30_000);
-  const sessions = usePoll<TradingSession[]>('/api/trading/sessions', 30_000);
-  const config = usePoll<{ trading_mode: string }>('/api/system/config', 30_000);
 
   const [perfMap, setPerfMap] = useState<Record<string, StrategyPerformance>>({});
   const [perfErrors, setPerfErrors] = useState<Record<string, unknown>>({});
@@ -150,7 +143,7 @@ export default function StrategiesPage() {
   const loading = list.state === 'loading';
   const loadError = list.error;
 
-  const sessionFor = (id: string): TradingSession | null =>
+  const sessionFor = (id: string): SessionResponse | null =>
     (sessions.data ?? []).find((s) => s.strategy_id === id && s.status === 'running') ?? null;
 
   const handleToggle = async (id: string) => {
@@ -357,7 +350,7 @@ export default function StrategiesPage() {
                   </div>
                   <div className="text-center">
                     <p className="text-sm font-bold text-ink-1">
-                      {performance.win_rate.toFixed(1)}%
+                      {pct(performance.win_rate)}
                     </p>
                     <p className="text-xs text-ink-2">Win rate</p>
                   </div>
@@ -381,7 +374,7 @@ export default function StrategiesPage() {
                       'text-sm font-bold',
                       performance.max_drawdown === null ? 'text-ink-2' : 'text-danger',
                     )}>
-                      {performance.max_drawdown === null ? '—' : `${performance.max_drawdown.toFixed(1)}%`}
+                      {performance.max_drawdown === null ? '—' : pct(performance.max_drawdown)}
                     </p>
                     <p className="text-xs text-ink-2">Max DD</p>
                   </div>
