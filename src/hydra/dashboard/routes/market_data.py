@@ -1,4 +1,4 @@
-"""Market data endpoints: funding rates, order book depth."""
+"""Market data endpoints: funding rates, order book depth, the top-100 universe."""
 
 from __future__ import annotations
 
@@ -12,9 +12,15 @@ from ccxt.base.errors import BadSymbol, BaseError
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from hydra.dashboard.routes._db import api_error, db_errors_to_503, require_pool
+from hydra.dashboard.routes._db import (
+    ServiceErrorRoute,
+    api_error,
+    db_errors_to_503,
+    require_pool,
+)
+from hydra.services import universe as universe_svc
 
-router = APIRouter(prefix="/api/market", tags=["market"])
+router = APIRouter(prefix="/api/market", tags=["market"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +51,24 @@ class OrderBookSnapshot(BaseModel):
     spread: float
     timestamp: str | None  # exchange time; None when the exchange does not report one
     fetched_at: str
+
+
+class UniverseMember(BaseModel):
+    rank: int
+    symbol: str  # the exchange market id, no slash (BTCUSDT)
+    quote_volume: float
+
+
+class UniverseSnapshot(BaseModel):
+    """The stored top-100 USDT-quoted universe, with the ranking's provenance and age."""
+
+    exchange_id: str
+    quote_asset: str
+    source: str
+    ranked_at: str
+    age_hours: float
+    count: int
+    symbols: list[UniverseMember]
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +133,22 @@ async def get_current_funding_rates(
         }
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Universe: the stored top-100 ranking (refreshed daily by the lifespan)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/universe", response_model=UniverseSnapshot)
+async def get_universe(request: Request) -> dict[str, Any]:
+    """The stored top-100 universe: USDT-quoted Binance spot pairs by 24h quote volume.
+
+    Serves the stored ranking however stale; before the first refresh has landed it is
+    a 503 ``universe_unavailable`` — never a fabricated or partial list. No exchange
+    call: the refresher owns refreshing, this reads the stored truth.
+    """
+    return await universe_svc.read_universe(require_pool(request))
 
 
 # ---------------------------------------------------------------------------

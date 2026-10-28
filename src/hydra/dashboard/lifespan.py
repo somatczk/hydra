@@ -7,15 +7,19 @@ process split) a :class:`~hydra.dashboard.trader_client.RemoteTrader` is bound o
 single-process engine starts here (``SessionManager.startup()``: risk state, recovery, display
 rows) with its ``LocalTrader`` backend. Then the MCP mount (only when ``HYDRA_MCP_TOKEN`` is set:
 no token, no ``/mcp`` surface) and the HealthMonitor (first readiness run; ``/livez`` turns
-green — the engine-side full set, or the split set with the remote-trader check). Shutdown closes
-the MCP session manager, unmounts ``/mcp`` and resets ``app.state.mcp`` (the session manager is
+green — the engine-side full set, or the split set with the remote-trader check), then the
+universe refresher (the daily top-100 ranking, only with a pool; a refresh failure logs a
+warning and retries hourly, never blocking startup or readiness). Shutdown cancels the
+universe refresher first, then closes the MCP session manager, unmounts ``/mcp`` and
+resets ``app.state.mcp`` (the session manager is
 single-use, so a re-entered lifespan remounts a fresh transport instead of finding the closed
 mount shadowing it), then stops the monitor. Any startup error propagates, so uvicorn exits
 non-zero instead of serving without a schema or a key. Without DATABASE_URL (dev only) there is
 no pool, no migration and no key requirement. ``app.state.session_clients`` (a
 ``ClientFactory``), when set before startup, replaces the public exchange clients of every
 session, and ``app.state.health_monitor_factory`` builds the ``HealthMonitor`` (the paper smoke
-test injects its fakes and a monitor clock there).
+test injects its fakes and a monitor clock there), as does
+``app.state.universe_refresher_factory`` for the universe refresher.
 """
 
 from __future__ import annotations
@@ -54,6 +58,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_manager = None
     app.state.trader = None
     app.state.health_monitor = None
+    app.state.universe_refresher = None
     clients: ClientFactory | None = getattr(app.state, "session_clients", None)
     mcp_stack: AsyncExitStack | None = None
     try:
@@ -82,8 +87,10 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             mcp_stack = AsyncExitStack()
             await mcp_stack.enter_async_context(app.state.mcp.session_manager.run())
         await _start_health_monitor(app)
+        await _start_universe_refresher(app)
         yield
     finally:
+        await _stop_universe_refresher(app)
         if mcp_stack is not None:
             await mcp_stack.aclose()
         _unmount_mcp(app)
@@ -219,6 +226,30 @@ async def _start_health_monitor(app: FastAPI) -> None:
     await monitor.start()
 
 
+def _default_universe_refresher(app: FastAPI) -> Any:
+    from hydra.services.universe import default_refresher
+
+    return default_refresher(app.state.db_pool)
+
+
+async def _start_universe_refresher(app: FastAPI) -> None:
+    """Start the background universe refresher; only with a pool, never a check.
+
+    A refresh failure is caught inside the refresher's loop (warning + hourly retry),
+    so startup and readiness never depend on it. Tests and the smoke install their own
+    through ``app.state.universe_refresher_factory`` — the ``health_monitor_factory``
+    pattern — so no test ever needs Binance egress.
+    """
+    if getattr(app.state, "db_pool", None) is None:
+        return
+    factory: Callable[[FastAPI], Any] = (
+        getattr(app.state, "universe_refresher_factory", None) or _default_universe_refresher
+    )
+    refresher = factory(app)
+    app.state.universe_refresher = refresher
+    await refresher.start()
+
+
 # ---------------------------------------------------------------------------
 # Shutdown steps
 # ---------------------------------------------------------------------------
@@ -244,6 +275,12 @@ async def _stop_health_monitor(app: FastAPI) -> None:
     monitor = getattr(app.state, "health_monitor", None)
     if monitor is not None:
         await monitor.stop()
+
+
+async def _stop_universe_refresher(app: FastAPI) -> None:
+    refresher = getattr(app.state, "universe_refresher", None)
+    if refresher is not None:
+        await refresher.stop()
 
 
 async def _shutdown_session_manager(app: FastAPI) -> None:

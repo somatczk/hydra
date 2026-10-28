@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -224,6 +226,7 @@ class TestLifespanClosesClients:
             "_load_exchange_credentials",
             "_load_system_config",
             "_init_session_manager",
+            "_start_universe_refresher",
             "_shutdown_session_manager",
             "_close_db_pool",
         ]
@@ -234,6 +237,69 @@ class TestLifespanClosesClients:
                 app.state.market_data_clients = {"binance": fake}
         assert fake.closed == 1
         assert app.state.market_data_clients == {}
+
+
+class TestUniverse:
+    """GET /api/market/universe: the stored ranking, or the 503 — never a fabricated list."""
+
+    @staticmethod
+    def _pool(row: dict[str, Any] | None) -> MagicMock:
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=row)
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+        pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        return pool
+
+    def test_seeded_row_is_served_in_rank_order_with_provenance(self) -> None:
+        ranked_at = datetime.now(UTC) - timedelta(hours=2)
+        row = {
+            "value": json.dumps(
+                {
+                    "exchange_id": "binance",
+                    "quote_asset": "USDT",
+                    "source": "binance spot rolling-24h quote volume (GET /api/v3/ticker/24hr)",
+                    "ranked_at": ranked_at.isoformat(),
+                    "count": 3,
+                    "symbols": [
+                        {"rank": 1, "symbol": "BTCUSDT", "quote_volume": 1000.0},
+                        {"rank": 2, "symbol": "ETHUSDT", "quote_volume": 500.0},
+                        {"rank": 3, "symbol": "SOLUSDT", "quote_volume": 250.0},
+                    ],
+                }
+            )
+        }
+        resp = TestClient(_make_app(pool=self._pool(row))).get("/api/market/universe")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["exchange_id"] == "binance"
+        assert body["quote_asset"] == "USDT"
+        assert body["source"] == "binance spot rolling-24h quote volume (GET /api/v3/ticker/24hr)"
+        assert body["ranked_at"] == ranked_at.isoformat()
+        assert body["age_hours"] == pytest.approx(2.0, abs=0.01)
+        assert body["count"] == 3
+        assert [entry["rank"] for entry in body["symbols"]] == [1, 2, 3]
+        assert [entry["symbol"] for entry in body["symbols"]] == [
+            "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+        ]
+        assert [entry["quote_volume"] for entry in body["symbols"]] == [1000.0, 500.0, 250.0]
+
+    def test_no_row_is_the_503_universe_unavailable_envelope_never_an_empty_list(self) -> None:
+        resp = TestClient(_make_app(pool=self._pool(None))).get("/api/market/universe")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == {
+            "code": "universe_unavailable",
+            "message": "The top-100 universe has not been computed yet",
+            "state": "unavailable",
+        }
+        assert resp.json() != []
+
+    def test_no_pool_is_the_503_database_envelope(self) -> None:
+        resp = TestClient(_make_app(pool=None)).get("/api/market/universe")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "database_unavailable"
 
 
 class TestFundingRates:
