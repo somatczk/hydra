@@ -864,6 +864,39 @@
         "graphMode": "none",
         "textMode": "value"
       }
+    },
+    {
+      "id": 800,
+      "type": "row",
+      "title": "Data Cache",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 74 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Data Cache",
+      "description": "Estimated size of the auto-fetched bar cache against its configured budget (HydraDataCacheOverBudget when over for 1h)",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 75 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "hydra_data_cache_bytes / 1024 / 1024 / 1024",
+          "legendFormat": "Cache (GB)"
+        },
+        {
+          "refId": "B",
+          "expr": "hydra_data_cache_budget_bytes / 1024 / 1024 / 1024",
+          "legendFormat": "Budget (GB)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "gbytes", "min": 0 }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
     }
   ],
   "annotations": {

@@ -920,3 +920,77 @@ tests:
       - eval_time: 6m
         alertname: HydraPaperPersistDirty
         exp_alerts: []
+
+  - name: data cache 2 GiB over budget fires at 1h
+    interval: 1m
+    input_series:
+      - series: hydra_data_cache_bytes
+        values: "12884901888x70"
+      - series: hydra_data_cache_budget_bytes
+        values: "10737418240x70"
+    alert_rule_test:
+      - eval_time: 59m
+        alertname: HydraDataCacheOverBudget
+        exp_alerts: []
+      - eval_time: 61m
+        alertname: HydraDataCacheOverBudget
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Auto-fetched data cache over budget"
+              description: "The auto-fetched bar cache holds 12GiB, over its configured budget for 1h — one default sweep interval (1h; data.sweep_interval_s overrides may shift the response window) — so the sweeper has not reclaimed the excess. Check hydra_data_sweep_errors_total and the sweeper logs."
+
+  - name: data cache at or below the budget does not fire
+    interval: 1m
+    input_series:
+      - series: hydra_data_cache_bytes
+        values: "9663676416x35 10737418240x70"
+      - series: hydra_data_cache_budget_bytes
+        values: "10737418240x105"
+    alert_rule_test:
+      - eval_time: 104m
+        alertname: HydraDataCacheOverBudget
+        exp_alerts: []
+
+  - name: data cache in zero-budget mode (budget_bytes=0, delete-after-run) does not fire
+    interval: 1m
+    input_series:
+      - series: hydra_data_cache_bytes
+        values: "12884901888x70"
+      - series: hydra_data_cache_budget_bytes
+        values: "0x70"
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: HydraDataCacheOverBudget
+        exp_alerts: []
+
+  - name: sweep stalled at a 2.5h gap fires
+    interval: 1m
+    input_series:
+      - series: hydra_data_sweep_last_timestamp_seconds
+        values: "0x155"
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: HydraDataSweepStalled
+        exp_alerts: []
+      - eval_time: 151m
+        alertname: HydraDataSweepStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: infra
+            exp_annotations:
+              summary: "Hydra data cache sweeper stalled"
+              description: "The data cache sweeper last completed a cycle 9060 seconds ago, over two sweep intervals; the cache can grow past its budget unchecked. Check hydra_data_sweep_errors_total and the sweeper logs."
+
+  - name: sweep completing its hourly cycles does not fire
+    interval: 1m
+    input_series:
+      - series: hydra_data_sweep_last_timestamp_seconds
+        values: "0x60 3600x60 7200x60"
+    alert_rule_test:
+      - eval_time: 179m
+        alertname: HydraDataSweepStalled
+        exp_alerts: []
