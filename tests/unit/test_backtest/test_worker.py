@@ -21,9 +21,20 @@ import pytest
 import yaml
 
 from hydra.backtest import worker
-from hydra.backtest.jobs import BacktestRunRequest, summary_from_row
+from hydra.backtest.jobs import (
+    BacktestRunRequest,
+    HyperoptRunRequest,
+    ParamDefRequest,
+    WalkForwardRunRequest,
+    summary_from_row,
+)
+from hydra.core.config import DataConfig, HydraConfig
+from hydra.core.types import Timeframe
+from hydra.data.backfill import GapRange
+from hydra.data.errors import DataFetchError, NoMarketDataError
 from hydra.services.backtest import _preflight
 from hydra.strategy.config import StrategyConfig
+from tests.fixtures.binance_kline import FakeRestExchange
 
 _RULES = {
     "entry_long": {
@@ -205,84 +216,432 @@ async def _preflighted(strategy_id: str, body: BacktestRunRequest) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Handlers
+# The on-demand fetch phase: one engine per worker, progress 0→20
 # ---------------------------------------------------------------------------
 
+_T0 = datetime(2026, 1, 1, tzinfo=UTC)
+_T1 = datetime(2026, 1, 1, 19, tzinfo=UTC)
+_RANGE = [[_T0.isoformat(), _T1.isoformat()]]  # one gap of 20 hourly bars
 
-# ---------------------------------------------------------------------------
-# fetch_fresh uses the async REST factory
-# ---------------------------------------------------------------------------
 
-
-async def test_fetch_fresh_uses_the_async_rest_factory(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The backfill gets an async REST client; the sync client made every fetch_fresh fail.
-
-    A sync ccxt client's ``fetch_ohlcv`` returns a list, so awaiting it raised TypeError and
-    fetch_fresh silently fell back to stored bars (D1 behaviour).
-    """
-    import inspect
-
-    from hydra.backtest import jobs
-
-    seen: dict[str, Any] = {}
-
-    class _Backfill:
-        def __init__(self, *, repository: Any, exchange_factories: dict[str, Any]) -> None:
-            seen["factories"] = exchange_factories
-
-        async def bulk_download(self, **kwargs: Any) -> None:
-            client = seen["factories"]["binance"]()
-            try:
-                seen["fetch_is_coroutine"] = inspect.iscoroutinefunction(client.fetch_ohlcv)
-            finally:
-                await client.close()
-
-        async def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(jobs, "ExchangeBackfillService", _Backfill)
-    config = StrategyConfig(
-        id="fresh",
-        name="Fresh",
+def _fetch_config() -> StrategyConfig:
+    return StrategyConfig(
+        id="fetch",
+        name="Fetch",
         strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
-        symbols=["BTCUSDT"],
         parameters={"rules": _RULES, "required_history": 10},
     )
 
-    start, end = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)
-    error = await jobs.fetch_fresh_bars(object(), config, start, end)
 
-    assert error is None
-    assert seen["fetch_is_coroutine"] is True
+def _progress(state: str, bars: int, weight: int = 2, elapsed: int = 0) -> dict[str, Any]:
+    """The engine's progress dict, exactly the shape ``ensure_available`` emits."""
+    return {
+        "state": state,
+        "ranges": [list(pair) for pair in _RANGE],
+        "bars_fetched": bars,
+        "weight_spent": weight,
+        "elapsed_ms": elapsed,
+    }
 
 
-async def test_fetch_fresh_reports_the_error_and_still_returns(
-    monkeypatch: pytest.MonkeyPatch,
+class _FakeEngine:
+    """Stands in for ``OnDemandFetchService`` at the wiring seam, recording the call."""
+
+    def __init__(
+        self,
+        *,
+        emits: list[dict[str, Any]] | None = None,
+        error: Exception | None = None,
+        pause_s: float = 0.0,
+    ) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._emits = emits or []
+        self._error = error
+        self._pause_s = pause_s
+
+    async def ensure_available(
+        self,
+        repo: Any,
+        exchange: str,
+        symbol: str,
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime,
+        *,
+        force: bool = False,
+        on_progress: Any = None,
+    ) -> None:
+        self.calls.append(
+            {
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "start": start,
+                "end": end,
+                "force": force,
+            }
+        )
+        for progress in self._emits:
+            if on_progress is not None:
+                on_progress(progress)
+            if self._pause_s:
+                await asyncio.sleep(self._pause_s)
+        if self._error is not None:
+            raise self._error
+
+
+def _engine_call(body: Any, force: bool = False) -> dict[str, Any]:
+    """The exact ensure_available call every handler must make for ``body``."""
+    return {
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "timeframe": Timeframe.H1,
+        "start": body.start_date,
+        "end": body.end_date,
+        "force": force,
+    }
+
+
+async def test_the_kill_switch_skips_the_fetch_phase() -> None:
+    """No engine (auto_fetch_enabled=false): no fetch, no progress — today's behaviour."""
+    run = worker.JobRun()
+
+    await worker._ensure_bars(object(), None, _fetch_config(), _T0, _T1, run)
+
+    assert run.progress == 0.0
+    assert run.detail == {}
+
+
+async def test_the_fetch_phase_maps_the_engine_progress_onto_the_band() -> None:
+    """detail['fetch'] is the engine's dict verbatim; progress climbs 0→20 and stops there."""
+    run = worker.JobRun()
+    seen: list[float] = []
+    emits = [
+        _progress("fetching", 0, weight=0),
+        _progress("fetching", 10, weight=4, elapsed=5),
+        _progress("fetched", 20, weight=6, elapsed=9),
+    ]
+
+    class _Recorder:
+        async def ensure_available(self, *args: Any, on_progress: Any = None, **kw: Any) -> None:
+            for progress in emits:
+                if on_progress is not None:
+                    on_progress(progress)
+                seen.append(run.progress)
+
+    await worker._ensure_bars(object(), _Recorder(), _fetch_config(), _T0, _T1, run)
+
+    # 20 hourly bars owed: 10 fetched lands at 10.0, the final emit caps at 20.0
+    assert seen == [0.0, 10.0, 20.0]
+    assert run.progress == 20.0
+    assert run.detail["fetch"] == emits[-1]
+
+
+async def test_a_data_fetch_error_fails_the_phase_retryable_with_the_reason() -> None:
+    run = worker.JobRun()
+    error = DataFetchError(
+        "rate_limited",
+        "binance",
+        "BTCUSDT",
+        Timeframe.H1,
+        weight_spent=2,
+        elapsed_s=31.2,
+        remaining_ranges=[GapRange(start=_T0, end=_T1)],
+    )
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0)], error=error)
+
+    with pytest.raises(worker.JobError) as excinfo:
+        await worker._ensure_bars(object(), engine, _fetch_config(), _T0, _T1, run)
+
+    assert str(excinfo.value) == error.message
+    assert excinfo.value.__cause__ is error
+    assert run.detail["fetch"] == {
+        **_progress("fetching", 0, weight=0),
+        "state": "failed",
+        "reason": "rate_limited",
+    }
+    assert run.progress == 0.0
+
+
+async def test_a_range_the_exchange_lacks_keeps_the_no_market_data_vocabulary() -> None:
+    run = worker.JobRun()
+    error = NoMarketDataError("binance", "BTCUSDT", Timeframe.H1, _T0, _T1, None, None)
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0)], error=error)
+
+    with pytest.raises(NoMarketDataError) as excinfo:
+        await worker._ensure_bars(object(), engine, _fetch_config(), _T0, _T1, run)
+
+    assert excinfo.value is error  # the P0-B class re-raised unchanged, never wrapped
+    assert run.detail["fetch"]["state"] == "failed"
+
+
+async def test_backtest_handler_ensures_bars_through_the_engine_before_loading(
+    strategies_dir: Path,
 ) -> None:
-    from hydra.backtest import jobs
+    _write_strategy(strategies_dir, "saw")
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    pf = await _preflighted("saw", body)
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 60, timedelta(hours=1))
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 60)])
+    run = worker.JobRun()
 
-    class _Backfill:
-        def __init__(self, *, repository: Any, exchange_factories: dict[str, Any]) -> None:
-            pass
-
-        async def bulk_download(self, **kwargs: Any) -> None:
-            msg = "exchange is down"
-            raise OSError(msg)
-
-        async def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(jobs, "ExchangeBackfillService", _Backfill)
-    config = StrategyConfig(
-        id="fresh",
-        name="Fresh",
-        strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
-        symbols=["BTCUSDT"],
-        parameters={"rules": _RULES, "required_history": 10},
+    outcome = await worker.run_backtest_job(
+        _Pool(_BarsThenRecordedWrites(rows)), engine, _job(body, pf.config), run
     )
 
-    start, end = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)
-    assert await jobs.fetch_fresh_bars(object(), config, start, end) == "exchange is down"
+    assert engine.calls == [_engine_call(body)]
+    assert outcome.result_id == "bt-task-unit"
+    assert run.detail["fetch"] == _progress("fetched", 60)
+    assert run.detail["provenance"]["bar_count"] == 60
+
+
+async def test_fetch_fresh_maps_to_the_engine_force(strategies_dir: Path) -> None:
+    """body.fetch_fresh keeps its meaning: the whole range refetched (force=True)."""
+    _write_strategy(strategies_dir, "saw")
+    body = BacktestRunRequest(
+        strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03", fetch_fresh=True
+    )
+    pf = await _preflighted("saw", body)
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 60, timedelta(hours=1))
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 60)])
+    run = worker.JobRun()
+
+    outcome = await worker.run_backtest_job(
+        _Pool(_BarsThenRecordedWrites(rows)), engine, _job(body, pf.config), run
+    )
+
+    assert engine.calls == [_engine_call(body, force=True)]
+    assert outcome.result_id == "bt-task-unit"
+
+
+async def test_hyperopt_handler_ensures_bars_through_the_engine(strategies_dir: Path) -> None:
+    _write_strategy(strategies_dir, "saw")
+    body = HyperoptRunRequest(
+        strategy_id="saw",
+        start_date="2026-01-01",
+        end_date="2026-01-03",
+        method="grid",
+        max_trials=1,
+        param_space=[ParamDefRequest(name="sma_period", type="int", low=4, high=5)],
+    )
+    pf = await _preflighted("saw", body)
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 60, timedelta(hours=1))
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 60)])
+    run = worker.JobRun()
+
+    outcome = await worker.run_hyperopt_job(
+        _Pool(_BarsThenRecordedWrites(rows)), engine, _job(body, pf.config), run
+    )
+
+    assert engine.calls == [_engine_call(body)]
+    assert outcome.result is not None
+    assert outcome.result["provenance"]["bar_count"] == 60
+    assert run.detail["fetch"] == _progress("fetched", 60)
+    assert run.progress == 20.0
+
+
+async def test_walkforward_handler_ensures_bars_through_the_engine(strategies_dir: Path) -> None:
+    _write_strategy(strategies_dir, "saw")
+    body = WalkForwardRunRequest(
+        strategy_id="saw",
+        start_date="2026-01-01",
+        end_date="2026-03-05",
+        fold_count=2,
+        param_space=[ParamDefRequest(name="sma_period", type="int", low=4, high=5)],
+    )
+    pf = await _preflighted("saw", body)
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 1512, timedelta(hours=1))
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 1512)])
+    run = worker.JobRun()
+
+    outcome = await worker.run_walkforward_job(
+        _Pool(_BarsThenRecordedWrites(rows)), engine, _job(body, pf.config), run
+    )
+
+    assert engine.calls == [_engine_call(body)]
+    assert outcome.result is not None
+    assert outcome.result["folds"]
+    assert run.detail["fetch"] == _progress("fetched", 1512)
+
+
+class _TickAndLoadConn(_BarsThenRecordedWrites):
+    """Serves the loader and the tick loop; records every tick's progress and detail."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        super().__init__(rows)
+        self.ticks: list[tuple[float, dict[str, Any]]] = []
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
+        if "RETURNING cancel_requested" in query:
+            self.ticks.append((args[1], json.loads(args[2])))
+            return {"cancel_requested": False}
+        return await super().fetchrow(query, *args)
+
+
+async def test_mid_fetch_progress_is_visible_on_the_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategies_dir: Path
+) -> None:
+    """The 10 s tick flushes detail.fetch while the fetch runs, live on the status row."""
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    _write_strategy(strategies_dir, "saw")
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    pf = await _preflighted("saw", body)
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 60, timedelta(hours=1))
+    engine = _FakeEngine(
+        emits=[_progress("fetching", 0, weight=0), _progress("fetched", 60)], pause_s=0.05
+    )
+    conn = _TickAndLoadConn(rows)
+
+    await worker._run_claimed(_Pool(conn), _job(body, pf.config), tick_s=0.01, fetch_engine=engine)
+
+    mid = [(p, d) for p, d in conn.ticks if d["fetch"]["state"] == "fetching"]
+    assert mid, conn.ticks
+    progress, detail = mid[0]
+    assert detail["fetch"]["bars_fetched"] == 0
+    assert progress < 20.0
+    done = [(p, d) for p, d in conn.ticks if d["fetch"]["state"] == "fetched"]
+    assert done and done[0][0] == 20.0  # the phase's 20.0, before the run moves it on
+    finishes = [(q, a) for q, a in conn.inserts if "finished_at = now()" in q]
+    assert len(finishes) == 1
+    assert finishes[0][1][:2] == ("task-unit", "completed")
+    assert json.loads(finishes[0][1][5])["fetch"] == _progress("fetched", 60)
+
+
+async def test_a_failed_fetch_fails_the_job_row_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fetch past patience: the row fails with the typed reason; detail.fetch says failed."""
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    error = DataFetchError(
+        "rate_limited",
+        "binance",
+        "BTCUSDT",
+        Timeframe.H1,
+        weight_spent=2,
+        elapsed_s=31.2,
+        remaining_ranges=[GapRange(start=body.start_date, end=body.end_date)],
+    )
+    engine = _FakeEngine(error=error)
+    conn = _JobsConn()
+
+    await worker._run_claimed(
+        _Pool(conn), _job(body, _fetch_config()), tick_s=0.01, fetch_engine=engine
+    )
+
+    finishes = [(q, a) for q, a in conn.executed if "finished_at = now()" in q]
+    assert len(finishes) == 1
+    _, args = finishes[0]
+    assert args[:2] == ("task-unit", "failed")
+    assert args[4] == error.message
+    assert "(rate_limited)" in args[4]
+    assert json.loads(args[5])["fetch"] == {"state": "failed", "reason": "rate_limited"}
+
+
+async def test_a_no_market_data_job_failure_keeps_the_vocabulary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-listing range: the row fails with today's no_market_data message."""
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    error = NoMarketDataError(
+        "binance",
+        "BTCUSDT",
+        Timeframe.H1,
+        body.start_date,
+        body.end_date,
+        datetime(2026, 1, 4, tzinfo=UTC),
+        datetime(2026, 1, 9, tzinfo=UTC),
+    )
+    engine = _FakeEngine(error=error)
+    conn = _JobsConn()
+
+    await worker._run_claimed(
+        _Pool(conn), _job(body, _fetch_config()), tick_s=0.01, fetch_engine=engine
+    )
+
+    finishes = [(q, a) for q, a in conn.executed if "finished_at = now()" in q]
+    assert len(finishes) == 1
+    _, args = finishes[0]
+    assert args[:2] == ("task-unit", "failed")
+    assert args[4] == error.message
+    assert "available: 2026-01-04T00:00:00+00:00 to 2026-01-09T00:00:00+00:00" in args[4]
+    assert json.loads(args[5])["fetch"]["state"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# The worker-lifetime client pool: one client, one engine per process
+# ---------------------------------------------------------------------------
+
+
+def _kline(ts: datetime) -> list[float]:
+    return [ts.timestamp() * 1000, 42000.0, 42500.0, 41800.0, 42100.0, 100.0]
+
+
+class _FetchConn(_BarsThenRecordedWrites):
+    """Serves the real engine's SQL and the loader; the detect queue is popped per read."""
+
+    def __init__(
+        self, rows: list[dict[str, Any]], detect_answers: list[list[dict[str, Any]]]
+    ) -> None:
+        super().__init__(rows)
+        self.detect_answers = list(detect_answers)
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        if "WITH present" in query:
+            return self.detect_answers.pop(0)
+        if "unnest" in query:
+            return []
+        assert "ORDER BY timestamp ASC" in query, query
+        return self._rows
+
+
+async def test_consecutive_fetching_jobs_share_one_pooled_client() -> None:
+    """Two fetching jobs through the ONE engine: the client is constructed exactly once."""
+    constructed: list[str] = []
+    exchange = FakeRestExchange(
+        [_kline(datetime(2026, 1, 1, tzinfo=UTC) + timedelta(hours=i)) for i in range(24)]
+    )
+
+    def _factory(exchange_id: str, creds: str | None) -> Any:
+        constructed.append(exchange_id)
+        return exchange
+
+    clients = worker._WorkerFetchClients(_factory)
+    engine = clients.fetch_engine(HydraConfig(data=DataConfig()))
+    assert engine is not None
+
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-02")
+    hole = [
+        {
+            "gap_start": datetime(2026, 1, 1, tzinfo=UTC),
+            "gap_end": datetime(2026, 1, 1, 23, tzinfo=UTC),
+        }
+    ]
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 24, timedelta(hours=1))
+
+    for _ in range(2):
+        conn = _FetchConn(rows, detect_answers=[hole, []])
+        run = worker.JobRun()
+        outcome = await worker.run_backtest_job(
+            _Pool(conn), engine, _job(body, _fetch_config()), run
+        )
+        assert outcome.result_id == "bt-task-unit"
+        assert run.detail["fetch"]["state"] == "fetched"
+        assert run.detail["fetch"]["bars_fetched"] == 24
+
+    assert constructed == ["binance"]  # the pool built the client once, not per job
+    assert len(exchange.calls) == 2  # both jobs really fetched through it
+    assert exchange.close_calls == 0  # held for the worker's lifetime
+
+    await clients.close()
+    assert exchange.close_calls == 1
+
+
+def test_no_engine_while_the_kill_switch_is_off() -> None:
+    """auto_fetch_enabled=false constructs no engine at all — the worker fetches nothing."""
+    clients = worker._WorkerFetchClients()
+    assert clients.fetch_engine(HydraConfig(data=DataConfig(auto_fetch_enabled=False))) is None
 
 
 async def test_persist_failure_fails_the_job(strategies_dir: Path) -> None:
@@ -293,7 +652,7 @@ async def test_persist_failure_fails_the_job(strategies_dir: Path) -> None:
     pool = _Pool(_BarsThenFailingWrites(rows))
 
     with pytest.raises(worker.JobError) as exc:
-        await worker.run_backtest_job(pool, _job(body, pf.config), worker.JobRun())
+        await worker.run_backtest_job(pool, None, _job(body, pf.config), worker.JobRun())
 
     assert str(exc.value).startswith("result not persisted")
 
@@ -307,7 +666,9 @@ async def test_curves_carry_their_own_timestamps_and_metrics_persist(
     rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 60, timedelta(hours=1))
     conn = _BarsThenRecordedWrites(rows)
 
-    outcome = await worker.run_backtest_job(_Pool(conn), _job(body, pf.config), worker.JobRun())
+    outcome = await worker.run_backtest_job(
+        _Pool(conn), None, _job(body, pf.config), worker.JobRun()
+    )
 
     assert outcome.result_id == "bt-task-unit"
     query, args = conn.inserts[0]
@@ -332,7 +693,7 @@ async def test_handler_exception_fails_the_job_row(
 ) -> None:
     """A handler exception (e.g. StrategyError) ends the row failed with its message."""
 
-    async def _boom(pool: Any, job: Any, run: worker.JobRun) -> Any:
+    async def _boom(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
         raise RuntimeError("saw: ZeroDivisionError('division by zero')")
 
     monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _boom})
@@ -371,9 +732,9 @@ async def test_handler_exception_fails_the_job_row(
 async def test_finish_flushes_the_handlers_final_detail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A job completing between ticks must persist its detail (provenance, trials, fetch_error)."""
+    """A job completing between ticks must persist its detail (provenance, trials, fetch)."""
 
-    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+    async def _handler(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
         run.detail["provenance"] = {"bar_count": 300, "hydra_version": "9.9.9"}
         run.detail["completed_trials"] = 4
         return worker.JobOutcome(result_id="bt-task-x")
@@ -432,7 +793,7 @@ async def test_a_tick_database_error_does_not_kill_the_job(
 ) -> None:
     """One failed progress flush must neither fail the job nor stop the heartbeat."""
 
-    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+    async def _handler(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
         await asyncio.sleep(0.05)
         return worker.JobOutcome(result_id="bt-task-blip")
 
@@ -477,7 +838,7 @@ async def test_a_database_error_at_the_finish_write_is_retried(
 ) -> None:
     """The outcome exists only in memory, so the terminal write outlives a DB blip."""
 
-    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+    async def _handler(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
         return worker.JobOutcome(result_id="bt-task-r")
 
     monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _handler})
@@ -525,7 +886,7 @@ async def test_cancel_after_the_persist_straddle_discards_the_result(
 ) -> None:
     """A cancel landing after the result commit must not leave an orphan completed result."""
 
-    async def _handler(pool: Any, job: Any, run: worker.JobRun) -> Any:
+    async def _handler(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
         run.persisted_result_id = f"bt-{job['id']}"
         await asyncio.sleep(5)  # cancelled by the tick's cancel_requested
 
