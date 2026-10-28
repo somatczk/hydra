@@ -152,8 +152,7 @@ class TestValidation:
         )
         assert resp.status_code == 200
         data = resp.json()
-        # trading_mode is not writable via the API (must-fix #3): the sent value is
-        # ignored and the legacy row stays frozen at 'paper'; live_capital persists.
+        # must-fix #3: trading_mode is not writable; the row stays 'paper' but live_capital persists
         assert data["trading_mode"] == "paper"
         assert data["paper_capital"] == 2500.5
         assert data["max_concurrent_strategies"] == 100

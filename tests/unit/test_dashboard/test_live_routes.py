@@ -127,6 +127,19 @@ class _Backend:
         return [dict(s) for s in self.sessions]
 
 
+class _BrokenDb:
+    """A pool whose acquisition fails: the disarm path's transient DB outage."""
+
+    def acquire(self) -> _BrokenDb:
+        return self
+
+    async def __aenter__(self) -> _BrokenDb:
+        raise OSError("db gone")
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
 RESTRICTIONS = {
     "ipRestrict": False,
     "enableWithdrawals": False,
@@ -387,7 +400,32 @@ class TestDisarm:
         resp = await browser.post("/api/live/disarm", json={"reason": "nothing armed"})
         assert resp.status_code == 200
         assert resp.json()["status"] == "already_disarmed"
+        assert resp.json()["pending_live_approvals"] == []
         assert db.events == []
+
+    async def test_a_broken_read_never_answers_already_disarmed(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        """R31 A2r: an unreadable armed row is 503, never a silent already_disarmed."""
+        db.config["live_armed"] = ARMED_ROW
+        app.state.db_pool = _BrokenDb()
+        resp = await browser.post("/api/live/disarm", json={"reason": "transient outage"})
+        assert (resp.status_code, _detail(resp)["code"]) == (503, "database_unavailable")
+        app.state.db_pool = db
+        assert (await browser.get("/api/live/status")).json()["live_armed"] is True
+
+    async def test_disarm_names_pending_live_arming_approvals(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        db.config["live_armed"] = ARMED_ROW
+        arm = (
+            await browser.post("/api/live/arm", json={"live_capital": 500.0, "reason": "arm it"})
+        ).json()
+        resp = await browser.post("/api/live/disarm", json={"reason": "stop the exposure"})
+        body = resp.json()
+        assert body["status"] == "disarmed"
+        assert body["pending_live_approvals"] == [arm["approval_id"]]
+        assert "still re-arm" in body["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +550,28 @@ class TestCreateRoutes:
             "/api/live/credential-delete", json={"exchange_id": "binance", "reason": "rotate keys"}
         )
         assert (resp.status_code, _detail(resp)["code"]) == (404, "credentials_not_found")
+
+    async def test_credential_delete_create_routes_null_keys_to_the_ceremony_under_live_sessions(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        """R31 A1: a null-permission key under a running live session gets the ceremony,
+        not the 'delete them directly' guidance the direct path now refuses."""
+        db.credentials = {"binance": _creds(permissions=None)}
+        backend.sessions = [_live_session()]
+        resp = await browser.post(
+            "/api/live/credential-delete", json={"exchange_id": "binance", "reason": "rotate"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) == {"status", "approval_id", "code", "expires_at", "params", "note"}
+        assert body["status"] == "approval_required"
+        approved = await _approve(browser, body["approval_id"], body["code"])
+        assert (approved.status_code, _detail(approved)["code"]) == (
+            409,
+            "credential_delete_gated",
+        )
+        assert _detail(approved)["running_live_sessions"] == ["s-live"]
+        assert "binance" in db.credentials
 
     async def test_credential_delete_create_answers_the_pinned_shape_and_deletes_on_approval(
         self, db: _Db, backend: _Backend, browser: httpx.AsyncClient

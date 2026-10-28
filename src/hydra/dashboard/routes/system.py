@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from hydra.dashboard.deps import current_config
 from hydra.dashboard.routes._db import (
+    ServiceErrorRoute,
     api_error,
     db_errors_to_503,
     request_trader,
@@ -24,9 +25,9 @@ from hydra.dashboard.routes._db import (
 )
 from hydra.dashboard.security import Principal, audit
 from hydra.execution import session_store
-from hydra.services.live_gate import is_trade_capable, stored_permissions
+from hydra.services.live_gate import is_trade_capable, running_live_sessions, stored_permissions
 
-router = APIRouter(prefix="/api/system", tags=["system"])
+router = APIRouter(prefix="/api/system", tags=["system"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
 
 
@@ -590,8 +591,10 @@ async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, A
     """Remove stored exchange credentials; 503 (and no change) if the DB delete fails.
 
     Trade-capable keys need the code-gated ``POST /api/live/credential-delete``
-    ceremony (the executor also refuses while any live session runs); read-only keys
-    delete directly, exactly as before.
+    ceremony, and BOTH paths refuse while any live session runs (the stored
+    snapshot is not the arm truth — R8 re-fetches live — so a pre-P3-C
+    null-permission row must not delete under live money); read-only keys delete
+    directly once no live session runs.
     """
     if exchange_id not in _EXCHANGE_DEFS:
         raise _unknown_exchange(exchange_id)
@@ -610,6 +613,16 @@ async def disconnect_exchange(exchange_id: str, request: Request) -> dict[str, A
             f"The stored {display_name} keys can trade; deleting them needs the code-gated "
             "POST /api/live/credential-delete ceremony",
             "invalid",
+        )
+    running = await running_live_sessions(request_trader(request))
+    if running:
+        raise api_error(
+            409,
+            "credential_delete_gated",
+            f"Credentials cannot be deleted while a live session runs "
+            f"({', '.join(running)}); stop it first",
+            "invalid",
+            running_live_sessions=running,
         )
     async with db_errors_to_503("deleting exchange credentials"), pool.acquire() as conn:
         await conn.execute(

@@ -9,9 +9,11 @@ existing ``POST /api/activity/approvals/{id}/approve`` with that code, and the e
 in :mod:`hydra.services.live_gate` runs — re-validating everything at execution time.
 Only a ``user``/``dev`` principal can request a live action (the UI's L4 dialogs).
 
-Disarm is honest (R10): the response names every running live session, and they keep
-running under their start's authorization — stopping a session and the kill switch stay
-ungated.
+Disarm is honest (R10): the response names every running live session — they keep
+running under their start's authorization until stopped or the kill switch fires —
+and every pending live-arming approval that can still re-arm on its code. The armed
+row is read with a raising read on the disarm path: an unreadable row is 503, never
+a silent ``already_disarmed``.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from hydra.services.live_gate import (
     create_live_approval,
     is_trade_capable,
     live_approval_store,
+    positively_disarmed,
     read_live_capital,
     read_live_state,
     require_armed,
@@ -65,6 +68,7 @@ class LiveStatusResponse(BaseModel):
 class DisarmResponse(LiveStatusResponse):
     status: str
     message: str
+    pending_live_approvals: list[str] = Field(default_factory=list)
 
 
 class ApprovalRequiredResponse(BaseModel):
@@ -194,20 +198,37 @@ async def disarm(body: DisarmRequest, request: Request) -> dict[str, Any]:
 
     Running live sessions are named and keep running under their start's
     authorization (R10); stopping a session and the kill switch stay ungated.
+    The armed row is read with a raising read: an unreadable row is 503, never a
+    silent ``already_disarmed``. Pending live-arming approvals are named too — a
+    surviving arm code can still re-arm after this disarm.
     """
     pool = request_pool(request)
-    state = await read_live_state(pool)
     status = "already_disarmed"
-    if state["armed"]:
+    if not await positively_disarmed(pool):
         await write_armed_transition(pool, armed=False, actor=_actor(request), reason=body.reason)
         status = "disarmed"
     running = await running_live_sessions(request_trader(request))
+    pending = [
+        a.id
+        for a in await live_approval_store(request.app.state).list_pending()
+        if a.action == "live_arming"
+    ]
     audit(
         getattr(request.state, "principal", None),
         "live_disarmed",
         reason=body.reason,
         running_live_sessions=len(running),
+        pending_live_approvals=len(pending),
     )
+    message = (
+        f"Live trading is disarmed. {len(running)} live session(s) keep running under "
+        f"their start's authorization. {LIVE_SESSION_NOTE}"
+    )
+    if pending:
+        message += (
+            f" {len(pending)} pending live-arming approval(s) requested before this "
+            "disarm can still re-arm on their code; deny them in the Activity review."
+        )
     return {
         "status": status,
         "live_armed": False,
@@ -216,10 +237,8 @@ async def disarm(body: DisarmRequest, request: Request) -> dict[str, Any]:
         "live_capital": await read_live_capital(pool),
         "running_live_sessions": running,
         "running_live_sessions_count": len(running),
-        "message": (
-            f"Live trading is disarmed. {len(running)} live session(s) keep running under "
-            f"their start's authorization. {LIVE_SESSION_NOTE}"
-        ),
+        "pending_live_approvals": pending,
+        "message": message,
     }
 
 
@@ -274,7 +293,9 @@ async def live_order(body: LiveOrderRequest, request: Request) -> dict[str, Any]
 @router.post("/credential-delete", response_model=ApprovalRequiredResponse)
 async def credential_delete(body: CredentialDeleteRequest, request: Request) -> dict[str, Any]:
     """Request deleting trade-capable stored credentials (read-only keys delete
-    directly through ``DELETE /api/system/exchanges/{id}/connect``)."""
+    directly through ``DELETE /api/system/exchanges/{id}/connect`` while no live
+    session runs; under a running live session even null-permission keys need this
+    ceremony — the direct path refuses them too)."""
     actor = _requester(request)
     pool = request_pool(request)
     async with db_errors_to_503("reading exchange credentials"), pool.acquire() as conn:
@@ -289,7 +310,9 @@ async def credential_delete(body: CredentialDeleteRequest, request: Request) -> 
             f"No credentials stored for {body.exchange_id}",
             "not_found",
         )
-    if not is_trade_capable(row["validated_permissions"]):
+    if not is_trade_capable(row["validated_permissions"]) and not await running_live_sessions(
+        request_trader(request)
+    ):
         raise api_error(
             409,
             "credential_delete_not_gated",

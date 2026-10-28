@@ -43,7 +43,9 @@ async def risk_live_status() -> str:
     """Kill switch, running-session count, breaker restrictions and the live-gate
     armed state — the operating picture. Unknown values are reported as unknown,
     never guessed; ``live_armed`` reads false when the row is absent or unreadable
-    (fail-safe)."""
+    (fail-safe). A false ``live_armed`` never means live trading stopped: running
+    live sessions keep running under their start's authorization until they are
+    stopped or the kill switch fires (R10)."""
     body = await _deps.trader().live_status()
     state = await read_live_state(_deps.db_pool())
     return _deps.json_text({**body, "live_armed": state["armed"]})

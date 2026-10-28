@@ -38,7 +38,6 @@ class _Reason(BaseModel):
 
 class _SessionStart(_Reason):
     strategy_id: str = Field(min_length=1)
-    paper_capital: str | None = None
 
 
 @server.tool(name="live_session_start", structured_output=False)
@@ -56,8 +55,6 @@ async def live_session_start(strategy_id: str, reason: str) -> str:
         body = _SessionStart(strategy_id=strategy_id, reason=reason)
         await require_armed(_deps.db_pool())
         params: dict[str, str] = {"strategy_id": body.strategy_id, "reason": body.reason}
-        if body.paper_capital is not None:
-            params["paper_capital"] = body.paper_capital
         store = live_approval_store(_deps.engine_state())
         approval = await create_live_approval(
             store,

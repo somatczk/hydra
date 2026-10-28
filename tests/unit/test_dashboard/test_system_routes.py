@@ -568,6 +568,20 @@ def _connect(client: TestClient, exchange: str = "binance", **extra: str) -> Any
     )
 
 
+class _Trader:
+    """The disconnect gate's session read: a minimal TraderBackend stand-in."""
+
+    def __init__(self, sessions: list[dict[str, Any]] | None = None) -> None:
+        self.sessions = sessions or []
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        return [dict(s) for s in self.sessions]
+
+
+def _live_session(session_id: str = "s-live") -> dict[str, Any]:
+    return {"session_id": session_id, "trading_mode": "live", "status": "running"}
+
+
 class TestExchanges:
     def test_states_without_stored_keys(self, client: TestClient) -> None:
         data = client.get("/api/system/exchanges").json()
@@ -835,6 +849,7 @@ class TestExchangeConnect:
         self, db: FakeSystemDb, app: FastAPI, client: TestClient
     ) -> None:
         _connect(client)
+        app.state.trader = _Trader()
         resp = client.delete("/api/system/exchanges/binance/connect")
         assert resp.status_code == 200
         assert resp.json()["connected"] is False
@@ -848,9 +863,78 @@ class TestExchangeConnect:
     ) -> None:
         _connect(client)
         db.fail, db.fail_on = OSError("db went away"), "DELETE"
+        app.state.trader = _Trader()
         resp = client.delete("/api/system/exchanges/binance/connect")
         assert resp.status_code == 503
         assert "binance" in app.state.exchange_credentials
+
+    def test_disconnect_trade_capable_keys_need_the_ceremony(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        db.credentials["binance"] = {
+            "validated_at": NOW,
+            "validated_environment": "mainnet",
+            "validated_permissions": json.dumps(
+                {
+                    "enable_spot_and_margin_trading": True,
+                    "enable_withdrawals": False,
+                    "ip_restrict": False,
+                }
+            ),
+        }
+        app.state.trader = _Trader()
+        resp = client.delete("/api/system/exchanges/binance/connect")
+        assert (resp.status_code, _detail(resp)["code"]) == (409, "credential_delete_gated")
+        assert "POST /api/live/credential-delete" in _detail(resp)["message"]
+        assert "binance" in db.credentials  # nothing was deleted
+
+    def test_disconnect_null_permission_keys_under_a_running_live_session_are_gated(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        """R31 A1: a pre-P3-C null-permission row must never delete under live money."""
+        db.credentials["binance"] = {
+            "validated_at": NOW,
+            "validated_environment": "mainnet",
+            "validated_permissions": None,
+        }
+        app.state.trader = _Trader([_live_session()])
+        resp = client.delete("/api/system/exchanges/binance/connect")
+        assert (resp.status_code, _detail(resp)["code"]) == (409, "credential_delete_gated")
+        assert _detail(resp)["running_live_sessions"] == ["s-live"]
+        assert "binance" in db.credentials  # nothing was deleted
+
+    def test_disconnect_read_only_keys_with_no_live_session_delete_directly(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        db.credentials["binance"] = {
+            "validated_at": NOW,
+            "validated_environment": "mainnet",
+            "validated_permissions": json.dumps(
+                {
+                    "enable_spot_and_margin_trading": False,
+                    "enable_withdrawals": False,
+                    "ip_restrict": True,
+                }
+            ),
+        }
+        app.state.trader = _Trader()
+        resp = client.delete("/api/system/exchanges/binance/connect")
+        assert resp.status_code == 200
+        assert resp.json()["connected"] is False
+        assert db.credentials == {}
+
+    def test_disconnect_fails_closed_when_sessions_are_unreadable(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        """No bound trader means the session list is unreadable: refuse, never delete."""
+        db.credentials["binance"] = {
+            "validated_at": NOW,
+            "validated_environment": "testnet",
+            "validated_permissions": None,
+        }
+        resp = client.delete("/api/system/exchanges/binance/connect")
+        assert (resp.status_code, _detail(resp)["code"]) == (503, "engine_not_ready")
+        assert "binance" in db.credentials
 
     def test_disconnect_unknown_exchange_is_404(self, client: TestClient) -> None:
         assert client.delete("/api/system/exchanges/unknown/connect").status_code == 404

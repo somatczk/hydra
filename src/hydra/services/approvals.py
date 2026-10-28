@@ -244,8 +244,7 @@ class ApprovalStore:
         try:
             result = await executor(deps, dict(approval.params), approval.requested_by)
         except ServiceError as exc:
-            # R22: the executor's own envelope reaches the deciding caller unchanged
-            # (code, extras and all); only the flattening path answers 503 below.
+            # R22: the executor's envelope reaches the caller unchanged; others answer 503 below.
             detail = exc.detail if isinstance(exc.detail, dict) else {}
             error = f"{detail.get('code', 'error')}: {detail.get('message', str(exc.detail))}"
             async with self._lock:

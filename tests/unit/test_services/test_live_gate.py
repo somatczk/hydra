@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Any, ClassVar
 
 import ccxt
@@ -562,6 +563,17 @@ class TestSessionStartExecutor:
             )
         assert (_detail(exc.value)["code"], exc.value.status_code) == ("kill_switch_active", 409)
 
+    async def test_a_bad_paper_capital_is_422_invalid_params(self) -> None:
+        """R31 A4r: like live_order, a bad param answers 422, not the flattened 503."""
+        db = _Db(config={"live_armed": ARMED_ROW})
+        with pytest.raises(ServiceError) as exc:
+            await execute_live_session_start(
+                _Deps(db, _Backend()),
+                {"strategy_id": "momentum", "paper_capital": "abc", "reason": "go live"},
+                "user:soma",
+            )
+        assert (_detail(exc.value)["code"], exc.value.status_code) == ("invalid_params", 422)
+
 
 class TestLiveOrderExecutor:
     async def test_orders_through_the_backend_on_a_live_running_session(self) -> None:
@@ -580,9 +592,23 @@ class TestLiveOrderExecutor:
         [order] = backend.order_calls
         assert (order.symbol, order.quantity, order.session_id) == (
             "BTCUSDT",
-            order.quantity,
+            Decimal("0.01"),
             "s-live",
         )
+
+    async def test_executed_after_the_kill_switch_latched_is_refused(self) -> None:
+        """The sibling re-validation session_start has (R31 A2o): a latched switch
+        never places a manual order through the executor path."""
+        db = _Db(config={"live_armed": ARMED_ROW})
+        backend = _Backend(kill_switch=True, sessions=[_live_session()])
+        with pytest.raises(ServiceError) as exc:
+            await execute_live_order(
+                _Deps(db, backend),
+                {"session_id": "s-live", "side": "buy", "quantity": "0.01", "reason": "r"},
+                "user:soma",
+            )
+        assert (_detail(exc.value)["code"], exc.value.status_code) == ("kill_switch_active", 409)
+        assert backend.order_calls == []  # nothing reached the wire
 
     async def test_disarmed_is_refused(self) -> None:
         with pytest.raises(ServiceError) as exc:

@@ -398,7 +398,9 @@ async def get_live_risk_status(request: Request, source: str | None = None) -> d
     (equity, current drawdown, active tier); 503 ``live_risk_unavailable`` when no live
     service is built. An unrecognized source is refused 422, never silently served as
     paper (A6≡S8). ``live_armed`` is the master gate's row, merged here (R9): it reads
-    disarmed when the row is absent or unreadable (fail-safe).
+    disarmed when the row is absent or unreadable (fail-safe) — and a false row never
+    means running live sessions stopped: they keep running under their start's
+    authorization until stopped or the kill switch fires (R10).
     """
     _validate_source(source)
     body = await request_trader(request).live_status(source=source or "paper")

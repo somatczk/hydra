@@ -19,8 +19,9 @@ seam #1.
 Trade-only credentials: arming re-fetches Binance ``/sapi/v1/account/apiRestrictions``
 through the keyed client (R8) — not just the connect-time snapshot — and refuses unless
 the keys are mainnet-validated, spot-trade-enabled and withdrawal-disabled. Credential
-delete is code-gated only while the stored key can trade, and additionally refuses while
-any live session runs (the trader's keyed pool entry outlives an API-side evict).
+delete is code-gated while the stored key can trade; both the gated executor and the
+direct route refuse while any live session runs (the trader's keyed pool entry outlives
+an API-side evict).
 """
 
 from __future__ import annotations
@@ -101,6 +102,24 @@ async def read_live_state(pool: Any) -> dict[str, Any]:
         "armed_by": value.get("by"),
         "armed_at": value.get("at"),
     }
+
+
+async def positively_disarmed(pool: Any) -> bool:
+    """The disarm path's raising read (R31): True only when a successful read shows
+    the row absent or explicitly disarmed. A failed read is 503 — never a silent
+    ``already_disarmed`` — and content that does not positively read disarmed answers
+    False so the disarm write replaces it (toward safety)."""
+    require_pool(pool)
+    async with db_errors("reading the live-arming state"), pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM system_config WHERE key = $1", LIVE_ARMED_KEY)
+    if row is None:
+        return True
+    raw = row["value"]
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return False
+    return not (isinstance(value, dict) and bool(value.get("armed")))
 
 
 async def read_live_capital(pool: Any) -> float | None:
@@ -465,11 +484,14 @@ async def execute_live_session_start(
     strategy_id = str(params.get("strategy_id") or "")
     if not strategy_id:
         raise service_error(422, "invalid_params", "strategy_id is required", "invalid")
-    body = StartSessionRequest(
-        strategy_id=strategy_id,
-        trading_mode="live",
-        paper_capital=params.get("paper_capital"),
-    )
+    try:
+        body = StartSessionRequest(
+            strategy_id=strategy_id,
+            trading_mode="live",
+            paper_capital=params.get("paper_capital"),
+        )
+    except ValidationError as exc:
+        raise service_error(422, "invalid_params", str(exc), "invalid") from exc
     started: dict[str, Any] = await backend.start_session(actor, body)
     return started
 
@@ -492,6 +514,13 @@ async def execute_live_order(deps: Any, params: dict[str, Any], actor: str) -> d
     pool = getattr(deps, "db_pool", None)
     await require_armed(pool)
     backend = _backend(deps)
+    if await backend.kill_switch_active():
+        raise service_error(
+            409,
+            "kill_switch_active",
+            "The kill switch is active; manual live orders cannot be placed",
+            "invalid",
+        )
     session_id = str(params.get("session_id") or "")
     target = next(
         (s for s in await backend.list_sessions() if s.get("session_id") == session_id), None

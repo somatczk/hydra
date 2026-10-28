@@ -121,7 +121,8 @@ those packages, because `mypy src/` alone does not catch everything it catches.
   connect-time Binance apiRestrictions record), and `system_config` rows (`PUT /api/system/config` writes them,
   secrets Fernet-encrypted; a missing row is a 503, never a default; a `paper_capital` change goes through
   `RiskService.reload_config`; the legacy `trading_mode` row is frozen at `paper` and unwritable — the `live_armed`
-  row is the single live gate, written only by the arm executor). In memory only: the backtest share-link tokens and
+  row is the single live gate, written ON only by the arm executor and OFF also by the ungated disarm route, toward
+  safety, audited). In memory only: the backtest share-link tokens and
   the approval store. Breakers, kill switch and the paper account ledger live in `risk_state` / `risk_events`;
   paper sessions are restored from `paper_accounts` by `SessionManager.startup()`.
 - Gated MCP actions go through one in-memory approval store (`services/approvals.py`, served by

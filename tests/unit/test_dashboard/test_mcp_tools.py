@@ -405,8 +405,7 @@ def test_tools_list_advertises_the_33_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
     assert names == B1_TOOLS | B2_TOOLS | LIVE_TOOLS
     assert len(names) == 33
-    # the live pin: exactly the two gated live tools, and no live_arm/live_disarm tool
-    # (arming is the operator's Settings ceremony; risk_live_status carries the state)
+    # the live pin: the two gated live tools; no live_arm/live_disarm (the operator's ceremony)
     assert "risk_live_status" in names
     assert {name for name in names if name.startswith("live_")} == {
         "live_session_start",
