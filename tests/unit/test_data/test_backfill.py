@@ -32,11 +32,15 @@ class _Repo:
 
     def __init__(self) -> None:
         self.upserts: list[list[tuple[str, str, Timeframe, OHLCV]]] = []
+        self.sources: list[str] = []
 
     async def upsert_closed_bars(
-        self, bars: list[tuple[str, str, Timeframe, OHLCV]]
+        self,
+        bars: list[tuple[str, str, Timeframe, OHLCV]],
+        source: str = "feed",
     ) -> tuple[int, int]:
         self.upserts.append(list(bars))
+        self.sources.append(source)
         return (len(bars), 0)
 
     @property
@@ -87,6 +91,18 @@ class TestBulkDownload:
         assert [(e, s, tf, b.timestamp) for e, s, tf, b in repo.stored] == [
             ("binance", "BTCUSDT", Timeframe.M1, _ts(m)) for m in range(3)
         ]
+        assert repo.sources == ["feed"]
+
+    async def test_source_is_threaded_to_the_upsert_seam(self) -> None:
+        """bulk_download writes the caller's attribution; the auto-fetch path passes 'auto'."""
+        repo = _Repo()
+        exchange = FakeRestExchange([_row(_ts(m)) for m in range(2)])
+
+        await _service(repo, exchange).bulk_download(
+            "binance", "BTCUSDT", Timeframe.M1, _ts(0), _ts(1), now=_LATER, source="auto"
+        )
+
+        assert repo.sources == ["auto"]
 
     async def test_respects_end_boundary(self) -> None:
         """Bars beyond the end timestamp are not stored."""

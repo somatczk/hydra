@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from hydra.core.types import OHLCV, Timeframe
-from hydra.data.storage import MarketDataRepository
+from hydra.data.storage import (
+    DataCacheEntry,
+    MarketDataRepository,
+    cache_totals,
+    delete_auto_dataset,
+    list_cache_entries,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,12 +141,13 @@ class TestStoreBars:
         )
 
         cols = conn.fetch.call_args[0][1:]
-        assert len(cols) == 9
+        assert len(cols) == 10
         assert cols[0] == ["binance", "binance"]
         assert cols[1] == ["BTCUSDT", "BTCUSDT"]
         assert cols[2] == ["1m", "1m"]
         assert cols[3] == [bar0.timestamp, bar1.timestamp]
         assert cols[7] == [Decimal("42100.00"), Decimal("42200.50")]
+        assert cols[9] == ["feed", "feed"]
 
 
 def _transactional(mock_pool: MagicMock) -> AsyncMock:
@@ -204,6 +211,256 @@ class TestUpsertClosedBars:
 
     async def test_empty_batch(self, repo: MarketDataRepository) -> None:
         assert await repo.upsert_closed_bars([]) == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Source attribution
+# ---------------------------------------------------------------------------
+
+
+class TestSourceAttribution:
+    """source: threaded into both INSERTs, immutable through conflicts, 'feed' by default."""
+
+    async def test_store_bars_sql_carries_source(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = mock_pool._conn
+        conn.fetch = AsyncMock(return_value=[])
+
+        await repo.store_bars([("binance", "BTCUSDT", Timeframe.M1, _make_bar(0))])
+
+        sql = conn.fetch.call_args[0][0]
+        assert "close, volume, source" in sql
+        assert "$10::text[]" in sql
+        assert conn.fetch.call_args[0][10] == ["feed"]
+
+    async def test_upsert_default_source_is_feed(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        conn.fetch = AsyncMock(side_effect=[[_key(0)], [_key(0)]])
+
+        await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(m)) for m in range(3)]
+        )
+
+        assert conn.fetch.call_args_list[1][0][10] == ["feed", "feed", "feed"]
+
+    async def test_upsert_conflict_set_list_never_touches_source(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        conn.fetch = AsyncMock(side_effect=[[], [_key(0)]])
+
+        await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(0))], source="auto"
+        )
+
+        sql = conn.fetch.call_args_list[1][0][0]
+        assert "close, volume, source" in sql
+        assert "$10::text[]" in sql
+        assert conn.fetch.call_args_list[1][0][10] == ["auto"]
+        set_list = sql.split("DO UPDATE SET")[1].split("WHERE")[0]
+        assert "source" not in set_list
+
+
+# ---------------------------------------------------------------------------
+# Cache-ledger writes (source='auto' only, same transaction)
+# ---------------------------------------------------------------------------
+
+
+def _record(exchange: str, symbol: str, timeframe: str, minute: int) -> _FakeRecord:
+    return _fake_record(
+        {
+            "exchange": exchange,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "timestamp": datetime(2024, 1, 1, 0, minute, tzinfo=UTC),
+        }
+    )
+
+
+class TestCacheLedgerWrites:
+    """``source='auto'`` maintains ``data_cache_entries`` for every dataset that gained rows."""
+
+    async def test_auto_insert_upserts_one_entry_per_dataset(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.fetch = AsyncMock(side_effect=[[], [_key(0), _key(1)]])
+
+        result = await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(m)) for m in range(2)], source="auto"
+        )
+
+        assert result == (2, 0)
+        assert conn.execute.await_count == 1
+        sql, *params = conn.execute.call_args[0]
+        assert "data_cache_entries" in sql
+        assert "ON CONFLICT (exchange, symbol, timeframe)" in sql
+        assert "rows = entry.rows + EXCLUDED.rows" in sql
+        assert params == [
+            "binance",
+            "BTCUSDT",
+            "1m",
+            _make_bar(0).timestamp,
+            _make_bar(1).timestamp,
+            2,
+        ]
+
+    async def test_overlapping_page_carries_page_bounds_and_new_rows_only(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        """Existing keys 3-4 get corrected; 5-7 are new: the entry gains 3 rows, spans 3-7."""
+        conn = _transactional(mock_pool)
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.fetch = AsyncMock(
+            side_effect=[[_key(3), _key(4)], [_key(3), _key(4), _key(5), _key(6), _key(7)]]
+        )
+
+        result = await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(m)) for m in range(3, 8)],
+            source="auto",
+        )
+
+        assert result == (3, 2)
+        *_, first_ts, last_ts, inserted_rows = conn.execute.call_args[0]
+        assert (first_ts, last_ts, inserted_rows) == (
+            _make_bar(3).timestamp,
+            _make_bar(7).timestamp,
+            3,
+        )
+
+    async def test_feed_default_writes_no_entry(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.fetch = AsyncMock(side_effect=[[], [_key(0), _key(1)]])
+
+        await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(m)) for m in range(2)]
+        )
+
+        conn.execute.assert_not_called()
+
+    async def test_auto_upsert_with_no_new_rows_writes_no_entry(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn.fetch = AsyncMock(side_effect=[[_key(0)], [_key(0)]])
+
+        result = await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(0, close="9"))], source="auto"
+        )
+
+        assert result == (0, 1)
+        conn.execute.assert_not_called()
+
+    async def test_mixed_batch_writes_one_entry_per_market(
+        self, repo: MarketDataRepository, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        records = [
+            _record("binance", "BTCUSDT", "1m", 0),
+            _record("binance", "BTCUSDT", "1m", 1),
+            _record("binance", "ETHUSDT", "1m", 5),
+            _record("binance", "ETHUSDT", "1m", 6),
+        ]
+        conn.fetch = AsyncMock(side_effect=[[], records])
+
+        await repo.upsert_closed_bars(
+            [("binance", "BTCUSDT", Timeframe.M1, _make_bar(m)) for m in range(2)]
+            + [("binance", "ETHUSDT", Timeframe.M1, _make_bar(m)) for m in (5, 6)],
+            source="auto",
+        )
+
+        assert conn.execute.await_count == 2
+        btc = conn.execute.call_args_list[0][0]
+        eth = conn.execute.call_args_list[1][0]
+        assert btc[1:4] == ("binance", "BTCUSDT", "1m")
+        assert btc[4:] == (_make_bar(0).timestamp, _make_bar(1).timestamp, 2)
+        assert eth[1:4] == ("binance", "ETHUSDT", "1m")
+        assert eth[4:] == (_make_bar(5).timestamp, _make_bar(6).timestamp, 2)
+
+
+# ---------------------------------------------------------------------------
+# Cache-ledger reads and eviction seam
+# ---------------------------------------------------------------------------
+
+
+class TestDataCacheFunctions:
+    """The pool-level seam C2's sweeper consumes: delete, list, totals."""
+
+    async def test_delete_auto_dataset_counts_deleted_rows_and_drops_the_entry(
+        self, mock_pool: MagicMock
+    ) -> None:
+        conn = _transactional(mock_pool)
+        conn.execute = AsyncMock(side_effect=["DELETE 7", "DELETE 1"])
+
+        deleted = await delete_auto_dataset(mock_pool, "binance", "BTCUSDT", Timeframe.M1)
+
+        assert deleted == 7
+        bars_sql, *bars_params = conn.execute.call_args_list[0][0]
+        entry_sql, *entry_params = conn.execute.call_args_list[1][0]
+        assert "source = 'auto'" in bars_sql
+        assert bars_params == ["binance", "BTCUSDT", "1m"]
+        assert "data_cache_entries" in entry_sql
+        assert entry_params == ["binance", "BTCUSDT", "1m"]
+        conn.transaction.assert_called_once()
+
+    async def test_list_cache_entries_orders_by_last_used(self, mock_pool: MagicMock) -> None:
+        conn = mock_pool._conn
+        now = datetime(2024, 1, 1, tzinfo=UTC)
+        conn.fetch = AsyncMock(
+            return_value=[
+                _fake_record(
+                    {
+                        "exchange": "binance",
+                        "symbol": "BTCUSDT",
+                        "timeframe": "1m",
+                        "first_ts": now,
+                        "last_ts": now + timedelta(minutes=9),
+                        "rows": 10,
+                        "status": "ready",
+                        "created_at": now,
+                        "last_fetched_at": now,
+                        "last_used_at": now,
+                    }
+                )
+            ]
+        )
+
+        entries = await list_cache_entries(mock_pool)
+
+        assert "ORDER BY last_used_at ASC" in conn.fetch.call_args[0][0]
+        assert entries == [
+            DataCacheEntry(
+                exchange="binance",
+                symbol="BTCUSDT",
+                timeframe="1m",
+                first_ts=now,
+                last_ts=now + timedelta(minutes=9),
+                rows=10,
+                status="ready",
+                created_at=now,
+                last_fetched_at=now,
+                last_used_at=now,
+            )
+        ]
+
+    async def test_cache_totals_sums_rows_and_datasets(self, mock_pool: MagicMock) -> None:
+        conn = mock_pool._conn
+        conn.fetch = AsyncMock(return_value=[_fake_record({"rows": 42, "datasets": 3})])
+        assert await cache_totals(mock_pool) == (42, 3)
+
+    async def test_cache_totals_empty_ledger(self, mock_pool: MagicMock) -> None:
+        conn = mock_pool._conn
+        conn.fetch = AsyncMock(return_value=[])
+        assert await cache_totals(mock_pool) == (0, 0)
 
 
 # ---------------------------------------------------------------------------

@@ -317,6 +317,7 @@ class ExchangeBackfillService:
         now: datetime | None = None,
         max_retries: int = 5,
         sleep: Sleep = asyncio.sleep,
+        source: str = "feed",
     ) -> int:
         """Download closed bars via paginated CCXT REST calls and upsert them.
 
@@ -343,6 +344,10 @@ class ExchangeBackfillService:
             Retries per page for ccxt network and rate-limit errors before raising.
         sleep:
             Backoff sleep (injectable for tests).
+        source:
+            Attribution written on every new bar. The manual backfills keep the default
+            'feed'; only the auto-fetch path passes 'auto', which also maintains the
+            data-cache ledger so the dataset stays reclaimable.
 
         Returns
         -------
@@ -372,7 +377,9 @@ class ExchangeBackfillService:
             sleep=sleep,
             normalizer=self._normalizer,
         ):
-            await self._repo.upsert_closed_bars([(exchange_id, symbol, timeframe, b) for b in page])
+            await self._repo.upsert_closed_bars(
+                [(exchange_id, symbol, timeframe, b) for b in page], source=source
+            )
             total += len(page)
             logger.debug(
                 "Bulk download page",

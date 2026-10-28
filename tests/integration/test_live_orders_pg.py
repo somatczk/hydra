@@ -47,8 +47,8 @@ async def pool(fresh_database: str):
 
 
 def test_0009_is_the_single_head() -> None:
-    # 0010 (P3-C's credential-permission column) is the head; 0009 lands the live schema
-    assert head_revision() == "0010_validated_permissions"
+    # 0011 (P6-C1's attribution column + cache ledger) is the head; 0009 lands the live schema
+    assert head_revision() == "0011_data_source_and_cache"
 
 
 async def test_the_schema_lands_idempotently_and_seeds_the_live_row(
@@ -57,7 +57,7 @@ async def test_the_schema_lands_idempotently_and_seeds_the_live_row(
     import asyncio
 
     await asyncio.to_thread(upgrade_to_head, fresh_database)
-    assert await current_revision(fresh_database) == "0010_validated_permissions"
+    assert await current_revision(fresh_database) == "0011_data_source_and_cache"
 
     async with pool.acquire() as conn:
         live_scope = await conn.fetchval("SELECT count(*) FROM risk_state WHERE scope = 'live'")
@@ -67,7 +67,7 @@ async def test_the_schema_lands_idempotently_and_seeds_the_live_row(
 
     # a second upgrade changes nothing (idempotent, forward-only)
     await asyncio.to_thread(upgrade_to_head, fresh_database)
-    assert await current_revision(fresh_database) == "0010_validated_permissions"
+    assert await current_revision(fresh_database) == "0011_data_source_and_cache"
 
 
 async def test_the_downgrade_drops_the_live_schema_and_the_seed(fresh_database: str) -> None:
@@ -90,7 +90,7 @@ async def test_the_downgrade_drops_the_live_schema_and_the_seed(fresh_database: 
         await conn.close()
 
     await asyncio.to_thread(upgrade_to_head, fresh_database)
-    assert await current_revision(fresh_database) == "0010_validated_permissions"
+    assert await current_revision(fresh_database) == "0011_data_source_and_cache"
 
 
 def _order(cid: str, symbol: str = "BTCUSDT", **overrides: Any) -> LiveOrderRecord:
