@@ -106,7 +106,7 @@ _FakeCcxt.privatePostOrderListOco = _fake_post_oco
 _FakeCcxt.privateDeleteOrderList = _fake_delete_order_list
 _FakeCcxt.privateDeleteOpenOrders = _fake_delete_open_orders
 _FakeCcxt.privateGetOpenOrderList = _fake_get_open_order_lists
-_FakeCcxt.privateGetAccountApiRestrictions = _fake_get_account_api_restrictions
+_FakeCcxt.sapiGetAccountApiRestrictions = _fake_get_account_api_restrictions
 
 
 ClientCall = Callable[[ExchangeClient], Awaitable[Any]]

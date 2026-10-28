@@ -168,7 +168,7 @@ async def _fake_get_account_api_restrictions(fake: FakeBinance, *args: Any) -> d
 
 
 # ccxt's camelCase implicit API name, bound as an attribute (pep8-naming flags the def)
-FakeBinance.privateGetAccountApiRestrictions = _fake_get_account_api_restrictions
+FakeBinance.sapiGetAccountApiRestrictions = _fake_get_account_api_restrictions
 
 
 TRADE_CAPABLE = json.dumps(
