@@ -62,6 +62,13 @@ _GET_VERSION_SQL = """
     FROM ml_models WHERE name = $1 AND version = $2
 """
 
+_GET_BY_ID_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE id = $1
+"""
+
 _GET_PRODUCTION_SQL = """
     SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
            artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
@@ -261,6 +268,12 @@ class ModelRegistry:
                 row = await conn.fetchrow(_GET_LATEST_SQL, name)
             else:
                 row = await conn.fetchrow(_GET_VERSION_SQL, name, version)
+        return None if row is None else _row_to_version(row)
+
+    async def get_by_id(self, model_id: uuid.UUID) -> ModelVersion | None:
+        """One version by its registry id — the identity the HTTP surface addresses."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_GET_BY_ID_SQL, model_id)
         return None if row is None else _row_to_version(row)
 
     async def get_production(self, name: str) -> ModelVersion | None:

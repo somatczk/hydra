@@ -45,7 +45,7 @@ jobs:
           version: "0.13.3"
           enable-cache: true
       - run: uv sync --locked --extra dev
-      - run: uv run mypy src/hydra/core/ src/hydra/data/ src/hydra/indicators/ src/hydra/strategy/ src/hydra/backtest/ src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ --strict
+      - run: uv run mypy src/hydra/core/ src/hydra/data/ src/hydra/indicators/ src/hydra/strategy/ src/hydra/backtest/ src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ src/hydra/ml/ --strict
 
   security:
     name: Security Scan

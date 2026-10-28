@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import signal
@@ -25,7 +27,7 @@ import tempfile
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,6 +38,7 @@ from hydra.backtest.jobs import (
     BacktestRunRequest,
     HyperoptRunRequest,
     JobOutcome,
+    MlTrainRunRequest,
     WalkForwardRunRequest,
     import_backtest_strategy,
 )
@@ -46,7 +49,13 @@ from hydra.data.bars import timeframe_seconds
 from hydra.data.errors import DataFetchError, NoMarketDataError
 from hydra.data.migrations.runner import current_revision, head_revision
 from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
+from hydra.data.storage import MarketDataRepository
 from hydra.execution.client_factory import RestHandle, RestPoolFactory, SharedRestClients
+from hydra.ml.dataset import DatasetBuilder
+from hydra.ml.export import export_xgboost_to_onnx, validate_onnx_export
+from hydra.ml.features import FeatureSpec
+from hydra.ml.registry import ModelRegistration, ModelRegistry
+from hydra.ml.training import ModelTrainer
 from hydra.risk.state import PgRiskStateStore
 from hydra.strategy.config import StrategyConfig
 
@@ -348,6 +357,167 @@ async def run_walkforward_job(
     return JobOutcome(result=result.to_dict())
 
 
+# ---------------------------------------------------------------------------
+# The ml_train job: dataset -> trainer -> ONNX export -> registry (P5-B)
+# ---------------------------------------------------------------------------
+
+
+def _ml_models_dir() -> Path:
+    """The mounted models directory, from the config — never from a job payload."""
+    from hydra.core.config import load_config
+
+    return Path(load_config().ml.models_dir)
+
+
+def _ml_reads(spec: FeatureSpec) -> tuple[tuple[Timeframe, int], ...]:
+    """The dataset's three (timeframe, window) reads, in builder order."""
+    return (
+        (Timeframe.H1, spec.window_1h),
+        (Timeframe.H4, spec.window_4h),
+        (Timeframe.D1, spec.window_1d),
+    )
+
+
+def _ml_fetch_progress(
+    run: JobRun, index: int, total: int, timeframe: Timeframe
+) -> ProgressCallback:
+    """Map one read's engine progress onto its slice of the 0→20 fetch band."""
+    span = 20.0 / total
+
+    def on_progress(progress: dict[str, Any]) -> None:
+        run.detail["fetch"] = {**progress, "timeframe": str(timeframe)}
+        owed = _bars_owed(progress["ranges"], timeframe)
+        if owed:
+            run.progress = min(20.0, round(span * (index + progress["bars_fetched"] / owed), 1))
+
+    return on_progress
+
+
+async def _ensure_ml_bars(
+    pool: Any,
+    fetch_engine: OnDemandFetchService | None,
+    exchange: ExchangeId,
+    symbol: str,
+    spec: FeatureSpec,
+    run: JobRun,
+) -> None:
+    """Make each window's bars available before the dataset builder reads them.
+
+    The same engine and budget as the backtest fetch phase; each read covers
+    exactly its (validated, bounded) window, so the phase is capped by
+    ``data.fetch_max_bars`` per read and the dataset by the window sums.
+    """
+    if fetch_engine is None:
+        return
+    repo = MarketDataRepository.from_pool(pool)
+    reads = _ml_reads(spec)
+    now = datetime.now(UTC)
+    for index, (timeframe, window) in enumerate(reads):
+        start = now - timedelta(seconds=timeframe_seconds(timeframe) * window)
+        try:
+            await fetch_engine.ensure_available(
+                repo,
+                exchange,
+                symbol,
+                timeframe,
+                start,
+                now,
+                on_progress=_ml_fetch_progress(run, index, len(reads), timeframe),
+            )
+        except DataFetchError as exc:
+            _fetch_failed(run, reason=exc.reason)
+            raise JobError(exc.message) from exc
+        except NoMarketDataError:
+            _fetch_failed(run)
+            raise
+    run.progress = 20.0
+
+
+def _onnx_metadata(onnx_path: Path) -> dict[str, str]:
+    """The artifact's custom metadata, read back the way serving reads it."""
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    meta = session.get_modelmeta()
+    return dict(meta.custom_metadata_map) if meta is not None else {}
+
+
+async def run_ml_train_job(
+    pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
+) -> JobOutcome:
+    """Train, export and register one model version — the serving bridge.
+
+    DatasetBuilder → ModelTrainer → ``export_xgboost_to_onnx`` (the ONNX carries
+    the feature-spec metadata) → ``validate_onnx_export`` gates the artifact
+    before anything is registered → ``ModelRegistry.register`` under the job's
+    id. Bounded three ways: the request's window/horizon bounds, the engine's
+    ``fetch_max_bars`` per read, and the same 6 h job timeout as every kind.
+    The parity sample is the most recent fully-warmed window — the rows serving
+    will actually see.
+    """
+    body = MlTrainRunRequest.model_validate(jobs.json_value(job["request"]))
+    config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
+    spec = jobs.ml_feature_spec(body)
+    exchange = config.exchange.exchange_id
+
+    await _ensure_ml_bars(pool, fetch_engine, exchange, body.symbol, spec, run)
+
+    repo = MarketDataRepository.from_pool(pool)
+    matrix, provenance = await DatasetBuilder(repo).build(spec, exchange, body.symbol)
+    run.detail["provenance"] = provenance.to_dict()
+    run.progress = 40.0
+
+    trained = await asyncio.to_thread(ModelTrainer().train_xgboost, matrix, None)
+    run.detail["metrics"] = dict(trained.metrics)
+    run.progress = 70.0
+
+    # the artifact file is named for the job id: server-generated, never request data
+    artifact = _ml_models_dir() / f"{job['id']}.onnx"
+    try:
+        await asyncio.to_thread(
+            export_xgboost_to_onnx,
+            trained.model,
+            trained.feature_names,
+            artifact,
+            trained.feature_spec,
+        )
+        metadata = await asyncio.to_thread(_onnx_metadata, artifact)
+        if metadata.get("feature_version") != str(spec.spec_version) or metadata.get(
+            "feature_names"
+        ) != json.dumps(trained.feature_names):
+            msg = (
+                f"the onnx artifact does not carry the trained feature spec "
+                f"(feature_version={metadata.get('feature_version')!r})"
+            )
+            raise JobError(msg)
+        parity = await asyncio.to_thread(
+            validate_onnx_export, trained.model, artifact, matrix.features[-64:]
+        )
+    except JobError:
+        raise
+    except Exception as exc:
+        raise JobError(f"onnx export failed validation: {exc!r}") from exc
+    if not parity:
+        msg = "the onnx export does not reproduce the trained model's predictions"
+        raise JobError(msg)
+    run.progress = 90.0
+
+    version = await ModelRegistry(pool).register(
+        ModelRegistration(
+            name=body.name,
+            model_type=trained.model_type,
+            metrics=dict(trained.metrics),
+            feature_spec=trained.feature_spec.to_dict(),
+            artifact_path=artifact,
+            artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            trained_at=trained.train_timestamp,
+            created_by=f"job:{job['id']}",
+            training_job_id=str(job["id"]),
+        )
+    )
+    return JobOutcome(result=version.to_dict())
+
+
 Handler = Callable[
     [Any, OnDemandFetchService | None, Mapping[str, Any], JobRun],
     Coroutine[Any, Any, JobOutcome],
@@ -357,6 +527,7 @@ _HANDLERS: dict[str, Handler] = {
     "backtest": run_backtest_job,
     "hyperopt": run_hyperopt_job,
     "walkforward": run_walkforward_job,
+    "ml_train": run_ml_train_job,
 }
 
 
