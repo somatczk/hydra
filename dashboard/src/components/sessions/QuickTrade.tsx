@@ -1,11 +1,12 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { LiveOrderReview } from '@/components/live/LiveOrderReview';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
-import { sessionName, stopRuleLabel, type PositionItem, type SessionDetail, type StopRule } from '@/lib/derive';
+import { needsLiveOrderReview, sessionName, stopRuleLabel, type PositionItem, type SessionDetail, type StopRule } from '@/lib/derive';
 import { money } from '@/lib/format';
 import { baseAsset, quickTradeOutcome, type Outcome, type QuickTradeRequest, type QuickTradeResponse } from '@/lib/outcomes';
 import { settle } from './useOutcomeSlot';
@@ -58,11 +59,13 @@ interface QuickTradeProps {
   onSent: () => void;
 }
 
-/** A manual paper order in one running session (F5): live summary above a single primary. */
+/** A manual order in one running session (F5): live summary above a single primary. A running live
+ * session swaps the primary for the L4 review step (08 §6); paper keeps the single-step flow. */
 export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTradeProps) {
   const symbol = session.symbols[0] ?? '';
   const base = baseAsset(symbol);
   const name = sessionName(session);
+  const live = needsLiveOrderReview(session);
   const [side, setSide] = useState<Side>('buy');
   const [quantity, setQuantity] = useState('');
   const [orderType, setOrderType] = useState<OrderType>('MARKET');
@@ -74,15 +77,16 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
   const [pending, setPending] = useState(false);
   const [inline, setInline] = useState<string | null>(null);
   const [rule, setRule] = useState<StopRule | Error | null>(null);
+  const [review, setReview] = useState<QuickTradeRequest | null>(null);
   const sending = useRef(false);
 
   useEffect(() => {
-    let live = true;
+    let alive = true;
     fetchApi<{ risk: StopRule }>(`/api/strategies/${session.strategy_id}`)
-      .then((s) => live && setRule(s.risk))
-      .catch((e: unknown) => live && setRule(e instanceof Error ? e : new Error(String(e))));
+      .then((s) => alive && setRule(s.risk))
+      .catch((e: unknown) => alive && setRule(e instanceof Error ? e : new Error(String(e))));
     return () => {
-      live = false;
+      alive = false;
     };
   }, [session.strategy_id]);
 
@@ -128,21 +132,27 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
         : `Strategy default stop (${ruleText}).`;
   const verb = buy ? 'Buy' : 'Sell';
 
+  const buildReq = (): QuickTradeRequest => ({
+    symbol,
+    side,
+    order_type: orderType,
+    quantity,
+    session_id: session.session_id,
+    ...(orderType === 'LIMIT' ? { price: limitPrice } : {}),
+    ...(buy && protection === 'stop' ? { stop_loss: stopLoss, ...(takeProfit ? { take_profit: takeProfit } : {}) } : {}),
+    ...(buy && protection === 'trailing' ? { trailing_stop_pct: trailing } : {}),
+  });
+
   const submit = async () => {
     if (!valid || sending.current) return;
+    if (live) {
+      setReview(buildReq());
+      return;
+    }
     sending.current = true;
     setPending(true);
     setInline(null);
-    const req: QuickTradeRequest = {
-      symbol,
-      side,
-      order_type: orderType,
-      quantity,
-      session_id: session.session_id,
-      ...(orderType === 'LIMIT' ? { price: limitPrice } : {}),
-      ...(buy && protection === 'stop' ? { stop_loss: stopLoss, ...(takeProfit ? { take_profit: takeProfit } : {}) } : {}),
-      ...(buy && protection === 'trailing' ? { trailing_stop_pct: trailing } : {}),
-    };
+    const req: QuickTradeRequest = buildReq();
     const result = await settle(fetchApi<QuickTradeResponse>('/api/trading/quick-trade', { method: 'POST', body: JSON.stringify(req) }));
     const outcome = quickTradeOutcome(req, result, session.session_id);
     if (outcome.inline) setInline(outcome.title);
@@ -152,6 +162,23 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
     setPending(false);
     onSent();
   };
+
+  if (live && review) {
+    return (
+      <LiveOrderReview
+        session={session}
+        req={review}
+        about={about}
+        onOutcome={(o) => {
+          setReview(null);
+          onOutcome(o);
+        }}
+        onPlaced={() => setQuantity('')}
+        onSent={onSent}
+        onBack={() => setReview(null)}
+      />
+    );
+  }
 
   return (
     <form
@@ -255,13 +282,13 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
       {positive(quantity) && (
         <p aria-live="off" className="rounded border border-line bg-canvas p-3 text-sm">
           <b>
-            {verb} {quantity} {base} at {orderType === 'LIMIT' && positive(limitPrice) ? limitPrice : 'market'} (paper).
+            {verb} {quantity} {base} at {orderType === 'LIMIT' && positive(limitPrice) ? limitPrice : 'market'} ({live ? 'live' : 'paper'}).
           </b>{' '}
           {about} {stopLine} Session {name}.
         </p>
       )}
       <Button type="submit" size="lg" disabled={!valid} loading={pending} className="max-lg:w-full">
-        {pending ? 'Placing order…' : [verb, positive(quantity) ? quantity : null, base, '(paper)'].filter(Boolean).join(' ')}
+        {pending ? 'Placing order…' : live ? 'Review live order' : [verb, positive(quantity) ? quantity : null, base, '(paper)'].filter(Boolean).join(' ')}
       </Button>
       {inline && (
         <p role="alert" className="text-sm text-danger">

@@ -147,7 +147,8 @@ export interface PlatformConfig {
   paper_capital_pending: number | null;
 }
 
-/** `routes/activity.py` PendingApproval (actor is always `service:mcp`). */
+/** `routes/activity.py` PendingApproval; the actor is the requester (C's requested_by) —
+ * 'service:mcp' is Claude, any other principal is your own challenge. */
 export interface PendingApproval {
   id: string;
   actor: string;
@@ -327,9 +328,11 @@ export function needsYou(src: {
   else {
     for (const a of src.approvals) {
       const when = age(now - Date.parse(a.requested_at), now);
+      // must-fix 7: only the MCP actor is Claude; a user principal's own challenge is never "Claude asks to".
+      const ask = a.actor === 'service:mcp' ? `Claude asks to ${actionPhrase(a.action)}` : `You asked to ${actionPhrase(a.action)}`;
       approvalItems.push({
         kind: 'approval',
-        text: `Claude asks to ${actionPhrase(a.action)}${when ? ` · ${when}` : ''}`,
+        text: `${ask}${when ? ` · ${when}` : ''}`,
         href: `/activity/approvals/${a.id}`,
       });
     }

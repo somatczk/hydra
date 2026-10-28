@@ -35,6 +35,8 @@ interface Exchange {
   validatedAt: string | null;
   environment: Environment;
   validatedEnvironment: Environment | null;
+  /** R9: from validated_permissions; true = the stored keys can trade (the delete becomes L4). */
+  tradeEnabled: boolean | null;
 }
 
 interface ApiExchange {
@@ -47,6 +49,7 @@ interface ApiExchange {
   last_sync: string | null;
   environment: Environment;
   validated_environment: Environment | null;
+  trade_enabled?: boolean | null;
 }
 
 interface PlatformConfig {
@@ -124,6 +127,7 @@ function mapApiExchanges(data: ApiExchange[]): Exchange[] {
     validatedAt: e.last_sync,
     environment: e.environment,
     validatedEnvironment: e.validated_environment,
+    tradeEnabled: e.trade_enabled ?? null,
   }));
 }
 

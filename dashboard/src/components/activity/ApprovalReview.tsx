@@ -8,6 +8,7 @@ import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { Input } from '@/components/ui/Input';
 import { Section } from '@/components/ui/Section';
 import { actionPhrase, type ApprovalDetail } from '@/lib/derive';
+import { liveUnknownLine } from '@/lib/outcomes';
 import { duration, utc } from '@/lib/format';
 
 const CODE_LENGTH = 6;
@@ -82,7 +83,11 @@ export function ApprovalReview({
             : approval.status === 'expired'
               ? `This request expired at ${at(approval.expires_at)}. Nothing changed.`
               : approval.status === 'failed'
-                ? 'This approval was invalidated: too many wrong codes, or the action failed to run. Ask for a new one.'
+                ? // R24: a live order or start may exist unwatched — never "Ask for a new one."
+                  [
+                    'This approval was invalidated: too many wrong codes, or the action failed to run.',
+                    liveUnknownLine(approval.action) ?? 'Ask for a new one.',
+                  ].join(' ')
                 : 'This approval is no longer waiting for you.';
 
   return (

@@ -68,7 +68,7 @@ export default function ApprovalReviewPage() {
       approveUnanswered.current = false;
       setInline(null);
       setDecidedHere('approved');
-      setOutcome(approvalOutcome(result));
+      setOutcome(approvalOutcome(result, 'approve', detail.data?.action));
       void refresh();
       return;
     }
@@ -78,7 +78,7 @@ export default function ApprovalReviewPage() {
       approveUnanswered.current = false;
       return;
     }
-    const o = approvalOutcome(result);
+    const o = approvalOutcome(result, 'approve', detail.data?.action);
     approveUnanswered.current = o.unanswered === true;
     if (o.inline) setInline([o.title, ...o.lines].join(' '));
     else {
@@ -101,7 +101,7 @@ export default function ApprovalReviewPage() {
       return;
     }
     if (decidedElsewhere(result.err)) return;
-    setOutcome(approvalOutcome(result, 'deny'));
+    setOutcome(approvalOutcome(result, 'deny', detail.data?.action));
     void refresh();
   };
 

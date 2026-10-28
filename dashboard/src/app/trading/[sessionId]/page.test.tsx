@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
 import { buttonByText, click, dialogPolyfill, flush, inputByLabel, mount, routeFetch, typeInto, type Mounted, type Mutations, type Routes } from '@/test/pageHarness';
-import { detail, liveStatus, paperFill, platformConfig, session } from '@/test/fixtures';
+import { detail, exchangeStop, liveChallenge, liveStatus, paperFill, platformConfig, reconcile, session } from '@/test/fixtures';
 
 const ID = 'a1b2c3d4-0000-4000-8000-000000000001';
 const fetchApi = vi.fn();
@@ -191,5 +191,99 @@ describe('session detail', () => {
     const h = m.container.querySelector('header')?.textContent ?? '';
     expect(h).not.toContain('Claude');
     expect(h).not.toContain('user:soma');
+  });
+});
+
+describe('session detail: the live reads (UI-4c)', () => {
+  const LIVE_POS = { ...HELD, exchange_stop: exchangeStop() };
+  const MIN = 60_000;
+  /** The page ages rows against the shell clock, so the fixture is relative to the real now. */
+  const reconcileDd = () => {
+    const dt = Array.from(m.container.querySelectorAll('dt')).find((n) => n.textContent === 'Reconcile');
+    return dt?.nextElementSibling?.textContent ?? '';
+  };
+
+  it('shows the reconcile row on a live session in each A7 state, and none on paper', async () => {
+    setup(detail({ trading_mode: 'live', reconcile: reconcile({ last_reconciled_at: new Date(Date.now() - 5 * MIN).toISOString() }) }));
+    m = await page();
+    expect(reconcileDd()).toContain('Reconciled 5 min ago');
+    m.unmount();
+
+    setup(detail({ trading_mode: 'live', reconcile: reconcile({ state: 'mismatch', detail: 'untracked order 123 on BTC/USDT (not managed)' }) }));
+    m = await page();
+    expect(reconcileDd()).toContain('Mismatch: untracked order 123 on BTC/USDT (not managed)');
+    m.unmount();
+
+    setup(detail({ trading_mode: 'live', reconcile: reconcile({ state: 'never', last_reconciled_at: null }) }));
+    m = await page();
+    expect(reconcileDd()).toContain('Not reconciled yet');
+    m.unmount();
+
+    setup(detail({ trading_mode: 'live', reconcile: reconcile({ state: 'unknown' }) }));
+    m = await page();
+    expect(reconcileDd()).toContain('UNKNOWN');
+    m.unmount();
+
+    setup(detail({ trading_mode: 'live', reconcile: null }));
+    m = await page();
+    expect(reconcileDd()).toBe('');
+    m.unmount();
+
+    setup(detail());
+    m = await page();
+    expect(reconcileDd()).toBe('');
+  });
+
+  it('reads each held position’s exchange stop: confirmed, missing, unknown', async () => {
+    setup(detail({ trading_mode: 'live', positions: [LIVE_POS] }));
+    m = await page();
+    expect(Array.from(m.container.querySelectorAll('th')).map((h) => h.textContent)).toContain('Exchange stop');
+    expect(text()).toContain('Stop at 64,256.00 on the exchange');
+    expect(text()).not.toContain('No exchange stop');
+    m.unmount();
+
+    setup(detail({ trading_mode: 'live', positions: [{ ...HELD, exchange_stop: exchangeStop({ state: 'missing', kind: null, stop_price: null, take_profit: null, order_list_id: null }) }] }));
+    m = await page();
+    expect(text()).toContain('No exchange stop for BTCUSDT');
+    m.unmount();
+
+    setup(detail({ trading_mode: 'live', positions: [{ ...HELD, exchange_stop: exchangeStop({ state: 'unknown' }) }] }));
+    m = await page();
+    const cells = Array.from(m.container.querySelectorAll('tbody td')).map((td) => td.textContent ?? '');
+    expect(cells.some((c) => c.includes('UNKNOWN'))).toBe(true);
+    expect(text()).not.toContain('No exchange stop for BTCUSDT');
+  });
+
+  it('never shows the exchange-stop cell or its danger for a paper position (the live-only gate)', async () => {
+    setup(detail({ positions: [HELD] }));
+    m = await page();
+    const headers = Array.from(m.container.querySelectorAll('th')).map((h) => h.textContent);
+    expect(headers).not.toContain('Exchange stop');
+    expect(text()).not.toContain('No exchange stop');
+  });
+
+  it('labels a live fill no reconcile pass has covered, and never a paper fill', async () => {
+    setup(detail({ trading_mode: 'live', trades: [paperFill({ reconciled: false }), paperFill({ id: 'ord-2', reconciled: true })] }));
+    m = await page();
+    const rows = Array.from(m.container.querySelectorAll('tbody tr')).map((r) => r.textContent ?? '');
+    expect(rows.filter((r) => r.includes('not reconciled'))).toHaveLength(1);
+    m.unmount();
+
+    setup(detail({ trades: [paperFill()] }));
+    m = await page();
+    expect(text()).not.toContain('not reconciled');
+  });
+
+  it('QuickTrade in a live session opens the review and posts no order from the form', async () => {
+    setup(detail({ trading_mode: 'live' }), {
+      'POST /api/live/order': liveChallenge({ note: 'Enter this code once to place the live order.' }),
+    });
+    m = await page();
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.0015');
+    expect(text()).toContain('Buy 0.0015 BTC at market (live).');
+    await click(buttonByText(m.container, 'Review live order'));
+    expect(calls.filter((c) => c.path === '/api/trading/quick-trade')).toHaveLength(0);
+    expect(text()).toContain('Buy 0.0015 BTC with real money on Binance');
+    expect(text()).toContain('Place live order');
   });
 });

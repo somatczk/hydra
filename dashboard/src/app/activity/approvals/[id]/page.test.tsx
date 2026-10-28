@@ -271,6 +271,21 @@ describe('approval review: the one-time code', () => {
     expect(text()).not.toContain("couldn't reach the engine");
     expect(text()).toContain('One-time code');
   });
+
+  it('a failed live order renders the unknown-live copy, never "Ask for a new one." (R24 caller half)', async () => {
+    const msg = "The approved action 'live_order' did not run: exchange unreachable";
+    setup(approvalDetail({ action: 'live_order', params: { session_id: 'a1b2c3d4-0000-4000-8000-000000000001', symbol: 'BTCUSDT', side: 'buy', quantity: '0.0015' } }), {
+      [`POST /api/activity/approvals/${ID}/approve`]: envelope(503, 'approval_execution_failed', msg, 'unavailable'),
+    });
+    m = await page();
+    expect(m.container.querySelector('h1')?.textContent).toBe('Claude asks to place a live order');
+    await typeCode('424242');
+    await click(buttonByText(m.container, 'Approve and place a live order'));
+    expect(text()).toContain('Not confirmed.');
+    expect(text()).toContain("We don't know whether the order was placed. Check this session's fills and positions before trying again.");
+    expect(text()).toContain(msg);
+    expect(text()).not.toContain('Ask for a new one.');
+  });
 });
 
 describe('approval review: a lost answer', () => {
@@ -357,6 +372,14 @@ describe('approval review: states that need no code', () => {
     m = await page();
     expect(text()).toContain('This approval was invalidated: too many wrong codes, or the action failed to run. Ask for a new one.');
     expect(text()).toContain('executor raised');
+  });
+
+  it('a failed live order never says "Ask for a new one." — the order may exist unwatched (R24)', async () => {
+    setup(approvalDetail({ status: 'failed', action: 'live_order', error: 'exchange unreachable', decided_at: '2026-10-21T13:54:00+00:00' }));
+    m = await page();
+    expect(text()).toContain('This approval was invalidated: too many wrong codes, or the action failed to run.');
+    expect(text()).toContain("We don't know whether the order was placed. Check this session's fills and positions before trying again.");
+    expect(text()).not.toContain('Ask for a new one.');
   });
 
   it('shows a decision that happened elsewhere after the POST, instead of an error', async () => {
