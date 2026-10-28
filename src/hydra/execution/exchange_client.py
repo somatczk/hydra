@@ -221,7 +221,7 @@ class ExchangeClient:
         sapi call that never trades; the caller maps ccxt errors."""
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "fetch_api_restrictions"):
-            result: dict[str, Any] = await exchange.privateGetAccountApiRestrictions()
+            result: dict[str, Any] = await exchange.sapiGetAccountApiRestrictions()
         return result
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
