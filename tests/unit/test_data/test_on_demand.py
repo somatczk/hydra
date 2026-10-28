@@ -451,6 +451,43 @@ class TestSerialization:
         assert (first.bars_fetched, first.weight_spent) == (5, 10)
         assert (second.bars_fetched, second.weight_spent, second.ranges_fetched) == (0, 0, 0)
 
+    async def test_concurrent_different_dataset_calls_interleave(self) -> None:
+        """Different (exchange, symbol, timeframe) keys never share the lock (B1-A4).
+
+        The per-key locks exist so a cold fetch of one dataset never blocks another:
+        with a yielding exchange, both progress streams advance inside the other's
+        span — the first concurrent-use pin.
+        """
+        repo = FakeRepo()
+        exchange = _YieldingExchange([_row(m) for m in range(5)])
+        service, _ = _engine(exchange, page_size=1)
+        events: list[str] = []
+
+        async def run(symbol: str):
+            def on_progress(progress: dict[str, Any]) -> None:
+                events.append(f"{symbol}:{progress['state']}:{progress['bars_fetched']}")
+
+            return await service.ensure_available(
+                repo,
+                "binance",
+                symbol,
+                Timeframe.M1,
+                _ts(0),
+                _ts(4),
+                on_progress=on_progress,
+            )
+
+        btc, eth = await asyncio.gather(run("BTCUSDT"), run("ETHUSDT"))
+
+        first_eth = next(i for i, e in enumerate(events) if e.startswith("ETHUSDT:"))
+        last_btc = max(i for i, e in enumerate(events) if e.startswith("BTCUSDT:"))
+        assert first_eth < last_btc  # serialized streams would finish BTCUSDT first
+        assert len(exchange.calls) == 10  # five pages each, no call dropped to the lock
+        assert (btc.bars_fetched, eth.bars_fetched) == (5, 5)
+        assert repo.stored_ts() == [_ts(m) for m in range(5)]
+        assert repo.stored_ts(symbol="ETHUSDT") == [_ts(m) for m in range(5)]
+        assert all(source == "auto" for _, source in repo.upserts)
+
 
 # ---------------------------------------------------------------------------
 # Patience

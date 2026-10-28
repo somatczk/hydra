@@ -1,5 +1,5 @@
-"""Backtest job building blocks: request models, strategy import, bar loading, result rows and
-the durable job queue (``backtest_jobs``) that the worker claims from.
+"""Backtest job building blocks: request models, strategy import, bar availability and loading,
+result rows and the durable job queue (``backtest_jobs``) that the worker claims from.
 
 Lives in hydra.backtest so the routes' services (enqueue/read) and the worker (claim/run) share it
 without either importing the other's layer.
@@ -29,9 +29,8 @@ from hydra.backtest.data import (
 from hydra.backtest.metrics import BacktestResult, Trade
 from hydra.backtest.walkforward import window_bar_counts
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
-from hydra.data.backfill import ExchangeBackfillService
+from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
 from hydra.data.storage import MarketDataRepository
-from hydra.execution.client_factory import rest_exchange_factory
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 
@@ -193,33 +192,33 @@ def provenance_payload(provenance: DataProvenance, config: StrategyConfig) -> di
 # ---------------------------------------------------------------------------
 
 
-async def fetch_fresh_bars(
-    pool: Any, config: StrategyConfig, start: datetime, end: datetime
-) -> str | None:
-    """Backfill the range over the exchange's public async REST API; the error when it failed."""
-    exchange_id = config.exchange.exchange_id
+async def ensure_job_bars(
+    pool: Any,
+    fetch_engine: OnDemandFetchService,
+    config: StrategyConfig,
+    start: datetime,
+    end: datetime,
+    *,
+    force: bool = False,
+    on_progress: ProgressCallback | None = None,
+) -> None:
+    """Fetch the range's missing bars through the injected on-demand engine.
 
-    def _rest_factory() -> Any:
-        return rest_exchange_factory(exchange_id)
-
-    backfill = ExchangeBackfillService(
-        repository=MarketDataRepository.from_pool(pool),
-        exchange_factories={exchange_id: _rest_factory},
+    ``force=True`` is the ``fetch_fresh`` meaning: refetch the whole grid-rounded
+    range. Bars the exchange genuinely lacks stay missing — the loader after this
+    raises the P0-B vocabulary, never a synthetic fallback.
+    """
+    repo = MarketDataRepository.from_pool(pool)
+    await fetch_engine.ensure_available(
+        repo,
+        config.exchange.exchange_id,
+        config.symbols[0],
+        config.timeframes.primary,
+        start,
+        end,
+        force=force,
+        on_progress=on_progress,
     )
-    try:
-        await backfill.bulk_download(
-            exchange_id=exchange_id,
-            symbol=config.symbols[0],
-            timeframe=config.timeframes.primary,
-            start=start,
-            end=end,
-        )
-    except Exception as exc:
-        logger.warning("Fresh data fetch failed, using stored bars", exc_info=True)
-        return str(exc)
-    finally:
-        await backfill.close()
-    return None
 
 
 async def load_job_bars(
