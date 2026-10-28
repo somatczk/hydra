@@ -1,4 +1,4 @@
-"""The 34 MCP tools (22 research + strategy, 10 session + risk, 2 code-gated live),
+"""The 35 MCP tools (23 research + strategy, 10 session + risk, 2 code-gated live),
 called through the mounted transport.
 
 Every test drives the real JSON-RPC surface — initialize, notifications/initialized,
@@ -32,6 +32,7 @@ from httpx import Response
 from structlog.testing import capture_logs
 
 from hydra.backtest.jobs import MAX_RESULT_SUMMARIES
+from hydra.core import metrics
 from hydra.core.config import HydraConfig
 from hydra.core.logging import get_logger
 from hydra.dashboard import security
@@ -76,6 +77,7 @@ B1_TOOLS = frozenset(
         "walkforward_results",
         "strategy_params",
         "data_coverage",
+        "data_inventory",
         "universe_list",
         "strategy_list",
         "strategy_get",
@@ -317,14 +319,41 @@ class _RefusingManager:
 
 
 class _CoverageConn:
-    """Serves one MIN/MAX/COUNT row for the data_coverage read."""
+    """Serves the three data_coverage reads: the range row, the source split, the ledger row."""
 
-    def __init__(self, row: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        row: dict[str, Any],
+        sources: list[dict[str, Any]] | None = None,
+        entry: dict[str, Any] | None = None,
+    ) -> None:
         self.row = row
+        self.sources = sources or []
+        self.entry = entry
 
-    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        if "FROM data_cache_entries" in query:
+            return self.entry
         assert "FROM ts.ohlcv_1m" in query
         return self.row
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM ts.ohlcv_1m" in query and "GROUP BY source" in query
+        return self.sources
+
+
+class _InventoryConn:
+    """Serves the two data_inventory reads: the LRU-ordered ledger rows and the totals."""
+
+    def __init__(self, entries: list[dict[str, Any]], totals: dict[str, Any]) -> None:
+        self.entries = entries
+        self.totals = totals
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM data_cache_entries" in query
+        if "ORDER BY" in query:
+            return self.entries
+        return [self.totals]
 
 
 class _UniverseConn:
@@ -415,10 +444,10 @@ def test_engine_state_falls_back_to_the_imported_module_app(
     assert _deps.db_pool() is sentinel
 
 
-def test_tools_list_advertises_the_34_tools(mcp: _McpClient) -> None:
+def test_tools_list_advertises_the_35_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
     assert names == B1_TOOLS | B2_TOOLS | LIVE_TOOLS
-    assert len(names) == 34
+    assert len(names) == 35
     # the live pin: the two gated live tools; no live_arm/live_disarm (the operator's ceremony)
     assert "risk_live_status" in names
     assert {name for name in names if name.startswith("live_")} == {
@@ -491,7 +520,11 @@ def test_data_coverage_round_trips_the_stored_range(
         "last_ts": datetime(2026, 1, 2, 23, tzinfo=UTC),
         "n": 48,
     }
-    monkeypatch.setattr(engine_app.state, "db_pool", _FakePool(_CoverageConn(row)))
+    monkeypatch.setattr(
+        engine_app.state,
+        "db_pool",
+        _FakePool(_CoverageConn(row, sources=[{"source": "feed", "n": 48}])),
+    )
     is_error, text = mcp.call(
         "data_coverage", {"exchange_id": "binance", "symbol": "BTCUSDT", "timeframe": "1h"}
     )
@@ -503,7 +536,119 @@ def test_data_coverage_round_trips_the_stored_range(
         "first_ts": "2026-01-01T00:00:00+00:00",
         "last_ts": "2026-01-02T23:00:00+00:00",
         "bar_count": 48,
+        "sources": {"feed": 48, "auto": 0},
+        "estimated_bytes": 48 * 160,
+        "cache": None,
     }
+
+
+def test_data_coverage_reads_the_estimate_from_the_engine_config(
+    mcp: _McpClient, bind_api_config: Bind, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``estimated_bytes`` follows the engine's ``data.row_bytes_estimate``, never a
+    baked-in constant."""
+    cfg = bind_api_config(
+        HYDRA_API_TOKEN=TEST_API_TOKEN,
+        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
+        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        HYDRA_DATA__ROW_BYTES_ESTIMATE="250",
+    )
+    assert cfg.data.row_bytes_estimate == 250
+    row = {
+        "first_ts": datetime(2026, 1, 1, tzinfo=UTC),
+        "last_ts": datetime(2026, 1, 2, 23, tzinfo=UTC),
+        "n": 48,
+    }
+    monkeypatch.setattr(engine_app.state, "db_pool", _FakePool(_CoverageConn(row)))
+    is_error, text = mcp.call(
+        "data_coverage", {"exchange_id": "binance", "symbol": "BTCUSDT", "timeframe": "1h"}
+    )
+    assert not is_error
+    assert json.loads(text)["estimated_bytes"] == 48 * 250
+
+
+def _inventory_entry(
+    symbol: str, timeframe: str, rows: int, status: str, last_used: datetime
+) -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "first_ts": datetime(2025, 12, 1, tzinfo=UTC),
+        "last_ts": datetime(2026, 1, 31, 23, tzinfo=UTC),
+        "rows": rows,
+        "status": status,
+        "created_at": datetime(2025, 12, 1, tzinfo=UTC),
+        "last_fetched_at": datetime(2026, 10, 27, 9, tzinfo=UTC),
+        "last_used_at": last_used,
+    }
+
+
+def test_data_inventory_lists_the_cached_datasets_lru_first_with_the_totals(
+    mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metrics.mark_data_sweep(at=1_761_628_200.0)
+    entries = [
+        _inventory_entry("ETHUSDT", "1h", 0, "ready", datetime(2026, 10, 1, tzinfo=UTC)),
+        _inventory_entry("BTCUSDT", "1m", 500, "fetching", datetime(2026, 10, 2, tzinfo=UTC)),
+    ]
+    monkeypatch.setattr(
+        engine_app.state,
+        "db_pool",
+        _FakePool(_InventoryConn(entries, {"rows": 500, "datasets": 2})),
+    )
+    is_error, text = mcp.call("data_inventory", {})
+    assert not is_error
+    assert json.loads(text) == {
+        "datasets": [
+            {
+                "exchange": "binance",
+                "symbol": "ETHUSDT",
+                "timeframe": "1h",
+                "coverage": {
+                    "first_ts": "2025-12-01T00:00:00+00:00",
+                    "last_ts": "2026-01-31T23:00:00+00:00",
+                },
+                "rows": 0,
+                "estimated_bytes": 0,
+                "status": "ready",
+                "last_used_at": "2026-10-01T00:00:00+00:00",
+            },
+            {
+                "exchange": "binance",
+                "symbol": "BTCUSDT",
+                "timeframe": "1m",
+                "coverage": {
+                    "first_ts": "2025-12-01T00:00:00+00:00",
+                    "last_ts": "2026-01-31T23:00:00+00:00",
+                },
+                "rows": 500,
+                "estimated_bytes": 500 * 160,
+                "status": "fetching",
+                "last_used_at": "2026-10-02T00:00:00+00:00",
+            },
+        ],
+        "totals": {
+            "bytes": 500 * 160,
+            "rows": 500,
+            "pairs": 2,
+            "budget_bytes": 10 * 2**30,
+            "last_sweep": "2025-10-28T05:10:00+00:00",
+        },
+    }
+
+
+def test_data_inventory_description_pins_the_coverage_copy(mcp: _McpClient) -> None:
+    """The copy: the LRU order, the requested-coverage range (never "auto-cached
+    since"), the rows=0 honesty and the budget/totals."""
+    [tool] = [t for t in mcp.list_tools() if t["name"] == "data_inventory"]
+    description = " ".join(tool["description"].split())
+    assert "least-recently-used first" in description
+    assert "eviction candidates lead the list" in description
+    assert "never an" in description
+    assert "auto-cached since" in description
+    assert 'an honest "no bars"' in description
+    assert "budget" in description
 
 
 def test_universe_list_returns_the_seeded_ranking(
@@ -852,6 +997,23 @@ def test_data_coverage_without_a_pool_is_the_503_envelope(
     )
     assert is_error
     envelope = json.loads(text.removeprefix("Error executing tool data_coverage: "))
+    assert envelope == {
+        "status": 503,
+        "detail": {
+            "code": "database_unavailable",
+            "message": "Database is not available",
+            "state": "unavailable",
+        },
+    }
+
+
+def test_data_inventory_without_a_pool_is_the_503_envelope(
+    mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", None)
+    is_error, text = mcp.call("data_inventory", {})
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool data_inventory: "))
     assert envelope == {
         "status": 503,
         "detail": {
