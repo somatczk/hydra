@@ -15,6 +15,7 @@ from prometheus_client import REGISTRY, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
 from hydra.core import metrics
+from hydra.core.config import HydraConfig
 from hydra.dashboard.health import FEED_MESSAGE_MAX_AGE_S, closed_bar_max_age
 from tests.unit.test_risk.harness import make_account, permissive
 
@@ -300,3 +301,41 @@ def test_forgetting_a_session_that_never_reconciled_is_quiet() -> None:
     metrics.forget_session("s5", "saw", "paper")  # the series was never set
 
     assert _reconcile_state("s5") is None
+
+
+# ---------------------------------------------------------------------------
+# The data cache alerts (P6-C3): the sweeper's budget and its own heartbeat
+# ---------------------------------------------------------------------------
+
+
+def test_data_cache_alerts_read_the_sweeper_gauges() -> None:
+    """The two alerts read C2's unlabelled gauges; absent series never fire either."""
+    rules = _rules()
+    over_budget = rules["HydraDataCacheOverBudget"]
+    assert over_budget["expr"].strip() == "hydra_data_cache_bytes > hydra_data_cache_budget_bytes"
+    assert over_budget["for"] == "1h"
+    assert over_budget["labels"] == {"severity": "warning", "team": "infra"}
+    description = over_budget["annotations"]["description"]
+    assert "over its configured budget" in description
+    assert "sweep interval" in description
+
+    stalled = rules["HydraDataSweepStalled"]
+    assert stalled["expr"].strip() == "time() - hydra_data_sweep_last_timestamp_seconds > 7200"
+    assert stalled["for"] == "30m"
+    assert stalled["labels"] == {"severity": "warning", "team": "infra"}
+
+
+def test_the_over_budget_window_gives_the_sweeper_a_full_cycle() -> None:
+    """1h for is one sweep interval: the sweeper reclaims the excess before the page lands."""
+    interval = HydraConfig().data.sweep_interval_s
+    assert interval <= 3600
+    assert 2 * interval <= 7200  # the stall threshold: two missed cycles
+
+
+def test_the_data_cache_gauges_write_through() -> None:
+    metrics.set_data_cache(rows=1_000, bytes=160_000, pairs=1, budget_bytes=10_737_418_240)
+    assert _exported_sample("hydra_data_cache_bytes") == 160_000.0
+    assert _exported_sample("hydra_data_cache_budget_bytes") == 10_737_418_240.0
+
+    metrics.mark_data_sweep(at=1_700_000_000.0)
+    assert _exported_sample("hydra_data_sweep_last_timestamp_seconds") == 1_700_000_000.0
