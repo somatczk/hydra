@@ -29,6 +29,7 @@ from hydra.dashboard.routes.system import router
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore, LoadedConfig, RiskStateUnavailableError
 from hydra.services.trader import LocalTrader
+from tests.fixtures.universe import OFFLINE_RANKED_AT
 from tests.unit.test_risk.harness import Clock, rules_cache
 
 from .system_db import NOW, FakeSystemDb
@@ -256,6 +257,49 @@ class TestUpdateConfig:
     def test_no_pool_is_503(self, client_no_pool: TestClient) -> None:
         resp = client_no_pool.put("/api/system/config", json={"default_pair": "ETH/USDT"})
         assert resp.status_code == 503
+
+    def test_default_pair_outside_the_universe_is_422_and_writes_nothing(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        """The write gate: a non-member default_pair is refused, nothing is persisted and
+        the stored universe row is only ever read."""
+        resp = client.put("/api/system/config", json={"default_pair": "FOOBAR"})
+        assert resp.status_code == 422
+        assert _detail(resp) == {
+            "code": "symbol_not_in_universe",
+            "message": (
+                "FOOBAR is not in the current top-100 universe "
+                f"(ranked at {OFFLINE_RANKED_AT.isoformat()}); running sessions and stored "
+                "strategies are unaffected"
+            ),
+            "state": "invalid",
+            "symbol": "FOOBAR",
+            "universe_ranked_at": OFFLINE_RANKED_AT.isoformat(),
+            "universe_count": 3,
+        }
+        assert db.value("default_pair") == "BTC/USDT"
+        # the gate reads the row; an INSERT would have stamped updated_by on it
+        assert db.config["universe"]["updated_by"] is None
+        assert client.get("/api/system/config").json()["default_pair"] == "BTC/USDT"
+
+    def test_default_pair_slash_form_normalizes_and_saves(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        resp = client.put("/api/system/config", json={"default_pair": "BTC/USDT"})
+        assert resp.status_code == 200
+        assert resp.json()["default_pair"] == "BTC/USDT"
+        assert db.value("default_pair") == "BTC/USDT"
+        assert db.config["universe"]["updated_by"] is None
+
+    def test_default_pair_with_no_universe_row_fails_closed(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        """Before the first refresh lands, no default_pair is writable — never a guess."""
+        del db.config["universe"]
+        resp = client.put("/api/system/config", json={"default_pair": "ETH/USDT"})
+        assert resp.status_code == 503
+        assert _detail(resp)["code"] == "universe_unavailable"
+        assert db.value("default_pair") == "BTC/USDT"
 
 
 class _SystemConfigStore(InMemoryRiskStateStore):

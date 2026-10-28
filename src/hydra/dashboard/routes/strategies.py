@@ -101,9 +101,9 @@ async def get_strategy(strategy_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.put("/{strategy_id}", response_model=SaveResponse)
-async def update_strategy(strategy_id: str, body: SaveRequest) -> SaveResponse:
+async def update_strategy(strategy_id: str, body: SaveRequest, request: Request) -> SaveResponse:
     """Update a rule-based strategy config (structured payload -> YAML)."""
-    return svc.update_strategy(strategy_id, body)
+    return await svc.update_strategy(request_pool(request), strategy_id, body)
 
 
 @router.get("/{strategy_id}/performance", response_model=StrategyPerformance)
@@ -144,9 +144,9 @@ async def preview_signals(body: PreviewRequest, request: Request) -> PreviewResp
 
 
 @router.post("/save", response_model=SaveResponse, status_code=201)
-async def save_strategy(request: SaveRequest) -> SaveResponse:
+async def save_strategy(body: SaveRequest, request: Request) -> SaveResponse:
     """Validate and save a strategy as a YAML config file."""
-    return svc.save_strategy(request)
+    return await svc.save_strategy(request_pool(request), body)
 
 
 @router.get("/{strategy_id}/export")

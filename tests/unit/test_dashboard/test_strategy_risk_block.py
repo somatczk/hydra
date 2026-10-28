@@ -12,13 +12,16 @@ import yaml
 
 from hydra.dashboard.api import app
 from hydra.strategy.config import load_strategy_config
+from tests.fixtures.universe import seeded_universe_pool
 from tests.unit.test_execution.session_harness import Harness, executor
 
 from .conftest import TEST_API_TOKEN
 
 
 @pytest.fixture()
-async def api() -> AsyncIterator[httpx.AsyncClient]:
+async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[httpx.AsyncClient]:
+    # the stored universe row every builder save now reads (the refresher's steady state)
+    monkeypatch.setattr(app.state, "db_pool", seeded_universe_pool())
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://engine",
