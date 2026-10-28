@@ -1,161 +1,315 @@
-"""In-memory model registry for tracking model versions and lifecycle.
+"""The DB-backed model registry: immutable versions over the ``ml_models`` table.
 
-Manages model versioning, stage promotion, and retrieval. Can later be backed
-by MLflow for persistent storage.
+One row per model version; register assigns the next version per name and
+verifies the artifact's sha256, promote stages a version as Production and
+archives the previous Production (recording the demotion time), and rollback
+re-promotes the most recently archived Production of the same name — a rollback
+never leaves the name without a Production. The pool is injected: ``hydra.ml``
+never owns one.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from typing import ClassVar
+import hashlib
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-from hydra.ml.training import TrainedModel
+from hydra.core.logging import get_logger
 
-# ---------------------------------------------------------------------------
-# ModelInfo dataclass
-# ---------------------------------------------------------------------------
+logger = get_logger(__name__)
+
+_REGISTER_SQL = """
+    INSERT INTO ml_models (id, name, version, model_type, metrics, feature_spec,
+                           artifact_file, artifact_sha256, trained_at, created_by,
+                           training_job_id)
+    SELECT $1::uuid, $2, COALESCE(MAX(version), 0) + 1, $3, $4::jsonb, $5::jsonb,
+           $6, $7, $8, $9, $10
+    FROM ml_models WHERE name = $2
+    RETURNING id, name, version, stage, model_type, metrics, feature_spec, drift,
+              artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+              archived_at
+"""
+
+_LIST_ALL_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models ORDER BY name, version
+"""
+
+_LIST_NAME_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE name = $1 ORDER BY version
+"""
+
+_GET_LATEST_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE name = $1 ORDER BY version DESC LIMIT 1
+"""
+
+_GET_VERSION_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE name = $1 AND version = $2
+"""
+
+_GET_PRODUCTION_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE name = $1 AND stage = 'production'
+"""
+
+_DEMOTE_OTHER_PRODUCTION_SQL = """
+    UPDATE ml_models SET stage = 'archived', archived_at = now()
+    WHERE name = $1 AND stage = 'production' AND version <> $2
+    RETURNING version
+"""
+
+_PROMOTE_SQL = """
+    UPDATE ml_models SET stage = 'production', archived_at = NULL
+    WHERE name = $1 AND version = $2
+    RETURNING id, name, version, stage, model_type, metrics, feature_spec, drift,
+              artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+              archived_at
+"""
+
+_RESTORE_LATEST_ARCHIVED_SQL = """
+    UPDATE ml_models SET stage = 'production', archived_at = NULL
+    WHERE id = (SELECT id FROM ml_models WHERE name = $1 AND stage = 'archived'
+                ORDER BY archived_at DESC, version DESC LIMIT 1)
+    RETURNING id, name, version, stage, model_type, metrics, feature_spec, drift,
+              artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+              archived_at
+"""
+
+_ARCHIVE_CURRENT_PRODUCTION_SQL = """
+    UPDATE ml_models SET stage = 'archived', archived_at = now()
+    WHERE name = $1 AND stage = 'production' AND version <> $2
+"""
 
 
-@dataclass
-class ModelInfo:
-    """Metadata about a registered model."""
+class ModelRegistryError(Exception):
+    """A registry refusal: unknown model, artifact hash mismatch or a duplicate version."""
 
-    model_id: str
+
+@dataclass(frozen=True)
+class ModelVersion:
+    """One immutable model version; only the stage lifecycle field is mutable."""
+
+    id: uuid.UUID
     name: str
-    version: str
+    version: int
     stage: str
-    metrics: dict[str, float]
-    created_at: datetime
+    model_type: str
+    metrics: dict[str, Any]
+    feature_spec: dict[str, Any]
+    drift: dict[str, Any] | None
+    artifact_file: str
+    artifact_sha256: str
+    trained_at: datetime
+    created_by: str
+    training_job_id: str | None
+    archived_at: datetime | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "name": self.name,
+            "version": self.version,
+            "stage": self.stage,
+            "model_type": self.model_type,
+            "metrics": self.metrics,
+            "feature_spec": self.feature_spec,
+            "drift": self.drift,
+            "artifact_file": self.artifact_file,
+            "artifact_sha256": self.artifact_sha256,
+            "trained_at": self.trained_at.isoformat(),
+            "created_by": self.created_by,
+            "training_job_id": self.training_job_id,
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None,
+        }
 
 
-# ---------------------------------------------------------------------------
-# Internal registry entry
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ModelRegistration:
+    """One new version: what was trained, where its artifact is, who trained it."""
+
+    name: str
+    model_type: str
+    metrics: dict[str, Any]
+    feature_spec: dict[str, Any]
+    artifact_path: Path
+    artifact_sha256: str
+    trained_at: datetime
+    created_by: str
+    training_job_id: str | None = None
 
 
-@dataclass
-class _RegistryEntry:
-    """Internal storage pairing a trained model with its registry info."""
-
-    model: TrainedModel
-    info: ModelInfo = field(repr=False)
+def _json_value(value: Any) -> Any:
+    """asyncpg returns jsonb columns as JSON text; dicts and records pass through."""
+    return json.loads(value) if isinstance(value, str) else value
 
 
-# ---------------------------------------------------------------------------
-# ModelRegistry
-# ---------------------------------------------------------------------------
+def _row_to_version(row: Any) -> ModelVersion:
+    return ModelVersion(
+        id=row["id"],
+        name=row["name"],
+        version=int(row["version"]),
+        stage=row["stage"],
+        model_type=row["model_type"],
+        metrics=_json_value(row["metrics"]),
+        feature_spec=_json_value(row["feature_spec"]),
+        drift=_json_value(row["drift"]) if row["drift"] is not None else None,
+        artifact_file=row["artifact_file"],
+        artifact_sha256=row["artifact_sha256"],
+        trained_at=row["trained_at"],
+        created_by=row["created_by"],
+        training_job_id=row["training_job_id"],
+        archived_at=row["archived_at"],
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    """The artifact's hex sha256 — the hash the registry pins and parity checks trust."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        msg = f"cannot read model artifact {path}: {exc!r}"
+        raise ModelRegistryError(msg) from exc
+    return digest.hexdigest()
 
 
 class ModelRegistry:
-    """In-memory model registry tracking versions and lifecycle stages.
+    """Registry over ``ml_models``; the pool is injected (ml never owns one)."""
 
-    Models progress through stages: ``"none"`` -> ``"staging"`` ->
-    ``"production"`` -> ``"archived"``.
-    """
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
 
-    _VALID_STAGES: ClassVar[set[str]] = {"none", "staging", "production", "archived"}
+    async def register(self, entry: ModelRegistration) -> ModelVersion:
+        """Insert the next immutable version of ``name``; refuse an artifact hash mismatch.
 
-    def __init__(self) -> None:
-        self._models: dict[str, list[_RegistryEntry]] = {}
-
-    def register(self, model: TrainedModel, name: str) -> str:
-        """Register a trained model under *name* and return its model_id.
-
-        The version is auto-incremented as ``"v1"``, ``"v2"``, etc.
+        The version is assigned atomically (max + 1 per name); a concurrent
+        duplicate loses on the ``UNIQUE (name, version)`` constraint.
         """
-        entries = self._models.setdefault(name, [])
-        version = f"v{len(entries) + 1}"
-        model_id = f"{name}/{version}"
+        actual = _sha256_file(entry.artifact_path)
+        if actual != entry.artifact_sha256:
+            msg = (
+                f"artifact sha256 mismatch for {entry.artifact_path.name}: "
+                f"expected {entry.artifact_sha256}, file hashes {actual}"
+            )
+            raise ModelRegistryError(msg)
 
-        info = ModelInfo(
-            model_id=model_id,
-            name=name,
-            version=version,
-            stage="none",
-            metrics=dict(model.metrics),
-            created_at=datetime.now(tz=UTC),
+        import asyncpg
+
+        async with self._pool.acquire() as conn:
+            try:
+                row = await conn.fetchrow(
+                    _REGISTER_SQL,
+                    uuid.uuid4(),
+                    entry.name,
+                    entry.model_type,
+                    json.dumps(entry.metrics),
+                    json.dumps(entry.feature_spec),
+                    entry.artifact_path.name,
+                    entry.artifact_sha256,
+                    entry.trained_at,
+                    entry.created_by,
+                    entry.training_job_id,
+                )
+            except asyncpg.UniqueViolationError as exc:
+                msg = f"model '{entry.name}' already has the next version; retry the register"
+                raise ModelRegistryError(msg) from exc
+        if row is None:
+            msg = "register produced no row"
+            raise ModelRegistryError(msg)
+        version = _row_to_version(row)
+        logger.info(
+            "ml model registered",
+            name=version.name,
+            version=version.version,
+            artifact=version.artifact_file,
+            created_by=version.created_by,
         )
-        entries.append(_RegistryEntry(model=model, info=info))
-        return model_id
+        return version
 
-    def get_model(self, name: str, version: str | None = None) -> TrainedModel | None:
-        """Retrieve a model by name and optional version.
+    async def list(self, name: str | None = None) -> list[ModelVersion]:
+        """Every version, optionally of one name, in name-then-version order."""
+        async with self._pool.acquire() as conn:
+            if name is None:
+                rows = await conn.fetch(_LIST_ALL_SQL)
+            else:
+                rows = await conn.fetch(_LIST_NAME_SQL, name)
+        return [_row_to_version(r) for r in rows]
 
-        If *version* is ``None``, the latest version is returned.
+    async def get(self, name: str, version: int | None = None) -> ModelVersion | None:
+        """One version, or the latest registered version of the name; None when absent."""
+        async with self._pool.acquire() as conn:
+            if version is None:
+                row = await conn.fetchrow(_GET_LATEST_SQL, name)
+            else:
+                row = await conn.fetchrow(_GET_VERSION_SQL, name, version)
+        return None if row is None else _row_to_version(row)
+
+    async def get_production(self, name: str) -> ModelVersion | None:
+        """The version currently in Production for the name; None when there is none."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_GET_PRODUCTION_SQL, name)
+        return None if row is None else _row_to_version(row)
+
+    async def promote(self, name: str, version: int) -> ModelVersion:
+        """Stage the version as Production; the previous Production is archived and recorded.
+
+        The refusal for an unknown version raises inside the transaction, so the
+        demote of the current Production rolls back with it.
         """
-        entries = self._models.get(name)
-        if not entries:
-            return None
+        async with self._pool.acquire() as conn, conn.transaction():
+            demoted = await conn.fetchrow(_DEMOTE_OTHER_PRODUCTION_SQL, name, version)
+            row = await conn.fetchrow(_PROMOTE_SQL, name, version)
+            if row is None:
+                msg = f"model '{name}' has no version {version}"
+                raise ModelRegistryError(msg)
+        if demoted is not None:
+            logger.info(
+                "ml model demoted from production",
+                name=name,
+                version=demoted["version"],
+                promoted_version=version,
+            )
+        return _row_to_version(row)
 
-        if version is None:
-            return entries[-1].model
+    async def rollback(self, name: str) -> ModelVersion:
+        """Re-promote the most recently archived Production of the name.
 
-        for entry in entries:
-            if entry.info.version == version:
-                return entry.model
-        return None
-
-    def list_models(self, name: str | None = None) -> list[ModelInfo]:
-        """List model info records, optionally filtered by *name*."""
-        result: list[ModelInfo] = []
-        if name is not None:
-            for entry in self._models.get(name, []):
-                result.append(entry.info)
-        else:
-            for entries in self._models.values():
-                for entry in entries:
-                    result.append(entry.info)
-        return result
-
-    def promote(self, model_id: str, stage: str) -> None:
-        """Promote a model to the given stage.
-
-        Parameters
-        ----------
-        model_id:
-            Model identifier in the form ``"name/version"``.
-        stage:
-            Target stage: ``"staging"``, ``"production"``, or ``"archived"``.
-
-        Raises
-        ------
-        ValueError
-            If the model_id is not found or the stage is invalid.
+        The restore candidate is picked before the current Production is
+        archived, so a rollback never re-promotes the version it just demoted.
+        Refuses (leaving Production untouched) when no archived version exists.
         """
-        if stage not in self._VALID_STAGES:
-            msg = f"Invalid stage '{stage}'. Must be one of {self._VALID_STAGES}"
-            raise ValueError(msg)
-
-        entry = self._find_entry(model_id)
-        if entry is None:
-            msg = f"Model '{model_id}' not found"
-            raise ValueError(msg)
-
-        # If promoting to production, demote current production model to archived
-        if stage == "production":
-            name = entry.info.name
-            for e in self._models.get(name, []):
-                if e.info.stage == "production" and e.info.model_id != model_id:
-                    e.info.stage = "archived"
-
-        entry.info.stage = stage
-
-    def get_production_model(self, name: str) -> TrainedModel | None:
-        """Return the model currently in ``"production"`` stage for *name*."""
-        for entry in self._models.get(name, []):
-            if entry.info.stage == "production":
-                return entry.model
-        return None
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _find_entry(self, model_id: str) -> _RegistryEntry | None:
-        """Locate a registry entry by model_id."""
-        for entries in self._models.values():
-            for entry in entries:
-                if entry.info.model_id == model_id:
-                    return entry
-        return None
+        async with self._pool.acquire() as conn, conn.transaction():
+            restored = await conn.fetchrow(_RESTORE_LATEST_ARCHIVED_SQL, name)
+            if restored is None:
+                msg = f"model '{name}' has no archived version to roll back to"
+                raise ModelRegistryError(msg)
+            await conn.execute(
+                _ARCHIVE_CURRENT_PRODUCTION_SQL,
+                name,
+                restored["version"],
+            )
+        logger.info(
+            "ml model rolled back",
+            name=name,
+            restored_version=restored["version"],
+        )
+        return _row_to_version(restored)

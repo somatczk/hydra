@@ -432,6 +432,30 @@ class MarketDataRepository:
             int(row["n"]),
         )
 
+    async def get_source_counts(
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[str, int]:
+        """The feed/auto row split over stored bars in range (provenance source mix)."""
+        pool = self._ensure_pool()
+
+        query = """
+            SELECT source, COUNT(*) AS n
+            FROM ts.ohlcv_1m
+            WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
+              AND ($4::timestamptz IS NULL OR timestamp >= $4::timestamptz)
+              AND ($5::timestamptz IS NULL OR timestamp <= $5::timestamptz)
+            GROUP BY source
+        """
+
+        async with pool.acquire() as conn:
+            records = await conn.fetch(query, exchange_id, symbol, str(timeframe), start, end)
+        return {str(r["source"]): int(r["n"]) for r in records}
+
     async def missing_ranges(
         self,
         exchange_id: str,

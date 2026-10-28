@@ -50,7 +50,8 @@ table in `README.md`. Do not duplicate it here; update that table in the PR that
 - **Frontend**: Next.js 16.4, React 19, TypeScript 7 for `tsc --noEmit` (lint and `next build` use the TypeScript 6
   API package), Tailwind CSS 4, Recharts, vitest + jsdom. The TradingView chart on `/trading` is a cross-origin
   iframe; production responses carry a CSP (`dashboard/next.config.ts`).
-- **ML**: onnxruntime, plus xgboost/torch/mlflow in the `ml-training` extra. Not wired into trading (P5).
+- **ML**: onnxruntime, plus xgboost/lightgbm/scikit-learn/onnxmltools in the `ml-training` extra. Not wired into
+  trading (P5).
 
 ## Project structure
 - `src/hydra/`: 13 modules.
@@ -66,7 +67,7 @@ table in `README.md`. Do not duplicate it here; update that table in the PR that
   - `execution`: SessionManager, OrderManager, paper executor, ExchangeClient.
   - `risk`: pre-trade checks, sizing, circuit breakers.
   - `portfolio`: P&L, positions, reconciliation.
-  - `ml`: features, serving, export, registry, drift, training.
+  - `ml`: features, dataset, training, serving, export, registry, drift.
   - `dashboard`: the FastAPI app, `routes/`, and `mcp/` (the MCP server, mounted at `/mcp/`
     only when `HYDRA_MCP_TOKEN` is set).
   - `services`: backtest, research and strategy operations the routes (and later MCP) call; no FastAPI.

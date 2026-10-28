@@ -1,7 +1,13 @@
 """Feature engineering for ML model training and real-time inference.
 
-Builds feature matrices from multi-timeframe OHLCV data and auxiliary sources
-(funding rates, fear & greed index). All computations use numpy; no pandas.
+One frozen :class:`FeatureSpec` pins everything a model consumes: the per-timeframe
+window lengths the dataset builder reads, the target horizon, the exact feature
+names and a spec version that bumps whenever the feature set changes.
+``build_features`` and ``build_live_features`` share one computation path, so the
+last training row and the live vector are identical by construction. Higher
+timeframe features are timestamp-joined onto the 1h grid (a 4h/1d bar is visible
+only once it has closed), never count-aligned. All computations use numpy; no
+pandas.
 """
 
 from __future__ import annotations
@@ -9,12 +15,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import pairwise
+from typing import Any
 
 import numpy as np
 from numpy import ndarray
 
 from hydra.core.types import OHLCV
-from hydra.indicators.custom import funding_rate_sma
+from hydra.data.bars import timeframe_seconds
 from hydra.indicators.library import (
     atr,
     bollinger_bands,
@@ -25,6 +33,9 @@ from hydra.indicators.library import (
     sma,
     vwap,
 )
+
+PRIMARY_TF = "1h"
+HIGHER_TFS = ("4h", "1d")
 
 # ---------------------------------------------------------------------------
 # FeatureMatrix dataclass
@@ -38,7 +49,144 @@ class FeatureMatrix:
     features: ndarray  # shape (n_samples, n_features)
     feature_names: list[str]  # column names
     timestamps: list[datetime]  # aligned timestamps
-    target: ndarray | None  # optional: forward returns for training
+    spec: FeatureSpec  # the pinned spec the matrix was built with
+    target: ndarray | None = None  # sign target (+1/-1; NaN where no forward bar exists)
+    forward_returns: ndarray | None = None  # the raw forward return each target came from
+
+
+# ---------------------------------------------------------------------------
+# The frozen feature spec
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureSpec:
+    """Everything a model consumes, pinned: windows, horizon, names, version.
+
+    ``reference_quantiles`` is the placeholder (``None``) until the trainer fills
+    it with one decile-edge tuple per feature, which the drift check reuses as its
+    bins. Frozen and hashable so a dataset is reproducible from (rows, spec).
+    """
+
+    spec_version: int
+    horizon: int
+    window_1h: int
+    window_4h: int
+    window_1d: int
+    feature_names: tuple[str, ...]
+    reference_quantiles: tuple[tuple[float, ...] | None, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.spec_version < 1:
+            msg = "spec_version must be >= 1"
+            raise ValueError(msg)
+        if self.horizon < 1:
+            msg = "horizon must be >= 1 (bars of the primary timeframe)"
+            raise ValueError(msg)
+        if min(self.window_1h, self.window_4h, self.window_1d) < 1:
+            msg = "window lengths must be >= 1"
+            raise ValueError(msg)
+        if not self.feature_names:
+            msg = "feature_names must not be empty"
+            raise ValueError(msg)
+
+    def to_dict(self) -> dict[str, Any]:
+        """The jsonb form stored on a registry row."""
+        quantiles = self.reference_quantiles
+        return {
+            "spec_version": self.spec_version,
+            "horizon": self.horizon,
+            "window_1h": self.window_1h,
+            "window_4h": self.window_4h,
+            "window_1d": self.window_1d,
+            "feature_names": list(self.feature_names),
+            "reference_quantiles": (
+                None
+                if quantiles is None
+                else [list(q) if q is not None else None for q in quantiles]
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Feature name lists (the single source the builders and the spec share)
+# ---------------------------------------------------------------------------
+
+
+def _technical_indicator_names(tf_label: str) -> list[str]:
+    return [
+        f"rsi_14_{tf_label}",
+        f"macd_hist_{tf_label}",
+        f"bb_pctb_{tf_label}",
+        f"atr_norm_{tf_label}",
+        f"rsi_14_{tf_label}_lag1",
+        f"macd_hist_{tf_label}_lag1",
+        f"rsi_14_{tf_label}_lag2",
+        f"macd_hist_{tf_label}_lag2",
+        f"rsi_14_{tf_label}_lag3",
+        f"macd_hist_{tf_label}_lag3",
+        f"rsi_14_{tf_label}_roc3",
+        f"macd_hist_{tf_label}_roc3",
+    ]
+
+
+def _price_action_names(tf_label: str) -> list[str]:
+    names = [f"log_return_{tf_label}"]
+    if tf_label == PRIMARY_TF:
+        names.append("realized_vol_24h")
+    elif tf_label == "1d":
+        names.append("realized_vol_7d")
+    names.extend(
+        [
+            f"price_vs_sma20_{tf_label}",
+            f"price_vs_sma50_{tf_label}",
+            f"candle_body_ratio_{tf_label}",
+            f"upper_wick_ratio_{tf_label}",
+            f"lower_wick_ratio_{tf_label}",
+        ]
+    )
+    return names
+
+
+def _volume_names(tf_label: str) -> list[str]:
+    return [
+        f"vol_sma20_ratio_{tf_label}",
+        f"vwap_dev_{tf_label}",
+        f"obv_roc10_{tf_label}",
+        f"mfi_14_{tf_label}",
+    ]
+
+
+def _temporal_names() -> list[str]:
+    return ["hour_sin", "hour_cos", "dow_sin", "dow_cos"]
+
+
+def _derived_names() -> list[str]:
+    return ["rsi_vol_ratio", "atr_pctile_rank_100", "bb_width_change"]
+
+
+def _all_feature_names() -> list[str]:
+    """The names in the exact block order the builder computes them."""
+    names: list[str] = []
+    for tf_label in (PRIMARY_TF, *HIGHER_TFS):
+        names.extend(_technical_indicator_names(tf_label))
+    for tf_label in (PRIMARY_TF, *HIGHER_TFS):
+        names.extend(_price_action_names(tf_label))
+    names.extend(_volume_names(PRIMARY_TF))
+    names.extend(_temporal_names())
+    names.extend(_derived_names())
+    return names
+
+
+DEFAULT_FEATURE_SPEC = FeatureSpec(
+    spec_version=3,
+    horizon=4,
+    window_1h=2000,
+    window_4h=500,
+    window_1d=120,
+    feature_names=tuple(_all_feature_names()),
+)
+"""The pinned spec training and serving share; bump spec_version on any change."""
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +217,8 @@ def _log_returns(close: ndarray) -> ndarray:
     Returns array of length len(close) - 1.
     """
     with np.errstate(divide="ignore", invalid="ignore"):
-        return np.log(close[1:] / close[:-1])
+        returns: ndarray = np.log(close[1:] / close[:-1])
+    return returns
 
 
 def _realized_vol(returns: ndarray, window: int) -> ndarray:
@@ -109,13 +258,37 @@ def _percentile_rank(data: ndarray, window: int) -> ndarray:
     return result
 
 
-def build_target(close_1h: ndarray, horizon: int = 1) -> ndarray:
-    """Build classification target from forward returns.
+def build_target(close: ndarray, horizon: int = 1) -> tuple[ndarray, ndarray]:
+    """The sign target and the forward returns it is taken from.
 
-    Returns array of length ``len(close_1h) - horizon`` with values +1, -1, or 0.
+    Both arrays have length ``len(close) - horizon``; the signs are +1, -1 or 0
+    (a zero forward return), which the trainer drops.
     """
-    fwd = close_1h[horizon:] / close_1h[:-horizon] - 1.0
-    return np.sign(fwd).astype(np.float64)
+    if horizon < 1:
+        msg = f"horizon must be >= 1, got {horizon}"
+        raise ValueError(msg)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fwd = close[horizon:] / close[:-horizon] - 1.0
+    return np.sign(fwd).astype(np.float64), fwd
+
+
+def reference_deciles(values: ndarray) -> tuple[float, ...] | None:
+    """The 9 internal decile edges of the non-NaN values; None when there is nothing to bin."""
+    clean = values[~np.isnan(values)]
+    if len(clean) == 0:
+        return None
+    return tuple(float(q) for q in np.quantile(clean, np.arange(1, 10) / 10.0))
+
+
+def _require_ascending(bars: list[OHLCV], tf_label: str) -> None:
+    """The timestamp join assumes strictly increasing bar timestamps."""
+    for prev, cur in pairwise(bars):
+        if cur.timestamp <= prev.timestamp:
+            msg = (
+                f"bars_{tf_label} not strictly increasing at {cur.timestamp.isoformat()} "
+                f"(previous {prev.timestamp.isoformat()})"
+            )
+            raise ValueError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +308,14 @@ def _technical_indicator_features(
     """
     n = len(close)
     cols: list[ndarray] = []
-    names: list[str] = []
 
     # RSI(14)
     rsi_14 = rsi(close, 14)
     cols.append(rsi_14)
-    names.append(f"rsi_14_{tf_label}")
 
     # MACD histogram
     _, _, macd_hist = macd(close)
     cols.append(macd_hist)
-    names.append(f"macd_hist_{tf_label}")
 
     # Bollinger Band %B
     bb_upper, _bb_mid, bb_lower = bollinger_bands(close, 20, 2.0)
@@ -153,14 +323,12 @@ def _technical_indicator_features(
     with np.errstate(divide="ignore", invalid="ignore"):
         bb_pctb = np.where(bb_range != 0, (close - bb_lower) / bb_range, np.nan)
     cols.append(bb_pctb.astype(np.float64))
-    names.append(f"bb_pctb_{tf_label}")
 
     # ATR(14) normalised by price
     atr_14 = atr(high, low, close, 14)
     with np.errstate(divide="ignore", invalid="ignore"):
         atr_norm = np.where(close != 0, atr_14 / close, np.nan)
     cols.append(atr_norm.astype(np.float64))
-    names.append(f"atr_norm_{tf_label}")
 
     # Lagged values: t-1, t-2, t-3 for RSI and MACD histogram
     for lag in (1, 2, 3):
@@ -168,28 +336,24 @@ def _technical_indicator_features(
         if lag < n:
             lagged_rsi[lag:] = rsi_14[:-lag]
         cols.append(lagged_rsi)
-        names.append(f"rsi_14_{tf_label}_lag{lag}")
 
         lagged_macd = np.full(n, np.nan, dtype=np.float64)
         if lag < n:
             lagged_macd[lag:] = macd_hist[:-lag]
         cols.append(lagged_macd)
-        names.append(f"macd_hist_{tf_label}_lag{lag}")
 
     # Rate of change over 3 periods for RSI and MACD histogram
     rsi_roc = np.full(n, np.nan, dtype=np.float64)
     if n > 3:
         rsi_roc[3:] = rsi_14[3:] - rsi_14[:-3]
     cols.append(rsi_roc)
-    names.append(f"rsi_14_{tf_label}_roc3")
 
     macd_roc = np.full(n, np.nan, dtype=np.float64)
     if n > 3:
         macd_roc[3:] = macd_hist[3:] - macd_hist[:-3]
     cols.append(macd_roc)
-    names.append(f"macd_hist_{tf_label}_roc3")
 
-    return np.column_stack(cols), names
+    return np.column_stack(cols), _technical_indicator_names(tf_label)
 
 
 def _price_action_features(
@@ -205,32 +369,22 @@ def _price_action_features(
     """
     n = len(close)
     cols: list[ndarray] = []
-    names: list[str] = []
 
     # Log returns
     lr = np.full(n, np.nan, dtype=np.float64)
     if n > 1:
         lr[1:] = _log_returns(close)
     cols.append(lr)
-    names.append(f"log_return_{tf_label}")
 
     # Realized volatility (only for 1h and 1d as specified)
-    if tf_label == "1h":
+    if tf_label in (PRIMARY_TF, "1d"):
         ret = _log_returns(close)
-        rv_24 = _realized_vol(ret, 24)
+        window = 24 if tf_label == PRIMARY_TF else 7
+        rv = _realized_vol(ret, window)
         rv_padded = np.full(n, np.nan, dtype=np.float64)
-        if len(rv_24) > 0:
-            rv_padded[1:] = rv_24
+        if len(rv) > 0:
+            rv_padded[1:] = rv
         cols.append(rv_padded)
-        names.append("realized_vol_24h")
-    elif tf_label == "1d":
-        ret = _log_returns(close)
-        rv_7 = _realized_vol(ret, 7)
-        rv_padded = np.full(n, np.nan, dtype=np.float64)
-        if len(rv_7) > 0:
-            rv_padded[1:] = rv_7
-        cols.append(rv_padded)
-        names.append("realized_vol_7d")
 
     # Price vs SMA(20) and SMA(50) ratio
     sma_20 = sma(close, 20)
@@ -239,32 +393,27 @@ def _price_action_features(
         price_vs_sma20 = np.where(sma_20 != 0, close / sma_20 - 1.0, np.nan)
         price_vs_sma50 = np.where(sma_50 != 0, close / sma_50 - 1.0, np.nan)
     cols.append(price_vs_sma20.astype(np.float64))
-    names.append(f"price_vs_sma20_{tf_label}")
     cols.append(price_vs_sma50.astype(np.float64))
-    names.append(f"price_vs_sma50_{tf_label}")
 
     # Candle body ratio: abs(close - open) / (high - low), zero-range guard
     hl_range = high - low
     with np.errstate(divide="ignore", invalid="ignore"):
         body_ratio = np.where(hl_range != 0, np.abs(close - open_arr) / hl_range, 0.0)
     cols.append(body_ratio.astype(np.float64))
-    names.append(f"candle_body_ratio_{tf_label}")
 
     # Upper wick ratio: (high - max(open, close)) / (high - low)
     upper_wick = high - np.maximum(open_arr, close)
     with np.errstate(divide="ignore", invalid="ignore"):
         upper_wick_ratio = np.where(hl_range != 0, upper_wick / hl_range, 0.0)
     cols.append(upper_wick_ratio.astype(np.float64))
-    names.append(f"upper_wick_ratio_{tf_label}")
 
     # Lower wick ratio: (min(open, close) - low) / (high - low)
     lower_wick = np.minimum(open_arr, close) - low
     with np.errstate(divide="ignore", invalid="ignore"):
         lower_wick_ratio = np.where(hl_range != 0, lower_wick / hl_range, 0.0)
     cols.append(lower_wick_ratio.astype(np.float64))
-    names.append(f"lower_wick_ratio_{tf_label}")
 
-    return np.column_stack(cols), names
+    return np.column_stack(cols), _price_action_names(tf_label)
 
 
 def _volume_features(
@@ -277,21 +426,18 @@ def _volume_features(
     """Compute volume-based features for one timeframe."""
     n = len(close)
     cols: list[ndarray] = []
-    names: list[str] = []
 
     # Volume SMA(20) ratio
     vol_sma = sma(volume, 20)
     with np.errstate(divide="ignore", invalid="ignore"):
         vol_ratio = np.where(vol_sma != 0, volume / vol_sma, np.nan)
     cols.append(vol_ratio.astype(np.float64))
-    names.append(f"vol_sma20_ratio_{tf_label}")
 
     # VWAP deviation
     vwap_vals = vwap(high, low, close, volume)
     with np.errstate(divide="ignore", invalid="ignore"):
         vwap_dev = np.where(vwap_vals != 0, (close - vwap_vals) / vwap_vals, np.nan)
     cols.append(vwap_dev.astype(np.float64))
-    names.append(f"vwap_dev_{tf_label}")
 
     # OBV rate of change over 10 periods
     obv_vals = obv(close, volume)
@@ -304,60 +450,12 @@ def _volume_features(
                 np.nan,
             )
     cols.append(obv_roc)
-    names.append(f"obv_roc10_{tf_label}")
 
     # MFI(14)
     mfi_vals = mfi(high, low, close, volume, 14)
     cols.append(mfi_vals)
-    names.append(f"mfi_14_{tf_label}")
 
-    return np.column_stack(cols), names
-
-
-def _crypto_features(
-    n: int,
-    funding_rates: list[float] | None,
-    fear_greed_index: list[float] | None,
-) -> tuple[ndarray, list[str]]:
-    """Compute crypto-specific features."""
-    cols: list[ndarray] = []
-    names: list[str] = []
-
-    # Funding rate (current)
-    if funding_rates is not None and len(funding_rates) > 0:
-        fr = np.array(funding_rates, dtype=np.float64)
-        # Align to length n: right-align, pad with NaN
-        fr_aligned = np.full(n, np.nan, dtype=np.float64)
-        take = min(len(fr), n)
-        fr_aligned[n - take :] = fr[len(fr) - take :]
-        cols.append(fr_aligned)
-        names.append("funding_rate")
-
-        # Funding rate SMA(24)
-        fr_sma = funding_rate_sma(fr, 24)
-        fr_sma_aligned = np.full(n, np.nan, dtype=np.float64)
-        fr_sma_aligned[n - take :] = fr_sma[len(fr_sma) - take :]
-        cols.append(fr_sma_aligned)
-        names.append("funding_rate_sma24")
-    else:
-        cols.append(np.full(n, np.nan, dtype=np.float64))
-        names.append("funding_rate")
-        cols.append(np.full(n, np.nan, dtype=np.float64))
-        names.append("funding_rate_sma24")
-
-    # Fear & Greed Index normalised to [0, 1]
-    if fear_greed_index is not None and len(fear_greed_index) > 0:
-        fg = np.array(fear_greed_index, dtype=np.float64) / 100.0
-        fg_aligned = np.full(n, np.nan, dtype=np.float64)
-        take = min(len(fg), n)
-        fg_aligned[n - take :] = fg[len(fg) - take :]
-        cols.append(fg_aligned)
-        names.append("fear_greed_norm")
-    else:
-        cols.append(np.full(n, np.nan, dtype=np.float64))
-        names.append("fear_greed_norm")
-
-    return np.column_stack(cols), names
+    return np.column_stack(cols), _volume_names(tf_label)
 
 
 def _temporal_features(bars: list[OHLCV]) -> tuple[ndarray, list[str]]:
@@ -369,9 +467,7 @@ def _temporal_features(bars: list[OHLCV]) -> tuple[ndarray, list[str]]:
     dow_sin, dow_cos = _sin_cos_encode(dows, 7.0)
 
     cols = np.column_stack([hour_sin, hour_cos, dow_sin, dow_cos])
-    names = ["hour_sin", "hour_cos", "dow_sin", "dow_cos"]
-    # Ensure float64
-    return cols.astype(np.float64), names
+    return cols.astype(np.float64), _temporal_names()
 
 
 def _derived_features(
@@ -383,7 +479,6 @@ def _derived_features(
     """Compute derived / interaction features from 1h data."""
     n = len(close_1h)
     cols: list[ndarray] = []
-    names: list[str] = []
 
     # RSI * Volume ratio (momentum + volume confirmation)
     rsi_14 = rsi(close_1h, 14)
@@ -392,13 +487,11 @@ def _derived_features(
         vol_ratio = np.where(vol_sma_20 != 0, volume_1h / vol_sma_20, np.nan)
     rsi_vol = rsi_14 * vol_ratio
     cols.append(rsi_vol.astype(np.float64))
-    names.append("rsi_vol_ratio")
 
     # ATR percentile rank over last 100 bars
     atr_14 = atr(high_1h, low_1h, close_1h, 14)
     atr_pctrank = _percentile_rank(atr_14, 100)
     cols.append(atr_pctrank)
-    names.append("atr_pctile_rank_100")
 
     # Bollinger Band width change (current - previous)
     bb_upper, _bb_mid, bb_lower = bollinger_bands(close_1h, 20, 2.0)
@@ -407,167 +500,154 @@ def _derived_features(
     if n > 1:
         bb_width_change[1:] = bb_width[1:] - bb_width[:-1]
     cols.append(bb_width_change)
-    names.append("bb_width_change")
 
-    return np.column_stack(cols), names
+    return np.column_stack(cols), _derived_names()
 
 
 # ---------------------------------------------------------------------------
-# FeatureEngineering class
+# The timestamp join (SM-14: never count-align timeframes)
 # ---------------------------------------------------------------------------
 
 
-class FeatureEngineering:
-    """Build feature matrices for ML model training and inference."""
+def _align_to_primary(
+    block: ndarray,
+    src_bars: list[OHLCV],
+    primary_ts: list[datetime],
+    tf_label: str,
+) -> ndarray:
+    """Timestamp-join a higher-timeframe block onto the 1h grid.
 
-    def build_features(
-        self,
-        bars_1h: list[OHLCV],
-        bars_4h: list[OHLCV],
-        bars_1d: list[OHLCV],
-        funding_rates: list[float] | None = None,
-        fear_greed_index: list[float] | None = None,
-    ) -> FeatureMatrix:
-        """Build complete feature matrix for training from historical data.
-
-        The primary timeframe is 1h. Higher timeframes (4h, 1d) are
-        resampled / aligned to the 1h bar count using forward-fill so that
-        every row represents one 1h bar.
-        """
-        feature_block, feature_names = self._compute_all_features(
-            bars_1h, bars_4h, bars_1d, funding_rates, fear_greed_index
-        )
-        timestamps = [b.timestamp for b in bars_1h]
-        return FeatureMatrix(
-            features=feature_block,
-            feature_names=feature_names,
-            timestamps=timestamps,
-            target=None,
-        )
-
-    def build_live_features(
-        self,
-        bars_1h: list[OHLCV],
-        bars_4h: list[OHLCV],
-        bars_1d: list[OHLCV],
-        funding_rates: list[float] | None = None,
-        fear_greed_index: list[float] | None = None,
-    ) -> ndarray:
-        """Build single feature vector for real-time inference.
-
-        Uses the exact same computation path as ``build_features`` and
-        returns the last row, guaranteeing consistency.
-        """
-        feature_block, _ = self._compute_all_features(
-            bars_1h, bars_4h, bars_1d, funding_rates, fear_greed_index
-        )
-        return feature_block[-1]
-
-    # ------------------------------------------------------------------
-    # Private: single computation path shared by both public methods
-    # ------------------------------------------------------------------
-
-    def _compute_all_features(
-        self,
-        bars_1h: list[OHLCV],
-        bars_4h: list[OHLCV],
-        bars_1d: list[OHLCV],
-        funding_rates: list[float] | None,
-        fear_greed_index: list[float] | None,
-    ) -> tuple[ndarray, list[str]]:
-        """Compute the full feature matrix (n_1h_bars, n_features).
-
-        Higher timeframe features are computed on their native resolution
-        and then right-aligned / forward-filled to 1h length.
-        """
-        n = len(bars_1h)
-
-        all_blocks: list[ndarray] = []
-        all_names: list[str] = []
-
-        # ---- 1. Technical indicators (multi-timeframe) ----
-        for bars, tf_label, ratio in [
-            (bars_1h, "1h", 1),
-            (bars_4h, "4h", 4),
-            (bars_1d, "1d", 24),
-        ]:
-            _o, h, lo, c, _v = _extract_ohlcv_arrays(bars)
-            block, names = _technical_indicator_features(c, h, lo, tf_label)
-            aligned = self._align_to_1h(block, len(bars), n, ratio)
-            all_blocks.append(aligned)
-            all_names.extend(names)
-
-        # ---- 2. Price action features (multi-timeframe) ----
-        for bars, tf_label, ratio in [
-            (bars_1h, "1h", 1),
-            (bars_4h, "4h", 4),
-            (bars_1d, "1d", 24),
-        ]:
-            o, h, lo, c, _v = _extract_ohlcv_arrays(bars)
-            block, names = _price_action_features(o, h, lo, c, tf_label)
-            aligned = self._align_to_1h(block, len(bars), n, ratio)
-            all_blocks.append(aligned)
-            all_names.extend(names)
-
-        # ---- 3. Volume features (1h only, primary timeframe) ----
-        _o, h, lo, c, v = _extract_ohlcv_arrays(bars_1h)
-        block, names = _volume_features(h, lo, c, v, "1h")
-        all_blocks.append(block)
-        all_names.extend(names)
-
-        # ---- 4. Crypto-specific features ----
-        block, names = _crypto_features(n, funding_rates, fear_greed_index)
-        all_blocks.append(block)
-        all_names.extend(names)
-
-        # ---- 5. Temporal features ----
-        block, names = _temporal_features(bars_1h)
-        all_blocks.append(block)
-        all_names.extend(names)
-
-        # ---- 6. Derived / interaction features ----
-        _o, h, lo, c, v = _extract_ohlcv_arrays(bars_1h)
-        block, names = _derived_features(c, h, lo, v)
-        all_blocks.append(block)
-        all_names.extend(names)
-
-        feature_matrix = np.hstack(all_blocks).astype(np.float64)
-        return feature_matrix, all_names
-
-    @staticmethod
-    def _align_to_1h(
-        block: ndarray,
-        src_len: int,
-        target_len: int,
-        ratio: int,
-    ) -> ndarray:
-        """Right-align a higher-timeframe feature block to 1h length.
-
-        Each higher-TF bar is forward-filled for *ratio* 1h bars.
-        If ratio == 1 the block is returned as-is (already 1h).
-        """
-        if ratio == 1:
-            return block
-
-        n_features = block.shape[1] if block.ndim == 2 else 1
-        result = np.full((target_len, n_features), np.nan, dtype=np.float64)
-
-        # Forward-fill: repeat each source row `ratio` times, right-aligned
-        expanded_len = src_len * ratio
-        if expanded_len >= target_len:
-            # More data than needed; take the tail
-            expanded = np.repeat(block, ratio, axis=0)
-            result[:] = expanded[expanded_len - target_len :]
-        else:
-            # Less data; fill from the end
-            expanded = np.repeat(block, ratio, axis=0)
-            result[target_len - expanded_len :] = expanded
-
-        # Shift by `ratio` rows to prevent forward-look bias:
-        # each higher-TF bar should only be visible after it closes
-        shifted = np.full((target_len, n_features), np.nan, dtype=np.float64)
-        if target_len > ratio:
-            shifted[ratio:] = result[:-ratio]
-        result = shifted
-
+    A 4h/1d bar contributes only to 1h bars that open at or after its close
+    (its open time plus one timeframe step), so no 1h row ever sees a
+    still-forming higher-timeframe bar — regardless of gaps on either grid.
+    """
+    n = len(primary_ts)
+    result = np.full((n, block.shape[1]), np.nan, dtype=np.float64)
+    if not src_bars or n == 0:
         return result
+    offset = timeframe_seconds(tf_label)
+    cutoff = np.array([t.timestamp() - offset for t in primary_ts])
+    src_open = np.array([b.timestamp.timestamp() for b in src_bars])
+    idx = np.searchsorted(src_open, cutoff, side="right") - 1
+    have = idx >= 0
+    result[have] = block[idx[have]]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public builders (one computation path for training and serving)
+# ---------------------------------------------------------------------------
+
+
+def build_features(
+    spec: FeatureSpec,
+    bars_1h: list[OHLCV],
+    bars_4h: list[OHLCV],
+    bars_1d: list[OHLCV],
+) -> FeatureMatrix:
+    """Build the feature matrix for one set of bars, one row per 1h bar.
+
+    The computed names must match the spec's pinned ``feature_names`` exactly;
+    a mismatch means the builder changed without a spec-version bump.
+    """
+    feature_block, feature_names = _compute_all_features(spec, bars_1h, bars_4h, bars_1d)
+    return FeatureMatrix(
+        features=feature_block,
+        feature_names=feature_names,
+        timestamps=[b.timestamp for b in bars_1h],
+        spec=spec,
+        target=None,
+        forward_returns=None,
+    )
+
+
+def build_live_features(
+    spec: FeatureSpec,
+    bars_1h: list[OHLCV],
+    bars_4h: list[OHLCV],
+    bars_1d: list[OHLCV],
+) -> ndarray:
+    """Build the single feature vector for real-time inference.
+
+    Uses the exact same computation path as ``build_features`` and returns the
+    last row, guaranteeing training/serving parity.
+    """
+    feature_block, _ = _compute_all_features(spec, bars_1h, bars_4h, bars_1d)
+    live: ndarray = feature_block[-1]
+    return live
+
+
+def _compute_all_features(
+    spec: FeatureSpec,
+    bars_1h: list[OHLCV],
+    bars_4h: list[OHLCV],
+    bars_1d: list[OHLCV],
+) -> tuple[ndarray, list[str]]:
+    """Compute the full feature matrix (n_1h_bars, n_features) and its names."""
+    if not bars_1h:
+        msg = "bars_1h is empty: nothing to build features from"
+        raise ValueError(msg)
+    for bars, label in ((bars_1h, PRIMARY_TF), (bars_4h, "4h"), (bars_1d, "1d")):
+        _require_ascending(bars, label)
+
+    n = len(bars_1h)
+    primary_ts = [b.timestamp for b in bars_1h]
+    per_tf = ((PRIMARY_TF, bars_1h), ("4h", bars_4h), ("1d", bars_1d))
+
+    all_blocks: list[ndarray] = []
+    all_names: list[str] = []
+
+    def add_block(block: ndarray, names: list[str], label: str, bars: list[OHLCV]) -> None:
+        if label == PRIMARY_TF:
+            all_blocks.append(block)
+        else:
+            all_blocks.append(_align_to_primary(block, bars, primary_ts, label))
+        all_names.extend(names)
+
+    # ---- 1. Technical indicators (multi-timeframe) ----
+    for label, bars in per_tf:
+        if not bars:
+            names = _technical_indicator_names(label)
+            all_blocks.append(np.full((n, len(names)), np.nan))
+            all_names.extend(names)
+            continue
+        _o, h, lo, c, _v = _extract_ohlcv_arrays(bars)
+        block, names = _technical_indicator_features(c, h, lo, label)
+        add_block(block, names, label, bars)
+
+    # ---- 2. Price action features (multi-timeframe) ----
+    for label, bars in per_tf:
+        if not bars:
+            names = _price_action_names(label)
+            all_blocks.append(np.full((n, len(names)), np.nan))
+            all_names.extend(names)
+            continue
+        o, h, lo, c, _v = _extract_ohlcv_arrays(bars)
+        block, names = _price_action_features(o, h, lo, c, label)
+        add_block(block, names, label, bars)
+
+    # ---- 3. Volume features (1h only, primary timeframe) ----
+    _o, h, lo, c, v = _extract_ohlcv_arrays(bars_1h)
+    block, names = _volume_features(h, lo, c, v, PRIMARY_TF)
+    all_blocks.append(block)
+    all_names.extend(names)
+
+    # ---- 4. Temporal features ----
+    block, names = _temporal_features(bars_1h)
+    all_blocks.append(block)
+    all_names.extend(names)
+
+    # ---- 5. Derived / interaction features ----
+    _o, h, lo, c, v = _extract_ohlcv_arrays(bars_1h)
+    block, names = _derived_features(c, h, lo, v)
+    all_blocks.append(block)
+    all_names.extend(names)
+
+    if all_names != list(spec.feature_names):
+        msg = (
+            f"feature spec v{spec.spec_version} pins {len(spec.feature_names)} feature names "
+            f"but the builder computes {len(all_names)} differently; bump spec_version"
+        )
+        raise ValueError(msg)
+
+    return np.hstack(all_blocks).astype(np.float64), all_names

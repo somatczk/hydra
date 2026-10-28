@@ -123,7 +123,7 @@ async def pool(database_dsn: str) -> AsyncIterator[Any]:
         async with db_pool.acquire() as conn:
             await conn.execute("TRUNCATE ts.ohlcv_1m")
             await conn.execute("TRUNCATE backtest_results CASCADE")
-            await conn.execute("TRUNCATE backtest_jobs")
+            await conn.execute("TRUNCATE backtest_jobs CASCADE")
         yield db_pool
     finally:
         await db_pool.close()

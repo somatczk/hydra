@@ -52,10 +52,7 @@ ml-training = [
     "xgboost>=3.2,<4",
     "lightgbm>=4.5,<5",
     "scikit-learn>=1.6,<2",
-    "torch>=2.14.1,<3",
-    "mlflow>=3.16.0,<4",
     "onnxmltools>=1.12,<2",
-    "finrl>=0.3,<1",
 ]
 dev = [
     "pytest>=9.0.3,<10",
@@ -126,19 +123,15 @@ strict = true
 plugins = ["pydantic.mypy"]
 exclude = [
     "tests/",
-    "src/hydra/ml/training.py",
-    "src/hydra/ml/serving.py",
-    "src/hydra/ml/export.py",
-    "src/hydra/ml/retraining.py",
     "src/hydra/strategy/indicator_registry.py",
 ]
 
 [[tool.mypy.overrides]]
-module = ["msgpack", "msgpack.*", "asyncpg", "asyncpg.*", "ccxt", "ccxt.*", "talib", "talib.*", "onnxruntime", "onnxruntime.*", "onnxmltools", "onnxmltools.*", "skl2onnx", "skl2onnx.*", "xgboost", "xgboost.*", "lightgbm", "lightgbm.*", "optuna", "optuna.*", "sklearn", "sklearn.*", "scipy", "scipy.*", "mlflow", "mlflow.*"]
+module = ["msgpack", "msgpack.*", "asyncpg", "asyncpg.*", "ccxt", "ccxt.*", "talib", "talib.*", "onnxruntime", "onnxruntime.*", "onnxmltools", "onnxmltools.*", "xgboost", "xgboost.*", "lightgbm", "lightgbm.*", "optuna", "optuna.*", "sklearn", "sklearn.*", "scipy", "scipy.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["hydra.strategy.builtin.*", "hydra.strategy.rule_engine", "hydra.strategy.indicator_registry", "hydra.data.*", "hydra.backtest.*", "hydra.execution.*", "hydra.risk.*", "hydra.ml.*", "hydra.portfolio.*", "hydra.dashboard.*", "hydra.dashboard.routes.*"]
+module = ["hydra.strategy.builtin.*", "hydra.strategy.rule_engine", "hydra.strategy.indicator_registry", "hydra.data.*", "hydra.backtest.*", "hydra.execution.*", "hydra.risk.*", "hydra.portfolio.*", "hydra.dashboard.*", "hydra.dashboard.routes.*"]
 disallow_any_expr = false
 warn_return_any = false
 disallow_untyped_defs = false
