@@ -558,6 +558,27 @@ class TestStatusAndResults:
         assert body["error"] == "on-demand fetch failed"
         assert body["fetch"] == {"state": "fetching", "bars_fetched": 3, "weight_spent": 2}
 
+    def test_hyperopt_progress_surfaces_the_fetch_detail(self) -> None:
+        """detail.fetch rides hyperopt_progress verbatim, exactly as backtest_status does."""
+        row = {
+            "id": "ho-x",
+            "kind": "hyperopt",
+            "status": "completed",
+            "error": None,
+            "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+            "request": json.dumps({"strategy_id": "saw", "max_trials": 7}),
+            "detail": json.dumps(
+                {
+                    "completed_trials": 7,
+                    "total_trials": 7,
+                    "fetch": {"state": "done", "bars_fetched": 40},
+                }
+            ),
+        }
+        client = TestClient(_make_app(pool=_Pool(_JobRowConn(row))))
+        body = client.get("/api/backtest/hyperopt/ho-x").json()
+        assert body["fetch"] == {"state": "done", "bars_fetched": 40}
+
     def test_hyperopt_progress_created_at_stays_optional(self) -> None:
         """D1's OpenAPI shape is unchanged: created_at is always served, never required."""
         assert "created_at" not in HyperoptProgressResponse.model_json_schema()["required"]

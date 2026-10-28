@@ -31,7 +31,7 @@ from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard.routes import backtest, strategies
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.data.backfill import GapRange
-from hydra.data.bars import timeframe_seconds
+from hydra.data.bars import floor_to_tf, timeframe_seconds
 from hydra.data.errors import DataFetchError, NoMarketDataError
 from hydra.data.migrations.runner import alembic_config, upgrade_to_head
 from hydra.data.storage import MarketDataRepository
@@ -220,9 +220,13 @@ def _write_strategy(directory: Path, strategy_id: str, **overrides: Any) -> None
     (directory / f"{strategy_id}.yaml").write_text(yaml.safe_dump(data))
 
 
-async def _drain(pool: Any) -> None:
-    """Run every queued job on the worker (the engine no longer executes them)."""
-    while await worker.run_once(pool) is not None:
+async def _drain(pool: Any, fetch_engine: Any = None) -> None:
+    """Run every queued job on the worker (the engine no longer executes them).
+
+    ``fetch_engine`` injects a stand-in engine at the worker seam — no test reaches
+    the network.
+    """
+    while await worker.run_once(pool, fetch_engine=fetch_engine) is not None:
         pass
 
 
@@ -611,14 +615,17 @@ async def test_walkforward_fast_fail_fires_only_when_the_stored_span_covers_the_
     pool: Any, strategies_dir: Path
 ) -> None:
     """The fast-fail predicate, both ways under the enabled default: a stored span that
-    already covers the request (no fetch could extend it) fails 422 range_too_short at
-    submit; a span that does not defers to the worker's post-load decision (202)."""
+    already covers the request AND is dense (no fetch could change the window sizing)
+    fails 422 range_too_short at submit; a span that does not defers to the worker's
+    post-load decision (202)."""
     daily = _saw(D1_START, D1_COUNT, timedelta(days=1))
     await _seed(pool, "binance", Timeframe.D1, daily)
     _write_strategy(strategies_dir, "saw_d", timeframes={"primary": "1d"})
     body = {"strategy_id": "saw_d", "fold_count": 2, "train_pct": 0.75}
 
     async with _client_on(pool, config=HydraConfig()) as client:
+        # 31 stored daily bars across January's 31 grid slots: covered AND dense —
+        # no fetch could change the window sizing, so the submit may fast-fail
         covered = await client.post(
             "/api/backtest/walkforward",
             json={
@@ -652,6 +659,83 @@ async def test_walkforward_fast_fail_fires_only_when_the_stored_span_covers_the_
         result = (await client.get(f"/api/backtest/walkforward/{task_id}/results")).json()
     assert len(result["folds"]) == 4
     assert result["provenance"]["bar_count"] == D1_COUNT
+
+
+class _FakeJobFetchEngine:
+    """A stand-in engine for the worker's fetch phase: fills the range with dense bars."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def ensure_available(
+        self,
+        repo: MarketDataRepository,
+        exchange: str,
+        symbol: str,
+        timeframe: Timeframe,
+        start: datetime,
+        end: datetime,
+        *,
+        force: bool = False,
+        on_progress: Any = None,
+    ) -> None:
+        self.calls.append({"start": start, "end": end})
+        step_s = timeframe_seconds(timeframe)
+        first = floor_to_tf(start, timeframe)
+        count = int((end - first).total_seconds() // step_s) + 1
+        bars = _saw(first, count, timedelta(seconds=step_s))
+        await repo.store_bars([(exchange, symbol, timeframe, bar) for bar in bars])
+
+
+async def test_walkforward_sparse_interior_span_defers_to_the_worker(
+    pool: Any, strategies_dir: Path
+) -> None:
+    """The sparse-interior trap (the review's A1): 10 stored daily bars whose ends cover
+    the whole 2024 request. The ends alone must not fast-fail — a fetch could fill the
+    interior and change the window sizing, so the submit defers (202) and the worker
+    fetches, then sizes the windows from the really-loaded dense span."""
+    sparse = [
+        *_saw(D1_START, 9, timedelta(days=40)),
+        _saw(D1_START + timedelta(days=365), 1, timedelta(days=1))[0],
+    ]
+    await _seed(pool, "binance", Timeframe.D1, sparse)
+    _write_strategy(strategies_dir, "saw_d", timeframes={"primary": "1d"})
+    engine = _FakeJobFetchEngine()
+
+    async with _client_on(pool, config=HydraConfig()) as client:
+        resp = await client.post(
+            "/api/backtest/walkforward",
+            json={
+                "strategy_id": "saw_d",
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+                "fold_count": 2,
+                "train_pct": 0.75,
+                "param_space": [{"name": "sma_period", "type": "int", "low": 4, "high": 5}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        task_id = resp.json()["task_id"]
+
+    # the worker fetches the gaps, then sizes the windows from the real bars
+    await _drain(pool, fetch_engine=engine)
+    assert len(engine.calls) == 1
+
+    async with pool.acquire() as conn:
+        raw_detail = await conn.fetchval("SELECT detail FROM backtest_jobs WHERE id = $1", task_id)
+    detail = json.loads(raw_detail)
+    assert (detail["in_sample_months"], detail["out_of_sample_months"]) == (4, 1)
+
+    async with _client_on(pool, config=HydraConfig()) as client:
+        result = (await client.get(f"/api/backtest/walkforward/{task_id}/results")).json()
+    assert result["provenance"]["bar_count"] == 366
+    assert result["provenance"]["gap_count"] == 0
+    # honest sizing from the dense 366-bar span: 120 IS + 30 OOS bars per window,
+    # stepping 30 bars -> 8 folds
+    assert len(result["folds"]) == 8
+    for fold in result["folds"]:
+        assert fold["in_sample_trades"] > 0
+        assert fold["out_of_sample_trades"] > 0
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ from hydra.backtest.jobs import (
     window_fits,
 )
 from hydra.core.types import Timeframe
-from hydra.data.bars import ceil_to_tf, floor_to_tf
+from hydra.data.bars import ceil_to_tf, floor_to_tf, timeframe_seconds
 from hydra.services import strategies as strategy_files
 from hydra.services.backtest import (
     DataProvenanceModel,
@@ -244,6 +244,8 @@ class HyperoptProgressResponse(BaseModel):
     start_date: str = ""
     end_date: str = ""
     error: str | None = None
+    # informational: a terminal row's status/error columns are authoritative, not fetch.state
+    fetch: dict[str, Any] | None = None
     provenance: JobProvenanceModel | None = None
 
 
@@ -388,6 +390,7 @@ async def get_hyperopt_progress(pool: Any, task_id: str) -> dict[str, Any]:
         "start_date": request.get("start_date", ""),
         "end_date": request.get("end_date", ""),
         "error": row["error"],
+        "fetch": detail.get("fetch"),
         "provenance": detail.get("provenance"),
     }
 
@@ -484,11 +487,17 @@ class WalkForwardResultResponse(BaseModel):
 def _span_covers(
     stored: tuple[datetime, datetime, int], body: WalkForwardRunRequest, timeframe: Timeframe
 ) -> bool:
-    """True when the stored span already covers the requested grid — no fetch could extend it."""
-    first, last, _ = stored
-    return first <= ceil_to_tf(body.start_date, timeframe) and last >= floor_to_tf(
+    """True when no fetch could change the window sizing: the stored span covers the
+    requested grid's ends AND its bar count saturates that span's grid. A covered span
+    with a sparse interior still defers — ``window_fits`` sizes from the bar count, and
+    the worker fetches the gaps first, then sizes from the real bars."""
+    first, last, bar_count = stored
+    if first > ceil_to_tf(body.start_date, timeframe) or last < floor_to_tf(
         body.end_date, timeframe
-    )
+    ):
+        return False
+    grid_bars = int((last - first).total_seconds() // timeframe_seconds(timeframe)) + 1
+    return bar_count >= grid_bars
 
 
 async def submit_walkforward(
@@ -498,8 +507,9 @@ async def submit_walkforward(
 
     Returns a ``task_id`` to poll for results. The submit-time ``range_too_short``
     fast-fail fires only when the stored span already fully covers the requested
-    range (no fetch could extend it); anything shorter defers to the worker's
-    post-load decision on the really-loaded span.
+    range AND its bars saturate the span's grid (no fetch could change the window
+    sizing); anything shorter or sparser defers to the worker's post-load decision
+    on the really-loaded span.
     """
     space = _validated_space(body.param_space)
     _, config = _load_backtest_strategy(body.strategy_id)
