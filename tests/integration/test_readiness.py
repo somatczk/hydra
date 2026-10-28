@@ -78,7 +78,6 @@ async def test_ready_with_a_real_pool_and_not_ready_once_it_closes(
     assert resp.json()["checks"]["db"]["error"] == "InterfaceError"
     live = await engine.get("/livez")
     assert live.status_code == 200
-    assert (await engine.get("/health")).json() == live.json()
 
 
 async def test_running_row_without_a_task_is_a_zombie(

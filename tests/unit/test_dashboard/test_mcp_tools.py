@@ -18,7 +18,7 @@ import sys
 import types
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 from httpx import Response
 from structlog.testing import capture_logs
 
+from hydra.backtest.jobs import MAX_RESULT_SUMMARIES
 from hydra.core.config import HydraConfig
 from hydra.core.logging import get_logger
 from hydra.dashboard import security
@@ -564,6 +565,82 @@ def test_universe_list_without_a_pool_is_the_503_database_envelope(
             "state": "unavailable",
         },
     }
+
+
+class _SummariesConn:
+    """Serves the backtest_results list read: newest first, honouring the SQL LIMIT."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        assert "FROM backtest_results" in query
+        assert "LIMIT" in query
+        newest_first = sorted(self.rows, key=lambda row: row["created_at"], reverse=True)
+        return newest_first[: args[0]]
+
+
+def _summary_row(i: int) -> dict[str, Any]:
+    """One result-summary row in the LIST_SUMMARIES_SQL shape, oldest first."""
+    stamp = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(hours=i)
+    row: dict[str, Any] = {
+        "id": f"bt-{i}",
+        "strategy": "Saw",
+        "period": "p",
+        "status": "completed",
+        "name": f"run {i}",
+        "strategy_id": "saw",
+        "initial_capital": 1000.0,
+        "total_trades": 3,
+        "win_rate": 33.33,
+        "total_pnl": -950.0,
+        "max_drawdown": 95.0,
+        "sharpe_ratio": -2.1,
+        "data_source": "db",
+        "data_exchange": "binance",
+        "data_symbol": "BTCUSDT",
+        "data_timeframe": "1h",
+        "bar_count": 25,
+        "first_ts": stamp,
+        "last_ts": stamp,
+        "gap_count": 0,
+        "requested_start": stamp,
+        "requested_end": stamp,
+        "created_at": stamp,
+    }
+    for metric in (
+        "benchmark_return",
+        "alpha",
+        "beta",
+        "max_consecutive_wins",
+        "max_consecutive_losses",
+        "expectancy",
+        "total_return",
+        "annualized_return",
+        "sortino_ratio",
+        "calmar_ratio",
+        "profit_factor",
+        "max_drawdown_duration_s",
+    ):
+        row[metric] = None
+    return row
+
+
+def test_backtest_results_listing_is_bounded_identically_on_both_surfaces(
+    mcp: _McpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A6 (audit #174): the route and the tool ride one shared, bounded results read."""
+    total = MAX_RESULT_SUMMARIES + 30
+    pool = _FakePool(_SummariesConn([_summary_row(i) for i in range(total)]))
+    monkeypatch.setattr(engine_app.state, "db_pool", pool)
+    route = TestClient(engine_app).get("/api/backtest/results")
+    assert route.status_code == 200
+    is_error, text = mcp.call("backtest_results")
+    assert not is_error
+    summaries = json.loads(text)
+    assert len(summaries) == MAX_RESULT_SUMMARIES == len(route.json())
+    assert [s["id"] for s in summaries] == [s["id"] for s in route.json()]
+    assert summaries[0]["id"] == f"bt-{total - 1}"
 
 
 def test_strategy_export_returns_the_yaml_text(mcp: _McpClient, strategies_dir: Any) -> None:

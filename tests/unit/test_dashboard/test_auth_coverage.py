@@ -28,7 +28,7 @@ from hydra.dashboard.security import PUBLIC_PATHS
 
 from .conftest import TEST_API_TOKEN
 
-EXPECTED_PUBLIC = {"/health", "/livez", "/readyz", "/metrics"}
+EXPECTED_PUBLIC = {"/livez", "/readyz", "/metrics"}
 DOC_PATHS = ["/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"]
 EXPECTED_WS = {"/ws/market", "/ws/trades", "/ws/portfolio", "/ws/signals", "/ws/risk"}
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}

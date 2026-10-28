@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from hydra.core.config import (
     _DEFAULT_CONFIG_DIR,
     ConfigError,
+    DataConfig,
     HydraConfig,
     _deep_merge,
     load_config,
@@ -446,6 +447,48 @@ class TestMcpFields:
         with pytest.raises(ValidationError) as exc_info:
             load_config()
         assert (("mcp", "foo"), "extra_forbidden") in _loc_types(exc_info.value)
+
+
+class TestDataFields:
+    """The on-demand fetch section (P6-B1): the folded budget/patience/cap defaults."""
+
+    def test_defaults_are_the_folded_decisions(self) -> None:
+        cfg = DataConfig()
+        assert cfg.auto_fetch_enabled is True
+        assert cfg.fetch_weight_per_min == 900
+        assert cfg.fetch_patience_s == 900
+        assert cfg.fetch_max_bars == 2_000_000
+        assert load_config().data == cfg
+
+    def test_env_overrides_thread_the_knobs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_DATA__AUTO_FETCH_ENABLED", "false")
+        monkeypatch.setenv("HYDRA_DATA__FETCH_WEIGHT_PER_MIN", "450")
+        monkeypatch.setenv("HYDRA_DATA__FETCH_PATIENCE_S", "300")
+        monkeypatch.setenv("HYDRA_DATA__FETCH_MAX_BARS", "100000")
+        cfg = load_config()
+        assert cfg.data.auto_fetch_enabled is False
+        assert cfg.data.fetch_weight_per_min == 450
+        assert cfg.data.fetch_patience_s == 300
+        assert cfg.data.fetch_max_bars == 100_000
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param("fetch_weight_per_min", 0, id="weight-zero"),
+            pytest.param("fetch_weight_per_min", 6001, id="weight-over-binance-ip-budget"),
+            pytest.param("fetch_patience_s", 0, id="patience-zero"),
+            pytest.param("fetch_max_bars", 0, id="max-bars-zero"),
+        ],
+    )
+    def test_out_of_range_knobs_fail(self, field: str, value: int) -> None:
+        with pytest.raises(ValidationError):
+            DataConfig(**{field: value})
+
+    def test_unknown_data_key_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_DATA__NOPE", "x")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config()
+        assert (("data", "nope"), "extra_forbidden") in _loc_types(exc_info.value)
 
 
 def test_repo_base_yaml_sections_match_model() -> None:

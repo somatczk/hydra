@@ -6,9 +6,10 @@ TimescaleDB with connection pooling and ON CONFLICT deduplication.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
@@ -18,11 +19,12 @@ logger = get_logger(__name__)
 
 _STORE_BARS_SQL = """
     INSERT INTO ts.ohlcv_1m (
-        exchange, symbol, timeframe, timestamp, open, high, low, close, volume
+        exchange, symbol, timeframe, timestamp, open, high, low, close, volume, source
     )
     SELECT * FROM unnest(
         $1::text[], $2::text[], $3::text[], $4::timestamptz[],
-        $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[]
+        $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[],
+        $10::text[]
     )
     ON CONFLICT (exchange, symbol, timeframe, timestamp) DO NOTHING
     RETURNING 1
@@ -30,11 +32,12 @@ _STORE_BARS_SQL = """
 
 _UPSERT_CLOSED_BARS_SQL = """
     INSERT INTO ts.ohlcv_1m (
-        exchange, symbol, timeframe, timestamp, open, high, low, close, volume
+        exchange, symbol, timeframe, timestamp, open, high, low, close, volume, source
     )
     SELECT * FROM unnest(
         $1::text[], $2::text[], $3::text[], $4::timestamptz[],
-        $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[]
+        $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[],
+        $10::text[]
     )
     ON CONFLICT (exchange, symbol, timeframe, timestamp) DO UPDATE SET
         open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
@@ -43,6 +46,26 @@ _UPSERT_CLOSED_BARS_SQL = """
         IS DISTINCT FROM
         (EXCLUDED.open, EXCLUDED.high, EXCLUDED.low, EXCLUDED.close, EXCLUDED.volume)
     RETURNING exchange, symbol, timeframe, timestamp
+"""
+
+# source is never in the DO UPDATE set: attribution is immutable while values correct.
+_UPSERT_CACHE_ENTRY_SQL = """
+    INSERT INTO data_cache_entries AS entry
+        (exchange, symbol, timeframe, first_ts, last_ts, rows)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET
+        first_ts = LEAST(entry.first_ts, EXCLUDED.first_ts),
+        last_ts = GREATEST(entry.last_ts, EXCLUDED.last_ts),
+        rows = entry.rows + EXCLUDED.rows,
+        last_fetched_at = now()
+"""
+
+# The fetch engine's race rail: only status flips, never the range or the row count.
+_SET_CACHE_STATUS_SQL = """
+    INSERT INTO data_cache_entries AS entry
+        (exchange, symbol, timeframe, first_ts, last_ts, rows, status)
+    VALUES ($1, $2, $3, $4, $5, 0, $6)
+    ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET status = EXCLUDED.status
 """
 
 _EXISTING_KEYS_SQL = """
@@ -55,19 +78,22 @@ _EXISTING_KEYS_SQL = """
 """
 
 
+def _utc(ts: datetime) -> datetime:
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
+
+
 def _key(record: Any) -> tuple[str, str, str, datetime]:
-    ts = record["timestamp"]
     return (
         record["exchange"],
         record["symbol"],
         record["timeframe"],
-        ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts,
+        _utc(record["timestamp"]),
     )
 
 
-def _columns(bars: list[tuple[str, str, Timeframe, OHLCV]]) -> list[list[Any]]:
+def _columns(bars: list[tuple[str, str, Timeframe, OHLCV]], source: str) -> list[list[Any]]:
     """One array per ``ts.ohlcv_1m`` column, in insert order, for the unnest queries."""
-    cols: list[list[Any]] = [[] for _ in range(9)]
+    cols: list[list[Any]] = [[] for _ in range(10)]
     for exchange_id, symbol, timeframe, ohlcv in bars:
         row = (
             exchange_id,
@@ -79,10 +105,23 @@ def _columns(bars: list[tuple[str, str, Timeframe, OHLCV]]) -> list[list[Any]]:
             ohlcv.low,
             ohlcv.close,
             ohlcv.volume,
+            source,
         )
         for col, value in zip(cols, row, strict=True):
             col.append(value)
     return cols
+
+
+def _page_bounds(
+    bars: list[tuple[str, str, Timeframe, OHLCV]],
+) -> dict[tuple[str, str, str], tuple[datetime, datetime]]:
+    """Per-dataset ``(min, max)`` open time over one upsert batch (the fetched page)."""
+    bounds: dict[tuple[str, str, str], tuple[datetime, datetime]] = {}
+    for exchange_id, symbol, timeframe, ohlcv in bars:
+        key = (exchange_id, symbol, str(timeframe))
+        first, last = bounds.get(key, (ohlcv.timestamp, ohlcv.timestamp))
+        bounds[key] = (min(first, ohlcv.timestamp), max(last, ohlcv.timestamp))
+    return bounds
 
 
 class MarketDataRepository:
@@ -173,7 +212,7 @@ class MarketDataRepository:
         if not bars:
             return 0
         async with self._ensure_pool().acquire() as conn:
-            records = await conn.fetch(_STORE_BARS_SQL, *_columns(bars))
+            records = await conn.fetch(_STORE_BARS_SQL, *_columns(bars, "feed"))
         inserted = len(records)
         logger.info("store_bars", attempted=len(bars), inserted=inserted)
         return inserted
@@ -181,11 +220,17 @@ class MarketDataRepository:
     async def upsert_closed_bars(
         self,
         bars: list[tuple[str, str, Timeframe, OHLCV]],
+        source: Literal["feed", "auto"] = "feed",
     ) -> tuple[int, int]:
         """Insert closed bars, correcting stored rows whose values differ.
 
         Only closed bars may be passed: a forming candle written here would be overwritten
         later, but anything that read it in between saw a partial bar.
+
+        New rows carry ``source``; an existing row's ``source`` is immutable, so a feed
+        write can never claim an auto-fetched row and vice versa. With ``source='auto'``,
+        every dataset that gained rows updates its ``data_cache_entries`` ledger row in
+        the same transaction, so the ledger never drifts from the committed bars.
 
         Returns
         -------
@@ -203,15 +248,60 @@ class MarketDataRepository:
                 ohlcv,
             )
         unique = list(latest.values())
-        cols = _columns(unique)
+        cols = _columns(unique, source)
+        page_bounds = _page_bounds(unique) if source == "auto" else {}
         async with self._ensure_pool().acquire() as conn, conn.transaction():
             existing = await conn.fetch(_EXISTING_KEYS_SQL, *cols[:4])
             records = await conn.fetch(_UPSERT_CLOSED_BARS_SQL, *cols)
-        existing_keys = {_key(r) for r in existing}
-        updated = sum(1 for r in records if _key(r) in existing_keys)
+            existing_keys = {_key(r) for r in existing}
+            updated = 0
+            inserted_by: dict[tuple[str, str, str], int] = {}
+            for record in records:
+                if _key(record) in existing_keys:
+                    updated += 1
+                else:
+                    key = (record["exchange"], record["symbol"], record["timeframe"])
+                    inserted_by[key] = inserted_by.get(key, 0) + 1
+            if source == "auto":
+                for key, inserted_rows in sorted(inserted_by.items()):
+                    first, last = page_bounds[key]
+                    await conn.execute(_UPSERT_CACHE_ENTRY_SQL, *key, first, last, inserted_rows)
         inserted = len(records) - updated
-        logger.info("upsert_closed_bars", attempted=len(unique), inserted=inserted, updated=updated)
+        logger.info(
+            "upsert_closed_bars",
+            attempted=len(unique),
+            inserted=inserted,
+            updated=updated,
+            source=source,
+        )
         return (inserted, updated)
+
+    async def set_cache_status(
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+        status: Literal["fetching", "ready"],
+        first_ts: datetime,
+        last_ts: datetime,
+    ) -> None:
+        """Mark a dataset's cache-ledger row ``fetching`` or ``ready``.
+
+        The on-demand engine writes ``fetching`` before its first page and ``ready``
+        when it stops, so the sweeper never evicts a dataset mid-write. A dataset
+        without a ledger row gets one over the requested range with ``rows = 0``; an
+        existing row keeps its range and count untouched.
+        """
+        async with self._ensure_pool().acquire() as conn:
+            await conn.execute(
+                _SET_CACHE_STATUS_SQL,
+                exchange_id,
+                symbol,
+                str(timeframe),
+                first_ts,
+                last_ts,
+                status,
+            )
 
     async def get_bars(
         self,
@@ -363,3 +453,88 @@ class MarketDataRepository:
             )
             for r in records
         ]
+
+
+# ------------------------------------------------------------------
+# Data-cache ledger (auto-fetched datasets; the sweeper's seam)
+# ------------------------------------------------------------------
+
+_DELETE_AUTO_BARS_SQL = """
+    DELETE FROM ts.ohlcv_1m
+    WHERE exchange = $1 AND symbol = $2 AND timeframe = $3 AND source = 'auto'
+"""
+
+_DELETE_CACHE_ENTRY_SQL = """
+    DELETE FROM data_cache_entries
+    WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
+"""
+
+_CACHE_ENTRIES_SQL = """
+    SELECT exchange, symbol, timeframe, first_ts, last_ts, rows, status,
+           created_at, last_fetched_at, last_used_at
+    FROM data_cache_entries
+    ORDER BY last_used_at ASC
+"""
+
+_CACHE_TOTALS_SQL = """
+    SELECT COALESCE(SUM(rows), 0) AS rows, COUNT(*) AS datasets FROM data_cache_entries
+"""
+
+
+@dataclass(frozen=True)
+class DataCacheEntry:
+    """One cached dataset's ledger row: range, size, state and freshness."""
+
+    exchange: str
+    symbol: str
+    timeframe: str
+    first_ts: datetime
+    last_ts: datetime
+    rows: int
+    status: str
+    created_at: datetime
+    last_fetched_at: datetime
+    last_used_at: datetime
+
+
+async def delete_auto_dataset(
+    pool: Any, exchange_id: str, symbol: str, timeframe: Timeframe
+) -> int:
+    """Delete one dataset's auto-fetched bars and its ledger row; feed rows never match.
+
+    Returns the number of bar rows deleted; the ledger row goes even when zero bars did.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        status = await conn.execute(_DELETE_AUTO_BARS_SQL, exchange_id, symbol, str(timeframe))
+        await conn.execute(_DELETE_CACHE_ENTRY_SQL, exchange_id, symbol, str(timeframe))
+    return int(status.split()[-1])
+
+
+async def list_cache_entries(pool: Any) -> list[DataCacheEntry]:
+    """Every ledger row, least-recently-used first (the sweeper's eviction order)."""
+    async with pool.acquire() as conn:
+        records = await conn.fetch(_CACHE_ENTRIES_SQL)
+    return [
+        DataCacheEntry(
+            exchange=r["exchange"],
+            symbol=r["symbol"],
+            timeframe=r["timeframe"],
+            first_ts=_utc(r["first_ts"]),
+            last_ts=_utc(r["last_ts"]),
+            rows=r["rows"],
+            status=r["status"],
+            created_at=_utc(r["created_at"]),
+            last_fetched_at=_utc(r["last_fetched_at"]),
+            last_used_at=_utc(r["last_used_at"]),
+        )
+        for r in records
+    ]
+
+
+async def cache_totals(pool: Any) -> tuple[int, int]:
+    """``(total cached rows, dataset count)`` over the ledger."""
+    async with pool.acquire() as conn:
+        records = await conn.fetch(_CACHE_TOTALS_SQL)
+    if not records:
+        return (0, 0)
+    return (int(records[0]["rows"]), int(records[0]["datasets"]))

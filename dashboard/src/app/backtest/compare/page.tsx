@@ -180,6 +180,9 @@ function BacktestCompareContent() {
       .catch((err) => {
         logger.error('BacktestCompare', 'Failed to fetch backtest details', err);
         setDetailError(err);
+        // Stale details would keep the table, chart and mismatch banner below the error card.
+        setDetailA(null);
+        setDetailB(null);
       })
       .finally(() => setLoadingDetails(false));
   }, [selectedA, selectedB]);

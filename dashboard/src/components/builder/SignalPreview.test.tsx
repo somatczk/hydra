@@ -97,4 +97,45 @@ describe('SignalPreview', () => {
     expect(text).toContain('No market data for kraken ETHUSDT 4h; available: none stored');
     expect(text).not.toContain('"detail"');
   });
+
+  it('renders PnL as signed USDT with no colour and an sr-only gain/loss label', async () => {
+    fetchApi.mockResolvedValue({
+      signals: [],
+      metrics: { trades: 3, win_rate: 0.5, pnl: -12345.67 },
+    });
+    page = await mount(<SignalPreview state={STATE} />);
+
+    await click(buttonByText(page.container, 'Preview Signals'));
+
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('−12,345.67');
+    expect(text).toContain('loss 12,345.67 USDT');
+    expect(text).toContain('PnL (USDT)');
+    const value = Array.from(page.container.querySelectorAll('p')).find((p) =>
+      p.textContent?.includes('−12,345.67'),
+    );
+    expect(value).toBeDefined();
+    expect(value?.className).not.toContain('text-danger');
+    expect(page.container.querySelectorAll('.text-danger')).toHaveLength(0);
+  });
+
+  it('truncates the metric values so a large PnL cannot overflow its cell at 320px', async () => {
+    fetchApi.mockResolvedValue({
+      signals: [],
+      metrics: { trades: 3, win_rate: 0.5, pnl: -12345.67 },
+    });
+    page = await mount(<SignalPreview state={STATE} />);
+
+    await click(buttonByText(page.container, 'Preview Signals'));
+
+    const cells = Array.from(page.container.querySelectorAll('p')).filter((p) =>
+      p.className.includes('truncate'),
+    );
+    expect(cells).toHaveLength(3);
+    for (const cell of cells) {
+      const box = cell.parentElement;
+      expect(box?.className).toContain('min-w-0');
+    }
+    expect(cells.some((c) => c.textContent?.includes('−12,345.67'))).toBe(true);
+  });
 });

@@ -62,7 +62,7 @@ async def list_jobs(
 
 @router.get("/results", response_model=list[BacktestResultSummary])
 async def list_results(request: Request) -> list[dict[str, Any]]:
-    """List all persisted backtest result summaries."""
+    """List persisted backtest result summaries, newest first (at most 200)."""
     return await svc.list_results(request_pool(request))
 
 

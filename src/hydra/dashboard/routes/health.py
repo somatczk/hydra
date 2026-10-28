@@ -1,6 +1,5 @@
-"""Public probes: ``/livez`` (Docker healthcheck), ``/readyz`` (alerting), ``/health`` (alias).
+"""Public probes: ``/livez`` (Docker healthcheck) and ``/readyz`` (alerting).
 
-``/health`` answers exactly like ``/livez`` until P3, because probes and users were told to use it.
 Neither body carries secrets, balances or positions.
 """
 
@@ -32,12 +31,6 @@ def _liveness(request: Request) -> JSONResponse:
 @router.get("/livez")
 async def livez(request: Request) -> JSONResponse:
     """200 once startup completed and the health monitor ran within three intervals."""
-    return _liveness(request)
-
-
-@router.get("/health")
-async def health(request: Request) -> JSONResponse:
-    """Alias of ``/livez`` (removed in P3)."""
     return _liveness(request)
 
 

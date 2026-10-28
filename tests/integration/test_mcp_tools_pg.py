@@ -373,6 +373,37 @@ async def test_backtest_result_reads_back_a_seeded_completed_result(
         assert [summary["id"] for summary in json.loads(text)] == ["bt-seeded"]
 
 
+async def test_backtest_results_listing_stops_at_the_cap_on_both_surfaces(
+    pool: Any, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A6 (audit #174): the shared results read is bounded in real SQL, and the route
+    and the tool ride the same bound: more rows than the cap, both surfaces return
+    exactly the cap, newest first, identically."""
+    total = jobs.MAX_RESULT_SUMMARIES + 5
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO backtest_results (id, strategy, period, data_source, created_at) "
+            "VALUES ($1, 'saw', 'x', 'db', $2)",
+            [(f"bt-{i}", T0 + i * H) for i in range(total)],
+        )
+    cfg = _bind_engine_state(pool, monkeypatch, strategies_dir)
+    async with _mcp_session(cfg) as mcp:
+        is_error, text = await mcp.call("backtest_results")
+        assert not is_error
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=engine_app),
+            base_url="http://t",
+            headers={"Authorization": f"Bearer {TEST_API_TOKEN}"},
+        ) as api:
+            route = await api.get("/api/backtest/results")
+    assert route.status_code == 200, route.text
+    summaries = json.loads(text)
+    assert len(summaries) == jobs.MAX_RESULT_SUMMARIES == len(route.json())
+    assert [s["id"] for s in summaries] == [s["id"] for s in route.json()]
+    assert summaries[0]["id"] == f"bt-{total - 1}"
+    assert summaries[-1]["id"] == f"bt-{total - jobs.MAX_RESULT_SUMMARIES}"
+
+
 def _real_clients(h: Harness) -> ClientFactory:
     """The harness's fakes behind the real bars repository (the recovery-test wiring)."""
     fake = h.clients()

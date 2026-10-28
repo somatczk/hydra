@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from hydra.backtest.hyperopt import ParamDef, ParameterSpace
 from hydra.backtest.jobs import (
+    MAX_RESULT_SUMMARIES,
     BacktestRunRequest,
     detail_from_row,
     walkforward_months,
@@ -811,6 +812,7 @@ def _db_row(result_id: str = "bt-task-db", **overrides: Any) -> dict[str, Any]:
         "gap_count": 0,
         "requested_start": datetime(2026, 1, 1, tzinfo=UTC),
         "requested_end": datetime(2026, 1, 2, tzinfo=UTC),
+        "created_at": datetime(2026, 1, 2, 12, tzinfo=UTC),
         "equity_curve": '[{"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}]',
         "benchmark_equity": '[{"timestamp": "2026-01-01T00:00:00+00:00", "value": 1000.0}]',
         "transactions": "[]",
@@ -856,19 +858,25 @@ class TestPersistedDetail:
 
 
 class _ResultsConn:
+    """Serves backtest_results rows; the list read emulates the SELECT faithfully:
+    newest first, and a query that carries LIMIT never yields more rows than its bound."""
+
     def __init__(self, rows: dict[str, dict[str, Any]], *, down: bool = False) -> None:
         self.rows = rows
         self.down = down
-        self.queries: list[str] = []
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def _check(self, query: str) -> None:
-        self.queries.append(query)
         if self.down:
             raise OSError("database unreachable")
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         self._check(query)
-        return list(self.rows.values())
+        assert "FROM backtest_results" in query
+        assert "LIMIT" in query
+        self.calls.append((query, args))
+        newest_first = sorted(self.rows.values(), key=lambda row: row["created_at"], reverse=True)
+        return newest_first[: args[0]]
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         self._check(query)
@@ -930,10 +938,40 @@ class TestResultMutations:
         resp = _results_client(conn).get("/api/backtest/results")
         assert resp.status_code == 200
         assert resp.json()[0]["metrics"]["max_consecutive_losses"] == 2
-        (query,) = conn.queries
+        ((query, _limit),) = conn.calls
         select_list = query.split(" FROM ")[0]
         for column in ("equity_curve", "benchmark_equity", "transactions"):
             assert column not in select_list
+
+
+def _seeded_results(total: int) -> dict[str, dict[str, Any]]:
+    """Result rows with distinct created_at stamps, oldest first."""
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    return {
+        f"bt-{i}": _db_row(f"bt-{i}", created_at=base + timedelta(hours=i)) for i in range(total)
+    }
+
+
+class TestResultListBounding:
+    """A6 (audit #174): the shared results read stops at the cap, newest first."""
+
+    def test_the_read_stops_at_the_cap(self) -> None:
+        total = MAX_RESULT_SUMMARIES + 30
+        conn = _ResultsConn(_seeded_results(total))
+        resp = _results_client(conn).get("/api/backtest/results")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body) == MAX_RESULT_SUMMARIES
+        assert [s["id"] for s in body] == [f"bt-{i}" for i in range(total - 1, 29, -1)]
+        ((query, args),) = conn.calls
+        assert "LIMIT" in query
+        assert args == (MAX_RESULT_SUMMARIES,)
+
+    def test_a_realistic_count_returns_every_row_newest_first(self) -> None:
+        conn = _ResultsConn(_seeded_results(7))
+        resp = _results_client(conn).get("/api/backtest/results")
+        assert resp.status_code == 200
+        assert [s["id"] for s in resp.json()] == [f"bt-{i}" for i in range(6, -1, -1)]
 
 
 # ---------------------------------------------------------------------------

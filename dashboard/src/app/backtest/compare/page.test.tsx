@@ -95,6 +95,29 @@ describe('BacktestComparePage', () => {
     expect(warning).toContain('exchange: binance vs kraken; timeframe: 1h vs 4h');
   });
 
+  it('clears the stale comparison and mismatch banner when the detail refetch fails', async () => {
+    const routes: Routes = {
+      '/api/backtest/results': [A, B, result('bt-c', prov('binance', '1h'))],
+      '/api/backtest/results/bt-a': A,
+      '/api/backtest/results/bt-b': B,
+      '/api/backtest/results/bt-c': unavailable(),
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<BacktestComparePage />);
+
+    await choose(page.container, 0, 'bt-a');
+    await choose(page.container, 1, 'bt-b');
+    expect(page.container.querySelector('[data-testid="provenance-mismatch"]')).not.toBeNull();
+    expect(page.container.textContent).toContain('Metrics comparison');
+
+    await choose(page.container, 1, 'bt-c');
+
+    expect(page.container.querySelector('[data-state="unavailable"]')).not.toBeNull();
+    expect(page.container.querySelector('[data-testid="provenance-mismatch"]')).toBeNull();
+    expect(page.container.textContent).not.toContain('Metrics comparison');
+    expect(page.container.textContent).not.toContain('These runs used different data');
+  });
+
   it('prefills both runs from the ?a= and ?b= URL parameters', async () => {
     nav.search = new URLSearchParams('a=bt-a&b=bt-b');
     const routes: Routes = {

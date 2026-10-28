@@ -135,6 +135,88 @@ async def test_downgrade_drops_the_session_config_columns(fresh_database: str) -
     assert await current_revision(fresh_database) == "0006_backtest_jobs"
 
 
+async def test_0011_upgrade_gives_pre_existing_rows_the_feed_source(fresh_database: str) -> None:
+    """Bars stored before 0011 (the 2.6.0 prod shape) all take the immutable 'feed' default."""
+    await _upgrade(fresh_database)
+    await asyncio.to_thread(
+        command.downgrade, alembic_config(fresh_database), "0010_validated_permissions"
+    )
+    await _execute(
+        fresh_database,
+        "INSERT INTO ts.ohlcv_1m (exchange, symbol, timeframe, timestamp, open, high, "
+        "low, close, volume) VALUES ('binance', 'BTCUSDT', '1m', '2026-01-01T00:00:00Z', "
+        "1, 1, 1, 1, 1), ('binance', 'BTCUSDT', '1m', '2026-01-01T00:01:00Z', 1, 1, 1, 1, 1)",
+    )
+
+    await _upgrade(fresh_database)
+
+    sources = await _fetch(
+        fresh_database, "SELECT source, count(*) FROM ts.ohlcv_1m GROUP BY source"
+    )
+    assert [tuple(r) for r in sources] == [("feed", 2)]
+    column = await _fetch(
+        fresh_database,
+        "SELECT column_default, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = 'ts' AND table_name = 'ohlcv_1m' AND column_name = 'source'",
+    )
+    assert [tuple(r) for r in column] == [("'feed'::text", "NO")]
+    assert await current_revision(fresh_database) == head_revision()
+
+
+async def test_0011_downgrade_drops_the_column_and_the_ledger(fresh_database: str) -> None:
+    """The attribution revision is reversible: the column and the ledger both go."""
+    await _upgrade(fresh_database)
+    await _execute(
+        fresh_database,
+        "INSERT INTO data_cache_entries (exchange, symbol, timeframe, first_ts, last_ts, rows) "
+        "VALUES ('binance', 'BTCUSDT', '1m', now(), now(), 10)",
+    )
+
+    await asyncio.to_thread(
+        command.downgrade, alembic_config(fresh_database), "0010_validated_permissions"
+    )
+
+    leftovers = await _fetch(fresh_database, "SELECT to_regclass('public.data_cache_entries')")
+    assert [tuple(r) for r in leftovers] == [(None,)]
+    assert (
+        await _fetch(
+            fresh_database,
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = 'ts' "
+            "AND table_name = 'ohlcv_1m' AND column_name = 'source'",
+        )
+        == []
+    )
+
+    await _upgrade(fresh_database)
+    assert await current_revision(fresh_database) == head_revision()
+    entries = await _fetch(fresh_database, "SELECT count(*) FROM data_cache_entries")
+    assert [r["count"] for r in entries] == [0]
+
+
+async def test_0011_data_cache_entries_is_unique_per_dataset(fresh_database: str) -> None:
+    """One ledger row per dataset: UNIQUE(exchange, symbol, timeframe) and NOT NULL bounds."""
+    await _upgrade(fresh_database)
+    insert = (
+        "INSERT INTO data_cache_entries (exchange, symbol, timeframe, first_ts, last_ts, rows) "
+        "VALUES ('binance', 'BTCUSDT', '1m', now(), now(), 3)"
+    )
+    await _execute(fresh_database, insert)
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await _execute(fresh_database, insert)
+    row = await _fetch(
+        fresh_database,
+        "SELECT status, created_at IS NOT NULL AS created, last_fetched_at IS NOT NULL AS fetched, "
+        "last_used_at IS NOT NULL AS used FROM data_cache_entries",
+    )
+    assert [tuple(r) for r in row] == [("ready", True, True, True)]
+    with pytest.raises(asyncpg.NotNullViolationError):
+        await _execute(
+            fresh_database,
+            "INSERT INTO data_cache_entries (exchange, symbol, timeframe, last_ts, rows) "
+            "VALUES ('binance', 'ETHUSDT', '1m', now(), 1)",
+        )
+
+
 async def test_legacy_2_1_10_schema_upgrades_in_place(fresh_database: str) -> None:
     await _execute(fresh_database, LEGACY_SCHEMA.read_text())
     await _execute(

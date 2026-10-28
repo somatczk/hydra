@@ -96,7 +96,7 @@ async def backtest_cancel(job_id: str) -> str:
 
 @server.tool(name="backtest_results", structured_output=False)
 async def backtest_results() -> str:
-    """List every persisted backtest result summary (newest first)."""
+    """List persisted backtest result summaries, newest first (at most 200)."""
     try:
         return _deps.json_text(await backtest_svc.list_results(_deps.db_pool()))
     except ServiceError as exc:

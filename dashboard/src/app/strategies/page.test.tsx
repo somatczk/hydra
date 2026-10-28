@@ -67,6 +67,7 @@ const RUNNING_SESSION = {
 function baseRoutes(): Routes {
   return {
     '/api/strategies': [STRATEGY],
+    '/api/risk/live-status': liveStatus(),
     '/api/trading/sessions': [],
     '/api/system/config': { trading_mode: 'paper', paper_capital: 2500 },
     '/api/strategies/saw/performance': PERFORMANCE,
@@ -75,6 +76,16 @@ function baseRoutes(): Routes {
 
 let page: Mounted | null = null;
 let calls: Array<{ path: string; init?: RequestInit }>;
+
+/** The page reads the shell's session/config polls, so it mounts inside the provider. */
+async function mountPage(): Promise<Mounted> {
+  page = await mount(
+    <ShellStatusProvider>
+      <StrategiesPage />
+    </ShellStatusProvider>,
+  );
+  return page;
+}
 
 beforeEach(() => {
   dialogPolyfill();
@@ -94,7 +105,7 @@ describe('StrategiesPage error states', () => {
     const routes = baseRoutes();
     routes['/api/strategies'] = unavailable();
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const text = page.container.textContent ?? '';
     expect(text).toContain('Strategies unavailable');
@@ -107,7 +118,7 @@ describe('StrategiesPage error states', () => {
     const routes = baseRoutes();
     routes['/api/strategies/saw/performance'] = unavailable('Database error while loading strategy performance');
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const row = page.container.querySelector('[data-testid="performance-error"]');
     expect(row?.textContent).toContain('Database error while loading strategy performance');
@@ -124,7 +135,7 @@ describe('StrategiesPage error states', () => {
       max_drawdown: null,
     };
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const card = sectionText(page.container, 'Saw');
     expect(card).not.toContain('0.00Sharpe');
@@ -137,7 +148,7 @@ describe('StrategiesPage error states', () => {
     const routes = baseRoutes();
     routes['/api/strategies/saw/performance'] = { ...PERFORMANCE, total_pnl: -50 };
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const card = sectionText(page.container, 'Saw');
     expect(card).toContain('−50.00');
@@ -149,7 +160,7 @@ describe('StrategiesPage error states', () => {
     const routes = baseRoutes();
     routes['/api/strategies/saw/performance'] = { ...PERFORMANCE, total_pnl: -50 };
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const labels = Array.from(page.container.querySelectorAll('.sr-only')).map((s) => s.textContent);
     expect(labels).toContain('loss 50.00 USDT');
@@ -158,10 +169,30 @@ describe('StrategiesPage error states', () => {
     expect(value?.className).not.toContain('text-danger');
   });
 
+  it('renders the card percents at 2 dp, not the carried-over 1 dp', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
+    page = await mountPage();
+
+    const card = sectionText(page.container, 'Saw');
+    expect(card).toContain('50.00%');
+    expect(card).toContain('1.00%');
+    expect(card).not.toContain('50.0%');
+    expect(card).not.toContain('1.0%');
+  });
+
+  it('adds no session or config poll of its own next to the shell context polls', async () => {
+    fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
+    page = await mountPage();
+
+    expect(calls.filter((c) => c.path === '/api/trading/sessions')).toHaveLength(1);
+    expect(calls.filter((c) => c.path === '/api/system/config')).toHaveLength(1);
+    expect(calls.filter((c) => c.path === '/api/strategies')).toHaveLength(1);
+  });
+
   it('says Loading… with the ellipsis character while the list loads', async () => {
     const routes: Routes = { ...baseRoutes(), '/api/strategies': () => new Promise<never>(() => {}) };
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     expect(page.container.textContent).toContain('Loading…');
     expect(page.container.textContent).not.toContain('Loading...');
@@ -169,7 +200,7 @@ describe('StrategiesPage error states', () => {
 
   it('asks for capital in the start dialog, not on the card', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     expect(page.container.querySelector('input[type="number"]')).toBeNull();
   });
@@ -178,7 +209,7 @@ describe('StrategiesPage error states', () => {
     const routes = baseRoutes();
     routes['/api/system/config'] = unavailable();
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     expect(page.container.querySelector('[data-testid="config-error"]')).not.toBeNull();
     expect(page.container.innerHTML).not.toContain('10000');
@@ -189,7 +220,7 @@ describe('StrategiesPage error states', () => {
     const routes = baseRoutes();
     routes['/api/trading/sessions'] = unavailable();
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     expect(page.container.querySelector('[data-testid="sessions-error"]')).not.toBeNull();
     expect(page.container.textContent).not.toContain('Start paper session');
@@ -202,7 +233,7 @@ describe('StrategiesPage hot-reload state', () => {
     routes['/api/trading/sessions'] = [RUNNING_SESSION];
     routes['/api/strategies/saw'] = DRIFTED;
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const card = sectionText(page.container, 'Saw');
     expect(card).toContain('The strategy file changed after this session started.');
@@ -218,7 +249,7 @@ describe('StrategiesPage hot-reload state', () => {
       running_sessions: [{ session_id: 's1', config_hash: 'aabb', stale: false }],
     };
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const text = page.container.textContent ?? '';
     expect(text).not.toContain('The strategy file changed after this session started.');
@@ -230,7 +261,7 @@ describe('StrategiesPage hot-reload state', () => {
     routes['/api/trading/sessions'] = [RUNNING_SESSION];
     routes['/api/strategies/saw'] = unavailable('Strategy detail could not be read');
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const row = page.container.querySelector('[data-testid="drift-error"]');
     expect(row?.textContent).toContain('Strategy detail could not be read');
@@ -246,7 +277,7 @@ describe('StrategiesPage hot-reload state', () => {
       JSON.stringify({ detail: { code: 'strategy_not_found', message: 'Strategy saw not found', state: 'not_found' } }),
     );
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const row = page.container.querySelector('[data-testid="drift-error"]');
     expect(row?.textContent).toContain('NOT FOUND');
@@ -272,7 +303,7 @@ describe('StrategiesPage hot-reload state', () => {
       '/api/strategies/st-22': DRIFTED,
     };
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const detailCalls = calls.filter((c) => /^\/api\/strategies\/st-\d\d$/.test(c.path));
     expect(detailCalls.map((c) => c.path).sort()).toEqual(['/api/strategies/st-07', '/api/strategies/st-22']);
@@ -304,7 +335,7 @@ describe('StrategiesPage post-reload state', () => {
     routes['/api/trading/sessions'] = [RUNNING_SESSION];
     routes['/api/strategies/saw'] = DRIFTED;
     fetchApi.mockImplementation(routeFetch(routes, calls, { 'POST /api/strategies/saw/reload': reloadOk }));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     await applyReload();
 
@@ -322,7 +353,7 @@ describe('StrategiesPage post-reload state', () => {
     routes['/api/trading/sessions'] = [RUNNING_SESSION];
     routes['/api/strategies/saw'] = () => detail;
     fetchApi.mockImplementation(routeFetch(routes, calls, { 'POST /api/strategies/saw/reload': reloadOk }));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     detail = LANDED;
     await applyReload();
@@ -339,7 +370,7 @@ describe('StrategiesPage post-reload state', () => {
     routes['/api/trading/sessions'] = [RUNNING_SESSION];
     routes['/api/strategies/saw'] = () => detail;
     fetchApi.mockImplementation(routeFetch(routes, calls, { 'POST /api/strategies/saw/reload': reloadOk }));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     detail = STOPPED;
     await applyReload();
@@ -356,7 +387,7 @@ describe('StrategiesPage research hygiene', () => {
     routes['/api/trading/sessions'] = [RUNNING_SESSION];
     routes['/api/strategies/saw'] = DRIFTED;
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
     expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Strategies');
@@ -369,14 +400,14 @@ describe('StrategiesPage research hygiene', () => {
 
   it('offers a paper session only in paper mode', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
     expect(page.container.textContent).toContain('Start paper session');
     page.unmount();
 
     const routes = baseRoutes();
     routes['/api/system/config'] = { trading_mode: 'live', paper_capital: 2500 };
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
     expect(page.container.textContent).not.toContain('Start paper session');
   });
 
@@ -384,7 +415,7 @@ describe('StrategiesPage research hygiene', () => {
     const routes = baseRoutes();
     routes['/api/strategies'] = [];
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     expect(page.container.textContent).toContain('No strategies yet. Build one or start from a template.');
     const labels = Array.from(page.container.querySelectorAll('button')).map((b) => b.textContent?.trim());
@@ -404,11 +435,7 @@ describe('StrategiesPage start paper session', () => {
       'POST /api/trading/sessions': session({ session_id: 'new-1', strategy_id: 'saw', paper_capital: 6000 }),
     };
     fetchApi.mockImplementation(routeFetch(routes, calls, mutations));
-    page = await mount(
-      <ShellStatusProvider>
-        <StrategiesPage />
-      </ShellStatusProvider>,
-    );
+    page = await mountPage();
 
     await click(buttonByText(page.container, 'Start paper session'));
     const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
@@ -433,7 +460,7 @@ describe('StrategiesPage delete', () => {
   it('asks via a confirm dialog focused on its title and deletes once after confirming', async () => {
     const confirmSpy = vi.spyOn(window, 'confirm');
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, {}));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     await click(buttonByText(page.container, 'Delete'));
     expect(confirmSpy).not.toHaveBeenCalled();
@@ -457,7 +484,7 @@ describe('StrategiesPage delete', () => {
 
   it('keeps the strategy when the secondary is chosen', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, {}));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     await click(buttonByText(page.container, 'Delete'));
     await click(buttonByText(page.container, 'Keep it'));
@@ -469,7 +496,7 @@ describe('StrategiesPage delete', () => {
     const routes = baseRoutes();
     routes['/api/trading/sessions'] = unavailable();
     fetchApi.mockImplementation(routeFetch(routes, calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     await click(buttonByText(page.container, 'Delete'));
     const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
@@ -480,7 +507,7 @@ describe('StrategiesPage delete', () => {
 
   it('refreshes the sessions when the delete dialog opens', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, {}));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const before = calls.filter((c) => c.path === '/api/trading/sessions').length;
     expect(before).toBeGreaterThan(0);
@@ -495,7 +522,7 @@ describe('StrategiesPage delete', () => {
 describe('StrategiesPage import', () => {
   it('sends the chosen file as multipart FormData, not JSON', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls, { 'POST /api/strategies/import': {} }));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const input = page.container.querySelector('input[type="file"]') as HTMLInputElement;
     const file = new File(['id: imported\nname: Imported\n'], 'my.yaml', { type: 'application/x-yaml' });
@@ -518,7 +545,7 @@ describe('StrategiesPage import', () => {
 describe('StrategiesPage phone-equal targets', () => {
   it('gives the four card actions and the enable switch a 44 px target below 1024', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     const actions = Array.from(page.container.querySelectorAll('button')).filter((b) =>
       ['Edit', 'Backtest', 'Export', 'Delete'].includes(b.textContent?.trim() ?? ''),
@@ -568,7 +595,7 @@ describe('StrategiesPage export', () => {
       new Response('id: saw\nname: Saw\n', { status: 200, headers: { 'content-type': 'application/x-yaml' } }),
     );
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     await click(buttonByText(page.container, 'Export'));
 
@@ -593,7 +620,7 @@ describe('StrategiesPage export', () => {
       ),
     );
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
-    page = await mount(<StrategiesPage />);
+    page = await mountPage();
 
     await click(buttonByText(page.container, 'Export'));
 

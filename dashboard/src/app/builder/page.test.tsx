@@ -148,7 +148,7 @@ describe('BuilderPage scope', () => {
     fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
     page = await mount(<BuilderPage />);
 
-    await click(buttonByText(page.container, 'Update Strategy'));
+    await click(buttonByText(page.container, 'Update strategy'));
     await click(buttonByText(page.container, 'Save strategy'));
 
     const put = calls.find((c) => c.init?.method === 'PUT');
@@ -176,7 +176,7 @@ describe('BuilderPage draft guard', () => {
     await click(buttonByText(page.container, 'Add Condition'));
     expect(added()).toHaveLength(1);
 
-    await click(buttonByText(page.container, 'Update Strategy'));
+    await click(buttonByText(page.container, 'Update strategy'));
     await click(buttonByText(page.container, 'Save strategy'));
     expect(removed()).toHaveLength(1);
   });
@@ -288,7 +288,7 @@ describe('BuilderPage in-app route-leave guard (S1)', () => {
     nav.textContent = 'Strategies';
     page.container.appendChild(nav);
 
-    await click(buttonByText(page.container, 'Update Strategy'));
+    await click(buttonByText(page.container, 'Update strategy'));
     await click(buttonByText(page.container, 'Save strategy'));
 
     await click(nav);
@@ -358,7 +358,7 @@ describe('BuilderPage history-traversal guard (S1 amendment)', () => {
     await click(buttonByText(page.container, 'Add Condition'));
     expect(added()).toHaveLength(1);
 
-    await click(buttonByText(page.container, 'Update Strategy'));
+    await click(buttonByText(page.container, 'Update strategy'));
     await click(buttonByText(page.container, 'Save strategy'));
     expect(removed()).toHaveLength(1);
 
