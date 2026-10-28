@@ -34,8 +34,6 @@ export function ConditionBar() {
   if (needs.count) {
     conditions.push({ text: `${plural(needs.count, 'thing')} ${needs.count === 1 ? 'needs' : 'need'} you`, href: '/#needs-you' });
   }
-  const mode = config.data?.trading_mode;
-  if (mode && mode !== 'paper') conditions.push({ text: `Stored mode is ${mode}; showing paper`, href: '/settings' });
   const polls = [live, sessions, config];
   const stale = polls.filter((p) => p.state === 'stale' && p.fetchedAt !== null).map((p) => p.fetchedAt as number);
   if (stale.length) conditions.push({ text: `Data STALE · as of ${utc(Math.min(...stale), now)}` });

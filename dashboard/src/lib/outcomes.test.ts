@@ -9,6 +9,7 @@ import {
   limitsOutcome,
   liveGateOutcome,
   liveOrderOutcome,
+  liveStartOutcome,
   quickTradeOutcome,
   releaseOutcome,
   saveAgainOutcome,
@@ -18,6 +19,7 @@ import {
   type ApproveResponse,
   type DenyResponse,
   type KillSwitchResponse,
+  type LiveSessionStartRequest,
   type Outcome,
   type QuickTradeRequest,
   type QuickTradeResponse,
@@ -496,6 +498,14 @@ describe('liveGateOutcome', () => {
     expect(o.title).toBe('Not confirmed.');
     expect(text(o)).toContain("we don't know whether live trading was turned on");
   });
+
+  it("a definite executor refusal (R8's credentials_not_live_capable) says why, never 'couldn't reach'", () => {
+    const msg = 'The stored Binance keys can withdraw; connect trade-only keys before arming';
+    const o = liveGateOutcome({ err: envelope(409, 'credentials_not_live_capable', msg, 'invalid') });
+    expect(o.title).toBe("Live trading wasn't turned on.");
+    expect(o.lines).toEqual([msg]);
+    expect(text(o)).not.toContain("couldn't reach the engine");
+  });
 });
 
 describe('liveOrderOutcome', () => {
@@ -589,5 +599,61 @@ describe('liveOrderOutcome', () => {
     expect(text(o)).toContain("we don't know whether the live order was placed");
     expect(text(o)).toContain("Check this session's fills before trying again.");
     expect(o.actions).toEqual([{ kind: 'open', label: 'Open session', href: `/trading/${SID}` }]);
+  });
+});
+
+describe('liveStartOutcome', () => {
+  const startReq: LiveSessionStartRequest = { strategy_id: 'sma-cross-btc-1h', paper_capital: '8000', reason: 'Live session: SMA cross' };
+  const startReqBody = { ...session({ started_at: '2026-10-21T14:03:00+00:00' }), paper_capital: 6000, trading_mode: 'live' };
+
+  it('a started live session says real money and navigates to it, clamped like paper (case 7)', () => {
+    const o = liveStartOutcome(
+      startReq,
+      { ok: { executed: true, result: startReqBody, actor: 'user:soma', approved_by: 'user:soma' } },
+      'approve',
+      NOW,
+    );
+    expect(o.tone).toBe('none');
+    expect(o.title).toBe('Started 14:03:00 UTC.');
+    expect(o.lines).toEqual([
+      'Warming up. Waiting for the first closed 1h bar.',
+      'This session places real orders on Binance with real money.',
+      'Asked 8,000.00; started with 6,000.00 (all that was unallocated).',
+    ]);
+    expect(o.navigate).toBe(`/trading/${startReqBody.session_id}`);
+  });
+
+  it('a refused executor run says nothing was started, never claims a session', () => {
+    const o = liveStartOutcome(startReq, { ok: { executed: false, result: null, actor: 'user:soma', approved_by: 'user:soma' } });
+    expect(o.title).toBe('Nothing was started.');
+    expect(o.navigate).toBeUndefined();
+  });
+
+  it("a wrong code keeps the frozen sentence inline with the start's tail", () => {
+    const o = liveStartOutcome(startReq, { err: envelope(422, 'code_mismatch', "That code didn't match. Nothing changed.", 'invalid', { attempts_left: 3 }) });
+    expect(o.inline).toBe(true);
+    expect(o.title).toBe("That code didn't match. Nothing was started.");
+    expect(o.lines).toEqual(['3 attempts left.']);
+  });
+
+  it('a challenge the code service could not create started nothing', () => {
+    const o = liveStartOutcome(startReq, { err: envelope(503, 'engine_unreachable', 'trader unreachable', 'unavailable') }, 'challenge');
+    expect(o.title).toBe('Nothing was started.');
+    expect(o.lines).toEqual(['Live actions are hidden until the code service recovers.']);
+    expect(o.actions).toEqual([{ kind: 'retry', label: 'Try again' }]);
+  });
+
+  it('a definite executor refusal uses the start vocabulary (kill_switch_active)', () => {
+    const o = liveStartOutcome(startReq, { err: envelope(409, 'kill_switch_active', 'Kill switch is on', 'invalid') });
+    expect(o.title).toBe('Nothing was started.');
+    expect(o.lines).toEqual(['The kill switch is on. Release it on Risk before starting a session.']);
+  });
+
+  it('an executed approve without a session answer stays unknown — the session may exist unwatched', () => {
+    const o = liveStartOutcome(startReq, { ok: { executed: true, result: null, actor: 'user:soma', approved_by: 'user:soma' } });
+    expect(o.tone).toBe('danger');
+    expect(o.unanswered).toBe(true);
+    expect(text(o)).toBe("Not confirmed. We don't know whether the session started. Check the sessions list before trying again.");
+    expect(o.actions).toEqual([{ kind: 'open', label: 'Open Sessions', href: '/trading' }]);
   });
 });

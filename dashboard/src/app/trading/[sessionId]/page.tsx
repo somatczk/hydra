@@ -7,6 +7,7 @@ import { Copy } from 'lucide-react';
 import { ActorChip } from '@/components/activity/ActorChip';
 import { QuickTrade } from '@/components/sessions/QuickTrade';
 import { SessionHealth } from '@/components/sessions/SessionHealth';
+import { ModeBadge } from '@/components/shell/ModeBadge';
 import { StopSessionDialog } from '@/components/sessions/StopSessionDialog';
 import { useOutcomeSlot } from '@/components/sessions/useOutcomeSlot';
 import { useShellStatus } from '@/components/shell/ShellStatusProvider';
@@ -56,29 +57,33 @@ function Account({ d }: { d: SessionDetail }) {
   const m = d.metrics;
   const win = winRate(d.trades);
   return (
-    <dl className="grid grid-cols-2 gap-3 lg:grid-cols-3">
-      <Stat label="Equity (USDT)" value={money(m.equity)} />
-      <Stat label="Realised (USDT)" value={signed(m.realized_pnl)} />
-      <Stat
-        label="Unrealised (USDT)"
-        value={signed(m.unrealized_pnl)}
-        note={`Marked at the last closed ${d.timeframe} bar${d.last_bar_at ? ` (processed ${utc(d.last_bar_at)})` : ''}`}
-      />
-      <Stat label="Fees (USDT)" value={money(m.fees)} />
-      <Stat label="Drawdown" value={pct(m.drawdown === null ? null : m.drawdown * 100)} />
-      <div className="rounded border border-line bg-surface p-3">
-        <dt className="text-sm text-ink-2">Win rate</dt>
-        <dd className="mt-1 text-lg font-semibold text-ink-1">
-          {win === null ? (
-            <>
-              <DataStateBadge state="no_data" reason="No closed trades yet" /> <span className="text-sm font-normal text-ink-2">No closed trades yet</span>
-            </>
-          ) : (
-            pct(win)
-          )}
-        </dd>
-      </div>
-    </dl>
+    <div className="flex flex-col gap-3">
+      {d.trading_mode === 'live' && <p className="text-sm font-semibold text-live">Real money on Binance.</p>}
+      <dl className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+        <Stat label="Equity (USDT)" value={money(m.equity)} />
+        <Stat label="Realised (USDT)" value={signed(m.realized_pnl)} />
+        <Stat
+          label="Unrealised (USDT)"
+          value={signed(m.unrealized_pnl)}
+          note={`Marked at the last closed ${d.timeframe} bar${d.last_bar_at ? ` (processed ${utc(d.last_bar_at)})` : ''}`}
+        />
+        <Stat label="Fees (USDT)" value={money(m.fees)} />
+        <Stat label="Drawdown" value={pct(m.drawdown === null ? null : m.drawdown * 100)} />
+        <div className="rounded border border-line bg-surface p-3">
+          <dt className="text-sm text-ink-2">Win rate</dt>
+          <dd className="mt-1 text-lg font-semibold text-ink-1">
+            {win === null ? (
+              <>
+                <DataStateBadge state="no_data" reason="No closed trades yet" />{' '}
+                <span className="text-sm font-normal text-ink-2">No closed trades yet</span>
+              </>
+            ) : (
+              pct(win)
+            )}
+          </dd>
+        </div>
+      </dl>
+    </div>
   );
 }
 
@@ -217,6 +222,7 @@ export default function SessionDetailPage() {
         </nav>
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-xl font-semibold text-ink-1">{name}</h1>
+          {d.trading_mode === 'live' && <ModeBadge mode="live" />}
           <StatusBadge status={d.status} variant={d.status === 'error' ? 'error' : d.status === 'running' ? 'info' : 'neutral'} />
           <ActorChip actor={d.created_by} />
           {poll.state === 'stale' && poll.fetchedAt !== null && <DataStateBadge state="stale" reason={`Session as of ${utc(poll.fetchedAt)}`} />}

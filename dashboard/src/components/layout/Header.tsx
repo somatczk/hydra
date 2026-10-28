@@ -13,7 +13,7 @@ import { useShellStatus } from '@/components/shell/ShellStatusProvider';
 import { DataStateBadge } from '@/components/ui/DataStateBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchAgeLabel, type PollState } from '@/lib/apiState';
-import { plural } from '@/lib/derive';
+import { modeBadge, plural } from '@/lib/derive';
 import { utc } from '@/lib/format';
 
 const Skeleton = () => <span aria-hidden="true" className="inline-block h-4 w-20 animate-pulse rounded bg-hover" />;
@@ -101,7 +101,7 @@ export function Header() {
     <header className="sticky top-0 z-30 border-b border-line bg-canvas lg:pl-56">
       <div className="flex min-h-14 items-center gap-2 px-4 py-1.5 lg:flex-wrap lg:gap-x-4 lg:px-6">
         <span className="min-w-0 flex-1 truncate text-base font-semibold lg:hidden">{pageTitle(pathname) ?? 'Hydra'}</span>
-        <ModeBadge storedMode={config.data?.trading_mode} />
+        <ModeBadge mode={modeBadge(live.data, sessions.data)} />
         <KillSwitchControl />
         {breaker}
         {sessionsCell}

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buttonByText, click, dialogPolyfill, mount, routeFetch, type Mounted, type Mutations, type Routes } from '@/test/pageHarness';
-import { detail, liveStatus, platformConfig, session } from '@/test/fixtures';
+import { detail, liveSession, liveStatus, platformConfig, session } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
 vi.mock('@/lib/api', async (orig) => ({
@@ -118,6 +118,42 @@ describe('Sessions list', () => {
     expect(dialog.textContent).not.toContain('Open positions: unknown');
     await click(buttonByText(dialog, 'Try closing again'));
     expect(calls.filter((c) => c.init?.method === 'DELETE').map((c) => c.path)).toEqual(['/api/trading/sessions/held-1']);
+  });
+
+  it('labels every row in both layouts once a live row is in the list', async () => {
+    setup([RUN, liveSession({ session_id: 'live-1', strategy_name: 'Live momentum' })], {
+      '/api/trading/sessions/live-1/detail': detail({ trading_mode: 'live' }),
+    });
+    m = await page();
+    const phoneRows = Array.from(m.container.querySelectorAll('ul.lg\\:hidden > li'));
+    expect(phoneRows).toHaveLength(2);
+    for (const li of phoneRows) {
+      expect(li.textContent).toMatch(/PAPER|LIVE/);
+    }
+    const desktopRows = Array.from(m.container.querySelectorAll('table tbody tr'));
+    expect(desktopRows).toHaveLength(2);
+    for (const tr of desktopRows) {
+      expect(tr.textContent).toMatch(/PAPER|LIVE/);
+    }
+    expect(m.container.textContent).toContain('Live momentum');
+    expect(m.container.textContent).toContain('real money');
+  });
+
+  it('labels nothing in an all-paper list', async () => {
+    setup([RUN]);
+    m = await page();
+    expect(m.container.textContent).not.toContain('PAPER');
+    expect(m.container.textContent).not.toMatch(/\bLIVE\b/);
+    expect(m.container.textContent).not.toContain('real money');
+  });
+
+  it('still labels a stopped live row LIVE — it traded real money', async () => {
+    setup([liveSession({ session_id: 'held-live', strategy_name: 'Live momentum', status: 'stopped', stopped_at: '2026-10-21T10:00:00+00:00', positions_at_stop: 1 })]);
+    m = await page();
+    expect(text()).toContain('Live momentum');
+    expect(text()).toContain('LIVE');
+    expect(m.container.querySelector('ul.lg\\:hidden > li')?.textContent).toContain('LIVE');
+    expect(m.container.querySelector('table tbody tr')?.textContent).toContain('LIVE');
   });
 
   it('confirms a stop from the table row and sends one DELETE for that session', async () => {

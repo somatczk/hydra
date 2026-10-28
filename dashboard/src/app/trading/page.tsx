@@ -7,11 +7,12 @@ import { StopSessionDialog } from '@/components/sessions/StopSessionDialog';
 import { useOutcomeSlot } from '@/components/sessions/useOutcomeSlot';
 import { ActorChip } from '@/components/activity/ActorChip';
 import { useShellStatus } from '@/components/shell/ShellStatusProvider';
+import { ModeBadge } from '@/components/shell/ModeBadge';
 import { Button } from '@/components/ui/Button';
 import { cn } from '@/components/ui/cn';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { fetchApi } from '@/lib/api';
-import { heldAfter, isOverdue, plural, sessionName, type SessionDetail, type SessionResponse } from '@/lib/derive';
+import { heldAfter, isOverdue, needsModeLabels, plural, rowMode, sessionName, type SessionDetail, type SessionResponse } from '@/lib/derive';
 import { signed, utc } from '@/lib/format';
 
 const DETAIL_POLL_MS = 15_000;
@@ -98,7 +99,10 @@ const HeldChip = ({ text }: { text: string }) => (
   <span className="rounded bg-danger-soft px-2 py-0.5 text-xs font-medium text-danger">{text}</span>
 );
 
-function PhoneList({ rows }: { rows: RowData[] }) {
+/** The PAPER/LIVE chip a row carries whenever the view holds a live row (08 §6). */
+const RowMode = ({ s }: { s: SessionResponse }) => <ModeBadge mode={rowMode(s)} />;
+
+function PhoneList({ rows, labels }: { rows: RowData[]; labels: boolean }) {
   return (
     <ul className="flex flex-col gap-2 lg:hidden">
       {rows.map((r) => (
@@ -109,6 +113,7 @@ function PhoneList({ rows }: { rows: RowData[] }) {
           >
             <span className="flex items-center gap-2 font-semibold text-ink-1">
               {sessionName(r.session)}
+              {labels && <RowMode s={r.session} />}
               {r.holds && <HeldChip text={r.holds} />}
               <ActorChip actor={r.session.created_by} />
             </span>
@@ -131,7 +136,7 @@ function PhoneList({ rows }: { rows: RowData[] }) {
   );
 }
 
-function DesktopTable({ rows, onStop }: { rows: RowData[]; onStop: (s: SessionResponse) => void }) {
+function DesktopTable({ rows, labels, onStop }: { rows: RowData[]; labels: boolean; onStop: (s: SessionResponse) => void }) {
   return (
     <div className="hidden overflow-x-auto lg:block">
       <table className="w-full text-sm">
@@ -153,7 +158,7 @@ function DesktopTable({ rows, onStop }: { rows: RowData[]; onStop: (s: SessionRe
                 <Link href={`/trading/${r.session.session_id}`} className="font-semibold underline">
                   {sessionName(r.session)}
                 </Link>{' '}
-                {r.holds && <HeldChip text={r.holds} />} <ActorChip actor={r.session.created_by} />
+                {labels && <RowMode s={r.session} />} {r.holds && <HeldChip text={r.holds} />} <ActorChip actor={r.session.created_by} />
               </td>
               <td className="px-3 py-2 text-ink-2">
                 {r.market} · {r.since}
@@ -180,11 +185,11 @@ function DesktopTable({ rows, onStop }: { rows: RowData[]; onStop: (s: SessionRe
   );
 }
 
-function SessionRows({ rows, onStop }: { rows: RowData[]; onStop: (s: SessionResponse) => void }) {
+function SessionRows({ rows, labels, onStop }: { rows: RowData[]; labels: boolean; onStop: (s: SessionResponse) => void }) {
   return (
     <>
-      <PhoneList rows={rows} />
-      <DesktopTable rows={rows} onStop={onStop} />
+      <PhoneList rows={rows} labels={labels} />
+      <DesktopTable rows={rows} labels={labels} onStop={onStop} />
     </>
   );
 }
@@ -199,6 +204,8 @@ export default function SessionsPage() {
   const [starting, setStarting] = useState(false);
   const [target, setTarget] = useState<SessionResponse | null>(null);
   const [showStopped, setShowStopped] = useState(false);
+  // 08 §6: one live row anywhere in the list puts the mode on every row, both layouts.
+  const labels = needsModeLabels(list ?? []);
 
   const slot = useOutcomeSlot(
     (id) => {
@@ -243,7 +250,7 @@ export default function SessionsPage() {
             {running.length === 0 ? (
               <p className="text-sm text-ink-2">Nothing is running. Start a paper session from a strategy.</p>
             ) : (
-              <SessionRows rows={rows(running)} onStop={setTarget} />
+              <SessionRows rows={rows(running)} labels={labels} onStop={setTarget} />
             )}
           </section>
 
@@ -252,7 +259,7 @@ export default function SessionsPage() {
               <h2 id="holders-heading" className="text-base font-semibold text-ink-1">
                 Stopped, still holding ({holders.length})
               </h2>
-              <SessionRows rows={rows(holders)} onStop={setTarget} />
+              <SessionRows rows={rows(holders)} labels={labels} onStop={setTarget} />
             </section>
           )}
 
@@ -268,7 +275,7 @@ export default function SessionsPage() {
                   Stopped ({quiet.length})
                 </button>
               </h2>
-              {showStopped && <SessionRows rows={rows(quiet)} onStop={setTarget} />}
+              {showStopped && <SessionRows rows={rows(quiet)} labels={labels} onStop={setTarget} />}
             </section>
           )}
         </>
