@@ -671,7 +671,8 @@ async def test_curves_carry_their_own_timestamps_and_metrics_persist(
     )
 
     assert outcome.result_id == "bt-task-unit"
-    query, args = conn.inserts[0]
+    # the LRU's last_used_at UPDATE precedes the results write; locate, don't assume position
+    query, args = next((q, a) for q, a in conn.inserts if "INSERT INTO backtest_results" in q)
     columns = re.search(r"INSERT INTO backtest_results\s*\(([^)]*)\)", query)
     assert columns is not None
     row = dict(zip([c.strip() for c in columns.group(1).split(",")], args, strict=True))

@@ -458,6 +458,9 @@ class TestDataFields:
         assert cfg.fetch_weight_per_min == 900
         assert cfg.fetch_patience_s == 900
         assert cfg.fetch_max_bars == 2_000_000
+        assert cfg.cache_max_gb == 10.0
+        assert cfg.sweep_interval_s == 3600
+        assert cfg.row_bytes_estimate == 160
         assert load_config().data == cfg
 
     def test_env_overrides_thread_the_knobs(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -465,11 +468,17 @@ class TestDataFields:
         monkeypatch.setenv("HYDRA_DATA__FETCH_WEIGHT_PER_MIN", "450")
         monkeypatch.setenv("HYDRA_DATA__FETCH_PATIENCE_S", "300")
         monkeypatch.setenv("HYDRA_DATA__FETCH_MAX_BARS", "100000")
+        monkeypatch.setenv("HYDRA_DATA__CACHE_MAX_GB", "0.5")
+        monkeypatch.setenv("HYDRA_DATA__SWEEP_INTERVAL_S", "120")
+        monkeypatch.setenv("HYDRA_DATA__ROW_BYTES_ESTIMATE", "192")
         cfg = load_config()
         assert cfg.data.auto_fetch_enabled is False
         assert cfg.data.fetch_weight_per_min == 450
         assert cfg.data.fetch_patience_s == 300
         assert cfg.data.fetch_max_bars == 100_000
+        assert cfg.data.cache_max_gb == 0.5
+        assert cfg.data.sweep_interval_s == 120
+        assert cfg.data.row_bytes_estimate == 192
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -478,9 +487,13 @@ class TestDataFields:
             pytest.param("fetch_weight_per_min", 6001, id="weight-over-binance-ip-budget"),
             pytest.param("fetch_patience_s", 0, id="patience-zero"),
             pytest.param("fetch_max_bars", 0, id="max-bars-zero"),
+            pytest.param("cache_max_gb", -0.1, id="cache-negative"),
+            pytest.param("cache_max_gb", float("inf"), id="cache-infinite"),
+            pytest.param("sweep_interval_s", 0, id="sweep-interval-zero"),
+            pytest.param("row_bytes_estimate", 0, id="row-bytes-zero"),
         ],
     )
-    def test_out_of_range_knobs_fail(self, field: str, value: int) -> None:
+    def test_out_of_range_knobs_fail(self, field: str, value: int | float) -> None:
         with pytest.raises(ValidationError):
             DataConfig(**{field: value})
 

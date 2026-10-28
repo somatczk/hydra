@@ -60,12 +60,19 @@ _UPSERT_CACHE_ENTRY_SQL = """
         last_fetched_at = now()
 """
 
-# The fetch engine's race rail: only status flips, never the range or the row count.
+# The fetch engine's race rail: the status and its fetch clock move, never range or count.
 _SET_CACHE_STATUS_SQL = """
     INSERT INTO data_cache_entries AS entry
         (exchange, symbol, timeframe, first_ts, last_ts, rows, status)
     VALUES ($1, $2, $3, $4, $5, 0, $6)
-    ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET status = EXCLUDED.status
+    ON CONFLICT (exchange, symbol, timeframe) DO UPDATE SET
+        status = EXCLUDED.status, last_fetched_at = now()
+"""
+
+# The sweeper's LRU freshness write, issued by the backtest loaders (best effort).
+_TOUCH_CACHE_ENTRY_SQL = """
+    UPDATE data_cache_entries SET last_used_at = now()
+    WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
 """
 
 _EXISTING_KEYS_SQL = """
@@ -290,7 +297,9 @@ class MarketDataRepository:
         The on-demand engine writes ``fetching`` before its first page and ``ready``
         when it stops, so the sweeper never evicts a dataset mid-write. A dataset
         without a ledger row gets one over the requested range with ``rows = 0``; an
-        existing row keeps its range and count untouched.
+        existing row keeps its range and count, while its fetch clock moves to now —
+        the flip is fetch activity, so the sweeper's crash-aging (``2 x
+        fetch_patience_s``) measures from the flip, never from a page days ago.
         """
         async with self._ensure_pool().acquire() as conn:
             await conn.execute(
@@ -302,6 +311,21 @@ class MarketDataRepository:
                 last_ts,
                 status,
             )
+
+    async def touch_cache_entry(
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+    ) -> None:
+        """Bump the dataset's ``last_used_at`` — the LRU freshness write.
+
+        No row exists until the first auto fetch; an unmatched key is a silent
+        no-op, and the caller (the backtest loader) treats any failure as
+        best-effort.
+        """
+        async with self._ensure_pool().acquire() as conn:
+            await conn.execute(_TOUCH_CACHE_ENTRY_SQL, exchange_id, symbol, str(timeframe))
 
     async def get_bars(
         self,

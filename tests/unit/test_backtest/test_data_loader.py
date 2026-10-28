@@ -41,6 +41,8 @@ class _FakeRepo:
         self.bars = bars
         self.stored_range = stored_range
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.touched: list[tuple[str, str, Timeframe]] = []
+        self.fail_touch = False
 
     async def get_bars(self, *args: Any) -> list[OHLCV]:
         self.calls.append(("get_bars", args))
@@ -53,6 +55,11 @@ class _FakeRepo:
     async def get_bar_range(self, *args: Any) -> tuple[datetime, datetime, int] | None:
         self.calls.append(("get_bar_range", args))
         return self.stored_range
+
+    async def touch_cache_entry(self, exchange: str, symbol: str, timeframe: Timeframe) -> None:
+        self.touched.append((exchange, symbol, timeframe))
+        if self.fail_touch:
+            raise RuntimeError("last_used_at write failed")
 
 
 def _as_repo(fake: _FakeRepo) -> MarketDataRepository:
@@ -158,3 +165,37 @@ async def test_invalid_stored_bars_raise() -> None:
     repo = _FakeRepo(_hourly([0, 0]), None)
     with pytest.raises(InvalidMarketDataError):
         await load_latest_bars(_as_repo(repo), "binance", "BTCUSDT", Timeframe.H1, 2)
+
+
+# ---------------------------------------------------------------------------
+# The LRU freshness hook (P6-C2): successful reads bump last_used_at
+# ---------------------------------------------------------------------------
+
+
+async def test_a_successful_load_bars_bumps_last_used_at() -> None:
+    repo = _FakeRepo(_hourly([0, 1, 2]), None)
+    await load_bars(_as_repo(repo), "binance", "BTCUSDT", Timeframe.H1, T0, T0 + timedelta(hours=3))
+    assert repo.touched == [("binance", "BTCUSDT", Timeframe.H1)]
+
+
+async def test_a_successful_load_latest_bars_bumps_last_used_at() -> None:
+    repo = _FakeRepo(_hourly([0, 1, 2]), None)
+    await load_latest_bars(_as_repo(repo), "binance", "ETHUSDT", Timeframe.M15, 3)
+    assert repo.touched == [("binance", "ETHUSDT", Timeframe.M15)]
+
+
+async def test_a_failing_touch_never_fails_the_read() -> None:
+    repo = _FakeRepo(_hourly([0, 1, 2]), None)
+    repo.fail_touch = True
+    bars, prov = await load_bars(
+        _as_repo(repo), "binance", "BTCUSDT", Timeframe.H1, T0, T0 + timedelta(hours=3)
+    )
+    assert len(bars) == 3
+    assert prov.bar_count == 3
+
+
+async def test_a_no_data_read_touches_nothing() -> None:
+    repo = _FakeRepo([], None)
+    with pytest.raises(NoMarketDataError):
+        await load_bars(_as_repo(repo), "binance", "BTCUSDT", Timeframe.H1, T0, T0)
+    assert repo.touched == []
