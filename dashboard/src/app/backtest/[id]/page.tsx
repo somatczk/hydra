@@ -10,6 +10,7 @@ import {
   CheckCircle,
   XCircle,
   AlertTriangle,
+  Link2,
 } from 'lucide-react';
 import {
   AreaChart,
@@ -43,6 +44,7 @@ import {
 } from '@/components/backtest/DataProvenance';
 import { describeApiError, stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
+import { fetchLine, type JobFetch } from '@/lib/research';
 import {
   type TimeResolution,
   type EquityPoint,
@@ -124,6 +126,16 @@ interface TxnRow {
   isOpen: boolean;
 }
 
+/** `GET /api/backtest/status/{task_id}`: the job row behind a `bt-{task_id}` result, for its auto-fetch record. */
+interface JobStatus {
+  fetch?: JobFetch | null;
+  fetch_error?: string | null;
+}
+
+/** Share tokens live in the API process's memory; this sentence is the whole contract the UI can promise. */
+const SHARE_CAVEAT =
+  "Anyone who can sign in to this Hydra can open it — it is not public. Links live in the engine's memory: a restart or redeploy ends every link, and there is no revoke.";
+
 interface MergedEquityPoint {
   timestamp: string;
   value: number;
@@ -148,7 +160,10 @@ export default function BacktestDetailPage() {
   const params = useParams();
   const router = useRouter();
   const { toast } = useToast();
-  const resultId = params.id as string;
+  // the same view serves /backtest/shared/[token]: read-only, no actions
+  const token = typeof params.token === 'string' ? params.token : null;
+  const shared = token !== null;
+  const resultId = typeof params.id === 'string' ? params.id : '';
 
   const [detail, setDetail] = useState<ApiBacktestDetail | null>(null);
   const [verification, setVerification] = useState<Verification | 'unavailable' | null>(null);
@@ -166,12 +181,19 @@ export default function BacktestDetailPage() {
   // Start paper session state
   const [starting, setStarting] = useState(false);
 
+  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
+  const [jobStatusError, setJobStatusError] = useState<unknown>(null);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [sharing, setSharing] = useState(false);
+
   useEffect(() => {
     async function load() {
       try {
         const [d, v] = await Promise.all([
-          fetchApi<ApiBacktestDetail>(`/api/backtest/results/${resultId}`),
-          fetchApi<Verification>(`/api/backtest/results/${resultId}/verify`).catch(() => 'unavailable' as const),
+          fetchApi<ApiBacktestDetail>(shared ? `/api/backtest/shared/${token}` : `/api/backtest/results/${resultId}`),
+          shared
+            ? null
+            : fetchApi<Verification>(`/api/backtest/results/${resultId}/verify`).catch(() => 'unavailable' as const),
         ]);
         setDetail(d);
         setEditName(d.name || '');
@@ -184,7 +206,38 @@ export default function BacktestDetailPage() {
       }
     }
     load();
-  }, [resultId]);
+  }, [resultId, shared, token]);
+
+  // a bt-{task_id} result came from a durable job: its row records the auto-fetch the run needed
+  const detailId = detail?.id ?? null;
+  useEffect(() => {
+    if (!detailId?.startsWith('bt-')) return;
+    fetchApi<JobStatus>(`/api/backtest/status/${detailId.slice(3)}`)
+      .then(setJobStatus)
+      .catch((err) => {
+        if (stateFromError(err) !== 'not_found') setJobStatusError(err);
+      });
+  }, [detailId]);
+
+  const handleShare = async () => {
+    setSharing(true);
+    try {
+      const res = await fetchApi<{ token: string }>(`/api/backtest/results/${resultId}/share`, { method: 'POST' });
+      setShareUrl(`${window.location.origin}/backtest/shared/${res.token}`);
+    } catch (err) {
+      toast('error', describeApiError(err, 'Failed to create a share link'));
+    } finally {
+      setSharing(false);
+    }
+  };
+
+  const copyShareUrl = () => {
+    if (!shareUrl) return;
+    navigator.clipboard
+      .writeText(shareUrl)
+      .then(() => toast('success', 'Share link copied'))
+      .catch(() => toast('error', 'Could not copy: select the link and copy it'));
+  };
 
   const handleRename = async () => {
     if (!detail) return;
@@ -341,7 +394,9 @@ export default function BacktestDetailPage() {
     return (
       <div className="flex flex-col items-center justify-center gap-4 py-20">
         {missing ? (
-          <p className="text-sm text-ink-2">Backtest not found</p>
+          <p className="text-sm text-ink-2">
+            {shared ? 'This share link no longer works: links end when the engine restarts.' : 'Backtest not found'}
+          </p>
         ) : (
           <DataStateErrorCard error={loadError} fallback="Failed to load backtest" />
         )}
@@ -360,6 +415,11 @@ export default function BacktestDetailPage() {
   return (
     <div className="flex flex-col gap-6">
       <ResearchNav current="/backtest" />
+      {shared && (
+        <p className="rounded-lg border border-line bg-raised px-4 py-3 text-sm text-ink-2" data-testid="shared-banner">
+          Shared backtest result, read-only. {SHARE_CAVEAT}
+        </p>
+      )}
       {/* Stopped reason banner */}
       {detail.stopped_reason && (
         <div className="flex items-center gap-3 rounded-lg border border-caution/30 bg-caution-soft px-4 py-3">
@@ -399,9 +459,11 @@ export default function BacktestDetailPage() {
                 <h1 className="text-lg font-semibold text-ink-1">
                   {detail.name || detail.strategy}
                 </h1>
-                <button onClick={() => { setEditName(detail.name || detail.strategy); setEditing(true); }} className="text-ink-2 hover:text-ink-1" aria-label="Rename this backtest">
-                  <Pencil className="h-3.5 w-3.5" />
-                </button>
+                {!shared && (
+                  <button onClick={() => { setEditName(detail.name || detail.strategy); setEditing(true); }} className="text-ink-2 hover:text-ink-1" aria-label="Rename this backtest">
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </div>
             )}
             <p className="text-xs text-ink-2">{detail.strategy} &middot; {detail.period}</p>
@@ -410,24 +472,57 @@ export default function BacktestDetailPage() {
         <div className="flex flex-wrap items-center gap-2">
           <ProvenanceBadge provenance={detail.provenance} />
           <StatusBadge status={detail.status === 'completed' ? 'Completed' : detail.status} variant={detail.status === 'completed' ? 'success' : 'info'} />
-          <Link
-            href={`/backtest/compare?a=${resultId}`}
-            className="inline-flex h-8 max-lg:h-11 items-center rounded border border-line-strong bg-surface px-3 text-sm font-medium text-ink-1 transition-colors hover:bg-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-          >
-            Compare with…
-          </Link>
-          {detail.strategy_id && (
-            <Button variant="outline" size="sm" onClick={() => setStarting(true)}>
-              Start paper session
-            </Button>
+          {!shared && (
+            <>
+              <Link
+                href={`/backtest/compare?a=${resultId}`}
+                className="inline-flex h-8 max-lg:h-11 items-center rounded border border-line-strong bg-surface px-3 text-sm font-medium text-ink-1 transition-colors hover:bg-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+              >
+                Compare with…
+              </Link>
+              {detail.strategy_id && (
+                <Button variant="outline" size="sm" onClick={() => setStarting(true)}>
+                  Start paper session
+                </Button>
+              )}
+              <Button variant="outline" size="sm" loading={sharing} onClick={() => void handleShare()}>
+                <Link2 className="h-4 w-4" aria-hidden="true" /> Share link
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setConfirmDelete(true)}>
+                <Trash2 className="h-4 w-4" aria-hidden="true" /> Delete
+              </Button>
+            </>
           )}
-          <Button variant="outline" size="sm" onClick={() => setConfirmDelete(true)}>
-            <Trash2 className="h-4 w-4" aria-hidden="true" /> Delete
-          </Button>
         </div>
       </div>
 
+      {shareUrl && (
+        <Section title="Share link">
+          <div className="flex flex-col gap-2" data-testid="share-link">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+              <div className="min-w-0 flex-1">
+                <Input label="Link" value={shareUrl} readOnly onFocus={(e) => e.target.select()} className="font-mono" />
+              </div>
+              <Button variant="outline" onClick={copyShareUrl}>
+                Copy
+              </Button>
+            </div>
+            <p className="text-xs text-ink-2">{SHARE_CAVEAT}</p>
+          </div>
+        </Section>
+      )}
+
       <ProvenancePanel provenance={detail.provenance} />
+      {jobStatus?.fetch && (
+        <p className="text-xs text-ink-2" data-testid="result-fetch">{fetchLine(jobStatus.fetch)}</p>
+      )}
+      {jobStatus?.fetch_error && <p className="text-xs text-danger">{jobStatus.fetch_error}</p>}
+      {jobStatusError !== null && (
+        <div className="flex items-center gap-2 text-xs text-ink-2" data-testid="result-fetch-error">
+          <DataStateBadge state={stateFromError(jobStatusError)} reason={describeApiError(jobStatusError, 'Job record unavailable')} />
+          Auto-fetch record: {describeApiError(jobStatusError, 'unavailable')}
+        </div>
+      )}
 
       {/* Metrics row */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
