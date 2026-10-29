@@ -246,3 +246,68 @@ async def test_exchange_client_get_equity_marks_every_asset() -> None:
     client._exchange = fake
     assert await client.get_equity() == Decimal("1000.5") + Decimal("0.02") * Decimal("60000.0")
     assert fake.tickers == ["BTC/USDT"]
+
+
+def test_build_live_executor_builds_the_perp_executor_for_futures() -> None:
+    from hydra.execution.perp_live import LivePerpTradingExecutor
+
+    fake = object()
+    executor = client_factory.build_live_executor(
+        "binanceusdm",
+        client=fake,
+        market_rules={"BTCUSDT": _rules()},
+        db_pool=object(),
+        strategy_id="s",
+        session_id="sess",
+        initial_quote=Decimal("100"),
+        poll_interval=5.0,
+        market_type="FUTURES",
+        leverage=2,
+    )
+    assert isinstance(executor, LivePerpTradingExecutor)
+    assert executor.exchange_client is fake
+    assert executor.leverage == 2
+    assert executor.get_account_snapshot().wallet_available == Decimal("100")
+
+
+def test_build_live_executor_refuses_the_futures_venue_without_the_market_type() -> None:
+    """The P4-C fail-closed refusal still stands for a mismatched pair: binanceusdm
+    must ask for FUTURES explicitly (and every live surface checks the perps gate
+    before this build is even reached)."""
+    with pytest.raises(UnsupportedVenueError):
+        client_factory.build_live_executor(
+            "binanceusdm",
+            client=object(),
+            market_rules={"BTCUSDT": _rules()},
+            db_pool=object(),
+            strategy_id="s",
+            session_id="sess",
+            initial_quote=Decimal("100"),
+        )
+
+
+def test_build_live_executor_futures_needs_rules_and_a_pool_too() -> None:
+    with pytest.raises(ValueError, match="MarketRules"):
+        client_factory.build_live_executor(
+            "binanceusdm",
+            client=object(),
+            market_rules={"BTCUSDT": SimpleNamespace(amount_step=Decimal("0.00001"))},
+            db_pool=object(),
+            strategy_id="s",
+            session_id="sess",
+            initial_quote=Decimal("100"),
+            market_type="FUTURES",
+            leverage=2,
+        )
+    with pytest.raises(ValueError, match="database"):
+        client_factory.build_live_executor(
+            "binanceusdm",
+            client=object(),
+            market_rules={"BTCUSDT": _rules()},
+            db_pool=None,
+            strategy_id="s",
+            session_id="sess",
+            initial_quote=Decimal("100"),
+            market_type="FUTURES",
+            leverage=2,
+        )

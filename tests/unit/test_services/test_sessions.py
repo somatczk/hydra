@@ -19,7 +19,9 @@ import pytest
 from pydantic import ValidationError
 
 from hydra.core.config import HydraConfig
-from hydra.core.types import OrderType, Timeframe
+from hydra.core.event_bus import InMemoryEventBus
+from hydra.core.events import OrderFillEvent
+from hydra.core.types import MarketType, OrderType, Side, Symbol, Timeframe
 from hydra.dashboard.routes.trading import SessionDetailResponse
 from hydra.data.ingestion import InsufficientHistoryError
 from hydra.execution.errors import (
@@ -36,9 +38,10 @@ from hydra.execution.errors import (
     UnsupportedVenueError,
 )
 from hydra.execution.live_executor import LiveTradingExecutor
-from hydra.execution.order_manager import RiskRejectedError
+from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
-from hydra.execution.protective_orders import ProtectionSpec
+from hydra.execution.perp_live import LivePerpTradingExecutor
+from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.execution.session_manager import KillSwitchReport, SessionManager, TradingSession
 from hydra.execution.session_wiring import ManualOrderResult
 from hydra.risk.market_rules import MarketRules, MarketRulesUnavailableError
@@ -51,6 +54,8 @@ from hydra.services.sessions import (
     SessionStopNotPersistedError,
     StartSessionRequest,
 )
+from hydra.strategy.config import StrategyRiskConfig
+from tests.fixtures.binance_futures_trading import FakeBinanceUsdmTradingClient
 from tests.fixtures.binance_trading import FakeBinanceTradingClient
 from tests.unit.test_execution.session_harness import Harness, held, rule, write_strategy
 
@@ -66,6 +71,16 @@ _LIVE_RULES = MarketRules(
     min_notional=D("5"),
     price_tick=D("0.01"),
     trailing_delta_bips=(D("10"), D("2000")),
+)
+
+_PERP_RULES = MarketRules(
+    symbol="BTCUSDT",
+    amount_step=D("0.00001"),
+    min_qty=D("0.00001"),
+    min_notional=D("5"),
+    price_tick=D("0.01"),
+    trailing_delta_bips=None,
+    trailing_callback_rate_pct=(D("0.1"), D("10")),
 )
 
 
@@ -1119,6 +1134,78 @@ class TestSessionDetailLive:
         assert stop["stop_price"] == 95000.0
         assert stop["take_profit"] is None  # no expected group: the stop leg is the proof
         assert stop["order_list_id"] == "1"
+        model = SessionDetailResponse.model_validate(detail)
+        assert model.positions[0].exchange_stop is not None
+        assert model.positions[0].exchange_stop.state == "confirmed"
+
+    async def test_a_real_live_perp_executor_routes_through_the_perp_branch(
+        self, strategies_dir: Path
+    ) -> None:
+        """A5 (the P4-D review): a REAL LivePerpTradingExecutor gets the perp reads —
+        the ladder legs from BOTH fapi namespaces as open orders and the perp
+        verify as each position's exchange_stop truth. The spot reads never list
+        the ladder (it rests in the algo namespace) and answer missing while it
+        rests, so every held perp position paged in the detail."""
+        fake = FakeBinanceUsdmTradingClient(wallet="10000")
+        fake.leverage["BTCUSDT"] = 2
+        ex = LivePerpTradingExecutor(
+            fake,
+            exchange_id="binanceusdm",
+            initial_balances={"USDT": D("10000")},
+            db_pool=None,
+            strategy_id="saw",
+            session_id="s1",
+            market_rules={"BTCUSDT": _PERP_RULES},
+            leverage=2,
+            poll_interval=5.0,
+            resolve_grace=0.0,
+        )
+        ex.set_mark("BTCUSDT", D("100000"))
+        await ex.create_order("BTCUSDT", "BUY", "MARKET", D("0.02"), params={"tag": "entry"})
+        await ex.collect_exchange_fills(None)
+        om = OrderManager(ex, InMemoryEventBus(), session_id="s1")
+        protect = ProtectiveOrderManager(
+            om,
+            ex,
+            strategy_id="saw",
+            exchange_id="binanceusdm",
+            market_type=MarketType.FUTURES,
+            policy=StrategyRiskConfig(
+                stop_loss_method="fixed_pct",
+                stop_loss_value=2.0,
+                take_profit_method="fixed_pct",
+                take_profit_value=3.0,
+            ),
+            atr=lambda symbol: None,
+        )
+        await protect.on_fill(
+            OrderFillEvent(
+                order_id="e1",
+                symbol=Symbol("BTCUSDT"),
+                side=Side.BUY,
+                quantity=D("0.02"),
+                price=D("100000"),
+                tag="entry",
+            )
+        )
+        session = _session(trading_mode="live", exchange_id="binanceusdm")
+        session._executor = ex
+        session._runtime = SimpleNamespace(protect=protect, entries_paused=None)
+        mgr = SessionManager(config=HydraConfig())
+        mgr._sessions["s1"] = session
+
+        detail = await sessions_svc.get_session_detail(mgr, "s1")
+
+        assert [(o["reason"], o["stop_price"], o["protective"]) for o in detail["open_orders"]] == [
+            ("stop_loss", 98000.0, True),
+            ("take_profit", 103000.0, True),
+        ]
+        (position,) = detail["positions"]
+        stop = position["exchange_stop"]
+        assert stop["state"] == "confirmed"
+        assert stop["kind"] == "oco"
+        assert stop["stop_price"] == 98000.0
+        assert stop["take_profit"] == 103000.0
         model = SessionDetailResponse.model_validate(detail)
         assert model.positions[0].exchange_stop is not None
         assert model.positions[0].exchange_stop.state == "confirmed"

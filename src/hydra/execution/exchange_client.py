@@ -120,11 +120,17 @@ class ExchangeClient:
             )
         return result
 
-    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        """Cancel an order on the exchange."""
+    async def cancel_order(
+        self, order_id: str, symbol: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Cancel an order on the exchange.
+
+        *params* reaches ccxt untouched: a perp conditional leg cancels through the
+        fapi ALGO namespace by passing ``{'clientAlgoId': ..., 'conditional': True}``.
+        """
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "cancel_order"):
-            result: dict[str, Any] = await exchange.cancel_order(order_id, symbol)
+            result: dict[str, Any] = await exchange.cancel_order(order_id, symbol, params or {})
         return result
 
     async def create_oco(
@@ -184,10 +190,22 @@ class ExchangeClient:
         return result
 
     async def cancel_all_orders(self, symbol: str) -> dict[str, Any]:
-        """Cancel EVERY open order on *symbol* (DELETE /api/v3/openOrders), hydra's or not."""
+        """Cancel EVERY open order on *symbol*, hydra's or not.
+
+        Futures conditional (ladder) orders rest in their own fapi algo namespace,
+        so the futures sweep cancels both: the regular open orders
+        (DELETE /fapi/v1/allOpenOrders) and the open algo orders
+        (DELETE /fapi/v1/algoOpenOrders). Spot keeps the single historic call.
+        """
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "cancel_all_orders"):
-            result: dict[str, Any] = await exchange.privateDeleteOpenOrders({"symbol": symbol})
+            if self._market_type is MarketType.FUTURES:
+                result: dict[str, Any] = await exchange.fapiPrivateDeleteAllOpenOrders(
+                    {"symbol": symbol}
+                )
+                await exchange.fapiPrivateDeleteAlgoOpenOrders({"symbol": symbol})
+                return result
+            result = await exchange.privateDeleteOpenOrders({"symbol": symbol})
         return result
 
     # ------------------------------------------------------------------
@@ -225,11 +243,23 @@ class ExchangeClient:
             result: dict[str, Any] = await exchange.sapiGetAccountApiRestrictions()
         return result
 
-    async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Fetch open orders from the exchange."""
+    async def fetch_open_orders(
+        self, symbol: str | None = None, *, conditional: bool = False
+    ) -> list[dict[str, Any]]:
+        """Fetch open orders from the exchange.
+
+        Futures conditional (ladder) orders live in the separate fapi algo namespace:
+        ``conditional=True`` reads the open algo orders instead of the regular ones.
+        The regular call is unchanged — one argument, no params.
+        """
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "fetch_open_orders"):
-            result: list[dict[str, Any]] = await exchange.fetch_open_orders(symbol)
+            if conditional:
+                result: list[dict[str, Any]] = await exchange.fetch_open_orders(
+                    symbol, None, None, {"conditional": True}
+                )
+            else:
+                result = await exchange.fetch_open_orders(symbol)
         return result
 
     async def fetch_open_order_lists(self, symbol: str | None = None) -> list[dict[str, Any]]:
@@ -343,10 +373,61 @@ class ExchangeClient:
             await exchange.set_leverage(leverage, symbol)
 
     async def set_margin_mode(self, symbol: str, mode: str) -> None:
-        """Set margin mode ('cross' or 'isolated') for a futures symbol."""
+        """Set margin mode ('cross' or 'isolated') for a futures symbol.
+
+        Binance answers -4046 when the mode is already the asked one; ccxt maps
+        that to ``MarginModeAlreadySet`` and swallows it by default.
+        """
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "set_margin_mode"):
             await exchange.set_margin_mode(mode, symbol)
+
+    async def fetch_position_side_dual(self) -> bool:
+        """GET /fapi/v1/positionSide/dual: True when the account is in hedge mode."""
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "fetch_position_side_dual"):
+            result: dict[str, Any] = await exchange.fapiPrivateGetPositionSideDual()
+        return bool(result.get("dualSidePosition"))
+
+    async def set_one_way_position_mode(self) -> None:
+        """POST /fapi/v1/positionSide/dual with dualSidePosition=false.
+
+        Hydra's perp model is one signed position per symbol; a hedged account
+        cannot carry it, so the live start switches the account to one-way (the
+        call raises when positions exist — Binance refuses the change).
+        """
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "set_position_mode"):
+            await exchange.set_position_mode(False)
+
+    async def fetch_position_risk(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """GET /fapi/v3/positionRisk rows, optionally filtered to *symbol*.
+
+        The wallet/margin/position truth for live perps: signed ``positionAmt``,
+        ``entryPrice``, ``markPrice``, ``unRealizedProfit``, ``isolatedMargin``.
+        """
+        exchange = self._get_exchange()
+        with observe_exchange_call(self._exchange_id, "fetch_position_risk"):
+            rows: list[dict[str, Any]] = await exchange.fapiPrivateV3GetPositionRisk()
+        if symbol is None:
+            return rows
+        return [row for row in rows if str(row.get("symbol")) == symbol]
+
+    async def fetch_funding_income(
+        self, symbol: str, since_ms: int | None = None
+    ) -> list[dict[str, Any]]:
+        """GET /fapi/v1/income: the settled FUNDING_FEE rows for one symbol.
+
+        Each row carries the signed ``income`` (negative = paid), the ``asset``,
+        the settlement ``time`` and the idempotency key ``tranId``.
+        """
+        exchange = self._get_exchange()
+        request: dict[str, Any] = {"symbol": symbol, "incomeType": "FUNDING_FEE"}
+        if since_ms:
+            request["startTime"] = int(since_ms)
+        with observe_exchange_call(self._exchange_id, "fetch_funding_income"):
+            rows: list[dict[str, Any]] = await exchange.fapiPrivateGetIncome(request)
+        return rows
 
     # ------------------------------------------------------------------
     # WebSocket reconnection helper

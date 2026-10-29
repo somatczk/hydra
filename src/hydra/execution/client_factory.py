@@ -2,9 +2,11 @@
 
 P3-A opens the live path behind the service-layer armed gate: ``build_trading_client`` builds
 the keyed client from stored credentials and ``build_live_executor`` the live session executor
-(Binance SPOT only, D10). P4-B adds the second venue: Binance USD⌂-M linear perps as
-``binanceusdm`` FUTURES — public market data, market rules and funding rates; the live perps
-executor stays P4-D's.
+(Binance SPOT, D10). P4-B adds the second venue: Binance USD⌂-M linear perps as
+``binanceusdm`` FUTURES — public market data, market rules and funding rates. P4-D extends
+``build_live_executor`` to FUTURES: behind the perps gate (checked at every live surface) it
+builds the live perp executor — the perp margin sleeve at the strategy's 1-3x isolated
+leverage — instead of refusing the venue.
 """
 
 from __future__ import annotations
@@ -24,7 +26,6 @@ from hydra.execution.perp_trading import default_funding_reader
 
 if TYPE_CHECKING:
     from hydra.execution.exchange_client import ExchangeClient
-    from hydra.execution.live_executor import LiveTradingExecutor
     from hydra.execution.perp_trading import FundingReader, PerpPaperTradingExecutor
 
 logger = get_logger(__name__)
@@ -201,22 +202,41 @@ def build_live_executor(
     session_id: str,
     initial_quote: Decimal,
     poll_interval: float = 5.0,
-) -> LiveTradingExecutor:
+    market_type: MarketType | str = MarketType.SPOT,
+    leverage: int = 1,
+) -> Any:
     """Create the live executor for one session over the keyed *client* (venue-validated).
 
-    *market_rules* must be real ``MarketRules``: the protective ladder needs tick rounding,
-    lot flooring and the TRAILING_DELTA bounds, not just the paper pre-check trio. Binance
-    SPOT is quote-USDT only (D10), so the sleeve seeds USDT.
+    *market_rules* must be real ``MarketRules``: the protective machinery needs
+    tick rounding, lot flooring and the trailing bounds, not just the paper
+    pre-check trio. Binance SPOT seeds a USDT sleeve (D10); Binance USD⌂-M
+    FUTURES (P4-D, behind the perps gate at every live surface) seeds the perp
+    margin sleeve at the strategy's 1-3x isolated leverage.
     """
     from hydra.execution.live_executor import LiveTradingExecutor
     from hydra.risk.market_rules import MarketRules
 
-    eid = validate_venue(exchange_id, MarketType.SPOT)
+    mt = _market_type(market_type)
+    eid = validate_venue(exchange_id, mt)
     bad = sorted(k for k, v in market_rules.items() if not isinstance(v, MarketRules))
     if bad:
         raise ValueError(f"live trading needs full MarketRules for: {', '.join(bad)}")
     if db_pool is None:
         raise ValueError("a live session needs the database (order ledger and credentials)")
+    if mt is MarketType.FUTURES:
+        from hydra.execution.perp_live import LivePerpTradingExecutor
+
+        return LivePerpTradingExecutor(
+            client,
+            exchange_id=eid,
+            initial_balances={"USDT": initial_quote},
+            db_pool=db_pool,
+            strategy_id=strategy_id,
+            session_id=session_id,
+            market_rules=market_rules,
+            leverage=leverage,
+            poll_interval=poll_interval,
+        )
     return LiveTradingExecutor(
         client,
         exchange_id=eid,
@@ -361,7 +381,12 @@ def bars_repository(db_pool: Any) -> MarketDataRepository | None:
 
 
 MarketsLoader = Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]]
-TradingClientFactory = Callable[[str, Mapping[str, Any], bool], Any]
+TradingClientFactory = Callable[..., Any]
+"""``(exchange_id, creds, testnet, market_type=SPOT)`` -> the keyed live client.
+
+The perp start passes ``MarketType.FUTURES`` as the fourth argument so the
+built client is the binanceusdm class; the spot start keeps the three-arg call
+(every existing injected fake keeps working)."""
 FundingReaderFactory = Callable[[Any, ExchangeId], "FundingReader | None"]
 
 
@@ -382,7 +407,9 @@ class ClientFactory:
     markets_loader: MarketsLoader | None = None
     repository_factory: Callable[[Any], MarketDataRepository | None] = bars_repository
     history_window: int = 1000
-    trading_client_factory: TradingClientFactory = lambda eid, creds, testnet: build_trading_client(
-        eid, creds, testnet=testnet
+    trading_client_factory: TradingClientFactory = (
+        lambda eid, creds, testnet, market_type=MarketType.SPOT: build_trading_client(
+            eid, creds, testnet=testnet, market_type=market_type
+        )
     )
     funding_reader_factory: FundingReaderFactory = default_funding_reader

@@ -199,7 +199,9 @@ class FakeCcxt:
             raise self.fail["create_order"]
         return self.order
 
-    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
+    async def cancel_order(
+        self, order_id: str, symbol: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         self._record("cancel_order", {"order_id": order_id, "symbol": symbol})
         return {"id": order_id, "status": "CANCELED"}
 

@@ -44,7 +44,9 @@ class _FakeCcxt:
     async def create_order(self, **kwargs: Any) -> dict[str, Any]:
         return await self._call("create_order", {"id": "o1", **kwargs})
 
-    async def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
+    async def cancel_order(
+        self, order_id: str, symbol: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         return await self._call("cancel_order", {"id": order_id, "symbol": symbol})
 
     async def fetch_balance(self) -> dict[str, Any]:
@@ -72,6 +74,9 @@ class _FakeCcxt:
 
     async def set_margin_mode(self, mode: str, symbol: str) -> None:
         await self._call("set_margin_mode", None)
+
+    async def set_position_mode(self, hedged: bool) -> None:
+        await self._call("set_position_mode", None)
 
 
 async def _fake_post_oco(fake: _FakeCcxt, params: dict[str, Any]) -> dict[str, Any]:
@@ -101,12 +106,39 @@ async def _fake_get_account_api_restrictions(
     )
 
 
+async def _fake_v3_get_position_risk(
+    fake: _FakeCcxt, params: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    return await fake._call(
+        "fetch_position_risk",
+        [{"symbol": "BTCUSDT", "positionAmt": "0.01", "positionSide": "BOTH"}],
+    )
+
+
+async def _fake_get_income(
+    fake: _FakeCcxt, params: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    return await fake._call(
+        "fetch_funding_income",
+        [{"symbol": "BTCUSDT", "incomeType": "FUNDING_FEE", "income": "-0.01"}],
+    )
+
+
+async def _fake_get_position_side_dual(
+    fake: _FakeCcxt, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return await fake._call("fetch_position_side_dual", {"dualSidePosition": False})
+
+
 # ccxt's camelCase implicit API names, bound as attributes (pep8-naming flags the defs)
 _FakeCcxt.privatePostOrderListOco = _fake_post_oco
 _FakeCcxt.privateDeleteOrderList = _fake_delete_order_list
 _FakeCcxt.privateDeleteOpenOrders = _fake_delete_open_orders
 _FakeCcxt.privateGetOpenOrderList = _fake_get_open_order_lists
 _FakeCcxt.sapiGetAccountApiRestrictions = _fake_get_account_api_restrictions
+_FakeCcxt.fapiPrivateV3GetPositionRisk = _fake_v3_get_position_risk
+_FakeCcxt.fapiPrivateGetIncome = _fake_get_income
+_FakeCcxt.fapiPrivateGetPositionSideDual = _fake_get_position_side_dual
 
 
 ClientCall = Callable[[ExchangeClient], Awaitable[Any]]
@@ -139,6 +171,10 @@ CALLS: list[tuple[str, ClientCall]] = [
     ("fetch_ticker", lambda c: c.get_last_price("BTC/USDT")),
     ("set_leverage", lambda c: c.set_leverage("BTC/USDT", 2)),
     ("set_margin_mode", lambda c: c.set_margin_mode("BTC/USDT", "isolated")),
+    ("set_position_mode", lambda c: c.set_one_way_position_mode()),
+    ("fetch_position_risk", lambda c: c.fetch_position_risk("BTCUSDT")),
+    ("fetch_funding_income", lambda c: c.fetch_funding_income("BTCUSDT", since_ms=1)),
+    ("fetch_position_side_dual", lambda c: c.fetch_position_side_dual()),
 ]
 
 
@@ -256,7 +292,7 @@ async def test_outcomes_accumulate_per_endpoint(clock: _Clock) -> None:
     assert _errors("fetch_ticker", "ExchangeNotAvailable") == 1.0
 
 
-CLIENT_METHOD = {"fetch_ticker": "get_last_price"}
+CLIENT_METHOD = {"fetch_ticker": "get_last_price", "set_position_mode": "set_one_way_position_mode"}
 DELEGATES = {
     "get_balance": "fetch_balance",
     "fetch_balance_totals": "fetch_balance",

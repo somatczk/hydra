@@ -70,6 +70,11 @@ from hydra.execution.paper_trading import (
     PaperSessionHaltedError,
     PersistenceUnavailableError,
 )
+from hydra.execution.perp_live import (
+    LivePerpOrderPoller,
+    LivePerpTradingExecutor,
+    verify_perp_ladder,
+)
 from hydra.execution.perp_trading import PaperExecutor
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.risk.service import RiskService
@@ -189,7 +194,7 @@ class SessionRuntime:
         self.spot_shorts_ignored = 0
         self._manual_orders: dict[str, str] = {}
         self._poller: LiveOrderPoller | None = None
-        if isinstance(executor, LiveTradingExecutor):
+        if isinstance(executor, (LiveTradingExecutor, LivePerpTradingExecutor)):
             # R4: B's dead-man hook reads this producer after every closed bar
             self._live_coverage = self._verify_live_coverage
 
@@ -237,13 +242,23 @@ class SessionRuntime:
         await self.bus.subscribe("order_cancel", self._on_cancel)
         await self.bus.subscribe("feed_status", self._on_feed_status)
         await self.bus.subscribe("price", self._on_price)
-        if isinstance(self.executor, LiveTradingExecutor):
-            self._poller = LiveOrderPoller(
-                self.executor,
-                self.om,
-                interval=self.executor.poll_interval,
-                resolve_grace=self.executor.resolve_grace,
+        if isinstance(self.executor, (LiveTradingExecutor, LivePerpTradingExecutor)):
+            poller: LiveOrderPoller = (
+                LivePerpOrderPoller(
+                    self.executor,
+                    self.om,
+                    interval=self.executor.poll_interval,
+                    resolve_grace=self.executor.resolve_grace,
+                )
+                if isinstance(self.executor, LivePerpTradingExecutor)
+                else LiveOrderPoller(
+                    self.executor,
+                    self.om,
+                    interval=self.executor.poll_interval,
+                    resolve_grace=self.executor.resolve_grace,
+                )
             )
+            self._poller = poller
             self._poller.start()
 
     async def prime(self, warm: WarmBars) -> None:
@@ -346,12 +361,14 @@ class SessionRuntime:
     async def _verify_live_coverage(self) -> Mapping[str, ExchangeStopState | None]:
         """R4: per session symbol the verified exchange stop; None when nothing is held.
 
-        The real producer B's dead-man hook consumes: ``verify_exchange_stop`` per held
-        symbol per closed bar. A symbol with nothing held reads None, so the gauge clears.
+        The real producer B's dead-man hook consumes: ``verify_exchange_stop`` per
+        held symbol per closed bar on spot, ``verify_perp_ladder`` (BOTH fapi
+        namespaces) on perps. A symbol with nothing held reads None, so the gauge
+        clears.
         """
-        if not isinstance(self.executor, LiveTradingExecutor):
+        if not isinstance(self.executor, (LiveTradingExecutor, LivePerpTradingExecutor)):
             return {}
-        client = self.executor.exchange_client
+        live_executor: LiveTradingExecutor | LivePerpTradingExecutor = self.executor
         states: dict[str, ExchangeStopState | None] = {}
         for symbol in self.cfg.symbols:
             try:
@@ -363,7 +380,14 @@ class SessionRuntime:
                 states[symbol] = None
                 continue
             expected = self.protect.armed(symbol)
-            states[symbol] = await verify_exchange_stop(client, symbol, expected)
+            if isinstance(live_executor, LivePerpTradingExecutor):
+                states[symbol] = await verify_perp_ladder(
+                    live_executor.exchange_client, symbol, expected
+                )
+            else:
+                states[symbol] = await verify_exchange_stop(
+                    live_executor.exchange_client, symbol, expected
+                )
         return states
 
     async def _check_live_coverage(self) -> None:
@@ -874,7 +898,7 @@ class SessionRuntime:
             await self._fail(f"{symbol} is unprotected and its close outcome is unknown: {exc}")
 
     def _is_live(self) -> bool:
-        return isinstance(self.executor, LiveTradingExecutor)
+        return isinstance(self.executor, (LiveTradingExecutor, LivePerpTradingExecutor))
 
     async def _on_cancel(self, event: Event) -> None:
         if isinstance(event, OrderCancelEvent):
