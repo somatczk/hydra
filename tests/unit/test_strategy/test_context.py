@@ -186,3 +186,33 @@ def test_ambiguous_and_invalid_rejected(name: str, params: dict[str, object], ma
     ctx, *_ = _walk_ctx(5)
     with pytest.raises(ValueError, match=match):
         ctx.indicator(name, "BTCUSDT", _TF, **params)
+
+
+def test_cached_arrays_follow_appends_replacements_inserts_and_trims() -> None:
+    rng = np.random.default_rng(11)
+    ctx = StrategyContext(max_bars=40)
+    for step in range(400):
+        # mostly a new latest bar; otherwise a replacement, a late gap fill or a too-old bar
+        hour = step if rng.random() < 0.75 else int(rng.integers(max(step - 60, 0), step + 1))
+        close = Decimal(str(round(rng.uniform(100, 200), 2)))
+        ctx.add_bar(
+            "BTCUSDT",
+            _TF,
+            OHLCV(
+                open=close,
+                high=close + Decimal(str(round(rng.uniform(0, 5), 2))),
+                low=close - Decimal(str(round(rng.uniform(0, 5), 2))),
+                close=close,
+                volume=Decimal(str(round(rng.uniform(1, 100), 3))),
+                timestamp=_T0 + timedelta(hours=hour),
+            ),
+        )
+        if rng.random() < 0.5:
+            continue
+        fresh = StrategyContext()
+        for bar in ctx.bars("BTCUSDT", _TF, 100):
+            fresh.add_bar("BTCUSDT", _TF, bar)
+        for name in ("close", "vwap", "obv"):
+            got = ctx.indicator(name, "BTCUSDT", _TF)
+            assert np.array_equal(got, fresh.indicator(name, "BTCUSDT", _TF), equal_nan=True)
+        assert not ctx.indicator("close", "BTCUSDT", _TF).flags.writeable

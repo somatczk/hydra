@@ -8,9 +8,12 @@ outputs have their own single-output function (``macd_hist``, ``bollinger_lower`
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import talib
 from numpy import ndarray
+from numpy.lib.stride_tricks import sliding_window_view
 
 # ===========================================================================
 # Trend indicators
@@ -97,37 +100,41 @@ def supertrend(
     if n <= period:
         return st, direction
 
+    # Recursive, so a loop; on Python floats (the same IEEE doubles, without numpy's per-item cost).
+    atr_l, close_l, upper, lower = (a.tolist() for a in (atr_vals, close, upper_band, lower_band))
+    st_l, dir_l = st.tolist(), direction.tolist()
+
     # Initialize at first valid ATR index
     start = period
-    st[start] = upper_band[start]
-    direction[start] = -1.0
+    st_l[start] = upper[start]
+    dir_l[start] = -1.0
 
     for i in range(start + 1, n):
-        if np.isnan(atr_vals[i]):
+        if math.isnan(atr_l[i]):
             continue
         # Adjust bands
-        if not (lower_band[i] > lower_band[i - 1] or close[i - 1] < lower_band[i - 1]):
-            lower_band[i] = lower_band[i - 1]
+        if not (lower[i] > lower[i - 1] or close_l[i - 1] < lower[i - 1]):
+            lower[i] = lower[i - 1]
 
-        if not (upper_band[i] < upper_band[i - 1] or close[i - 1] > upper_band[i - 1]):
-            upper_band[i] = upper_band[i - 1]
+        if not (upper[i] < upper[i - 1] or close_l[i - 1] > upper[i - 1]):
+            upper[i] = upper[i - 1]
 
-        if direction[i - 1] == 1.0:
-            if close[i] < lower_band[i]:
-                direction[i] = -1.0
-                st[i] = upper_band[i]
+        if dir_l[i - 1] == 1.0:
+            if close_l[i] < lower[i]:
+                dir_l[i] = -1.0
+                st_l[i] = upper[i]
             else:
-                direction[i] = 1.0
-                st[i] = lower_band[i]
+                dir_l[i] = 1.0
+                st_l[i] = lower[i]
         else:
-            if close[i] > upper_band[i]:
-                direction[i] = 1.0
-                st[i] = lower_band[i]
+            if close_l[i] > upper[i]:
+                dir_l[i] = 1.0
+                st_l[i] = lower[i]
             else:
-                direction[i] = -1.0
-                st[i] = upper_band[i]
+                dir_l[i] = -1.0
+                st_l[i] = upper[i]
 
-    return st, direction
+    return np.array(st_l, dtype=np.float64), np.array(dir_l, dtype=np.float64)
 
 
 def supertrend_direction(
@@ -161,10 +168,9 @@ def ichimoku(
 
     def _midline(h: ndarray, lo: ndarray, p: int) -> ndarray:
         result = np.full(n, np.nan, dtype=np.float64)
-        for i in range(p - 1, n):
-            window_h = h[i - p + 1 : i + 1]
-            window_l = lo[i - p + 1 : i + 1]
-            result[i] = (np.max(window_h) + np.min(window_l)) / 2.0
+        if n >= p:
+            hh = sliding_window_view(h, p).max(axis=1)
+            result[p - 1 :] = (hh + sliding_window_view(lo, p).min(axis=1)) / 2.0
         return result
 
     tenkan_sen = _midline(high, low, tenkan)
@@ -255,14 +261,13 @@ def cci(
     tp = (high.astype(np.float64) + low.astype(np.float64) + close.astype(np.float64)) / 3.0
     n = len(tp)
     result = np.full(n, np.nan, dtype=np.float64)
-    for i in range(period - 1, n):
-        window = tp[i - period + 1 : i + 1]
-        mean = np.mean(window)
-        mad = np.mean(np.abs(window - mean))
-        if mad == 0:
-            result[i] = 0.0
-        else:
-            result[i] = (tp[i] - mean) / (0.015 * mad)
+    if 0 < period <= n:
+        window = sliding_window_view(tp, period)
+        mean = window.mean(axis=1)
+        mad = np.abs(window - mean[:, None]).mean(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cci_vals = (tp[period - 1 :] - mean) / (0.015 * mad)
+        result[period - 1 :] = np.where(mad == 0, 0.0, cci_vals)
     return result
 
 
@@ -278,13 +283,12 @@ def williams_r(
     close = close.astype(np.float64)
     n = len(close)
     result = np.full(n, np.nan, dtype=np.float64)
-    for i in range(period - 1, n):
-        hh = np.max(high[i - period + 1 : i + 1])
-        ll = np.min(low[i - period + 1 : i + 1])
-        if hh == ll:
-            result[i] = -50.0
-        else:
-            result[i] = -100.0 * (hh - close[i]) / (hh - ll)
+    if n >= period:
+        hh = sliding_window_view(high, period).max(axis=1)
+        ll = sliding_window_view(low, period).min(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            wr = -100.0 * (hh - close[period - 1 :]) / (hh - ll)
+        result[period - 1 :] = np.where(hh == ll, -50.0, wr)
     return result
 
 
@@ -320,8 +324,8 @@ def bollinger_bands(
     data_f = data.astype(np.float64)
     n = len(data_f)
     std = np.full(n, np.nan, dtype=np.float64)
-    for i in range(period - 1, n):
-        std[i] = np.std(data_f[i - period + 1 : i + 1], ddof=0)
+    if 0 < period <= n:
+        std[period - 1 :] = np.std(sliding_window_view(data_f, period), axis=1, ddof=0)
     upper = middle + std_dev * std
     lower = middle - std_dev * std
     return upper, middle, lower
@@ -356,8 +360,8 @@ def rolling_max(data: ndarray, period: int) -> ndarray:
     data_f = data.astype(np.float64)
     n = len(data_f)
     result = np.full(n, np.nan, dtype=np.float64)
-    for i in range(period, n):
-        result[i] = np.max(data_f[i - period : i])
+    if n > period:
+        result[period:] = sliding_window_view(data_f[:-1], period).max(axis=1)
     return result
 
 
@@ -372,8 +376,8 @@ def rolling_min(data: ndarray, period: int) -> ndarray:
     data_f = data.astype(np.float64)
     n = len(data_f)
     result = np.full(n, np.nan, dtype=np.float64)
-    for i in range(period, n):
-        result[i] = np.min(data_f[i - period : i])
+    if n > period:
+        result[period:] = sliding_window_view(data_f[:-1], period).min(axis=1)
     return result
 
 
@@ -440,18 +444,10 @@ def obv(close: ndarray, volume: ndarray) -> ndarray:
     """On Balance Volume."""
     close = close.astype(np.float64)
     volume = volume.astype(np.float64)
-    n = len(close)
-    result = np.full(n, np.nan, dtype=np.float64)
-    if n == 0:
-        return result
-    result[0] = volume[0]
-    for i in range(1, n):
-        if close[i] > close[i - 1]:
-            result[i] = result[i - 1] + volume[i]
-        elif close[i] < close[i - 1]:
-            result[i] = result[i - 1] - volume[i]
-        else:
-            result[i] = result[i - 1]
+    prev, cur = close[:-1], close[1:]
+    # cumsum adds in order; -0.0 is the exact additive identity for an unchanged close
+    step = np.where(cur > prev, volume[1:], np.where(cur < prev, -volume[1:], -0.0))
+    result: ndarray = np.cumsum(np.concatenate((volume[:1], step)))
     return result
 
 
@@ -485,20 +481,18 @@ def mfi(
     if n < period + 1:
         return result
 
-    for i in range(period, n):
-        pos_flow = 0.0
-        neg_flow = 0.0
-        for j in range(i - period + 1, i + 1):
-            if tp[j] > tp[j - 1]:
-                pos_flow += raw_mf[j]
-            elif tp[j] < tp[j - 1]:
-                neg_flow += raw_mf[j]
-        if neg_flow == 0:
-            result[i] = 100.0
-        else:
-            ratio = pos_flow / neg_flow
-            result[i] = 100.0 - 100.0 / (1.0 + ratio)
-
+    up = np.where(tp[1:] > tp[:-1], raw_mf[1:], 0.0)
+    down = np.where(tp[1:] < tp[:-1], raw_mf[1:], 0.0)
+    m = n - period
+    pos_flow = np.zeros(m)
+    neg_flow = np.zeros(m)
+    # Each window summed in order, one bar at a time: a pairwise sum would round differently.
+    for k in range(period):
+        pos_flow += up[k : k + m]
+        neg_flow += down[k : k + m]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mfi_vals = 100.0 - 100.0 / (1.0 + pos_flow / neg_flow)
+    result[period:] = np.where(neg_flow == 0, 100.0, mfi_vals)
     return result
 
 

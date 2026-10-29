@@ -7,10 +7,11 @@ do not redundantly recompute indicators.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 from bisect import bisect_left
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from decimal import Decimal
 from typing import Any
 
@@ -42,6 +43,16 @@ PARAM_LIMITS: dict[str, tuple[float, float]] = {
     "ema_period": (2, 200),
     "atr_period": (2, 200),
 }
+_FIELDS = ("close", "high", "low", "volume")
+_signature = functools.cache(inspect.signature)
+
+
+def _frozen(columns: Iterable[ndarray]) -> dict[str, ndarray]:
+    """The arrays indicators read (``data`` is the close); read-only, ``close`` returns them."""
+    arrays = dict(zip(_FIELDS, columns, strict=True))
+    for arr in arrays.values():
+        arr.flags.writeable = False
+    return {"data": arrays["close"], **arrays}
 
 
 def resolve_indicator(name: str, params: Mapping[str, object]) -> Callable[..., Any]:
@@ -53,7 +64,7 @@ def resolve_indicator(name: str, params: Mapping[str, object]) -> Callable[..., 
     if name.startswith("_") or not inspect.isfunction(func) or func.__module__ != ind_lib.__name__:
         msg = f"Unknown indicator: {name}"
         raise ValueError(msg)
-    sig = inspect.signature(func)
+    sig = _signature(func)
     for key, value in params.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             msg = f"Indicator {name!r} parameter {key!r} must be a number, got {value!r}"
@@ -91,6 +102,8 @@ class StrategyContext:
         self._bars: dict[str, dict[str, list[OHLCV]]] = {}
         # Indicator cache: (symbol, timeframe, name, params) -> ndarray
         self._indicator_cache: dict[tuple[str, str, str, tuple[tuple[str, Any], ...]], ndarray] = {}
+        # (symbol, timeframe) -> read-only close/high/low/volume arrays of the stored bars
+        self._arrays: dict[tuple[str, str], dict[str, ndarray]] = {}
         # symbol -> Position | None
         self._positions: dict[str, Position | None] = {}
         # symbol -> list of open orders
@@ -113,7 +126,8 @@ class StrategyContext:
         """
         series = self._bars.setdefault(symbol, {}).setdefault(str(timeframe), [])
         ts = bar.timestamp
-        if not series or ts > series[-1].timestamp:
+        appended = not series or ts > series[-1].timestamp
+        if appended:
             series.append(bar)
         else:
             i = bisect_left(series, ts, key=lambda b: b.timestamp)
@@ -126,6 +140,12 @@ class StrategyContext:
         if self._max_bars is not None and len(series) > self._max_bars:
             del series[: len(series) - self._max_bars]
         tf = str(timeframe)
+        arrays = self._arrays.pop((symbol, tf), None)
+        if appended and arrays is not None:
+            # A new latest bar: extend the arrays rather than convert every Decimal again.
+            self._arrays[(symbol, tf)] = _frozen(
+                np.append(arrays[f], float(getattr(bar, f)))[-len(series) :] for f in _FIELDS
+            )
         keys_to_drop = [k for k in self._indicator_cache if k[0] == symbol and k[1] == tf]
         for k in keys_to_drop:
             del self._indicator_cache[k]
@@ -160,15 +180,12 @@ class StrategyContext:
             self._indicator_cache[key] = empty
             return empty
 
-        close = np.array([float(b.close) for b in all_bars], dtype=np.float64)
-        arrays = {
-            "data": close,
-            "close": close,
-            "high": np.array([float(b.high) for b in all_bars], dtype=np.float64),
-            "low": np.array([float(b.low) for b in all_bars], dtype=np.float64),
-            "volume": np.array([float(b.volume) for b in all_bars], dtype=np.float64),
-        }
-        data = {p: arrays[p] for p in inspect.signature(func).parameters if p in arrays}
+        arrays = self._arrays.get((symbol, str(timeframe)))
+        if arrays is None:
+            arrays = self._arrays[(symbol, str(timeframe))] = _frozen(
+                np.array([float(getattr(b, f)) for b in all_bars]) for f in _FIELDS
+            )
+        data = {p: arrays[p] for p in _signature(func).parameters if p in arrays}
         out = func(**data, **params)
         result: ndarray = out[0] if isinstance(out, tuple) else out
 
