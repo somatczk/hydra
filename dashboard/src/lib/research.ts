@@ -26,7 +26,8 @@ export interface ResearchJob {
   worker_id?: string | null;
 }
 
-/** `detail.fetch` (data/on_demand.py `_emit`, worker `_fetch_failed`): a failure before any progress has only state and reason. */
+/** `detail.fetch` (data/on_demand.py `_emit`, worker `_fetch_failed`): a failure before any progress has only state and
+ * reason; `waiting` means another worker holds the dataset's fetch lock. */
 export interface JobFetch {
   state: string;
   ranges?: string[][];
@@ -258,6 +259,7 @@ export function fetchLine(fetch: JobFetch | null | undefined): string | null {
     fetch.elapsed_ms !== undefined ? duration(fetch.elapsed_ms) : null,
   ].filter(Boolean);
   const tail = cost.length > 0 ? ` · ${cost.join(' · ')}` : '';
+  if (fetch.state === 'waiting') return "Waiting for another worker's fetch of these bars to finish";
   if (fetch.state === 'fetching') return `Fetching missing bars: ${bars} so far${where}${tail}`;
   if (fetch.state === 'fetched') {
     return ranges.length === 0 ? 'No missing bars: every bar was already stored' : `Fetched ${bars} missing bars${where} before the run${tail}`;
