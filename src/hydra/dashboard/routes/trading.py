@@ -180,6 +180,20 @@ class SessionMetrics(BaseModel):
     drawdown: float | None = None
 
 
+class PerpsSessionState(BaseModel):
+    """P4-C's perp session reads (``get_session_detail``'s ``perps`` block), passed through
+    for FUTURES sessions so the perp surfaces (P4-F) can render the margin wallet, leverage,
+    funding accrual and liquidation state. Absent/null on spot sessions."""
+
+    leverage: int
+    margin_mode: str
+    funding_applied: int
+    funding_missing: int
+    liquidations: int
+    wallet_available: float
+    margin_used: float
+
+
 class SessionDetailResponse(BaseModel):
     session_id: str
     strategy_id: str
@@ -207,6 +221,8 @@ class SessionDetailResponse(BaseModel):
     # A7 (live sessions): the tracked order rows + reconcile; paper answers the defaults
     orders: list[LiveOrderItem] = Field(default_factory=list)
     reconcile: ReconcileStatus | None = None
+    # P4-C (FUTURES sessions): the perp session reads; null/absent on spot
+    perps: PerpsSessionState | None = None
 
 
 class KillSwitchResponse(BaseModel):

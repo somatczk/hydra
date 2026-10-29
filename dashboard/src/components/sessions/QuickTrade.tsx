@@ -6,9 +6,9 @@ import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { cn } from '@/components/ui/cn';
 import { fetchApi } from '@/lib/api';
-import { needsLiveOrderReview, sessionName, stopRuleLabel, type PositionItem, type SessionDetail, type StopRule } from '@/lib/derive';
+import { isPerpSession, needsLiveOrderReview, sessionName, stopRuleLabel, type PositionItem, type SessionDetail, type StopRule } from '@/lib/derive';
 import { money } from '@/lib/format';
-import { baseAsset, quickTradeOutcome, type Outcome, type QuickTradeRequest, type QuickTradeResponse } from '@/lib/outcomes';
+import { baseAsset, PERP_MANUAL_LONG_ONLY, quickTradeOutcome, type Outcome, type QuickTradeRequest, type QuickTradeResponse } from '@/lib/outcomes';
 import { settle } from './useOutcomeSlot';
 
 type Side = 'buy' | 'sell';
@@ -27,7 +27,7 @@ function Segmented<T extends string>({
 }: {
   label: string;
   value: T;
-  options: Array<{ value: T; label: string }>;
+  options: Array<{ value: T; label: string; disabled?: boolean }>;
   onChange: (v: T) => void;
 }) {
   return (
@@ -37,10 +37,12 @@ function Segmented<T extends string>({
           key={o.value}
           type="button"
           aria-pressed={value === o.value}
+          disabled={o.disabled}
           onClick={() => onChange(o.value)}
           className={cn(
             'h-10 rounded border px-4 text-sm font-medium max-lg:h-11 max-lg:min-w-11',
             value === o.value ? 'border-accent bg-hover text-ink-1' : 'border-line-strong text-ink-2 hover:bg-hover',
+            o.disabled && 'cursor-not-allowed opacity-50 hover:bg-transparent',
           )}
         >
           {o.label}
@@ -90,10 +92,20 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
     };
   }, [session.strategy_id]);
 
-  const held = positions.filter((p) => sameSymbol(p.symbol, symbol)).reduce((n, p) => n + p.quantity, 0);
+  const shortHeld = isPerpSession(session) && positions.some((p) => sameSymbol(p.symbol, symbol) && p.direction === 'short');
+  const longs = positions.filter((p) => sameSymbol(p.symbol, symbol) && p.direction !== 'short');
+  const longHeld = longs.reduce((n, p) => n + p.quantity, 0);
   const buy = side === 'buy';
+  // §4(2): manual/quick-trade on perps is LONG-ONLY in 2.8.0 — the SELL that would open a SHORT
+  // entry is refused up front with the cut named, and so is the BUY over a strategy-held short.
+  const perpSellCut = isPerpSession(session) && longHeld <= 0
+    ? `No ${base} long held: ${PERP_MANUAL_LONG_ONLY} (use a strategy session to trade shorts).`
+    : null;
+  const perpShortBuyCut = isPerpSession(session) && shortHeld
+    ? `${symbol} is held short by the strategy: ${PERP_MANUAL_LONG_ONLY} — its own exit rules and the kill switch close it (BUY-back).`
+    : null;
   const errors = {
-    side: !buy && held <= 0 ? "Nothing to sell. Spot can't go short." : null,
+    side: buy ? perpShortBuyCut : (perpSellCut ?? (!buy && longHeld <= 0 ? "Nothing to sell. Spot can't go short." : null)),
     quantity: quantity !== '' && !positive(quantity) ? 'Enter a quantity above 0 with up to 8 decimals.' : null,
     price:
       orderType !== 'LIMIT'
@@ -114,9 +126,8 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
   };
   const valid = positive(quantity) && Object.values(errors).every((e) => e === null);
 
-  const markValue = positions.length > 0 && held > 0
-    ? positions.filter((p) => sameSymbol(p.symbol, symbol)).reduce((n, p) => n + p.quantity * p.avg_entry_price + p.unrealized_pnl, 0) / held
-    : null;
+  // The value line prices the manual order — long-only on perps, so a short never prices it.
+  const markValue = longHeld > 0 ? longs.reduce((n, p) => n + p.quantity * p.avg_entry_price + p.unrealized_pnl, 0) / longHeld : null;
   const unit = orderType === 'LIMIT' && positive(limitPrice) ? Number(limitPrice) : markValue;
   const about =
     unit === null
@@ -193,16 +204,20 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
           label="Side"
           value={side}
           options={[
-            { value: 'buy', label: 'Buy' },
-            { value: 'sell', label: 'Sell' },
+            { value: 'buy', label: 'Buy', disabled: perpShortBuyCut !== null },
+            // §4(2): the visibly-disabled SHORT side on perps — manual orders are long-only in 2.8.0.
+            { value: 'sell', label: 'Sell', disabled: perpSellCut !== null },
           ]}
           onChange={setSide}
         />
-        {errors.side && (
+        {/* The disabled side's reason stands visible without clicking it (never half-broken). */}
+        {errors.side ? (
           <p role="alert" className="text-xs text-danger">
             {errors.side}
           </p>
-        )}
+        ) : perpSellCut ? (
+          <p className="text-xs text-danger">{perpSellCut}</p>
+        ) : null}
       </div>
       <Input
         label={`Quantity (${base})`}

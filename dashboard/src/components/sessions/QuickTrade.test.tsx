@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buttonByText, click, inputByLabel, mount, routeFetch, typeInto, type Mounted, type Mutations } from '@/test/pageHarness';
-import { detail, liveChallenge } from '@/test/fixtures';
+import { detail, liveChallenge, perpSession } from '@/test/fixtures';
 import type { QuickTradeResponse } from '@/lib/outcomes';
 
 const fetchApi = vi.fn();
@@ -12,18 +12,25 @@ vi.mock('@/lib/api', async (orig) => ({
 const { QuickTrade } = await import('./QuickTrade');
 
 const HELD = [{ symbol: 'BTCUSDT', direction: 'long', quantity: 0.002, avg_entry_price: 60000, unrealized_pnl: 10 }];
+const SHORT = [{ symbol: 'BTCUSDT', direction: 'short', quantity: 0.002, avg_entry_price: 60000, unrealized_pnl: 10 }];
 let m: Mounted;
 let calls: Array<{ path: string; init?: RequestInit }>;
 
 const FILLED: QuickTradeResponse = { order_id: 'abcdef123456', session_id: detail().session_id, symbol: 'BTCUSDT', side: 'buy', order_type: 'MARKET', quantity: 0.0015, price: null, status: 'FILLED', protection: 'armed', protective_order_id: 'p1', exit_orders_deferred: false, fill_price: 67612.4, mark_source: 'live' };
 
-function show(positions = HELD) {
+function show(session = detail(), positions = HELD, mutations: Mutations = {}) {
   fetchApi.mockImplementation(
     routeFetch({ '/api/strategies/sma-cross-btc-1h': { risk: { stop_loss_method: 'atr', stop_loss_value: 2 } } }, calls, {
       'POST /api/trading/quick-trade': FILLED,
+      ...mutations,
     }),
   );
-  return mount(<QuickTrade session={detail()} positions={positions} onOutcome={vi.fn()} onSent={vi.fn()} />);
+  return mount(<QuickTrade session={session} positions={positions} onOutcome={vi.fn()} onSent={vi.fn()} />);
+}
+
+/** A perp (binanceusdm) paper session — the §4(2) long-only surface. */
+function showPerp(positions = HELD, mutations: Mutations = {}) {
+  return show(detail({ ...perpSession(), symbols: ['BTCUSDT'] }), positions, mutations);
 }
 
 /** The L4 world: a running live session; the form's primary opens the review, never the quick-trade POST. */
@@ -99,7 +106,7 @@ describe('QuickTrade', () => {
   });
 
   it('refuses a sell when nothing is held', async () => {
-    m = await show([]);
+    m = await show(detail(), []);
     await click(side('Sell'));
     await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
     expect(m.container.textContent).toContain("Nothing to sell. Spot can't go short.");
@@ -161,5 +168,67 @@ describe('QuickTrade', () => {
     await click(primary());
     expect(calls.filter((c) => c.path === '/api/trading/quick-trade')).toHaveLength(1);
     expect(calls.filter((c) => c.path === '/api/live/order')).toHaveLength(0);
+  });
+});
+
+describe('QuickTrade on perps (§4(2): manual orders are long-only in 2.8.0)', () => {
+  const cut = 'long-only in 2.8.0';
+
+  it('visibly disables the Sell side with no long held and names the cut — never half-broken', async () => {
+    m = await showPerp([]);
+    const sell = side('Sell');
+    expect(sell.disabled).toBe(true);
+    expect(m.container.textContent).toContain(`No BTC long held: manual orders on perpetual sessions are ${cut} (use a strategy session to trade shorts).`);
+    // Long-only means exactly that: the BUY stays available and posts.
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
+    expect(primary().disabled).toBe(false);
+    await click(primary());
+    expect(calls.filter((c) => c.path === '/api/trading/quick-trade')).toHaveLength(1);
+  });
+
+  it('keeps the Sell side enabled when a long is held — reducing it is the safety net, not a short', async () => {
+    m = await showPerp(HELD);
+    expect(side('Sell').disabled).toBe(false);
+    await click(side('Sell'));
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
+    expect(primary().disabled).toBe(false);
+    expect(m.container.textContent).not.toContain(cut);
+  });
+
+  it('refuses the manual BUY over a strategy-held short: the strategy closes its own (BUY-back)', async () => {
+    m = await showPerp(SHORT);
+    expect(side('Buy').disabled).toBe(true);
+    expect(m.container.textContent).toContain(`BTCUSDT is held short by the strategy: manual orders on perpetual sessions are ${cut} — its own exit rules and the kill switch close it (BUY-back).`);
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
+    expect(primary().disabled).toBe(true);
+    await click(primary());
+    expect(calls.filter((c) => c.path === '/api/trading/quick-trade')).toHaveLength(0);
+  });
+
+  it('a short-only session prices no manual order — the mark line stays unknown (A3)', async () => {
+    m = await showPerp(SHORT);
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
+    expect(m.container.textContent).toContain('Value unknown until it fills.');
+    expect(m.container.textContent).not.toContain('About ');
+  });
+
+  it('keeps the spot rules byte-identical: Sell with nothing held is the spot refusal, not the perp cut', async () => {
+    m = await show(detail(), []);
+    expect(side('Sell').disabled).toBe(false);
+    await click(side('Sell'));
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
+    expect(m.container.textContent).toContain("Nothing to sell. Spot can't go short.");
+    expect(m.container.textContent).not.toContain(cut);
+  });
+
+  it('the live perp review names the leveraged venue, not plain Binance spot', async () => {
+    m = await show(detail({ ...perpSession(), trading_mode: 'live', symbols: ['BTCUSDT'] }), HELD, {
+      'POST /api/live/order': liveChallenge({ note: 'Enter this code once to place the live order.' }),
+    });
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.0015');
+    expect(primary().textContent).toBe('Review live order');
+    await click(primary());
+    expect(m.container.textContent).toContain('Buy 0.0015 BTC with real leveraged money on Binance USD⌂-M perps');
+    expect(m.container.textContent).not.toContain('with real money on Binance');
   });
 });

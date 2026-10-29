@@ -289,3 +289,63 @@ class TestSessionDetailMetrics:
         assert metrics["win_rate"] == 75.0
         assert metrics["total_trades"] == 4
         assert metrics["open_positions"] == 0
+
+
+class TestSessionDetailPerps:
+    """P4-C's perps block (the perp session reads) passes through the route's response model."""
+
+    def test_perps_block_passes_through_for_a_futures_session(
+        self, client: TestClient, mock_session_manager: MagicMock
+    ) -> None:
+        perps = {
+            "leverage": 2,
+            "margin_mode": "isolated",
+            "funding_applied": 3,
+            "funding_missing": 1,
+            "liquidations": 0,
+            "wallet_available": 400.5,
+            "margin_used": 99.5,
+        }
+        mock_session_manager.get_session_detail.return_value = {
+            "session_id": "sess-perp-1",
+            "strategy_id": "perp-trend",
+            "trading_mode": "paper",
+            "status": "running",
+            "exchange_id": "binanceusdm",
+            "symbols": ["BTCUSDT"],
+            "timeframe": "1h",
+            "metrics": {
+                "balance": {"USDT": 500.0},
+                "total_pnl": 0.0,
+                "win_rate": 0.0,
+                "total_trades": 0,
+                "open_positions": 1,
+            },
+            "positions": [],
+            "trades": [],
+            "perps": perps,
+        }
+
+        resp = client.get("/api/trading/sessions/sess-perp-1/detail")
+        assert resp.status_code == 200
+        assert resp.json()["perps"] == perps
+
+    def test_a_spot_session_answers_perps_none(
+        self, client: TestClient, mock_session_manager: MagicMock
+    ) -> None:
+        mock_session_manager.get_session_detail.return_value = {
+            "session_id": "sess-spot-1",
+            "strategy_id": "strat-alpha",
+            "trading_mode": "paper",
+            "status": "running",
+            "exchange_id": "binance",
+            "symbols": ["BTCUSDT"],
+            "timeframe": "1h",
+            "metrics": {},
+            "positions": [],
+            "trades": [],
+        }
+
+        resp = client.get("/api/trading/sessions/sess-spot-1/detail")
+        assert resp.status_code == 200
+        assert resp.json()["perps"] is None

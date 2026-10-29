@@ -70,6 +70,25 @@ export interface DisarmResponse {
   running_live_sessions_count: number;
 }
 
+/** GET /api/live/perps/status (P4-E): the separate perps ceremony's state — its own
+ * `perps_armed`/`perps_capital` rows beside the spot gate's; arming spot never arms perps. */
+export interface PerpsStatusResponse {
+  perps_armed: boolean;
+  armed_by: string | null;
+  armed_at: string | null;
+  perps_capital: number | null;
+  running_live_perps_sessions: string[];
+  running_live_perps_sessions_count: number;
+}
+
+/** POST /api/live/perps/disarm (the R10 pattern for perps): running live perp sessions are
+ * named and keep running; pending perps-arming approvals can still re-arm on their code. */
+export interface PerpsDisarmResponse extends PerpsStatusResponse {
+  status: string;
+  message: string;
+  pending_perps_approvals: string[];
+}
+
 /** POST /api/live/session-start (R9's create-route): the same facts as a paper start, plus the reason
  * the approval store needs; the challenge params bind them. */
 export interface LiveSessionStartRequest {
@@ -81,6 +100,16 @@ export interface LiveSessionStartRequest {
 /** R19 (the amended 06 §10 body, verbatim): the facts block of the L4 arm and live-start ceremonies. */
 export const LIVE_FACTS =
   "Live sessions place real orders on Binance with real money. Paper sessions keep running. Every live order you place needs the one-time code; once a live session starts, its strategy trades under that start's authorization — bounded by the kill switch, risk limits and exchange stops.";
+
+/** The perps ceremonies' facts block (P4-F names the dialog, §4(7)): the same L4 truth with the
+ * leveraged venue's own risks — isolated margin caps each position's loss at what it posted,
+ * and a liquidation takes that margin to zero. */
+export const PERPS_FACTS =
+  "Live perp sessions place real leveraged orders on Binance USD⌂-M futures with real money — up to 3× on isolated margin, so each position's loss is capped at the margin it posted and a liquidation takes that margin to zero. Paper sessions keep running. Every live perp session start and manual live order needs its own one-time code; once a live perp session starts, its strategy trades under that start's authorization — bounded by the kill switch, risk limits and the exchange's reduce-only stop ladder.";
+
+/** The §4(2) 2.8.0 cut, as the manual-order surfaces refuse it (session_wiring.py's own vocabulary):
+ * strategy exits and the kill switch still close shorts (BUY-back); manual SHORT entries do not exist. */
+export const PERP_MANUAL_LONG_ONLY = 'manual orders on perpetual sessions are long-only in 2.8.0';
 
 /** trading.py:213-226 QuickTradeResponse: no stop price anywhere. */
 export interface QuickTradeResponse {
@@ -156,6 +185,10 @@ export function copyForCode(code: string, detail: ApiErrorDetail | null): string
         : `${msg} Nothing was started.`;
     case 'paper_capital_unavailable':
       return "Paper capital isn't loaded, so the session can't be sized. Nothing was started. Try again shortly.";
+    case 'perps_not_armed':
+      return 'Perps trading is not armed. Arm it with the separate code-gated ceremony in Settings first. Nothing was started.';
+    case 'perps_capital_missing':
+      return 'Perps trading is armed but its capital is missing. Disarm and re-arm it in Settings to set the capital. Nothing was started.';
     case 'market_rules_unavailable':
       return "Binance's lot and price rules couldn't be loaded. Nothing was started. Try again.";
     case 'engine_not_ready':
@@ -670,6 +703,74 @@ export function liveGateOutcome(result: Result<ApproveResponse>, phase: LivePhas
   // A definite 4xx refusal the engine answered — never "couldn't reach the engine" for one that arrived.
   if (d && !unreachable(err)) return { tone: 'caution', title: "Live trading wasn't turned on.", lines: [d.message], actions: [] };
   return notConfirmed('live trading was turned on', err);
+}
+
+/** The approve leg's futures-permission refusals (the fail-closed re-fetch): the stored key cannot
+ * trade futures, has withdrawals on, was validated for neither environment, or the permission read
+ * itself failed — every one refuses the arm, so 'nothing was armed' is the honest headline. */
+function perpsNotArmed(d: ApiErrorDetail, tone: Tone = 'danger'): Outcome {
+  return { tone, title: 'Nothing was armed.', lines: [d.message], actions: [] };
+}
+
+/** POST /api/live/perps/arm, then the existing approve endpoint (the separate P4-E ceremony).
+ * Mirrors `liveGateOutcome` with the perps vocabulary: the executor's futures-permission
+ * re-fetch refuses are fail-closed, an already-armed gate is the honest no-op, and an
+ * unanswered approve stays not-confirmed — never claimed off. */
+export function perpsGateOutcome(result: Result<ApproveResponse>, phase: LivePhase = 'approve'): Outcome {
+  if ('ok' in result) {
+    if (result.ok.executed === false) return { tone: 'caution', title: "Perps trading wasn't turned on.", lines: [], actions: [retry] };
+    const r = result.ok.result;
+    // The executor re-read the armed row at execution time: arming twice is a clean no-op.
+    if (typeof r === 'object' && r !== null && (r as { status?: unknown }).status === 'already_armed') {
+      return { tone: 'caution', title: 'Perps trading is already armed; nothing changed.', lines: [], actions: [] };
+    }
+    return ok('Perps trading is on.', ['Each live perp session start and manual live order still needs its own one-time code.']);
+  }
+  const err = result.err;
+  if (isSignedOut(err)) return signedOut('turn perps trading on again');
+  const d = parseErrorDetail(err);
+  if (phase === 'challenge') return challengeOutcome("Perps trading wasn't turned on.", err);
+  if (d?.code === 'code_mismatch') {
+    const left = typeof d.attempts_left === 'number' ? d.attempts_left : null;
+    return {
+      tone: 'danger',
+      title: "That code didn't match. Nothing changed.",
+      lines: left === null ? [] : [left === 1 ? '1 attempt left.' : left === 0 ? 'No attempts left — start again for a fresh code.' : `${left} attempts left.`],
+      actions: [],
+      inline: true,
+    };
+  }
+  if (d?.code === 'credentials_not_futures_capable' || d?.code === 'live_credentials_missing') {
+    return perpsNotArmed(d);
+  }
+  if (d?.code === 'kill_switch_active') {
+    return {
+      tone: 'caution',
+      title: 'Nothing was armed.',
+      lines: [d.message],
+      actions: [{ kind: 'open', label: 'Release on Risk', href: '/risk#kill-switch' }],
+    };
+  }
+  if (d?.code === 'approval_execution_failed') {
+    return { tone: 'caution', title: "Perps trading wasn't turned on.", lines: [d.message], actions: [retry] };
+  }
+  if (d?.code === 'already_decided' || d?.code === 'approval_expired' || d?.code === 'approval_failed') {
+    return { tone: 'caution', title: d.message, lines: ['Nothing changed from this screen.'], actions: [] };
+  }
+  if (d?.code === 'executor_not_registered') {
+    return {
+      tone: 'caution',
+      title: 'The engine cannot execute this action yet.',
+      lines: [d.message, 'The code was not used. Wait for the engine, or deny this request.'],
+      actions: [],
+    };
+  }
+  if (d?.code === 'principal_not_allowed') return { tone: 'danger', title: d.message, lines: [], actions: [], inline: true };
+  // R30(1): a timed-out approve may still be arming on the trader — in-flight-unknown, never claimed off.
+  if (d?.code === 'engine_unreachable') return notConfirmed('perps trading was turned on', err);
+  // A definite refusal the engine answered — never "couldn't reach the engine" for one that arrived.
+  if (d && !unreachable(err)) return perpsNotArmed(d, 'caution');
+  return notConfirmed('perps trading was turned on', err);
 }
 
 function unknownLiveOrder(lines: string[], selectedSessionId: string): Outcome {

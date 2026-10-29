@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
 import { buttonByText, click, dialogPolyfill, flush, inputByLabel, mount, routeFetch, typeInto, type Mounted, type Mutations, type Routes } from '@/test/pageHarness';
-import { detail, exchangeStop, liveChallenge, liveStatus, paperFill, platformConfig, reconcile, session } from '@/test/fixtures';
+import { detail, exchangeStop, liveChallenge, liveStatus, paperFill, perpSession, perpsState, platformConfig, reconcile, session } from '@/test/fixtures';
 
 const ID = 'a1b2c3d4-0000-4000-8000-000000000001';
 const fetchApi = vi.fn();
@@ -293,5 +293,51 @@ describe('session detail: the live reads (UI-4c)', () => {
     expect(calls.filter((c) => c.path === '/api/trading/quick-trade')).toHaveLength(0);
     expect(text()).toContain('Buy 0.0015 BTC with real money on Binance');
     expect(text()).toContain('Place live order');
+  });
+});
+
+describe('session detail perps surfaces (P4)', () => {
+  it('renders the perps block: leverage, isolated margin, the margin wallet and the funding accrual', async () => {
+    setup(detail({ ...perpSession(), perps: perpsState() }));
+    m = await page();
+    const perps = document.getElementById('perps-heading')?.parentElement?.textContent ?? '';
+    expect(perps).toContain('2× isolated');
+    expect(perps).toContain('400.50 available · 99.50 margin used');
+    expect(perps).toContain('Funding applied at 3 settlements.');
+    expect(perps).not.toContain('skipped');
+    expect(perps).not.toContain('Liquidations');
+  });
+
+  it('names the funding skips and a liquidation honestly', async () => {
+    setup(detail({ ...perpSession(), perps: perpsState({ funding_applied: 2, funding_missing: 1, liquidations: 1 }) }));
+    m = await page();
+    const perps = document.getElementById('perps-heading')?.parentElement?.textContent ?? '';
+    expect(perps).toContain('Funding applied at 2 settlements; 1 skipped (no stored rate) — P&L shows the gaps honestly.');
+    expect(perps).toContain('1 position liquidated at its liquidation price — the wallet got nothing back.');
+  });
+
+  it('shows no perps section on a spot session', async () => {
+    setup(detail());
+    m = await page();
+    expect(text()).not.toContain('Margin wallet');
+    expect(document.getElementById('perps-heading')).toBeNull();
+  });
+
+  it('shows a short position signed, with the BUY-back note; longs stay unsigned', async () => {
+    setup(detail({ ...perpSession(), positions: [{ ...HELD, direction: 'short' }] }));
+    m = await page();
+    const rows = Array.from(m.container.querySelectorAll('tbody tr')).map((r) => r.textContent ?? '');
+    expect(rows.some((r) => r.includes('Short'))).toBe(true);
+    expect(rows.some((r) => r.includes('-0.00150'))).toBe(true);
+    expect(text()).toContain("A short closes by buying it back. Its strategy's exit rules and the kill switch close it; manual orders are long-only in 2.8.0.");
+  });
+
+  it('keeps the spot positions table byte-identical: Held side, unsigned qty, no BUY-back note', async () => {
+    setup(detail({ positions: [HELD] }));
+    m = await page();
+    const rows = Array.from(m.container.querySelectorAll('tbody tr')).map((r) => r.textContent ?? '');
+    expect(rows.some((r) => r.includes('Held'))).toBe(true);
+    expect(rows.some((r) => r.includes('-0.00150'))).toBe(false);
+    expect(text()).not.toContain('closes by buying it back');
   });
 });

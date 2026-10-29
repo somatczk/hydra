@@ -362,6 +362,11 @@ class TestPermissions:
         assert is_trade_capable(json.dumps({"enable_spot_and_margin_trading": True}))
         assert not is_trade_capable(json.dumps({"enable_spot_and_margin_trading": False}))
         assert not is_trade_capable(None)
+        # P4-F: a binanceusdm key that can trade futures is trade-capable for the delete gate.
+        assert is_trade_capable(
+            json.dumps({"enable_spot_and_margin_trading": False, "enable_futures": True})
+        )
+        assert not is_trade_capable(json.dumps({"enable_futures": False}))
 
 
 # ---------------------------------------------------------------------------

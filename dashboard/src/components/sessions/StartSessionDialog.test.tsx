@@ -98,7 +98,6 @@ describe('StartSessionDialog live door', () => {
     expect(text()).toContain('Live needs the gate on — turn on live trading in Settings first.');
     expect(text()).toContain('SMA cross · Binance spot · BTCUSDT · 1h · PAPER');
   });
-
   it('starts a live session through the code-gated ceremony and navigates to it', async () => {
     const CHALLENGE = liveChallenge({ approval_id: '3f0b9e2a-3000-4000-8000-000000000009', code: '482913' });
     m = await show(liveStatus({ live_armed: true }), {
@@ -192,5 +191,80 @@ describe('StartSessionDialog live door', () => {
     expect(calls.filter((c) => c.path === '/api/live/session-start')).toHaveLength(2);
     expect(calls.filter((c) => c.path === '/api/activity/approvals/3f0b9e2a-3000-4000-8000-000000000009/approve')).toHaveLength(1);
     expect(text()).toContain('482913');
+  });
+});
+
+describe('StartSessionDialog perp door (P4-E: a perp strategy answers to the perps gate)', () => {
+  const PERP_DETAIL = {
+    id: 'perp-trend',
+    name: 'Perp trend',
+    symbol: 'BTCUSDT',
+    timeframes: { primary: '1h' },
+    exchange_id: 'binanceusdm',
+  };
+  const PERPS_FACTS_LINE =
+    "up to 3× on isolated margin, so each position's loss is capped at the margin it posted and a liquidation takes that margin to zero.";
+
+  function showPerp(live: unknown, mutations: Mutations = {}) {
+    fetchApi.mockImplementation(
+      routeFetch(
+        {
+          '/api/risk/live-status': live,
+          '/api/trading/sessions': [],
+          '/api/system/config': platformConfig(),
+          '/api/strategies/perp-trend': PERP_DETAIL,
+        },
+        calls,
+        mutations,
+      ),
+    );
+    return mount(<ShellStatusProvider><StartSessionDialog strategyId="perp-trend" onClose={vi.fn()} /></ShellStatusProvider>);
+  }
+
+  it('names the perps venue on the strategy line', async () => {
+    m = await showPerp(liveStatus());
+    expect(text()).toContain('Perp trend · Binance USD⌂-M perps · BTCUSDT · 1h · PAPER');
+    expect(text()).not.toContain('Binance spot');
+  });
+
+  it('keeps Live disabled while only the SPOT gate is armed — arming spot never arms perps', async () => {
+    m = await showPerp(liveStatus({ live_armed: true, perps_armed: false }));
+    const liveRadio = buttonByText(m.container, 'live');
+    expect(liveRadio.disabled).toBe(true);
+    expect(text()).toContain('Live needs the perps gate on — turn on perps trading in Settings first.');
+  });
+
+  it('offers Live once the PERPS gate is armed, with the leveraged facts and the perps capital hint', async () => {
+    m = await showPerp(liveStatus({ perps_armed: true }));
+    expect(buttonByText(m.container, 'live').disabled).toBe(false);
+    await click(buttonByText(m.container, 'live'));
+    expect(text()).toContain('Perp trend · Binance USD⌂-M perps · BTCUSDT · 1h · LIVE');
+    expect(text()).toContain(PERPS_FACTS_LINE);
+    const capital = inputByLabel(m.container, 'Live capital for this session (USDT)');
+    expect(capital.parentElement?.textContent).toContain('Leave empty to use all unallocated perps capital.');
+  });
+
+  it('starts a live perp session through the same code-gated session-start ceremony', async () => {
+    const CHALLENGE = liveChallenge({ approval_id: '3f0b9e2a-3000-4000-8000-000000000010', code: '482913' });
+    m = await showPerp(liveStatus({ perps_armed: true }), {
+      'POST /api/live/session-start': CHALLENGE,
+      'POST /api/activity/approvals/3f0b9e2a-3000-4000-8000-000000000010/approve': {
+        executed: true,
+        result: session({ session_id: 'new-perp', trading_mode: 'live', exchange_id: 'binanceusdm' }),
+        actor: 'user:soma',
+        approved_by: 'user:soma',
+      },
+    });
+    await click(buttonByText(m.container, 'live'));
+    await click(buttonByText(m.container, 'Start live session'));
+    const startCall = calls.find((c) => c.path === '/api/live/session-start');
+    expect(JSON.parse(startCall?.init?.body as string)).toEqual({
+      strategy_id: 'perp-trend',
+      reason: 'Live session: Perp trend',
+    });
+    expect(text()).toContain('482913');
+    await typeInto(inputByLabel(m.container, 'One-time code'), '482913');
+    await click(buttonByText(m.container, 'Start live session'));
+    expect(push).toHaveBeenCalledWith('/trading/new-perp');
   });
 });

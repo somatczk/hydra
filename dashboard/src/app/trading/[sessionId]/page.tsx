@@ -19,7 +19,7 @@ import { Table } from '@/components/ui/Table';
 import { usePoll } from '@/hooks/usePoll';
 import { connectWebSocket } from '@/lib/api';
 import { stateFromError } from '@/lib/apiState';
-import { exchangeStopRow, fillQty, plural, sessionName, sideLabel, winRate, type PositionItem, type SessionDetail, type TradeItem } from '@/lib/derive';
+import { exchangeStopRow, fillQty, isPerpSession, perpsRows, plural, sessionName, sideLabel, winRate, type PositionItem, type SessionDetail, type TradeItem } from '@/lib/derive';
 import { money, pct, price, qty, signed, utc } from '@/lib/format';
 import { baseAsset } from '@/lib/outcomes';
 import { classifySessionWsMessage, debounce } from '@/lib/sessionWs';
@@ -92,11 +92,13 @@ function Positions({ d }: { d: SessionDetail }) {
   const live = d.trading_mode === 'live';
   if (d.positions.length > 0) {
     return (
-      <Table<PositionItem>
+      <>
+        <Table<PositionItem>
         columns={[
           { key: 'symbol', header: 'Symbol' },
           { key: 'direction', header: 'Side', render: (p) => sideLabel(p.direction).text },
-          { key: 'quantity', header: `Qty (${base})`, render: (p) => qty(p.quantity) },
+          // A perp SHORT renders its quantity signed (it closes by buying back); spot stays unsigned.
+          { key: 'quantity', header: `Qty (${base})`, render: (p) => (p.direction === 'short' ? `-${qty(p.quantity)}` : qty(p.quantity)) },
           { key: 'avg_entry_price', header: 'Avg entry', render: (p) => price(p.avg_entry_price) },
           { key: 'unrealized_pnl', header: 'Unrealised (USDT)', render: (p) => signed(p.unrealized_pnl) },
           // The A8-live cell is live-only: a paper position's null exchange_stop is not a danger (R26's note).
@@ -123,6 +125,12 @@ function Positions({ d }: { d: SessionDetail }) {
         data={d.positions}
         keyExtractor={(p) => p.symbol}
       />
+        {isPerpSession(d) && d.positions.some((p) => p.direction === 'short') && (
+          <p className="mt-2 text-sm text-ink-2">
+            {"A short closes by buying it back. Its strategy's exit rules and the kill switch close it; manual orders are long-only in 2.8.0."}
+          </p>
+        )}
+      </>
     );
   }
   if (d.status !== 'running' && (d.positions_at_stop > 0 || d.flatten_incomplete)) {
@@ -130,6 +138,35 @@ function Positions({ d }: { d: SessionDetail }) {
     return <p className="text-sm text-danger">{held} still held; details aren&apos;t available for a stopped session.</p>;
   }
   return <p className="text-sm text-ink-2">No open positions. This session holds only USDT.</p>;
+}
+
+/** P4-C's perp session reads (the detail's `perps` block): the margin wallet, leverage and
+ * isolated mode, the funding accrual with its skips visible, and the liquidation state. */
+function Perps({ d }: { d: SessionDetail }) {
+  const rows = perpsRows(d.perps);
+  if (!rows) return null;
+  return (
+    <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="rounded border border-line bg-surface p-3">
+        <dt className="text-sm text-ink-2">Leverage</dt>
+        <dd className="mt-1 text-lg font-semibold text-ink-1">{rows.leverage}</dd>
+      </div>
+      <div className="rounded border border-line bg-surface p-3">
+        <dt className="text-sm text-ink-2">Margin wallet (USDT)</dt>
+        <dd className="mt-1 text-lg font-semibold text-ink-1">{rows.wallet}</dd>
+      </div>
+      <div className="rounded border border-line bg-surface p-3 sm:col-span-2">
+        <dt className="text-sm text-ink-2">Funding</dt>
+        <dd className={rows.funding.tone === 'caution' ? 'text-sm text-caution' : 'text-sm text-ink-1'}>{rows.funding.text}</dd>
+      </div>
+      {rows.liquidations && (
+        <div className="rounded border border-line bg-surface p-3 sm:col-span-2">
+          <dt className="text-sm text-ink-2">Liquidations</dt>
+          <dd className="text-sm font-semibold text-danger">{rows.liquidations.text}</dd>
+        </div>
+      )}
+    </dl>
+  );
 }
 
 function Fills({ d }: { d: SessionDetail }) {
@@ -286,6 +323,12 @@ export default function SessionDetailPage() {
       <Section id="account-heading" title="Account">
         <Account d={d} />
       </Section>
+
+      {d.perps && (
+        <Section id="perps-heading" title="Perps">
+          <Perps d={d} />
+        </Section>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-2">
         <Section id="positions-heading" title="Positions">

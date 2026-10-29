@@ -99,6 +99,23 @@ async def test_binance_spot_implicit_methods_exist_async() -> None:
         await exchange.close()
 
 
+def test_binanceusdm_sapi_api_restrictions_exists_sync() -> None:
+    """The perps arm re-fetches the futures permission on the binanceusdm class (the
+    #220 review's A2): the sapi name must exist there too, as it inherits binance's."""
+    exchange = ccxt.binanceusdm()
+    missing = _missing(exchange, ("sapiGetAccountApiRestrictions",))
+    assert not missing, f"ccxt {ccxt.__version__} binanceusdm lacks: {missing}"
+
+
+async def test_binanceusdm_sapi_api_restrictions_exists_async() -> None:
+    exchange = ccxt.async_support.binanceusdm()
+    try:
+        missing = _missing(exchange, ("sapiGetAccountApiRestrictions",))
+        assert not missing, f"ccxt {ccxt.__version__} async binanceusdm lacks: {missing}"
+    finally:
+        await exchange.close()
+
+
 def test_binanceusdm_fapi_implicit_methods_exist_sync() -> None:
     missing = _missing(ccxt.binanceusdm(), FAPI_IMPLICIT_METHODS)
     assert not missing, f"ccxt {ccxt.__version__} binanceusdm lacks implicit methods: {missing}"

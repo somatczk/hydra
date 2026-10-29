@@ -7,11 +7,12 @@ import { Input } from '@/components/ui/Input';
 import { settle } from '@/components/sessions/useOutcomeSlot';
 import { fetchApi } from '@/lib/api';
 import { parseErrorDetail } from '@/lib/apiState';
-import { sessionName, type SessionDetail } from '@/lib/derive';
+import { isPerpSession, sessionName, type SessionDetail } from '@/lib/derive';
 import { logger } from '@/lib/logger';
 import { utc } from '@/lib/format';
 import {
   LIVE_FACTS,
+  PERPS_FACTS,
   baseAsset,
   liveOrderOutcome,
   type ApproveResponse,
@@ -35,19 +36,21 @@ function Failure({ outcome }: { outcome: Outcome }) {
   );
 }
 
-/** The 06 §10 order sentence: 'Buy 0.0015 BTC with real money on Binance · about 97.50 USDT · Stop at 64256 on the exchange'; sells reduce. */
-function orderSentence(req: QuickTradeRequest, about: string): string {
+/** The 06 §10 order sentence: 'Buy 0.0015 BTC with real money on Binance · about 97.50 USDT · Stop at 64256 on the exchange'; sells reduce.
+ * A perp session's order names the leveraged USD⌂-M venue. */
+function orderSentence(req: QuickTradeRequest, about: string, perp: boolean): string {
   const base = baseAsset(req.symbol);
   const kind = req.order_type === 'LIMIT' ? ` (limit at ${req.price})` : '';
+  const venue = perp ? 'with real leveraged money on Binance USD⌂-M perps' : 'with real money on Binance';
   if (req.side === 'sell') {
-    return `Sell ${req.quantity} ${base} with real money on Binance${kind} · ${about} · This reduces the held position; no stop is needed.`;
+    return `Sell ${req.quantity} ${base} ${venue}${kind} · ${about} · This reduces the held position; no stop is needed.`;
   }
   const stop = req.stop_loss
     ? `Stop at ${req.stop_loss}${req.take_profit ? `, take-profit at ${req.take_profit}` : ''} on the exchange.`
     : req.trailing_stop_pct
       ? `Trailing stop ${req.trailing_stop_pct}% on the exchange.`
       : 'Strategy default stop on the exchange.';
-  return `Buy ${req.quantity} ${base} with real money on Binance${kind} · ${about} · ${stop}`;
+  return `Buy ${req.quantity} ${base} ${venue}${kind} · ${about} · ${stop}`;
 }
 
 interface LiveOrderReviewProps {
@@ -188,9 +191,9 @@ export function LiveOrderReview({ session, req, about, onOutcome, onSent, onPlac
         void place();
       }}
     >
-      <p className="font-semibold text-ink-1">{LIVE_FACTS}</p>
+      <p className="font-semibold text-ink-1">{isPerpSession(session) ? PERPS_FACTS : LIVE_FACTS}</p>
       <p className="rounded border border-live bg-live-soft p-3 text-sm text-ink-1">
-        <b>{orderSentence(req, about)}</b> Session {sessionName(session)}.
+        <b>{orderSentence(req, about, isPerpSession(session))}</b> Session {sessionName(session)}.
       </p>
       {challenge ? (
         <>

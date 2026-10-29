@@ -100,6 +100,20 @@ export interface SessionMetrics {
   drawdown: number | null;
 }
 
+/** P4-C's perp session reads (`get_session_detail`'s `perps` block): the margin wallet, the
+ * leverage this session runs at, the funding accrual counters and the liquidation count.
+ * `funding_missing` counts settlement windows an open position crossed with no stored rate
+ * (the honest skip); `liquidations` counts forced closes. */
+export interface PerpsSessionState {
+  leverage: number;
+  margin_mode: string;
+  funding_applied: number;
+  funding_missing: number;
+  liquidations: number;
+  wallet_available: number;
+  margin_used: number;
+}
+
 export interface SessionDetail extends SessionResponse {
   last_bar_at: string | null;
   entries_paused: string | null;
@@ -110,6 +124,8 @@ export interface SessionDetail extends SessionResponse {
   open_orders: OpenOrder[];
   /** A7 (pinned seam #2): present on live sessions only; null on paper. */
   reconcile?: ReconcileState | null;
+  /** P4-C: present on FUTURES sessions only (paper or live perp executors); null/absent on spot. */
+  perps?: PerpsSessionState | null;
 }
 
 export interface Restrictions {
@@ -130,6 +146,8 @@ export interface LiveStatus {
   circuit_breakers_state: 'live' | 'unavailable';
   /** P3-C adds it to GET /api/risk/live-status (must-fix 6, R9): the persisted armed row, fail-safe false; absent before P3-C. */
   live_armed?: boolean | null;
+  /** P4-E adds the separate perps ceremony's row, fail-safe false; arming spot never arms perps. */
+  perps_armed?: boolean | null;
 }
 
 export interface CircuitBreaker {
@@ -260,11 +278,13 @@ export const ksTargets = (sessions: SessionResponse[]) => ({
   errored: sessions.filter((s) => s.status === 'error'),
 });
 
-/** Seam #10 / R23: LIVE = armed OR any running live session OR any stopped live session still holding
- * (`positions_at_stop > 0` — R13's unprotected remainder); an unreadable source (live OR sessions null)
- * returns null — the caller renders '?', never PAPER over real money. */
+/** Seam #10 / R23: LIVE = armed (spot OR the separate perps ceremony — leveraged money is
+ * real money) OR any running live session OR any stopped live session still holding
+ * (`positions_at_stop > 0` — R13's unprotected remainder); an unreadable source (live OR
+ * sessions null) returns null — the caller renders '?', never PAPER over real money. */
 export function modeBadge(live: LiveStatus | null, sessions: SessionResponse[] | null): TradingMode | null {
   if (live?.live_armed === true) return 'live';
+  if (live?.perps_armed === true) return 'live';
   if (
     sessions?.some((s) => s.trading_mode === 'live' && (s.status === 'running' || (s.status === 'stopped' && s.positions_at_stop > 0)))
   ) {
@@ -273,6 +293,12 @@ export function modeBadge(live: LiveStatus | null, sessions: SessionResponse[] |
   if (!live || !sessions) return null;
   return 'paper';
 }
+
+/** The USD⌂-M perps venue (P4): the only FUTURES venue the platform runs — `session_manager.py`
+ * builds perp executors for it alone, and every live FUTURES surface gates on it. */
+export const PERP_VENUE = 'binanceusdm';
+
+export const isPerpSession = (s: Pick<SessionResponse, 'exchange_id'>): boolean => s.exchange_id === PERP_VENUE;
 
 /** 08 §6: per-row labels only when a view contains a live row — a stopped live row still traded real money. */
 export function needsModeLabels(sessions: SessionResponse[]): boolean {
@@ -302,10 +328,12 @@ export interface NeedsYou {
 }
 
 /** The gated action as a phrase: 'kill_switch_release' → 'release the kill switch' (06 §2 approval row).
- * The four P3 live executors (seam #1) read as sentences after 'Claude asks to …'. */
+ * The four P3 live executors (seam #1) read as sentences after 'Claude asks to …'; the P4-E perps
+ * ceremony's action reads as its own leveraged sentence. */
 export function actionPhrase(action: string): string {
   if (action === 'kill_switch_release') return 'release the kill switch';
   if (action === 'live_arming') return 'turn on live trading';
+  if (action === 'live_perps_arming') return 'arm perps trading';
   if (action === 'live_session_start') return 'start a live session';
   if (action === 'live_order') return 'place a live order';
   if (action === 'credential_delete') return 'delete the stored exchange keys';
@@ -389,6 +417,7 @@ export function fillQty(t: TradeItem): number | null {
 export function sideLabel(side: string | null | undefined): { text: string; caution: boolean } {
   const s = (side ?? '').toLowerCase();
   if (s === 'long') return { text: 'Held', caution: false };
+  if (s === 'short') return { text: 'Short', caution: false };
   if (s === 'buy') return { text: 'Buy', caution: false };
   if (s === 'sell') return { text: 'Sell', caution: false };
   return { text: side ?? '—', caution: true };
@@ -450,6 +479,35 @@ export function exchangeStopRow(position: PositionItem): { text: string; tone: T
   if (!stop || stop.state === 'missing') return { text: `No exchange stop for ${position.symbol}`, tone: 'danger' };
   if (stop.state === 'confirmed') return { text: `Stop at ${price(stop.stop_price) ?? '—'} on the exchange`, tone: 'none' };
   return null;
+}
+
+/** P4-C's perp session reads as the perps rows on the session surfaces (P4-F): the margin wallet,
+ * leverage and isolated-margin mode, the funding accrual with its honest skips named, and the
+ * liquidation count as danger. Null when the block is absent (a spot session) or out of
+ * vocabulary — the caller renders nothing, never a guessed wallet. */
+export function perpsRows(perps: PerpsSessionState | null | undefined): {
+  wallet: string;
+  leverage: string;
+  funding: { text: string; tone: Tone };
+  liquidations: { text: string; tone: Tone } | null;
+} | null {
+  if (!perps || typeof perps.leverage !== 'number') return null;
+  const mode = (perps.margin_mode ?? '').toLowerCase() === 'isolated' ? 'isolated' : null;
+  if (mode === null) return null;
+  const wallet = `${money(perps.wallet_available)} available · ${money(perps.margin_used)} margin used`;
+  const leverage = `${perps.leverage}× isolated`;
+  const fundingLine = perps.funding_missing > 0
+    ? `Funding applied at ${plural(perps.funding_applied, 'settlement')}; ${perps.funding_missing} skipped (no stored rate) — P&L shows the gaps honestly.`
+    : `Funding applied at ${plural(perps.funding_applied, 'settlement')}.`;
+  const funding = {
+    text: fundingLine,
+    tone: (perps.funding_missing > 0 ? 'caution' : 'none') as Tone,
+  };
+  const liquidations =
+    perps.liquidations > 0
+      ? { text: `${plural(perps.liquidations, 'position')} liquidated at its liquidation price — the wallet got nothing back.`, tone: 'danger' as Tone }
+      : null;
+  return { wallet, leverage, funding, liquidations };
 }
 
 /** Percent of closing fills that won; null when none closed (the API reports 0.0 then). */

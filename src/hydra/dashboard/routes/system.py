@@ -36,14 +36,16 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Exchange definitions: id -> display name; only Binance can be connected until P4 (decision 4)
+# Exchange definitions: id -> display name; Binance spot + Binance USD⌂-M perps are
+# connectable (P4-F closes the futures-keys gap; the others stay decision 4's later cut)
 _EXCHANGE_DEFS: dict[str, str] = {
     "binance": "Binance",
+    "binanceusdm": "Binance USD⌂-M",
     "bybit": "Bybit",
     "kraken": "Kraken",
     "okx": "OKX",
 }
-_SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance"})
+_SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance", "binanceusdm"})
 CONNECT_TIMEOUT_S = 10.0
 
 TradingMode = Literal["paper", "live"]
@@ -517,6 +519,7 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
                     None
                     if permissions is None
                     else bool(permissions.get("enable_spot_and_margin_trading"))
+                    or bool(permissions.get("enable_futures"))
                 ),
                 "ip_restrict": None
                 if permissions is None
@@ -588,7 +591,10 @@ async def connect_exchange(
         "validated_at": _iso(validated_at),
         "environment": environment,
         "trade_enabled": (
-            None if restrictions is None else restrictions["enable_spot_and_margin_trading"]
+            None
+            if restrictions is None
+            else restrictions["enable_spot_and_margin_trading"]
+            or bool(restrictions.get("enable_futures"))
         ),
         "ip_restrict": None if restrictions is None else restrictions["ip_restrict"],
     }
@@ -860,10 +866,18 @@ def _get_exchange_clients(request: Request) -> dict[str, Any]:
 
 
 def _readonly_client(exchange_id: str, creds: dict[str, Any], environment: Environment) -> Any:
-    """E's read-only Binance SPOT client; the sandbox on ``testnet``."""
-    from hydra.execution.client_factory import build_readonly_client
+    """E's read-only client for the venue (SPOT, or USD⌂-M FUTURES for binanceusdm).
 
-    return build_readonly_client(exchange_id, creds, testnet=environment == "testnet")
+    The sandbox is used on ``testnet``.
+    """
+    from hydra.execution.client_factory import build_readonly_client, venue_market_type
+
+    return build_readonly_client(
+        exchange_id,
+        creds,
+        testnet=environment == "testnet",
+        market_type=venue_market_type(exchange_id),
+    )
 
 
 async def _keyed_read(read: Any, name: str) -> Any:
@@ -909,6 +923,8 @@ async def _check_credentials(
     withdrawals-enabled key is refused 422 ``credentials_can_withdraw`` — nothing is
     stored — so a connected key is trade-only.
     """
+    from hydra.core.types import MarketType
+    from hydra.execution.client_factory import venue_market_type
     from hydra.services.live_gate import normalize_restrictions
 
     name = _venue(exchange_id, environment)
@@ -927,6 +943,19 @@ async def _check_credentials(
                     "trade-only keys (disable withdrawals on the key); nothing was stored",
                     "invalid",
                 )
+            if venue_market_type(exchange_id) is MarketType.FUTURES:
+                # P4-F: a connected perps key must be able to trade futures (fail-closed,
+                # the perps arm ceremony re-fetches the same flag live before arming).
+                restrictions["enable_futures"] = bool(raw.get("enableFutures"))
+                if not restrictions["enable_futures"]:
+                    raise api_error(
+                        422,
+                        "credentials_not_futures_capable",
+                        f"{name} reports these keys cannot trade futures; perps trading "
+                        "needs futures enabled on the key (enable futures trading on the "
+                        "key); nothing was stored",
+                        "invalid",
+                    )
         return restrictions
     finally:
         try:

@@ -6,13 +6,14 @@ import type {
   ExchangeStopState,
   LiveStatus,
   PendingApproval,
+  PerpsSessionState,
   PlatformConfig,
   ReconcileState,
   SessionDetail,
   SessionResponse,
   TradeItem,
 } from '@/lib/derive';
-import type { DisarmResponse, LiveApprovalChallenge } from '@/lib/outcomes';
+import type { DisarmResponse, LiveApprovalChallenge, PerpsDisarmResponse, PerpsStatusResponse } from '@/lib/outcomes';
 
 /** trading.py:56-75 SessionResponse, filled by `_session_to_dict` (trading.py:250-265) — no A3+ fields. */
 export function session(over: Partial<SessionResponse> = {}): SessionResponse {
@@ -89,6 +90,26 @@ export function paperFill(over: Partial<TradeItem> = {}): TradeItem {
     pnl: 0,
     net_pnl: null,
     timestamp: '2026-10-21T14:00:04+00:00',
+    ...over,
+  };
+}
+
+/** A P4 perp session (paper or live): the venue every perp surface keys on. */
+export function perpSession(over: Partial<SessionResponse> = {}): SessionResponse {
+  return session({ exchange_id: 'binanceusdm', symbols: ['BTCUSDT'], ...over });
+}
+
+/** P4-C's `perps` block on a FUTURES session detail (session_manager.get_session_detail):
+ * the margin wallet, leverage, funding accrual counters and the liquidation count. */
+export function perpsState(over: Partial<PerpsSessionState> = {}): PerpsSessionState {
+  return {
+    leverage: 2,
+    margin_mode: 'isolated',
+    funding_applied: 3,
+    funding_missing: 0,
+    liquidations: 0,
+    wallet_available: 400.5,
+    margin_used: 99.5,
     ...over,
   };
 }
@@ -176,6 +197,30 @@ export function disarmResponse(over: Partial<DisarmResponse> = {}): DisarmRespon
     live_armed: false,
     running_live_sessions: [],
     running_live_sessions_count: 0,
+    ...over,
+  };
+}
+
+/** GET /api/live/perps/status (P4-E): the separate perps ceremony's rows, beside the spot gate's. */
+export function perpsStatus(over: Partial<PerpsStatusResponse> = {}): PerpsStatusResponse {
+  return {
+    perps_armed: false,
+    armed_by: null,
+    armed_at: null,
+    perps_capital: null,
+    running_live_perps_sessions: [],
+    running_live_perps_sessions_count: 0,
+    ...over,
+  };
+}
+
+/** POST /api/live/perps/disarm (the perps R10): running live perp sessions keep running. */
+export function perpsDisarmResponse(over: Partial<PerpsDisarmResponse> = {}): PerpsDisarmResponse {
+  return {
+    ...perpsStatus(),
+    status: 'disarmed',
+    message: 'Perps trading is disarmed.',
+    pending_perps_approvals: [],
     ...over,
   };
 }

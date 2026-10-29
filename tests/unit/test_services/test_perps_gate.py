@@ -233,7 +233,7 @@ class FakeBinance:
         self.opts = opts
         self.closed = False
         self.restriction_calls = 0
-        FakeBinance.instances.append(self)
+        type(self).instances.append(self)
 
     async def close(self) -> None:
         self.closed = True
@@ -241,13 +241,23 @@ class FakeBinance:
 
 async def _fake_get_account_api_restrictions(fake: FakeBinance, *args: Any) -> dict[str, Any]:
     fake.restriction_calls += 1
-    if FakeBinance.error is not None:
-        raise FakeBinance.error
-    return dict(FakeBinance.restrictions)
+    cls = type(fake)
+    if cls.error is not None:
+        raise cls.error
+    return dict(cls.restrictions)
 
 
 # ccxt's camelCase implicit API name, bound as an attribute (pep8-naming flags the def)
 FakeBinance.sapiGetAccountApiRestrictions = _fake_get_account_api_restrictions
+
+
+class FakeBinanceUsdm(FakeBinance):
+    """The USD⌂-M class stand-in: its own error/restrictions/instances, so a test can
+    answer differently per venue (the arm reads the binanceusdm row first)."""
+
+    error: ClassVar[BaseException | None] = None
+    restrictions: ClassVar[dict[str, Any]] = dict(FUTURES_RESTRICTIONS)
+    instances: ClassVar[list[FakeBinanceUsdm]] = []
 
 
 @pytest.fixture()
@@ -257,6 +267,15 @@ def binance(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinance]:
     FakeBinance.instances = []
     monkeypatch.setattr(ccxt.async_support, "binance", FakeBinance)
     return FakeBinance
+
+
+@pytest.fixture()
+def binanceusdm(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinanceUsdm]:
+    FakeBinanceUsdm.error = None
+    FakeBinanceUsdm.restrictions = dict(FUTURES_RESTRICTIONS)
+    FakeBinanceUsdm.instances = []
+    monkeypatch.setattr(ccxt.async_support, "binanceusdm", FakeBinanceUsdm)
+    return FakeBinanceUsdm
 
 
 @pytest.fixture(autouse=True)
@@ -277,9 +296,10 @@ def perp_strategies(strategies_dir: Any) -> Any:
 def _creds_row(
     *,
     environment: str = "mainnet",
+    key: str = "key-1",
 ) -> dict[str, Any]:
     return {
-        "encrypted_key": encrypt("key-1"),
+        "encrypted_key": encrypt(key),
         "encrypted_secret": encrypt("secret-1"),
         "encrypted_passphrase": None,
         "validated_environment": environment,
@@ -432,14 +452,19 @@ class TestRequirePerpsGate:
 
 
 class TestRequireFuturesCapableCredentials:
-    async def test_no_stored_keys_is_403(self, binance: type[FakeBinance]) -> None:
+    async def test_no_keys_on_either_venue_is_403_naming_both(
+        self, binance: type[FakeBinance], binanceusdm: type[FakeBinanceUsdm]
+    ) -> None:
         with pytest.raises(ServiceError) as exc:
             await require_futures_capable_credentials(_Db())
         assert (_detail(exc.value)["code"], exc.value.status_code) == (
             "live_credentials_missing",
             403,
         )
-        assert FakeBinance.instances == []
+        assert _detail(exc.value)["message"] == (
+            "No binanceusdm or binance credentials are stored; connect keys in Settings first"
+        )
+        assert FakeBinance.instances == [] and FakeBinanceUsdm.instances == []
 
     async def test_undecryptable_keys_are_403(self, binance: type[FakeBinance]) -> None:
         db = _Db(credentials={"binance": {**_creds_row(), "encrypted_key": "not-fernet"}})
@@ -475,6 +500,70 @@ class TestRequireFuturesCapableCredentials:
         assert probe.opts["apiKey"] == "key-1"
         assert "sandbox" not in probe.opts  # the mainnet client
         assert probe.closed is True
+
+    async def test_no_usdm_row_falls_back_to_the_spot_row_and_its_client(
+        self, binance: type[FakeBinance], binanceusdm: type[FakeBinanceUsdm]
+    ) -> None:
+        """A2 (the #220 review, a pre-existing P4-E root): the single-key operator's
+        working path — only a spot row stored means the arm still checks that row, with
+        the spot client, exactly as before."""
+        db = _Db(credentials={"binance": _creds_row()})
+        assert (await require_futures_capable_credentials(db))["enable_futures"] is True
+        [probe] = FakeBinance.instances
+        assert probe.opts["apiKey"] == "key-1"
+        assert FakeBinanceUsdm.instances == []
+
+    async def test_the_arm_prefers_the_usdm_row_over_a_read_only_spot_row(
+        self, binance: type[FakeBinance], binanceusdm: type[FakeBinanceUsdm]
+    ) -> None:
+        """The reviewer's dead end: a futures-capable USD⌂-M row beside a read-only
+        spot row used to end in a fail-closed 409 naming the spot key — the arm now
+        proceeds on the perps venue's key, the row a live perp session trades with."""
+        db = _Db(
+            credentials={
+                "binanceusdm": _creds_row(key="key-usdm"),
+                "binance": _creds_row(key="key-spot"),
+            }
+        )
+        FakeBinanceUsdm.restrictions = dict(FUTURES_RESTRICTIONS)
+        FakeBinance.restrictions = {
+            "ipRestrict": False,
+            "enableWithdrawals": False,
+            "enableSpotAndMarginTrading": True,
+        }  # the spot key: futures permission absent, read-only
+        assert await require_futures_capable_credentials(db) == {
+            "enable_futures": True,
+            "enable_withdrawals": False,
+        }
+        [probe] = FakeBinanceUsdm.instances
+        assert probe.restriction_calls == 1
+        assert probe.opts["apiKey"] == "key-usdm"
+        assert probe.closed is True
+        assert FakeBinance.instances == []  # the spot row was never read
+
+    async def test_every_refusal_names_the_venue_of_the_key_it_refused(
+        self, binance: type[FakeBinance], binanceusdm: type[FakeBinanceUsdm]
+    ) -> None:
+        FakeBinanceUsdm.restrictions = {**FUTURES_RESTRICTIONS, "enableFutures": False}
+        db = _Db(
+            credentials={"binanceusdm": _creds_row(), "binance": _creds_row()},
+        )
+        with pytest.raises(ServiceError) as exc:
+            await require_futures_capable_credentials(db)
+        assert _detail(exc.value)["message"] == (
+            "The stored binanceusdm key cannot trade futures; perps trading needs "
+            "futures enabled on the key (enable futures trading on the key and "
+            "reconnect it in Settings)"
+        )
+        FakeBinance.restrictions = {**FUTURES_RESTRICTIONS, "enableWithdrawals": True}
+        db = _Db(credentials={"binance": _creds_row()})
+        with pytest.raises(ServiceError) as exc:
+            await require_futures_capable_credentials(db)
+        assert _detail(exc.value)["message"] == (
+            "The stored binance key has withdrawals enabled; perps trading needs "
+            "a trade-only key (disable withdrawals on the key and reconnect it "
+            "in Settings)"
+        )
 
     async def test_an_absent_enable_futures_flag_refuses_arming(
         self, binance: type[FakeBinance]

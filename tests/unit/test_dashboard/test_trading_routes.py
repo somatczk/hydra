@@ -14,8 +14,10 @@ from typing import Any
 import httpx
 import pytest
 
+from hydra.core.types import Direction
 from hydra.dashboard.api import app
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
+from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.execution.session_manager import TradingSession
 from hydra.risk.state import RiskStateUnavailableError
 from hydra.services.errors import ServiceError, error_detail
@@ -24,6 +26,8 @@ from tests.unit.test_execution.session_harness import (
     Harness,
     executor,
     held,
+    perp_clients,
+    rule,
     settle,
     write_strategy,
 )
@@ -554,6 +558,46 @@ class TestQuickTrade:
         assert resp.status_code == 200, resp.text
         assert resp.json()["session_id"] == other.session_id
         assert (await held(other), await held(session)) == (D("0.1"), D("0"))
+
+
+class TestQuickTradePerpsLongOnly:
+    """A1 (the #220 review, a pre-existing P4-C gap): quick-trade's SELL over a perp
+    session's strategy short refuses with the §4(2) cut — the surface the UI already
+    guards; the backend now matches it."""
+
+    async def test_a_sell_over_a_strategy_short_is_422_and_the_short_is_unchanged(
+        self, h: Harness, api: httpx.AsyncClient, strategies_dir: Path
+    ) -> None:
+        assert h.mgr is not None
+        h.mgr._clients = perp_clients(h)
+        write_strategy(
+            strategies_dir,
+            "perp-qt",
+            entry_short=rule(("greater_than", 99.5)),
+            exchange_id="binanceusdm",
+            market_type="FUTURES",
+        )
+        session = await h.session("perp-qt", capital="2")
+        await h.bar(session, "100", exchange_id="binanceusdm")
+        ex = session._executor
+        assert isinstance(ex, PerpPaperTradingExecutor)
+        [short] = await ex.get_positions("BTCUSDT")
+        assert (short.direction, short.quantity) == (Direction.SHORT, D("0.002"))
+        resp = await api.post(
+            "/api/trading/quick-trade",
+            json={
+                "session_id": session.session_id,
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "quantity": "0.001",
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        detail = _detail(resp)
+        assert (detail["code"], detail["state"]) == ("order_rejected", "invalid")
+        assert "long-only in 2.8.0" in detail["message"]
+        [after] = await ex.get_positions("BTCUSDT")
+        assert (after.direction, after.quantity) == (Direction.SHORT, D("0.002"))
 
 
 class TestStopAndDetail:

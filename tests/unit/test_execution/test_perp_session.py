@@ -16,13 +16,13 @@ from typing import Any
 import pytest
 
 from hydra.core.types import Direction, OrderType, Side
-from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.paper_trading import PaperTradingExecutor
-from hydra.execution.perp_trading import PerpPaperTradingExecutor, static_funding_reader
+from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.risk.pretrade import RiskConfig
 from tests.unit.test_execution.session_harness import (
     Harness,
+    perp_clients,
     rule,
     settle,
     write_strategy,
@@ -31,18 +31,6 @@ from tests.unit.test_execution.session_harness import (
 D = Decimal
 ALWAYS = rule(("greater_than", 0.0))
 AT_100 = rule(("less_than", 100.5), ("greater_than", 99.5))
-
-
-def perp_clients(h: Harness, funding: dict[str, list[Any]] | None = None) -> ClientFactory:
-    base = h.clients()
-    return ClientFactory(
-        ws_factory=base.ws_factory,
-        rest_pool=base.rest_pool,
-        markets_loader=base.markets_loader,
-        repository_factory=base.repository_factory,
-        history_window=base.history_window,
-        funding_reader_factory=lambda _pool, _eid: static_funding_reader(funding or {}),
-    )
 
 
 @pytest.fixture()
@@ -173,6 +161,47 @@ class TestShortsThroughTheWiring:
             await h.mgr.submit_manual_order(
                 symbol="BTCUSDT", side=Side.BUY, order_type=OrderType.MARKET, quantity=D("0.1")
             )
+
+    async def test_a_manual_sell_over_a_strategy_short_is_refused_not_pyramided(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """A1 (the #220 review, a pre-existing P4-C gap): the §4(2) cut fires on the
+        absence of a LONG, not the absence of a position — a SELL over a strategy-held
+        short refuses instead of pyramiding it through the paper perp executor."""
+        sid = write_perp(strategies_dir, "perp-sell-over-short", entry_short=AT_100)
+        session = await h.session(sid, capital="2")
+        await h.bar(session, "100", exchange_id="binanceusdm")
+        ex = session._executor
+        assert isinstance(ex, PerpPaperTradingExecutor)
+        [short] = await ex.get_positions("BTCUSDT")
+        assert (short.direction, short.quantity) == (Direction.SHORT, D("0.002"))
+        assert h.mgr is not None
+        with pytest.raises(ValueError, match=r"long-only in 2\.8\.0"):
+            await h.mgr.submit_manual_order(
+                symbol="BTCUSDT", side=Side.SELL, order_type=OrderType.MARKET, quantity=D("0.001")
+            )
+        [after] = await ex.get_positions("BTCUSDT")
+        assert (after.direction, after.quantity) == (Direction.SHORT, D("0.002"))
+
+    async def test_a_manual_sell_over_a_held_long_still_reduces_it(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """The direction filter keeps the safety net: a manual SELL that reduces the
+        perp session's own LONG still passes (and sizes against the long)."""
+        sid = write_perp(strategies_dir, "perp-sell-over-long", entry_long=AT_100)
+        session = await h.session(sid, capital="2")
+        await h.bar(session, "100", exchange_id="binanceusdm")
+        ex = session._executor
+        assert isinstance(ex, PerpPaperTradingExecutor)
+        [long] = await ex.get_positions("BTCUSDT")
+        assert (long.direction, long.quantity) == (Direction.LONG, D("0.002"))
+        assert h.mgr is not None
+        _, result = await h.mgr.submit_manual_order(
+            symbol="BTCUSDT", side=Side.SELL, order_type=OrderType.MARKET, quantity=D("0.001")
+        )
+        assert result.quantity == D("0.001")
+        [after] = await ex.get_positions("BTCUSDT")
+        assert (after.direction, after.quantity) == (Direction.LONG, D("0.001"))
 
     async def test_stopping_the_session_closes_a_short_by_buy_back(
         self, h: Harness, strategies_dir: Path

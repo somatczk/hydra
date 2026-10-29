@@ -19,13 +19,22 @@ interface StrategyNameDialogProps {
   initialDescription?: string;
   initialExchangeId?: string;
   initialSymbol?: string;
+  /** P4-F: the stored perp leverage, so an edited binanceusdm strategy round-trips it. */
+  initialLeverage?: number;
 }
 
 const EXCHANGE_OPTIONS = [
   { value: 'binance', label: 'Binance' },
+  { value: 'binanceusdm', label: 'Binance USD⌂-M (perps)' },
   { value: 'bybit', label: 'Bybit' },
   { value: 'kraken', label: 'Kraken' },
   { value: 'okx', label: 'OKX' },
+];
+
+const LEVERAGE_OPTIONS = [
+  { value: '1', label: '1× (no leverage)' },
+  { value: '2', label: '2×' },
+  { value: '3', label: '3×' },
 ];
 
 function serializeGroup(
@@ -53,11 +62,13 @@ export function StrategyNameDialog({
   initialDescription,
   initialExchangeId,
   initialSymbol,
+  initialLeverage,
 }: StrategyNameDialogProps) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [exchangeId, setExchangeId] = useState('binance');
   const [symbol, setSymbol] = useState('BTCUSDT');
+  const [leverage, setLeverage] = useState('1');
   const [enableImmediately, setEnableImmediately] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,12 +78,14 @@ export function StrategyNameDialog({
       setDescription(initialDescription || '');
       setExchangeId(initialExchangeId || 'binance');
       setSymbol(initialSymbol || 'BTCUSDT');
+      setLeverage(String(initialLeverage ?? 1));
       setEnableImmediately(false);
       setError(null);
     }
-  }, [open, initialName, initialDescription, initialExchangeId, initialSymbol]);
+  }, [open, initialName, initialDescription, initialExchangeId, initialSymbol, initialLeverage]);
 
   const isEditing = !!editingId;
+  const perps = exchangeId === 'binanceusdm';
 
   const handleSave = async () => {
     setError(null);
@@ -115,6 +128,9 @@ export function StrategyNameDialog({
             },
           }
         : {}),
+      // P4-F: the perps fields — leverage applies to binanceusdm FUTURES only (isolated is the sole
+      // mode in 2.8.0); a spot venue always sends 1× or the save refuses it.
+      leverage: perps ? Number(leverage) : 1,
     };
 
     try {
@@ -176,6 +192,26 @@ export function StrategyNameDialog({
           placeholder="BTCUSDT"
         />
       </div>
+
+      {/* P4-F: the perps fields (venue-gated); the symbol section above is owned by P6-UI. */}
+      {perps && (
+        <fieldset className="flex flex-col gap-3 rounded-lg border border-line bg-surface p-3">
+          <legend className="px-1 text-sm font-medium text-ink-2">Perps (Binance USD⌂-M)</legend>
+          <p className="text-xs text-ink-2">
+            Market type: FUTURES · Margin mode: isolated (the only mode in 2.8.0). Live perp sessions answer to the
+            separate perps arm ceremony, not the spot gate.
+          </p>
+          <Select
+            label="Leverage (1–3×)"
+            options={LEVERAGE_OPTIONS}
+            value={leverage}
+            onChange={(e) => setLeverage(e.target.value)}
+          />
+          <p className="text-xs text-ink-2">
+            The account-wide cap (3×) is enforced again at session start; spot strategies stay 1×.
+          </p>
+        </fieldset>
+      )}
 
       {/* Enable toggle */}
       <label className="flex items-center gap-2 cursor-pointer max-lg:min-h-11">

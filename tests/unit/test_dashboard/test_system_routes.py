@@ -605,6 +605,21 @@ def binance(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinance]:
     return FakeBinance
 
 
+@pytest.fixture()
+def binanceusdm(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinance]:
+    """The USD⌂-M perps venue's client stand-in; futures-enabled by default (mainnet)."""
+    FakeBinance.error = None
+    FakeBinance.restrictions = {
+        "ipRestrict": False,
+        "enableWithdrawals": False,
+        "enableSpotAndMarginTrading": False,
+        "enableFutures": True,
+    }
+    FakeBinance.instances = []
+    monkeypatch.setattr(ccxt.async_support, "binanceusdm", FakeBinance)
+    return FakeBinance
+
+
 def _connect(client: TestClient, exchange: str = "binance", **extra: str) -> Any:
     return client.post(
         f"/api/system/exchanges/{exchange}/connect",
@@ -629,14 +644,15 @@ def _live_session(session_id: str = "s-live") -> dict[str, Any]:
 class TestExchanges:
     def test_states_without_stored_keys(self, client: TestClient) -> None:
         data = client.get("/api/system/exchanges").json()
-        assert [e["id"] for e in data] == ["binance", "bybit", "kraken", "okx"]
-        assert [e["supported"] for e in data] == [True, False, False, False]
+        assert [e["id"] for e in data] == ["binance", "binanceusdm", "bybit", "kraken", "okx"]
+        assert [e["supported"] for e in data] == [True, True, False, False, False]
         for entry in data:
             assert entry["credential_state"] == "missing"
             assert entry["api_key_set"] is False
             assert entry["connected"] is False
             assert entry["last_sync"] is None
             assert entry["environment"] == "testnet"
+        assert data[1]["name"] == "Binance USD⌂-M"
 
     def test_env_keys_are_not_a_badge(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -683,7 +699,7 @@ class TestExchanges:
     ) -> None:
         db.credentials["bybit"] = {"validated_at": NOW, "validated_environment": "testnet"}
         app.state.exchange_credential_errors = {"bybit": "undecryptable"}
-        bybit = client.get("/api/system/exchanges").json()[1]
+        bybit = client.get("/api/system/exchanges").json()[2]
         assert bybit["credential_state"] == "undecryptable"
         assert bybit["connected"] is False
 
@@ -991,6 +1007,106 @@ class TestExchangeConnect:
         resp = client.get("/api/system/exchanges/binance/balance")
         assert resp.status_code == 404
         assert _detail(resp)["code"] == "credentials_not_found"
+
+
+@pytest.mark.usefixtures("binanceusdm")
+class TestConnectBinanceUsdm:
+    """P4-F closes the futures-keys connect gap: binanceusdm connects through Settings,
+    with the fail-closed futures-permission validation the perps arm re-fetches live."""
+
+    def _mainnet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cfg = system.current_config().model_copy(deep=True)
+        cfg.trading.testnet = False
+        monkeypatch.setattr(system, "current_config", lambda: cfg)
+
+    def test_testnet_keys_are_checked_then_stored_for_the_perps_venue(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        resp = _connect(client, "binanceusdm")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["id"] == "binanceusdm"
+        assert body["name"] == "Binance USD⌂-M"
+        assert body["message"] == "Binance USD⌂-M testnet accepted these keys; they are stored"
+        [probe] = FakeBinance.instances
+        assert probe.balance_calls == 1
+        assert probe.restriction_calls == 0  # the apiRestrictions read is mainnet-only
+        assert probe.opts["sandbox"] is True
+        assert probe.closed is True
+        stored = db.credentials["binanceusdm"]
+        assert decrypt(stored["encrypted_key"]) == API_KEY
+        assert stored["validated_environment"] == "testnet"
+        assert stored["validated_permissions"] is None
+        assert app.state.exchange_credentials["binanceusdm"]["api_key"] == API_KEY
+
+    def test_mainnet_futures_keys_connect_with_the_enable_futures_record(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mainnet(monkeypatch)
+        resp = _connect(client, "binanceusdm")
+        assert resp.status_code == 200
+        assert resp.json()["trade_enabled"] is True  # the futures flag, spot off
+        assert json.loads(db.credentials["binanceusdm"]["validated_permissions"]) == {
+            "enable_spot_and_margin_trading": False,
+            "enable_withdrawals": False,
+            "ip_restrict": False,
+            "enable_futures": True,
+        }
+
+    def test_mainnet_keys_without_futures_are_refused_and_nothing_is_stored(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mainnet(monkeypatch)
+        FakeBinance.restrictions = {
+            "ipRestrict": False,
+            "enableWithdrawals": False,
+            "enableSpotAndMarginTrading": False,
+            "enableFutures": False,
+        }
+        resp = _connect(client, "binanceusdm")
+        assert resp.status_code == 422
+        assert _detail(resp)["code"] == "credentials_not_futures_capable"
+        assert _detail(resp)["state"] == "invalid"
+        assert "cannot trade futures" in _detail(resp)["message"]
+        assert db.credentials == {}
+        assert not any(sql.startswith("INSERT") for sql in db.statements)
+        assert app.state.exchange_credentials == {}
+        assert FakeBinance.instances[0].closed is True
+
+    def test_mainnet_withdrawal_keys_are_refused_on_the_perps_venue_too(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mainnet(monkeypatch)
+        FakeBinance.restrictions = {
+            "ipRestrict": False,
+            "enableWithdrawals": True,
+            "enableSpotAndMarginTrading": False,
+            "enableFutures": True,
+        }
+        resp = _connect(client, "binanceusdm")
+        assert resp.status_code == 422
+        assert _detail(resp)["code"] == "credentials_can_withdraw"
+        assert db.credentials == {}
+
+    def test_a_futures_trade_key_needs_the_ceremony_to_delete(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient
+    ) -> None:
+        db.credentials["binanceusdm"] = {
+            "validated_at": NOW,
+            "validated_environment": "mainnet",
+            "validated_permissions": json.dumps(
+                {
+                    "enable_spot_and_margin_trading": False,
+                    "enable_withdrawals": False,
+                    "ip_restrict": False,
+                    "enable_futures": True,
+                }
+            ),
+        }
+        app.state.trader = _Trader()
+        resp = client.delete("/api/system/exchanges/binanceusdm/connect")
+        assert (resp.status_code, _detail(resp)["code"]) == (409, "credential_delete_gated")
+        assert "binanceusdm" in db.credentials  # nothing was deleted
 
 
 @pytest.mark.usefixtures("binance")
