@@ -100,6 +100,10 @@ describe('ModelVersionSelect', () => {
     const select = selectByLabel(page.container, 'Model version');
     expect(select.options[0].textContent).toBe('Production (alpha v2, beta: none)');
     expect(optionLabels(select).map(([v]) => v)).toEqual(['', 'a1', 'a3', 'b1']);
+    expect(page.container.querySelector('span.inline-flex')?.textContent).toBe('No Production version');
+
+    await choose(select, 'b1');
+    expect(page.container.querySelector('span.inline-flex')?.textContent).toBe('Staging');
   });
 
   it('shows the error envelope with a retry when the registry is unavailable', async () => {

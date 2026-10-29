@@ -65,10 +65,8 @@ export function ModelVersionSelect({
 
   const mine = (versions ?? []).filter((v) => modelNames.includes(v.name));
   const isProduction = (v: RegistryVersion) => stageBadge(v.stage).label === 'Production';
-  const current = modelNames.map((name) => {
-    const p = mine.find((v) => v.name === name && isProduction(v));
-    return p ? `${name} v${p.version}` : `${name}: none`;
-  });
+  const production = modelNames.map((name) => mine.find((v) => v.name === name && isProduction(v)));
+  const current = modelNames.map((name, i) => (production[i] ? `${name} v${production[i].version}` : `${name}: none`));
   const options = [
     { value: '', label: versions === null ? 'Production' : `Production (${current.join(', ')})` },
     ...mine
@@ -76,7 +74,11 @@ export function ModelVersionSelect({
       .map((v) => ({ value: v.id, label: `${v.name} v${v.version} · ${stageBadge(v.stage).label}` })),
   ];
   const chosen = mine.find((v) => v.id === value);
-  const badge = stageBadge(chosen?.stage ?? 'production');
+  // an unpinned run of a name with no Production version fails in the worker: say so before submit
+  const badge =
+    chosen || versions === null || production.every(Boolean)
+      ? stageBadge(chosen?.stage ?? 'production')
+      : { label: 'No Production version', variant: 'warning' as const };
 
   return (
     <div className="flex flex-col gap-1.5">
