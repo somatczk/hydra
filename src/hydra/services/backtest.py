@@ -76,6 +76,8 @@ class JobListEntry(BaseModel):
     result_id: str | None = None
     completed_trials: int | None = None
     total_trials: int | None = None
+    # the worker's auto-fetch progress (state, ranges, bars_fetched, weight_spent, elapsed_ms)
+    fetch: dict[str, Any] | None = None
 
 
 class DataProvenanceModel(BaseModel):
@@ -409,6 +411,7 @@ async def list_jobs(
     entries: list[dict[str, Any]] = []
     for row in rows[:limit]:
         request = jobs.json_value(row["request"]) or {}
+        detail = jobs.json_value(row["detail"]) or {}
         entry = {
             "task_id": row["id"],
             "kind": row["kind"],
@@ -420,9 +423,9 @@ async def list_jobs(
             "name": str(request.get("name", "")),
             "error": row["error"],
             "result_id": row["result_id"],
+            "fetch": detail.get("fetch"),
         }
         if row["kind"] == "hyperopt":
-            detail = jobs.json_value(row["detail"]) or {}
             entry["completed_trials"] = detail.get("completed_trials", 0)
             entry["total_trials"] = detail.get("total_trials", request.get("max_trials", 0))
         entries.append(entry)

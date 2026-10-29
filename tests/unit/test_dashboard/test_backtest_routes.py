@@ -1042,6 +1042,7 @@ JOB_LIST_FIELDS = {
     "result_id",
     "completed_trials",
     "total_trials",
+    "fetch",
 }
 
 
@@ -1146,6 +1147,7 @@ class TestJobListRoute:
             "result_id": None,
             "completed_trials": None,
             "total_trials": None,
+            "fetch": None,
         }
         hyperopt = body[2]
         assert hyperopt["completed_trials"] == 37
@@ -1153,6 +1155,26 @@ class TestJobListRoute:
         # pinned seam: the request/strategy_config JSONB never crosses the wire
         assert all(set(e) == JOB_LIST_FIELDS for e in body)
         assert all("param_space" not in json.dumps(e) for e in body)
+
+    def test_every_kind_serves_the_workers_fetch_progress(self) -> None:
+        fetch = {
+            "state": "fetching",
+            "ranges": [["2026-01-01T00:00:00+00:00", "2026-01-31T23:00:00+00:00"]],
+            "bars_fetched": 300,
+            "weight_spent": 6,
+            "elapsed_ms": 4200,
+        }
+        conn = _JobsConn(
+            [
+                _jobs_row(id="wf-1", kind="walkforward", detail=json.dumps({"fetch": fetch})),
+                _jobs_row(
+                    id="task-1", detail='{"fetch": {"state": "failed", "reason": "rate_limited"}}'
+                ),
+            ]
+        )
+        body = {e["task_id"]: e for e in _jobs_client(conn).get("/api/backtest/jobs").json()}
+        assert body["wf-1"]["fetch"] == fetch
+        assert body["task-1"]["fetch"] == {"state": "failed", "reason": "rate_limited"}
 
     def test_kind_filter_reads_only_that_kind(self) -> None:
         conn = _JobsConn([_jobs_row(), _jobs_row(id="ho-1", kind="hyperopt")])
