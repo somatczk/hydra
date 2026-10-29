@@ -277,7 +277,7 @@ const RULE_SECTIONS: RuleSectionConfig[] = [
   },
 ];
 
-/* ---------- Default indicator/comparator data ---------- */
+/* ---------- Offline fallback: a subset of GET /api/strategies/indicators, rule-usable names only ---------- */
 
 const DEFAULT_INDICATORS: IndicatorSchema[] = [
   {
@@ -301,7 +301,7 @@ const DEFAULT_INDICATORS: IndicatorSchema[] = [
   {
     name: 'macd',
     category: 'trend',
-    description: 'Moving Average Convergence Divergence',
+    description: 'MACD line (fast EMA - slow EMA)',
     params: [
       { name: 'fast', type: 'int', default: 12, min: 2, max: 100 },
       { name: 'slow', type: 'int', default: 26, min: 2, max: 200 },
@@ -309,9 +309,18 @@ const DEFAULT_INDICATORS: IndicatorSchema[] = [
     ],
   },
   {
-    name: 'bollinger_bands',
+    name: 'bollinger_upper',
     category: 'volatility',
-    description: 'Bollinger Bands (upper, middle, lower)',
+    description: 'Upper Bollinger Band',
+    params: [
+      { name: 'period', type: 'int', default: 20, min: 2, max: 200 },
+      { name: 'std_dev', type: 'float', default: 2.0, min: 0.1, max: 5.0 },
+    ],
+  },
+  {
+    name: 'bollinger_lower',
+    category: 'volatility',
+    description: 'Lower Bollinger Band',
     params: [
       { name: 'period', type: 'int', default: 20, min: 2, max: 200 },
       { name: 'std_dev', type: 'float', default: 2.0, min: 0.1, max: 5.0 },
@@ -320,7 +329,7 @@ const DEFAULT_INDICATORS: IndicatorSchema[] = [
   {
     name: 'atr',
     category: 'volatility',
-    description: 'Average True Range (volatility measure)',
+    description: 'Average True Range (Wilder)',
     params: [{ name: 'period', type: 'int', default: 14, min: 2, max: 200 }],
   },
 ];

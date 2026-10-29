@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/Input';
 import type { IndicatorSchema, ConditionParams } from './types';
 
 interface IndicatorPickerProps {
+  label?: string;
   indicators: IndicatorSchema[];
   selectedIndicator: string;
   params: ConditionParams;
@@ -24,6 +25,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 const CATEGORY_ORDER = ['trend', 'momentum', 'volatility', 'volume', 'other'];
 
 export function IndicatorPicker({
+  label = 'Indicator',
   indicators,
   selectedIndicator,
   params,
@@ -73,7 +75,7 @@ export function IndicatorPicker({
   return (
     <div className="flex flex-col gap-3">
       <Select
-        label="Indicator"
+        label={label}
         options={groupedOptions}
         value={selectedIndicator}
         onChange={(e) => onIndicatorChange(e.target.value)}
