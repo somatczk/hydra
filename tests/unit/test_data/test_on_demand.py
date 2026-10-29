@@ -8,7 +8,7 @@ injected, so every paced wait and patience deadline is asserted exactly.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -112,9 +112,16 @@ class FakeRepo:
 
     @asynccontextmanager
     async def dataset_lock(
-        self, exchange_id: str, symbol: str, timeframe: Timeframe
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+        on_wait: Callable[[], None] | None = None,
     ) -> AsyncIterator[FakeRepo]:
-        async with self.dataset_locks.setdefault((exchange_id, symbol, timeframe), asyncio.Lock()):
+        lock = self.dataset_locks.setdefault((exchange_id, symbol, timeframe), asyncio.Lock())
+        if lock.locked() and on_wait is not None:
+            on_wait()
+        async with lock:
             yield self
 
     def stored_ts(
@@ -463,8 +470,8 @@ class TestSerialization:
 
     async def test_two_processes_fetch_one_dataset_once(self) -> None:
         """Two engines (two workers: separate asyncio locks and budgets) on one database:
-        the second waits on the dataset lock, re-detects, fetches nothing, and the
-        ledger flips ``ready`` once — never while the first is still writing."""
+        the second reports ``waiting`` on the dataset lock, re-detects, fetches nothing,
+        and the ledger flips ``ready`` once — never while the first is still writing."""
         repo = FakeRepo()
         exchange = _YieldingExchange([_row(m) for m in range(5)])
         worker_a, _ = _engine(exchange, page_size=1)
@@ -479,6 +486,8 @@ class TestSerialization:
 
         first, second = await asyncio.gather(run("A", worker_a), run("B", worker_b))
 
+        # B reports the wait while A fetches, then re-detects and fetches nothing
+        assert events.index("B:waiting:0") < events.index("A:fetched:5")
         assert events[-2:] == ["A:fetched:5", "B:fetched:0"]
         assert not any(e.startswith("B:fetching") for e in events)
         assert len(exchange.calls) == 5

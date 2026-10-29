@@ -201,14 +201,25 @@ class OnDemandFetchService:
         Concurrent calls for the same dataset serialize on a per-key asyncio lock and,
         across processes, on ``repo.dataset_lock``, so the second caller re-detects gaps
         after the first one's writes land and the ledger flips ``ready`` only once the
-        last writer is done.
+        last writer is done. A caller blocked on another process's fetch first reports
+        ``state: "waiting"`` to ``on_progress``.
         """
         call = _Call(started=self._clock())
         grid_start = ceil_to_tf(start, timeframe)
         grid_end = floor_to_tf(end, timeframe)
         lock_key = (exchange, symbol, timeframe)
         lock = self._locks.setdefault(lock_key, asyncio.Lock())
-        async with lock, repo.dataset_lock(exchange, symbol, timeframe) as held:
+
+        def waiting() -> None:
+            logger.info(
+                "on-demand fetch waiting for another process's fetch",
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=str(timeframe),
+            )
+            self._emit(on_progress, "waiting", call, [])
+
+        async with lock, repo.dataset_lock(exchange, symbol, timeframe, waiting) as held:
             gaps = await self._detect_or_force(
                 held, exchange, symbol, timeframe, grid_start, grid_end, force=force
             )
@@ -431,7 +442,7 @@ class OnDemandFetchService:
     def _emit(
         self,
         on_progress: ProgressCallback | None,
-        phase: Literal["fetching", "fetched", "failed"],
+        phase: Literal["waiting", "fetching", "fetched", "failed"],
         call: _Call,
         gaps: list[GapRange],
     ) -> None:

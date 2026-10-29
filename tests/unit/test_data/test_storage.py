@@ -586,9 +586,16 @@ class TestNotConnected:
 class _Conn:
     """A connection that records every statement it runs."""
 
-    def __init__(self, name: str, log: list[tuple[str, str, tuple[object, ...]]]) -> None:
+    def __init__(
+        self, name: str, log: list[tuple[str, str, tuple[object, ...]]], free: bool
+    ) -> None:
         self.name = name
         self._log = log
+        self._free = free
+
+    async def fetchval(self, query: str, *args: object) -> bool:
+        self._log.append((self.name, query, args))
+        return self._free
 
     async def execute(self, query: str, *args: object) -> str:
         self._log.append((self.name, query, args))
@@ -601,14 +608,20 @@ class _Conn:
 class _CountingPool:
     """Hands out a new named connection per ``acquire()``."""
 
-    def __init__(self) -> None:
+    def __init__(self, free: bool = True) -> None:
         self.log: list[tuple[str, str, tuple[object, ...]]] = []
         self.acquired = 0
+        self._free = free
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[_Conn]:
         self.acquired += 1
-        yield _Conn(f"conn{self.acquired}", self.log)
+        yield _Conn(f"conn{self.acquired}", self.log, self._free)
+
+
+_TRY = "SELECT pg_try_advisory_lock(hashtextextended($1, 0))"
+_LOCK = "SELECT pg_advisory_lock(hashtextextended($1, 0))"
+_UNLOCK = "SELECT pg_advisory_unlock(hashtextextended($1, 0))"
 
 
 class TestDatasetLock:
@@ -624,9 +637,21 @@ class TestDatasetLock:
         assert pool.acquired == 1
         assert {name for name, _, _ in pool.log} == {"conn1"}
         key = ("hydra.on_demand:binance:BTCUSDT:1m",)
-        assert pool.log[0][1:] == ("SELECT pg_advisory_lock(hashtextextended($1, 0))", key)
-        assert pool.log[-1][1:] == ("SELECT pg_advisory_unlock(hashtextextended($1, 0))", key)
+        # a free lock is taken by the try alone: no wait, no blocking call
+        assert pool.log[0][1:] == (_TRY, key)
+        assert pool.log[-1][1:] == (_UNLOCK, key)
         assert len(pool.log) == 4
+
+    async def test_a_held_lock_reports_the_wait_then_blocks_for_it(self) -> None:
+        pool = _CountingPool(free=False)
+        repo = MarketDataRepository.from_pool(pool)
+        waits: list[int] = []
+
+        async with repo.dataset_lock("binance", "BTCUSDT", Timeframe.M1, lambda: waits.append(1)):
+            assert [q for _, q, _ in pool.log] == [_TRY, _LOCK]
+            assert waits == [1]
+
+        assert [q for _, q, _ in pool.log] == [_TRY, _LOCK, _UNLOCK]
 
     async def test_the_lock_is_released_when_the_body_raises(self) -> None:
         pool = _CountingPool()
@@ -636,8 +661,5 @@ class TestDatasetLock:
             async with repo.dataset_lock("binance", "ETHUSDT", Timeframe.H1):
                 raise RuntimeError("fetch failed")
 
-        assert [q for _, q, _ in pool.log] == [
-            "SELECT pg_advisory_lock(hashtextextended($1, 0))",
-            "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
-        ]
+        assert [q for _, q, _ in pool.log] == [_TRY, _UNLOCK]
         assert pool.log[0][2] == ("hydra.on_demand:binance:ETHUSDT:1h",)

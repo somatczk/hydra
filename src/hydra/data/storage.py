@@ -6,7 +6,7 @@ TimescaleDB with connection pooling and ON CONFLICT deduplication.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -77,6 +77,7 @@ _TOUCH_CACHE_ENTRY_SQL = """
     WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
 """
 
+_DATASET_TRY_LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended($1, 0))"
 _DATASET_LOCK_SQL = "SELECT pg_advisory_lock(hashtextextended($1, 0))"
 _DATASET_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended($1, 0))"
 
@@ -214,7 +215,11 @@ class MarketDataRepository:
 
     @asynccontextmanager
     async def dataset_lock(
-        self, exchange_id: str, symbol: str, timeframe: Timeframe
+        self,
+        exchange_id: str,
+        symbol: str,
+        timeframe: Timeframe,
+        on_wait: Callable[[], None] | None = None,
     ) -> AsyncIterator[MarketDataRepository]:
         """Hold one dataset's cross-process write lock; yields a repository on its connection.
 
@@ -222,11 +227,15 @@ class MarketDataRepository:
         second backtest worker, the engine's preview) blocks here until the holder
         releases it, and the server drops it if the holder's connection dies. Every call
         on the yielded repository runs on that one connection, so a holder never waits
-        for a second pooled connection while it pins the first.
+        for a second pooled connection while it pins the first. ``on_wait`` is called once
+        when another session holds the lock, before this one blocks on it.
         """
         key = f"hydra.on_demand:{exchange_id}:{symbol}:{timeframe}"
         async with self._ensure_pool().acquire() as conn:
-            await conn.execute(_DATASET_LOCK_SQL, key)
+            if not await conn.fetchval(_DATASET_TRY_LOCK_SQL, key):
+                if on_wait is not None:
+                    on_wait()
+                await conn.execute(_DATASET_LOCK_SQL, key)
             try:
                 yield MarketDataRepository.from_pool(_HeldConnection(conn))
             finally:

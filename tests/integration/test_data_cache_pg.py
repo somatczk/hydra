@@ -287,10 +287,18 @@ async def test_two_processes_fetch_one_dataset_once(pool: Any, fresh_database: s
         worker_a = OnDemandFetchService(client, page_size=3, now=later)
         worker_b = OnDemandFetchService(client, page_size=3, now=later)
 
+        states: list[str] = []
+
         async def ensure(service: OnDemandFetchService, db: Any) -> FetchReport:
             repo = MarketDataRepository.from_pool(db)
             return await service.ensure_available(
-                repo, "binance", "BTCUSDT", Timeframe.M1, T0, T0 + 9 * M
+                repo,
+                "binance",
+                "BTCUSDT",
+                Timeframe.M1,
+                T0,
+                T0 + 9 * M,
+                on_progress=lambda p: states.append(p["state"]) if service is worker_b else None,
             )
 
         first = asyncio.create_task(ensure(worker_a, pool))
@@ -303,6 +311,7 @@ async def test_two_processes_fetch_one_dataset_once(pool: Any, fresh_database: s
         # one session holds the dataset's lock, the other waits on it
         assert await _advisory_locks(pool) == [False, True]
         assert (await list_cache_entries(pool))[0].status == "fetching"
+        assert states == ["waiting"]
 
         exchange.resume.set()
         a, b = await asyncio.wait_for(asyncio.gather(first, second), 30)
@@ -313,6 +322,7 @@ async def test_two_processes_fetch_one_dataset_once(pool: Any, fresh_database: s
 
     assert (a.bars_fetched, a.ranges_fetched) == (10, 1)
     assert (b.bars_fetched, b.weight_spent, b.ranges_fetched) == (0, 0, 0)
+    assert states == ["waiting", "fetched"]
     assert len(exchange.calls) == 4
     entry = (await list_cache_entries(pool))[0]
     assert (entry.status, entry.rows) == ("ready", 10)
