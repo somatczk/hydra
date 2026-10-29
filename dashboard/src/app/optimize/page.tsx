@@ -59,7 +59,7 @@ const METHOD_OPTIONS = [
 ];
 
 /** C-WF: the 422 range_too_short envelope in operator words; null for anything else. */
-function rangeTooShort(err: unknown, divisor: number): { title: string; line: string } | null {
+function rangeTooShort(err: unknown, foldCount: number): { title: string; line: string } | null {
   const detail = parseErrorDetail(err);
   if (detail?.code !== 'range_too_short') return null;
   const first = detail.available_first_ts;
@@ -68,7 +68,7 @@ function rangeTooShort(err: unknown, divisor: number): { title: string; line: st
     typeof first === 'string' && typeof last === 'string'
       ? `Stored bars cover ${utcDay(first)} to ${utcDay(last)}.`
       : '';
-  return { title: `The stored range is too short for one walk-forward window at window divisor ${divisor}.`, line };
+  return { title: `The stored range is too short for ${foldCount} folds.`, line };
 }
 
 /* ---------- Page ---------- */
@@ -322,10 +322,9 @@ export default function OptimizePage() {
   const noBars = runError !== null ? noStoredBars(runError) : null;
   const tooShort = runError !== null && mode === 'walkforward' ? rangeTooShort(runError, folds) : null;
   const wfPlan = wfWindowPlan(startDate, endDate, folds, train / 100);
-  // fold_count sizes the windows (span ÷ k), it is not the number of folds the run makes
   const wfPlanHint = wfPlan
-    ? `Each window is span ÷ ${folds}: ${wfPlan.isMonths} mo train, ${wfPlan.oosMonths} mo test, rolled by the test window — about ${wfPlan.folds} folds for these dates`
-    : `Each window is span ÷ ${foldCount || 'k'}; no full window fits these dates`;
+    ? `${folds} test windows of ~${wfPlan.oosDays} days after ~${wfPlan.isDays} days of training, rolled by the test window`
+    : `${foldCount || 'k'} folds of at least 30 days train and test do not fit these dates`;
 
   const jobsError = hyperoptJobs.data === null ? hyperoptJobs.error : null;
   const wfJobsError = walkforwardJobs.data === null ? walkforwardJobs.error : null;
@@ -404,7 +403,7 @@ export default function OptimizePage() {
           ) : (
             <>
               <Input
-                label="Window divisor"
+                label="Folds"
                 type="number"
                 min={2}
                 max={24}

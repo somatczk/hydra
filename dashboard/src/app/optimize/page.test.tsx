@@ -66,7 +66,7 @@ const RANGE_TOO_SHORT = new ApiError(
     detail: {
       code: 'range_too_short',
       message:
-        'range too short for 6 folds: stored bars span 2026-09-09T00:00:00+00:00 to 2026-10-21T00:00:00+00:00, one window needs 8 months',
+        'range too short for 6 folds: stored bars span 2026-09-09T00:00:00+00:00 to 2026-10-21T00:00:00+00:00; 6 out-of-sample windows and one in-sample window at train_pct 0.75 of at least 30 days each need about 270 days',
       state: 'invalid',
       available_first_ts: '2026-09-09T00:00:00+00:00',
       available_last_ts: '2026-10-21T00:00:00+00:00',
@@ -213,7 +213,7 @@ describe('OptimizePage segmented control', () => {
     expect(wf.getAttribute('aria-pressed')).toBe('false');
 
     expect(labels(page.container)).toContain('Max Trials');
-    expect(labels(page.container)).not.toContain('Window divisor');
+    expect(labels(page.container)).not.toContain('Folds');
     expect(labels(page.container)).toContain('Initial capital (USDT)');
     expect(page.container.querySelector('select option[value=""]')?.textContent).toBe(
       'Select strategy…',
@@ -223,12 +223,12 @@ describe('OptimizePage segmented control', () => {
     expect(ho.getAttribute('aria-pressed')).toBe('false');
     expect(wf.getAttribute('aria-pressed')).toBe('true');
     expect(labels(page.container)).not.toContain('Max Trials');
-    for (const label of ['Window divisor', 'Train %', 'Trials per fold', 'Anchored']) {
+    for (const label of ['Folds', 'Train %', 'Trials per fold', 'Anchored']) {
       expect(labels(page.container)).toContain(label);
     }
-    // fold_count divides the span; the default 2025-01-01 → 2026-03-01 at 6 and 75 % runs 12 folds, not 6
+    // fold_count is the fold count: the default 424 days at 6 and 75 % tile as 142 + 6 × 47 days
     expect(page.container.textContent).toContain(
-      'Each window is span ÷ 6: 2 mo train, 1 mo test, rolled by the test window — about 12 folds for these dates',
+      '6 test windows of ~47 days after ~142 days of training, rolled by the test window',
     );
   });
 
@@ -323,7 +323,7 @@ describe('OptimizePage submissions', () => {
     await click(buttonByText(page.container, 'Run Walk-forward'));
 
     const card = page.container.querySelector('[data-testid="run-error"]');
-    expect(card?.textContent).toContain('The stored range is too short for one walk-forward window at window divisor 6.');
+    expect(card?.textContent).toContain('The stored range is too short for 6 folds.');
     expect(card?.textContent).toContain('Stored bars cover 9 Sep 2026 to 21 Oct 2026.');
     expect(card?.querySelector('[data-state="invalid"]')?.textContent).toBe('INVALID');
     expect(card?.textContent).not.toContain('{');

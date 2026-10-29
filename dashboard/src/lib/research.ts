@@ -226,31 +226,21 @@ export function wfFoldRow(fold: WfFold): { isWindow: string; oosWindow: string; 
   };
 }
 
-/** Python's round(): half to even, so the estimate sizes windows exactly as `walkforward_months` does. */
-function roundHalfEven(x: number): number {
-  const r = Math.round(x);
-  return x % 1 === 0.5 && r % 2 !== 0 ? r - 1 : r;
-}
-
-/** The walk-forward windows `fold_count` really asks for (jobs.py `walkforward_months` + the walkforward.py loop).
- * fold_count divides the span: each in-sample window is train% of span/k months, each out-of-sample window the
- * rest, and windows roll by one out-of-sample step, so the run makes about (k − train)/(1 − train) folds (4k − 3 at
- * 75 %), not k. An estimate from the requested dates: the worker sizes from the stored bars' span. Null when no
- * window fits or an input is unusable. */
+/** The walk-forward windows `fold_count` asks for (walkforward.py `fold_windows`): one in-sample window plus
+ * fold_count out-of-sample windows tile the span, the in-sample one train/(1 − train) times an out-of-sample one,
+ * and the run makes exactly fold_count folds. An estimate in days from the requested dates (the worker sizes the
+ * stored bars the same way). Null when either window is under 30 days or an input is unusable. */
 export function wfWindowPlan(
   startDate: string,
   endDate: string,
-  divisor: number,
+  folds: number,
   trainFraction: number,
-): { isMonths: number; oosMonths: number; folds: number } | null {
+): { isDays: number; oosDays: number } | null {
   const days = Math.floor((Date.parse(endDate) - Date.parse(startDate)) / 86_400_000);
-  if (!(days > 0) || !(divisor >= 1) || !(trainFraction > 0 && trainFraction < 1)) return null;
-  const months = Math.max(1, Math.floor(days / 30.44));
-  const isMonths = Math.max(1, roundHalfEven((months * trainFraction) / divisor));
-  const oosMonths = Math.max(1, roundHalfEven((months * (1 - trainFraction)) / divisor));
-  const windowDays = 30 * (isMonths + oosMonths);
-  if (days < windowDays) return null;
-  return { isMonths, oosMonths, folds: Math.floor((days - windowDays) / (30 * oosMonths)) + 1 };
+  if (!(days > 0) || !(folds >= 1) || !(trainFraction > 0 && trainFraction < 1)) return null;
+  const oosDays = Math.floor((days * (1 - trainFraction)) / (folds * (1 - trainFraction) + trainFraction));
+  const isDays = days - folds * oosDays;
+  return Math.min(isDays, oosDays) < 30 ? null : { isDays, oosDays };
 }
 
 const MAX_RANGES_SHOWN = 3;

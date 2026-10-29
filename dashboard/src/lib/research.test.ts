@@ -215,23 +215,21 @@ describe('wfFoldRow', () => {
 });
 
 describe('wfWindowPlan', () => {
-  it('sizes windows from the span like walkforward_months: divisor 6 at 75 % makes 12 folds over 13 months, not 6', () => {
-    // 424 days → 13 months; IS round(13·0.75/6 = 1.625) = 2, OOS round(0.54) = 1; (424 − 90) / 30 → 11 steps + 1
-    expect(wfWindowPlan('2025-01-01', '2026-03-01', 6, 0.75)).toEqual({ isMonths: 2, oosMonths: 1, folds: 12 });
+  it('tiles the span with one train window and exactly k test windows, like fold_windows', () => {
+    // 424 days at 6 folds, 75 %: test = floor(424 · 0.25 / 2.25) = 47, train = 424 − 6 · 47 = 142
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 6, 0.75)).toEqual({ isDays: 142, oosDays: 47 });
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 2, 0.75)).toEqual({ isDays: 256, oosDays: 84 });
+    expect(wfWindowPlan('2023-01-01', '2026-01-01', 12, 0.75)).toEqual({ isDays: 220, oosDays: 73 });
   });
 
-  it('rounds half to even as Python does (2.5 → 2, not 3)', () => {
-    // 20 months (609 days), divisor 4 at 50 %: 20·0.5/4 = 2.5 → 2 on both sides; (609 − 120) / 60 → 8 steps + 1
-    expect(wfWindowPlan('2024-01-01', '2025-09-01', 4, 0.5)).toEqual({ isMonths: 2, oosMonths: 2, folds: 9 });
+  it('keeps the train/test ratio up to the floor remainder', () => {
+    // 609 days at 4 folds, 50 %: test = floor(304.5 / 2.5) = 121, train = 609 − 484 = 125
+    expect(wfWindowPlan('2024-01-01', '2025-09-01', 4, 0.5)).toEqual({ isDays: 125, oosDays: 121 });
   });
 
-  it('matches the worker on a 3-year span: divisor 12 runs 34 folds', () => {
-    expect(wfWindowPlan('2023-01-01', '2026-01-01', 12, 0.75)).toEqual({ isMonths: 2, oosMonths: 1, folds: 34 });
-    expect(wfWindowPlan('2025-01-01', '2026-03-01', 2, 0.75)).toEqual({ isMonths: 5, oosMonths: 2, folds: 4 });
-  });
-
-  it('is null when one window does not fit or an input is unusable', () => {
+  it('is null when a window is under 30 days or an input is unusable', () => {
     expect(wfWindowPlan('2026-01-01', '2026-02-15', 2, 0.75)).toBeNull();
+    expect(wfWindowPlan('2025-01-01', '2025-05-01', 6, 0.75)).toBeNull();
     expect(wfWindowPlan('2026-03-01', '2025-01-01', 6, 0.75)).toBeNull();
     expect(wfWindowPlan('2025-01-01', '2026-03-01', 6, 1)).toBeNull();
     expect(wfWindowPlan('', '2026-03-01', 6, 0.75)).toBeNull();
