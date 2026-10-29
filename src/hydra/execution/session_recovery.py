@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from hydra.core import metrics
@@ -20,6 +21,7 @@ from hydra.execution.flatten import FlattenResult
 from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
 from hydra.execution.perp_trading import PaperExecutor, PerpPaperTradingExecutor
 from hydra.execution.session_wiring import SessionRuntime, probe_strategy
+from hydra.ml.consumers import validate_session_ml
 from hydra.risk.market_rules import MarketRulesCache
 from hydra.risk.service import RiskService
 from hydra.strategy.config import StrategyConfig, config_hash
@@ -213,6 +215,14 @@ class SessionRecoveryMixin:
             required_history = await probe_strategy(cfg, self._config)
             if session.paper_capital is None or session.paper_capital <= 0:
                 raise PaperCapitalUnavailableError("the session row has no allocated paper_capital")
+            # P5-C: a session that consumes a Production model re-validates it
+            # here — a model that cannot be attached errors the recovery loudly
+            # (and the native strategy's predictor is re-attached for the resume)
+            await validate_session_ml(
+                self._db_pool,
+                Path(self._config.ml.models_dir),
+                cfg,
+            )
             runtime = self._runtime(session, cfg, executor, required_history)
             await self._launch(runtime, session.paper_capital, recovering=True)
         except Exception as exc:

@@ -14,6 +14,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -49,6 +50,8 @@ from hydra.execution.paper_trading import (
     PersistenceUnavailableError,
 )
 from hydra.execution.protective_orders import ProtectionSpec
+from hydra.ml.consumers import validate_session_ml
+from hydra.ml.serving import MlServingError
 from hydra.risk.market_rules import MarketRulesUnavailableError
 from hydra.risk.state import RiskStateUnavailableError
 from hydra.services.errors import (
@@ -60,7 +63,13 @@ from hydra.services.errors import (
     service_error,
 )
 from hydra.services.perps_gate import is_perp_strategy, require_perps_gate
-from hydra.services.strategies import build_strategy_name_map
+from hydra.services.strategies import (
+    build_strategy_name_map,
+    find_strategy_file,
+    parse_strategy_file,
+)
+from hydra.strategy.builtin.ml_ensemble import STRATEGY_CLASS as ML_NATIVE_CLASS
+from hydra.strategy.config import StrategyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -203,12 +212,58 @@ def _start_error(exc: Exception) -> ServiceError:
         )
     if isinstance(exc, MarketRulesUnavailableError):
         return service_error(503, "market_rules_unavailable", str(exc), "unavailable")
+    if isinstance(exc, MlServingError):
+        if exc.kind in ("artifact_missing", "unavailable"):
+            return service_error(503, f"ml_model_{exc.kind}", str(exc), "unavailable")
+        if exc.kind == "not_promoted":
+            return service_error(422, "ml_model_not_promoted", str(exc), "invalid")
+        return service_error(422, "ml_model_invalid", str(exc), "invalid")
     if isinstance(exc, KeyError | FileNotFoundError):
         return service_error(404, "strategy_not_found", str(exc).strip("'\""), "not_found")
     return service_error(400, "invalid_session", str(exc), "invalid")
 
 
 LIVE_ARMED_KEY = "live_armed"
+
+
+async def _validate_session_ml(mgr: Any, strategy_id: str) -> None:
+    """P5-C: the fail-closed session-start gate for a strategy that consumes a
+    Production model (an enabled ``ml_overlay`` or the ML-native strategy) —
+    validated at START, never at save.
+
+    A strategy that consumes no model changes nothing here: the validation
+    resolves nothing beyond its file and returns before touching the engine's
+    config or pool, so non-ML starts keep their exact envelopes and error
+    priority. A strategy that does consume a model must find it attachable
+    NOW: registry → artifact → onnxruntime → the frozen-spec metadata check,
+    and the native strategy's predictor is attached so the session starts
+    with its model loaded. Resolution failures defer to the manager's own
+    start refusals (the same 404/422 the probe would raise).
+    """
+    path = find_strategy_file(strategy_id)
+    if path is None:
+        return
+    data = parse_strategy_file(path)
+    if data is None:
+        return
+    overlay = data.get("ml_overlay") or {}
+    consumes_model = bool(overlay.get("enabled")) or (data.get("strategy_class") == ML_NATIVE_CLASS)
+    if not consumes_model:
+        return
+    try:
+        cfg = StrategyConfig(**data)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid strategy config for {strategy_id}: {exc}") from exc
+    hydra_config = getattr(mgr, "_config", None)
+    pool = getattr(mgr, "_db_pool", None)
+    if hydra_config is None or pool is None:
+        raise MlServingError(
+            "unavailable",
+            f"strategy {strategy_id} consumes a Production model but the model "
+            "registry is unreachable (no database pool); the session refuses "
+            "to start without the model",
+        )
+    await validate_session_ml(pool, Path(hydra_config.ml.models_dir), cfg)
 
 
 async def _require_live_armed(mgr: Any) -> None:
@@ -271,6 +326,10 @@ async def start_session(mgr: Any, actor: str, body: StartSessionRequest) -> dict
                 await _require_live_armed(mgr)
             except LiveNotArmedError as exc:
                 raise _start_error(exc) from exc
+    try:
+        await _validate_session_ml(mgr, body.strategy_id)
+    except (MlServingError, TypeError, ValueError) as exc:
+        raise _start_error(exc) from exc
     try:
         session_id = await mgr.start_session(
             strategy_id=body.strategy_id,

@@ -432,9 +432,13 @@ class SessionRuntime:
             if isinstance(event, ExitSignal):
                 await self._exit(event)
             elif isinstance(event, EntrySignal):
-                order = await self.entry_order(event)
-                if order is not None:
-                    await self.om.submit_order(order)
+                # P5-C: the veto-only ML overlay gates entries here, fail-closed
+                from hydra.ml.consumers import veto_entry
+
+                if not await veto_entry(self, self._db_pool, self.engine.hydra_config, event):
+                    order = await self.entry_order(event)
+                    if order is not None:
+                        await self.om.submit_order(order)
         except _HALT_ERRORS as exc:
             await self._fail(f"paper ledger halted: {exc}")
         except (RiskRejectedError, ValueError) as exc:
