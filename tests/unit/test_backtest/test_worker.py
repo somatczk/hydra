@@ -600,6 +600,10 @@ class _FetchConn(_BarsThenRecordedWrites):
         assert "ORDER BY timestamp ASC" in query, query
         return self._rows
 
+    async def fetchval(self, query: str, *args: Any) -> bool:
+        assert "pg_try_advisory_lock" in query, query
+        return True  # no other worker holds the dataset
+
 
 async def test_consecutive_fetching_jobs_share_one_pooled_client() -> None:
     """Two fetching jobs through the ONE engine: the client is constructed exactly once."""
