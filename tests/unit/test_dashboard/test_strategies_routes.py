@@ -530,7 +530,8 @@ class TestStrategiesFallback:
             plain = client.post("/api/strategies/save", json={**body, "ml_overlay": None})
             assert plain.status_code == 201, plain.text
         [plain_path] = [p for p in tmp_path.glob("*.yaml") if p != path]
-        assert yaml.safe_load(plain_path.read_text())["parameters"]["required_history"] == 50
+        # without the overlay: the RSI(14) rule's own lookback, 6 Wilder windows + 2
+        assert yaml.safe_load(plain_path.read_text())["parameters"]["required_history"] == 86
 
     def test_update_non_rule_based_returns_400(self, tmp_path: Path) -> None:
         yaml_content = (
