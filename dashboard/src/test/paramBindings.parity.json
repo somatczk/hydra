@@ -1,5 +1,5 @@
 {
-  "_comment": "One rule set, two resolvers: strategy/builtin/rule_based.py param_bindings and dashboard/src/components/builder/bindings.ts paramBindings must both produce `bindable` and `ambiguous` (tests/unit/test_strategy/test_param_bindings_parity.py, bindings.test.ts).",
+  "_comment": "One rule set, two resolvers: strategy/builtin/rule_based.py param_bindings and dashboard/src/components/builder/bindings.ts paramBindings must both produce `bindable` and `ambiguous` (tests/unit/test_strategy/test_param_bindings_parity.py, bindings.test.ts). `refused` is one condition whose param_overrides names a parameter its indicator lacks: the engine raises at that site and unknownTargets, fed `catalogue` (the registry's params, pinned to the engine's signature by the Python test), names the same binding.",
   "rules": {
     "entry_long": {
       "operator": "AND",
@@ -134,5 +134,42 @@
   },
   "ambiguous": [
     "sma_period"
-  ]
+  ],
+  "refused": {
+    "rules": {
+      "entry_long": {
+        "operator": "AND",
+        "conditions": [
+          {
+            "indicator": "bollinger_upper",
+            "params": {
+              "period": 20,
+              "std_dev": 2.0
+            },
+            "comparator": "less_than",
+            "value": "close",
+            "param_overrides": {
+              "bb_len": "period",
+              "bb_width": "length"
+            }
+          }
+        ]
+      },
+      "exit_long": null,
+      "entry_short": null,
+      "exit_short": null
+    },
+    "catalogue": {
+      "bollinger_upper": [
+        "period",
+        "std_dev"
+      ]
+    },
+    "site": {
+      "group": "entry_long",
+      "index": 0,
+      "name": "bb_width",
+      "key": "length"
+    }
+  }
 }

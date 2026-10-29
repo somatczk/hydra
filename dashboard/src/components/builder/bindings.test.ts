@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import parity from '@/test/paramBindings.parity.json';
-import { ambiguous, bindableParams, bindingsOf, bindingsText, dropBindings, paramBindings, RULE_GROUPS } from './bindings';
+import {
+  ambiguous,
+  bindableParams,
+  bindingsOf,
+  bindingsText,
+  dropBindings,
+  paramBindings,
+  RULE_GROUPS,
+  unknownTargets,
+} from './bindings';
 import type { BuilderState, RuleSection } from './types';
 
 type ApiCondition = { indicator: string; params: Record<string, number>; value: number | string } & Record<string, unknown>;
@@ -71,6 +80,28 @@ describe('the ported resolver', () => {
     expect(bindableParams(rules)).toEqual(parity.bindable);
     const table = paramBindings(rules);
     expect(Object.keys(table).filter((name) => ambiguous(table[name])).sort()).toEqual(parity.ambiguous);
+  });
+
+  it('flags the param_overrides target the engine refuses at save, at the same site', () => {
+    const { rules, catalogue, site } = parity.refused;
+    const builder = builderRules(rules as Record<string, { conditions: ApiCondition[] } | null>);
+    const catalogueParams: Record<string, string[] | undefined> = catalogue;
+    const flagged = RULE_GROUPS.flatMap(([group, section]) =>
+      builder[section].conditions.flatMap((c, index) =>
+        unknownTargets(c.bindings, catalogueParams[c.indicator]).map((name) => ({
+          group,
+          index,
+          name,
+          key: c.bindings?.param_overrides?.[name],
+        })),
+      ),
+    );
+    expect(flagged).toEqual([site]);
+  });
+
+  it('leaves an indicator the catalogue does not list to the engine', () => {
+    expect(unknownTargets({ param_overrides: { x: 'length' } }, undefined)).toEqual([]);
+    expect(unknownTargets({ param_overrides: {} }, ['period'])).toEqual([]);
   });
 });
 

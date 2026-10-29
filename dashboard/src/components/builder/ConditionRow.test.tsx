@@ -160,6 +160,28 @@ describe('ConditionRow', () => {
     expect(page.container.querySelector('[role="status"]')?.textContent).toContain('Dropped rsi_period: it bound');
   });
 
+  it('says inline that a binding targets a parameter the indicator does not take', async () => {
+    const condition: BuilderCondition = { ...CONDITION, bindings: { param_overrides: { rsi_len: 'period', rsi_win: 'window' } } };
+    page = await mount(
+      <ConditionRow condition={condition} indicators={INDICATORS} comparators={COMPARATORS} onUpdate={vi.fn()} onRemove={vi.fn()} />,
+    );
+    expect(page.container.querySelector('[data-testid="binding-target-error"]')?.textContent).toBe(
+      'rsi_win → window: rsi takes period, so saving is refused until the binding goes; changing the indicator drops it.',
+    );
+
+    page.unmount();
+    page = await mount(
+      <ConditionRow
+        condition={{ ...condition, bindings: { param_overrides: { rsi_len: 'period' } } }}
+        indicators={INDICATORS}
+        comparators={COMPARATORS}
+        onUpdate={vi.fn()}
+        onRemove={vi.fn()}
+      />,
+    );
+    expect(page.container.querySelector('[data-testid="binding-target-error"]')).toBeNull();
+  });
+
   it('drops the value-side binding when the comparison switches from a number to an indicator', async () => {
     const onUpdate = vi.fn();
     const condition: BuilderCondition = { ...CONDITION, bindings: { param_key: 'rsi_period', value_param_key: 'rsi_lower' } };

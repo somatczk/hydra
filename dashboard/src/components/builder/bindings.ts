@@ -54,6 +54,16 @@ export function bindingsText(bindings: ConditionBindings | undefined, params: Co
   return parts.length > 0 ? `Strategy parameter bindings: ${parts.join(', ')}` : null;
 }
 
+/** The `param_overrides` names whose target the indicator does not take: `known` is its registry params (the
+ * signature the engine reads), and rule_based.param_bindings refuses such a target at save. An indicator the
+ * catalogue does not list (`known` undefined) is left to the engine. */
+export function unknownTargets(bindings: ConditionBindings | undefined, known: string[] | undefined): string[] {
+  if (!known) return [];
+  return Object.entries(bindings?.param_overrides ?? {})
+    .filter(([, key]) => !known.includes(key))
+    .map(([name]) => name);
+}
+
 /** A condition value naming another indicator, `"name:k=v,k=v"`, as rule_engine.parse_indicator_ref reads it. */
 export function parseIndicatorRef(ref: string): { name: string; params: ConditionParams } {
   const [name, args = ''] = ref.split(':');
