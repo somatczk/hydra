@@ -173,7 +173,9 @@ class TestEvictionArithmetic:
 
     async def test_exactly_the_two_oldest_go_and_the_counter_counts_their_rows(self) -> None:
         pool = self._stacked_cache()
-        cfg = _cfg(cache_max_gb=500_000 / 2**30)
+        # 6000 rows x 205 B = 1_230_000 against a 615_000-byte budget: after the two
+        # oldest go the newest fits exactly (3000 x 205 = 615_000).
+        cfg = _cfg(cache_max_gb=615_000 / 2**30)
 
         deleted_rows, deleted_datasets = await _sweeper(pool, cfg).sweep_once(pool)
 
@@ -182,9 +184,9 @@ class TestEvictionArithmetic:
         assert remaining == [("SOLUSDT", 3000)]
         assert _metric("hydra_data_sweep_deleted_rows_total") == 3000.0
         assert _metric("hydra_data_cache_rows") == 3000.0
-        assert _metric("hydra_data_cache_bytes") == 3000 * 160.0
+        assert _metric("hydra_data_cache_bytes") == 3000 * 205.0
         assert _metric("hydra_data_cache_pairs") == 1.0
-        assert _metric("hydra_data_cache_budget_bytes") == 500_000.0
+        assert _metric("hydra_data_cache_budget_bytes") == 615_000.0
 
     async def test_within_budget_nothing_is_deleted(self) -> None:
         pool = self._stacked_cache()
@@ -317,14 +319,15 @@ class TestRecompute:
                 _Dataset("binance", "BTCUSDT", "1m", 50, 100, NOW),
             ]
         )
-        # 100 x 160 would breach 10_000 and evict; 50 x 160 fits and stays.
-        cfg = _cfg(cache_max_gb=10_000 / 2**30)
+        # 100 x 205 would breach 10_250 and evict; the recounted 50 x 205 = 10_250
+        # fits exactly and stays.
+        cfg = _cfg(cache_max_gb=10_250 / 2**30)
 
         deleted_rows, deleted_datasets = await _sweeper(pool, cfg).sweep_once(pool)
 
         assert (deleted_rows, deleted_datasets) == (0, 0)
         assert _metric("hydra_data_cache_rows") == 50.0
-        assert _metric("hydra_data_cache_bytes") == 50 * 160.0
+        assert _metric("hydra_data_cache_bytes") == 50 * 205.0
 
 
 class TestConcurrentCommitRace:
@@ -365,7 +368,7 @@ class TestOverBudgetNothingEligible:
             last_fetched_at=datetime.now(UTC),
         )
         pool = _FakePool(datasets=[protected, mid_fetch], running={("binance", "DOGEUSDT")})
-        # 3000 rows x 160 B = 480_000 bytes against a 10_000-byte budget
+        # 3000 rows x 205 B = 615_000 bytes against a 10_000-byte budget
         cfg = _cfg(cache_max_gb=10_000 / 2**30)
 
         with capture_logs() as logs:
@@ -376,12 +379,12 @@ class TestOverBudgetNothingEligible:
             {
                 "event": "data cache still over budget with nothing eligible",
                 "log_level": "warning",
-                "estimated_bytes": 3000 * 160,
+                "estimated_bytes": 3000 * 205,
                 "budget_bytes": 10_000,
             }
         ]
         assert _metric("hydra_data_cache_rows") == 3000.0
-        assert _metric("hydra_data_cache_bytes") == 3000 * 160.0
+        assert _metric("hydra_data_cache_bytes") == 3000 * 205.0
         assert _metric("hydra_data_cache_pairs") == 2.0
         assert _metric("hydra_data_sweep_deleted_rows_total") == 0.0
 

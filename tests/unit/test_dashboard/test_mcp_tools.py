@@ -537,7 +537,7 @@ def test_data_coverage_round_trips_the_stored_range(
         "last_ts": "2026-01-02T23:00:00+00:00",
         "bar_count": 48,
         "sources": {"feed": 48, "auto": 0},
-        "estimated_bytes": 48 * 160,
+        "estimated_bytes": 48 * 205,
         "cache": None,
     }
 
@@ -623,13 +623,13 @@ def test_data_inventory_lists_the_cached_datasets_lru_first_with_the_totals(
                     "last_ts": "2026-01-31T23:00:00+00:00",
                 },
                 "rows": 500,
-                "estimated_bytes": 500 * 160,
+                "estimated_bytes": 500 * 205,
                 "status": "fetching",
                 "last_used_at": "2026-10-02T00:00:00+00:00",
             },
         ],
         "totals": {
-            "bytes": 500 * 160,
+            "bytes": 500 * 205,
             "rows": 500,
             "pairs": 2,
             "budget_bytes": 10 * 2**30,

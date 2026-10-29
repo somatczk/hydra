@@ -108,7 +108,7 @@ async def test_the_lru_evicts_exactly_the_two_oldest_datasets(pool: Any) -> None
     await _age_last_used(pool, "ETHUSDT", 30)
     await _age_last_used(pool, "SOLUSDT", 5)
 
-    sweeper = DataCacheSweeper(pool, _cfg(cache_max_gb=500_000 / 2**30))
+    sweeper = DataCacheSweeper(pool, _cfg(cache_max_gb=615_000 / 2**30))
     assert await sweeper.sweep_once(pool) == (3000, 2)
 
     entries = await list_cache_entries(pool)
@@ -213,14 +213,15 @@ async def test_the_eviction_input_is_recomputed_from_the_bars_not_the_ledger(poo
     async with pool.acquire() as conn:
         await conn.execute("UPDATE data_cache_entries SET rows = 100 WHERE symbol = 'BTCUSDT'")
 
-    # the ledger claims 100 x 160 = 16_000 bytes (over the 10_000 budget); the bars hold 50 x 160
-    sweeper = DataCacheSweeper(pool, _cfg(cache_max_gb=10_000 / 2**30))
+    # the ledger claims 100 x 205 = 20_500 bytes (over the 10_250 budget); the bars hold 50 x 205
+    # = 10_250 and fit exactly
+    sweeper = DataCacheSweeper(pool, _cfg(cache_max_gb=10_250 / 2**30))
     assert await sweeper.sweep_once(pool) == (0, 0)
 
     assert [e.symbol for e in await list_cache_entries(pool)] == ["BTCUSDT"]
     assert REGISTRY.get_sample_value("hydra_data_cache_rows") == 50.0
-    assert REGISTRY.get_sample_value("hydra_data_cache_bytes") == 50 * 160.0
-    assert REGISTRY.get_sample_value("hydra_data_cache_budget_bytes") == 10_000.0
+    assert REGISTRY.get_sample_value("hydra_data_cache_bytes") == 50 * 205.0
+    assert REGISTRY.get_sample_value("hydra_data_cache_budget_bytes") == 10_250.0
 
 
 async def test_the_backtest_loaders_bump_last_used_at(pool: Any) -> None:

@@ -297,7 +297,7 @@ class DataConfig(_Section):
     fetch_max_bars: int = Field(2_000_000, gt=0)
     cache_max_gb: float = Field(10.0, ge=0, allow_inf_nan=False)
     sweep_interval_s: int = Field(3600, gt=0)
-    row_bytes_estimate: int = Field(160, gt=0)
+    row_bytes_estimate: int = Field(205, gt=0)
 
 
 class PlatformConfig(_Section):

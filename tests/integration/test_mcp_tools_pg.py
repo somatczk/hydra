@@ -246,7 +246,7 @@ async def test_data_coverage_returns_the_exact_stored_range(
         "last_ts": "2026-01-01T04:00:00+00:00",
         "bar_count": 5,
         "sources": {"feed": 5, "auto": 0},
-        "estimated_bytes": 5 * 160,
+        "estimated_bytes": 5 * 205,
         "cache": None,
     }
 
@@ -318,14 +318,14 @@ async def test_data_inventory_lists_the_cache_with_the_coverage_semantics(
                 "last_ts": "2026-02-01T00:00:00+00:00",
             },
             "rows": 5,
-            "estimated_bytes": 5 * 160,
+            "estimated_bytes": 5 * 205,
             "status": "ready",
         }
         for dataset in inventory["datasets"]:
             used = datetime.fromisoformat(dataset["last_used_at"])
             assert abs(datetime.now(UTC) - used) < timedelta(minutes=5)
         assert inventory["totals"] == {
-            "bytes": 5 * 160,
+            "bytes": 5 * 205,
             "rows": 5,
             "pairs": 2,
             "budget_bytes": 10 * 2**30,
@@ -339,7 +339,7 @@ async def test_data_inventory_lists_the_cache_with_the_coverage_semantics(
         coverage = json.loads(text)
         assert coverage["sources"] == {"feed": 0, "auto": 5}
         assert coverage["bar_count"] == 5
-        assert coverage["estimated_bytes"] == 5 * 160
+        assert coverage["estimated_bytes"] == 5 * 205
         assert {
             k: v
             for k, v in coverage["cache"].items()

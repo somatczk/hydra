@@ -460,7 +460,7 @@ class TestDataFields:
         assert cfg.fetch_max_bars == 2_000_000
         assert cfg.cache_max_gb == 10.0
         assert cfg.sweep_interval_s == 3600
-        assert cfg.row_bytes_estimate == 160
+        assert cfg.row_bytes_estimate == 205
         assert load_config().data == cfg
 
     def test_env_overrides_thread_the_knobs(self, monkeypatch: pytest.MonkeyPatch) -> None:
