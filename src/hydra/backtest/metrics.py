@@ -29,9 +29,9 @@ beta               cov(r, r_b, ddof=1) / var(r_b, ddof=1)                       
 alpha              Jensen, annualised: (mean(r) - beta * mean(r_b)) * ppy       0.0
 ================== ============================================================ ================
 
-``Trade.pnl`` is net of the exit fee; the entry fee is included once P2-A lands (BT-9). The API
-reports win_rate, max_drawdown and returns in percent on /backtest results and win_rate as a
-fraction on /strategies/preview.
+``Trade.pnl`` is net of both fees: the executor's ``net_pnl`` takes the exit fee and the pro-rata
+entry fee. The API reports win_rate, max_drawdown and returns in percent on /backtest results
+and win_rate as a fraction on /strategies/preview.
 """
 
 from __future__ import annotations

@@ -20,8 +20,8 @@ The gate is the positive precondition the live perps executor (P4-D) consumes. E
 live FUTURES surface — the session-start executor, the manual live order executor, the
 create routes, the MCP tools and the service layer's live branch — refuses with 409
 ``perps_not_armed`` (403 ``perps_capital_missing`` when armed without the capital) until
-the ceremony armed. P4-C's fail-closed executor build is unchanged: even armed, a live
-FUTURES start still stops where P4-C stops it until P4-D lands the executor. Disarm is
+the ceremony armed; once armed, a live FUTURES start builds the live perps executor
+(``hydra.execution.perp_live.LivePerpTradingExecutor``). Disarm is
 ungated toward safety, audited, and honest (the R10 pattern): running live perp sessions
 are named and keep running under their start's authorization.
 """

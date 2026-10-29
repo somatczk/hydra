@@ -1,14 +1,18 @@
 """AGENTS.md is the one source of agent instructions.
 
 Every CLAUDE.md only imports its sibling AGENTS.md, every nested AGENTS.md is indexed from the root,
-and the root plus any nested file fit Codex's default instruction budget.
+the root plus any nested file fit Codex's default instruction budget, and the tools that need an
+opt-in (Gemini CLI, Aider) are pointed at it.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
+
+import yaml
 
 _ROOT = Path(__file__).resolve().parents[3]
 _SKIP_DIRS = {"node_modules", "__pycache__"}
@@ -48,3 +52,10 @@ def test_root_plus_any_nested_file_fits_the_codex_default_budget() -> None:
     root_size = (_ROOT / "AGENTS.md").stat().st_size
     largest_nested = max(p.stat().st_size for p in _find("AGENTS.md") if p.parent != _ROOT)
     assert root_size + largest_nested < _CODEX_PROJECT_DOC_MAX_BYTES
+
+
+def test_gemini_cli_and_aider_are_opted_in() -> None:
+    gemini = json.loads((_ROOT / ".gemini" / "settings.json").read_text())
+    assert "AGENTS.md" in gemini["context"]["fileName"]
+    aider = yaml.safe_load((_ROOT / ".aider.conf.yml").read_text())
+    assert "AGENTS.md" in (aider["read"] if isinstance(aider["read"], list) else [aider["read"]])

@@ -14,8 +14,9 @@ honest gappy data; only a range with zero stored bars raises the P0-B
 ``NoMarketDataError``.
 
 The REST client is injected (``data`` may not import ``execution``); the caller owns
-its lifecycle. No caller is wired yet — the jobs/worker wiring is P6-B2, the
-submit/preview surfaces P6-B3.
+its lifecycle. Two callers each hold one engine per process: the backtest worker
+(``hydra.backtest.worker.fetch_engine``) and the builder preview
+(``hydra.services.strategies.preview_fetch_engine``).
 """
 
 from __future__ import annotations

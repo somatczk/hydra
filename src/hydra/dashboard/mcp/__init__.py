@@ -5,8 +5,8 @@ One module-level ``MCPServer`` ('hydra') per engine process; the lifespan binds 
 ``HYDRA_MCP_TOKEN`` is set (no token, no surface — fail-safe). The token is deliberately
 not ``HYDRA_API_TOKEN``: it grants ``Principal('service', 'mcp')``, never a REST
 service principal. Tool modules register on the shared ``server`` instance via
-``hydra.dashboard.mcp.tools`` — empty placeholders in this PR (``tools/list == []``);
-B1/B2 fill them without touching the transport files.
+``hydra.dashboard.mcp.tools`` (42 tools in six modules); a new tool goes in one of them,
+never in the transport files.
 """
 
 from __future__ import annotations

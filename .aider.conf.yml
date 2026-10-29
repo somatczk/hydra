@@ -1,0 +1,2 @@
+# Aider does not discover AGENTS.md on its own; load the root file read-only in every session.
+read: AGENTS.md

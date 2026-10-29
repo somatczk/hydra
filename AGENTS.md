@@ -2,8 +2,9 @@
 
 Hydra is a self-hosted crypto trading platform: rule-based and ML strategies, backtests on stored Binance bars, paper
 sessions, and code-gated live trading on Binance spot and USD⌂-M perps. This file is the one set of agent
-instructions for every tool (Codex, Copilot, Cursor, Gemini CLI, and Claude Code through `CLAUDE.md` → `@AGENTS.md`).
-Humans start at `README.md`. What works and what does not lives only in the README **Status** table: do not
+instructions for every tool: Codex, Copilot and Cursor read it natively, Claude Code through `CLAUDE.md` →
+`@AGENTS.md`, Gemini CLI through `.gemini/settings.json` (`context.fileName`) and Aider through `.aider.conf.yml`
+(`read: AGENTS.md`, the root file only). Keep those opt-ins when you touch tool config. Humans start at `README.md`. What works and what does not lives only in the README **Status** table: do not
 duplicate it here, and update its row in the PR that changes the behaviour.
 
 **Local rules.** These directories have their own `AGENTS.md` (each with a sibling `CLAUDE.md` that imports it). Read
