@@ -9,7 +9,12 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from hydra.backtest import jobs
-from hydra.backtest.hyperopt import ParamDef, ParameterSpace, param_space_problems
+from hydra.backtest.hyperopt import (
+    ParamDef,
+    ParameterSpace,
+    param_space_problems,
+    untunable_param_problem,
+)
 from hydra.backtest.jobs import (
     HyperoptRunRequest,
     ParamDefRequest,
@@ -240,11 +245,15 @@ def _validated_space(defs: list[ParamDefRequest]) -> ParameterSpace:
 def _check_param_names(
     space: ParameterSpace, config: StrategyConfig, strategy_class: type[BaseStrategy]
 ) -> None:
-    """Reject names the strategy cannot read, before anything is queued.
+    """Reject names the strategy cannot read, and the model it serves, before anything is queued.
 
     A rule-based name that matches conditions holding different values by name binds
-    nothing; the 422 names it with its sites instead of calling it unread.
+    nothing; the 422 names it with its sites instead of calling it unread. The ML-native
+    ``model_name`` is readable but not tunable (``untunable_param_problem``): its own code.
     """
+    untunable = untunable_param_problem(space, config)
+    if untunable:
+        raise service_error(422, "param_not_tunable", untunable, "invalid", param="model_name")
     try:
         problems = param_space_problems(space, config, strategy_class)
     except ValueError as exc:

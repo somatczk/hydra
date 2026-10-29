@@ -728,3 +728,30 @@ async def test_hyperopt_and_walkforward_pass_the_same_model_gate(
         await handler(pool, None, job(None), worker.JobRun())
     with pytest.raises(NoMarketDataError):
         await handler(pool, None, job(staged), worker.JobRun())
+
+
+@pytest.mark.parametrize("tool", ["hyperopt_run", "walkforward_run"])
+async def test_an_optimiser_over_the_native_model_name_is_refused_and_queues_nothing(
+    mcp_cfg: HydraConfig, pool: _RegistryPool, strategies_dir: Path, tool: str
+) -> None:
+    """A trial naming another model would hit one the job never attached: the shared
+    submit validation refuses it 422 param_not_tunable, the REST surface's code."""
+    async with _async_mcp(mcp_cfg) as mcp:
+        is_error, text = await mcp.call(
+            "strategy_import", {"filename": "native.yaml", "yaml_content": _native_yaml()}
+        )
+        assert not is_error, text
+        space = [{"name": "model_name", "type": "categorical", "choices": ["alpha", "beta"]}]
+        is_error, text = await mcp.call(
+            tool,
+            {
+                "strategy_id": json.loads(text)["id"],
+                "start_date": "2026-01-01",
+                "end_date": "2026-01-03",
+                "param_space": space,
+            },
+        )
+    assert is_error
+    assert _envelope(tool, text) == (422, "param_not_tunable")
+    assert '"param": "model_name"' in text
+    assert pool.conn.jobs == {}

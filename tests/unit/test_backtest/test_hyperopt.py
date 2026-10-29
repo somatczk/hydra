@@ -25,6 +25,8 @@ from hydra.backtest.hyperopt import (
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Timeframe
 from hydra.strategy.base import BaseStrategy
+from hydra.strategy.builtin.ml_ensemble import STRATEGY_CLASS as ML_NATIVE_CLASS
+from hydra.strategy.builtin.ml_ensemble import MLEnsembleStrategy
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
@@ -425,4 +427,30 @@ async def test_the_worker_names_an_ambiguous_name_by_its_sites_like_the_submit_4
         "param_space name 'sma_period' matches conditions with different values by name "
         "(entry_long[0].params.period=20, exit_long[0].params.period=50), so it binds "
         "nothing; bind the one it is meant for with param_overrides or value_ref_overrides"
+    )
+
+
+async def test_the_worker_never_runs_a_trial_over_the_ml_native_model_name() -> None:
+    """A job queued before the submit check, or a direct analyzer call, refuses before any
+    trial: a trial naming another model would hit one the job never attached."""
+    config = _config(
+        strategy_class=ML_NATIVE_CLASS,
+        parameters={"model_name": "alpha", "entry_threshold": 0.6, "required_history": 60},
+    )
+    space = ParameterSpace(
+        params=[ParamDef(name="model_name", type="categorical", choices=["alpha", "beta"])]
+    )
+    with pytest.raises(ValueError) as err:
+        await HyperoptRunner().run(
+            strategy_class=MLEnsembleStrategy,
+            base_config=config,
+            bars=_bars(60),
+            initial_capital=D("10000"),
+            param_space=space,
+            method="grid",
+            max_trials=5,
+        )
+    assert str(err.value) == (
+        "param_space varies model_name, but a run serves only the model attached before "
+        "it starts; pin one registry version with model_version_id instead"
     )
