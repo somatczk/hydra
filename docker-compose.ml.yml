@@ -1,5 +1,6 @@
-# Desktop ML training stack (NVIDIA GPU + CUDA). NON-FUNCTIONAL UNTIL P5: no hydra.ml.training entrypoint,
-# jupyter not declared, no python3.12 apt package on ubuntu22.04, MLflow unauthenticated on 0.0.0.0:5000.
+# Desktop ML training stack (NVIDIA GPU + CUDA). NON-FUNCTIONAL: P5 shipped training as the bounded ml_train job in the
+# hydra-backtest worker instead. This stack has no hydra.ml.training entrypoint, jupyter is not declared, ubuntu22.04
+# has no python3.12 apt package, and MLflow would be unauthenticated on 0.0.0.0:5000.
 services:
   ml-training:
     build:

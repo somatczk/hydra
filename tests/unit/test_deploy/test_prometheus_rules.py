@@ -239,7 +239,8 @@ def test_live_protective_gap_rule_matches_the_contract() -> None:
     assert gap["expr"].strip() == "hydra_live_protective_gap == 1"
     assert gap["for"] == "1m"
     assert gap["labels"] == {"severity": "critical", "team": "trading"}
-    assert "dead-man checklist" in gap["annotations"]["description"]
+    assert "dead-man checklist in docs/live-trading.md" in gap["annotations"]["description"]
+    assert "### Operator checklist" in (DEPLOY.parent / "docs" / "live-trading.md").read_text()
 
     (spec,) = [s for s in metrics.CONTRACT if s.name == "hydra_live_protective_gap"]
     assert spec.kind == "gauge"

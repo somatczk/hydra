@@ -40,7 +40,7 @@ def build_mcp_app(cfg: HydraConfig) -> ASGIApp:
     """The shared server's streamable-HTTP app, wrapped in the bearer-token middleware.
 
     Also imports ``hydra.dashboard.mcp.tools`` so the tool modules register on the shared
-    server instance (empty placeholders now; B1/B2 fill them without touching this file).
+    server instance; a new tool goes in a tool module, never in this file.
     """
     from hydra.dashboard.mcp import server
 

@@ -529,7 +529,7 @@ tests:
               team: trading
             exp_annotations:
               summary: "Live position without a confirmed exchange-side stop"
-              description: "Session s1 holds BTCUSDT on binance with no confirmed exchange-side protective order. The position is unprotected: follow the dead-man checklist in README.md (Stop all, or flatten manually from the Binance app)."
+              description: "Session s1 holds BTCUSDT on binance with no confirmed exchange-side protective order. The position is unprotected: follow the dead-man checklist in docs/live-trading.md (Stop all, or flatten manually from the Binance app)."
 
   - name: live protective gap at 0 does not fire
     interval: 1m
@@ -566,7 +566,7 @@ tests:
               team: trading
             exp_annotations:
               summary: "Live session reconcile mismatch"
-              description: "Session s1 has reported drift between its ledger and the exchange for 2 minutes: untracked orders, an unresolved submit, a terminal status it had to apply, or balance drift. Read the session detail's reconcile detail; the ledger is never auto-corrected, so resolve it per the live trading notes in README.md."
+              description: "Session s1 has reported drift between its ledger and the exchange for 2 minutes: untracked orders, an unresolved submit, a terminal status it had to apply, or balance drift. Read the session detail's reconcile detail; the ledger is never auto-corrected, so resolve it per docs/live-trading.md."
 
   - name: live reconcile ok does not fire
     interval: 1m
