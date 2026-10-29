@@ -383,3 +383,43 @@ async def test_backtest_does_not_touch_live_metrics() -> None:
         for s in metric.samples
     }
     assert not any(sid.startswith("backtest-") for sid in position_ids)
+
+
+def _regime_bars() -> list[OHLCV]:
+    """30 drifting zigzag bars (low ADX), 10 bars up 1.5 each, 8 bars down 1 each."""
+    closes = [100 + 0.2 * t + 2 * (-1) ** t for t in range(30)]
+    closes += [closes[-1] + 1.5 * (k + 1) for k in range(10)]
+    closes += [closes[-1] - (k + 1) for k in range(8)]
+    return [
+        _bar(i, f"{c:.2f}", f"{c + 0.5:.2f}", f"{c - 0.5:.2f}", f"{c:.2f}")
+        for i, c in enumerate(closes)
+    ]
+
+
+async def test_adx_filter_and_lag_momentum_trade_end_to_end() -> None:
+    """``close > lag:3`` alone buys the chop at bar 10; ``adx(5) > 20`` holds it off to bar 34."""
+    bars = _regime_bars()
+    above_lag = {"indicator": "close", "comparator": "greater_than", "value": "lag:period=3"}
+    below_lag = {"indicator": "close", "comparator": "less_than", "value": "lag:period=3"}
+    trending = {
+        "indicator": "adx",
+        "params": {"period": 5},
+        "comparator": "greater_than",
+        "value": 20,
+    }
+
+    def config(*entry: dict[str, Any]) -> StrategyConfig:
+        rules = {
+            "entry_long": {"operator": "AND", "conditions": list(entry)},
+            "exit_long": {"operator": "AND", "conditions": [below_lag]},
+        }
+        return _config(parameters={"required_history": 10, "rules": rules})
+
+    filtered = await _run(bars, config=config(trending, above_lag), warmup_bars=0)
+    unfiltered = await _run(bars, config=config(above_lag), warmup_bars=0)
+
+    assert [(t, side) for t, side, *_ in _fills(filtered)] == [
+        (bars[34].timestamp.isoformat(), "Buy"),
+        (bars[41].timestamp.isoformat(), "Sell"),
+    ]
+    assert _fills(unfiltered)[0][:2] == (bars[10].timestamp.isoformat(), "Buy")

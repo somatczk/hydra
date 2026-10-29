@@ -930,6 +930,60 @@ def test_strategy_save_with_a_member_symbol_saves(
     assert yaml.safe_load(written.read_text())["symbols"] == ["BTCUSDT"]
 
 
+def _regime_rules(adx_period: int) -> dict[str, Any]:
+    """Every regime/momentum indicator, as a condition or as a value reference."""
+
+    def cond(indicator: str, params: dict[str, Any], comparator: str, value: Any) -> dict[str, Any]:
+        return {"indicator": indicator, "params": params, "comparator": comparator, "value": value}
+
+    entry = [
+        cond("adx", {"period": adx_period}, "greater_than", 20),
+        cond("close", {}, "greater_than", "lag:period=60"),
+        cond("bb_width", {"period": 20, "std_dev": 2.0}, "greater_than", "atr_pct:period=14"),
+        cond("plus_di", {"period": 14}, "greater_than", "minus_di:period=14"),
+    ]
+    exits = [
+        cond("roc", {"period": 30}, "less_than", 0),
+        cond("close", {}, "crosses_below", "rolling_low:period=20"),
+        cond("rolling_high", {"period": 20}, "greater_than", "close"),
+    ]
+    return {
+        "entry_long": {"operator": "AND", "conditions": entry},
+        "exit_long": {"operator": "OR", "conditions": exits},
+    }
+
+
+def test_strategy_save_and_import_accept_the_regime_indicators(
+    mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    is_error, text = mcp.call("strategy_save", {"name": "Regime", "rules": _regime_rules(14)})
+    assert not is_error, text
+    saved = (strategies_dir / f"{json.loads(text)['id']}.yaml").read_text()
+
+    is_error, text = mcp.call("strategy_import", {"filename": "regime.yaml", "yaml_content": saved})
+    assert not is_error, text
+    imported = yaml.safe_load((strategies_dir / f"{json.loads(text)['id']}.yaml").read_text())
+
+    def triples(rules: dict[str, Any]) -> list[tuple[str, Any, Any]]:
+        groups = (rules["entry_long"], rules["exit_long"])
+        return [(c["indicator"], c["params"], c["value"]) for g in groups for c in g["conditions"]]
+
+    assert triples(imported["parameters"]["rules"]) == triples(_regime_rules(14))
+
+
+def test_strategy_save_refuses_an_out_of_range_adx_period(
+    mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    is_error, text = mcp.call("strategy_save", {"name": "Regime", "rules": _regime_rules(1)})
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool strategy_save: "))
+    assert envelope["status"] == 422
+    assert "Indicator 'adx' parameter 'period' must be in [2, 200], got 1" in str(envelope)
+    assert list(strategies_dir.glob("*.yaml")) == []
+
+
 def test_strategy_export_on_a_file_deleted_after_the_scan_is_the_404_envelope(
     mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

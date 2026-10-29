@@ -500,3 +500,102 @@ def mfi(
             result[i] = 100.0 - 100.0 / (1.0 + ratio)
 
     return result
+
+
+# ===========================================================================
+# Regime and time-series momentum (single output, causal: the value at t reads bars <= t)
+# ===========================================================================
+
+
+def adx(high: ndarray, low: ndarray, close: ndarray, period: int = 14) -> ndarray:
+    """Average Directional Index, Wilder's (TA-Lib ``ADX``), trend strength in [0, 100].
+
+    The first value, at index ``2 * period - 1``, is the mean of the first ``period`` DX
+    values; then Wilder smoothing. DI is seeded as in ``plus_di``.
+    """
+    return talib.ADX(
+        high.astype(np.float64),
+        low.astype(np.float64),
+        close.astype(np.float64),
+        timeperiod=period,
+    )
+
+
+def plus_di(high: ndarray, low: ndarray, close: ndarray, period: int = 14) -> ndarray:
+    """+DI, Wilder's (TA-Lib ``PLUS_DI``): 100 * smoothed +DM / smoothed TR, in [0, 100].
+
+    First value at index ``period``: the sums of +DM and TR over bars 1..period-1, then one
+    Wilder step (``s - s / period + x``) with bar ``period``; Wilder steps after that.
+    """
+    return talib.PLUS_DI(
+        high.astype(np.float64),
+        low.astype(np.float64),
+        close.astype(np.float64),
+        timeperiod=period,
+    )
+
+
+def minus_di(high: ndarray, low: ndarray, close: ndarray, period: int = 14) -> ndarray:
+    """-DI, Wilder's (TA-Lib ``MINUS_DI``), seeded like ``plus_di``, in [0, 100]."""
+    return talib.MINUS_DI(
+        high.astype(np.float64),
+        low.astype(np.float64),
+        close.astype(np.float64),
+        timeperiod=period,
+    )
+
+
+def roc(data: ndarray, period: int) -> ndarray:
+    """Rate of change in percent: ``(data[t] / data[t - period] - 1) * 100`` (TA-Lib ``ROC``).
+
+    NaN for the first ``period`` elements.
+    """
+    return talib.ROC(data.astype(np.float64), timeperiod=period)
+
+
+def lag(data: ndarray, period: int) -> ndarray:
+    """The close ``period`` bars ago, ``data[t - period]``; NaN for the first ``period``.
+
+    Time-series momentum as a rule: ``close greater_than "lag:period=60"``.
+    """
+    data_f = data.astype(np.float64)
+    result = np.full(len(data_f), np.nan, dtype=np.float64)
+    if 0 < period < len(data_f):
+        result[period:] = data_f[:-period]
+    return result
+
+
+def bb_width(data: ndarray, period: int = 20, std_dev: float = 2.0) -> ndarray:
+    """Bollinger bandwidth in percent of the middle band: ``(upper - lower) / middle * 100``.
+
+    The same bands as ``bollinger_upper``/``bollinger_lower``; NaN for the first ``period - 1``.
+    """
+    upper, middle, lower = bollinger_bands(data, period, std_dev)
+    result: ndarray = (upper - lower) / middle * 100.0
+    return result
+
+
+def atr_pct(high: ndarray, low: ndarray, close: ndarray, period: int = 14) -> ndarray:
+    """ATR in percent of the close, ``atr / close * 100`` (TA-Lib's ``NATR``).
+
+    NaN for the first ``period`` elements.
+    """
+    result: ndarray = atr(high, low, close, period) / close.astype(np.float64) * 100.0
+    return result
+
+
+def rolling_high(high: ndarray, period: int) -> ndarray:
+    """Highest high of the *period* bars before the current one, window [t-period, t-1].
+
+    The upper Donchian channel on highs: ``close crosses_above`` it on a breakout.
+    NaN for the first ``period`` elements.
+    """
+    return rolling_max(high, period)
+
+
+def rolling_low(low: ndarray, period: int) -> ndarray:
+    """Lowest low of the *period* bars before the current one, window [t-period, t-1].
+
+    The lower Donchian channel on lows. NaN for the first ``period`` elements.
+    """
+    return rolling_min(low, period)

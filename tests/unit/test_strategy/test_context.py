@@ -145,6 +145,11 @@ def test_dispatch_follows_the_signature() -> None:
             ind_lib.williams_r(high, low, close, 14),
         ),
         (ctx.indicator("atr", "BTCUSDT", _TF, period=14), talib.ATR(high, low, close, 14)),
+        (ctx.indicator("adx", "BTCUSDT", _TF, period=14), talib.ADX(high, low, close, 14)),
+        (
+            ctx.indicator("rolling_low", "BTCUSDT", _TF, period=20),
+            ind_lib.rolling_min(low, 20),
+        ),
     ]
     for got, want in pairs:
         assert np.array_equal(got, want, equal_nan=True)
@@ -169,6 +174,12 @@ def test_dispatch_follows_the_signature() -> None:
         ("sma", {"period": -5}, r"must be in \[2, 200\]"),
         ("ema", {"period": 10**8}, r"must be in \[2, 200\]"),
         ("bollinger_upper", {"std_dev": 0.0}, r"must be in \[0.1, 5.0\]"),
+        ("adx", {"period": 1}, r"must be in \[2, 200\]"),
+        ("lag", {"period": 201}, r"must be in \[2, 200\]"),
+        ("lag", {}, "period"),
+        ("roc", {"period": 2.5}, "must be an integer"),
+        ("bb_width", {"std_dev": 6.0}, r"must be in \[0.1, 5.0\]"),
+        ("rolling_high", {"period": 0}, r"must be in \[2, 200\]"),
     ],
 )
 def test_ambiguous_and_invalid_rejected(name: str, params: dict[str, object], match: str) -> None:
