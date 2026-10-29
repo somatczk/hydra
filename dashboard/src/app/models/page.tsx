@@ -16,6 +16,7 @@ import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
 import { pct, signed, utc } from '@/lib/format';
 import { logger } from '@/lib/logger';
+import { fetchLine, type JobFetch } from '@/lib/research';
 
 /* ---------- Types (the registry-backed routes' own shapes) ---------- */
 
@@ -59,6 +60,8 @@ interface RetrainStatus {
   result: { name?: string; version?: number; stage?: string } | null;
   metrics: Record<string, unknown> | null;
   provenance: Record<string, unknown> | null;
+  /** The worker's fetch of the training bars (`detail.fetch`); it also names the timeframe being fetched. */
+  fetch?: JobFetch | null;
 }
 
 type Dialog =
@@ -459,6 +462,11 @@ export default function ModelsPage() {
                 )}
                 <Button variant="ghost" size="sm" onClick={() => setTaskId(null)}>Dismiss</Button>
               </div>
+              {task.fetch && (
+                <p className="text-xs text-ink-2" data-testid="train-fetch">
+                  {fetchLine(task.fetch)}
+                </p>
+              )}
               {task.error && <p className="text-sm text-danger" role="alert">{task.error}</p>}
               {task.status === 'completed' && task.metrics && (
                 <p className="text-sm text-ink-2">

@@ -88,6 +88,11 @@ describe('JobRow', () => {
     );
   });
 
+  it('names the worker holding the job when several share the queue', async () => {
+    m = await mount(<JobRow kind="backtest" job={{ ...RUNNING, worker_id: 'hydra-backtest-worker-2' }} now={NOW} />);
+    expect(m.container.textContent).toContain('Started 3 h ago · 40% · worker hydra-backtest-worker-2');
+  });
+
   it('shows no fetch line for a job the worker never fetched for', async () => {
     m = await mount(<JobRow kind="backtest" job={{ ...RUNNING, fetch: null }} now={NOW} />);
     expect(m.container.querySelector('[data-testid="job-fetch"]')).toBeNull();

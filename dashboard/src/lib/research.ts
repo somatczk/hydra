@@ -22,6 +22,8 @@ export interface ResearchJob {
   total_trials?: number | null;
   /** The worker's auto-fetch of missing bars, as the job row's `detail.fetch` carries it. */
   fetch?: JobFetch | null;
+  /** The worker holding (or last holding) the job's lease; several workers share the queue. */
+  worker_id?: string | null;
 }
 
 /** `detail.fetch` (data/on_demand.py `_emit`, worker `_fetch_failed`): a failure before any progress has only state and reason. */

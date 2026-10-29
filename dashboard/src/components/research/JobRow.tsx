@@ -45,7 +45,9 @@ export function JobRow({ kind, job, onRefetch, now }: JobRowProps) {
 
   const ageText = jobAgeText(job.status, job.created_at, job.finished_at, now);
   const progressText = jobProgressText(kind, job);
-  const meta = [job.name ? job.strategy_id : null, ageText, progressText].filter(Boolean).join(' · ');
+  const meta = [job.name ? job.strategy_id : null, ageText, progressText, job.worker_id ? `worker ${job.worker_id}` : null]
+    .filter(Boolean)
+    .join(' · ');
 
   let resultHref: string | null = null;
   if (job.status === 'completed') {
