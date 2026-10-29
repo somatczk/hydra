@@ -865,7 +865,7 @@ async def main() -> None:
         await jobs.requeue_abandoned(pool, lease_s, worker_id=WORKER_ID)
         fetch_engine = fetch_clients.fetch_engine(cfg)
         logger.info(
-            "Backtest worker %s started (auto-fetch %s)",
+            "Backtest worker started (id %s, auto-fetch %s)",
             WORKER_ID,
             "on" if fetch_engine is not None else "off",
         )
