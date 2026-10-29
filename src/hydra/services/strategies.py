@@ -791,7 +791,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
 
     if body.ml_overlay:
         config_dict["ml_overlay"] = body.ml_overlay
-    # the builder never sends a schedule: keep the stored one rather than silently drop it
+    # a caller that omits the schedule (MCP, an older client) keeps the stored one; {} clears it
     schedule = data.get("schedule") if body.schedule is None else body.schedule
     if schedule:
         config_dict["schedule"] = schedule
