@@ -700,17 +700,30 @@ async def claim(pool: Any, worker_id: str) -> Any:
         )
 
 
-async def tick(pool: Any, job_id: str, progress: float, detail: dict[str, Any]) -> bool:
-    """Flush progress to the row; True when a cancel was requested."""
+class LeaseLostError(Exception):
+    """The row is no longer this worker's running job: its lease expired and it was requeued."""
+
+
+async def tick(
+    pool: Any, job_id: str, progress: float, detail: dict[str, Any], worker_id: str
+) -> bool:
+    """Flush progress and renew the lease; True when a cancel was requested.
+
+    Raises :class:`LeaseLostError` when the row is no longer running under ``worker_id``.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "UPDATE backtest_jobs SET progress = $2, detail = $3::jsonb, heartbeat_at = now() "
-            "WHERE id = $1 AND status = 'running' RETURNING cancel_requested",
+            "WHERE id = $1 AND status = 'running' AND worker_id = $4 "
+            "RETURNING cancel_requested",
             job_id,
             progress,
             json.dumps(detail),
+            worker_id,
         )
-    return bool(row["cancel_requested"]) if row is not None else False
+    if row is None:
+        raise LeaseLostError(job_id)
+    return bool(row["cancel_requested"])
 
 
 async def finish(
@@ -722,27 +735,32 @@ async def finish(
     result_id: str | None = None,
     error: str | None = None,
     detail: dict[str, Any] | None = None,
-) -> None:
+    worker_id: str,
+) -> bool:
     """Write the job's terminal state, flushing the handler's final ``detail``.
 
     The 10 s tick is not guaranteed to have run since the last mutation (short jobs finish
     inside one tick), so the terminal write persists the detail itself; ``detail=None`` keeps
-    whatever the last tick flushed.
+    whatever the last tick flushed. False when the row is no longer running under
+    ``worker_id`` (the lease expired): nothing is written over the new owner's row.
     """
     async with pool.acquire() as conn:
-        await conn.execute(
+        tag = await conn.execute(
             "UPDATE backtest_jobs SET status = $2, "
             "progress = CASE WHEN $2 = 'completed' THEN 100 ELSE progress END, "
             "detail = COALESCE($6::jsonb, detail), "
             "result = $3::jsonb, result_id = $4, error = $5, cancel_requested = FALSE, "
-            "heartbeat_at = now(), finished_at = now() WHERE id = $1",
+            "heartbeat_at = now(), finished_at = now() "
+            "WHERE id = $1 AND status = 'running' AND worker_id = $7",
             job_id,
             status,
             json.dumps(result) if result is not None else None,
             result_id,
             error,
             json.dumps(detail) if detail is not None else None,
+            worker_id,
         )
+    return tag != "UPDATE 0"
 
 
 async def delete_result_rows(pool: Any, result_id: str) -> None:
@@ -752,20 +770,34 @@ async def delete_result_rows(pool: Any, result_id: str) -> None:
         await conn.execute("DELETE FROM backtest_results WHERE id = $1", result_id)
 
 
-async def requeue_abandoned(pool: Any, max_attempts: int = 3) -> None:
-    """A worker restart requeues rows left running, up to ``max_attempts``; then they are poison."""
-    # shortcut: single worker, so startup requeues all running rows; lease by
-    # heartbeat_at before running more than one worker
+async def requeue_abandoned(
+    pool: Any, lease_s: float, *, worker_id: str | None = None, max_attempts: int = 3
+) -> None:
+    """Requeue running rows whose lease expired, up to ``max_attempts``; then they are poison.
+
+    A row is abandoned when its ``heartbeat_at`` is older than ``lease_s`` (its worker died or
+    lost the database), or when it is still running under ``worker_id`` — this worker's
+    previous incarnation, passed only at startup before anything is claimed. A live peer's row
+    keeps a fresh heartbeat (every tick), so any number of workers may sweep concurrently.
+    """
     async with pool.acquire() as conn, conn.transaction():
         requeued = await conn.fetch(
             "UPDATE backtest_jobs SET status = 'queued' "
-            "WHERE status = 'running' AND attempts < $1 RETURNING id",
+            "WHERE status = 'running' AND attempts < $1 AND (worker_id = $3 "
+            "OR heartbeat_at IS NULL OR heartbeat_at < now() - make_interval(secs => $2)) "
+            "RETURNING id",
             max_attempts,
+            float(lease_s),
+            worker_id,
         )
         poisoned = await conn.fetch(
-            "UPDATE backtest_jobs SET status = 'failed', finished_at = now(), error = $2 "
-            "WHERE status = 'running' AND attempts >= $1 RETURNING id",
+            "UPDATE backtest_jobs SET status = 'failed', finished_at = now(), error = $4 "
+            "WHERE status = 'running' AND attempts >= $1 AND (worker_id = $3 "
+            "OR heartbeat_at IS NULL OR heartbeat_at < now() - make_interval(secs => $2)) "
+            "RETURNING id",
             max_attempts,
+            float(lease_s),
+            worker_id,
             f"worker lost the job {max_attempts} times",
         )
     if requeued:
@@ -774,13 +806,14 @@ async def requeue_abandoned(pool: Any, max_attempts: int = 3) -> None:
         logger.warning("Failed %d job(s) the worker lost %d times", len(poisoned), max_attempts)
 
 
-async def requeue_for_shutdown(pool: Any, job_id: str) -> None:
+async def requeue_for_shutdown(pool: Any, job_id: str, worker_id: str) -> None:
     """A deploy requeues the running job without counting the interrupted attempt."""
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE backtest_jobs SET status = 'queued', attempts = GREATEST(attempts - 1, 0), "
-            "cancel_requested = FALSE WHERE id = $1 AND status = 'running'",
+            "cancel_requested = FALSE WHERE id = $1 AND status = 'running' AND worker_id = $2",
             job_id,
+            worker_id,
         )
 
 

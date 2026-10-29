@@ -504,6 +504,20 @@ class TestDataFields:
         assert (("data", "nope"), "extra_forbidden") in _loc_types(exc_info.value)
 
 
+class TestBacktestFields:
+    def test_the_job_lease_defaults_to_three_minutes(self) -> None:
+        assert load_config().backtest.job_lease_s == 180
+
+    def test_the_job_lease_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_BACKTEST__JOB_LEASE_S", "600")
+        assert load_config().backtest.job_lease_s == 600
+
+    def test_a_lease_near_the_10s_tick_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_BACKTEST__JOB_LEASE_S", "30")
+        with pytest.raises(ValidationError):
+            load_config()
+
+
 def test_repo_base_yaml_sections_match_model() -> None:
     raw = yaml.safe_load((_DEFAULT_CONFIG_DIR / "base.yaml").read_text())
     assert set(raw) <= set(HydraConfig.model_fields)

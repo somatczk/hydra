@@ -3,7 +3,8 @@
 Covers the P2-D2 acceptance: a job survives an engine restart, re-running a job is idempotent, an
 abandoned running job is requeued (then poisoned after 3 losses), cancel and the job timeout work,
 hyperopt and walk-forward results are durable, the strategy config snapshot wins over a later YAML
-edit, and the worker waits for the schema instead of running migrations.
+edit, and the worker waits for the schema instead of running migrations. With several workers, a
+live peer's leased job is never stolen, a stale one is, and the expired worker is fenced out.
 
 Needs HYDRA_DB_HOST/PORT/NAME/USER/PASSWORD (as exported by CI). The tests/infra.py fixtures
 create and drop their own databases, so the target server's data is never touched.
@@ -37,6 +38,7 @@ from hydra.data.storage import MarketDataRepository
 
 pytestmark = pytest.mark.integration
 
+LEASE_S = 180.0
 H1_START = datetime(2026, 1, 1, tzinfo=UTC)
 H1_COUNT = 300
 D1_START = datetime(2024, 1, 1, tzinfo=UTC)
@@ -336,7 +338,7 @@ async def test_abandoned_running_job_is_requeued_then_poisoned(
     assert claimed is not None
     assert (claimed["id"], claimed["attempts"]) == (task_id, 1)
 
-    await jobs.requeue_abandoned(pool)
+    await jobs.requeue_abandoned(pool, LEASE_S, worker_id="w1")  # its restart
     row = await jobs.get(pool, task_id)
     assert row is not None
     assert (row["status"], row["attempts"]) == ("queued", 1)
@@ -354,11 +356,90 @@ async def test_abandoned_running_job_is_requeued_then_poisoned(
         await conn.execute(
             "UPDATE backtest_jobs SET status = 'running', attempts = 3 WHERE id = $1", poisoned_id
         )
-    await jobs.requeue_abandoned(pool)
+    await jobs.requeue_abandoned(pool, LEASE_S)
     row = await jobs.get(pool, poisoned_id)
     assert row is not None
     assert row["status"] == "failed"
     assert row["error"] == "worker lost the job 3 times"
+
+
+async def _backdate_heartbeat(pool: Any, job_id: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE backtest_jobs SET heartbeat_at = now() - make_interval(secs => $2) "
+            "WHERE id = $1",
+            job_id,
+            LEASE_S + 1.0,
+        )
+
+
+async def test_two_workers_a_live_peer_keeps_its_job_and_a_stale_one_is_requeued(
+    pool: Any,
+) -> None:
+    for _ in range(2):
+        await jobs.enqueue(pool, "backtest", {}, {}, {})
+    stale = await jobs.claim(pool, "w1")
+    live = await jobs.claim(pool, "w2")
+    assert stale is not None and live is not None
+    stale_id, live_id = stale["id"], live["id"]
+
+    await _backdate_heartbeat(pool, stale_id)  # w1 died; w2 keeps ticking
+    assert not await jobs.tick(pool, live_id, 5.0, {}, "w2")
+    await jobs.requeue_abandoned(pool, LEASE_S, worker_id="w3")  # w3's sweep
+
+    rows = {r["id"]: r for r in [await jobs.get(pool, stale_id), await jobs.get(pool, live_id)]}
+    assert (rows[stale_id]["status"], rows[stale_id]["attempts"]) == ("queued", 1)
+    assert (rows[live_id]["status"], rows[live_id]["worker_id"]) == ("running", "w2")
+    assert rows[live_id]["attempts"] == 1
+
+    # w3 picks the stale job up; w1, if it was only partitioned, is fenced out of the row
+    again = await jobs.claim(pool, "w3")
+    assert again is not None
+    assert (again["id"], again["attempts"]) == (stale_id, 2)
+    with pytest.raises(jobs.LeaseLostError):
+        await jobs.tick(pool, stale_id, 99.0, {"from": "w1"}, "w1")
+    assert not await jobs.finish(pool, stale_id, "completed", worker_id="w1")
+    await jobs.requeue_for_shutdown(pool, stale_id, "w1")
+    row = await jobs.get(pool, stale_id)
+    assert row is not None
+    assert (row["status"], row["worker_id"], row["attempts"]) == ("running", "w3", 2)
+    assert row["progress"] == 0
+    assert await jobs.finish(pool, stale_id, "completed", worker_id="w3")
+
+    # a restarted worker reclaims its previous incarnation's row without waiting for the lease
+    await jobs.requeue_abandoned(pool, LEASE_S, worker_id="w2")
+    row = await jobs.get(pool, live_id)
+    assert row is not None
+    assert row["status"] == "queued"
+
+
+async def test_a_worker_whose_lease_expired_abandons_the_running_job(
+    pool: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+
+    async def _slow(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
+        started.set()
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _slow})
+    job_id = await jobs.enqueue(pool, "backtest", {}, {}, {})
+    job = await jobs.claim(pool, "w1")
+    assert job is not None
+    run_task = asyncio.create_task(worker._run_claimed(pool, job, tick_s=0.05))
+    await asyncio.wait_for(started.wait(), 5)
+
+    # w1 stalled past its lease, so a peer's sweep requeued the job (the sweep itself is pinned
+    # above; w1 still ticking here would renew a backdated heartbeat) and w2 claims it
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE backtest_jobs SET status = 'queued' WHERE id = $1", job_id)
+    assert (await jobs.claim(pool, "w2")) is not None
+
+    await asyncio.wait_for(run_task, 5)  # w1's next tick finds the lease lost
+    row = await jobs.get(pool, job_id)
+    assert row is not None
+    assert (row["status"], row["worker_id"], row["attempts"]) == ("running", "w2", 2)
+    assert row["finished_at"] is None
 
 
 async def test_cancel_queued_job(
