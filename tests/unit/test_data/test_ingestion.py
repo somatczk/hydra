@@ -28,6 +28,7 @@ from tests.fixtures.binance_kline import (
     BinanceKlineDriver,
     FakeRestExchange,
     FakeWsExchange,
+    binanceusdm_markets,
 )
 
 DAY = datetime(2026, 3, 2, tzinfo=UTC)
@@ -148,6 +149,8 @@ class Harness:
         repo: MemoryRepo | None = None,
         rest: FakeRestExchange | None = None,
         sleep: Callable[[float], Any] = _fast_sleep,
+        exchange: str = "binance",
+        ws_markets: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self.bus = InMemoryEventBus()
@@ -156,6 +159,8 @@ class Harness:
         self.rest = rest or FakeRestExchange()
         self.clock = clock
         self.driver = BinanceKlineDriver()
+        self._exchange = exchange
+        self._ws_markets = ws_markets
         options: dict[str, Any] = {
             "ws_silence_s": 1e6,
             "stale_after_bars": 10_000,
@@ -166,7 +171,7 @@ class Harness:
         options.update(kwargs)
         self.feed = ExchangeFeedManager(
             event_bus=self.bus,
-            exchange_factories={"binance": self._new_ws},
+            exchange_factories={exchange: self._new_ws},
             repository=repo,
             rest_factory=lambda _eid: self.rest,
             clock=clock,
@@ -175,7 +180,7 @@ class Harness:
         )
 
     def _new_ws(self) -> FakeWsExchange:
-        ws = FakeWsExchange()
+        ws = FakeWsExchange(self._ws_markets)
         self.ws.append(ws)
         return ws
 
@@ -184,7 +189,9 @@ class Harness:
     ) -> None:
         for event_type in ("bar", "price", "feed_status"):
             await self.bus.subscribe(event_type, self.recorder)
-        await self.feed.connect("binance", symbols or ["BTCUSDT"], timeframes or [Timeframe.H1])
+        await self.feed.connect(
+            self._exchange, symbols or ["BTCUSDT"], timeframes or [Timeframe.H1]
+        )
 
     def kline(
         self,
@@ -682,6 +689,69 @@ async def test_warm_up_seeds_live_assembler() -> None:
     await until(lambda: len(h.recorder.bars) == 1)
     assert [b.ohlcv.timestamp for b in h.recorder.bars if b.ohlcv] == [end + H]
     await h.stop()
+
+
+# ---------------------------------------------------------------------------
+# The FUTURES venue's warm-up and feed (the 2.8.0 on-box battery hotfix)
+# ---------------------------------------------------------------------------
+
+
+async def test_futures_warm_up_resolves_the_venues_linear_swaps() -> None:
+    """A binanceusdm warm-up resolves BTCUSDT on the venue's own markets and fetches.
+
+    The 2.8.0 on-box catch: the venue loads linear swaps only — no spot market
+    exists — so the spot-only resolution killed every FUTURES session start with
+    ``symbol 'BTCUSDT' must match exactly one spot market, got no spot market``.
+    """
+    now = DAY + 2 * 24 * H + 25 * M
+    end = last_closed_open(now, Timeframe.H1)
+    rest = FakeRestExchange(
+        [_row(end - i * H, 100.0 + i) for i in range(30)], markets=binanceusdm_markets()
+    )
+    h = Harness(Clock(now), rest=rest, history_window=20, exchange="binanceusdm")
+
+    warm = await h.feed.warm_up(["BTCUSDT"], [Timeframe.H1], min_bars=10, exchange_id="binanceusdm")
+
+    bars = warm[("BTCUSDT", Timeframe.H1)]
+    assert len(bars) == 20
+    assert bars[-1].timestamp == end
+    assert rest.calls[0][0] == "BTC/USDT:USDT"  # the venue's unified perp symbol
+
+
+async def test_futures_warm_up_refuses_a_symbol_with_no_linear_swap() -> None:
+    """The futures venue's own error names its market type, not spot's."""
+    h = Harness(Clock(DAY), exchange="binanceusdm")
+    with pytest.raises(ValueError, match="linear swap market"):
+        await h.feed.warm_up(["DOGEUSDT"], [Timeframe.H1], min_bars=10, exchange_id="binanceusdm")
+
+
+async def test_futures_connect_subscribes_the_venues_unified_symbol() -> None:
+    """The websocket feed build resolves the same way the warm-up does (one seam)."""
+    h = Harness(Clock(DAY), exchange="binanceusdm", ws_markets=binanceusdm_markets())
+    await h.start()
+    await until(lambda: h.ws[0].subscriptions)
+    assert h.ws[0].subscriptions[0] == [["BTC/USDT:USDT", "1h"]]
+    await h.stop()
+
+
+async def test_default_rest_factory_builds_the_venues_class() -> None:
+    """The no-pool fallback constructs the venue's ccxt class with its market-type
+    options (construction only; nothing is fetched)."""
+    rest = ingestion._default_rest_factory("binanceusdm")
+    try:
+        assert rest.id == "binanceusdm"
+        assert rest.options["defaultType"] == "swap"
+        assert rest.options["defaultSubType"] == "linear"
+        assert rest.options["fetchMarkets"]["types"] == ["linear"]
+    finally:
+        await rest.close()
+    spot = ingestion._default_rest_factory("binance")
+    try:
+        assert spot.id == "binance"
+        assert spot.options["defaultType"] == "spot"
+        assert spot.options["fetchMarkets"]["types"] == ["spot"]
+    finally:
+        await spot.close()
 
 
 async def test_consumer_lag_marks_stale_then_live() -> None:
