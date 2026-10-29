@@ -5,11 +5,13 @@ import type { ResearchJob } from '@/lib/research';
 import {
   advance,
   buttonByText,
+  choose,
   click,
   dialogPolyfill,
   flush,
   mount,
   sectionText,
+  selectByLabel,
   unavailable,
   type Mounted,
 } from '@/test/pageHarness';
@@ -142,6 +144,35 @@ describe('BacktestPage', () => {
 
     await click(buttonByText(page.container, 'Run Backtest'));
     expect(posts[0]).toMatchObject({ strategy_id: 'saw', timeframe: '4h', start_date: '2026-01-01' });
+  });
+
+  it('offers the model pin only for a strategy that serves a model, and sends it only when chosen', async () => {
+    serve({
+      'GET /api/backtest/strategies': [
+        { id: 'saw', name: 'Saw', primary_timeframe: '4h', model_names: [] },
+        { id: 'native', name: 'Native', primary_timeframe: '1h', model_names: ['alpha'] },
+      ],
+      'GET /api/models': [
+        { id: 'a1', name: 'alpha', version: 1, stage: 'Production' },
+        { id: 'a2', name: 'alpha', version: 2, stage: 'Staging' },
+      ],
+      'POST /api/backtest/run': { task_id: 'task-9' },
+    });
+    page = await mount(<BacktestPage />);
+    expect(page.container.textContent).not.toContain('Model version');
+
+    await choose(selectByLabel(page.container, 'Strategy'), 'native');
+    await click(buttonByText(page.container, 'Run Backtest'));
+    expect(posts[0]).toMatchObject({ strategy_id: 'native' });
+    expect(posts[0]).not.toHaveProperty('model_version_id');
+
+    await choose(selectByLabel(page.container, 'Model version'), 'a2');
+    await click(buttonByText(page.container, 'Run Backtest'));
+    expect(posts[1]).toMatchObject({ strategy_id: 'native', model_version_id: 'a2' });
+
+    await choose(selectByLabel(page.container, 'Strategy'), 'saw');
+    await choose(selectByLabel(page.container, 'Strategy'), 'native');
+    expect(selectByLabel(page.container, 'Model version').value).toBe('');
   });
 
   it('Save & Backtest autorun waits for the strategy primary timeframe', async () => {

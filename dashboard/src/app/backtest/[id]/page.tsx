@@ -130,6 +130,8 @@ interface TxnRow {
 interface JobStatus {
   fetch?: JobFetch | null;
   fetch_error?: string | null;
+  /** The job's provenance; only it records the model versions the run served. */
+  provenance?: DataProvenance | null;
 }
 
 /** Share tokens live in the API process's memory; this sentence is the whole contract the UI can promise. */
@@ -512,7 +514,13 @@ export default function BacktestDetailPage() {
         </Section>
       )}
 
-      <ProvenancePanel provenance={detail.provenance} />
+      <ProvenancePanel
+        provenance={
+          detail.provenance && jobStatus?.provenance?.ml_models
+            ? { ...detail.provenance, ml_models: jobStatus.provenance.ml_models }
+            : detail.provenance
+        }
+      />
       {jobStatus?.fetch && (
         <p className="text-xs text-ink-2" data-testid="result-fetch">{fetchLine(jobStatus.fetch)}</p>
       )}

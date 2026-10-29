@@ -108,6 +108,31 @@ describe('ProvenancePanel', () => {
     expect(hash?.getAttribute('title')).toBe('aabbccddeeff0099');
   });
 
+  it('names each model version the job served, its stage and whether it was pinned', async () => {
+    page = await mount(
+      <ProvenancePanel
+        provenance={{
+          ...PROV,
+          ml_models: [
+            { id: 'id-alpha-2', name: 'alpha', version: 2, stage: 'staging', pinned: true },
+            { id: 'id-gate-5', name: 'gate', version: 5, stage: 'production', pinned: false },
+          ],
+        }}
+      />,
+    );
+    const rows = Array.from(page.container.querySelectorAll('ul[aria-label="Models served"] li'));
+    expect(rows.map((r) => r.textContent)).toEqual([
+      'Model alpha v2StagingPinned for this run',
+      'Model gate v5Production',
+    ]);
+    expect(rows[0].getAttribute('title')).toBe('id-alpha-2');
+  });
+
+  it('lists no models for a run that served none', async () => {
+    page = await mount(<ProvenancePanel provenance={{ ...PROV, ml_models: [] }} />);
+    expect(page.container.querySelector('ul[aria-label="Models served"]')).toBeNull();
+  });
+
   it('hides both rows when neither field is present, never an em dash', async () => {
     page = await mount(<ProvenancePanel provenance={PROV} />);
     const text = page.container.textContent ?? '';

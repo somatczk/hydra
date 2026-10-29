@@ -212,6 +212,12 @@ export function trialStatusText(status: string | null | undefined): string | nul
   return null;
 }
 
+/** A registry stage as a badge; the models API says 'Production', job provenance 'production'. */
+export function stageBadge(stage: string): { label: string; variant: 'success' | 'info' | 'neutral' } {
+  const label = stage.charAt(0).toUpperCase() + stage.slice(1).toLowerCase();
+  return { label, variant: label === 'Production' ? 'success' : label === 'Staging' ? 'info' : 'neutral' };
+}
+
 /** Params to the wire shape the run endpoints require; the editor-only step never crosses. */
 export function paramSpaceBody(defs: StrategyParamDef[]): WireParamDef[] {
   return defs.map((d) => ({ name: d.name, type: d.type, low: d.min, high: d.max }));

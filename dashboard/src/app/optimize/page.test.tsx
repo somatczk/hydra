@@ -5,10 +5,12 @@ import type { ResearchJob } from '@/lib/research';
 import {
   advance,
   buttonByText,
+  choose,
   click,
   flush,
   mount,
   sectionText,
+  selectByLabel,
   unavailable,
   type Mounted,
 } from '@/test/pageHarness';
@@ -406,6 +408,31 @@ describe('OptimizePage submissions', () => {
 
     expect(page.container.textContent).toContain('RSI Period');
     expect(page.container.textContent).not.toContain('SMA Period');
+  });
+});
+
+describe('OptimizePage model pin', () => {
+  it.each([
+    ['hyperopt', 'Run Hyperopt', 'POST /api/backtest/hyperopt'],
+    ['walkforward', 'Run Walk-forward', 'POST /api/backtest/walkforward'],
+  ])('a %s run sends model_version_id only for a chosen non-Production version', async (mode, button, route) => {
+    serve({
+      'GET /api/backtest/strategies': () => [{ id: 'saw', name: 'Saw', model_names: ['alpha'] }],
+      'GET /api/models': () => [
+        { id: 'a1', name: 'alpha', version: 1, stage: 'Production' },
+        { id: 'a2', name: 'alpha', version: 2, stage: 'Staging' },
+      ],
+      [route]: () => ({ task_id: `${mode}-1` }),
+    });
+    page = await mount(<OptimizePage />);
+    if (mode === 'walkforward') await click(buttonByText(page.container, 'Walk-forward'));
+
+    await click(buttonByText(page.container, button));
+    expect(posts[0]).not.toHaveProperty('model_version_id');
+
+    await choose(selectByLabel(page.container, 'Model version'), 'a2');
+    await click(buttonByText(page.container, button));
+    expect(posts[1]).toMatchObject({ strategy_id: 'saw', model_version_id: 'a2' });
   });
 });
 

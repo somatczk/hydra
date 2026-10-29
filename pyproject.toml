@@ -50,7 +50,6 @@ dependencies = [
 [project.optional-dependencies]
 ml-training = [
     "xgboost>=3.2,<4",
-    "lightgbm>=4.5,<5",
     "scikit-learn>=1.6,<2",
     "onnxmltools>=1.12,<2",
 ]
@@ -127,7 +126,7 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["msgpack", "msgpack.*", "asyncpg", "asyncpg.*", "ccxt", "ccxt.*", "talib", "talib.*", "onnxruntime", "onnxruntime.*", "onnxmltools", "onnxmltools.*", "xgboost", "xgboost.*", "lightgbm", "lightgbm.*", "optuna", "optuna.*", "sklearn", "sklearn.*", "scipy", "scipy.*"]
+module = ["msgpack", "msgpack.*", "asyncpg", "asyncpg.*", "ccxt", "ccxt.*", "talib", "talib.*", "onnxruntime", "onnxruntime.*", "onnxmltools", "onnxmltools.*", "xgboost", "xgboost.*", "optuna", "optuna.*", "sklearn", "sklearn.*", "scipy", "scipy.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

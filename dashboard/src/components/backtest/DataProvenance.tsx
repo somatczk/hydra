@@ -1,6 +1,16 @@
 import { AlertTriangle } from 'lucide-react';
 import { DataStateBadge } from '@/components/ui/DataStateBadge';
 import { StatusBadge } from '@/components/ui/StatusBadge';
+import { stageBadge } from '@/lib/research';
+
+/** One registry version a research job served (`provenance.ml_models`). */
+export interface MlModelProvenance {
+  id: string;
+  name: string;
+  version: number;
+  stage: string;
+  pinned: boolean;
+}
 
 /** Which stored bars a backtest ran on, as returned by the API. */
 export interface DataProvenance {
@@ -17,6 +27,8 @@ export interface DataProvenance {
   /** Job-row provenance only (hyperopt/WF reads); result reads never carry them. */
   hydra_version?: string | null;
   config_hash?: string | null;
+  /** The model versions the job served; a backtest result reads them from its job. */
+  ml_models?: MlModelProvenance[] | null;
 }
 
 const TIMEFRAME_MS: Record<string, number> = {
@@ -135,6 +147,20 @@ export function ProvenancePanel({ provenance }: { provenance: DataProvenance | n
             <span title={provenance.config_hash}>Config {short(provenance.config_hash)}</span>
           )}
         </p>
+      )}
+      {provenance.ml_models && provenance.ml_models.length > 0 && (
+        <ul className="mt-2 flex flex-col gap-1 text-xs" aria-label="Models served">
+          {provenance.ml_models.map((m) => {
+            const stage = stageBadge(m.stage);
+            return (
+              <li key={m.id} title={m.id} className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-ink-1">Model {m.name} v{m.version}</span>
+                <StatusBadge status={stage.label} variant={stage.variant} size="sm" />
+                {m.pinned && <span className="text-ink-2">Pinned for this run</span>}
+              </li>
+            );
+          })}
+        </ul>
       )}
       {warnings.length > 0 && (
         <ul className="mt-2 flex flex-col gap-1">

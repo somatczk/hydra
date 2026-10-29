@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { Select } from '@/components/ui/Select';
 import { Input } from '@/components/ui/Input';
 import { IndicatorPicker } from './IndicatorPicker';
-import { bindingsText, dropBindings, formatIndicatorRef, parseIndicatorRef } from './bindings';
+import { bindingsText, dropBindings, formatIndicatorRef, parseIndicatorRef, unknownTargets } from './bindings';
 import type {
   BuilderCondition,
   ConditionParams,
@@ -55,6 +55,10 @@ export function ConditionRow({
     return { bindings: kept };
   };
   const bound = bindingsText(condition.bindings, condition.params);
+  const known = indicators.find((i) => i.name === condition.indicator)?.params.map((p) => p.name);
+  const unknown = unknownTargets(condition.bindings?.param_overrides, known);
+  const refKnown = ref ? indicators.find((i) => i.name === ref.name)?.params.map((p) => p.name) : undefined;
+  const ignored = unknownTargets(condition.bindings?.value_ref_overrides, refKnown);
   const comparatorOptions = comparators.map((c) => ({
     value: c.value,
     label: c.label,
@@ -129,9 +133,24 @@ export function ConditionRow({
           </div>
         )}
 
-        {(bound || dropped.length > 0) && (
+        {(bound || dropped.length > 0 || unknown.length > 0 || ignored.length > 0) && (
           <div className="flex flex-col gap-1 text-xs text-ink-2 md:col-span-12">
             {bound && <p data-testid="condition-bindings">{bound}</p>}
+            {unknown.length > 0 && (
+              <p role="alert" className="text-danger" data-testid="binding-target-error">
+                {unknown.map((name) => `${name} → ${condition.bindings?.param_overrides?.[name]}`).join(', ')}:{' '}
+                {condition.indicator} takes {known?.join(', ') || 'no parameters'}, so saving is refused until the
+                binding goes; changing the indicator drops it.
+              </p>
+            )}
+            {ref && ignored.length > 0 && (
+              <p role="status" className="text-caution" data-testid="binding-ref-ignored">
+                {ignored.map((name) => `${name} → compared ${condition.bindings?.value_ref_overrides?.[name]}`).join(', ')}:{' '}
+                {ref.name} takes {refKnown?.join(', ') || 'no parameters'}, so the engine ignores{' '}
+                {ignored.length === 1 ? 'this binding' : 'these bindings'} and hyperopt cannot set{' '}
+                {ignored.length === 1 ? 'it' : 'them'}.
+              </p>
+            )}
             {dropped.length > 0 && (
               <p role="status" className="text-caution">
                 Dropped {dropped.join(', ')}: {dropped.length === 1 ? 'it' : 'they'} bound what this condition no longer

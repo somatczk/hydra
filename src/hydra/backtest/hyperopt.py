@@ -41,6 +41,7 @@ from hydra.backtest.validation import (
 )
 from hydra.core.types import OHLCV, Timeframe
 from hydra.strategy.base import BaseStrategy
+from hydra.strategy.builtin.ml_ensemble import STRATEGY_CLASS as ML_NATIVE_CLASS
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy, bindable_params, param_bindings
 from hydra.strategy.condition_schema import RuleSet
 from hydra.strategy.config import StrategyConfig
@@ -197,7 +198,27 @@ def param_space_problems(
             f"param_space names the strategy never reads: {', '.join(unread)} "
             "(strategy_params lists the names a rule-based strategy binds)"
         )
+    untunable = untunable_param_problem(param_space, base_config)
+    if untunable:
+        problems.append(untunable)
     return problems
+
+
+def untunable_param_problem(param_space: ParameterSpace, base_config: StrategyConfig) -> str | None:
+    """Why a trial cannot vary the ML-native ``model_name``; None when the space does not.
+
+    The name is readable, but a job attaches its model once, before the run, so a trial
+    naming another model would hit one nothing bound. An ``ml_overlay`` name sits outside
+    ``parameters`` and is already unread.
+    """
+    if base_config.strategy_class != ML_NATIVE_CLASS:
+        return None
+    if all(p.name != "model_name" for p in param_space.params):
+        return None
+    return (
+        "param_space varies model_name, but a run serves only the model attached before "
+        "it starts; pin one registry version with model_version_id instead"
+    )
 
 
 # ---------------------------------------------------------------------------

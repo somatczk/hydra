@@ -2,7 +2,7 @@
  * and walk-forward rewire. The builder never authors them; it carries them through untouched and drops only the ones a
  * user edit invalidates. `param_overrides: {}` is an explicit opt-out of the implicit `{indicator}_{param}` binding. */
 
-import type { BuilderState, ConditionParams, RuleSection } from './types';
+import type { BuilderState, ConditionParams, IndicatorSchema, RuleSection } from './types';
 
 export interface ConditionBindings {
   param_key?: string;
@@ -54,6 +54,24 @@ export function bindingsText(bindings: ConditionBindings | undefined, params: Co
   return parts.length > 0 ? `Strategy parameter bindings: ${parts.join(', ')}` : null;
 }
 
+/** Each indicator's params with their registry defaults (`GET /api/strategies/indicators`): the signature the
+ * engine's indicator_params reads. A param with no default is null. */
+export type Catalogue = Record<string, Record<string, number | null>>;
+
+export function catalogueOf(indicators: IndicatorSchema[]): Catalogue {
+  return Object.fromEntries(indicators.map((i) => [i.name, Object.fromEntries(i.params.map((p) => [p.name, p.default]))]));
+}
+
+/** The override names whose target the indicator does not take (`known`, its registry params). The engine
+ * refuses such a `param_overrides` target at save and skips such a `value_ref_overrides` key. An indicator the
+ * catalogue does not list (`known` undefined) is left to the engine. */
+export function unknownTargets(overrides: Record<string, string> | undefined, known: string[] | undefined): string[] {
+  if (!known) return [];
+  return Object.entries(overrides ?? {})
+    .filter(([, key]) => !known.includes(key))
+    .map(([name]) => name);
+}
+
 /** A condition value naming another indicator, `"name:k=v,k=v"`, as rule_engine.parse_indicator_ref reads it. */
 export function parseIndicatorRef(ref: string): { name: string; params: ConditionParams } {
   const [name, args = ''] = ref.split(':');
@@ -99,10 +117,15 @@ interface BindableCondition {
 
 type BindableRules = Pick<BuilderState, RuleSection> | Record<RuleSection, { conditions: BindableCondition[] }>;
 
-/** Every top-level name the rules bind, with its sites in rule order. A `param_overrides` target the condition's
- * params lack still binds (the engine refuses an unknown one at save); the catalogue is not needed. */
-export function paramBindings(rules: BindableRules): Record<string, BindingSite[]> {
+/** Every top-level name the rules bind, with its sites in rule order. With the `catalogue` it binds as the engine
+ * does: an override the condition's params lack takes the indicator's registry default, and a `value_ref_overrides`
+ * key the compared indicator does not take is skipped. A `param_overrides` target the indicator does not take still
+ * binds (the engine refuses it at save; unknownTargets flags it), and an indicator the catalogue does not list binds
+ * from its params alone. */
+export function paramBindings(rules: BindableRules, catalogue?: Catalogue): Record<string, BindingSite[]> {
   const table: Record<string, BindingSite[]> = {};
+  const valueOf = (indicator: string, params: ConditionParams, key: string) =>
+    params[key] ?? catalogue?.[indicator]?.[key] ?? undefined;
   const bind = (name: string, site: BindingSite) => {
     (table[name] ??= []).push(site);
   };
@@ -113,11 +136,16 @@ export function paramBindings(rules: BindableRules): Record<string, BindingSite[
         ({ group, index, target, key, value, implicit }) satisfies BindingSite;
       const firstKey = Object.keys(cond.params)[0];
       if (b.param_key && firstKey !== undefined) bind(b.param_key, site('params', firstKey, cond.params[firstKey]));
-      for (const [name, key] of Object.entries(b.param_overrides ?? {})) bind(name, site('params', key, cond.params[key]));
+      for (const [name, key] of Object.entries(b.param_overrides ?? {})) {
+        bind(name, site('params', key, valueOf(cond.indicator, cond.params, key)));
+      }
       if (b.value_param_key && typeof cond.value === 'number') bind(b.value_param_key, site('value', 'value', cond.value));
       const ref = typeof cond.value === 'string' ? parseIndicatorRef(cond.value) : null;
       if (b.value_ref_overrides && ref) {
-        for (const [name, key] of Object.entries(b.value_ref_overrides)) bind(name, site('ref', key, ref.params[key]));
+        const known = catalogue?.[ref.name];
+        for (const [name, key] of Object.entries(b.value_ref_overrides)) {
+          if (!known || key in known) bind(name, site('ref', key, valueOf(ref.name, ref.params, key)));
+        }
       }
       if (!b.param_key && b.param_overrides === undefined) {
         for (const [key, value] of Object.entries(cond.params)) bind(`${cond.indicator}_${key}`, site('params', key, value, true));
@@ -136,6 +164,6 @@ export function ambiguous(sites: BindingSite[]): boolean {
 }
 
 /** The names a top-level parameter can set (rule_based.bindable_params). */
-export function bindableParams(rules: BindableRules): Record<string, BindingSite[]> {
-  return Object.fromEntries(Object.entries(paramBindings(rules)).filter(([, sites]) => !ambiguous(sites)));
+export function bindableParams(rules: BindableRules, catalogue?: Catalogue): Record<string, BindingSite[]> {
+  return Object.fromEntries(Object.entries(paramBindings(rules, catalogue)).filter(([, sites]) => !ambiguous(sites)));
 }
