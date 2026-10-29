@@ -50,6 +50,8 @@ function serializeGroup(
       params: c.params,
       comparator: c.comparator,
       value: c.value,
+      // hyperopt bindings ride through untouched (the builder only ever drops invalidated ones)
+      ...c.bindings,
     })),
   };
 }

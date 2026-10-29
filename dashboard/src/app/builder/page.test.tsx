@@ -162,6 +162,75 @@ describe('BuilderPage schedule', () => {
   });
 });
 
+describe('BuilderPage bindings round-trip', () => {
+  it('re-saves a hand-written strategy with every condition binding intact', async () => {
+    const rules = {
+      entry_long: {
+        operator: 'AND',
+        conditions: [
+          {
+            indicator: 'rsi',
+            params: { period: 14 },
+            comparator: 'less_than',
+            value: 30,
+            param_key: 'rsi_period',
+            param_overrides: null,
+            value_param_key: 'rsi_lower',
+            value_ref_overrides: null,
+          },
+          {
+            indicator: 'close',
+            params: {},
+            comparator: 'crosses_above',
+            value: 'sma:period=50',
+            param_key: null,
+            param_overrides: {},
+            value_param_key: null,
+            value_ref_overrides: { sma_slow: 'period' },
+          },
+        ],
+      },
+      exit_long: {
+        operator: 'OR',
+        conditions: [
+          {
+            indicator: 'bollinger_upper',
+            params: { period: 20, std_dev: 2 },
+            comparator: 'greater_than',
+            value: 'close',
+            param_key: null,
+            param_overrides: { bb_len: 'period', bb_width: 'std_dev' },
+            value_param_key: null,
+            value_ref_overrides: null,
+          },
+        ],
+      },
+      entry_short: null,
+      exit_short: null,
+    };
+    const r = routes();
+    r['/api/strategies/strat-1'] = { ...STRATEGY, rules };
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+
+    const put = calls.find((c) => c.init?.method === 'PUT');
+    const strip = (c: Record<string, unknown>) => Object.fromEntries(Object.entries(c).filter(([, v]) => v !== null));
+    const stored = (g: { operator: string; conditions: Array<Record<string, unknown>> }) => ({
+      operator: g.operator,
+      conditions: g.conditions.map(strip),
+    });
+    expect(JSON.parse(String(put?.init?.body)).rules).toEqual({
+      entry_long: stored(rules.entry_long),
+      exit_long: stored(rules.exit_long),
+      entry_short: null,
+      exit_short: null,
+    });
+  });
+});
+
 describe('BuilderPage scope', () => {
   it('has one h1 and no DCA, Grid or ML overlay controls', async () => {
     fetchApi.mockImplementation(routeFetch(routes(), calls));

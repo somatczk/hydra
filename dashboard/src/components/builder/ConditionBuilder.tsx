@@ -6,9 +6,9 @@ import { ConditionRow } from './ConditionRow';
 import type {
   BuilderCondition,
   BuilderConditionGroup,
-  ConditionParams,
   IndicatorSchema,
   ComparatorSchema,
+  ConditionFieldValue,
 } from './types';
 
 interface ConditionBuilderProps {
@@ -20,7 +20,7 @@ interface ConditionBuilderProps {
   onUpdateCondition: (
     conditionId: string,
     field: keyof BuilderCondition,
-    value: string | number | ConditionParams,
+    value: ConditionFieldValue,
   ) => void;
   onSetOperator: (operator: 'AND' | 'OR') => void;
 }

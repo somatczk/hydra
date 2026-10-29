@@ -6,9 +6,9 @@ import { ConditionBuilder } from './ConditionBuilder';
 import type {
   BuilderCondition,
   BuilderConditionGroup,
-  ConditionParams,
   IndicatorSchema,
   ComparatorSchema,
+  ConditionFieldValue,
 } from './types';
 
 interface RuleSectionProps {
@@ -23,7 +23,7 @@ interface RuleSectionProps {
   onUpdateCondition: (
     conditionId: string,
     field: keyof BuilderCondition,
-    value: string | number | ConditionParams,
+    value: ConditionFieldValue,
   ) => void;
   onSetOperator: (operator: 'AND' | 'OR') => void;
 }

@@ -141,6 +141,42 @@ describe('ConditionRow', () => {
     await choose(selectByLabel(page.container, 'Compare to'), 'indicator');
     expect(onUpdate).toHaveBeenLastCalledWith('value', 'close');
   });
+
+  it('shows the stored bindings, and drops and names the ones an indicator change invalidates', async () => {
+    const onUpdate = vi.fn();
+    const condition: BuilderCondition = {
+      ...CONDITION,
+      bindings: { param_key: 'rsi_period', value_param_key: 'rsi_lower' },
+    };
+    page = await mount(
+      <ConditionRow condition={condition} indicators={[...INDICATORS, MACD]} comparators={COMPARATORS} onUpdate={onUpdate} onRemove={vi.fn()} />,
+    );
+
+    expect(page.container.querySelector('[data-testid="condition-bindings"]')?.textContent).toBe(
+      'Strategy parameter bindings: rsi_period → period, rsi_lower → value',
+    );
+    await choose(selectByLabel(page.container, 'Indicator'), 'macd');
+    expect(onUpdate.mock.calls).toEqual([
+      ['indicator', 'macd'],
+      ['params', { fast: 12, slow: 26, signal: 9 }],
+      ['bindings', { value_param_key: 'rsi_lower' }],
+    ]);
+    expect(page.container.querySelector('[role="status"]')?.textContent).toContain('Dropped rsi_period: it bound');
+  });
+
+  it('drops the value-side binding when the comparison switches from a number to an indicator', async () => {
+    const onUpdate = vi.fn();
+    const condition: BuilderCondition = { ...CONDITION, bindings: { param_key: 'rsi_period', value_param_key: 'rsi_lower' } };
+    page = await mount(
+      <ConditionRow condition={condition} indicators={[...INDICATORS, CLOSE]} comparators={COMPARATORS} onUpdate={onUpdate} onRemove={vi.fn()} />,
+    );
+
+    await choose(selectByLabel(page.container, 'Compare to'), 'indicator');
+    expect(onUpdate.mock.calls).toEqual([
+      ['value', 'close'],
+      ['bindings', { param_key: 'rsi_period' }],
+    ]);
+  });
 });
 
 describe('indicator references', () => {

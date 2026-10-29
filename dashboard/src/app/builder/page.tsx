@@ -17,6 +17,7 @@ import { describeApiError } from '@/lib/apiState';
 import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
 import { scheduleFromWire } from '@/lib/schedule';
+import { bindingsOf } from '@/components/builder/bindings';
 import type {
   BuilderState,
   BuilderAction,
@@ -24,7 +25,6 @@ import type {
   BuilderConditionGroup,
   IndicatorSchema,
   ComparatorSchema,
-  ConditionParams,
   StopLossConfig,
   TakeProfitConfig,
   SizingConfig,
@@ -32,6 +32,7 @@ import type {
   RuleSection as RuleSectionKey,
   StrategyDetail,
   SerializedConditionGroup,
+  ConditionFieldValue,
 } from '@/components/builder/types';
 
 /* ---------- Initial state ---------- */
@@ -97,6 +98,7 @@ function apiGroupToBuilder(
       params: c.params,
       comparator: c.comparator,
       value: c.value,
+      bindings: bindingsOf(c),
     })),
   };
 }
@@ -525,7 +527,7 @@ function BuilderPageContent() {
             onUpdateCondition={(
               conditionId: string,
               field: keyof BuilderCondition,
-              value: string | number | ConditionParams,
+              value: ConditionFieldValue,
             ) => dispatch({ type: 'UPDATE_CONDITION', section: section.key, conditionId, field, value })}
             onSetOperator={(operator: 'AND' | 'OR') =>
               dispatch({ type: 'SET_OPERATOR', section: section.key, operator })

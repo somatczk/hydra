@@ -1,22 +1,25 @@
 'use client';
 
+import { useState } from 'react';
 import { X } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Select } from '@/components/ui/Select';
 import { Input } from '@/components/ui/Input';
 import { IndicatorPicker } from './IndicatorPicker';
+import { bindingsText, dropBindings } from './bindings';
 import type {
   BuilderCondition,
   ConditionParams,
   IndicatorSchema,
   ComparatorSchema,
+  ConditionFieldValue,
 } from './types';
 
 interface ConditionRowProps {
   condition: BuilderCondition;
   indicators: IndicatorSchema[];
   comparators: ComparatorSchema[];
-  onUpdate: (field: keyof BuilderCondition, value: string | number | ConditionParams) => void;
+  onUpdate: (field: keyof BuilderCondition, value: ConditionFieldValue) => void;
   onRemove: () => void;
 }
 
@@ -56,6 +59,15 @@ export function ConditionRow({
   onRemove,
 }: ConditionRowProps) {
   const ref = typeof condition.value === 'string' ? parseIndicatorRef(condition.value) : null;
+  const [dropped, setDropped] = useState<string[]>([]);
+  /** An edit that changes what one side of the condition is invalidates that side's stored bindings. */
+  const dropSide = (side: 'indicator' | 'value') => {
+    const { kept, dropped: names } = dropBindings(condition.bindings, side);
+    if (names.length === 0) return;
+    onUpdate('bindings', kept);
+    setDropped((prev) => [...prev, ...names]);
+  };
+  const bound = bindingsText(condition.bindings, condition.params);
   const comparatorOptions = comparators.map((c) => ({
     value: c.value,
     label: c.label,
@@ -74,6 +86,7 @@ export function ConditionRow({
               onUpdate('indicator', ind);
               // the previous indicator's params would make the new one unbuildable (422 at save)
               onUpdate('params', defaultParams(indicators.find((i) => i.name === ind)));
+              dropSide('indicator');
             }}
             onParamChange={(params) => onUpdate('params', params)}
           />
@@ -95,7 +108,10 @@ export function ConditionRow({
             label="Compare to"
             options={COMPARE_TO_OPTIONS}
             value={ref ? 'indicator' : 'number'}
-            onChange={(e) => onUpdate('value', e.target.value === 'indicator' ? 'close' : 0)}
+            onChange={(e) => {
+              onUpdate('value', e.target.value === 'indicator' ? 'close' : 0);
+              dropSide('value');
+            }}
           />
           {!ref && (
             <Input
@@ -120,11 +136,24 @@ export function ConditionRow({
               indicators={indicators}
               selectedIndicator={ref.name}
               params={ref.params}
-              onIndicatorChange={(ind) =>
-                onUpdate('value', formatIndicatorRef(ind, defaultParams(indicators.find((i) => i.name === ind))))
-              }
+              onIndicatorChange={(ind) => {
+                onUpdate('value', formatIndicatorRef(ind, defaultParams(indicators.find((i) => i.name === ind))));
+                dropSide('value');
+              }}
               onParamChange={(params) => onUpdate('value', formatIndicatorRef(ref.name, params))}
             />
+          </div>
+        )}
+
+        {(bound || dropped.length > 0) && (
+          <div className="flex flex-col gap-1 text-xs text-ink-2 md:col-span-12">
+            {bound && <p data-testid="condition-bindings">{bound}</p>}
+            {dropped.length > 0 && (
+              <p role="status" className="text-caution">
+                Dropped {dropped.join(', ')}: {dropped.length === 1 ? 'it' : 'they'} bound what this condition no longer
+                uses, so hyperopt and walk-forward can no longer set {dropped.length === 1 ? 'it' : 'them'} here.
+              </p>
+            )}
           </div>
         )}
       </div>

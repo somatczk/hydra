@@ -1,6 +1,7 @@
 /** Type definitions for the visual strategy builder. */
 
 import type { Schedule, WireSchedule } from '@/lib/schedule';
+import type { ConditionBindings } from './bindings';
 
 /* ---------- Indicator API types ---------- */
 
@@ -37,7 +38,11 @@ export interface BuilderCondition {
   params: ConditionParams;
   comparator: string;
   value: number | string;
+  /** Carried through from the stored condition; the builder never authors these. */
+  bindings?: ConditionBindings;
 }
+
+export type ConditionFieldValue = BuilderCondition[keyof BuilderCondition];
 
 export interface BuilderConditionGroup {
   operator: 'AND' | 'OR';
@@ -157,6 +162,11 @@ export interface SerializedCondition {
   params: ConditionParams;
   comparator: string;
   value: number | string;
+  /** Hyperopt bindings (strategy/condition_schema.py); the detail sends absent ones as null. */
+  param_key?: string | null;
+  param_overrides?: Record<string, string> | null;
+  value_param_key?: string | null;
+  value_ref_overrides?: Record<string, string> | null;
 }
 
 export interface SerializedConditionGroup {
@@ -212,7 +222,7 @@ export type BuilderAction =
       section: RuleSection;
       conditionId: string;
       field: keyof BuilderCondition;
-      value: string | number | ConditionParams;
+      value: ConditionFieldValue;
     }
   | { type: 'SET_OPERATOR'; section: RuleSection; operator: 'AND' | 'OR' }
   | { type: 'SET_TIMEFRAME'; field: keyof TimeframeConfig; value: string }
