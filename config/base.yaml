@@ -33,4 +33,4 @@ data:
   fetch_max_bars: 2000000
   cache_max_gb: 10.0
   sweep_interval_s: 3600
-  row_bytes_estimate: 160
+  row_bytes_estimate: 205

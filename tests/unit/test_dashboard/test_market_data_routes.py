@@ -378,7 +378,7 @@ class TestDataInventory:
                     "last_ts": "2026-01-31T23:00:00+00:00",
                 },
                 "rows": 500,
-                "estimated_bytes": 500 * 160,
+                "estimated_bytes": 500 * 205,
                 "status": "ready",
                 "last_used_at": "2026-10-02T00:00:00+00:00",
             },
@@ -397,7 +397,7 @@ class TestDataInventory:
             },
         ]
         assert body["totals"] == {
-            "bytes": 500 * 160,
+            "bytes": 500 * 205,
             "rows": 500,
             "pairs": 2,
             "budget_bytes": 10 * (1 << 30),
