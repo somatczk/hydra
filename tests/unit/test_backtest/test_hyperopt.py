@@ -376,3 +376,53 @@ def test_unknown_param_names_reads_exactly_what_the_rules_bind() -> None:
     assert unknown_param_names(space, config, _ModeStrategy) == sorted(
         set(names) - {"level", "multiplier"}
     )
+
+
+async def test_the_worker_names_an_ambiguous_name_by_its_sites_like_the_submit_422() -> None:
+    """Direct analyzer use reaches the trial loop without the submit check: the job error
+    names the ambiguous name's sites, not "never reads"."""
+    two_smas = {
+        "entry_long": {
+            "operator": "AND",
+            "conditions": [
+                {
+                    "indicator": "sma",
+                    "params": {"period": 20},
+                    "comparator": "less_than",
+                    "value": 1,
+                }
+            ],
+        },
+        "exit_long": {
+            "operator": "AND",
+            "conditions": [
+                {
+                    "indicator": "sma",
+                    "params": {"period": 50},
+                    "comparator": "less_than",
+                    "value": 1,
+                }
+            ],
+        },
+    }
+    config = _config(
+        strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        parameters={"rules": two_smas, "required_history": 60},
+    )
+    with pytest.raises(ValueError) as err:
+        await HyperoptRunner().run(
+            strategy_class=RuleBasedStrategy,
+            base_config=config,
+            bars=_bars(60),
+            initial_capital=D("10000"),
+            param_space=ParameterSpace(
+                params=[ParamDef(name="sma_period", type="int", low=10, high=60)]
+            ),
+            method="grid",
+            max_trials=5,
+        )
+    assert str(err.value) == (
+        "param_space name 'sma_period' matches conditions with different values by name "
+        "(entry_long[0].params.period=20, exit_long[0].params.period=50), so it binds "
+        "nothing; bind the one it is meant for with param_overrides or value_ref_overrides"
+    )
