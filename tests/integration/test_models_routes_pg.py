@@ -261,6 +261,35 @@ class TestPromoteRollback:
         assert resp.json()["detail"]["code"] == "rollback_refused"
         assert await _stages(client, "alpha") == {1: "Production"}
 
+    async def test_the_typed_confirm_reason_lands_in_the_audit_lines(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The UI's typed confirm sends an optional reason; the audit lines carry it."""
+        from structlog.testing import capture_logs
+
+        from hydra.core.logging import get_logger
+        from hydra.dashboard import security
+
+        monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
+        ids = [(await _upload(client)).json()["id"] for _ in range(2)]
+
+        with capture_logs() as logs:
+            promoted = await client.post(
+                f"/api/models/{ids[0]}/promote", json={"reason": "challenger won OOS"}
+            )
+            assert promoted.status_code == 200
+            await client.post(f"/api/models/{ids[1]}/promote")
+            rolled = await client.post(
+                f"/api/models/{ids[1]}/rollback", json={"reason": "v2 drifted"}
+            )
+            assert rolled.status_code == 200
+
+        entries = [e for e in logs if e.get("event") == "audit"]
+        promoted = [e for e in entries if e.get("action") == "model_promoted"]
+        assert [e.get("reason") for e in promoted] == ["challenger won OOS", None]
+        rolled = [e for e in entries if e.get("action") == "model_rolled_back"]
+        assert [e.get("reason") for e in rolled] == ["v2 drifted"]
+
     async def test_an_unknown_uuid_is_404_and_a_non_uuid_is_400(
         self, client: httpx.AsyncClient
     ) -> None:

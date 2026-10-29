@@ -93,6 +93,21 @@ _GET_PRODUCTION_SQL = """
     FROM ml_models WHERE name = $1 AND stage = 'production'
 """
 
+_LIST_PRODUCTION_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE stage = 'production' ORDER BY name
+"""
+
+_RECORD_DRIFT_SQL = """
+    UPDATE ml_models SET drift = $3::jsonb
+    WHERE name = $1 AND version = $2
+    RETURNING id, name, version, stage, model_type, metrics, feature_spec, drift,
+              artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+              archived_at
+"""
+
 _DEMOTE_OTHER_PRODUCTION_SQL = """
     UPDATE ml_models SET stage = 'archived', archived_at = now()
     WHERE name = $1 AND stage = 'production' AND version <> $2
@@ -162,6 +177,10 @@ class ModelVersion:
             "training_job_id": self.training_job_id,
             "archived_at": self.archived_at.isoformat() if self.archived_at else None,
         }
+
+
+_Versions = list[ModelVersion]
+"""The list annotation spelled outside the class: ``list`` is a method name here."""
 
 
 @dataclass(frozen=True)
@@ -343,6 +362,36 @@ class ModelRegistry:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(_GET_PRODUCTION_SQL, name)
         return None if row is None else _row_to_version(row)
+
+    async def list_production(self) -> _Versions:
+        """Every name's current Production version, in name order (the P5-D drift scan)."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_LIST_PRODUCTION_SQL)
+        return [_row_to_version(r) for r in rows]
+
+    async def record_drift(
+        self, name: str, version: int, drift: dict[str, Any]
+    ) -> ModelVersion | None:
+        """Write the measured drift snapshot onto the version's row.
+
+        The startup drift task's write: the jsonb carries the max PSI, its band
+        label, the worst NaN rate, the computed-at time and the window it was
+        measured on. None when the version no longer exists (nothing is
+        inserted); the stage lifecycle is untouched.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_RECORD_DRIFT_SQL, name, version, json.dumps(drift))
+        if row is None:
+            return None
+        measured = _row_to_version(row)
+        logger.info(
+            "ml model drift recorded",
+            name=name,
+            version=version,
+            max_psi=drift.get("max_psi"),
+            status=drift.get("status"),
+        )
+        return measured
 
     async def promote(self, name: str, version: int) -> ModelVersion:
         """Stage the version as Production; the previous Production is archived and recorded.

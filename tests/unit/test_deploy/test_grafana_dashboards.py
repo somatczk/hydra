@@ -178,6 +178,10 @@ def test_every_series_a_rule_or_panel_reads_has_a_runtime_producer() -> None:
         "execution/session_manager.py",
         "execution/session_recovery.py",
     }
+    # §8: the trader's startup drift task is the drift gauges' only producer,
+    # never anything inside hydra.ml (which _producers already excludes)
+    assert producers["hydra_ml_drift_psi"] == {"trader/main.py"}
+    assert producers["hydra_ml_drift_nan_ratio"] == {"trader/main.py"}
 
 
 @pytest.fixture()

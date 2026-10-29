@@ -645,6 +645,43 @@ tests:
         alertname: HydraLiveReconcileUnknown
         exp_alerts: []
 
+  - name: ml drift psi 0.31 fires the manual-retrain page
+    interval: 1m
+    input_series:
+      - series: 'hydra_ml_drift_psi{model_name="alpha"}'
+        values: "0.31x10"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HydraMLDriftHigh
+        exp_alerts:
+          - exp_labels:
+              model_name: alpha
+              severity: critical
+              team: trading
+            exp_annotations:
+              summary: "ML model feature drift is high"
+              description: "Model alpha's max feature PSI is 0.310 (alert threshold 0.2, retrain threshold 0.25). Retraining is manual by design: run the retrain from the Models page or POST /api/models/alpha/retrain and promote the challenger yourself — this alert never triggers it. Drift is measured at trader startup only, so the gauge refreshes on the next restart."
+
+  - name: ml drift psi 0.19 does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_ml_drift_psi{model_name="alpha"}'
+        values: "0.19x10"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HydraMLDriftHigh
+        exp_alerts: []
+
+  - name: ml drift psi exactly at the 0.2 alert threshold does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_ml_drift_psi{model_name="alpha"}'
+        values: "0.2x10"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: HydraMLDriftHigh
+        exp_alerts: []
+
   - name: event bus p99 0.95s fires
     interval: 1m
     input_series:

@@ -92,6 +92,18 @@ groups:
           summary: "Live session reconcile blind"
           description: "Session {{ $labels.session_id }} has been unable to complete a reconcile pass for 10 minutes: the drift detector is BLIND — an exchange outage or credential revocation means drift cannot be detected. Restore the exchange read (connectivity, credentials) and confirm the session's next pass reports ok."
 
+      # P5-D: the gauge is written once per trader start (startup-only by the user's
+      # cut) and read here only — hydra.ml never produces it (tests/unit/test_deploy/
+      # test_prometheus_rules.py pins these numbers to retraining.py's constants).
+      - alert: HydraMLDriftHigh
+        expr: hydra_ml_drift_psi > 0.2
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "ML model feature drift is high"
+          description: "Model {{ $labels.model_name }}'s max feature PSI is {{ $value | printf \"%.3f\" }} (alert threshold 0.2, retrain threshold 0.25). Retraining is manual by design: run the retrain from the Models page or POST /api/models/{{ $labels.model_name }}/retrain and promote the challenger yourself — this alert never triggers it. Drift is measured at trader startup only, so the gauge refreshes on the next restart."
+
   - name: hydra-system
     interval: 30s
     rules:

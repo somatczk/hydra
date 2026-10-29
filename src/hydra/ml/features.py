@@ -107,6 +107,33 @@ class FeatureSpec:
             ),
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FeatureSpec:
+        """Parse the jsonb form ``to_dict`` wrote; refuse anything else.
+
+        The drift task reads the spec a version was trained on off its registry
+        row: a spec that is absent, partial or unreadable refuses (drift stays
+        unknown), never a silent fall-back to the frozen default.
+        """
+        try:
+            quantiles = data["reference_quantiles"]
+            return cls(
+                spec_version=int(data["spec_version"]),
+                horizon=int(data["horizon"]),
+                window_1h=int(data["window_1h"]),
+                window_4h=int(data["window_4h"]),
+                window_1d=int(data["window_1d"]),
+                feature_names=tuple(str(n) for n in data["feature_names"]),
+                reference_quantiles=(
+                    None
+                    if quantiles is None
+                    else tuple(None if q is None else tuple(float(v) for v in q) for q in quantiles)
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            msg = f"not a stored feature spec: {data!r}"
+            raise ValueError(msg) from exc
+
 
 # ---------------------------------------------------------------------------
 # Feature name lists (the single source the builders and the spec share)
