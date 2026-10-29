@@ -413,6 +413,139 @@ class TestAttachPipeline:
         assert attached.predict_up(vector) == pytest.approx(1.0, abs=1e-9)
 
 
+class TestMidSessionPromote:
+    """A mid-session promote never swaps the model a running consumer pinned.
+
+    The pin is three-way: the overlay's ``_OVERLAYS`` entry (pinned at the
+    session's first signal), the native strategy's ``_predictor`` (pinned at
+    ``on_start``) and the attach cache's ``(name, registry version)`` key. The
+    registry row the stub pool serves flips from v1 to v2 mid-test — the
+    promote — and a running consumer must keep answering v1's numbers while a
+    fresh consumer attaches v2. v1 is the permissive scale (rising bars ->
+    P(up) = 1.0, passes the 0.6 threshold) and v2 the strict one (P(up) =
+    0.1, vetoed), so a regression to per-signal registry reads or a name-only
+    cache key flips the running session's decision, not just its metadata.
+    """
+
+    class _PromotePool:
+        """Serves whatever Production row it currently holds (the promote flips it)."""
+
+        def __init__(self) -> None:
+            self.row: Any = None
+
+        def acquire(self) -> Any:
+            pool = self
+
+            class _Conn:
+                async def fetchrow(self, sql: str, *args: Any) -> Any:
+                    return pool.row
+
+            class _Acquire:
+                async def __aenter__(self) -> Any:
+                    return _Conn()
+
+                async def __aexit__(self, *exc: Any) -> None:
+                    return None
+
+            return _Acquire()
+
+    def _write_version(self, models_dir: Path, name: str, scale: float) -> tuple[str, str]:
+        meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+        blob = confidence_onnx(meta, N_FEATURES, scale=scale)
+        (models_dir / f"{name}.onnx").write_bytes(blob)
+        return f"{name}.onnx", hashlib.sha256(blob).hexdigest()
+
+    def _production_row(self, artifact_file: str, sha256: str, version: int) -> dict[str, Any]:
+        return {
+            "id": uuid4(),
+            "name": MODEL,
+            "version": version,
+            "stage": "production",
+            "model_type": "onnx",
+            "metrics": "{}",
+            "feature_spec": "{}",
+            "drift": None,
+            "artifact_file": artifact_file,
+            "artifact_sha256": sha256,
+            "trained_at": datetime(2026, 10, 28, tzinfo=UTC),
+            "created_by": "test",
+            "training_job_id": None,
+            "archived_at": None,
+        }
+
+    def _native_cfg(self) -> StrategyConfig:
+        return StrategyConfig(
+            id="native",
+            name="native",
+            strategy_class="hydra.strategy.builtin.ml_ensemble.MLEnsembleStrategy",
+            symbols=["BTCUSDT"],
+            timeframes={"primary": "1h", "confirmation": "4h", "entry": "1d"},
+            parameters={"model_name": MODEL, "required_history": 2000},
+        )
+
+    async def test_a_running_overlay_keeps_v1_across_a_promote(self, tmp_path: Path) -> None:
+        from hydra.core.config import MlConfig
+        from hydra.ml.consumers import _OVERLAYS
+
+        v1_file, v1_sha = self._write_version(tmp_path, "alpha", 0.01)
+        v2_file, v2_sha = self._write_version(tmp_path, "alpha-v2", 0.001)
+        pool = self._PromotePool()
+        pool.row = self._production_row(v1_file, v1_sha, 1)
+        closes = [100.0 + i for i in range(60)]  # rising: v1 answers 1.0, v2 answers 0.1
+        hydra_config = HydraConfig.model_construct(ml=MlConfig(models_dir=str(tmp_path)))
+
+        # the session's first signal pins v1: the permissive model passes the entry
+        host, _ = _host_with(closes, _overlay_cfg(threshold=0.6))
+        assert await veto_entry(host, pool, hydra_config, _entry()) is False
+        assert _OVERLAYS[host].model.version == 1
+        assert _decision_value("gated", "pass") == 1.0
+
+        # the promote: the registry now serves v2 as Production
+        pool.row = self._production_row(v2_file, v2_sha, 2)
+
+        # the RUNNING session keeps its pinned v1: the same signal still passes —
+        # a per-signal registry read (or a name-only cache key) would attach v2
+        # here and veto the entry the session already blessed
+        assert await veto_entry(host, pool, hydra_config, _entry()) is False
+        assert _OVERLAYS[host].model.version == 1
+        assert _decision_value("gated", "pass") == 2.0
+
+        # a NEW session attaches v2: the strict scale vetoes what v1 blessed
+        host2, _ = _host_with(closes, _overlay_cfg(threshold=0.6))
+        assert await veto_entry(host2, pool, hydra_config, _entry()) is True
+        assert _OVERLAYS[host2].model.version == 2
+        assert _decision_value("gated", "veto") == 1.0
+
+    async def test_a_running_native_strategy_keeps_its_pinned_predictor(
+        self, tmp_path: Path
+    ) -> None:
+        v1_file, v1_sha = self._write_version(tmp_path, "alpha", 0.01)
+        v2_file, v2_sha = self._write_version(tmp_path, "alpha-v2", 0.001)
+        pool = self._PromotePool()
+        pool.row = self._production_row(v1_file, v1_sha, 1)
+        cfg = self._native_cfg()
+
+        await validate_session_ml(pool, tmp_path, cfg)
+        strategy = MLEnsembleStrategy(cfg, StrategyContext())
+        await strategy.on_start()
+        pinned = strategy._predictor
+        assert pinned is not None
+
+        # the promote mid-session
+        pool.row = self._production_row(v2_file, v2_sha, 2)
+        bars = _series([100.0 + i for i in range(60)])
+        assert pinned.predict_up(bars, [], []) == pytest.approx(1.0, abs=1e-9)
+
+        # a NEW session's validation attaches v2 and answers its number; the
+        # running strategy's pin is untouched
+        await validate_session_ml(pool, tmp_path, cfg)
+        fresh = provider_for(MODEL)
+        assert fresh is not pinned
+        assert fresh.predict_up(bars, [], []) == pytest.approx(0.1, abs=1e-7)
+        assert strategy._predictor is pinned
+        assert pinned.predict_up(bars, [], []) == pytest.approx(1.0, abs=1e-9)
+
+
 class TestValidateSessionMl:
     """The session-start gate: pure config refusals first, then the attach."""
 

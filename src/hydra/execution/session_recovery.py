@@ -215,9 +215,7 @@ class SessionRecoveryMixin:
             required_history = await probe_strategy(cfg, self._config)
             if session.paper_capital is None or session.paper_capital <= 0:
                 raise PaperCapitalUnavailableError("the session row has no allocated paper_capital")
-            # P5-C: a session that consumes a Production model re-validates it
-            # here — a model that cannot be attached errors the recovery loudly
-            # (and the native strategy's predictor is re-attached for the resume)
+            # P5-C: a model-consuming session re-validates its model before the resume
             await validate_session_ml(
                 self._db_pool,
                 Path(self._config.ml.models_dir),

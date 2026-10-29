@@ -51,10 +51,12 @@ from hydra.data.migrations.runner import current_revision, head_revision
 from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
 from hydra.data.storage import MarketDataRepository
 from hydra.execution.client_factory import RestHandle, RestPoolFactory, SharedRestClients
+from hydra.ml.consumers import validate_session_ml
 from hydra.ml.dataset import DatasetBuilder
 from hydra.ml.export import export_xgboost_to_onnx, validate_onnx_export
 from hydra.ml.features import FeatureSpec
 from hydra.ml.registry import ModelRegistration, ModelRegistry
+from hydra.ml.serving import MlServingError
 from hydra.ml.training import ModelTrainer
 from hydra.risk.state import PgRiskStateStore
 from hydra.strategy.config import StrategyConfig
@@ -214,10 +216,21 @@ async def run_backtest_job(
     stored ``ts.funding_rates`` rows up for the window through the fetch engine's pooled
     client (skipped while auto-fetch is off) and loads what is stored — the executor
     accrues only from those rows.
+
+    A config that consumes a Production model (an enabled ``ml_overlay`` or the ML-native
+    strategy) passes the same session-start gate first: the model is validated and attached
+    HERE, where the pool is, so an un-promoted name or a missing artifact fails the job
+    loudly with the model named — never a completed run whose every entry was vetoed
+    ``error`` (the runner itself has no pool to attach with).
     """
     body = BacktestRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
+
+    try:
+        await validate_session_ml(pool, _ml_models_dir(), config)
+    except (MlServingError, ValueError) as exc:
+        raise JobError(str(exc)) from exc
 
     await _ensure_bars(
         pool, fetch_engine, config, body.start_date, body.end_date, run, force=body.fetch_fresh
