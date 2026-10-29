@@ -8,7 +8,8 @@ injected, so every paced wait and patience deadline is asserted exactly.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -106,6 +107,15 @@ class FakeRepo:
         self.upserts: list[tuple[list[tuple[str, str, Timeframe, OHLCV]], str]] = []
         self.statuses: list[tuple[str, datetime, datetime]] = []
         self.ledger_credits: dict[_DatasetKey, int] = {}
+        # the database's advisory locks: shared by every engine (process) on this repo
+        self.dataset_locks: dict[_DatasetKey, asyncio.Lock] = {}
+
+    @asynccontextmanager
+    async def dataset_lock(
+        self, exchange_id: str, symbol: str, timeframe: Timeframe
+    ) -> AsyncIterator[FakeRepo]:
+        async with self.dataset_locks.setdefault((exchange_id, symbol, timeframe), asyncio.Lock()):
+            yield self
 
     def stored_ts(
         self,
@@ -450,6 +460,46 @@ class TestSerialization:
         assert repo.statuses == [("fetching", _ts(0), _ts(4)), ("ready", _ts(0), _ts(4))]
         assert (first.bars_fetched, first.weight_spent) == (5, 10)
         assert (second.bars_fetched, second.weight_spent, second.ranges_fetched) == (0, 0, 0)
+
+    async def test_two_processes_fetch_one_dataset_once(self) -> None:
+        """Two engines (two workers: separate asyncio locks and budgets) on one database:
+        the second waits on the dataset lock, re-detects, fetches nothing, and the
+        ledger flips ``ready`` once — never while the first is still writing."""
+        repo = FakeRepo()
+        exchange = _YieldingExchange([_row(m) for m in range(5)])
+        worker_a, _ = _engine(exchange, page_size=1)
+        worker_b, _ = _engine(exchange, page_size=1)
+        events: list[str] = []
+
+        async def run(tag: str, service: OnDemandFetchService):
+            def on_progress(progress: dict[str, Any]) -> None:
+                events.append(f"{tag}:{progress['state']}:{progress['bars_fetched']}")
+
+            return await _ensure(service, repo, start=_ts(0), end=_ts(4), on_progress=on_progress)
+
+        first, second = await asyncio.gather(run("A", worker_a), run("B", worker_b))
+
+        assert events[-2:] == ["A:fetched:5", "B:fetched:0"]
+        assert not any(e.startswith("B:fetching") for e in events)
+        assert len(exchange.calls) == 5
+        assert repo.stored_ts() == [_ts(m) for m in range(5)]
+        assert repo.statuses == [("fetching", _ts(0), _ts(4)), ("ready", _ts(0), _ts(4))]
+        assert (first.bars_fetched, first.ranges_fetched) == (5, 1)
+        assert (second.bars_fetched, second.weight_spent, second.ranges_fetched) == (0, 0, 0)
+
+    async def test_a_failed_fetch_releases_the_dataset_lock(self) -> None:
+        """A writer that raises frees the dataset: the next process fetches it."""
+        repo = FakeRepo()
+        broken = FakeRestExchange([_row(m) for m in range(5)])
+        broken.errors = [ccxt.BadSymbol("nope")]
+        worker_a, _ = _engine(broken)
+        with pytest.raises(ccxt.BadSymbol):
+            await _ensure(worker_a, repo, start=_ts(0), end=_ts(4))
+
+        worker_b, _ = _engine(FakeRestExchange([_row(m) for m in range(5)]))
+        report = await asyncio.wait_for(_ensure(worker_b, repo, start=_ts(0), end=_ts(4)), 1)
+        assert report.bars_fetched == 5
+        assert not any(lock.locked() for lock in repo.dataset_locks.values())
 
     async def test_concurrent_different_dataset_calls_interleave(self) -> None:
         """Different (exchange, symbol, timeframe) keys never share the lock (B1-A4).

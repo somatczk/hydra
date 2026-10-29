@@ -6,6 +6,8 @@ TimescaleDB with connection pooling and ON CONFLICT deduplication.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -75,6 +77,9 @@ _TOUCH_CACHE_ENTRY_SQL = """
     WHERE exchange = $1 AND symbol = $2 AND timeframe = $3
 """
 
+_DATASET_LOCK_SQL = "SELECT pg_advisory_lock(hashtextextended($1, 0))"
+_DATASET_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended($1, 0))"
+
 _EXISTING_KEYS_SQL = """
     SELECT o.exchange, o.symbol, o.timeframe, o.timestamp
     FROM ts.ohlcv_1m AS o
@@ -129,6 +134,17 @@ def _page_bounds(
         first, last = bounds.get(key, (ohlcv.timestamp, ohlcv.timestamp))
         bounds[key] = (min(first, ohlcv.timestamp), max(last, ohlcv.timestamp))
     return bounds
+
+
+class _HeldConnection:
+    """A pool stand-in whose every ``acquire()`` lends the one connection already held."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[Any]:
+        yield self._conn
 
 
 class MarketDataRepository:
@@ -195,6 +211,26 @@ class MarketDataRepository:
             msg = "MarketDataRepository is not connected. Call connect() first."
             raise RuntimeError(msg)
         return self._pool
+
+    @asynccontextmanager
+    async def dataset_lock(
+        self, exchange_id: str, symbol: str, timeframe: Timeframe
+    ) -> AsyncIterator[MarketDataRepository]:
+        """Hold one dataset's cross-process write lock; yields a repository on its connection.
+
+        A session-level Postgres advisory lock keyed by the dataset: another process (a
+        second backtest worker, the engine's preview) blocks here until the holder
+        releases it, and the server drops it if the holder's connection dies. Every call
+        on the yielded repository runs on that one connection, so a holder never waits
+        for a second pooled connection while it pins the first.
+        """
+        key = f"hydra.on_demand:{exchange_id}:{symbol}:{timeframe}"
+        async with self._ensure_pool().acquire() as conn:
+            await conn.execute(_DATASET_LOCK_SQL, key)
+            try:
+                yield MarketDataRepository.from_pool(_HeldConnection(conn))
+            finally:
+                await conn.execute(_DATASET_UNLOCK_SQL, key)
 
     # ------------------------------------------------------------------
     # OHLCV bars

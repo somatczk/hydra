@@ -6,10 +6,12 @@ API page by page — never the forming candle — and stores every page through
 ``upsert_closed_bars(source='auto')``, so attribution is immutable and the
 data-cache ledger stays in the same transaction as the bars. Requests are paced by a
 fixed-window weight budget (the static split: feeds stay uncapped), the fetch is
-patient up to a deadline, and writes for one dataset are serialized by an asyncio
-lock (the single-writer contract). Gaps the exchange genuinely lacks are accepted and
-reported — the run proceeds on honest gappy data; only a range with zero stored bars
-raises the P0-B ``NoMarketDataError``.
+patient up to a deadline, and writes for one dataset are serialized (the single-writer
+contract) by an asyncio lock in this process and the repository's Postgres advisory
+lock across processes, so several backtest workers never fetch one dataset twice.
+Gaps the exchange genuinely lacks are accepted and reported — the run proceeds on
+honest gappy data; only a range with zero stored bars raises the P0-B
+``NoMarketDataError``.
 
 The REST client is injected (``data`` may not import ``execution``); the caller owns
 its lifecycle. No caller is wired yet — the jobs/worker wiring is P6-B2, the
@@ -196,17 +198,19 @@ class OnDemandFetchService:
 
         ``force=True`` refetches the whole grid-rounded range (``fetch_fresh``
         semantics); values are corrected through the upsert, attribution never flips.
-        Concurrent calls for the same dataset serialize on a per-key lock, so the
-        second caller re-detects gaps after the first one's writes land.
+        Concurrent calls for the same dataset serialize on a per-key asyncio lock and,
+        across processes, on ``repo.dataset_lock``, so the second caller re-detects gaps
+        after the first one's writes land and the ledger flips ``ready`` only once the
+        last writer is done.
         """
         call = _Call(started=self._clock())
         grid_start = ceil_to_tf(start, timeframe)
         grid_end = floor_to_tf(end, timeframe)
         lock_key = (exchange, symbol, timeframe)
         lock = self._locks.setdefault(lock_key, asyncio.Lock())
-        async with lock:
+        async with lock, repo.dataset_lock(exchange, symbol, timeframe) as held:
             gaps = await self._detect_or_force(
-                repo, exchange, symbol, timeframe, grid_start, grid_end, force=force
+                held, exchange, symbol, timeframe, grid_start, grid_end, force=force
             )
             if not gaps:
                 self._emit(on_progress, "fetched", call, gaps)
@@ -235,7 +239,7 @@ class OnDemandFetchService:
                 bars_owed=owed,
             )
             self._emit(on_progress, "fetching", call, gaps)
-            await repo.set_cache_status(
+            await held.set_cache_status(
                 exchange, symbol, timeframe, "fetching", grid_start, grid_end
             )
             try:
@@ -244,18 +248,18 @@ class OnDemandFetchService:
                     await self._acquire(call, LOAD_MARKETS_WEIGHT)
                     await client.load_markets()
                 await self._fetch_gaps(
-                    repo, client, exchange, symbol, timeframe, gaps, call, on_progress
+                    held, client, exchange, symbol, timeframe, gaps, call, on_progress
                 )
             finally:
-                await repo.set_cache_status(
+                await held.set_cache_status(
                     exchange, symbol, timeframe, "ready", grid_start, grid_end
                 )
 
             remaining = await self._detect_or_force(
-                repo, exchange, symbol, timeframe, grid_start, grid_end, force=False
+                held, exchange, symbol, timeframe, grid_start, grid_end, force=False
             )
             if remaining == [GapRange(start=grid_start, end=grid_end)]:
-                available = await repo.get_bar_range(exchange, symbol, timeframe)
+                available = await held.get_bar_range(exchange, symbol, timeframe)
                 first, last = (available[0], available[1]) if available else (None, None)
                 raise NoMarketDataError(exchange, symbol, timeframe, start, end, first, last)
             logger.info(
