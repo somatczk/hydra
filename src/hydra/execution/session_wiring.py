@@ -751,16 +751,16 @@ class SessionRuntime:
         if order_type != OrderType.MARKET:
             raise ValueError("manual exits are MARKET orders (a resting SELL would unprotect)")
         positions = [p for p in await self.executor.get_positions(symbol) if p.quantity > 0]
-        if not positions and self.market_type == MarketType.FUTURES:
-            # the 2.8.0 cut (§4(2)): quick-trade on perps is long-only — strategy exits
-            # and the kill switch still close shorts, manual SHORT entries do not exist
+        longs = [p for p in positions if p.direction != Direction.SHORT]
+        if self.market_type == MarketType.FUTURES and not longs:
+            # the §4(2) cut fires on the absent LONG: a SELL over a short would extend it
             raise ValueError(
                 f"no {symbol} long held: manual SHORT entries on perpetual sessions are "
                 "long-only in 2.8.0 (use a strategy session to trade shorts)"
             )
         if not positions:
             raise SpotShortError(f"no {symbol} held: a spot SELL cannot open a short")
-        held = positions[0].quantity
+        held = longs[0].quantity
         qty = held if quantity is None else min(quantity, held)
         order = OrderRequest(
             symbol=Symbol(symbol),

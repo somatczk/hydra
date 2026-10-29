@@ -92,9 +92,9 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
     };
   }, [session.strategy_id]);
 
-  const held = positions.filter((p) => sameSymbol(p.symbol, symbol)).reduce((n, p) => n + p.quantity, 0);
   const shortHeld = isPerpSession(session) && positions.some((p) => sameSymbol(p.symbol, symbol) && p.direction === 'short');
-  const longHeld = positions.filter((p) => sameSymbol(p.symbol, symbol) && p.direction !== 'short').reduce((n, p) => n + p.quantity, 0);
+  const longs = positions.filter((p) => sameSymbol(p.symbol, symbol) && p.direction !== 'short');
+  const longHeld = longs.reduce((n, p) => n + p.quantity, 0);
   const buy = side === 'buy';
   // §4(2): manual/quick-trade on perps is LONG-ONLY in 2.8.0 — the SELL that would open a SHORT
   // entry is refused up front with the cut named, and so is the BUY over a strategy-held short.
@@ -105,7 +105,7 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
     ? `${symbol} is held short by the strategy: ${PERP_MANUAL_LONG_ONLY} — its own exit rules and the kill switch close it (BUY-back).`
     : null;
   const errors = {
-    side: buy ? perpShortBuyCut : (perpSellCut ?? (!buy && held <= 0 ? "Nothing to sell. Spot can't go short." : null)),
+    side: buy ? perpShortBuyCut : (perpSellCut ?? (!buy && longHeld <= 0 ? "Nothing to sell. Spot can't go short." : null)),
     quantity: quantity !== '' && !positive(quantity) ? 'Enter a quantity above 0 with up to 8 decimals.' : null,
     price:
       orderType !== 'LIMIT'
@@ -126,9 +126,8 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
   };
   const valid = positive(quantity) && Object.values(errors).every((e) => e === null);
 
-  const markValue = positions.length > 0 && held > 0
-    ? positions.filter((p) => sameSymbol(p.symbol, symbol)).reduce((n, p) => n + p.quantity * p.avg_entry_price + p.unrealized_pnl, 0) / held
-    : null;
+  // The value line prices the manual order — long-only on perps, so a short never prices it.
+  const markValue = longHeld > 0 ? longs.reduce((n, p) => n + p.quantity * p.avg_entry_price + p.unrealized_pnl, 0) / longHeld : null;
   const unit = orderType === 'LIMIT' && positive(limitPrice) ? Number(limitPrice) : markValue;
   const about =
     unit === null

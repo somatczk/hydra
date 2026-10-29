@@ -24,7 +24,7 @@ from hydra.core.types import OHLCV, ExchangeId, Symbol, Timeframe
 from hydra.data.bars import last_closed_open
 from hydra.execution.client_factory import ClientFactory, SharedRestClients
 from hydra.execution.paper_trading import PaperTradingExecutor
-from hydra.execution.perp_trading import PerpPaperTradingExecutor
+from hydra.execution.perp_trading import PerpPaperTradingExecutor, static_funding_reader
 from hydra.execution.session_manager import SessionManager, TradingSession
 from hydra.risk.pretrade import RiskConfig
 from hydra.risk.state import InMemoryRiskStateStore
@@ -234,6 +234,20 @@ def perp_executor(session: TradingSession) -> PerpPaperTradingExecutor:
     ex = session._executor
     assert isinstance(ex, PerpPaperTradingExecutor)
     return ex
+
+
+def perp_clients(h: Harness, funding: dict[str, list[Any]] | None = None) -> ClientFactory:
+    """A FUTURES session's client factory: the harness's fakes plus the static
+    funding reader a perp session needs (empty by default: nothing accrues)."""
+    base = h.clients()
+    return ClientFactory(
+        ws_factory=base.ws_factory,
+        rest_pool=base.rest_pool,
+        markets_loader=base.markets_loader,
+        repository_factory=base.repository_factory,
+        history_window=base.history_window,
+        funding_reader_factory=lambda _pool, _eid: static_funding_reader(funding or {}),
+    )
 
 
 async def usdt(session: TradingSession) -> Decimal:

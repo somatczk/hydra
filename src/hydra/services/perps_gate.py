@@ -4,10 +4,13 @@ P4-E: leveraged trading is its own decision. ``perps_armed`` and ``perps_capital
 ``system_config`` beside the spot gate's rows (no migration), and arming spot never arms
 perps. The ``live_perps_arming`` executor is the ceremony's only write path — a code
 shown once and typed back, the capital set as part of arming — and its heart is the
-futures-permission re-fetch fail-closed: at arm time the gate RE-FETCHES the connected
-key's Binance ``/sapi/v1/account/apiRestrictions`` record (``sapiGetAccountApiRestrictions``,
-the name the P4-A hotfix pinned; futures trading permission is a property of the same
-API key) and refuses unless ``enableFutures`` reads live-true with withdrawals disabled.
+futures-permission re-fetch fail-closed: at arm time the gate RE-FETCHES the perps
+venue's stored key's Binance ``/sapi/v1/account/apiRestrictions`` record
+(``sapiGetAccountApiRestrictions``, the name the P4-A hotfix pinned; futures trading
+permission is a property of the same API key) — the ``binanceusdm`` credentials row a
+live perp session trades with, falling back to the spot ``binance`` row only when no
+USD⌂-M key is stored — and refuses unless ``enableFutures`` reads live-true with
+withdrawals disabled, naming the venue of the key it refused.
 Any failure — the read errors, the flag absent or false — refuses the arm: nothing arms
 on stale or absent permission data. The same re-fetch runs on the testnet path, through
 the client of the keys' own validated environment: if the testnet key model cannot
@@ -46,9 +49,15 @@ PERPS_CAPITAL_KEY = "perps_capital"
 PERPS_ACTIONS = ("live_perps_arming",)
 """The ceremony's gated action; its executor is the only ``perps_armed`` write path."""
 
-CONNECTED_EXCHANGE = "binance"
-"""The connected exchange whose keys carry the futures permission (the spot ceremony's
-trade-only key model; ``enableFutures`` is a property of the same API key)."""
+PERPS_KEY_VENUE = "binanceusdm"
+FALLBACK_KEY_VENUE = "binance"
+"""The rows the arm's re-fetch reads, in order: the perps venue's key (the row a live
+perp session trades with), then the spot venue's key when no USD⌂-M key is stored."""
+
+_CREDENTIAL_ROW_SQL = (
+    "SELECT encrypted_key, encrypted_secret, encrypted_passphrase, "
+    "validated_environment FROM exchange_credentials WHERE exchange_id = $1"
+)
 
 RESTRICTIONS_TIMEOUT_S = 10.0
 
@@ -222,9 +231,12 @@ def _not_futures_capable(message: str) -> ServiceError:
 
 async def require_futures_capable_credentials(pool: Any) -> dict[str, bool]:
     """The connected key re-fetched live: ``enableFutures`` true with withdrawals
-    disabled, or the refusal.
+    disabled, or the refusal naming the venue of the key it refused.
 
-    The stored ``validated_permissions`` snapshot is never consulted here — the truth is
+    The arm reads the perps venue's row first — ``binanceusdm``, the keys a live perp
+    session trades with — and falls back to the spot ``binance`` row only when no
+    USD⌂-M key is stored (the single-key operator's working path). The stored
+    ``validated_permissions`` snapshot is never consulted here — the truth is
     the exchange's own apiRestrictions read at arm time (the R8 shape, futures' leg).
     The keys' validated environment selects the client: mainnet keys re-fetch from
     mainnet, testnet keys from the sandbox (the ceremony must be arm-able on testnet —
@@ -238,16 +250,17 @@ async def require_futures_capable_credentials(pool: Any) -> dict[str, bool]:
 
     require_pool(pool)
     async with db_errors("reading the stored exchange credentials"), pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT encrypted_key, encrypted_secret, encrypted_passphrase, "
-            "validated_environment FROM exchange_credentials WHERE exchange_id = $1",
-            CONNECTED_EXCHANGE,
-        )
+        row = await conn.fetchrow(_CREDENTIAL_ROW_SQL, PERPS_KEY_VENUE)
+        venue = PERPS_KEY_VENUE
+        if row is None:
+            row = await conn.fetchrow(_CREDENTIAL_ROW_SQL, FALLBACK_KEY_VENUE)
+            venue = FALLBACK_KEY_VENUE
     if row is None:
         raise service_error(
             403,
             "live_credentials_missing",
-            f"No {CONNECTED_EXCHANGE} credentials are stored; connect keys in Settings first",
+            f"No {PERPS_KEY_VENUE} or {FALLBACK_KEY_VENUE} credentials are stored; "
+            "connect keys in Settings first",
             "not_found",
         )
     try:
@@ -264,25 +277,26 @@ async def require_futures_capable_credentials(pool: Any) -> dict[str, bool]:
         raise service_error(
             403,
             "live_credentials_missing",
-            f"The stored {CONNECTED_EXCHANGE} credentials cannot be decrypted; reconnect "
-            "them in Settings",
+            f"The stored {venue} credentials cannot be decrypted; reconnect them in Settings",
             "invalid",
         ) from None
     environment = str(row["validated_environment"] or "")
     if environment not in ("mainnet", "testnet"):
         raise _not_futures_capable(
-            f"The stored {CONNECTED_EXCHANGE} credentials are not validated for mainnet or "
-            "testnet; reconnect them in Settings so the futures permission can be checked"
+            f"The stored {venue} credentials are not validated for mainnet or testnet; "
+            "reconnect them in Settings so the futures permission can be checked"
         )
-    client = build_readonly_client(CONNECTED_EXCHANGE, creds, testnet=environment == "testnet")
+    client = build_readonly_client(
+        venue, creds, testnet=environment == "testnet", market_type=venue_market_type(venue)
+    )
     try:
         raw = await asyncio.wait_for(
             client.fetch_api_restrictions(), timeout=RESTRICTIONS_TIMEOUT_S
         )
     except Exception as exc:
         raise _not_futures_capable(
-            f"The {CONNECTED_EXCHANGE} key's futures permission could not be re-validated "
-            f"on {environment}: {exc}; nothing was armed"
+            f"The {venue} key's futures permission could not be re-validated on "
+            f"{environment}: {exc}; nothing was armed"
         ) from exc
     finally:
         try:
@@ -292,15 +306,15 @@ async def require_futures_capable_credentials(pool: Any) -> dict[str, bool]:
     permissions = normalize_futures_permissions(raw)
     if permissions["enable_withdrawals"]:
         raise _not_futures_capable(
-            f"The stored {CONNECTED_EXCHANGE} key has withdrawals enabled; perps trading "
-            "needs a trade-only key (disable withdrawals on the key and reconnect it in "
+            f"The stored {venue} key has withdrawals enabled; perps trading needs a "
+            "trade-only key (disable withdrawals on the key and reconnect it in "
             "Settings)"
         )
     if not permissions["enable_futures"]:
         raise _not_futures_capable(
-            f"The stored {CONNECTED_EXCHANGE} key cannot trade futures; perps trading needs "
-            "futures enabled on the key (enable futures trading on the key and reconnect "
-            "it in Settings)"
+            f"The stored {venue} key cannot trade futures; perps trading needs futures "
+            "enabled on the key (enable futures trading on the key and reconnect it "
+            "in Settings)"
         )
     return permissions
 

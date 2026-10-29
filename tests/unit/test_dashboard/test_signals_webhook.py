@@ -19,12 +19,21 @@ from fastapi.testclient import TestClient
 from structlog import get_logger
 from structlog.testing import capture_logs
 
+from hydra.core.types import Direction
 from hydra.dashboard import security
 from hydra.dashboard.api import app
 from hydra.dashboard.routes import signals
 from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.services.trader import LocalTrader
-from tests.unit.test_execution.session_harness import Harness, executor, write_strategy
+from tests.unit.test_execution.session_harness import (
+    Harness,
+    executor,
+    perp_clients,
+    perp_executor,
+    rule,
+    write_strategy,
+)
 
 from .conftest import TEST_API_TOKEN
 
@@ -347,6 +356,54 @@ class TestLiveGate:
         assert resp.status_code == 200, resp.text
         positions = await live_row_sessions["momentum"]["executor"].fetch_positions("BTCUSDT")
         assert [(p["side"], p["contracts"]) for p in positions] == [("long", 0.01)]
+
+
+@pytest.fixture()
+async def perp_short_session(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[PerpPaperTradingExecutor]:
+    """A paper perp session holding a strategy SHORT 0.002 (sleeve 2 x 10 % at mark 100)."""
+    h = Harness(strategies_dir)
+    mgr = await h.start()
+    assert mgr is not None
+    mgr._clients = perp_clients(h)
+    write_strategy(
+        strategies_dir,
+        "perp-short",
+        entry_short=rule(("greater_than", 99.5)),
+        exchange_id="binanceusdm",
+        market_type="FUTURES",
+    )
+    session = await h.session("perp-short", "2")
+    await h.bar(session, "100", exchange_id="binanceusdm")
+    monkeypatch.setattr(app.state, "session_manager", mgr)
+    rows = [_running_row("perp-short", "paper")]
+    monkeypatch.setattr(app.state, "db_pool", _GatePool(rows))
+    monkeypatch.setattr(app.state, "trader", LocalTrader(_GatePool(rows), mgr))
+    yield perp_executor(session)
+    await h.close()
+
+
+class TestPerpWebhookExit:
+    """A1 (the #220 review, a pre-existing P4-C gap): the webhook exit rides the same
+    manual seam quick-trade does — over a perp session's strategy short its SELL must
+    refuse with the §4(2) cut, never pyramid the short through the paper perp executor."""
+
+    async def test_exit_sell_over_a_strategy_short_is_refused_not_pyramided(
+        self, perp_short_session: PerpPaperTradingExecutor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _secret(monkeypatch, SECRET)
+        [short] = await perp_short_session.get_positions("BTCUSDT")
+        assert (short.direction, short.quantity) == (Direction.SHORT, Decimal("0.002"))
+        resp = await _post(
+            secret=SECRET, strategy_id="perp-short", side="sell", action="exit", quantity="0.001"
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert (detail["code"], detail["state"]) == ("order_rejected", "invalid")
+        assert "long-only in 2.8.0" in detail["message"]
+        [after] = await perp_short_session.get_positions("BTCUSDT")
+        assert (after.direction, after.quantity) == (Direction.SHORT, Decimal("0.002"))
 
 
 def test_telegram_endpoint_is_gone() -> None:

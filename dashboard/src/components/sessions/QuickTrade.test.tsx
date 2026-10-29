@@ -205,6 +205,13 @@ describe('QuickTrade on perps (§4(2): manual orders are long-only in 2.8.0)', (
     expect(calls.filter((c) => c.path === '/api/trading/quick-trade')).toHaveLength(0);
   });
 
+  it('a short-only session prices no manual order — the mark line stays unknown (A3)', async () => {
+    m = await showPerp(SHORT);
+    await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
+    expect(m.container.textContent).toContain('Value unknown until it fills.');
+    expect(m.container.textContent).not.toContain('About ');
+  });
+
   it('keeps the spot rules byte-identical: Sell with nothing held is the spot refusal, not the perp cut', async () => {
     m = await show(detail(), []);
     expect(side('Sell').disabled).toBe(false);

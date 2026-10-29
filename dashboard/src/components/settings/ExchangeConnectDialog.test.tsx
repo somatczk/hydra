@@ -273,12 +273,38 @@ describe('ExchangeConnectDialog perps venue (P4-F: the futures-keys connect gap)
     page = await showPerps();
     expect(page.container.textContent).toContain('Use a trade-only Binance USD\u2302-M key: withdrawals disabled and futures enabled.');
     expect(page.container.textContent).toContain('refuses keys that cannot trade futures');
-    expect(page.container.textContent).toContain('The perps arm ceremony re-checks the futures permission live before anything is armed.');
+    expect(page.container.textContent).toContain('The perps arm ceremony re-checks the futures permission live on this USD\u2302-M key before anything is armed.');
     expect(page.container.textContent).not.toContain("it's used only to show your balance and open orders.");
     await typeInto(inputByLabel(page.container, 'API Key'), 'key');
     await typeInto(inputByLabel(page.container, 'API Secret'), 'secret');
     await click(buttonByText(page.container, 'Check and save keys'));
     expect(calls.filter((c) => c.path === '/api/system/exchanges/binanceusdm/connect')).toHaveLength(1);
+  });
+
+  it('names which venue the arm checks on both dialogs (the spot fallback, A2)', async () => {
+    page = await mount(
+      <ExchangeConnectDialog
+        open
+        onClose={vi.fn()}
+        onUpdated={vi.fn()}
+        exchange={{ id: 'binance', name: 'Binance', connected: false, environment: 'testnet' }}
+      />,
+    );
+    expect(page.container.textContent).toContain(
+      'The perps arm ceremony re-checks the futures permission live on the stored USD\u2302-M key — or on this key when no USD\u2302-M key is stored.',
+    );
+    page.unmount();
+
+    page = await mount(
+      <ExchangeConnectDialog
+        open
+        onClose={vi.fn()}
+        onUpdated={vi.fn()}
+        exchange={{ id: 'bybit', name: 'Bybit', connected: false, environment: 'testnet' }}
+      />,
+    );
+    expect(page.container.textContent).not.toContain('The perps arm ceremony re-checks the futures permission');
+    expect(page.container.textContent).toContain('Use a read-only API key.');
   });
 
   it('surfaces the fail-closed futures refusal verbatim, nothing half-stored', async () => {

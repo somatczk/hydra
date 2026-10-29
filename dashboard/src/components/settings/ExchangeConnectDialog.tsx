@@ -320,7 +320,7 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
             Use a <strong>trade-only</strong> Binance USD⌂-M key: withdrawals disabled and futures
             enabled. Hydra checks it with a read-only call — and refuses keys that cannot trade
             futures — before storing it, encrypted. The perps arm ceremony re-checks the futures
-            permission live before anything is armed.
+            permission live on this USD⌂-M key before anything is armed.
           </p>
           <p className="text-xs text-ink-2">
             These keys are what a live perp session trades with; on testnet they come from
@@ -328,10 +328,19 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
           </p>
         </>
       ) : (
-      <p>
-        Use a <strong>read-only</strong> API key. Hydra checks it with a read-only call before storing it, encrypted. In
-        this version it&apos;s used only to show your balance and open orders.
-      </p>
+      <>
+        <p>
+          Use a <strong>read-only</strong> API key. Hydra checks it with a read-only call before
+          storing it, encrypted. In this version it&apos;s used only to show your balance and open
+          orders.
+        </p>
+        {exchange.id === 'binance' && (
+          <p className="text-xs text-ink-2">
+            The perps arm ceremony re-checks the futures permission live on the stored
+            USD⌂-M key — or on this key when no USD⌂-M key is stored.
+          </p>
+        )}
+      </>
       )}
       <p className="text-xs text-ink-2" data-testid="connect-target">
         The keys are checked against {exchange.name} {exchange.environment}
