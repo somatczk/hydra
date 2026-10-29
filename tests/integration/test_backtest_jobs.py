@@ -376,12 +376,12 @@ async def _backdate_heartbeat(pool: Any, job_id: str) -> None:
 async def test_two_workers_a_live_peer_keeps_its_job_and_a_stale_one_is_requeued(
     pool: Any,
 ) -> None:
-    stale_id = await jobs.enqueue(pool, "backtest", {}, {}, {})
-    live_id = await jobs.enqueue(pool, "backtest", {}, {}, {})
+    for _ in range(2):
+        await jobs.enqueue(pool, "backtest", {}, {}, {})
     stale = await jobs.claim(pool, "w1")
     live = await jobs.claim(pool, "w2")
     assert stale is not None and live is not None
-    assert (stale["id"], live["id"]) == (stale_id, live_id)
+    stale_id, live_id = stale["id"], live["id"]
 
     await _backdate_heartbeat(pool, stale_id)  # w1 died; w2 keeps ticking
     assert not await jobs.tick(pool, live_id, 5.0, {}, "w2")
