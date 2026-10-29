@@ -34,6 +34,10 @@ _REGISTER_SQL = """
               archived_at
 """
 
+_REGISTER_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
+"""Serialises version allocation per name: MAX(version) + 1 is read after the previous
+register of the same name committed, so concurrent workers never collide on it."""
+
 _LIST_ALL_SQL = """
     SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
            artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
@@ -244,12 +248,14 @@ class ModelRegistry:
     async def register(self, entry: ModelRegistration) -> ModelVersion:
         """Insert the next immutable version of ``name``; refuse an artifact hash mismatch.
 
-        The version is assigned atomically (max + 1 per name); a concurrent
-        duplicate loses on the ``UNIQUE (name, version)`` constraint. The one
-        idempotent case is a training job's re-run: a register whose
-        ``training_job_id`` already has a version (the 0013 partial unique
-        index) returns that committed version instead of raising, so the
-        requeue story holds — one training job, one registered version.
+        The version is assigned as max + 1 per name under a per-name advisory
+        transaction lock, so concurrent registers of one name (two ``ml_train``
+        workers) each get the next version instead of the loser failing on
+        ``UNIQUE (name, version)``. The one idempotent case is a training
+        job's re-run: a register whose ``training_job_id`` already has a
+        version (the 0013 partial unique index) returns that committed version
+        instead of raising, so the requeue story holds — one training job, one
+        registered version.
         """
         actual = _sha256_file(entry.artifact_path)
         if actual != entry.artifact_sha256:
@@ -263,19 +269,21 @@ class ModelRegistry:
 
         async with self._pool.acquire() as conn:
             try:
-                row = await conn.fetchrow(
-                    _REGISTER_SQL,
-                    uuid.uuid4(),
-                    entry.name,
-                    entry.model_type,
-                    json.dumps(entry.metrics),
-                    json.dumps(entry.feature_spec),
-                    entry.artifact_path.name,
-                    entry.artifact_sha256,
-                    entry.trained_at,
-                    entry.created_by,
-                    entry.training_job_id,
-                )
+                async with conn.transaction():
+                    await conn.execute(_REGISTER_LOCK_SQL, f"ml_models:{entry.name}")
+                    row = await conn.fetchrow(
+                        _REGISTER_SQL,
+                        uuid.uuid4(),
+                        entry.name,
+                        entry.model_type,
+                        json.dumps(entry.metrics),
+                        json.dumps(entry.feature_spec),
+                        entry.artifact_path.name,
+                        entry.artifact_sha256,
+                        entry.trained_at,
+                        entry.created_by,
+                        entry.training_job_id,
+                    )
             except asyncpg.UniqueViolationError as exc:
                 if (
                     entry.training_job_id is not None

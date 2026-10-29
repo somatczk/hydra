@@ -32,6 +32,7 @@ from hydra.execution.errors import (
     SessionNotRunningError,
     UnsupportedVenueError,
 )
+from hydra.ml.features import DEFAULT_FEATURE_SPEC
 from hydra.services import universe
 from hydra.services.errors import (
     DB_ERRORS,
@@ -132,6 +133,15 @@ def _write_validated(path: Path, data: dict[str, Any]) -> None:
         raise ServiceError(422, f"Invalid strategy config: {exc}") from exc
     except OSError as exc:
         raise ServiceError(500, f"Failed to write: {exc}") from exc
+
+
+def _apply_ml_history(config: dict[str, Any]) -> None:
+    """An enabled ML overlay needs the frozen feature spec's 1h window of history."""
+    if (config.get("ml_overlay") or {}).get("enabled"):
+        params = config["parameters"]
+        params["required_history"] = max(
+            int(params["required_history"]), DEFAULT_FEATURE_SPEC.window_1h
+        )
 
 
 def _strategy_not_found(strategy_id: str) -> ServiceError:
@@ -743,6 +753,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
     if body.timeframes.entry:
         config_dict["timeframes"]["entry"] = body.timeframes.entry
 
+    _apply_ml_history(config_dict)
     _write_validated(path, config_dict)
 
     return SaveResponse(
@@ -1031,6 +1042,7 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
         config_dict["timeframes"]["entry"] = request.timeframes.entry
 
     config_path = _CONFIG_DIR / config_filename
+    _apply_ml_history(config_dict)
     _write_validated(config_path, config_dict)
 
     return SaveResponse(

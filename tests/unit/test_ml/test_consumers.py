@@ -687,3 +687,161 @@ class TestConfigRoundTrip:
     def test_the_threshold_is_bounded(self) -> None:
         with pytest.raises(ValueError):
             MLOverlayConfig(enabled=True, model_name=MODEL, confidence_threshold=1.5)
+
+
+class TestResearchPin:
+    """A research job serves a pinned registry version (any stage) for its run only.
+
+    v1 is Production with the strict scale (rising bars -> P(up) = 0.1, vetoed
+    at 0.6) and v2 is Staging with the permissive one (P(up) = 1.0, passes), so
+    which version answered is visible in the decision, not just the metadata.
+    The pin rides a context binding: inside it both consumers answer v2; outside
+    it — where every session lives — nothing resolves to v2, and a session's
+    gate attaches Production v1 in the same process.
+    """
+
+    class _RegistryPool:
+        """Rows by id (the pin lookup) and the name's Production row."""
+
+        def __init__(self, rows: list[dict[str, Any]]) -> None:
+            self.rows = rows
+
+        def acquire(self) -> Any:
+            rows = self.rows
+
+            class _Conn:
+                async def fetchrow(self, sql: str, *args: Any) -> Any:
+                    if "WHERE id = $1" in sql:
+                        return next((r for r in rows if r["id"] == args[0]), None)
+                    if "stage = 'production'" in sql:
+                        return next(
+                            (
+                                r
+                                for r in rows
+                                if r["name"] == args[0] and r["stage"] == "production"
+                            ),
+                            None,
+                        )
+                    raise AssertionError(f"unexpected registry read: {sql}")
+
+            class _Acquire:
+                async def __aenter__(self) -> Any:
+                    return _Conn()
+
+                async def __aexit__(self, *exc: Any) -> None:
+                    return None
+
+            return _Acquire()
+
+    def _row(
+        self, models_dir: Path, version: int, stage: str, scale: float, name: str = MODEL
+    ) -> dict[str, Any]:
+        meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+        blob = confidence_onnx(meta, N_FEATURES, scale=scale)
+        artifact = f"{name}-v{version}.onnx"
+        (models_dir / artifact).write_bytes(blob)
+        return {
+            "id": uuid4(),
+            "name": name,
+            "version": version,
+            "stage": stage,
+            "model_type": "onnx",
+            "metrics": "{}",
+            "feature_spec": "{}",
+            "drift": None,
+            "artifact_file": artifact,
+            "artifact_sha256": hashlib.sha256(blob).hexdigest(),
+            "trained_at": datetime(2026, 10, 28, tzinfo=UTC),
+            "created_by": "test",
+            "training_job_id": None,
+            "archived_at": None,
+        }
+
+    def _native_cfg(self) -> StrategyConfig:
+        return StrategyConfig(
+            id="native",
+            name="native",
+            strategy_class="hydra.strategy.builtin.ml_ensemble.MLEnsembleStrategy",
+            symbols=["BTCUSDT"],
+            timeframes={"primary": "1h", "confirmation": "4h", "entry": "1d"},
+            parameters={"model_name": MODEL, "required_history": 2000},
+        )
+
+    async def test_a_pinned_staging_version_serves_the_run_and_never_a_session(
+        self, tmp_path: Path
+    ) -> None:
+        from hydra.core.config import MlConfig
+        from hydra.ml.consumers import _OVERLAYS, attach_research_ml
+        from hydra.strategy.ml_access import bound_providers
+
+        production = self._row(tmp_path, 1, "production", 0.001)
+        staging = self._row(tmp_path, 2, "staging", 0.01)
+        pool = self._RegistryPool([production, staging])
+        cfg = self._native_cfg()
+        closes = [100.0 + i for i in range(60)]
+        bars = _series(closes)
+        hydra_config = HydraConfig.model_construct(ml=MlConfig(models_dir=str(tmp_path)))
+
+        # a session already serves Production v1 in this process
+        await validate_session_ml(pool, tmp_path, cfg)
+        assert provider_for(MODEL).predict_up(bars, [], []) == pytest.approx(0.1, abs=1e-7)
+
+        providers, served = await attach_research_ml(pool, tmp_path, cfg, staging["id"])
+
+        assert served == [
+            {
+                "id": str(staging["id"]),
+                "name": MODEL,
+                "version": 2,
+                "stage": "staging",
+                "pinned": True,
+            }
+        ]
+        with bound_providers(providers):
+            strategy = MLEnsembleStrategy(cfg, StrategyContext())
+            await strategy.on_start()
+            assert strategy._predictor is not None
+            assert strategy._predictor.predict_up(bars, [], []) == pytest.approx(1.0, abs=1e-9)
+            # the backtest overlay (no pool) reads the same binding, not the attach cache
+            # where v1 sits first: v2 passes what Production vetoes
+            host, _ = _host_with(closes, _overlay_cfg(threshold=0.6))
+            assert await veto_entry(host, None, HydraConfig.model_construct(), _entry()) is False
+            assert _OVERLAYS[host].model.version == 2
+
+        # outside the binding, where sessions live, the pin resolves nowhere
+        assert provider_for(MODEL).predict_up(bars, [], []) == pytest.approx(0.1, abs=1e-7)
+        await validate_session_ml(pool, tmp_path, cfg)
+        assert provider_for(MODEL).predict_up(bars, [], []) == pytest.approx(0.1, abs=1e-7)
+        session_host, _ = _host_with(closes, _overlay_cfg(threshold=0.6))
+        assert await veto_entry(session_host, pool, hydra_config, _entry()) is True
+        assert _OVERLAYS[session_host].model.version == 1
+
+    async def test_without_a_pin_the_job_serves_production(self, tmp_path: Path) -> None:
+        from hydra.ml.consumers import attach_research_ml
+
+        production = self._row(tmp_path, 1, "production", 0.001)
+        pool = self._RegistryPool([production, self._row(tmp_path, 2, "staging", 0.01)])
+        bars = _series([100.0 + i for i in range(60)])
+
+        providers, served = await attach_research_ml(pool, tmp_path, self._native_cfg())
+
+        assert [(m["version"], m["stage"], m["pinned"]) for m in served] == [
+            (1, "production", False)
+        ]
+        assert providers[MODEL].predict_up(bars, [], []) == pytest.approx(0.1, abs=1e-7)
+
+    async def test_a_pin_must_name_a_model_the_strategy_consumes(self, tmp_path: Path) -> None:
+        from hydra.ml.consumers import attach_research_ml
+
+        other = self._row(tmp_path, 1, "staging", 0.01, name="beta")
+        pool = self._RegistryPool([other])
+
+        with pytest.raises(ValueError, match="'beta' v1 but strategy native consumes alpha"):
+            await attach_research_ml(pool, tmp_path, self._native_cfg(), other["id"])
+        with pytest.raises(MlServingError) as unknown:
+            await attach_research_ml(pool, tmp_path, self._native_cfg(), uuid4())
+        assert unknown.value.kind == "not_found"
+        rules_only = _overlay_cfg()
+        rules_only.ml_overlay = None
+        with pytest.raises(ValueError, match="consumes no model"):
+            await attach_research_ml(pool, tmp_path, rules_only, other["id"])

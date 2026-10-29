@@ -484,6 +484,53 @@ class TestStrategiesFallback:
         written = yaml.safe_load(yaml_files[0].read_text())
         assert written["ml_overlay"] == {"model_name": "lstm_btc", "confidence_threshold": 0.7}
 
+    def test_an_enabled_overlay_saves_and_updates_with_the_feature_window(
+        self, tmp_path: Path
+    ) -> None:
+        """The builder's hard-coded history (50) can never pass the session's ML gate; an
+        enabled overlay lifts it to the frozen spec's 1h window on save and on update."""
+        from hydra.ml.consumers import _required_history
+        from hydra.ml.features import DEFAULT_FEATURE_SPEC
+        from hydra.strategy.config import StrategyConfig
+
+        body: dict[str, Any] = {
+            "name": "Gated RSI",
+            "rules": {
+                "entry_long": {
+                    "operator": "AND",
+                    "conditions": [
+                        {
+                            "indicator": "rsi",
+                            "params": {"period": 14},
+                            "comparator": "less_than",
+                            "value": 30,
+                        }
+                    ],
+                },
+            },
+            "timeframes": {"primary": "1h", "confirmation": "4h", "entry": "1d"},
+            "ml_overlay": {"enabled": True, "model_name": "alpha", "confidence_threshold": 0.6},
+        }
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            saved = client.post("/api/strategies/save", json=body)
+            assert saved.status_code == 201, saved.text
+            [path] = tmp_path.glob("*.yaml")
+            written = yaml.safe_load(path.read_text())
+            assert written["parameters"]["required_history"] == DEFAULT_FEATURE_SPEC.window_1h
+            # the gate's own reading: the strategy instance declares the whole window
+            assert _required_history(StrategyConfig(**written)) >= DEFAULT_FEATURE_SPEC.window_1h
+
+            updated = client.put(f"/api/strategies/{saved.json()['id']}", json=body)
+            assert updated.status_code == 200, updated.text
+            written = yaml.safe_load(path.read_text())
+            assert written["parameters"]["required_history"] == DEFAULT_FEATURE_SPEC.window_1h
+
+            plain = client.post("/api/strategies/save", json={**body, "ml_overlay": None})
+            assert plain.status_code == 201, plain.text
+        [plain_path] = [p for p in tmp_path.glob("*.yaml") if p != path]
+        assert yaml.safe_load(plain_path.read_text())["parameters"]["required_history"] == 50
+
     def test_update_non_rule_based_returns_400(self, tmp_path: Path) -> None:
         yaml_content = (
             "id: lstm_strat\n"
