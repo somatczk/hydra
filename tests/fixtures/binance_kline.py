@@ -67,6 +67,15 @@ def binance_markets() -> dict[str, dict[str, Any]]:
     return {m["symbol"]: m for m in markets}
 
 
+def binanceusdm_markets() -> dict[str, dict[str, Any]]:
+    """The BTC/USDT and ETH/USDT linear perpetuals only, keyed by unified symbol.
+
+    What the ``binanceusdm`` class's ``load_markets`` returns with its linear-only
+    ``fetchMarkets`` options: linear swaps and no spot market at all.
+    """
+    return {m["symbol"]: m for m in (swap_market("BTC"), swap_market("ETH"))}
+
+
 class _SpotStreamClient:
     url = "wss://stream.binance.com:9443/ws"
 

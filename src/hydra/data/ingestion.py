@@ -27,7 +27,7 @@ import asyncio
 import contextlib
 import time
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -125,32 +125,54 @@ class InsufficientHistoryError(Exception):
         )
 
 
+_FUTURES_VENUES: frozenset[str] = frozenset({"binanceusdm"})
+"""The FUTURES venues: their feeds resolve linear swap markets, never spot."""
+
+_SPOT_REST_OPTIONS: dict[str, Any] = {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}}
+_USDM_REST_OPTIONS: dict[str, Any] = {
+    "defaultType": "swap",
+    "defaultSubType": "linear",
+    "fetchMarkets": {"types": ["linear"]},
+}
+
+
+def _venue_rest_options(exchange_id: str) -> dict[str, Any]:
+    return dict(_USDM_REST_OPTIONS if exchange_id in _FUTURES_VENUES else _SPOT_REST_OPTIONS)
+
+
 def _default_rest_factory(exchange_id: str) -> Any:
     import ccxt.async_support as ccxt_async
 
     cls = getattr(ccxt_async, exchange_id)
-    return cls(
-        {
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}},
-        }
-    )
+    return cls({"enableRateLimit": True, "options": _venue_rest_options(exchange_id)})
 
 
-def resolve_spot_symbol(markets: dict[str, Any], symbol: str, exchange_id: str = "") -> str:
-    """Unified spot symbol for a config symbol (exchange id like ``BTCUSDT`` or unified)."""
+def _is_venue_market(exchange_id: str, market: Mapping[str, Any]) -> bool:
+    """Spot markets on binance; linear swap markets on the FUTURES venues."""
+    if exchange_id in _FUTURES_VENUES:
+        return market.get("swap") is True and market.get("linear") is True
+    return market.get("spot") is True
+
+
+def resolve_market_symbol(markets: dict[str, Any], symbol: str, exchange_id: str = "") -> str:
+    """Unified symbol for a config symbol on the venue's own markets (id or unified).
+
+    Spot on binance, linear swaps on the FUTURES venues — the same venue pair
+    ``client_factory``/``market_rules`` dispatch on.
+    """
+    noun = "linear swap" if exchange_id in _FUTURES_VENUES else "spot"
     matches = {
         m["symbol"]
         for m in markets.values()
-        if m.get("spot") is True and symbol in (m.get("id"), m.get("symbol"))
+        if _is_venue_market(exchange_id, m) and symbol in (m.get("id"), m.get("symbol"))
     }
     if len(matches) != 1:
-        found = sorted(matches) or "no spot market"
-        msg = f"{exchange_id}: symbol {symbol!r} must match exactly one spot market, got {found}"
+        found = sorted(matches) or f"no {noun} market"
+        msg = f"{exchange_id}: symbol {symbol!r} must match exactly one {noun} market, got {found}"
         raise ValueError(msg)
     unified = matches.pop()
     if markets[unified].get("active") is False:
-        msg = f"{exchange_id}: spot market {unified} is not active"
+        msg = f"{exchange_id}: {noun} market {unified} is not active"
         raise ValueError(msg)
     return unified
 
@@ -255,7 +277,8 @@ class ExchangeFeedManager:
         Where closed bars are upserted and warm-up history is read; ``None`` disables both.
     rest_factory:
         Exchange id -> ccxt async REST instance for warm-up and gap fills. Defaults to a
-        rate-limited spot instance. The feed owns this client (closing it with the feed);
+        rate-limited public instance of the venue's class (spot on binance, linear swaps
+        on the FUTURES venues). The feed owns this client (closing it with the feed);
         pass ``rest_pool`` instead to share one process-wide client.
     rest_pool:
         A refcounted shared pool (``execution.client_factory.SharedRestClients``); the
@@ -355,9 +378,10 @@ class ExchangeFeedManager:
         symbols: list[str],
         timeframes: list[Timeframe],
     ) -> None:
-        """Resolve the spot markets and start the watch, dispatch and watchdog tasks.
+        """Resolve the venue's markets and start the watch, dispatch and watchdog tasks.
 
-        Raises ``ValueError`` when a symbol is not exactly one active spot market.
+        Raises ``ValueError`` when a symbol is not exactly one active market of the
+        venue's own type (spot on binance, linear swaps on the FUTURES venues).
         """
         if self._running.get(exchange_id, False):
             logger.warning("Already connected", exchange=exchange_id)
@@ -618,7 +642,7 @@ class ExchangeFeedManager:
         max_retries: int = 5,
     ) -> list[OHLCV]:
         rest, markets = await self._ensure_rest(exchange_id)
-        unified = unified or resolve_spot_symbol(markets, symbol, exchange_id)
+        unified = unified or resolve_market_symbol(markets, symbol, exchange_id)
         return await fetch_closed_bars(
             rest,
             unified,
@@ -642,7 +666,7 @@ class ExchangeFeedManager:
         streams: dict[StreamKey, _Stream] = {}
         resync = False
         for symbol in dict.fromkeys(symbols):
-            unified = resolve_spot_symbol(markets, symbol, exchange_id)
+            unified = resolve_market_symbol(markets, symbol, exchange_id)
             for timeframe in dict.fromkeys(timeframes):
                 tail = self._warm_tails.get((exchange_id, symbol, timeframe))
                 resync = resync or tail is not None

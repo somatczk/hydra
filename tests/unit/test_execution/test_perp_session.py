@@ -20,6 +20,7 @@ from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.risk.pretrade import RiskConfig
+from tests.fixtures.binance_kline import binanceusdm_markets
 from tests.unit.test_execution.session_harness import (
     Harness,
     perp_clients,
@@ -98,6 +99,29 @@ class TestSessionDispatch:
 
         with pytest.raises(UnsupportedVenueError):
             build_paper_executor("binanceusdm", {"USDT": D("100")}, None, "s", "sess")
+
+    async def test_a_futures_session_starts_against_the_venues_own_markets(
+        self, strategies_dir: Path
+    ) -> None:
+        """The 2.8.0 on-box battery hotfix: the usdm venue loads linear swaps only —
+        there is no spot market — so the session start must resolve BTCUSDT on the
+        venue's markets. The spot-only warm-up killed the start with the box's
+        ``symbol 'BTCUSDT' must match exactly one spot market, got no spot market``;
+        the default fakes (a spot market present) could never see it.
+        """
+        sid = write_perp(strategies_dir, "perp-usdm-markets", entry_long=ALWAYS)
+        harness = Harness(strategies_dir, markets=binanceusdm_markets())
+        await harness.start()
+        assert harness.mgr is not None
+        harness.mgr._clients = perp_clients(harness)
+        try:
+            session = await harness.session(sid)
+            assert session.status == "running"
+            assert isinstance(session._executor, PerpPaperTradingExecutor)
+            await settle()
+            assert harness.ws[0].subscriptions[0] == [["BTC/USDT:USDT", "1h"]]
+        finally:
+            await harness.close()
 
 
 class TestShortsThroughTheWiring:

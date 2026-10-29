@@ -120,23 +120,31 @@ class Harness:
     ws: list[FakeWsExchange] = field(default_factory=list)
     mgr: SessionManager | None = None
     store: InMemoryRiskStateStore | None = None
+    markets: dict[str, dict[str, Any]] | None = None
+    """The fakes' market set; None serves the default binance set (spot + the BTC perp)."""
     _next: dict[str, datetime] = field(default_factory=dict)
 
     def clients(self) -> ClientFactory:
         rows = history_rows(self.end, self.history_bars, self.history_close)
+        markets = self.markets
 
         def ws_factory(exchange_id: str) -> Any:
             def make() -> FakeWsExchange:
-                ex = FakeWsExchange()
+                ex = FakeWsExchange(markets)
                 self.ws.append(ex)
                 return ex
 
             return make
 
+        async def loader(exchange_id: str) -> list[dict[str, Any]]:
+            return list((markets or binance_markets()).values())
+
         return ClientFactory(
             ws_factory=ws_factory,
-            rest_pool=SharedRestClients(rest_factory=lambda eid, creds: FakeRestExchange(rows)),
-            markets_loader=markets_loader,
+            rest_pool=SharedRestClients(
+                rest_factory=lambda eid, creds: FakeRestExchange(rows, markets=markets)
+            ),
+            markets_loader=loader,
             repository_factory=lambda _pool: None,
             history_window=20,
         )
