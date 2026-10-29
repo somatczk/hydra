@@ -10,7 +10,7 @@ timeframes:
   primary: 1h
 parameters:
   description: Mean reversion using Bollinger Bands. Buys when price touches lower band with RSI confirmation, exits at middle band.
-  required_history: 50
+  required_history: 86
   rules:
     entry_long:
       operator: AND

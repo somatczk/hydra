@@ -67,7 +67,7 @@ parameters:
           comparator: crosses_above
           value: 0
           param_key: macd_fast
-  required_history: 50
+  required_history: 143
   description: Momentum strategy combining RSI oversold/overbought with MACD zero-line crossovers for entry confirmation.
 position_sizing:
   method: fixed_fractional

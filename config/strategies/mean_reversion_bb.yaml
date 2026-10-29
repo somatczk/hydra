@@ -73,7 +73,7 @@ parameters:
           comparator: less_than
           value: 40
           param_key: rsi_period
-  required_history: 30
+  required_history: 86
   description: RSI-based mean reversion with Bollinger Band confirmation. Enters on band touches with RSI extremes, exits at mid-band.
 position_sizing:
   method: fixed_fractional

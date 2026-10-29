@@ -61,7 +61,7 @@ parameters:
           value_ref_overrides:
             bb_period: period
             bb_std_dev: std_dev
-  required_history: 30
+  required_history: 86
   description: Volume-weighted breakout detection using Bollinger Band breakouts with ATR volatility confirmation
 position_sizing:
   method: fixed_fractional

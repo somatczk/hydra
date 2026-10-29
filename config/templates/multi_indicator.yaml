@@ -10,7 +10,7 @@ timeframes:
   primary: 1h
 parameters:
   description: Multi-indicator strategy requiring RSI, MACD and close-above-EMA to agree before entering.
-  required_history: 50
+  required_history: 143
   rules:
     entry_long:
       operator: AND
