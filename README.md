@@ -325,7 +325,7 @@ Each PR that changes one of these rows updates the row.
 ## Roadmap
 
 Hydra is being rebuilt in phases, each ending in a release. All planned phases have shipped; the current release is
-2.8.1.
+2.9.0.
 
 | Phase | Release | What it delivered |
 |-------|---------|-------------------|
@@ -337,6 +337,7 @@ Hydra is being rebuilt in phases, each ending in a release. All planned phases h
 | P6 Top-100 data | 2.7.0 (UI in 2.8.0) | The ranked top-100 universe and its write gate, on-demand candle fetching with a bounded disk cache, the Data page and universe picker. |
 | P4 Perps | 2.8.0 | Binance USD⌂-M perps end to end: paper sessions and backtests (isolated margin, 1-3x leverage, long and short, funding from settled rates, liquidation), the separate perps arming ceremony, the live perps executor. |
 | P5 ML | 2.8.0 | The honest dataset and walk-forward training, the versioned model registry, the training job and ONNX export, the ML veto overlay and the ML-native strategy, drift detection, the Models page. |
+| Research hardening | 2.9.0 | Regime and momentum indicators (ADX, rate of change, lagged close, Bollinger width, ATR %, Donchian highs and lows), computed vectorised; entry schedules; explicit parameter bindings whose tuned values round-trip through the builder; warm-up history derived from the rules; several backtest workers sharing one queue and fetching each dataset once; walk-forward folds that mean what they say; model registry tools over MCP and version-pinned research runs; the agent instructions and this README. |
 
 **Deferred and known gaps** (the [Status](#status) table has the full list):
 
@@ -400,7 +401,7 @@ dependencies only. The engine creates its database schema on first start.
 Production runs as a Docker Compose stack in the [romulus](https://github.com/somatczk/romulus) homelab repo
 (`stacks/hydra/`) on a single Ubuntu server. CI publishes three images to GHCR after every green push to `main`:
 `hydra-engine` (the API, and the trader with `command: python -m hydra.trader`), `hydra-dashboard` and
-`hydra-backtest` (the worker). A release tag such as `2.8.1` is pushed once and never moves; romulus pins it.
+`hydra-backtest` (the worker). A release tag such as `2.9.0` is pushed once and never moves; romulus pins it.
 
 In production the API and the trader are separate containers of the engine image (`HYDRA_TRADER__URL` points the
 API at the trader), the dashboard sits behind the same host, and the API sits behind a Traefik reverse proxy with
