@@ -1,5 +1,6 @@
-"""The 35 MCP tools (23 research + strategy, 10 session + risk, 2 code-gated live),
-called through the mounted transport.
+"""The 42 MCP tools (23 research + strategy, 10 session + risk, 2 code-gated live,
+7 model registry), called through the mounted transport. The model tools' behaviour
+lives in ``test_mcp_model_tools.py``.
 
 Every test drives the real JSON-RPC surface — initialize, notifications/initialized,
 tools/list, tools/call — over the real mount (token gate, SDK streamable-HTTP app)
@@ -107,6 +108,18 @@ B2_TOOLS = frozenset(
 )
 
 LIVE_TOOLS = frozenset({"live_session_start", "live_order"})
+
+MODEL_TOOLS = frozenset(
+    {
+        "model_list",
+        "model_get",
+        "model_retrain",
+        "model_retrain_status",
+        "model_retrain_cancel",
+        "model_promote",
+        "model_rollback",
+    }
+)
 
 _RULES = {
     "entry_long": {
@@ -444,10 +457,10 @@ def test_engine_state_falls_back_to_the_imported_module_app(
     assert _deps.db_pool() is sentinel
 
 
-def test_tools_list_advertises_the_35_tools(mcp: _McpClient) -> None:
+def test_tools_list_advertises_the_42_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
-    assert names == B1_TOOLS | B2_TOOLS | LIVE_TOOLS
-    assert len(names) == 35
+    assert names == B1_TOOLS | B2_TOOLS | LIVE_TOOLS | MODEL_TOOLS
+    assert len(names) == 42
     # the live pin: the two gated live tools; no live_arm/live_disarm (the operator's ceremony)
     assert "risk_live_status" in names
     assert {name for name in names if name.startswith("live_")} == {

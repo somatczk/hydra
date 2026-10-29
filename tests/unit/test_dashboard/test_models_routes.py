@@ -13,7 +13,6 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -24,14 +23,10 @@ from structlog.testing import capture_logs
 
 from hydra.core.logging import get_logger
 from hydra.dashboard import security
-from hydra.dashboard.routes import models as routes_models
 from hydra.dashboard.routes._db import install_error_handlers
-from hydra.dashboard.routes.models import (
-    _drift_fields,
-    _version_response,
-    router,
-)
+from hydra.dashboard.routes.models import router
 from hydra.ml.registry import ModelVersion
+from hydra.services.models import drift_fields, version_response
 from tests.fixtures.ml_onnx import reduce_max_onnx
 
 ONNX = reduce_max_onnx({"spec_version": "3", "feature_names": '["f0"]', "horizon": "4"})
@@ -192,20 +187,20 @@ def _version(
 
 class TestDriftFields:
     def test_no_measurement_is_unknown(self) -> None:
-        assert _drift_fields(_version(drift=None)) == (None, "unknown")
-        assert _drift_fields(_version(drift={})) == (None, "unknown")
-        assert _drift_fields(_version(drift={"status": "high"})) == (None, "unknown")
+        assert drift_fields(_version(drift=None)) == (None, "unknown")
+        assert drift_fields(_version(drift={})) == (None, "unknown")
+        assert drift_fields(_version(drift={"status": "high"})) == (None, "unknown")
 
     def test_a_label_is_only_trusted_when_a_value_backs_it(self) -> None:
-        assert _drift_fields(_version(drift={"max_psi": 0.42, "status": "high"})) == (0.42, "high")
-        assert _drift_fields(_version(drift={"max_psi": 0.1, "status": "fine"})) == (0.1, "unknown")
-        assert _drift_fields(_version(drift={"max_psi": "lots", "status": "low"})) == (
+        assert drift_fields(_version(drift={"max_psi": 0.42, "status": "high"})) == (0.42, "high")
+        assert drift_fields(_version(drift={"max_psi": 0.1, "status": "fine"})) == (0.1, "unknown")
+        assert drift_fields(_version(drift={"max_psi": "lots", "status": "low"})) == (
             None,
             "unknown",
         )
 
     def test_the_alternative_label_key_is_read(self) -> None:
-        assert _drift_fields(_version(drift={"max_psi": 0.3, "drift_status": "moderate"})) == (
+        assert drift_fields(_version(drift={"max_psi": 0.3, "drift_status": "moderate"})) == (
             0.3,
             "moderate",
         )
@@ -213,7 +208,7 @@ class TestDriftFields:
 
 class TestVersionResponse:
     def test_the_stage_and_drift_mapping_the_ui_expects(self, tmp_path: Path) -> None:
-        response = _version_response(_version())
+        response = version_response(_version(), tmp_path)
         assert response["stage"] == "Staging"
         assert response["drift"] is None
         assert response["drift_status"] == "unknown"
@@ -222,18 +217,18 @@ class TestVersionResponse:
         assert response["trained_at"] == "2026-10-28T12:00:00+00:00"
         assert response["training_job_id"] == "ml-abc12345"
 
-    def test_every_stage_has_its_label(self) -> None:
-        assert _version_response(_version(stage="production"))["stage"] == "Production"
-        assert _version_response(_version(stage="archived"))["stage"] == "Archived"
+    def test_every_stage_has_its_label(self, tmp_path: Path) -> None:
+        assert version_response(_version(stage="production"), tmp_path)["stage"] == "Production"
+        assert version_response(_version(stage="archived"), tmp_path)["stage"] == "Archived"
 
     def test_the_artifact_size_is_read_from_a_validated_file_only(self, tmp_path: Path) -> None:
         artifact = tmp_path / "abc123.onnx"
         artifact.write_bytes(b"0123456789")
-        with patch.object(routes_models, "_models_dir", return_value=tmp_path):
-            assert _version_response(_version())["file_size"] == 10
-            # a stored filename that is not a plain .onnx name never joins the dir
-            assert _version_response(_version(artifact_file="../../etc/passwd"))["file_size"] == 0
-            assert _version_response(_version(artifact_file="nope.txt"))["file_size"] == 0
+        assert version_response(_version(), tmp_path)["file_size"] == 10
+        # a stored filename that is not a plain .onnx name never joins the dir
+        traversal = _version(artifact_file="../../etc/passwd")
+        assert version_response(traversal, tmp_path)["file_size"] == 0
+        assert version_response(_version(artifact_file="nope.txt"), tmp_path)["file_size"] == 0
 
 
 # ---------------------------------------------------------------------------
