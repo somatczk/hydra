@@ -6,6 +6,7 @@ export { TimeframeSelector } from './TimeframeSelector';
 export { RiskConfigurator } from './RiskConfigurator';
 export { SignalPreview } from './SignalPreview';
 export { StrategyNameDialog } from './StrategyNameDialog';
+export { UniversePicker, rankedAtPhrase, symbolInUniverse, type UniverseMember, type UniverseSnapshot } from './UniversePicker';
 export type {
   BuilderState,
   BuilderAction,

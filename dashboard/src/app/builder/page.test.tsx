@@ -33,6 +33,7 @@ function routes(): Routes {
         detail: { code: 'strategy_not_found', message: 'Strategy strat-1 not found', state: 'not_found' },
       }),
     ),
+    '/api/market/universe': UNIVERSE,
   };
 }
 
@@ -53,6 +54,21 @@ const STRATEGY = {
     sizing_method: 'fixed_fractional',
     sizing_params: {},
   },
+};
+
+/** The stored top-100 ranking exactly as GET /api/market/universe serves it (BTCUSDT is a member). */
+const UNIVERSE = {
+  exchange_id: 'binance',
+  quote_asset: 'USDT',
+  source: 'binance spot rolling-24h quote volume (GET /api/v3/ticker/24hr)',
+  ranked_at: '2026-10-29T08:00:00+00:00',
+  age_hours: 2,
+  count: 3,
+  symbols: [
+    { rank: 1, symbol: 'BTCUSDT', quote_volume: 2_000_000_000 },
+    { rank: 2, symbol: 'ETHUSDT', quote_volume: 800_000_000 },
+    { rank: 3, symbol: 'SOLUSDT', quote_volume: 300_000_000 },
+  ],
 };
 
 function loadedRoutes(): Routes {

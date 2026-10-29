@@ -18,7 +18,7 @@ const { AppLayout } = await import('./AppLayout');
 const { ThemeProvider } = await import('./ThemeProvider');
 const { isActive, navItems, pageTitle } = await import('./navItems');
 
-const RAIL = ['Status', 'Sessions', 'Risk', 'Activity', 'Research', 'Settings'];
+const RAIL = ['Status', 'Sessions', 'Risk', 'Activity', 'Research', 'Data', 'Settings'];
 const TABS = ['Status', 'Sessions', 'Risk', 'Research', 'Settings'];
 const SRC = path.join(process.cwd(), 'src');
 
@@ -44,7 +44,7 @@ async function bars(at: string) {
 }
 
 describe('navigation', () => {
-  it('renders six destinations in the rail (Activity rail-only between Risk and Research) and exactly five in the tab bar', async () => {
+  it('renders six destinations in the rail (Activity and Data rail-only) and exactly five in the tab bar', async () => {
     const { rail, tabs } = await bars('/');
     expect(topLabels(rail)).toEqual(RAIL);
     expect(topLabels(tabs)).toEqual(TABS);
@@ -70,6 +70,7 @@ describe('navigation', () => {
   it.each([
     ['/activity', 'Activity'],
     ['/activity/approvals/abc', 'Activity'],
+    ['/data', 'Data'],
   ])('marks the rail-only %s only in the rail, never in the tab bar', async (at, label) => {
     const { rail, tabs } = await bars(at);
     expect(current(rail)).toEqual([label]);
@@ -90,6 +91,7 @@ describe('navigation', () => {
     expect(navItems.filter((item) => isActive('/', item)).map((i) => i.label)).toEqual(['Status']);
     expect(navItems.filter((item) => isActive('/riskier', item))).toEqual([]);
     expect(navItems.filter((item) => isActive('/activity', item)).map((i) => i.label)).toEqual(['Activity']);
+    expect(navItems.filter((item) => isActive('/data', item)).map((i) => i.label)).toEqual(['Data']);
   });
 
   it('has no single-key shortcuts left (WCAG 2.1.4)', () => {

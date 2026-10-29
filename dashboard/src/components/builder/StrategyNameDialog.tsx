@@ -1,12 +1,13 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { fetchApi } from '@/lib/api';
-import { describeApiError } from '@/lib/apiState';
+import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
+import { UniversePicker, symbolInUniverse, type UniverseSnapshot } from './UniversePicker';
 import type { BuilderState, SerializedConditionGroup } from './types';
 
 interface StrategyNameDialogProps {
@@ -70,7 +71,9 @@ export function StrategyNameDialog({
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [leverage, setLeverage] = useState('1');
   const [enableImmediately, setEnableImmediately] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<unknown>(null);
+  const [universe, setUniverse] = useState<UniverseSnapshot | null>(null);
+  const handleUniverse = useCallback((snapshot: UniverseSnapshot | null) => setUniverse(snapshot), []);
 
   useEffect(() => {
     if (open) {
@@ -80,15 +83,19 @@ export function StrategyNameDialog({
       setSymbol(initialSymbol || 'BTCUSDT');
       setLeverage(String(initialLeverage ?? 1));
       setEnableImmediately(false);
-      setError(null);
+      setSaveError(null);
     }
   }, [open, initialName, initialDescription, initialExchangeId, initialSymbol, initialLeverage]);
 
   const isEditing = !!editingId;
   const perps = exchangeId === 'binanceusdm';
+  /* The write gate at the UI layer: only universe members are committable; an unreadable universe leaves the refusal to the engine's 422. */
+  const symbolGateBlocks = universe !== null && !symbolInUniverse(symbol, universe);
+  const gate = saveError !== null ? parseErrorDetail(saveError) : null;
+  const isUniverseGate = gate?.code === 'symbol_not_in_universe';
 
   const handleSave = async () => {
-    setError(null);
+    setSaveError(null);
 
     const requestBody = {
       name: name.trim(),
@@ -150,7 +157,7 @@ export function StrategyNameDialog({
       onClose();
     } catch (err) {
       logger.error('Builder', 'Failed to save strategy', err);
-      setError(describeApiError(err, 'Save failed'));
+      setSaveError(err);
     }
   };
 
@@ -162,7 +169,7 @@ export function StrategyNameDialog({
       secondaryLabel="Cancel"
       pendingLabel="Saving…"
       pendingHint="Closing this won't cancel the save."
-      primaryDisabled={!name.trim()}
+      primaryDisabled={!name.trim() || symbolGateBlocks}
       onConfirm={handleSave}
       onClose={onClose}
     >
@@ -185,12 +192,7 @@ export function StrategyNameDialog({
           value={exchangeId}
           onChange={(e) => setExchangeId(e.target.value)}
         />
-        <Input
-          label="Symbol"
-          value={symbol}
-          onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-          placeholder="BTCUSDT"
-        />
+        <UniversePicker open={open} value={symbol} onChange={setSymbol} onUniverse={handleUniverse} />
       </div>
 
       {/* P4-F: the perps fields (venue-gated); the symbol section above is owned by P6-UI. */}
@@ -225,9 +227,19 @@ export function StrategyNameDialog({
       </label>
 
       {/* Error */}
-      {error && (
+      {saveError !== null && isUniverseGate && (
+        <div
+          role="alert"
+          data-testid="universe-gate-error"
+          className="rounded-lg border border-danger bg-danger-soft p-3 text-sm text-danger"
+        >
+          <p>{describeApiError(saveError, 'Save failed')}</p>
+          <p>Pick a member of the current top-100 universe from the symbol field above — a symbol outside it can&apos;t be saved.</p>
+        </div>
+      )}
+      {saveError !== null && !isUniverseGate && (
         <p role="alert" className="rounded-lg border border-danger bg-danger-soft p-3 text-sm text-danger">
-          {error}
+          {describeApiError(saveError, 'Save failed')}
         </p>
       )}
     </ConfirmDialog>
