@@ -89,12 +89,20 @@ class _DateRange(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+_MODEL_VERSION_ID = Field(
+    default=None,
+    description="a registry model version (any stage) the job serves in place of its "
+    "name's Production version; research jobs only, sessions never take one",
+)
+
+
 class BacktestRunRequest(_DateRange):
     strategy_id: str
     initial_capital: float = Field(default=10000.0, gt=0)
     name: str = ""
     timeframe: Timeframe | None = None
     fetch_fresh: bool = False
+    model_version_id: uuid.UUID | None = _MODEL_VERSION_ID
 
 
 class ParamDefRequest(BaseModel):
@@ -114,6 +122,7 @@ class HyperoptRunRequest(_DateRange):
     max_trials: int = Field(default=50, ge=1, le=500)
     timeframe: Timeframe | None = None
     initial_capital: float = Field(default=10000.0, gt=0)
+    model_version_id: uuid.UUID | None = _MODEL_VERSION_ID
 
 
 class WalkForwardRunRequest(_DateRange):
@@ -126,6 +135,7 @@ class WalkForwardRunRequest(_DateRange):
     train_pct: float = Field(default=0.75, gt=0.0, lt=1.0)
     timeframe: Timeframe | None = None
     initial_capital: float = Field(default=10000.0, gt=0)
+    model_version_id: uuid.UUID | None = _MODEL_VERSION_ID
 
 
 # ---------------------------------------------------------------------------

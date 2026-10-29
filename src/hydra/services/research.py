@@ -20,10 +20,11 @@ from hydra.core.types import Timeframe
 from hydra.data.bars import ceil_to_tf, floor_to_tf, timeframe_seconds
 from hydra.services import strategies as strategy_files
 from hydra.services.backtest import (
-    DataProvenanceModel,
+    JobProvenanceModel,
     _invalid_strategy,
     _load_backtest_strategy,
     _preflight,
+    check_model_pin,
 )
 from hydra.services.errors import ServiceError, db_errors, service_error
 from hydra.strategy.base import BaseStrategy
@@ -134,13 +135,6 @@ def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
 class HyperoptRunResponse(BaseModel):
     task_id: str
     status: str = "queued"
-
-
-class JobProvenanceModel(DataProvenanceModel):
-    """Provenance read from a job row: carries the code and config that ran it (D2 decision)."""
-
-    hydra_version: str | None = None
-    config_hash: str | None = None
 
 
 class HyperoptProgressResponse(BaseModel):
@@ -270,6 +264,7 @@ async def submit_hyperopt(
         body.end_date,
         auto_fetch=auto_fetch,
     )
+    await check_model_pin(pf.pool, pf.config, body.model_version_id)
     async with db_errors("queueing the job"):
         task_id = await jobs.enqueue(
             pool,
@@ -455,6 +450,7 @@ async def submit_walkforward(
                 available_first_ts=first.isoformat(),
                 available_last_ts=last.isoformat(),
             )
+    await check_model_pin(pf.pool, pf.config, body.model_version_id)
     async with db_errors("queueing the job"):
         task_id = await jobs.enqueue(
             pool,

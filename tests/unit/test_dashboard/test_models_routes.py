@@ -108,6 +108,17 @@ class _NullConn:
         self.executed.append((query, args))
         return "OK"
 
+    def transaction(self) -> _Transaction:
+        return _Transaction()
+
+
+class _Transaction:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
 
 class _NullPool:
     def __init__(self) -> None:

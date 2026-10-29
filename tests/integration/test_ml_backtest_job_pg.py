@@ -39,7 +39,7 @@ from hydra.data.migrations.runner import upgrade_to_head
 from hydra.data.storage import MarketDataRepository
 from hydra.ml.consumers import _reset_overlays
 from hydra.ml.features import DEFAULT_FEATURE_SPEC
-from hydra.ml.registry import ModelRegistration, ModelRegistry
+from hydra.ml.registry import ModelRegistration, ModelRegistry, ModelVersion
 from hydra.ml.serving import _reset_attached
 from hydra.strategy.ml_access import _reset_providers
 from tests.fixtures.ml_onnx import confidence_onnx, frozen_spec_metadata
@@ -164,12 +164,18 @@ async def _seed(pool: Any, bars: list[OHLCV]) -> None:
 
 
 async def _register(
-    pool: Any, models_dir: Path, name: str, *, scale: float = 0.01, promote: bool = True
-) -> None:
+    pool: Any,
+    models_dir: Path,
+    name: str,
+    *,
+    scale: float = 0.01,
+    promote: bool = True,
+    artifact_name: str | None = None,
+) -> ModelVersion:
     meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
     blob = confidence_onnx(meta, N_FEATURES, scale=scale)
     models_dir.mkdir(parents=True, exist_ok=True)
-    artifact = models_dir / f"{name}.onnx"
+    artifact = models_dir / (artifact_name or f"{name}.onnx")
     artifact.write_bytes(blob)
     version = await ModelRegistry(pool).register(
         ModelRegistration(
@@ -185,6 +191,7 @@ async def _register(
     )
     if promote:
         await ModelRegistry(pool).promote(name, version.version)
+    return version
 
 
 def _write_native(strategies_dir: Path) -> str:
@@ -226,11 +233,18 @@ def _write_gated(strategies_dir: Path, *, shadow: bool) -> str:
     return "gated"
 
 
-async def _run_job(client: httpx.AsyncClient, pool: Any, strategy_id: str) -> dict[str, Any]:
+async def _run_job(
+    client: httpx.AsyncClient, pool: Any, strategy_id: str, **extra: Any
+) -> dict[str, Any]:
     """Submit one backtest, run it on the worker, and return its terminal status."""
     resp = await client.post(
         "/api/backtest/run",
-        json={"strategy_id": strategy_id, "start_date": "2026-01-01", "end_date": "2026-04-01"},
+        json={
+            "strategy_id": strategy_id,
+            "start_date": "2026-01-01",
+            "end_date": "2026-04-01",
+            **extra,
+        },
     )
     assert resp.status_code == 202, resp.text
     task_id = resp.json()["task_id"]
@@ -319,3 +333,54 @@ class TestTheWorkerAttaches:
         assert status["result_id"] is None
         assert f"{MODEL}.onnx" in (status["error"] or "")
         assert "refuses rather than trade without the model" in (status["error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# The research pin: a Staging version evaluated before anyone promotes it
+# ---------------------------------------------------------------------------
+
+
+class TestThePinnedVersion:
+    async def test_a_pinned_staging_version_trades_where_production_does_not(
+        self, client: httpx.AsyncClient, pool: Any, models_dir: Path, strategies_dir: Path
+    ) -> None:
+        """The research loop's evaluate step needs no human: the pinned Staging version
+        serves the job, the result is attributable to it, and nothing was promoted.
+
+        Production v1 is the strict scale (rising -> P(up) = 0.1: only SHORT entries,
+        which spot drops) and Staging v2 the permissive one (P(up) = 1.0 -> LONG), so
+        the trades themselves say which version answered.
+        """
+        await _seed(pool, _rising())
+        await _register(pool, models_dir, MODEL, scale=0.001)
+        staging = await _register(
+            pool, models_dir, MODEL, promote=False, artifact_name=f"{MODEL}-v2.onnx"
+        )
+        strategy_id = _write_native(strategies_dir)
+
+        production_run = await _run_job(client, pool, strategy_id)
+        pinned_run = await _run_job(client, pool, strategy_id, model_version_id=str(staging.id))
+
+        assert production_run["status"] == "completed", production_run["error"]
+        assert pinned_run["status"] == "completed", pinned_run["error"]
+        served = (await client.get(f"/api/backtest/results/{production_run['result_id']}")).json()
+        assert served["metrics"]["total_trades"] == 0
+        pinned = (await client.get(f"/api/backtest/results/{pinned_run['result_id']}")).json()
+        assert pinned["metrics"]["total_trades"] >= 1
+        assert pinned["trades"][0]["side"] == "LONG"
+
+        assert [
+            (m["version"], m["stage"], m["pinned"])
+            for m in production_run["provenance"]["ml_models"]
+        ] == [(1, "production", False)]
+        assert pinned_run["provenance"]["ml_models"] == [
+            {
+                "id": str(staging.id),
+                "name": MODEL,
+                "version": 2,
+                "stage": "staging",
+                "pinned": True,
+            }
+        ]
+        production = await ModelRegistry(pool).get_production(MODEL)
+        assert production is not None and production.version == 1

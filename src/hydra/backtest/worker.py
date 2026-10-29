@@ -32,6 +32,7 @@ import socket
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -58,7 +59,7 @@ from hydra.data.migrations.runner import current_revision, head_revision
 from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
 from hydra.data.storage import MarketDataRepository
 from hydra.execution.client_factory import RestHandle, RestPoolFactory, SharedRestClients
-from hydra.ml.consumers import validate_session_ml
+from hydra.ml.consumers import LiveFeaturesPredictor, attach_research_ml
 from hydra.ml.dataset import DatasetBuilder
 from hydra.ml.export import export_xgboost_to_onnx, validate_onnx_export
 from hydra.ml.features import FeatureSpec
@@ -67,6 +68,7 @@ from hydra.ml.serving import MlServingError
 from hydra.ml.training import ModelTrainer
 from hydra.risk.state import PgRiskStateStore
 from hydra.strategy.config import StrategyConfig
+from hydra.strategy.ml_access import bound_providers
 
 if TYPE_CHECKING:
     from hydra.core.config import HydraConfig
@@ -174,6 +176,22 @@ def _fetch_failed(run: JobRun, **extra: Any) -> None:
     run.detail["fetch"] = {**(run.detail.get("fetch") or {}), "state": "failed", **extra}
 
 
+async def _attach_ml(
+    pool: Any, config: StrategyConfig, model_version_id: uuid.UUID | None
+) -> tuple[dict[str, LiveFeaturesPredictor], list[dict[str, Any]]]:
+    """Attach the models the config consumes for this job only; a refusal fails the job.
+
+    Runs where the pool is, before any bar is fetched: an un-promoted name, an
+    unknown or unconsumed pinned version or a missing artifact fails loudly with
+    the model named — never a completed run whose every entry was vetoed
+    ``error`` (the runner itself has no pool to attach with).
+    """
+    try:
+        return await attach_research_ml(pool, _ml_models_dir(), config, model_version_id)
+    except (MlServingError, ValueError) as exc:
+        raise JobError(str(exc)) from exc
+
+
 async def _ensure_bars(
     pool: Any,
     fetch_engine: OnDemandFetchService | None,
@@ -226,26 +244,21 @@ async def run_backtest_job(
     client (skipped while auto-fetch is off) and loads what is stored — the executor
     accrues only from those rows.
 
-    A config that consumes a Production model (an enabled ``ml_overlay`` or the ML-native
-    strategy) passes the same session-start gate first: the model is validated and attached
-    HERE, where the pool is, so an un-promoted name or a missing artifact fails the job
-    loudly with the model named — never a completed run whose every entry was vetoed
-    ``error`` (the runner itself has no pool to attach with).
+    A config that consumes a model (an enabled ``ml_overlay`` or the ML-native strategy)
+    has it attached first (``_attach_ml``) and bound for this run only: Production, or
+    the request's pinned ``model_version_id`` of any stage; the served versions ride the
+    job's provenance.
     """
     body = BacktestRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
-
-    try:
-        await validate_session_ml(pool, _ml_models_dir(), config)
-    except (MlServingError, ValueError) as exc:
-        raise JobError(str(exc)) from exc
+    models, served = await _attach_ml(pool, config, body.model_version_id)
 
     await _ensure_bars(
         pool, fetch_engine, config, body.start_date, body.end_date, run, force=body.fetch_fresh
     )
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
-    run.detail["provenance"] = jobs.provenance_payload(provenance, config)
+    run.detail["provenance"] = {**jobs.provenance_payload(provenance, config), "ml_models": served}
     run.progress = 30.0
 
     funding: dict[str, list[Any]] | None = None
@@ -263,17 +276,18 @@ async def run_backtest_job(
         run.progress = round(30.0 + pct * 60.0, 1)
 
     risk_config = (await PgRiskStateStore(pool).load_config()).config
-    result = await BacktestRunner().run(
-        strategy_class=strategy_cls,
-        strategy_config=config,
-        bars=bars,
-        initial_capital=Decimal(str(body.initial_capital)),
-        symbol=config.symbols[0],
-        timeframe=config.timeframes.primary,
-        on_progress=_report,
-        risk_config=risk_config,
-        funding=funding,
-    )
+    with bound_providers(models):
+        result = await BacktestRunner().run(
+            strategy_class=strategy_cls,
+            strategy_config=config,
+            bars=bars,
+            initial_capital=Decimal(str(body.initial_capital)),
+            symbol=config.symbols[0],
+            timeframe=config.timeframes.primary,
+            on_progress=_report,
+            risk_config=risk_config,
+            funding=funding,
+        )
     run.progress = 90.0
 
     result_id = f"bt-{job['id']}"
@@ -293,10 +307,11 @@ async def run_hyperopt_job(
     body = HyperoptRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
+    models, served = await _attach_ml(pool, config, body.model_version_id)
 
     await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
-    provenance_dict = jobs.provenance_payload(provenance, config)
+    provenance_dict = {**jobs.provenance_payload(provenance, config), "ml_models": served}
     run.detail["provenance"] = provenance_dict
 
     space = ParameterSpace(
@@ -318,18 +333,19 @@ async def run_hyperopt_job(
         run.detail["current_trial_params"] = record.params
         run.detail["best_so_far"] = best_seen
 
-    result = await HyperoptRunner(BacktestRunner()).run(
-        strategy_class=strategy_cls,
-        base_config=config,
-        bars=bars,
-        initial_capital=Decimal(str(body.initial_capital)),
-        param_space=space,
-        method=body.method,
-        max_trials=body.max_trials,
-        symbol=config.symbols[0],
-        timeframe=config.timeframes.primary,
-        on_trial_complete=_on_trial,
-    )
+    with bound_providers(models):
+        result = await HyperoptRunner(BacktestRunner()).run(
+            strategy_class=strategy_cls,
+            base_config=config,
+            bars=bars,
+            initial_capital=Decimal(str(body.initial_capital)),
+            param_space=space,
+            method=body.method,
+            max_trials=body.max_trials,
+            symbol=config.symbols[0],
+            timeframe=config.timeframes.primary,
+            on_trial_complete=_on_trial,
+        )
     payload = result.to_dict()
     payload["provenance"] = provenance_dict
     return JobOutcome(result=payload)
@@ -342,10 +358,11 @@ async def run_walkforward_job(
     body = WalkForwardRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
+    models, served = await _attach_ml(pool, config, body.model_version_id)
 
     await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
-    run.detail["provenance"] = jobs.provenance_payload(provenance, config)
+    run.detail["provenance"] = {**jobs.provenance_payload(provenance, config), "ml_models": served}
 
     in_sample, out_of_sample = jobs.walkforward_months(
         provenance.first_ts, provenance.last_ts, body.fold_count, body.train_pct
@@ -360,19 +377,20 @@ async def run_walkforward_job(
         ]
     )
     analyzer = WalkForwardAnalyzer(initial_capital=Decimal(str(body.initial_capital)))
-    result = await analyzer.run_walkforward(
-        bars=bars,
-        strategy_class=strategy_cls,
-        strategy_config=config,
-        param_space=space,
-        in_sample_months=in_sample,
-        out_of_sample_months=out_of_sample,
-        method=body.method,
-        max_trials=body.max_trials,
-        anchored=body.anchored,
-        symbol=config.symbols[0],
-        timeframe=config.timeframes.primary,
-    )
+    with bound_providers(models):
+        result = await analyzer.run_walkforward(
+            bars=bars,
+            strategy_class=strategy_cls,
+            strategy_config=config,
+            param_space=space,
+            in_sample_months=in_sample,
+            out_of_sample_months=out_of_sample,
+            method=body.method,
+            max_trials=body.max_trials,
+            anchored=body.anchored,
+            symbol=config.symbols[0],
+            timeframe=config.timeframes.primary,
+        )
     if not result.folds:
         raise JobError(f"range too short for {body.fold_count} folds")
     run.detail["fold_count"] = len(result.folds)

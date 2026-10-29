@@ -30,12 +30,13 @@ from hydra.core.config import HydraConfig
 from hydra.core.logging import get_logger
 from hydra.dashboard import security
 from hydra.dashboard.api import app as engine_app
-from hydra.ml.consumers import LiveFeaturesPredictor, _reset_overlays
+from hydra.ml.consumers import _reset_overlays
 from hydra.ml.features import DEFAULT_FEATURE_SPEC
-from hydra.ml.serving import _reset_attached
+from hydra.ml.serving import _reset_attached, attach_production
 from hydra.services import models as models_svc
 from hydra.strategy.builtin.ml_ensemble import DEFAULT_REQUIRED_HISTORY, STRATEGY_CLASS
-from hydra.strategy.ml_access import _reset_providers, provider_for
+from hydra.strategy.config import StrategyConfig
+from hydra.strategy.ml_access import MlModelNotAttachedError, _reset_providers, provider_for
 from tests.fixtures.ml_onnx import confidence_onnx, frozen_spec_metadata
 
 from .conftest import TEST_API_TOKEN
@@ -637,6 +638,93 @@ async def test_imported_ml_strategies_backtest_once_the_model_is_promoted(
     for job in jobs:
         with pytest.raises(NoMarketDataError):
             await worker.run_backtest_job(pool, None, job, worker.JobRun())
-    predictor = provider_for("alpha")  # the native strategy's predictor, attached by the gate
-    assert isinstance(predictor, LiveFeaturesPredictor)
-    assert (predictor.model.name, predictor.model.version) == ("alpha", 1)
+    attached = await attach_production(None, models_dir, "alpha")  # the gate's attach, cached
+    assert (attached.name, attached.version) == ("alpha", 1)
+    with pytest.raises(MlModelNotAttachedError):
+        provider_for("alpha")  # bound for the job's run only, never where a session resolves
+
+
+def _staged_alpha(pool: _RegistryPool, models_dir: Path) -> str:
+    """A Staging-only 'alpha' v1 whose artifact is really on the mount; never promoted."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    blob = confidence_onnx(meta, len(DEFAULT_FEATURE_SPEC.feature_names))
+    (models_dir / "alpha-v1.onnx").write_bytes(blob)
+    staged = pool.conn.add(1, "staging", artifact="alpha-v1.onnx")
+    pool.conn.models[uuid.UUID(staged)]["artifact_sha256"] = hashlib.sha256(blob).hexdigest()
+    return staged
+
+
+async def test_a_research_agent_backtests_a_staging_version_without_a_promote(
+    mcp_cfg: HydraConfig, pool: _RegistryPool, strategies_dir: Path
+) -> None:
+    """train -> evaluate with no human promote: backtest_run pins the Staging version.
+
+    The pin rides the job row and the worker's model gate serves it (without the pin
+    the same job refuses: there is no Production). A pin naming a model the strategy
+    does not consume, or no registry version at all, refuses at submit and queues
+    nothing. Only the three research runs take a pin; no session tool does.
+    """
+    staged = _staged_alpha(pool, Path(mcp_cfg.ml.models_dir))
+    beta = pool.conn.add(1, "staging", name="beta")
+    async with _async_mcp(mcp_cfg) as mcp:
+        is_error, text = await mcp.call(
+            "strategy_import", {"filename": "native.yaml", "yaml_content": _native_yaml()}
+        )
+        assert not is_error, text
+        run = {"strategy_id": json.loads(text)["id"], "start_date": "2026-01-01"}
+        run["end_date"] = "2026-01-03"
+
+        is_error, text = await mcp.call("backtest_run", {**run, "model_version_id": staged})
+        assert not is_error, text
+        job = pool.conn.jobs[json.loads(text)["task_id"]]
+        assert json.loads(job["request"])["model_version_id"] == staged
+
+        is_error, text = await mcp.call("backtest_run", {**run, "model_version_id": beta})
+        assert is_error
+        assert '"code": "model_not_consumed"' in text
+        is_error, text = await mcp.call(
+            "backtest_run", {**run, "model_version_id": str(uuid.uuid4())}
+        )
+        assert is_error
+        assert '"code": "model_not_found"' in text
+        assert len(pool.conn.jobs) == 1
+
+        tools = (await mcp.request("tools/list"))["tools"]
+    pinnable = {t["name"] for t in tools if "model_version_id" in t["inputSchema"]["properties"]}
+    assert pinnable == {"backtest_run", "hyperopt_run", "walkforward_run"}
+
+    with pytest.raises(NoMarketDataError):  # the gate served Staging v1; the run reached the bars
+        await worker.run_backtest_job(pool, None, job, worker.JobRun())
+    unpinned = {
+        **job,
+        "request": json.dumps({**json.loads(job["request"]), "model_version_id": None}),
+    }
+    with pytest.raises(worker.JobError, match="has no Production version"):
+        await worker.run_backtest_job(pool, None, unpinned, worker.JobRun())
+
+
+@pytest.mark.parametrize("kind", ["hyperopt", "walkforward"])
+async def test_hyperopt_and_walkforward_pass_the_same_model_gate(
+    mcp_cfg: HydraConfig, pool: _RegistryPool, kind: str
+) -> None:
+    """Both optimisers now attach before the run: no Production refuses loudly (they used to
+    run with nothing attached), and the pinned Staging version gets them to the bars."""
+    staged = _staged_alpha(pool, Path(mcp_cfg.ml.models_dir))
+    config = StrategyConfig.model_validate({"id": "native", **yaml.safe_load(_native_yaml())})
+    space = [{"name": "entry_threshold", "type": "float", "low": 0.6, "high": 0.7}]
+    request = {"strategy_id": "native", "start_date": "2026-01-01", "end_date": "2026-01-03"}
+    handler = worker.run_hyperopt_job if kind == "hyperopt" else worker.run_walkforward_job
+
+    def job(pin: str | None) -> dict[str, Any]:
+        body = {**request, "param_space": space, "model_version_id": pin}
+        return {
+            "id": f"{kind}-1",
+            "request": json.dumps(body),
+            "strategy_config": json.dumps(config.model_dump(mode="json")),
+        }
+
+    with pytest.raises(worker.JobError, match="has no Production version"):
+        await handler(pool, None, job(None), worker.JobRun())
+    with pytest.raises(NoMarketDataError):
+        await handler(pool, None, job(staged), worker.JobRun())

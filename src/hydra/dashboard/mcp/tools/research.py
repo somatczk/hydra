@@ -58,14 +58,19 @@ async def backtest_run(
     name: str = "",
     timeframe: Timeframe | None = None,
     fetch_fresh: bool = False,
+    model_version_id: str | None = None,
 ) -> str:
     """Queue a backtest of a strategy on stored bars (paper execution, no live orders).
 
     Dates are ISO strings (a bare YYYY-MM-DD is the whole UTC day). Returns
-    ``{"task_id", "status": "queued"}``; poll ``backtest_status`` with the task_id.
+    ``{"task_id", "status": "queued"}``; poll ``backtest_status`` with the task_id
+    (its ``provenance.ml_models`` names every model version the run served).
     Nothing is simulated without stored bars: a range with no data is auto-fetched
     before the run; a genuinely-unavailable range fails the job with
     ``no_market_data``.
+    ``model_version_id`` (a ``model_list`` id, any stage) serves that registry
+    version in place of its name's Production version for this job only — evaluate
+    a Staging version before anyone promotes it; sessions never take a pin.
     """
     try:
         body = BacktestRunRequest(
@@ -76,6 +81,7 @@ async def backtest_run(
             name=name,
             timeframe=timeframe,
             fetch_fresh=fetch_fresh,
+            model_version_id=model_version_id,
         )
         result = await backtest_svc.submit_backtest(_deps.db_pool(), body, auto_fetch=_auto_fetch())
     except ServiceError as exc:
@@ -87,6 +93,7 @@ async def backtest_run(
         "backtest_run",
         strategy_id=strategy_id,
         task_id=result["task_id"],
+        model_version_id=model_version_id,
     )
     return _deps.json_text(result)
 
@@ -137,6 +144,7 @@ async def hyperopt_run(
     max_trials: int = 50,
     timeframe: Timeframe | None = None,
     initial_capital: float = 10000.0,
+    model_version_id: str | None = None,
 ) -> str:
     """Queue a hyperparameter optimisation on stored bars.
 
@@ -144,6 +152,9 @@ async def hyperopt_run(
     ``name`` must be a parameter the strategy reads (see ``strategy_params``). Returns
     ``{"task_id", "status": "queued"}``; poll ``hyperopt_progress`` and read
     ``hyperopt_results`` once completed.
+    ``model_version_id`` (a ``model_list`` id, any stage) serves that registry
+    version in place of its name's Production version for this job only — evaluate
+    a Staging version before anyone promotes it; sessions never take a pin.
     """
     try:
         body = HyperoptRunRequest(
@@ -155,6 +166,7 @@ async def hyperopt_run(
             max_trials=max_trials,
             timeframe=timeframe,
             initial_capital=initial_capital,
+            model_version_id=model_version_id,
         )
         result = await research_svc.submit_hyperopt(_deps.db_pool(), body, auto_fetch=_auto_fetch())
     except ServiceError as exc:
@@ -166,6 +178,7 @@ async def hyperopt_run(
         "hyperopt_run",
         strategy_id=strategy_id,
         task_id=result["task_id"],
+        model_version_id=model_version_id,
     )
     return _deps.json_text(result)
 
@@ -202,6 +215,7 @@ async def walkforward_run(
     train_pct: float = 0.75,
     timeframe: Timeframe | None = None,
     initial_capital: float = 10000.0,
+    model_version_id: str | None = None,
 ) -> str:
     """Queue a walk-forward validation on stored bars (in-sample optimisation,
     out-of-sample verification per fold).
@@ -210,6 +224,9 @@ async def walkforward_run(
     out-of-sample window per fold or the call fails 422 ``range_too_short`` with the
     stored coverage. Returns ``{"task_id", "status": "queued"}``; read
     ``walkforward_results`` once completed.
+    ``model_version_id`` (a ``model_list`` id, any stage) serves that registry
+    version in place of its name's Production version for this job only — evaluate
+    a Staging version before anyone promotes it; sessions never take a pin.
     """
     try:
         body = WalkForwardRunRequest(
@@ -224,6 +241,7 @@ async def walkforward_run(
             train_pct=train_pct,
             timeframe=timeframe,
             initial_capital=initial_capital,
+            model_version_id=model_version_id,
         )
         result = await research_svc.submit_walkforward(
             _deps.db_pool(), body, auto_fetch=_auto_fetch()
@@ -237,6 +255,7 @@ async def walkforward_run(
         "walkforward_run",
         strategy_id=strategy_id,
         task_id=result["task_id"],
+        model_version_id=model_version_id,
     )
     return _deps.json_text(result)
 

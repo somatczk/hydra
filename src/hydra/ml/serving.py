@@ -26,7 +26,7 @@ import numpy as np
 from numpy import ndarray
 
 from hydra.ml.features import DEFAULT_FEATURE_SPEC
-from hydra.ml.registry import ModelRegistry
+from hydra.ml.registry import ModelRegistry, ModelVersion
 
 # ---------------------------------------------------------------------------
 # Internal model wrapper
@@ -390,6 +390,11 @@ async def attach_production(pool: Any, models_dir: Path, name: str) -> AttachedM
             f"the model registry is unreachable (no database pool); model "
             f"'{name}' cannot be attached and serving refuses to guess",
         )
+    return await attach_version(models_dir, await production_version(pool, name))
+
+
+async def production_version(pool: Any, name: str) -> ModelVersion:
+    """The name's Production row; ``not_promoted`` when there is none."""
     version = await ModelRegistry(pool).get_production(name)
     if version is None:
         raise MlServingError(
@@ -397,11 +402,16 @@ async def attach_production(pool: Any, models_dir: Path, name: str) -> AttachedM
             f"model '{name}' has no Production version: promote a version in "
             "the registry before a session can serve it",
         )
-    cached = _ATTACHED.get((name, version.version))
+    return version
+
+
+async def attach_version(models_dir: Path, version: ModelVersion) -> AttachedModel:
+    """Attach one registry version whatever its stage (cached by name and version)."""
+    cached = _ATTACHED.get((version.name, version.version))
     if cached is not None:
         return cached
     return await _attach(
-        models_dir, name, version.artifact_file, version.version, version.artifact_sha256
+        models_dir, version.name, version.artifact_file, version.version, version.artifact_sha256
     )
 
 
@@ -434,4 +444,6 @@ __all__ = [
     "ModelInference",
     "attach_artifact",
     "attach_production",
+    "attach_version",
+    "production_version",
 ]

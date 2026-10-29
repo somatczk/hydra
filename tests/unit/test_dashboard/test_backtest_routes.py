@@ -548,6 +548,7 @@ class TestStatusAndResults:
             "result_id": None,
             "fetch_error": None,
             "fetch": None,
+            "provenance": None,
         }
 
     def test_status_reports_fetch_error_from_the_detail(self) -> None:

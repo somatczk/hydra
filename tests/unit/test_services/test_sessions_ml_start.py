@@ -12,17 +12,21 @@ run on real Postgres in ``tests/integration/test_ml_session_start_pg.py``.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 import yaml
 
+from hydra.ml.features import DEFAULT_FEATURE_SPEC
 from hydra.services import sessions as sessions_svc
 from hydra.services import strategies as strategies_svc
 from hydra.services.errors import ServiceError
 from hydra.services.sessions import StartSessionRequest
+from tests.fixtures.ml_onnx import confidence_onnx, frozen_spec_metadata
 
 A_SHIPPED_STRATEGY = "momentum_rsi_macd"
 
@@ -231,4 +235,58 @@ class TestSessionStartMlGate:
         assert raised.value.status_code == 400
         assert raised.value.detail["code"] == "invalid_session"
         assert "required_history" in raised.value.detail["message"]
+        assert mgr.started == []
+
+
+class TestSessionsNeverTakeAModelPin:
+    """Research jobs may pin a registry version; a session start never can.
+
+    The registry here would serve the pinned Staging version perfectly (a real
+    artifact on the mount, its true sha256) — so the only reason the start
+    refuses is that sessions resolve Production and nothing else.
+    """
+
+    class _StagingOnlyPool:
+        def __init__(self, staging: dict[str, Any]) -> None:
+            self.staging = staging
+
+        def acquire(self) -> Any:
+            staging = self.staging
+
+            class _Conn:
+                async def __aenter__(self) -> Any:
+                    return self
+
+                async def __aexit__(self, *exc: Any) -> None:
+                    return None
+
+                async def fetchrow(self, sql: str, *args: Any) -> Any:
+                    return staging if "WHERE id = $1" in sql and args[0] == staging["id"] else None
+
+            return _Conn()
+
+    async def test_a_pin_in_the_start_payload_never_serves_a_staging_version(
+        self, strategy_dir: Path, tmp_path: Path
+    ) -> None:
+        meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+        blob = confidence_onnx(meta, len(DEFAULT_FEATURE_SPEC.feature_names))
+        (tmp_path / "alpha-v2.onnx").write_bytes(blob)
+        staging = {
+            **_production_row("alpha-v2.onnx"),
+            "id": uuid4(),
+            "version": 2,
+            "stage": "staging",
+            "artifact_sha256": hashlib.sha256(blob).hexdigest(),
+        }
+        name = _overlay_strategy_yaml(strategy_dir)
+        mgr = _StubManager(config=_config_with(tmp_path), pool=self._StagingOnlyPool(staging))
+
+        assert "model_version_id" not in StartSessionRequest.model_fields
+        body = StartSessionRequest.model_validate(
+            {"strategy_id": name, "model_version_id": str(staging["id"])}
+        )
+        with pytest.raises(ServiceError) as raised:
+            await sessions_svc.start_session(mgr, "user:test", body)
+
+        assert raised.value.detail["code"] == "ml_model_not_promoted"
         assert mgr.started == []

@@ -26,6 +26,8 @@ from hydra.backtest.jobs import (
 )
 from hydra.core.types import MarketType, Timeframe
 from hydra.data.storage import MarketDataRepository
+from hydra.ml.consumers import pinned_version
+from hydra.ml.serving import MlServingError
 from hydra.services import strategies as strategy_files
 from hydra.services.errors import ServiceError, db_errors, require_pool, service_error
 from hydra.strategy.base import BaseStrategy
@@ -53,6 +55,7 @@ class BacktestStatus(BaseModel):
     fetch_error: str | None = None
     # informational: a terminal row's status/error columns are authoritative, not fetch.state
     fetch: dict[str, Any] | None = None
+    provenance: JobProvenanceModel | None = None
 
 
 class CancelJobResponse(BaseModel):
@@ -86,6 +89,24 @@ class DataProvenanceModel(BaseModel):
     requested_start: str | None = None
     requested_end: str | None = None
     data_source: str | None = None
+
+
+class MlModelProvenance(BaseModel):
+    """One registry version a research job served, and whether the request pinned it."""
+
+    id: str
+    name: str
+    version: int
+    stage: str
+    pinned: bool = False
+
+
+class JobProvenanceModel(DataProvenanceModel):
+    """Provenance read from a job row: carries the code and config that ran it (D2 decision)."""
+
+    hydra_version: str | None = None
+    config_hash: str | None = None
+    ml_models: list[MlModelProvenance] | None = None
 
 
 class BacktestTradeRecord(BaseModel):
@@ -279,6 +300,21 @@ async def _preflight(
     return Preflight(strategy_cls, config, exchange, symbol, tf, pool, stored)
 
 
+async def check_model_pin(
+    pool: Any, config: StrategyConfig, model_version_id: uuid.UUID | None
+) -> None:
+    """A research job's pinned model version must exist and be one the strategy consumes."""
+    if model_version_id is None:
+        return
+    try:
+        async with db_errors("reading the model registry"):
+            await pinned_version(pool, config, model_version_id)
+    except MlServingError as exc:
+        raise service_error(404, "model_not_found", str(exc), "not_found") from exc
+    except ValueError as exc:
+        raise service_error(422, "model_not_consumed", str(exc), "invalid") from exc
+
+
 # ---------------------------------------------------------------------------
 # Job submission and status
 # ---------------------------------------------------------------------------
@@ -302,6 +338,7 @@ async def submit_backtest(
         auto_fetch=auto_fetch,
         allow_futures=True,
     )
+    await check_model_pin(pf.pool, pf.config, body.model_version_id)
     async with db_errors("queueing the job"):
         task_id = await jobs.enqueue(
             pool,
@@ -331,6 +368,7 @@ async def get_backtest_status(pool: Any, task_id: str) -> dict[str, Any]:
         "result_id": row["result_id"],
         "fetch_error": detail.get("fetch_error"),
         "fetch": detail.get("fetch"),
+        "provenance": detail.get("provenance"),
     }
 
 

@@ -177,6 +177,32 @@ class TestRegister:
         assert await registry.discard_training_job_version("task-abc12345") is None
         assert (await registry.get_production("alpha")) is not None
 
+    async def test_concurrent_training_jobs_each_register_the_next_version(
+        self, pool: Any, artifact: Path
+    ) -> None:
+        """Several ml_train workers finishing the same name at once: no loser.
+
+        Every register reads MAX(version) + 1; without the per-name lock they all
+        read the same max and all but one fail on UNIQUE (name, version).
+        """
+        job_ids = [f"ml-{i:08d}" for i in range(4)]  # the fixture pool's four connections
+        async with pool.acquire() as conn:
+            for job_id in job_ids:
+                await conn.execute(
+                    "INSERT INTO backtest_jobs (id, kind, request, strategy_config) "
+                    "VALUES ($1, 'ml_train', '{}', '{}')",
+                    job_id,
+                )
+        registry = ModelRegistry(pool)
+
+        versions = await asyncio.gather(
+            *(registry.register(_registration(artifact, training_job_id=j)) for j in job_ids)
+        )
+
+        assert sorted(v.version for v in versions) == [1, 2, 3, 4]
+        assert {v.training_job_id for v in versions} == set(job_ids)
+        assert [v.version for v in await registry.list("alpha")] == [1, 2, 3, 4]
+
     async def test_sha256_mismatch_is_refused_and_stores_nothing(
         self, pool: Any, artifact: Path
     ) -> None:

@@ -11,10 +11,18 @@ Providers are keyed by (model name, registry version) and the first attach of a
 key wins (attaching is idempotent); a later Production version attaches under
 its own key, and a running strategy keeps the predictor it pinned, so a
 mid-session promote never swaps the model under a live session.
+
+A research job (backtest, hyperopt, walk-forward) instead binds its own
+predictors with :func:`bound_providers`: a context variable, so the binding —
+which may be a pinned non-Production version — is visible only inside that
+job's task and never to a session, which resolves only the attached registry.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Protocol, runtime_checkable
 
 from hydra.core.types import OHLCV
@@ -38,6 +46,9 @@ class MlModelNotAttachedError(RuntimeError):
 
 
 _PROVIDERS: dict[tuple[str, int], PredictionProvider] = {}
+_BOUND: ContextVar[Mapping[str, PredictionProvider] | None] = ContextVar(
+    "hydra_ml_bound_providers", default=None
+)
 
 
 def attach_provider(model_name: str, version: int, provider: PredictionProvider) -> None:
@@ -47,12 +58,35 @@ def attach_provider(model_name: str, version: int, provider: PredictionProvider)
         _PROVIDERS[key] = provider
 
 
+@contextmanager
+def bound_providers(providers: Mapping[str, PredictionProvider]) -> Iterator[None]:
+    """Resolve exactly these names to these predictors in the current context only."""
+    token = _BOUND.set(providers)
+    try:
+        yield
+    finally:
+        _BOUND.reset(token)
+
+
+def bound_provider(model_name: str) -> PredictionProvider | None:
+    """The current context's bound predictor for the name, or None outside a binding."""
+    bound = _BOUND.get()
+    return None if bound is None else bound.get(model_name)
+
+
 def provider_for(model_name: str) -> PredictionProvider:
-    """The attached predictor for the model's newest attached version.
+    """The context's bound predictor, else the model's newest attached version.
 
     Raises :class:`MlModelNotAttachedError` when nothing is attached — the
-    fail-closed refusal a session start surfaces as its own error.
+    fail-closed refusal a session start surfaces as its own error. Inside a
+    binding only the bound names resolve: a research job never falls back to
+    whatever this process attached for someone else.
     """
+    bound = _BOUND.get()
+    if bound is not None:
+        if model_name not in bound:
+            raise MlModelNotAttachedError(f"model '{model_name}' is not bound for this run")
+        return bound[model_name]
     attached = [(version, p) for (name, version), p in _PROVIDERS.items() if name == model_name]
     if not attached:
         raise MlModelNotAttachedError(

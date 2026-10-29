@@ -78,6 +78,11 @@ def test_image_smoke_builds_every_published_image_on_prs_and_pushes() -> None:
     for image in ("hydra-engine", "hydra-backtest"):
         [branch] = re.findall(rf"^ *{image}\)\n(.*?);;", start, re.M | re.S)
         assert f"docker logs smoke 2>&1 | {_ALL_JSON} >/dev/null" in branch, image
+    [backtest] = re.findall(r"^ *hydra-backtest\)\n(.*?);;", start, re.M | re.S)
+    assert (
+        'docker exec smoke python -c "import xgboost, sklearn, onnxmltools, onnxruntime"'
+        in backtest
+    )
 
 
 def test_publish_skips_pushes_that_change_no_image_input() -> None:
