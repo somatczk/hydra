@@ -1,6 +1,6 @@
 'use client';
 
-import { useReducer, useEffect, useState, useCallback, useRef, Suspense } from 'react';
+import { useReducer, useEffect, useState, useCallback, useMemo, useRef, Suspense } from 'react';
 import { Save, Plus, FlaskConical } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { RuleSection } from '@/components/builder/RuleSection';
@@ -17,7 +17,7 @@ import { describeApiError } from '@/lib/apiState';
 import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
 import { scheduleFromWire } from '@/lib/schedule';
-import { bindingsOf } from '@/components/builder/bindings';
+import { bindingsOf, catalogueOf, type Catalogue } from '@/components/builder/bindings';
 import { reconcileTunables, storedTunables } from '@/components/builder/tunables';
 import { TunedParameters } from '@/components/builder/TunedParameters';
 import type {
@@ -108,7 +108,7 @@ function apiGroupToBuilder(
 
 /* ---------- Reducer ---------- */
 
-function builderReducer(state: BuilderState, action: BuilderAction): BuilderState {
+function builderReducer(state: BuilderState, action: BuilderAction, catalogue?: Catalogue): BuilderState {
   switch (action.type) {
     case 'ADD_CONDITION': {
       const section = action.section;
@@ -120,25 +120,33 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         value: 30,
       };
       // a new condition that binds a stored name by name runs with its stored value
-      return reconcileTunables({
-        ...state,
-        [section]: {
-          ...state[section],
-          conditions: [...state[section].conditions, newCondition],
+      return reconcileTunables(
+        {
+          ...state,
+          [section]: {
+            ...state[section],
+            conditions: [...state[section].conditions, newCondition],
+          },
         },
-      });
+        undefined,
+        catalogue,
+      );
     }
     case 'REMOVE_CONDITION': {
       const section = action.section;
-      return reconcileTunables({
-        ...state,
-        [section]: {
-          ...state[section],
-          conditions: state[section].conditions.filter(
-            (c: BuilderCondition) => c.id !== action.conditionId,
-          ),
+      return reconcileTunables(
+        {
+          ...state,
+          [section]: {
+            ...state[section],
+            conditions: state[section].conditions.filter(
+              (c: BuilderCondition) => c.id !== action.conditionId,
+            ),
+          },
         },
-      });
+        undefined,
+        catalogue,
+      );
     }
     case 'UPDATE_CONDITION': {
       const section = action.section;
@@ -151,13 +159,13 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
           ),
         },
       };
-      return reconcileTunables(next, action.edit ? { section, conditionId: action.conditionId } : undefined);
+      return reconcileTunables(next, action.edit ? { section, conditionId: action.conditionId } : undefined, catalogue);
     }
     case 'SET_TUNABLE': {
       const tunables = { ...state.tunables };
       if (action.value === null) delete tunables[action.name];
       else tunables[action.name] = action.value;
-      return reconcileTunables({ ...state, tunables });
+      return reconcileTunables({ ...state, tunables }, undefined, catalogue);
     }
     case 'SET_OPERATOR': {
       const section = action.section;
@@ -248,7 +256,7 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         tunables: storedTunables(payload.parameters),
         baseline: '',
       };
-      const applied = reconcileTunables(next);
+      const applied = reconcileTunables(next, undefined, catalogue);
       return { ...applied, baseline: snapshot(applied) };
     }
     case 'MARK_CLEAN':
@@ -364,8 +372,13 @@ const DEFAULT_COMPARATORS: ComparatorSchema[] = [
 /* ---------- Page ---------- */
 
 function BuilderPageContent() {
-  const [state, dispatch] = useReducer(builderReducer, initialState);
   const [indicators, setIndicators] = useState<IndicatorSchema[]>(DEFAULT_INDICATORS);
+  const catalogue = useMemo(() => catalogueOf(indicators), [indicators]);
+  // the tunables bind against the registry the engine reads, so the reducer sees the current catalogue
+  const [state, dispatch] = useReducer(
+    (s: BuilderState, a: BuilderAction) => builderReducer(s, a, catalogue),
+    initialState,
+  );
   const [comparators, setComparators] = useState<ComparatorSchema[]>(DEFAULT_COMPARATORS);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
@@ -553,7 +566,7 @@ function BuilderPageContent() {
         }
       />
 
-      <TunedParameters state={state} onSet={(name, value) => dispatch({ type: 'SET_TUNABLE', name, value })} />
+      <TunedParameters state={state} catalogue={catalogue} onSet={(name, value) => dispatch({ type: 'SET_TUNABLE', name, value })} />
 
       <ScheduleEditor
         schedule={state.schedule}

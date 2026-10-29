@@ -1,5 +1,5 @@
 {
-  "_comment": "One rule set, two resolvers: strategy/builtin/rule_based.py param_bindings and dashboard/src/components/builder/bindings.ts paramBindings must both produce `bindable` and `ambiguous` (tests/unit/test_strategy/test_param_bindings_parity.py, bindings.test.ts). `refused` is one condition whose param_overrides names a parameter its indicator lacks: the engine raises at that site and unknownTargets, fed `catalogue` (the registry's params, pinned to the engine's signature by the Python test), names the same binding.",
+  "_comment": "One rule set, two resolvers: strategy/builtin/rule_based.py param_bindings and dashboard/src/components/builder/bindings.ts paramBindings (fed `catalogue`, the registry's params and defaults, pinned to the engine's signature by the Python test) must both produce `bindable` and `ambiguous` (tests/unit/test_strategy/test_param_bindings_parity.py, bindings.test.ts). entry_short pins the catalogue cases: an override the condition's params lack binds the signature default, and a value_ref_overrides key the compared indicator does not take (bbu_typo) binds nothing. `refused` is one condition whose param_overrides names a parameter its indicator lacks: the engine raises at that site and unknownTargets names the same binding.",
   "rules": {
     "entry_long": {
       "operator": "AND",
@@ -67,7 +67,32 @@
         }
       ]
     },
-    "entry_short": null,
+    "entry_short": {
+      "operator": "AND",
+      "conditions": [
+        {
+          "indicator": "bollinger_lower",
+          "params": {
+            "period": 20
+          },
+          "comparator": "greater_than",
+          "value": "close",
+          "param_overrides": {
+            "bbl_dev": "std_dev"
+          }
+        },
+        {
+          "indicator": "close",
+          "params": {},
+          "comparator": "less_than",
+          "value": "bollinger_upper:period=20",
+          "value_ref_overrides": {
+            "bbu_dev": "std_dev",
+            "bbu_typo": "length"
+          }
+        }
+      ]
+    },
     "exit_short": null
   },
   "bindable": {
@@ -130,11 +155,44 @@
         "value": 2.0,
         "implicit": false
       }
+    ],
+    "bbl_dev": [
+      {
+        "group": "entry_short",
+        "index": 0,
+        "target": "params",
+        "key": "std_dev",
+        "value": 2.0,
+        "implicit": false
+      }
+    ],
+    "bbu_dev": [
+      {
+        "group": "entry_short",
+        "index": 1,
+        "target": "ref",
+        "key": "std_dev",
+        "value": 2.0,
+        "implicit": false
+      }
     ]
   },
   "ambiguous": [
     "sma_period"
   ],
+  "catalogue": {
+    "bollinger_lower": {
+      "period": 20,
+      "std_dev": 2.0
+    },
+    "bollinger_upper": {
+      "period": 20,
+      "std_dev": 2.0
+    },
+    "sma": {
+      "period": null
+    }
+  },
   "refused": {
     "rules": {
       "entry_long": {
@@ -158,12 +216,6 @@
       "exit_long": null,
       "entry_short": null,
       "exit_short": null
-    },
-    "catalogue": {
-      "bollinger_upper": [
-        "period",
-        "std_dev"
-      ]
     },
     "site": {
       "group": "entry_long",

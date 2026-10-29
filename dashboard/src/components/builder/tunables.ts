@@ -1,7 +1,7 @@
 /** The top-level tunables as the builder's single truth: a stored value is written into every site its name binds,
  * exactly as RuleBasedStrategy._apply_param_overrides does at runtime, so the builder shows what runs. */
 
-import { bindableParams, formatIndicatorRef, parseIndicatorRef, RULE_GROUPS, type BindingSite } from './bindings';
+import { bindableParams, formatIndicatorRef, parseIndicatorRef, RULE_GROUPS, type BindingSite, type Catalogue } from './bindings';
 import type { BuilderCondition, BuilderState, RuleSection } from './types';
 
 const SECTION_OF: Record<string, RuleSection> = Object.fromEntries(RULE_GROUPS);
@@ -30,8 +30,9 @@ function setSite(state: BuilderState, site: BindingSite, value: number): Builder
 export function reconcileTunables(
   state: BuilderState,
   edited?: { section: RuleSection; conditionId: string },
+  catalogue?: Catalogue,
 ): BuilderState {
-  const bound = bindableParams(state);
+  const bound = bindableParams(state, catalogue);
   const tunables: Record<string, number> = {};
   for (const [name, value] of Object.entries(state.tunables)) if (name in bound) tunables[name] = value;
   if (edited) {

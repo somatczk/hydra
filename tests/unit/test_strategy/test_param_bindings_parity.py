@@ -43,15 +43,21 @@ def test_the_engine_resolver_matches_the_shared_fixture() -> None:
     assert sorted(name for name, sites in table.items() if ambiguous(sites)) == fixture["ambiguous"]
 
 
+def test_the_fixture_catalogue_is_the_registry_and_the_engine_signature() -> None:
+    """The builder binds against ``catalogue`` (``/api/strategies/indicators``: params and
+    defaults); the registry serves exactly the engine's ``indicator_params`` signature."""
+    catalogue: dict[str, dict[str, Any]] = json.loads(FIXTURE.read_text())["catalogue"]
+    registry = {i.name: {p.name: p.default for p in i.params} for i in get_all_indicators()}
+    for name, params in catalogue.items():
+        assert registry[name] == params
+        required = {key: 2 for key, default in params.items() if default is None}
+        assert indicator_params(name, required) == {**params, **required}
+
+
 def test_the_engine_refuses_the_fixture_target_the_builder_flags() -> None:
     """``refused``: the builder flags a param_overrides target from the registry's params
-    (``unknownTargets``); the engine raises at the same site at save. The fixture's catalogue
-    is the registry's, and the registry lists exactly what the engine's signature takes."""
+    (``unknownTargets``); the engine raises at the same site at save."""
     refused: dict[str, Any] = json.loads(FIXTURE.read_text())["refused"]
-    registry = {info.name: [p.name for p in info.params] for info in get_all_indicators()}
-    for name, params in refused["catalogue"].items():
-        assert registry[name] == params
-        assert list(indicator_params(name, {})) == params
     site = refused["site"]
     condition = refused["rules"][site["group"]]["conditions"][site["index"]]
     message = (

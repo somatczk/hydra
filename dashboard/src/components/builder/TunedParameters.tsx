@@ -3,7 +3,7 @@
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { Input } from '@/components/ui/Input';
-import { bindableParams, parseIndicatorRef, RULE_GROUPS, type BindingSite } from './bindings';
+import { bindableParams, parseIndicatorRef, RULE_GROUPS, type BindingSite, type Catalogue } from './bindings';
 import type { BuilderState } from './types';
 
 const GROUP_TITLE: Record<string, string> = {
@@ -29,11 +29,13 @@ interface TunedParametersProps {
   state: BuilderState;
   /** A number stores the value and writes it into every site; null forgets it (the conditions keep their values). */
   onSet: (name: string, value: number | null) => void;
+  /** The registry params the engine binds against (bindings.ts paramBindings). */
+  catalogue?: Catalogue;
 }
 
 /** The top-level `parameters` the rules bind: what hyperopt and walk-forward tune, editable in one place. */
-export function TunedParameters({ state, onSet }: TunedParametersProps) {
-  const bound = Object.entries(bindableParams(state));
+export function TunedParameters({ state, onSet, catalogue }: TunedParametersProps) {
+  const bound = Object.entries(bindableParams(state, catalogue));
   return (
     <DataCard
       title="Tuned parameters"
