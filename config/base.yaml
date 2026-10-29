@@ -34,3 +34,6 @@ data:
   cache_max_gb: 10.0
   sweep_interval_s: 3600
   row_bytes_estimate: 205
+
+backtest:
+  job_lease_s: 180

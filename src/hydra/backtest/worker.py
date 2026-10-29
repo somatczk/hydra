@@ -4,7 +4,14 @@ Entry point is ``python -m hydra.backtest.worker``; ``check`` (the Docker health
 only while the heartbeat file is fresh. Jobs run directly on the worker's event loop — the runner
 yields every 100 bars and hyperopt yields per trial, so ``cancel()`` and the job timeout apply
 natively. The worker never runs migrations (the engine owns them): it waits until the schema is
-at the Alembic head, then requeues rows a dead worker left running (up to three attempts).
+at the Alembic head, then requeues rows its own previous incarnation left running.
+
+Any number of workers share the queue. A claimed job is leased to its worker: every tick renews
+``heartbeat_at``, and an idle worker requeues (up to three attempts) any running row whose
+heartbeat is older than ``backtest.job_lease_s`` — its worker died or lost the database. Every
+tick and terminal write is fenced by ``worker_id``, so a worker whose lease expired abandons the
+job without touching the row or the result its new owner writes. ``WORKER_ID`` must be unique
+per live worker: the container hostname (its id) plus the pid.
 
 A job never fails "data unavailable": the worker holds ONE on-demand fetch engine (and one
 refcounted REST client pool) for its whole lifetime, and every job fetches exactly its missing
@@ -70,6 +77,7 @@ JOB_TIMEOUT_S = 6 * 3600
 TICK_S = 10.0
 IDLE_SLEEP_S = 2.0
 HEARTBEAT_MAX_AGE_S = 90.0
+SWEEP_S = 30.0
 DB_CONNECT_BUDGET_S = 30.0
 _DEFAULT_HEARTBEAT = Path(tempfile.gettempdir()) / "hydra-worker.heartbeat"
 HEARTBEAT_PATH = str(_DEFAULT_HEARTBEAT)
@@ -87,6 +95,7 @@ class JobRun:
     progress: float = 0.0
     detail: dict[str, Any] = field(default_factory=dict)
     persisted_result_id: str | None = None
+    lease_lost: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -582,15 +591,24 @@ def check(path: str | None = None) -> int:
 
 
 async def _tick_loop(
-    pool: Any, job_id: str, run: JobRun, job_task: asyncio.Task[JobOutcome], tick_s: float
+    pool: Any,
+    job_id: str,
+    worker_id: str,
+    run: JobRun,
+    job_task: asyncio.Task[JobOutcome],
+    tick_s: float,
 ) -> None:
-    """Every tick: touch the heartbeat, flush progress to the row, honour a cancel request."""
+    """Every tick: touch the heartbeat, renew the lease, honour a cancel request or a lost lease."""
     while not job_task.done():
         touch_heartbeat()
         try:
-            if await jobs.tick(pool, job_id, run.progress, run.detail):
+            if await jobs.tick(pool, job_id, run.progress, run.detail, worker_id):
                 job_task.cancel()
                 return
+        except jobs.LeaseLostError:
+            run.lease_lost = True
+            job_task.cancel()
+            return
         except Exception:
             # a DB blip must not kill the tick (and with it the heartbeat) or the job
             logger.warning("Progress flush for %s failed; retrying", job_id, exc_info=True)
@@ -603,18 +621,29 @@ async def _cancel_on_stop(stop: asyncio.Event, job_task: asyncio.Task[JobOutcome
 
 
 async def _finish_with_retry(
-    pool: Any, job_id: str, status: str, *, detail: dict[str, Any] | None, **outcome: Any
+    pool: Any,
+    job_id: str,
+    worker_id: str,
+    status: str,
+    *,
+    detail: dict[str, Any] | None,
+    **outcome: Any,
 ) -> None:
     """Persist the terminal row state, retrying until the database takes it.
 
     The outcome exists only in this process, so a DB blip at the finish write is outlived here
-    instead of failing the job; if it lasts, the stale heartbeat lets Docker restart the worker
-    and the requeue path takes over.
+    instead of failing the job; if it outlasts the lease, a peer requeues the job and the fenced
+    write then lands on no row.
     """
     delay = 0.5
     while True:
         try:
-            await jobs.finish(pool, job_id, status, detail=detail, **outcome)
+            if not await jobs.finish(
+                pool, job_id, status, detail=detail, worker_id=worker_id, **outcome
+            ):
+                logger.warning(
+                    "Job %s is no longer leased to %s; dropped its outcome", job_id, worker_id
+                )
             return
         except Exception:
             logger.warning("Finishing %s failed; retrying in %.1fs", job_id, delay, exc_info=True)
@@ -657,18 +686,23 @@ async def _run_claimed(
     stop: asyncio.Event | None = None,
     fetch_engine: OnDemandFetchService | None = None,
 ) -> None:
-    """Run one claimed job to a terminal row state (or requeue it when shutting down)."""
+    """Run one claimed job to a terminal row state (or requeue it when shutting down).
+
+    Every row write is fenced by the claim's ``worker_id``; a lost lease abandons the job
+    without a write or a discard — the result rows now belong to the job's new owner.
+    """
     job_id = job["id"]
+    owner = job["worker_id"]
     handler = _HANDLERS.get(job["kind"])
     if handler is None:
         await _finish_with_retry(
-            pool, job_id, "failed", detail=None, error=f"unknown job kind: {job['kind']}"
+            pool, job_id, owner, "failed", detail=None, error=f"unknown job kind: {job['kind']}"
         )
         return
 
     run = JobRun(detail=jobs.json_value(job["detail"]) or {})
     job_task = asyncio.create_task(handler(pool, fetch_engine, job, run))
-    tick_task = asyncio.create_task(_tick_loop(pool, job_id, run, job_task, tick_s))
+    tick_task = asyncio.create_task(_tick_loop(pool, job_id, owner, run, job_task, tick_s))
     stop_task = asyncio.create_task(_cancel_on_stop(stop, job_task)) if stop is not None else None
     try:
         async with asyncio.timeout(timeout_s):
@@ -679,24 +713,27 @@ async def _run_claimed(
             await job_task
         await _discard_partial_result(pool, job, run)
         await _finish_with_retry(
-            pool, job_id, "failed", detail=run.detail, error=f"timed out after {timeout_s}s"
+            pool, job_id, owner, "failed", detail=run.detail, error=f"timed out after {timeout_s}s"
         )
     except asyncio.CancelledError:
-        if stop is not None and stop.is_set():
-            await jobs.requeue_for_shutdown(pool, job_id)
+        if run.lease_lost:
+            logger.warning("Job %s lease expired; abandoned to its new owner", job_id)
+        elif stop is not None and stop.is_set():
+            await jobs.requeue_for_shutdown(pool, job_id, owner)
         else:
             await _discard_partial_result(pool, job, run)
-            await _finish_with_retry(pool, job_id, "cancelled", detail=run.detail)
+            await _finish_with_retry(pool, job_id, owner, "cancelled", detail=run.detail)
     except JobError as exc:
-        await _finish_with_retry(pool, job_id, "failed", detail=run.detail, error=str(exc))
+        await _finish_with_retry(pool, job_id, owner, "failed", detail=run.detail, error=str(exc))
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
         await _discard_partial_result(pool, job, run)
-        await _finish_with_retry(pool, job_id, "failed", detail=run.detail, error=str(exc))
+        await _finish_with_retry(pool, job_id, owner, "failed", detail=run.detail, error=str(exc))
     else:
         await _finish_with_retry(
             pool,
             job_id,
+            owner,
             "completed",
             detail=run.detail,
             result=outcome.result,
@@ -771,12 +808,22 @@ async def _create_pool(dsn: str) -> Any:
             delay = min(delay * 2, 5.0)
 
 
-async def _serve_forever(pool: Any, fetch_engine: OnDemandFetchService | None) -> None:
+async def _serve_forever(
+    pool: Any, fetch_engine: OnDemandFetchService | None, lease_s: float
+) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
+    next_sweep = 0.0
     while not stop.is_set():
+        if loop.time() >= next_sweep:
+            # a busy worker cannot claim anyway, so sweeping between jobs is enough
+            try:
+                await jobs.requeue_abandoned(pool, lease_s)
+            except Exception:
+                logger.warning("Sweeping expired job leases failed; retrying", exc_info=True)
+            next_sweep = loop.time() + SWEEP_S
         try:
             job = await jobs.claim(pool, WORKER_ID)
         except Exception:
@@ -792,8 +839,8 @@ async def _serve_forever(pool: Any, fetch_engine: OnDemandFetchService | None) -
             await _run_claimed(pool, job, stop=stop, fetch_engine=fetch_engine)
         except Exception:
             logger.exception(
-                "Job %s could not reach a terminal state; it stays running and is requeued "
-                "on the next worker start",
+                "Job %s could not reach a terminal state; it stays running until its lease "
+                "expires and a worker requeues it",
                 job["id"],
             )
     logger.info("Backtest worker shutting down")
@@ -814,12 +861,15 @@ async def main() -> None:
     fetch_clients = _WorkerFetchClients()
     try:
         await wait_for_schema(dsn)
-        await jobs.requeue_abandoned(pool)
+        lease_s = cfg.backtest.job_lease_s
+        await jobs.requeue_abandoned(pool, lease_s, worker_id=WORKER_ID)
         fetch_engine = fetch_clients.fetch_engine(cfg)
         logger.info(
-            "Backtest worker started (auto-fetch %s)", "on" if fetch_engine is not None else "off"
+            "Backtest worker %s started (auto-fetch %s)",
+            WORKER_ID,
+            "on" if fetch_engine is not None else "off",
         )
-        await _serve_forever(pool, fetch_engine)
+        await _serve_forever(pool, fetch_engine, lease_s)
     finally:
         await pool.close()
         await fetch_clients.close()

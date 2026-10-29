@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,7 +21,7 @@ import asyncpg
 import pytest
 import yaml
 
-from hydra.backtest import worker
+from hydra.backtest import jobs, worker
 from hydra.backtest.jobs import (
     BacktestRunRequest,
     HyperoptRunRequest,
@@ -203,6 +204,7 @@ def _job(body: BacktestRunRequest, config: Any) -> dict[str, Any]:
     return {
         "id": "task-unit",
         "kind": "backtest",
+        "worker_id": "w-unit",
         "request": json.dumps(body.model_dump(mode="json")),
         "strategy_config": json.dumps(config.model_dump(mode="json")),
         "detail": "{}",
@@ -703,6 +705,7 @@ async def test_handler_exception_fails_the_job_row(
     job = {
         "id": "task-x",
         "kind": "backtest",
+        "worker_id": "w-unit",
         "request": "{}",
         "strategy_config": "{}",
         "detail": "{}",
@@ -722,7 +725,9 @@ async def test_handler_exception_fails_the_job_row(
         None,
         "saw: ZeroDivisionError('division by zero')",
         "{}",
+        "w-unit",
     )
+    assert "AND worker_id = $7" in query
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +751,7 @@ async def test_finish_flushes_the_handlers_final_detail(
     job = {
         "id": "task-x",
         "kind": "backtest",
+        "worker_id": "w-unit",
         "request": "{}",
         "strategy_config": "{}",
         "detail": "{}",
@@ -779,6 +785,7 @@ class _TickBlipConn:
         return {
             "id": "task-blip",
             "kind": "backtest",
+            "worker_id": "w-unit",
             "request": "{}",
             "strategy_config": "{}",
             "detail": "{}",
@@ -805,6 +812,7 @@ async def test_a_tick_database_error_does_not_kill_the_job(
     job = {
         "id": "task-blip",
         "kind": "backtest",
+        "worker_id": "w-unit",
         "request": "{}",
         "strategy_config": "{}",
         "detail": "{}",
@@ -848,6 +856,7 @@ async def test_a_database_error_at_the_finish_write_is_retried(
     job = {
         "id": "task-r",
         "kind": "backtest",
+        "worker_id": "w-unit",
         "request": "{}",
         "strategy_config": "{}",
         "detail": "{}",
@@ -897,6 +906,7 @@ async def test_cancel_after_the_persist_straddle_discards_the_result(
     job = {
         "id": "task-c",
         "kind": "backtest",
+        "worker_id": "w-unit",
         "request": "{}",
         "strategy_config": "{}",
         "detail": "{}",
@@ -907,6 +917,119 @@ async def test_cancel_after_the_persist_straddle_discards_the_result(
     assert len(conn.finishes) == 1
     assert conn.finishes[0][1][:2] == ("task-c", "cancelled")
     assert [args for _, args in conn.deletes] == [("bt-task-c",), ("bt-task-c",)]
+
+
+# ---------------------------------------------------------------------------
+# The lease: a worker whose row was requeued abandons the job without a write
+# ---------------------------------------------------------------------------
+
+
+class _LeaseLostConn:
+    """The tick's fenced UPDATE matches no row: a peer requeued the job after the lease expired."""
+
+    def __init__(self) -> None:
+        self.tick_args: list[tuple[Any, ...]] = []
+        self.writes: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: Any) -> None:
+        assert "AND worker_id = $4" in query
+        self.tick_args.append(args)
+        return None
+
+    def transaction(self) -> _Transaction:
+        return _Transaction()
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.writes.append((query, args))
+        return "OK"
+
+
+async def test_a_lost_lease_abandons_the_job_without_a_write_or_a_discard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The result id is shared with the new owner's run, so the loser must not delete it."""
+
+    async def _handler(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
+        run.persisted_result_id = f"bt-{job['id']}"
+        await asyncio.sleep(5)  # cancelled by the tick's lost lease
+
+    monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _handler})
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    conn = _LeaseLostConn()
+    job = {
+        "id": "task-l",
+        "kind": "backtest",
+        "worker_id": "w-old",
+        "request": "{}",
+        "strategy_config": "{}",
+        "detail": "{}",
+    }
+
+    await asyncio.wait_for(worker._run_claimed(_Pool(conn), job, tick_s=0.01), 2.0)
+
+    assert [args[3] for args in conn.tick_args] == ["w-old"]
+    assert conn.writes == []  # no terminal write, no requeue, no result discard
+
+
+class _FencedFinishConn(_JobsConn):
+    """The terminal UPDATE matches no row: the lease expired between the last tick and the end."""
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.executed.append((query, args))
+        return "UPDATE 0"
+
+
+async def test_a_fenced_finish_is_dropped_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _handler(pool: Any, fetch_engine: Any, job: Any, run: worker.JobRun) -> Any:
+        return worker.JobOutcome(result_id="bt-task-f")
+
+    monkeypatch.setattr(worker, "_HANDLERS", {"backtest": _handler})
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    conn = _FencedFinishConn()
+    job = {
+        "id": "task-f",
+        "kind": "backtest",
+        "worker_id": "w-old",
+        "request": "{}",
+        "strategy_config": "{}",
+        "detail": "{}",
+    }
+
+    await asyncio.wait_for(worker._run_claimed(_Pool(conn), job, tick_s=0.01), 2.0)
+
+    finishes = [a for q, a in conn.executed if "finished_at = now()" in q]
+    assert len(finishes) == 1
+    assert finishes[0][:2] == ("task-f", "completed")
+    assert finishes[0][6] == "w-old"
+
+
+async def test_an_idle_worker_sweeps_expired_leases_before_claiming(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The periodic sweep runs on the idle path, throttled, and never as the worker's own id."""
+    sweeps: list[tuple[float, dict[str, Any]]] = []
+    claims = 0
+
+    async def _requeue(pool: Any, lease_s: float, **kwargs: Any) -> None:
+        sweeps.append((lease_s, kwargs))
+
+    async def _claim(pool: Any, worker_id: str) -> None:
+        nonlocal claims
+        claims += 1
+        if claims == 3:
+            signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(jobs, "requeue_abandoned", _requeue)
+    monkeypatch.setattr(jobs, "claim", _claim)
+    monkeypatch.setattr(worker, "IDLE_SLEEP_S", 0.01)
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+
+    await asyncio.wait_for(worker._serve_forever(object(), None, 180), 2.0)
+
+    assert claims == 3
+    assert sweeps == [(180, {})]
 
 
 async def test_wait_for_schema_keeps_the_heartbeat_fresh(

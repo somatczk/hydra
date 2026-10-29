@@ -285,7 +285,9 @@ class DataConfig(_Section):
     ``auto_fetch_enabled`` is the kill switch: false restores the exact P0-B
     submit-time 422 behaviour. The fetch budget is a static split — the engine's
     bucket is capped, feeds and warm-ups stay uncapped — and ``fetch_max_bars`` is
-    the per-job disk safety net. ``cache_max_gb`` is the hard byte cap the sweeper
+    the per-job disk safety net. The weight budget is per process: N backtest workers
+    spend N budgets against the one Binance IP limit, so a multi-worker deploy divides
+    it. ``cache_max_gb`` is the hard byte cap the sweeper
     enforces over auto-fetched bars (0 = delete-after-run: every eligible dataset
     is deleted each sweep); ``row_bytes_estimate`` converts recomputed bar counts
     to the estimate the budget compares against.
@@ -298,6 +300,16 @@ class DataConfig(_Section):
     cache_max_gb: float = Field(10.0, ge=0, allow_inf_nan=False)
     sweep_interval_s: int = Field(3600, gt=0)
     row_bytes_estimate: int = Field(205, gt=0)
+
+
+class BacktestConfig(_Section):
+    """The backtest worker queue.
+
+    ``job_lease_s`` is how long a running job's ``heartbeat_at`` may go unrefreshed (the worker
+    ticks every 10 s) before any worker requeues it as abandoned by a dead or partitioned peer.
+    """
+
+    job_lease_s: int = Field(180, ge=60)
 
 
 class PlatformConfig(_Section):
@@ -333,6 +345,7 @@ class HydraConfig(BaseSettings):
     ml: MlConfig = Field(default_factory=MlConfig)
     trader: TraderConfig = Field(default_factory=TraderConfig)
     data: DataConfig = Field(default_factory=DataConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 
     database_url: SecretStr | None = Field(None, validation_alias="DATABASE_URL")
     redis_url: SecretStr | None = Field(None, validation_alias="REDIS_URL")

@@ -499,7 +499,7 @@ class TestIdempotentRerun:
         assert (v1.version, v1.training_job_id, v1.stage) == (1, task_id, "staging")
 
         # the restart: the abandoned row is requeued and claimed again
-        await jobs.requeue_abandoned(pool)
+        await jobs.requeue_abandoned(pool, 180, worker_id="test-worker")
         with ml_pipeline_fakes():
             claimed = await worker.run_once(pool)
         assert claimed == task_id

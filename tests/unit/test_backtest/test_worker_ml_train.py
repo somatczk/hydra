@@ -101,6 +101,7 @@ def _ml_job(body: MlTrainRunRequest, config: StrategyConfig) -> dict[str, Any]:
     return {
         "id": "ml-unit0001",
         "kind": "ml_train",
+        "worker_id": "w-unit",
         "request": json.dumps(body.model_dump(mode="json")),
         "strategy_config": json.dumps(config.model_dump(mode="json")),
         "detail": "{}",
