@@ -21,6 +21,7 @@ import { WalkForwardResults, type WalkForwardResult } from '@/components/researc
 import {
   noStoredBars,
   utcDay,
+  wfWindowPlan,
   type JobKind,
   type ResearchJob,
   type StrategyParamDef,
@@ -56,7 +57,7 @@ const METHOD_OPTIONS = [
 ];
 
 /** C-WF: the 422 range_too_short envelope in operator words; null for anything else. */
-function rangeTooShort(err: unknown, foldCount: number): { title: string; line: string } | null {
+function rangeTooShort(err: unknown, divisor: number): { title: string; line: string } | null {
   const detail = parseErrorDetail(err);
   if (detail?.code !== 'range_too_short') return null;
   const first = detail.available_first_ts;
@@ -65,7 +66,7 @@ function rangeTooShort(err: unknown, foldCount: number): { title: string; line: 
     typeof first === 'string' && typeof last === 'string'
       ? `Stored bars cover ${utcDay(first)} to ${utcDay(last)}.`
       : '';
-  return { title: `The stored range is too short for ${foldCount} folds.`, line };
+  return { title: `The stored range is too short for one walk-forward window at window divisor ${divisor}.`, line };
 }
 
 /* ---------- Page ---------- */
@@ -317,6 +318,11 @@ export default function OptimizePage() {
 
   const noBars = runError !== null ? noStoredBars(runError) : null;
   const tooShort = runError !== null && mode === 'walkforward' ? rangeTooShort(runError, folds) : null;
+  const wfPlan = wfWindowPlan(startDate, endDate, folds, train / 100);
+  // fold_count sizes the windows (span ÷ k), it is not the number of folds the run makes
+  const wfPlanHint = wfPlan
+    ? `Each window is span ÷ ${folds}: ${wfPlan.isMonths} mo train, ${wfPlan.oosMonths} mo test, rolled by the test window — about ${wfPlan.folds} folds for these dates`
+    : `Each window is span ÷ ${foldCount || 'k'}; no full window fits these dates`;
 
   const jobsError = hyperoptJobs.data === null ? hyperoptJobs.error : null;
   const wfJobsError = walkforwardJobs.data === null ? walkforwardJobs.error : null;
@@ -395,12 +401,13 @@ export default function OptimizePage() {
           ) : (
             <>
               <Input
-                label="Folds"
+                label="Window divisor"
                 type="number"
                 min={2}
                 max={24}
                 value={foldCount}
                 onChange={(e) => setFoldCount(e.target.value)}
+                hint={wfPlanHint}
               />
               <Input
                 label="Train %"

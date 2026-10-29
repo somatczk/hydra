@@ -12,6 +12,7 @@ import {
   trialStatusText,
   validationLines,
   wfFoldRow,
+  wfWindowPlan,
 } from './research';
 
 const noMarketData = (extras: Record<string, unknown> = {}) =>
@@ -209,5 +210,29 @@ describe('wfFoldRow', () => {
       'period=42, threshold=0.5',
     );
     expect(wfFoldRow({ fold_index: 3 })).toEqual({ isWindow: '—', oosWindow: '—', params: '—' });
+  });
+});
+
+describe('wfWindowPlan', () => {
+  it('sizes windows from the span like walkforward_months: divisor 6 at 75 % makes 12 folds over 13 months, not 6', () => {
+    // 424 days → 13 months; IS round(13·0.75/6 = 1.625) = 2, OOS round(0.54) = 1; (424 − 90) / 30 → 11 steps + 1
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 6, 0.75)).toEqual({ isMonths: 2, oosMonths: 1, folds: 12 });
+  });
+
+  it('rounds half to even as Python does (2.5 → 2, not 3)', () => {
+    // 20 months (609 days), divisor 4 at 50 %: 20·0.5/4 = 2.5 → 2 on both sides; (609 − 120) / 60 → 8 steps + 1
+    expect(wfWindowPlan('2024-01-01', '2025-09-01', 4, 0.5)).toEqual({ isMonths: 2, oosMonths: 2, folds: 9 });
+  });
+
+  it('matches the worker on a 3-year span: divisor 12 runs 34 folds', () => {
+    expect(wfWindowPlan('2023-01-01', '2026-01-01', 12, 0.75)).toEqual({ isMonths: 2, oosMonths: 1, folds: 34 });
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 2, 0.75)).toEqual({ isMonths: 5, oosMonths: 2, folds: 4 });
+  });
+
+  it('is null when one window does not fit or an input is unusable', () => {
+    expect(wfWindowPlan('2026-01-01', '2026-02-15', 2, 0.75)).toBeNull();
+    expect(wfWindowPlan('2026-03-01', '2025-01-01', 6, 0.75)).toBeNull();
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 6, 1)).toBeNull();
+    expect(wfWindowPlan('', '2026-03-01', 6, 0.75)).toBeNull();
   });
 });
