@@ -16,6 +16,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from hydra.core import metrics
+from hydra.core.config import HydraConfig
 from hydra.dashboard import lifespan
 from hydra.dashboard.routes import market_data
 from hydra.dashboard.routes._db import install_error_handlers
@@ -310,6 +312,124 @@ class TestUniverse:
         resp = TestClient(_make_app(pool=None)).get("/api/market/universe")
         assert resp.status_code == 503
         assert resp.json()["detail"]["code"] == "database_unavailable"
+
+
+class TestDataInventory:
+    """GET /api/market/data-inventory: the data_inventory tool's reads over HTTP."""
+
+    @staticmethod
+    def _pool(entries: list[dict[str, Any]], totals: dict[str, Any]) -> MagicMock:
+        conn = MagicMock()
+
+        async def fetch(query: str, *args: Any) -> list[dict[str, Any]]:
+            assert "FROM data_cache_entries" in query
+            if "ORDER BY" in query:
+                return entries
+            return [totals]
+
+        conn.fetch = AsyncMock(side_effect=fetch)
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+        pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        return pool
+
+    def test_serves_the_lru_ordered_datasets_with_the_totals_and_sweep_interval(self) -> None:
+        metrics.mark_data_sweep(at=1_761_628_200.0)
+        entries = [
+            {
+                "exchange": "binance",
+                "symbol": "ETHUSDT",
+                "timeframe": "1m",
+                "first_ts": datetime(2025, 12, 1, tzinfo=UTC),
+                "last_ts": datetime(2026, 1, 31, 23, 0, tzinfo=UTC),
+                "rows": 500,
+                "status": "ready",
+                "created_at": datetime(2026, 10, 1, tzinfo=UTC),
+                "last_fetched_at": datetime(2026, 10, 1, tzinfo=UTC),
+                "last_used_at": datetime(2026, 10, 2, tzinfo=UTC),
+            },
+            {
+                "exchange": "binance",
+                "symbol": "BTCUSDT",
+                "timeframe": "1h",
+                "first_ts": datetime(2025, 12, 1, tzinfo=UTC),
+                "last_ts": datetime(2026, 1, 31, 23, 0, tzinfo=UTC),
+                "rows": 0,
+                "status": "fetching",
+                "created_at": datetime(2026, 10, 3, tzinfo=UTC),
+                "last_fetched_at": datetime(2026, 10, 3, tzinfo=UTC),
+                "last_used_at": datetime(2026, 10, 3, tzinfo=UTC),
+            },
+        ]
+        resp = TestClient(_make_app(pool=self._pool(entries, {"rows": 500, "datasets": 2}))).get(
+            "/api/market/data-inventory"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # a lifespan-less app serves the DataConfig section defaults
+        assert body["sweep_interval_s"] == 3600
+        assert body["datasets"] == [
+            {
+                "exchange": "binance",
+                "symbol": "ETHUSDT",
+                "timeframe": "1m",
+                "coverage": {
+                    "first_ts": "2025-12-01T00:00:00+00:00",
+                    "last_ts": "2026-01-31T23:00:00+00:00",
+                },
+                "rows": 500,
+                "estimated_bytes": 500 * 160,
+                "status": "ready",
+                "last_used_at": "2026-10-02T00:00:00+00:00",
+            },
+            {
+                "exchange": "binance",
+                "symbol": "BTCUSDT",
+                "timeframe": "1h",
+                "coverage": {
+                    "first_ts": "2025-12-01T00:00:00+00:00",
+                    "last_ts": "2026-01-31T23:00:00+00:00",
+                },
+                "rows": 0,
+                "estimated_bytes": 0,
+                "status": "fetching",
+                "last_used_at": "2026-10-03T00:00:00+00:00",
+            },
+        ]
+        assert body["totals"] == {
+            "bytes": 500 * 160,
+            "rows": 500,
+            "pairs": 2,
+            "budget_bytes": 10 * (1 << 30),
+            "last_sweep": datetime.fromtimestamp(1_761_628_200.0, UTC).isoformat(),
+        }
+
+    def test_the_config_bound_app_serves_its_own_cache_knobs(self) -> None:
+        app = _make_app(pool=self._pool([], {"rows": 0, "datasets": 0}))
+        config = HydraConfig()
+        config.data.cache_max_gb = 0.5
+        config.data.sweep_interval_s = 120
+        config.data.row_bytes_estimate = 200
+        app.state.config = config
+        resp = TestClient(app).get("/api/market/data-inventory")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["datasets"] == []
+        assert body["totals"]["budget_bytes"] == int(0.5 * (1 << 30))
+        assert body["sweep_interval_s"] == 120
+
+    def test_no_pool_is_the_503_database_envelope(self) -> None:
+        resp = TestClient(_make_app(pool=None)).get("/api/market/data-inventory")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "database_unavailable"
+
+    def test_db_down_is_the_503_envelope(self) -> None:
+        pool = MagicMock()
+        pool.acquire.return_value.__aenter__ = AsyncMock(side_effect=OSError("refused"))
+        pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        resp = TestClient(_make_app(pool=pool)).get("/api/market/data-inventory")
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
 
 
 class TestFundingRates:

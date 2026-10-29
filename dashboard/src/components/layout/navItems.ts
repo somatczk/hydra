@@ -1,5 +1,6 @@
 import {
   CandlestickChart,
+  Database,
   FlaskConical,
   History,
   LayoutDashboard,
@@ -36,6 +37,7 @@ export const navItems: NavItem[] = [
       { label: 'Optimize', href: '/optimize' },
     ],
   },
+  { label: 'Data', href: '/data', icon: Database, railOnly: true },
   { label: 'Settings', href: '/settings', icon: Settings },
 ];
 

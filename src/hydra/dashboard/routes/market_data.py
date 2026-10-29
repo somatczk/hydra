@@ -1,4 +1,5 @@
-"""Market data endpoints: funding rates, order book depth, the top-100 universe."""
+"""Market data endpoints: funding rates, order book depth, the top-100 universe and
+the auto-fetched data inventory."""
 
 from __future__ import annotations
 
@@ -10,14 +11,17 @@ from typing import Any
 
 from ccxt.base.errors import BadSymbol, BaseError
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from prometheus_client import REGISTRY
 from pydantic import BaseModel
 
+from hydra.core.config import DataConfig
 from hydra.dashboard.routes._db import (
     ServiceErrorRoute,
     api_error,
     db_errors_to_503,
     require_pool,
 )
+from hydra.services import data as data_svc
 from hydra.services import universe as universe_svc
 
 router = APIRouter(prefix="/api/market", tags=["market"], route_class=ServiceErrorRoute)
@@ -149,6 +153,73 @@ async def get_universe(request: Request) -> dict[str, Any]:
     call: the refresher owns refreshing, this reads the stored truth.
     """
     return await universe_svc.read_universe(require_pool(request))
+
+
+# ---------------------------------------------------------------------------
+# Data inventory: the auto-fetched bar cache the sweeper bounds (the data_inventory
+# MCP tool's reads over HTTP, for the dashboard's Data page)
+# ---------------------------------------------------------------------------
+
+
+class CoverageRange(BaseModel):
+    """The fetch grid a market was asked to fill — never an "auto-cached since" bound."""
+
+    first_ts: str
+    last_ts: str
+
+
+class CacheDataset(BaseModel):
+    exchange: str
+    symbol: str
+    timeframe: str
+    coverage: CoverageRange
+    rows: int
+    estimated_bytes: int
+    status: str
+    last_used_at: str
+
+
+class CacheTotals(BaseModel):
+    bytes: int
+    rows: int
+    pairs: int
+    budget_bytes: int
+    last_sweep: str | None = None
+
+
+class DataInventory(BaseModel):
+    """Every auto-cached dataset least-recently-used first, plus the totals.
+
+    ``sweep_interval_s`` is the configured cycle the sweep-stall threshold reads
+    (two intervals); the LRU order is the sweeper's eviction order, so the
+    eviction candidates lead.
+    """
+
+    datasets: list[CacheDataset]
+    totals: CacheTotals
+    sweep_interval_s: int
+
+
+def _data_config(request: Request) -> DataConfig:
+    """The bound ``data`` section; the section's defaults while the state is unbound."""
+    cfg = getattr(request.app.state, "config", None)
+    return cfg.data if cfg is not None else DataConfig()
+
+
+@router.get("/data-inventory", response_model=DataInventory)
+async def get_data_inventory(request: Request) -> dict[str, Any]:
+    """The auto-fetched bar cache: every dataset least-recently-used first (the
+    sweeper's eviction candidates lead) with its requested coverage range, bar
+    rows, estimated bytes (rows x ``data.row_bytes_estimate``), fetch status and
+    last use, plus the totals — the whole cache's rows and estimated bytes
+    against the ``data.cache_max_gb`` budget and the last completed sweep —
+    mirroring the ``data_inventory`` MCP tool. 503 when the process has no pool
+    or the database cannot answer.
+    """
+    config = _data_config(request)
+    sweep_ts = REGISTRY.get_sample_value("hydra_data_sweep_last_timestamp_seconds")
+    inventory = await data_svc.cache_inventory(require_pool(request), config, sweep_ts)
+    return {**inventory, "sweep_interval_s": config.sweep_interval_s}
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ const pages: Array<[string, () => Promise<{ default: () => ReactNode }>]> = [
   ['/models', () => import('@/app/models/page')],
   ['/builder', () => import('@/app/builder/page')],
   ['/templates', () => import('@/app/templates/page')],
+  ['/data', () => import('@/app/data/page')],
   ['/activity', () => import('@/app/activity/page')],
   ['/activity/approvals/[id]', () => import('@/app/activity/approvals/[id]/page')],
 ];
