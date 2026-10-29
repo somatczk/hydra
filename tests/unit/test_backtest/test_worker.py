@@ -447,13 +447,14 @@ async def test_walkforward_handler_ensures_bars_through_the_engine(strategies_di
     body = WalkForwardRunRequest(
         strategy_id="saw",
         start_date="2026-01-01",
-        end_date="2026-03-05",
+        end_date="2026-06-01",
         fold_count=2,
         param_space=[ParamDefRequest(name="sma_period", type="int", low=4, high=5)],
     )
     pf = await _preflighted("saw", body)
-    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 1512, timedelta(hours=1))
-    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 1512)])
+    # 155 days: a 93-day in-sample window and two 31-day out-of-sample folds
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 3720, timedelta(hours=1))
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 3720)])
     run = worker.JobRun()
 
     outcome = await worker.run_walkforward_job(
@@ -462,8 +463,10 @@ async def test_walkforward_handler_ensures_bars_through_the_engine(strategies_di
 
     assert engine.calls == [_engine_call(body)]
     assert outcome.result is not None
-    assert outcome.result["folds"]
-    assert run.detail["fetch"] == _progress("fetched", 1512)
+    assert len(outcome.result["folds"]) == 2
+    assert (run.detail["in_sample_bars"], run.detail["out_of_sample_bars"]) == (2232, 744)
+    assert run.detail["fold_count"] == 2
+    assert run.detail["fetch"] == _progress("fetched", 3720)
 
 
 class _TickAndLoadConn(_BarsThenRecordedWrites):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any
 
@@ -13,9 +14,8 @@ from hydra.backtest.jobs import (
     HyperoptRunRequest,
     ParamDefRequest,
     WalkForwardRunRequest,
-    walkforward_months,
-    window_fits,
 )
+from hydra.backtest.walkforward import MIN_WINDOW_DAYS, fold_windows
 from hydra.core.types import Timeframe
 from hydra.data.bars import ceil_to_tf, floor_to_tf, timeframe_seconds
 from hydra.services import strategies as strategy_files
@@ -402,7 +402,7 @@ def _span_covers(
 ) -> bool:
     """True when no fetch could change the window sizing: the stored span covers the
     requested grid's ends AND its bar count saturates that span's grid. A covered span
-    with a sparse interior still defers — ``window_fits`` sizes from the bar count, and
+    with a sparse interior still defers — ``fold_windows`` sizes from the bar count, and
     the worker fetches the gaps first, then sizes from the real bars."""
     first, last, bar_count = stored
     if first > ceil_to_tf(body.start_date, timeframe) or last < floor_to_tf(
@@ -438,14 +438,16 @@ async def submit_walkforward(
     )
     if pf.stored is not None and _span_covers(pf.stored, body, pf.timeframe):
         first, last, bar_count = pf.stored
-        in_sample, out_of_sample = walkforward_months(first, last, body.fold_count, body.train_pct)
-        if not window_fits(first, last, bar_count, in_sample, out_of_sample):
+        k, ratio = body.fold_count, body.train_pct / (1 - body.train_pct)
+        if fold_windows(bar_count, (last - first).days, k, body.train_pct) is None:
+            needed = math.ceil(MIN_WINDOW_DAYS * (k + ratio) * max(1.0, 1 / ratio))
             raise service_error(
                 422,
                 "range_too_short",
-                f"range too short for {body.fold_count} folds: stored bars span "
-                f"{first.isoformat()} to {last.isoformat()}, one window needs "
-                f"{in_sample + out_of_sample} months",
+                f"range too short for {k} folds: stored bars span {first.isoformat()} to "
+                f"{last.isoformat()}; {k} out-of-sample windows and one in-sample window at "
+                f"train_pct {body.train_pct} of at least {MIN_WINDOW_DAYS} days each need "
+                f"about {needed} days",
                 "invalid",
                 available_first_ts=first.isoformat(),
                 available_last_ts=last.isoformat(),
