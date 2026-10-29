@@ -144,6 +144,8 @@ export function StrategyNameDialog({
       leverage: perps ? Number(leverage) : 1,
       // the builder owns the schedule once loaded: {} clears a stored one on update
       schedule: scheduleToWire(state.schedule),
+      // the tunables are authoritative too: {} clears every stored value on update
+      parameters: state.tunables,
     };
 
     try {

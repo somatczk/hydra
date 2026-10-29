@@ -2,7 +2,7 @@
  * and walk-forward rewire. The builder never authors them; it carries them through untouched and drops only the ones a
  * user edit invalidates. `param_overrides: {}` is an explicit opt-out of the implicit `{indicator}_{param}` binding. */
 
-import type { ConditionParams } from './types';
+import type { BuilderState, ConditionParams, RuleSection } from './types';
 
 export interface ConditionBindings {
   param_key?: string;
@@ -14,9 +14,10 @@ export interface ConditionBindings {
 const KEYS = ['param_key', 'param_overrides', 'value_param_key', 'value_ref_overrides'] as const;
 
 /** The binding fields a stored condition carries; the API sends absent ones as null. */
-export function bindingsOf(condition: Partial<Record<(typeof KEYS)[number], unknown>>): ConditionBindings | undefined {
+export function bindingsOf(condition: object): ConditionBindings | undefined {
+  const fields = condition as Partial<Record<(typeof KEYS)[number], unknown>>;
   const out: Record<string, unknown> = {};
-  for (const k of KEYS) if (condition[k] !== null && condition[k] !== undefined) out[k] = condition[k];
+  for (const k of KEYS) if (fields[k] !== null && fields[k] !== undefined) out[k] = fields[k];
   return Object.keys(out).length > 0 ? (out as ConditionBindings) : undefined;
 }
 
@@ -51,4 +52,90 @@ export function bindingsText(bindings: ConditionBindings | undefined, params: Co
   if (bindings.value_param_key) parts.push(`${bindings.value_param_key} → value`);
   for (const [name, param] of Object.entries(bindings.value_ref_overrides ?? {})) parts.push(`${name} → compared ${param}`);
   return parts.length > 0 ? `Strategy parameter bindings: ${parts.join(', ')}` : null;
+}
+
+/** A condition value naming another indicator, `"name:k=v,k=v"`, as rule_engine.parse_indicator_ref reads it. */
+export function parseIndicatorRef(ref: string): { name: string; params: ConditionParams } {
+  const [name, args = ''] = ref.split(':');
+  const params: ConditionParams = {};
+  for (const kv of args.split(',')) {
+    const [k, v] = kv.split('=');
+    if (k?.trim() && v !== undefined && v.trim() !== '' && Number.isFinite(Number(v))) params[k.trim()] = Number(v);
+  }
+  return { name, params };
+}
+
+export function formatIndicatorRef(name: string, params: ConditionParams): string {
+  const args = Object.entries(params).map(([k, v]) => `${k}=${v}`).join(',');
+  return args ? `${name}:${args}` : name;
+}
+
+/* ---------- The resolver (strategy/builtin/rule_based.py `param_bindings`), ported for live edits ---------- */
+
+/** The rule groups in the resolver's order, with the builder's key for each. */
+export const RULE_GROUPS: ReadonlyArray<readonly [string, RuleSection]> = [
+  ['entry_long', 'entryLong'],
+  ['exit_long', 'exitLong'],
+  ['entry_short', 'entryShort'],
+  ['exit_short', 'exitShort'],
+];
+
+/** One condition site a top-level parameter sets (rule_based.ParamBinding). */
+export interface BindingSite {
+  group: string;
+  index: number;
+  target: 'params' | 'value' | 'ref';
+  key: string;
+  value: number | undefined;
+  implicit: boolean;
+}
+
+interface BindableCondition {
+  indicator: string;
+  params: ConditionParams;
+  value: number | string;
+  bindings?: ConditionBindings;
+}
+
+type BindableRules = Pick<BuilderState, RuleSection> | Record<RuleSection, { conditions: BindableCondition[] }>;
+
+/** Every top-level name the rules bind, with its sites in rule order. A `param_overrides` target the condition's
+ * params lack still binds (the engine refuses an unknown one at save); the catalogue is not needed. */
+export function paramBindings(rules: BindableRules): Record<string, BindingSite[]> {
+  const table: Record<string, BindingSite[]> = {};
+  const bind = (name: string, site: BindingSite) => {
+    (table[name] ??= []).push(site);
+  };
+  for (const [group, section] of RULE_GROUPS) {
+    (rules[section]?.conditions ?? []).forEach((cond: BindableCondition, index: number) => {
+      const b = cond.bindings ?? {};
+      const site = (target: BindingSite['target'], key: string, value: number | undefined, implicit = false) =>
+        ({ group, index, target, key, value, implicit }) satisfies BindingSite;
+      const firstKey = Object.keys(cond.params)[0];
+      if (b.param_key && firstKey !== undefined) bind(b.param_key, site('params', firstKey, cond.params[firstKey]));
+      for (const [name, key] of Object.entries(b.param_overrides ?? {})) bind(name, site('params', key, cond.params[key]));
+      if (b.value_param_key && typeof cond.value === 'number') bind(b.value_param_key, site('value', 'value', cond.value));
+      const ref = typeof cond.value === 'string' ? parseIndicatorRef(cond.value) : null;
+      if (b.value_ref_overrides && ref) {
+        for (const [name, key] of Object.entries(b.value_ref_overrides)) bind(name, site('ref', key, ref.params[key]));
+      }
+      if (!b.param_key && b.param_overrides === undefined) {
+        for (const [key, value] of Object.entries(cond.params)) bind(`${cond.indicator}_${key}`, site('params', key, value, true));
+      }
+      if (b.value_ref_overrides === undefined && ref) {
+        for (const [key, value] of Object.entries(ref.params)) bind(`${ref.name}_${key}`, site('ref', key, value, true));
+      }
+    });
+  }
+  return table;
+}
+
+/** An implicit name-match whose sites hold different values never binds (rule_based.ambiguous). */
+export function ambiguous(sites: BindingSite[]): boolean {
+  return sites.some((s) => s.implicit) && new Set(sites.map((s) => s.value)).size > 1;
+}
+
+/** The names a top-level parameter can set (rule_based.bindable_params). */
+export function bindableParams(rules: BindableRules): Record<string, BindingSite[]> {
+  return Object.fromEntries(Object.entries(paramBindings(rules)).filter(([, sites]) => !ambiguous(sites)));
 }

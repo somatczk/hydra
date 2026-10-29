@@ -108,10 +108,7 @@ describe('ConditionRow', () => {
     );
 
     await choose(selectByLabel(page.container, 'Indicator'), 'macd');
-    expect(onUpdate.mock.calls).toEqual([
-      ['indicator', 'macd'],
-      ['params', { fast: 12, slow: 26, signal: 9 }],
-    ]);
+    expect(onUpdate.mock.calls).toEqual([[{ indicator: 'macd', params: { fast: 12, slow: 26, signal: 9 } }]]);
   });
 
   it('compares against another indicator: close greater_than lag:period=60 shows and edits the reference', async () => {
@@ -128,7 +125,8 @@ describe('ConditionRow', () => {
     expect(page.container.textContent).not.toContain('Value');
 
     await typeInto(period, '30');
-    expect(onUpdate).toHaveBeenLastCalledWith('value', 'lag:period=30');
+    // a user edit of a value a tunable may bind
+    expect(onUpdate).toHaveBeenLastCalledWith({ value: 'lag:period=30' }, true);
   });
 
   it('switches the comparison between a number and an indicator', async () => {
@@ -139,7 +137,7 @@ describe('ConditionRow', () => {
 
     expect(inputByLabel(page.container, 'Value').value).toBe('30');
     await choose(selectByLabel(page.container, 'Compare to'), 'indicator');
-    expect(onUpdate).toHaveBeenLastCalledWith('value', 'close');
+    expect(onUpdate).toHaveBeenLastCalledWith({ value: 'close' });
   });
 
   it('shows the stored bindings, and drops and names the ones an indicator change invalidates', async () => {
@@ -157,9 +155,7 @@ describe('ConditionRow', () => {
     );
     await choose(selectByLabel(page.container, 'Indicator'), 'macd');
     expect(onUpdate.mock.calls).toEqual([
-      ['indicator', 'macd'],
-      ['params', { fast: 12, slow: 26, signal: 9 }],
-      ['bindings', { value_param_key: 'rsi_lower' }],
+      [{ indicator: 'macd', params: { fast: 12, slow: 26, signal: 9 }, bindings: { value_param_key: 'rsi_lower' } }],
     ]);
     expect(page.container.querySelector('[role="status"]')?.textContent).toContain('Dropped rsi_period: it bound');
   });
@@ -172,10 +168,7 @@ describe('ConditionRow', () => {
     );
 
     await choose(selectByLabel(page.container, 'Compare to'), 'indicator');
-    expect(onUpdate.mock.calls).toEqual([
-      ['value', 'close'],
-      ['bindings', { param_key: 'rsi_period' }],
-    ]);
+    expect(onUpdate.mock.calls).toEqual([[{ value: 'close', bindings: { param_key: 'rsi_period' } }]]);
   });
 });
 

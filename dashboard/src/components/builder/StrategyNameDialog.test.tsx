@@ -69,6 +69,7 @@ const STATE: BuilderState = {
   symbol: 'BTCUSDT',
   leverage: 1,
   schedule: null,
+  tunables: {},
   baseline: '',
 };
 
@@ -232,6 +233,7 @@ describe('StrategyNameDialog', () => {
       ml_overlay: { model_name: 'm1', confidence_threshold: 0.6 },
       leverage: 1,
       schedule: {},
+      parameters: {},
     });
     expect(saved).toEqual([['RSI bot', 'strat-7']]);
     expect(closes).toBe(1);

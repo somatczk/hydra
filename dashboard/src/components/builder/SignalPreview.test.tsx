@@ -34,6 +34,7 @@ const STATE: BuilderState = {
   symbol: 'ETHUSDT',
   leverage: 1,
   schedule: null,
+  tunables: {},
   baseline: '',
 };
 

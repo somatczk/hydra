@@ -6,20 +6,21 @@ import { Button } from '@/components/ui/Button';
 import { Select } from '@/components/ui/Select';
 import { Input } from '@/components/ui/Input';
 import { IndicatorPicker } from './IndicatorPicker';
-import { bindingsText, dropBindings } from './bindings';
+import { bindingsText, dropBindings, formatIndicatorRef, parseIndicatorRef } from './bindings';
 import type {
   BuilderCondition,
   ConditionParams,
   IndicatorSchema,
   ComparatorSchema,
-  ConditionFieldValue,
+  ConditionPatch,
 } from './types';
 
 interface ConditionRowProps {
   condition: BuilderCondition;
   indicators: IndicatorSchema[];
   comparators: ComparatorSchema[];
-  onUpdate: (field: keyof BuilderCondition, value: ConditionFieldValue) => void;
+  /** `edit` marks a user change to a value a tunable may bind (it moves the tunable with it). */
+  onUpdate: (patch: ConditionPatch, edit?: boolean) => void;
   onRemove: () => void;
 }
 
@@ -30,21 +31,7 @@ export function defaultParams(schema: IndicatorSchema | undefined): ConditionPar
   return out;
 }
 
-/** A condition value naming another indicator, `"name:k=v,k=v"`, as rule_engine.parse_indicator_ref reads it. */
-export function parseIndicatorRef(ref: string): { name: string; params: ConditionParams } {
-  const [name, args = ''] = ref.split(':');
-  const params: ConditionParams = {};
-  for (const kv of args.split(',')) {
-    const [k, v] = kv.split('=');
-    if (k?.trim() && v !== undefined && v.trim() !== '' && Number.isFinite(Number(v))) params[k.trim()] = Number(v);
-  }
-  return { name, params };
-}
-
-export function formatIndicatorRef(name: string, params: ConditionParams): string {
-  const args = Object.entries(params).map(([k, v]) => `${k}=${v}`).join(',');
-  return args ? `${name}:${args}` : name;
-}
+export { formatIndicatorRef, parseIndicatorRef };
 
 const COMPARE_TO_OPTIONS = [
   { value: 'number', label: 'A number' },
@@ -61,11 +48,11 @@ export function ConditionRow({
   const ref = typeof condition.value === 'string' ? parseIndicatorRef(condition.value) : null;
   const [dropped, setDropped] = useState<string[]>([]);
   /** An edit that changes what one side of the condition is invalidates that side's stored bindings. */
-  const dropSide = (side: 'indicator' | 'value') => {
+  const dropSide = (side: 'indicator' | 'value'): ConditionPatch => {
     const { kept, dropped: names } = dropBindings(condition.bindings, side);
-    if (names.length === 0) return;
-    onUpdate('bindings', kept);
+    if (names.length === 0) return {};
     setDropped((prev) => [...prev, ...names]);
+    return { bindings: kept };
   };
   const bound = bindingsText(condition.bindings, condition.params);
   const comparatorOptions = comparators.map((c) => ({
@@ -82,13 +69,11 @@ export function ConditionRow({
             indicators={indicators}
             selectedIndicator={condition.indicator}
             params={condition.params}
-            onIndicatorChange={(ind) => {
-              onUpdate('indicator', ind);
+            onIndicatorChange={(ind) =>
               // the previous indicator's params would make the new one unbuildable (422 at save)
-              onUpdate('params', defaultParams(indicators.find((i) => i.name === ind)));
-              dropSide('indicator');
-            }}
-            onParamChange={(params) => onUpdate('params', params)}
+              onUpdate({ indicator: ind, params: defaultParams(indicators.find((i) => i.name === ind)), ...dropSide('indicator') })
+            }
+            onParamChange={(params) => onUpdate({ params }, true)}
           />
         </div>
 
@@ -98,7 +83,7 @@ export function ConditionRow({
             label="Comparator"
             options={comparatorOptions}
             value={condition.comparator}
-            onChange={(e) => onUpdate('comparator', e.target.value)}
+            onChange={(e) => onUpdate({ comparator: e.target.value })}
           />
         </div>
 
@@ -108,10 +93,7 @@ export function ConditionRow({
             label="Compare to"
             options={COMPARE_TO_OPTIONS}
             value={ref ? 'indicator' : 'number'}
-            onChange={(e) => {
-              onUpdate('value', e.target.value === 'indicator' ? 'close' : 0);
-              dropSide('value');
-            }}
+            onChange={(e) => onUpdate({ value: e.target.value === 'indicator' ? 'close' : 0, ...dropSide('value') })}
           />
           {!ref && (
             <Input
@@ -121,7 +103,7 @@ export function ConditionRow({
               onChange={(e) => {
                 const val = parseFloat(e.target.value);
                 if (!isNaN(val)) {
-                  onUpdate('value', val);
+                  onUpdate({ value: val }, true);
                 }
               }}
               placeholder="0"
@@ -136,11 +118,13 @@ export function ConditionRow({
               indicators={indicators}
               selectedIndicator={ref.name}
               params={ref.params}
-              onIndicatorChange={(ind) => {
-                onUpdate('value', formatIndicatorRef(ind, defaultParams(indicators.find((i) => i.name === ind))));
-                dropSide('value');
-              }}
-              onParamChange={(params) => onUpdate('value', formatIndicatorRef(ref.name, params))}
+              onIndicatorChange={(ind) =>
+                onUpdate({
+                  value: formatIndicatorRef(ind, defaultParams(indicators.find((i) => i.name === ind))),
+                  ...dropSide('value'),
+                })
+              }
+              onParamChange={(params) => onUpdate({ value: formatIndicatorRef(ref.name, params) }, true)}
             />
           </div>
         )}
@@ -151,7 +135,8 @@ export function ConditionRow({
             {dropped.length > 0 && (
               <p role="status" className="text-caution">
                 Dropped {dropped.join(', ')}: {dropped.length === 1 ? 'it' : 'they'} bound what this condition no longer
-                uses, so hyperopt and walk-forward can no longer set {dropped.length === 1 ? 'it' : 'them'} here.
+                uses, so hyperopt and walk-forward can no longer set {dropped.length === 1 ? 'it' : 'them'} here, and a
+                tuned value goes with the binding once nothing else binds the name.
               </p>
             )}
           </div>

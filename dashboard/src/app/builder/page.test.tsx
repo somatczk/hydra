@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { ApiError } from '@/lib/api';
-import { buttonByText, click, dialogPolyfill, flush, mount, routeFetch, sectionText, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
+import { buttonByText, click, dialogPolyfill, flush, inputByLabel, mount, routeFetch, sectionText, typeInto, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
 const toast = vi.fn();
@@ -228,6 +228,64 @@ describe('BuilderPage bindings round-trip', () => {
       entry_short: null,
       exit_short: null,
     });
+  });
+});
+
+describe('BuilderPage tuned parameters', () => {
+  const TUNED = {
+    ...STRATEGY,
+    rules: {
+      entry_long: {
+        operator: 'AND',
+        conditions: [
+          { indicator: 'rsi', params: { period: 14 }, comparator: 'less_than', value: 30, param_key: 'rsi_len', value_param_key: null },
+        ],
+      },
+      exit_long: null,
+      entry_short: null,
+      exit_short: null,
+    },
+    parameters: { rsi_len: 10 },
+  };
+
+  it('shows the stored value on the panel and in the condition, keeps both in step and PUTs it', async () => {
+    const r = routes();
+    r['/api/strategies/strat-1'] = TUNED;
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    // the engine runs the stored 10, not the condition's own 14: the builder shows 10 in both places
+    expect(inputByLabel(page.container, 'rsi_len').value).toBe('10');
+    expect(inputByLabel(page.container, 'period').value).toBe('10');
+    expect(page.container.querySelector('[data-testid="tuned-parameters"]')?.textContent).toContain('Entry long #1 · rsi period');
+
+    await typeInto(inputByLabel(page.container, 'period'), '12');
+    expect(inputByLabel(page.container, 'rsi_len').value).toBe('12');
+
+    await typeInto(inputByLabel(page.container, 'rsi_len'), '9');
+    expect(inputByLabel(page.container, 'period').value).toBe('9');
+
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    const body = JSON.parse(String(calls.find((c) => c.init?.method === 'PUT')?.init?.body));
+    expect(body.parameters).toEqual({ rsi_len: 9 });
+    expect(body.rules.entry_long.conditions[0].params).toEqual({ period: 9 });
+  });
+
+  it('clears a stored value and leaves the condition as it is, then sends {}', async () => {
+    const r = routes();
+    r['/api/strategies/strat-1'] = TUNED;
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    await click(page.container.querySelector('button[aria-label="Clear rsi_len"]') as HTMLButtonElement);
+    expect(page.container.querySelector('button[aria-label="Clear rsi_len"]')).toBeNull();
+    expect(inputByLabel(page.container, 'period').value).toBe('10');
+
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    const body = JSON.parse(String(calls.find((c) => c.init?.method === 'PUT')?.init?.body));
+    expect(body.parameters).toEqual({});
   });
 });
 

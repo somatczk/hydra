@@ -42,7 +42,8 @@ export interface BuilderCondition {
   bindings?: ConditionBindings;
 }
 
-export type ConditionFieldValue = BuilderCondition[keyof BuilderCondition];
+/** A condition edit applied in one reducer step; `edit` marks a user change to a bound value (it moves the tunable). */
+export type ConditionPatch = Partial<Omit<BuilderCondition, 'id'>>;
 
 export interface BuilderConditionGroup {
   operator: 'AND' | 'OR';
@@ -105,6 +106,8 @@ export interface BuilderState {
   leverage: number;
   /** The entry schedule (strategy/config.py ScheduleConfig); null is always active. */
   schedule: Schedule | null;
+  /** Stored top-level values of names the rules bind; kept equal to every site they set. */
+  tunables: Record<string, number>;
   baseline: string;
 }
 
@@ -155,6 +158,8 @@ export interface SaveRequest {
   leverage?: number;
   /** On update `{}` clears the stored schedule; on save it writes none. */
   schedule?: WireSchedule;
+  /** Top-level tunables by name; only names the rules bind (`{}` clears on update). */
+  parameters?: Record<string, number>;
 }
 
 export interface SerializedCondition {
@@ -210,6 +215,8 @@ export interface StrategyDetail {
   /** P4-F: the stored perp leverage for a binanceusdm strategy, so an edit round-trips it. */
   leverage?: number;
   schedule?: WireSchedule | null;
+  /** Stored top-level `parameters` other than rules / required_history / description. */
+  parameters?: Record<string, unknown>;
 }
 
 /* ---------- Reducer actions ---------- */
@@ -217,13 +224,8 @@ export interface StrategyDetail {
 export type BuilderAction =
   | { type: 'ADD_CONDITION'; section: RuleSection }
   | { type: 'REMOVE_CONDITION'; section: RuleSection; conditionId: string }
-  | {
-      type: 'UPDATE_CONDITION';
-      section: RuleSection;
-      conditionId: string;
-      field: keyof BuilderCondition;
-      value: ConditionFieldValue;
-    }
+  | { type: 'UPDATE_CONDITION'; section: RuleSection; conditionId: string; patch: ConditionPatch; edit?: boolean }
+  | { type: 'SET_TUNABLE'; name: string; value: number | null }
   | { type: 'SET_OPERATOR'; section: RuleSection; operator: 'AND' | 'OR' }
   | { type: 'SET_TIMEFRAME'; field: keyof TimeframeConfig; value: string }
   | { type: 'SET_RISK'; risk: Partial<RiskConfig> }

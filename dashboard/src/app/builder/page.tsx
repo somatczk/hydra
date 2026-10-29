@@ -18,6 +18,8 @@ import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
 import { scheduleFromWire } from '@/lib/schedule';
 import { bindingsOf } from '@/components/builder/bindings';
+import { reconcileTunables, storedTunables } from '@/components/builder/tunables';
+import { TunedParameters } from '@/components/builder/TunedParameters';
 import type {
   BuilderState,
   BuilderAction,
@@ -32,7 +34,7 @@ import type {
   RuleSection as RuleSectionKey,
   StrategyDetail,
   SerializedConditionGroup,
-  ConditionFieldValue,
+  ConditionPatch,
 } from '@/components/builder/types';
 
 /* ---------- Initial state ---------- */
@@ -68,6 +70,7 @@ const initialDraft: Omit<BuilderState, 'baseline'> = {
   symbol: 'BTCUSDT',
   leverage: 1,
   schedule: null,
+  tunables: {},
 };
 
 function snapshot(state: BuilderState): string {
@@ -116,17 +119,18 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         comparator: 'less_than',
         value: 30,
       };
-      return {
+      // a new condition that binds a stored name by name runs with its stored value
+      return reconcileTunables({
         ...state,
         [section]: {
           ...state[section],
           conditions: [...state[section].conditions, newCondition],
         },
-      };
+      });
     }
     case 'REMOVE_CONDITION': {
       const section = action.section;
-      return {
+      return reconcileTunables({
         ...state,
         [section]: {
           ...state[section],
@@ -134,21 +138,26 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
             (c: BuilderCondition) => c.id !== action.conditionId,
           ),
         },
-      };
+      });
     }
     case 'UPDATE_CONDITION': {
       const section = action.section;
-      return {
+      const next = {
         ...state,
         [section]: {
           ...state[section],
           conditions: state[section].conditions.map((c: BuilderCondition) =>
-            c.id === action.conditionId
-              ? { ...c, [action.field]: action.value }
-              : c,
+            c.id === action.conditionId ? { ...c, ...action.patch } : c,
           ),
         },
       };
+      return reconcileTunables(next, action.edit ? { section, conditionId: action.conditionId } : undefined);
+    }
+    case 'SET_TUNABLE': {
+      const tunables = { ...state.tunables };
+      if (action.value === null) delete tunables[action.name];
+      else tunables[action.name] = action.value;
+      return reconcileTunables({ ...state, tunables });
     }
     case 'SET_OPERATOR': {
       const section = action.section;
@@ -236,9 +245,11 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         symbol: payload.symbol || 'BTCUSDT',
         leverage: payload.leverage ?? 1,
         schedule: scheduleFromWire(payload.schedule),
+        tunables: storedTunables(payload.parameters),
         baseline: '',
       };
-      return { ...next, baseline: snapshot(next) };
+      const applied = reconcileTunables(next);
+      return { ...applied, baseline: snapshot(applied) };
     }
     case 'MARK_CLEAN':
       return { ...state, baseline: snapshot(state) };
@@ -524,11 +535,9 @@ function BuilderPageContent() {
             onRemoveCondition={(conditionId: string) =>
               dispatch({ type: 'REMOVE_CONDITION', section: section.key, conditionId })
             }
-            onUpdateCondition={(
-              conditionId: string,
-              field: keyof BuilderCondition,
-              value: ConditionFieldValue,
-            ) => dispatch({ type: 'UPDATE_CONDITION', section: section.key, conditionId, field, value })}
+            onUpdateCondition={(conditionId: string, patch: ConditionPatch, edit?: boolean) =>
+              dispatch({ type: 'UPDATE_CONDITION', section: section.key, conditionId, patch, edit })
+            }
             onSetOperator={(operator: 'AND' | 'OR') =>
               dispatch({ type: 'SET_OPERATOR', section: section.key, operator })
             }
@@ -543,6 +552,8 @@ function BuilderPageContent() {
           dispatch({ type: 'SET_TIMEFRAME', field, value })
         }
       />
+
+      <TunedParameters state={state} onSet={(name, value) => dispatch({ type: 'SET_TUNABLE', name, value })} />
 
       <ScheduleEditor
         schedule={state.schedule}

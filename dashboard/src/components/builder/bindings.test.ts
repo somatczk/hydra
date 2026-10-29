@@ -1,5 +1,29 @@
 import { describe, expect, it } from 'vitest';
-import { bindingsOf, bindingsText, dropBindings } from './bindings';
+import parity from '@/test/paramBindings.parity.json';
+import { ambiguous, bindableParams, bindingsOf, bindingsText, dropBindings, paramBindings, RULE_GROUPS } from './bindings';
+import type { BuilderState, RuleSection } from './types';
+
+type ApiCondition = { indicator: string; params: Record<string, number>; value: number | string } & Record<string, unknown>;
+
+/** The fixture's API-shaped rules as builder groups, the way the builder loads a stored strategy. */
+function builderRules(rules: Record<string, { conditions: ApiCondition[] } | null>): Pick<BuilderState, RuleSection> {
+  return Object.fromEntries(
+    RULE_GROUPS.map(([group, section]) => [
+      section,
+      {
+        operator: 'AND',
+        conditions: (rules[group]?.conditions ?? []).map((c, i) => ({
+          id: `${group}-${i}`,
+          indicator: c.indicator,
+          params: c.params,
+          comparator: 'less_than',
+          value: c.value,
+          bindings: bindingsOf(c),
+        })),
+      },
+    ]),
+  ) as Pick<BuilderState, RuleSection>;
+}
 
 describe('condition bindings', () => {
   it('keeps every stored binding, the {} opt-out included, and treats the API nulls as absent', () => {
@@ -40,3 +64,13 @@ describe('condition bindings', () => {
     expect(bindingsText(undefined, {})).toBeNull();
   });
 });
+
+describe('the ported resolver', () => {
+  it('matches strategy/builtin/rule_based.py param_bindings on the shared fixture', () => {
+    const rules = builderRules(parity.rules as Record<string, { conditions: ApiCondition[] } | null>);
+    expect(bindableParams(rules)).toEqual(parity.bindable);
+    const table = paramBindings(rules);
+    expect(Object.keys(table).filter((name) => ambiguous(table[name])).sort()).toEqual(parity.ambiguous);
+  });
+});
+
