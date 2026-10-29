@@ -265,3 +265,8 @@ class StrategyEngine:
     def get_all_strategies(self) -> dict[str, BaseStrategy]:
         """Return all loaded strategies."""
         return dict(self._strategies)
+
+    @property
+    def hydra_config(self) -> HydraConfig:
+        """The config the engine was built with (consumers read ``ml.models_dir``)."""
+        return self._config

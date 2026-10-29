@@ -67,6 +67,9 @@ Contract (name: type, unit / labels / producer):
 - hydra_ml_inference_latency_seconds: histogram, seconds
   labels: model_name
   producer: ml.serving
+- hydra_ml_overlay_decisions_total: counter, decisions
+  labels: strategy_id, model_name, decision
+  producer: ml.consumers (the P5-C overlay seam)
 - hydra_feed_last_message_timestamp_seconds: gauge, unix seconds
   labels: exchange_id, symbol, timeframe
   producer: P1-B feed
@@ -344,6 +347,15 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "ml.serving",
         ("model_name",),
         (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5),
+    ),
+    MetricSpec(
+        "hydra_ml_overlay_decisions_total",
+        "counter",
+        "ML overlay decisions at the signal seam: pass, veto, shadow_veto or "
+        "error (error counts the fail-closed refusals)",
+        "decisions",
+        "ml.consumers (the P5-C overlay seam)",
+        ("strategy_id", "model_name", "decision"),
     ),
     MetricSpec(
         "hydra_feed_last_message_timestamp_seconds",
@@ -815,6 +827,17 @@ def observe_order_fill_latency(seconds: float) -> None:
 def observe_ml_inference_latency(model_name: str, seconds: float) -> None:
     """Record ML model inference latency."""
     _histogram("hydra_ml_inference_latency_seconds").labels(model_name=model_name).observe(seconds)
+
+
+OVERLAY_DECISIONS = ("pass", "veto", "shadow_veto", "error")
+
+
+def record_ml_overlay_decision(strategy_id: str, model_name: str, decision: str) -> None:
+    """Count one overlay decision at the signal seam (P5-C)."""
+    _check(decision, OVERLAY_DECISIONS, "decision")
+    _counter("hydra_ml_overlay_decisions_total").labels(
+        strategy_id=strategy_id, model_name=model_name, decision=decision
+    ).inc()
 
 
 # ---------------------------------------------------------------------------

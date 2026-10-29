@@ -104,11 +104,27 @@ class ScheduleConfig(BaseModel):
 
 
 class MLOverlayConfig(BaseModel):
-    """Optional ML overlay configuration."""
+    """The veto-only ML overlay on a strategy's entries (P5-C).
 
+    ``enabled`` turns the gate on: the session start then fail-closes on the
+    named model's Production version (never at save), and the signal seam vetoes
+    an entry whose confidence for its own direction is below
+    ``confidence_threshold`` — at the threshold the entry passes. ``shadow``
+    records would-vetoes without suppressing them. The overlay never generates,
+    sizes or bypasses: the frozen ``FeatureSpec`` is the feature contract, so
+    there is no per-strategy feature list.
+    """
+
+    enabled: bool = False
     model_name: str = ""
-    confidence_threshold: float = 0.6
-    features: list[str] = Field(default_factory=list)
+    confidence_threshold: float = Field(0.6, ge=0.0, le=1.0)
+    shadow: bool = False
+
+    @model_validator(mode="after")
+    def _enabled_names_a_model(self) -> MLOverlayConfig:
+        if self.enabled and not self.model_name.strip():
+            raise ValueError("an enabled ml_overlay must name a model")
+        return self
 
 
 # ---------------------------------------------------------------------------

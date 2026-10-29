@@ -1,34 +1,63 @@
-"""E2E: ML confidence overlay -- signal filtering and model fallback.
+"""E2E: the ML-native strategy consumes a real Production model's predictions.
 
-Tests the interaction between strategy signals and ML confidence scoring.
-Uses the MLEnsembleStrategy which has a confidence threshold that filters
-weak predictions.
+The fake momentum heuristic is gone; ``MLEnsembleStrategy`` now reads the
+Production model through the real attach pipeline (a real ONNX fixture:
+P(up) = 0.01 * RSI(14) of the 1h closes, loaded by real onnxruntime), so the
+entry/exit decisions are asserted against the pinned P(up) values — a strictly
+rising series has RSI(14) = 100 -> P(up) = 1.0, an equal alternation has
+RSI = 51.9178 -> P(up) = 0.519178 between the bands, and the unattached model
+refuses loudly instead of trading silently. No exchange, DB or Redis is
+needed: the model is the fixture artifact and the bars are deterministic.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from unittest.mock import patch
+from pathlib import Path
 
-import numpy as np
 import pytest
 
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
-from hydra.core.types import OHLCV, Direction, Symbol, Timeframe
+from hydra.core.types import OHLCV, Direction, Position, Symbol, Timeframe
+from hydra.ml.features import DEFAULT_FEATURE_SPEC
+from hydra.ml.serving import _reset_attached
 from hydra.strategy.builtin.ml_ensemble import MLEnsembleStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
+from hydra.strategy.ml_access import _reset_providers
+from tests.fixtures.ml_onnx import confidence_onnx, frozen_spec_metadata
 
 from .conftest import make_bar
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+MODEL = "e2e_alpha"
+N_FEATURES = len(DEFAULT_FEATURE_SPEC.feature_names)
+T0 = datetime(2024, 1, 1, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ml_state() -> AsyncIterator[None]:
+    _reset_attached()
+    _reset_providers()
+    yield
+    _reset_attached()
+    _reset_providers()
+
+
+async def _attach_fixture(models_dir: Path) -> None:
+    from hydra.ml.consumers import attach_native_provider
+    from hydra.ml.serving import attach_artifact
+
+    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    (models_dir / "fixture.onnx").write_bytes(confidence_onnx(meta, N_FEATURES))
+    attach_native_provider(await attach_artifact(models_dir, "fixture.onnx", MODEL))
 
 
 def _ml_config(
-    confidence_threshold: float = 0.6,
+    entry_threshold: float = 0.6,
+    exit_threshold: float = 0.4,
     strategy_id: str = "ml_test",
 ) -> StrategyConfig:
     return StrategyConfig(
@@ -36,173 +65,137 @@ def _ml_config(
         name="ML Ensemble Test",
         strategy_class="hydra.strategy.builtin.ml_ensemble.MLEnsembleStrategy",
         symbols=["BTCUSDT"],
-        timeframes={"primary": Timeframe.H1},
+        timeframes={"primary": Timeframe.H1, "confirmation": Timeframe.H4, "entry": Timeframe.D1},
         parameters={
-            "confidence_threshold": confidence_threshold,
-            "required_history": 30,
+            "model_name": MODEL,
+            "entry_threshold": entry_threshold,
+            "exit_threshold": exit_threshold,
+            "required_history": 2000,
         },
     )
 
 
-def _build_trending_bars(count: int = 50, direction: str = "up") -> list[OHLCV]:
-    """Build bars with a steep trend to drive ML placeholder confidence above threshold.
-
-    The ML placeholder computes confidence = min(abs(short_ret) * 10, 1.0) where
-    short_ret = close[-1]/close[-5] - 1.  For confidence > 0.3 we need
-    abs(short_ret) > 0.03, i.e. a 3% move over 5 bars.  We use 2% per bar
-    (exponential growth) to ensure this.
-    """
-    bars: list[OHLCV] = []
-    start = datetime(2024, 1, 1, tzinfo=UTC)
-    base_price = 40000.0
-
-    for i in range(count):
-        ts = start + timedelta(hours=i)
-        price = base_price * (1.02**i) if direction == "up" else base_price * (0.98**i)
-
-        bars.append(make_bar(max(price, 1000.0), ts, volume=500.0))
-
-    return bars
+def _build_bars(closes: list[float]) -> list[OHLCV]:
+    return [
+        make_bar(close, T0 + timedelta(hours=i), volume=500.0) for i, close in enumerate(closes)
+    ]
 
 
-def _build_flat_bars(count: int = 50) -> list[OHLCV]:
-    """Build flat bars with no clear trend -- ML should have low confidence."""
-    bars: list[OHLCV] = []
-    start = datetime(2024, 1, 1, tzinfo=UTC)
-
-    for i in range(count):
-        ts = start + timedelta(hours=i)
-        # Oscillate around 40000 with tiny amplitude
-        price = 40000.0 + 5 * np.sin(i * 0.5)
-        bars.append(make_bar(price, ts, volume=500.0))
-
-    return bars
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+async def _run_strategy(
+    strategy: MLEnsembleStrategy,
+    bars: list[OHLCV],
+) -> list[EntrySignal | ExitSignal]:
+    context = strategy.context
+    signals: list[EntrySignal | ExitSignal] = []
+    sym = Symbol("BTCUSDT")
+    tf = Timeframe.H1
+    for bar in bars:
+        context.add_bar(str(sym), tf, bar)
+        bar_event = BarEvent(symbol=sym, timeframe=tf, ohlcv=bar, exchange_id="binance")
+        signals.extend(await strategy.on_bar(bar_event))
+    return signals
 
 
 @pytest.mark.e2e
-class TestMLOverlay:
-    """Strategy with ML confidence scoring overlay."""
+class TestMLNativeStrategy:
+    """Entries and exits driven by the Production model's P(up)."""
 
-    async def test_ml_confidence_filters_signals(self) -> None:
-        """Low confidence prediction causes no signal to be emitted."""
-        # Use flat bars where ML placeholder yields low confidence
-        bars = _build_flat_bars(50)
-        config = _ml_config(confidence_threshold=0.6, strategy_id="ml_filter")
-        context = StrategyContext()
-        context.set_portfolio_value(Decimal("100000"))
-        strategy = MLEnsembleStrategy(config=config, context=context)
+    async def test_a_rising_market_enters_long_then_holds(self, tmp_path: Path) -> None:
+        await _attach_fixture(tmp_path)
+        # strictly rising closes: RSI(14) = 100 -> P(up) = 1.0 >= entry 0.6;
+        # the level-triggered entry fires once, then the session's fill
+        # feedback (the position) holds it like every other strategy
+        bars = _build_bars([40000.0 + 100.0 * i for i in range(50)])
+        strategy = MLEnsembleStrategy(_ml_config(strategy_id="ml_long"), StrategyContext())
         await strategy.on_start()
-
-        signals: list[EntrySignal | ExitSignal] = []
-        symbol = "BTCUSDT"
-        sym = Symbol(symbol)
-        tf = Timeframe.H1
-
+        entries: list[EntrySignal] = []
         for bar in bars:
-            context.add_bar(symbol, tf, bar)
-            bar_event = BarEvent(symbol=sym, timeframe=tf, ohlcv=bar, exchange_id="binance")
-            sigs = await strategy.on_bar(bar_event)
-            signals.extend(sigs)
-
+            strategy.context.add_bar("BTCUSDT", Timeframe.H1, bar)
+            sigs = await strategy.on_bar(
+                BarEvent(
+                    symbol=Symbol("BTCUSDT"),
+                    timeframe=Timeframe.H1,
+                    ohlcv=bar,
+                    exchange_id="binance",
+                )
+            )
+            entries.extend(s for s in sigs if isinstance(s, EntrySignal))
+            if entries:
+                # the position the session's fill handler would create
+                strategy.context.set_position(
+                    "BTCUSDT",
+                    Position(
+                        symbol=Symbol("BTCUSDT"),
+                        direction=Direction.LONG,
+                        quantity=Decimal("1"),
+                        avg_entry_price=bar.close,
+                        unrealized_pnl=Decimal("0"),
+                        realized_pnl=Decimal("0"),
+                        strategy_id="ml_long",
+                        exchange_id="binance",
+                    ),
+                )
         await strategy.on_stop()
 
-        # With flat data the ML placeholder should produce low confidence,
-        # so no signals should pass the threshold
-        entry_signals = [s for s in signals if isinstance(s, EntrySignal)]
-        # The flat data has near-zero returns => direction=0, confidence=0
-        assert len(entry_signals) == 0
+        assert len(entries) == 1
+        assert entries[0].direction is Direction.LONG
+        assert float(entries[0].strength) == pytest.approx(1.0, abs=1e-9)
 
-    async def test_ml_high_confidence_passes_through(self) -> None:
-        """High confidence predictions produce signals."""
-        # Use trending bars where the ML placeholder yields high confidence
-        bars = _build_trending_bars(50, direction="up")
-        config = _ml_config(confidence_threshold=0.3, strategy_id="ml_pass")
-        context = StrategyContext()
-        context.set_portfolio_value(Decimal("100000"))
-        strategy = MLEnsembleStrategy(config=config, context=context)
+    async def test_a_flat_market_emits_nothing_between_the_bands(self, tmp_path: Path) -> None:
+        await _attach_fixture(tmp_path)
+        # alternating closes: RSI(14) = 51.9178 -> P(up) = 0.519178, between
+        # the SHORT band (<= 1 - 0.6) and the LONG band (>= 0.6): no entry
+        bars = _build_bars([40100.0 if i % 2 == 0 else 40000.0 for i in range(50)])
+        strategy = MLEnsembleStrategy(_ml_config(strategy_id="ml_flat"), StrategyContext())
         await strategy.on_start()
-
-        signals: list[EntrySignal | ExitSignal] = []
-        symbol = "BTCUSDT"
-        sym = Symbol(symbol)
-        tf = Timeframe.H1
-
-        for bar in bars:
-            context.add_bar(symbol, tf, bar)
-            bar_event = BarEvent(symbol=sym, timeframe=tf, ohlcv=bar, exchange_id="binance")
-            sigs = await strategy.on_bar(bar_event)
-            signals.extend(sigs)
-
+        signals = await _run_strategy(strategy, bars)
         await strategy.on_stop()
+        assert [s for s in signals if isinstance(s, EntrySignal)] == []
 
-        # With trending data the ML placeholder should produce some signals
-        entry_signals = [s for s in signals if isinstance(s, EntrySignal)]
-        # At least some signals should pass through with a strong trend
-        assert len(entry_signals) > 0
-
-        # All signals should be LONG for uptrending data
-        for sig in entry_signals:
-            assert sig.direction == Direction.LONG
-
-    async def test_ml_model_fallback(self) -> None:
-        """When ML _compute_prediction returns direction=0, strategy produces no signal."""
-        bars = _build_trending_bars(50, direction="up")
-        config = _ml_config(confidence_threshold=0.5, strategy_id="ml_fallback")
-        context = StrategyContext()
-        context.set_portfolio_value(Decimal("100000"))
-        strategy = MLEnsembleStrategy(config=config, context=context)
+    async def test_a_held_long_exits_when_the_model_turns_bearish(self, tmp_path: Path) -> None:
+        await _attach_fixture(tmp_path)
+        bars = _build_bars([40000.0 - 100.0 * i for i in range(50)])  # RSI 0 -> P(up) = 0.0
+        strategy = MLEnsembleStrategy(_ml_config(strategy_id="ml_exit"), StrategyContext())
         await strategy.on_start()
-
-        # Patch the ML prediction to simulate model unavailability
-        def _fake_prediction(close, high, low, volume):
-            return {"direction": 0, "confidence": 0.0}
-
-        signals: list[EntrySignal | ExitSignal] = []
-        symbol = "BTCUSDT"
-        sym = Symbol(symbol)
-        tf = Timeframe.H1
-
-        with patch.object(strategy, "_compute_prediction", side_effect=_fake_prediction):
-            for bar in bars:
-                context.add_bar(symbol, tf, bar)
-                bar_event = BarEvent(symbol=sym, timeframe=tf, ohlcv=bar, exchange_id="binance")
-                sigs = await strategy.on_bar(bar_event)
-                signals.extend(sigs)
-
+        strategy.context.set_position(
+            "BTCUSDT",
+            Position(
+                symbol=Symbol("BTCUSDT"),
+                direction=Direction.LONG,
+                quantity=Decimal("1"),
+                avg_entry_price=Decimal("40000"),
+                unrealized_pnl=Decimal("0"),
+                realized_pnl=Decimal("0"),
+                strategy_id="ml_exit",
+                exchange_id="binance",
+            ),
+        )
+        signals = await _run_strategy(strategy, bars)
         await strategy.on_stop()
+        exits = [s for s in signals if isinstance(s, ExitSignal)]
+        assert len(exits) >= 1
+        assert exits[0].reason == "ml_native_exit"
 
-        # With fallback returning direction=0, no signals should be emitted
-        entry_signals = [s for s in signals if isinstance(s, EntrySignal)]
-        assert len(entry_signals) == 0
+    async def test_a_strategy_without_its_model_refuses_loudly(self) -> None:
+        # nothing attached in this process: the strategy still constructs, but
+        # start (and every bar) refuses — never a silent no-signal strategy
+        from hydra.strategy.ml_access import MlModelNotAttachedError
 
-    async def test_ml_threshold_boundary(self) -> None:
-        """Signals at exactly the confidence threshold are filtered out."""
-        bars = _build_trending_bars(50, direction="up")
-        # Set threshold to exactly 1.0 so nothing passes
-        config = _ml_config(confidence_threshold=1.0, strategy_id="ml_boundary")
-        context = StrategyContext()
-        context.set_portfolio_value(Decimal("100000"))
-        strategy = MLEnsembleStrategy(config=config, context=context)
-        await strategy.on_start()
+        strategy = MLEnsembleStrategy(_ml_config(strategy_id="ml_ghost"), StrategyContext())
+        with pytest.raises(MlModelNotAttachedError, match="attached"):
+            await strategy.on_start()
+        with pytest.raises(RuntimeError, match="no attached model"):
+            await strategy.on_bar(
+                BarEvent(
+                    symbol=Symbol("BTCUSDT"),
+                    timeframe=Timeframe.H1,
+                    ohlcv=make_bar(40000.0, T0, volume=500.0),
+                    exchange_id="binance",
+                )
+            )
 
-        signals: list[EntrySignal | ExitSignal] = []
-        symbol = "BTCUSDT"
-        sym = Symbol(symbol)
-        tf = Timeframe.H1
-
-        for bar in bars:
-            context.add_bar(symbol, tf, bar)
-            bar_event = BarEvent(symbol=sym, timeframe=tf, ohlcv=bar, exchange_id="binance")
-            sigs = await strategy.on_bar(bar_event)
-            signals.extend(sigs)
-
-        await strategy.on_stop()
-
-        # With threshold=1.0 nothing should pass (confidence is always < 1.0)
-        entry_signals = [s for s in signals if isinstance(s, EntrySignal)]
-        assert len(entry_signals) == 0
+    async def test_a_config_without_a_model_name_is_refused_at_construction(self) -> None:
+        config = _ml_config(strategy_id="ml_no_name")
+        config.parameters["model_name"] = ""
+        with pytest.raises(ValueError, match=r"parameters\.model_name"):
+            MLEnsembleStrategy(config, StrategyContext())

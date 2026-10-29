@@ -18,6 +18,8 @@ failure, a spec-less artifact, a stalling fit) keep the fakes unconditionally.
 from __future__ import annotations
 
 import importlib.util
+import json
+import struct
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -48,6 +50,10 @@ def _field(num: int, wire: int, payload: bytes | int) -> bytes:
 
 def _dim(name: bytes) -> bytes:
     return _field(2, 2, name)  # Dimension.dim_param (a dynamic dimension)
+
+
+def _dim_value(n: int) -> bytes:
+    return _field(1, 0, n)  # Dimension.dim_value (a fixed dimension)
 
 
 def _float_type(rank: int) -> bytes:
@@ -93,6 +99,153 @@ def reduce_max_onnx(metadata: dict[str, str] | list[tuple[str, str]]) -> bytes:
         + _field(2, 2, b"g")
         + _field(11, 2, _value_info("x", 2))
         + _field(12, 2, _value_info("y", 1))
+    )
+    props = b"".join(
+        _field(14, 2, _field(1, 2, key.encode()) + _field(2, 2, value_.encode()))
+        for key, value_ in entries
+    )
+    return _field(1, 0, 8) + _field(8, 2, _field(2, 0, 13)) + _field(7, 2, graph) + props
+
+
+# ---------------------------------------------------------------------------
+# A deterministic confidence model (the P5-C serving fixture)
+# ---------------------------------------------------------------------------
+
+
+def _tensor_float(name: bytes, dims: list[int], values: list[float]) -> bytes:
+    """TensorProto: dims, FLOAT, packed float_data, name."""
+    packed = struct.pack(f"<{len(values)}f", *values)
+    return (
+        b"".join(_field(1, 0, d) for d in dims)
+        + _field(2, 0, 1)
+        + _field(4, 2, packed)
+        + _field(8, 2, name)
+    )
+
+
+def _tensor_int64(name: bytes, dims: list[int], values: list[int]) -> bytes:
+    """TensorProto: dims, INT64, packed int64_data, name."""
+    packed = b"".join(_varint(v) for v in values)
+    return (
+        b"".join(_field(1, 0, d) for d in dims)
+        + _field(2, 0, 7)
+        + _field(7, 2, packed)
+        + _field(8, 2, name)
+    )
+
+
+def _value_info_rowcol(name: str, second: int | None) -> bytes:
+    """ValueInfoProto: a FLOAT tensor with a dynamic row dim and a fixed/absent
+    second dim."""
+    first = _field(1, 2, _dim(b"rows"))
+    second_dim = (
+        _field(1, 2, _dim_value(second)) if second is not None else _field(1, 2, _dim(b"cols"))
+    )
+    tensor = _field(1, 0, 1) + _field(2, 2, first + second_dim)
+    return _field(1, 2, name.encode()) + _field(2, 2, tensor)
+
+
+def confidence_onnx(
+    metadata: dict[str, str] | list[tuple[str, str]],
+    feature_count: int,
+    *,
+    column: int = 0,
+    scale: float = 0.01,
+) -> bytes:
+    """A real ONNX model computing ``y = Gather(x, [column], axis=1) * scale``.
+
+    The P5-C serving fixture: P(up) = scale * x[:, column] — a hand-checkable
+    number in [0, 1] when the column is an RSI/MFI-style 0-100 feature, and
+    NaN-safe: no other column enters the arithmetic, so the all-NaN
+    higher-timeframe feature blocks of a single-stream backtest context
+    cannot poison the prediction.
+    """
+    entries: list[tuple[str, str]] = (
+        list(metadata.items()) if isinstance(metadata, dict) else list(metadata)
+    )
+    gather = (
+        _field(1, 2, b"x")
+        + _field(1, 2, b"index")
+        + _field(2, 2, b"col")
+        + _field(4, 2, b"Gather")
+        + _field(5, 2, _attr_int("axis", 1))
+    )
+    mul = _field(1, 2, b"col") + _field(1, 2, b"scale") + _field(2, 2, b"y") + _field(4, 2, b"Mul")
+    graph = (
+        _field(1, 2, gather)
+        + _field(1, 2, mul)
+        + _field(2, 2, b"g")
+        + _field(5, 2, _tensor_int64(b"index", [1], [column]))
+        + _field(5, 2, _tensor_float(b"scale", [1], [scale]))
+        + _field(11, 2, _value_info("x", 2))
+        + _field(12, 2, _value_info_rowcol("y", 1))
+    )
+    props = b"".join(
+        _field(14, 2, _field(1, 2, key.encode()) + _field(2, 2, value_.encode()))
+        for key, value_ in entries
+    )
+    return _field(1, 0, 8) + _field(8, 2, _field(2, 0, 13)) + _field(7, 2, graph) + props
+
+
+def frozen_spec_metadata(
+    feature_names: list[str], spec_version: int, horizon: int
+) -> dict[str, str]:
+    """The metadata serving's frozen-spec check reads (feature_version matches SM-11)."""
+    return {
+        "feature_names": json.dumps(feature_names),
+        "spec_version": str(spec_version),
+        "horizon": str(horizon),
+        "feature_version": str(spec_version),
+    }
+
+
+def two_output_classifier_onnx(
+    metadata: dict[str, str] | list[tuple[str, str]],
+    feature_count: int,
+    *,
+    scale: float = 0.01,
+) -> bytes:
+    """A real ONNX classifier shaped like an xgboost export: two outputs.
+
+    ``label`` (width 1) = x[:, 0], then ``probabilities`` (width 2) =
+    x[:, [0, 1]] * scale - so P(up) = scale * x[:, 1] comes from the SECOND
+    output, and a consumer that reads the first would answer x[:, 0] instead.
+    Serving reads the output named ``probabilities``; this fixture pins that.
+    """
+    entries: list[tuple[str, str]] = (
+        list(metadata.items()) if isinstance(metadata, dict) else list(metadata)
+    )
+    label_node = (
+        _field(1, 2, b"x")
+        + _field(1, 2, b"label_index")
+        + _field(2, 2, b"label")
+        + _field(4, 2, b"Gather")
+        + _field(5, 2, _attr_int("axis", 1))
+    )
+    gather_probs = (
+        _field(1, 2, b"x")
+        + _field(1, 2, b"probs_index")
+        + _field(2, 2, b"probs_cols")
+        + _field(4, 2, b"Gather")
+        + _field(5, 2, _attr_int("axis", 1))
+    )
+    mul_probs = (
+        _field(1, 2, b"probs_cols")
+        + _field(1, 2, b"scale")
+        + _field(2, 2, b"probabilities")
+        + _field(4, 2, b"Mul")
+    )
+    graph = (
+        _field(1, 2, label_node)
+        + _field(1, 2, gather_probs)
+        + _field(1, 2, mul_probs)
+        + _field(2, 2, b"g")
+        + _field(5, 2, _tensor_int64(b"label_index", [1], [0]))
+        + _field(5, 2, _tensor_int64(b"probs_index", [2], [0, 1]))
+        + _field(5, 2, _tensor_float(b"scale", [1], [scale]))
+        + _field(11, 2, _value_info("x", 2))
+        + _field(12, 2, _value_info_rowcol("label", 1))
+        + _field(12, 2, _value_info_rowcol("probabilities", 2))
     )
     props = b"".join(
         _field(14, 2, _field(1, 2, key.encode()) + _field(2, 2, value_.encode()))
