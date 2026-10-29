@@ -66,7 +66,7 @@ const RANGE_TOO_SHORT = new ApiError(
     detail: {
       code: 'range_too_short',
       message:
-        'range too short for 6 folds: stored bars span 2026-09-09T00:00:00+00:00 to 2026-10-21T00:00:00+00:00, one window needs 8 months',
+        'range too short for 6 folds: stored bars span 2026-09-09T00:00:00+00:00 to 2026-10-21T00:00:00+00:00; 6 out-of-sample windows and one in-sample window at train_pct 0.75 of at least 30 days each need about 270 days',
       state: 'invalid',
       available_first_ts: '2026-09-09T00:00:00+00:00',
       available_last_ts: '2026-10-21T00:00:00+00:00',
@@ -226,6 +226,10 @@ describe('OptimizePage segmented control', () => {
     for (const label of ['Folds', 'Train %', 'Trials per fold', 'Anchored']) {
       expect(labels(page.container)).toContain(label);
     }
+    // fold_count is the fold count: the default 424 days at 6 and 75 % tile as 142 + 6 × 47 days
+    expect(page.container.textContent).toContain(
+      '6 test windows of ~47 days after ~142 days of training, rolled by the test window',
+    );
   });
 
   it('has one h1 and the phone Research nav with Optimize current', async () => {

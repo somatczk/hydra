@@ -221,6 +221,22 @@ describe('OptimizeTaskPage hyperopt', () => {
     expect(panel?.textContent).toContain('Config aabbccddeeff…');
   });
 
+  it('records the auto-fetch the run made before it started, next to the provenance', async () => {
+    const fetch = {
+      state: 'fetched',
+      ranges: [['2025-01-01T00:00:00+00:00', '2025-03-01T00:00:00+00:00']],
+      bars_fetched: 1416,
+      weight_spent: 30,
+      elapsed_ms: 61_000,
+    };
+    serve({ 'GET /api/backtest/hyperopt/ho-1': () => ({ ...HYPEROPT, fetch }) });
+    page = await mount(<OptimizeTaskPage />);
+
+    expect(page.container.querySelector('[data-testid="run-fetch"]')?.textContent).toBe(
+      'Fetched 1,416 missing bars over 1 range (1 Jan 2025 – 1 Mar 2025) before the run · weight 30 · 1 min',
+    );
+  });
+
   it('hides every holdout and validation field when the API returned none', async () => {
     serve({
       'GET /api/backtest/hyperopt/ho-1/results': () =>
@@ -361,6 +377,21 @@ describe('OptimizeTaskPage walk-forward', () => {
     );
     expect(calls.some((c) => c.path.startsWith('/api/backtest/jobs'))).toBe(true);
     expect(calls.some((c) => c.path === '/api/backtest/walkforward/wf-1/results')).toBe(true);
+  });
+
+  it('records the auto-fetch of a completed run from its job row', async () => {
+    const fetch = { state: 'fetched', ranges: [['2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00']], bars_fetched: 25 };
+    serve({
+      'GET /api/backtest/jobs?kind=walkforward&limit=50': () => [
+        wfJob({ status: 'completed', finished_at: new Date().toISOString(), fetch }),
+      ],
+      'GET /api/backtest/walkforward/wf-1/results': () => WF_RESULT,
+    });
+    page = await mount(<OptimizeTaskPage />);
+
+    expect(page.container.querySelector('[data-testid="run-fetch"]')?.textContent).toBe(
+      'Fetched 25 missing bars over 1 range (1 Jan 2026 – 2 Jan 2026) before the run',
+    );
   });
 
   it('shows the status panel with cancel while the run is not completed', async () => {

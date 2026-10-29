@@ -15,6 +15,7 @@ import {
 
 const fetchApi = vi.fn();
 const nav = vi.hoisted(() => ({ push: vi.fn() }));
+const route = vi.hoisted(() => ({ params: { id: 'bt-task-1' } as Record<string, string> }));
 
 vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
@@ -23,7 +24,7 @@ vi.mock('@/lib/api', async (orig) => ({
 vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: nav.push }),
-  useParams: () => ({ id: 'bt-task-1' }),
+  useParams: () => route.params,
 }));
 
 const { default: BacktestDetailPage } = await import('./page');
@@ -97,6 +98,7 @@ beforeEach(() => {
   calls = [];
   fetchApi.mockReset();
   nav.push.mockReset();
+  route.params = { id: 'bt-task-1' };
 });
 
 afterEach(() => {
@@ -294,12 +296,12 @@ describe('BacktestDetailPage', () => {
     expect(text).not.toContain('mismatch');
   });
 
-  it('surfaces no Share control and deletes only through a title-focused confirm', async () => {
+  it('mints no share link until asked and deletes only through a title-focused confirm', async () => {
     const mutations: Mutations = { 'DELETE /api/backtest/results/bt-task-1': {} };
     fetchApi.mockImplementation(routeFetch(routes(DETAIL), calls, mutations));
     page = await mount(<BacktestDetailPage />);
 
-    expect(page.container.textContent).not.toContain('Share');
+    expect(calls.some((c) => c.path.endsWith('/share'))).toBe(false);
 
     await click(buttonByText(page.container, 'Delete'));
     const dialog = page.container.querySelector('dialog[open]');
@@ -368,5 +370,85 @@ describe('BacktestDetailPage', () => {
     expect(link?.classList.contains('focus-visible:outline-2')).toBe(true);
     expect(link?.classList.contains('focus-visible:outline-offset-2')).toBe(true);
     expect(link?.classList.contains('focus-visible:outline-accent')).toBe(true);
+  });
+});
+
+describe('BacktestDetailPage auto-fetch record', () => {
+  it('shows what the worker fetched before the run, from the bt- result\'s job row', async () => {
+    const fetch = {
+      state: 'fetched',
+      ranges: [['2026-01-01T00:00:00+00:00', '2026-01-13T11:00:00+00:00']],
+      bars_fetched: 300,
+      weight_spent: 6,
+      elapsed_ms: 9000,
+    };
+    fetchApi.mockImplementation(routeFetch({ ...routes(DETAIL), '/api/backtest/status/task-1': { fetch, fetch_error: null } }, calls));
+    page = await mount(<BacktestDetailPage />);
+
+    expect(page.container.querySelector('[data-testid="result-fetch"]')?.textContent).toBe(
+      'Fetched 300 missing bars over 1 range (1 Jan 2026 – 13 Jan 2026) before the run · weight 6 · 9 s',
+    );
+  });
+
+  it('shows nothing for a result without a job row, and says so when the row cannot be read', async () => {
+    fetchApi.mockImplementation(routeFetch(routes(DETAIL), calls));
+    page = await mount(<BacktestDetailPage />);
+    expect(calls.some((c) => c.path === '/api/backtest/status/task-1')).toBe(true);
+    expect(page.container.querySelector('[data-testid="result-fetch"]')).toBeNull();
+    expect(page.container.querySelector('[data-testid="result-fetch-error"]')).toBeNull();
+    page.unmount();
+
+    fetchApi.mockImplementation(routeFetch({ ...routes(DETAIL), '/api/backtest/status/task-1': unavailable() }, calls));
+    page = await mount(<BacktestDetailPage />);
+    expect(page.container.querySelector('[data-testid="result-fetch-error"]')?.textContent).toContain(
+      'Auto-fetch record: Database is not available',
+    );
+  });
+});
+
+describe('BacktestDetailPage share links', () => {
+  it('creates a link to the dashboard view, copies it and says it is not public and ends on restart', async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    fetchApi.mockImplementation(
+      routeFetch(routes(DETAIL), calls, {
+        'POST /api/backtest/results/bt-task-1/share': { token: 'a1b2c3d4e5f6', share_url: '/api/backtest/shared/a1b2c3d4e5f6' },
+      }),
+    );
+    page = await mount(<BacktestDetailPage />);
+
+    await click(buttonByText(page.container, 'Share link'));
+    const box = page.container.querySelector('[data-testid="share-link"]')!;
+    const url = `${window.location.origin}/backtest/shared/a1b2c3d4e5f6`;
+    expect((box.querySelector('input') as HTMLInputElement).value).toBe(url);
+    expect(box.textContent).toContain('it is not public');
+    expect(box.textContent).toContain('a restart or redeploy ends every link, and there is no revoke');
+
+    await click(buttonByText(box as HTMLElement, 'Copy'));
+    expect(writeText).toHaveBeenCalledWith(url);
+  });
+
+  it('renders a shared link read-only from the shared endpoint, with no actions and no verify read', async () => {
+    route.params = { token: 'a1b2c3d4e5f6' };
+    fetchApi.mockImplementation(routeFetch({ '/api/backtest/shared/a1b2c3d4e5f6': DETAIL }, calls));
+    page = await mount(<BacktestDetailPage />);
+
+    expect(page.container.querySelector('[data-testid="shared-banner"]')?.textContent).toContain('read-only');
+    expect(page.container.querySelector('[data-testid="provenance-panel"]')?.textContent).toContain('binance BTCUSDT 1h');
+    const buttons = Array.from(page.container.querySelectorAll('button')).map((b) => b.textContent?.trim());
+    for (const action of ['Share link', 'Delete', 'Start paper session']) expect(buttons).not.toContain(action);
+    expect(page.container.querySelector('[aria-label="Rename this backtest"]')).toBeNull();
+    expect(page.container.textContent).not.toContain('Compare with…');
+    expect(calls.some((c) => c.path.includes('/verify'))).toBe(false);
+  });
+
+  it('says a dead link ended with a restart', async () => {
+    route.params = { token: 'gone' };
+    fetchApi.mockImplementation(
+      routeFetch({ '/api/backtest/shared/gone': new ApiError(404, JSON.stringify({ detail: 'Shared link not found or expired' })) }, calls),
+    );
+    page = await mount(<BacktestDetailPage />);
+
+    expect(page.container.textContent).toContain('This share link no longer works: links end when the engine restarts.');
   });
 });

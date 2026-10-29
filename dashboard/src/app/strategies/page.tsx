@@ -19,6 +19,7 @@ import { ResearchNav } from '@/components/research/ResearchNav';
 import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { StrategyDriftPanel, type StrategyDrift } from '@/components/strategies/StrategyDriftPanel';
+import { scheduleSummary } from '@/lib/schedule';
 
 /* ---------- Types ---------- */
 
@@ -379,6 +380,10 @@ export default function StrategiesPage() {
                     <p className="text-xs text-ink-2">Max DD</p>
                   </div>
                 </div>
+              )}
+
+              {driftDetail?.schedule && (
+                <p className="mt-3 text-xs text-ink-2">{scheduleSummary(driftDetail.schedule)}</p>
               )}
 
               {/* Hot-reload state — only fetched for strategies with a running session */}

@@ -256,6 +256,21 @@ describe('StrategiesPage hot-reload state', () => {
     expect(text).not.toContain('Apply to session…');
   });
 
+  it('names the entry schedule of a running strategy (why it may not be entering)', async () => {
+    const routes = baseRoutes();
+    routes['/api/trading/sessions'] = [RUNNING_SESSION];
+    routes['/api/strategies/saw'] = {
+      config_hash: 'aabb',
+      file_changed: false,
+      running_sessions: [{ session_id: 's1', config_hash: 'aabb', stale: false }],
+      schedule: { active_hours_utc: [13, 14, 15], active_days: [0, 1, 2, 3, 4] },
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mountPage();
+
+    expect(sectionText(page.container, 'Saw')).toContain('Entries only on bars opening Mon–Fri, 13–15 UTC');
+  });
+
   it('renders a strategy whose detail fails instead of vanishing it', async () => {
     const routes = baseRoutes();
     routes['/api/trading/sessions'] = [RUNNING_SESSION];

@@ -1,5 +1,8 @@
 /** Type definitions for the visual strategy builder. */
 
+import type { Schedule, WireSchedule } from '@/lib/schedule';
+import type { ConditionBindings } from './bindings';
+
 /* ---------- Indicator API types ---------- */
 
 export interface ParamSchema {
@@ -35,7 +38,12 @@ export interface BuilderCondition {
   params: ConditionParams;
   comparator: string;
   value: number | string;
+  /** Carried through from the stored condition; the builder never authors these. */
+  bindings?: ConditionBindings;
 }
+
+/** A condition edit applied in one reducer step; `edit` marks a user change to a bound value (it moves the tunable). */
+export type ConditionPatch = Partial<Omit<BuilderCondition, 'id'>>;
 
 export interface BuilderConditionGroup {
   operator: 'AND' | 'OR';
@@ -96,6 +104,10 @@ export interface BuilderState {
   symbol: string;
   /** P4-F: the perp leverage (1-3×) — applies to binanceusdm FUTURES strategies only; spot stays 1×. */
   leverage: number;
+  /** The entry schedule (strategy/config.py ScheduleConfig); null is always active. */
+  schedule: Schedule | null;
+  /** Stored top-level values of names the rules bind; kept equal to every site they set. */
+  tunables: Record<string, number>;
   baseline: string;
 }
 
@@ -144,6 +156,10 @@ export interface SaveRequest {
   ml_overlay?: { model_name: string; confidence_threshold: number } | null;
   /** P4: perp strategies only (1-3×, isolated); the server refuses it on spot venues. */
   leverage?: number;
+  /** On update `{}` clears the stored schedule; on save it writes none. */
+  schedule?: WireSchedule;
+  /** Top-level tunables by name; only names the rules bind (`{}` clears on update). */
+  parameters?: Record<string, number>;
 }
 
 export interface SerializedCondition {
@@ -151,6 +167,11 @@ export interface SerializedCondition {
   params: ConditionParams;
   comparator: string;
   value: number | string;
+  /** Hyperopt bindings (strategy/condition_schema.py); the detail sends absent ones as null. */
+  param_key?: string | null;
+  param_overrides?: Record<string, string> | null;
+  value_param_key?: string | null;
+  value_ref_overrides?: Record<string, string> | null;
 }
 
 export interface SerializedConditionGroup {
@@ -193,6 +214,9 @@ export interface StrategyDetail {
   ml_overlay?: { model_name: string; confidence_threshold: number } | null;
   /** P4-F: the stored perp leverage for a binanceusdm strategy, so an edit round-trips it. */
   leverage?: number;
+  schedule?: WireSchedule | null;
+  /** Stored top-level `parameters` other than rules / required_history / description. */
+  parameters?: Record<string, unknown>;
 }
 
 /* ---------- Reducer actions ---------- */
@@ -200,13 +224,8 @@ export interface StrategyDetail {
 export type BuilderAction =
   | { type: 'ADD_CONDITION'; section: RuleSection }
   | { type: 'REMOVE_CONDITION'; section: RuleSection; conditionId: string }
-  | {
-      type: 'UPDATE_CONDITION';
-      section: RuleSection;
-      conditionId: string;
-      field: keyof BuilderCondition;
-      value: string | number | ConditionParams;
-    }
+  | { type: 'UPDATE_CONDITION'; section: RuleSection; conditionId: string; patch: ConditionPatch; edit?: boolean }
+  | { type: 'SET_TUNABLE'; name: string; value: number | null }
   | { type: 'SET_OPERATOR'; section: RuleSection; operator: 'AND' | 'OR' }
   | { type: 'SET_TIMEFRAME'; field: keyof TimeframeConfig; value: string }
   | { type: 'SET_RISK'; risk: Partial<RiskConfig> }
@@ -214,6 +233,7 @@ export type BuilderAction =
   | { type: 'SET_TAKE_PROFIT'; takeProfit: Partial<TakeProfitConfig> }
   | { type: 'SET_SIZING'; sizing: Partial<SizingConfig> }
   | { type: 'SET_ML_OVERLAY'; mlOverlay: MlOverlay | null }
+  | { type: 'SET_SCHEDULE'; schedule: Schedule | null }
   | { type: 'LOAD_STRATEGY'; payload: StrategyDetail }
   | { type: 'MARK_CLEAN' }
   | { type: 'RESET' };

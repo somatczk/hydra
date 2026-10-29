@@ -68,6 +68,8 @@ const STATE: BuilderState = {
   exchangeId: 'binance',
   symbol: 'BTCUSDT',
   leverage: 1,
+  schedule: null,
+  tunables: {},
   baseline: '',
 };
 
@@ -120,6 +122,7 @@ interface RenderProps {
   initialSymbol?: string;
   initialExchangeId?: string;
   initialLeverage?: number;
+  state?: BuilderState;
   /** Defaults to the member ranking; pass an Error for the unreadable universe. */
   universe?: unknown;
   mutations?: Mutations;
@@ -138,7 +141,7 @@ function render(props: RenderProps = {}): Promise<Mounted> {
       onClose={() => {
         closes += 1;
       }}
-      state={STATE}
+      state={props.state ?? STATE}
       onSaved={(name, id) => saved.push([name, id])}
       editingId={props.editingId ?? null}
       initialName={props.initialName ?? ''}
@@ -229,6 +232,8 @@ describe('StrategyNameDialog', () => {
       enable_immediately: false,
       ml_overlay: { model_name: 'm1', confidence_threshold: 0.6 },
       leverage: 1,
+      schedule: {},
+      parameters: {},
     });
     expect(saved).toEqual([['RSI bot', 'strat-7']]);
     expect(closes).toBe(1);
@@ -244,6 +249,27 @@ describe('StrategyNameDialog', () => {
     const put = calls.find((c) => c.init?.method === 'PUT');
     expect(put?.path).toBe('/api/strategies/strat-9');
     expect(saved).toEqual([['Saw', 'strat-9']]);
+  });
+
+  it('puts the builder\'s schedule as sorted UTC hours and Monday=0 days', async () => {
+    const state: BuilderState = { ...STATE, timeframes: { primary: '1h' }, schedule: { hours: [14, 13], days: [4, 0] } };
+    m = await render({ editingId: 'strat-9', initialName: 'Saw', state });
+
+    await click(buttonByText(dialog(), 'Save strategy'));
+
+    const put = calls.find((c) => c.init?.method === 'PUT');
+    expect(JSON.parse(String(put?.init?.body)).schedule).toEqual({ active_hours_utc: [13, 14], active_days: [0, 4] });
+  });
+
+  it('blocks a schedule no primary bar can match (the engine 422s it) and says why', async () => {
+    const state: BuilderState = { ...STATE, schedule: { hours: [13, 14], days: [0] } };
+    m = await render({ editingId: 'strat-9', initialName: 'Saw', state });
+
+    expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(true);
+    expect(dialog().querySelector('[role="alert"]')?.textContent).toBe(
+      'Trading schedule: 4h bars open only at 0, 4, 8, 12, 16, 20 UTC, so no entry could ever pass: include one of those hours.',
+    );
+    expect(calls.some((c) => c.init?.method === 'PUT')).toBe(false);
   });
 
   it('closes on Esc when not saving, but not while the save is in flight', async () => {

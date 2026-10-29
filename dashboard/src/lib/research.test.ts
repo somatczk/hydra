@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ApiError } from '@/lib/api';
 import { unavailable } from '@/test/pageHarness';
 import {
+  fetchLine,
   holdoutLines,
   jobAgeText,
   jobProgressText,
@@ -12,6 +13,7 @@ import {
   trialStatusText,
   validationLines,
   wfFoldRow,
+  wfWindowPlan,
 } from './research';
 
 const noMarketData = (extras: Record<string, unknown> = {}) =>
@@ -209,5 +211,57 @@ describe('wfFoldRow', () => {
       'period=42, threshold=0.5',
     );
     expect(wfFoldRow({ fold_index: 3 })).toEqual({ isWindow: '—', oosWindow: '—', params: '—' });
+  });
+});
+
+describe('wfWindowPlan', () => {
+  it('tiles the span with one train window and exactly k test windows, like fold_windows', () => {
+    // 424 days at 6 folds, 75 %: test = floor(424 · 0.25 / 2.25) = 47, train = 424 − 6 · 47 = 142
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 6, 0.75)).toEqual({ isDays: 142, oosDays: 47 });
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 2, 0.75)).toEqual({ isDays: 256, oosDays: 84 });
+    expect(wfWindowPlan('2023-01-01', '2026-01-01', 12, 0.75)).toEqual({ isDays: 220, oosDays: 73 });
+  });
+
+  it('keeps the train/test ratio up to the floor remainder', () => {
+    // 609 days at 4 folds, 50 %: test = floor(304.5 / 2.5) = 121, train = 609 − 484 = 125
+    expect(wfWindowPlan('2024-01-01', '2025-09-01', 4, 0.5)).toEqual({ isDays: 125, oosDays: 121 });
+  });
+
+  it('is null when a window is under 30 days or an input is unusable', () => {
+    expect(wfWindowPlan('2026-01-01', '2026-02-15', 2, 0.75)).toBeNull();
+    expect(wfWindowPlan('2025-01-01', '2025-05-01', 6, 0.75)).toBeNull();
+    expect(wfWindowPlan('2026-03-01', '2025-01-01', 6, 0.75)).toBeNull();
+    expect(wfWindowPlan('2025-01-01', '2026-03-01', 6, 1)).toBeNull();
+    expect(wfWindowPlan('', '2026-03-01', 6, 0.75)).toBeNull();
+  });
+});
+
+describe('fetchLine', () => {
+  const RANGES = [['2026-01-01T00:00:00+00:00', '2026-01-31T23:00:00+00:00']];
+
+  it('says what is being fetched while the worker fetches', () => {
+    expect(fetchLine({ state: 'fetching', ranges: RANGES, bars_fetched: 300, weight_spent: 6, elapsed_ms: 4200 })).toBe(
+      'Fetching missing bars: 300 so far over 1 range (1 Jan 2026 – 31 Jan 2026) · weight 6 · 4 s',
+    );
+  });
+
+  it('records what was fetched once the run went ahead, and caps the ranges at three', () => {
+    const ranges = [
+      ['2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00'],
+      ['2026-02-01T00:00:00+00:00', '2026-02-02T00:00:00+00:00'],
+      ['2026-03-01T00:00:00+00:00', '2026-03-02T00:00:00+00:00'],
+      ['2026-04-01T00:00:00+00:00', '2026-04-02T00:00:00+00:00'],
+    ];
+    expect(fetchLine({ state: 'fetched', ranges, bars_fetched: 1234, weight_spent: 40, elapsed_ms: 75_000 })).toBe(
+      'Fetched 1,234 missing bars over 4 ranges (1 Jan 2026 – 2 Jan 2026; 1 Feb 2026 – 2 Feb 2026; 1 Mar 2026 – 2 Mar 2026; 1 more) before the run · weight 40 · 1 min',
+    );
+    expect(fetchLine({ state: 'fetched', ranges: [], bars_fetched: 0, weight_spent: 0, elapsed_ms: 3 })).toBe(
+      'No missing bars: every bar was already stored',
+    );
+  });
+
+  it('names the failure reason, including a failure before any progress (state and reason only)', () => {
+    expect(fetchLine({ state: 'failed', reason: 'rate_limited' })).toBe('Fetching missing bars failed (rate_limited) after 0 bars');
+    expect(fetchLine(null)).toBeNull();
   });
 });

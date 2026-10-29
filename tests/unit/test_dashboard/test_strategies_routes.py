@@ -11,6 +11,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -1378,3 +1379,86 @@ def test_shipped_strategy_and_template_symbols_stay_savable() -> None:
         body["timeframes"] = data["timeframes"]
         resp = client.post("/api/strategies/save", json=body)
         assert resp.status_code == 201, (path.name, resp.text)
+
+
+def _tuned_yaml(strategy_id: str, **tunables: Any) -> str:
+    """A rule-based YAML whose RSI condition binds ``rsi_period`` by name, plus *tunables*."""
+    data = yaml.safe_load(_rule_based_yaml(strategy_id))
+    data["parameters"] = {"rules": _save_body()["rules"], "required_history": 50, **tunables}
+    return yaml.safe_dump(data)
+
+
+class TestTopLevelTunables:
+    def test_save_writes_bound_tunables_and_detail_reads_them_back(self, tmp_path: Path) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            body = {**_save_body(), "parameters": {"rsi_period": 21.0}}
+            resp = client.post("/api/strategies/save", json=body)
+            assert resp.status_code == 201
+            (written,) = tmp_path.glob("*.yaml")
+            stored = yaml.safe_load(written.read_text())["parameters"]
+            # an integral float is stored as the int the indicator takes
+            assert stored["rsi_period"] == 21
+            assert isinstance(stored["rsi_period"], int)
+            detail = client.get(f"/api/strategies/{resp.json()['id']}").json()
+        assert detail["parameters"] == {"rsi_period": 21}
+
+    @pytest.mark.parametrize(
+        ("parameters", "needle"),
+        [
+            ({"nope": 1}, "nope not bound by any rule (bound: rsi_period)"),
+            ({"rsi_period": 500}, "must be in [2, 200], got 500"),
+            ({"rsi_period": True}, "rsi_period"),
+            ({"rsi_period": "10"}, "rsi_period"),
+        ],
+    )
+    def test_save_refuses_unbound_out_of_range_and_non_numeric_tunables(
+        self, tmp_path: Path, parameters: dict[str, Any], needle: str
+    ) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post(
+                "/api/strategies/save", json={**_save_body(), "parameters": parameters}
+            )
+        assert resp.status_code == 422
+        assert needle in json.dumps(resp.json()["detail"])
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    def test_an_update_without_parameters_keeps_bound_values_and_drops_unbound_ones(
+        self, tmp_path: Path
+    ) -> None:
+        yaml_file = tmp_path / "s.yaml"
+        yaml_file.write_text(_tuned_yaml("tuned_1", rsi_period=10, sma_period=30))
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.put("/api/strategies/tuned_1", json=_save_body())
+        assert resp.status_code == 200
+        stored = yaml.safe_load(yaml_file.read_text())["parameters"]
+        assert stored["rsi_period"] == 10
+        assert "sma_period" not in stored  # no rule binds it any more
+
+    def test_an_update_with_parameters_replaces_them_and_empty_clears(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "s.yaml"
+        yaml_file.write_text(_tuned_yaml("tuned_1", rsi_period=10))
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            body = {**_save_body(), "parameters": {"rsi_period": 9}}
+            assert client.put("/api/strategies/tuned_1", json=body).status_code == 200
+            assert yaml.safe_load(yaml_file.read_text())["parameters"]["rsi_period"] == 9
+            body = {**_save_body(), "parameters": {}}
+            assert client.put("/api/strategies/tuned_1", json=body).status_code == 200
+        assert "rsi_period" not in yaml.safe_load(yaml_file.read_text())["parameters"]
+
+    def test_an_update_naming_an_unbound_tunable_is_422_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        yaml_file = tmp_path / "s.yaml"
+        yaml_file.write_text(_tuned_yaml("tuned_1", rsi_period=10))
+        before = yaml_file.read_bytes()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            body = {**_save_body(), "parameters": {"macd_fast": 8}}
+            resp = client.put("/api/strategies/tuned_1", json=body)
+        assert resp.status_code == 422
+        assert "macd_fast not bound by any rule" in resp.json()["detail"]
+        assert yaml_file.read_bytes() == before

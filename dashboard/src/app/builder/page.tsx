@@ -5,6 +5,7 @@ import { Save, Plus, FlaskConical } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { RuleSection } from '@/components/builder/RuleSection';
 import { TimeframeSelector } from '@/components/builder/TimeframeSelector';
+import { ScheduleEditor } from '@/components/builder/ScheduleEditor';
 import { RiskConfigurator } from '@/components/builder/RiskConfigurator';
 import { SignalPreview } from '@/components/builder/SignalPreview';
 import { StrategyNameDialog } from '@/components/builder/StrategyNameDialog';
@@ -15,6 +16,10 @@ import { fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
 import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
+import { scheduleFromWire } from '@/lib/schedule';
+import { bindingsOf } from '@/components/builder/bindings';
+import { reconcileTunables, storedTunables } from '@/components/builder/tunables';
+import { TunedParameters } from '@/components/builder/TunedParameters';
 import type {
   BuilderState,
   BuilderAction,
@@ -22,7 +27,6 @@ import type {
   BuilderConditionGroup,
   IndicatorSchema,
   ComparatorSchema,
-  ConditionParams,
   StopLossConfig,
   TakeProfitConfig,
   SizingConfig,
@@ -30,6 +34,7 @@ import type {
   RuleSection as RuleSectionKey,
   StrategyDetail,
   SerializedConditionGroup,
+  ConditionPatch,
 } from '@/components/builder/types';
 
 /* ---------- Initial state ---------- */
@@ -64,6 +69,8 @@ const initialDraft: Omit<BuilderState, 'baseline'> = {
   exchangeId: 'binance',
   symbol: 'BTCUSDT',
   leverage: 1,
+  schedule: null,
+  tunables: {},
 };
 
 function snapshot(state: BuilderState): string {
@@ -94,6 +101,7 @@ function apiGroupToBuilder(
       params: c.params,
       comparator: c.comparator,
       value: c.value,
+      bindings: bindingsOf(c),
     })),
   };
 }
@@ -111,17 +119,18 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         comparator: 'less_than',
         value: 30,
       };
-      return {
+      // a new condition that binds a stored name by name runs with its stored value
+      return reconcileTunables({
         ...state,
         [section]: {
           ...state[section],
           conditions: [...state[section].conditions, newCondition],
         },
-      };
+      });
     }
     case 'REMOVE_CONDITION': {
       const section = action.section;
-      return {
+      return reconcileTunables({
         ...state,
         [section]: {
           ...state[section],
@@ -129,21 +138,26 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
             (c: BuilderCondition) => c.id !== action.conditionId,
           ),
         },
-      };
+      });
     }
     case 'UPDATE_CONDITION': {
       const section = action.section;
-      return {
+      const next = {
         ...state,
         [section]: {
           ...state[section],
           conditions: state[section].conditions.map((c: BuilderCondition) =>
-            c.id === action.conditionId
-              ? { ...c, [action.field]: action.value }
-              : c,
+            c.id === action.conditionId ? { ...c, ...action.patch } : c,
           ),
         },
       };
+      return reconcileTunables(next, action.edit ? { section, conditionId: action.conditionId } : undefined);
+    }
+    case 'SET_TUNABLE': {
+      const tunables = { ...state.tunables };
+      if (action.value === null) delete tunables[action.name];
+      else tunables[action.name] = action.value;
+      return reconcileTunables({ ...state, tunables });
     }
     case 'SET_OPERATOR': {
       const section = action.section;
@@ -191,6 +205,8 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
       };
     case 'SET_ML_OVERLAY':
       return { ...state, mlOverlay: action.mlOverlay };
+    case 'SET_SCHEDULE':
+      return { ...state, schedule: action.schedule };
     case 'LOAD_STRATEGY': {
       const { payload } = action;
       const next: BuilderState = {
@@ -228,9 +244,12 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         exchangeId: payload.exchange_id || 'binance',
         symbol: payload.symbol || 'BTCUSDT',
         leverage: payload.leverage ?? 1,
+        schedule: scheduleFromWire(payload.schedule),
+        tunables: storedTunables(payload.parameters),
         baseline: '',
       };
-      return { ...next, baseline: snapshot(next) };
+      const applied = reconcileTunables(next);
+      return { ...applied, baseline: snapshot(applied) };
     }
     case 'MARK_CLEAN':
       return { ...state, baseline: snapshot(state) };
@@ -277,7 +296,7 @@ const RULE_SECTIONS: RuleSectionConfig[] = [
   },
 ];
 
-/* ---------- Default indicator/comparator data ---------- */
+/* ---------- Offline fallback: a subset of GET /api/strategies/indicators, rule-usable names only ---------- */
 
 const DEFAULT_INDICATORS: IndicatorSchema[] = [
   {
@@ -301,7 +320,7 @@ const DEFAULT_INDICATORS: IndicatorSchema[] = [
   {
     name: 'macd',
     category: 'trend',
-    description: 'Moving Average Convergence Divergence',
+    description: 'MACD line (fast EMA - slow EMA)',
     params: [
       { name: 'fast', type: 'int', default: 12, min: 2, max: 100 },
       { name: 'slow', type: 'int', default: 26, min: 2, max: 200 },
@@ -309,9 +328,18 @@ const DEFAULT_INDICATORS: IndicatorSchema[] = [
     ],
   },
   {
-    name: 'bollinger_bands',
+    name: 'bollinger_upper',
     category: 'volatility',
-    description: 'Bollinger Bands (upper, middle, lower)',
+    description: 'Upper Bollinger Band',
+    params: [
+      { name: 'period', type: 'int', default: 20, min: 2, max: 200 },
+      { name: 'std_dev', type: 'float', default: 2.0, min: 0.1, max: 5.0 },
+    ],
+  },
+  {
+    name: 'bollinger_lower',
+    category: 'volatility',
+    description: 'Lower Bollinger Band',
     params: [
       { name: 'period', type: 'int', default: 20, min: 2, max: 200 },
       { name: 'std_dev', type: 'float', default: 2.0, min: 0.1, max: 5.0 },
@@ -320,9 +348,9 @@ const DEFAULT_INDICATORS: IndicatorSchema[] = [
   {
     name: 'atr',
     category: 'volatility',
-    description: 'Average True Range (volatility measure)',
+    description: 'Average True Range (Wilder)',
     params: [{ name: 'period', type: 'int', default: 14, min: 2, max: 200 }],
-  },
+  },  { name: 'close', category: 'other', description: 'close indicator', params: [] },
 ];
 
 const DEFAULT_COMPARATORS: ComparatorSchema[] = [
@@ -507,11 +535,9 @@ function BuilderPageContent() {
             onRemoveCondition={(conditionId: string) =>
               dispatch({ type: 'REMOVE_CONDITION', section: section.key, conditionId })
             }
-            onUpdateCondition={(
-              conditionId: string,
-              field: keyof BuilderCondition,
-              value: string | number | ConditionParams,
-            ) => dispatch({ type: 'UPDATE_CONDITION', section: section.key, conditionId, field, value })}
+            onUpdateCondition={(conditionId: string, patch: ConditionPatch, edit?: boolean) =>
+              dispatch({ type: 'UPDATE_CONDITION', section: section.key, conditionId, patch, edit })
+            }
             onSetOperator={(operator: 'AND' | 'OR') =>
               dispatch({ type: 'SET_OPERATOR', section: section.key, operator })
             }
@@ -525,6 +551,14 @@ function BuilderPageContent() {
         onChange={(field: keyof TimeframeConfig, value: string) =>
           dispatch({ type: 'SET_TIMEFRAME', field, value })
         }
+      />
+
+      <TunedParameters state={state} onSet={(name, value) => dispatch({ type: 'SET_TUNABLE', name, value })} />
+
+      <ScheduleEditor
+        schedule={state.schedule}
+        primary={state.timeframes.primary}
+        onChange={(schedule) => dispatch({ type: 'SET_SCHEDULE', schedule })}
       />
 
       {/* Risk configurator */}

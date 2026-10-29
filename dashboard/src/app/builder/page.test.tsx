@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { ApiError } from '@/lib/api';
-import { buttonByText, click, dialogPolyfill, flush, mount, routeFetch, sectionText, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
+import { buttonByText, click, dialogPolyfill, flush, inputByLabel, mount, routeFetch, sectionText, typeInto, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
 const toast = vi.fn();
@@ -131,6 +131,161 @@ describe('BuilderPage error paths', () => {
       'warning',
       'Using built-in indicator list; server catalogue unavailable (indicators: Database is not available)',
     );
+  });
+});
+
+describe('BuilderPage schedule', () => {
+  it('loads the stored schedule into the editor and puts it back, or {} once switched off', async () => {
+    const r = routes();
+    r['/api/strategies/strat-1'] = { ...STRATEGY, schedule: { active_hours_utc: [13, 14, 15], active_days: [0, 1, 2, 3, 4] } };
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    const hours = page.container.querySelector('[role="group"][aria-label="Entry hours (UTC)"]')!;
+    const pressed = (group: Element) =>
+      Array.from(group.querySelectorAll('button[aria-pressed="true"]')).map((b) => b.textContent);
+    expect(pressed(hours)).toEqual(['13', '14', '15']);
+    expect(pressed(page.container.querySelector('[aria-label="Entry days"]')!)).toEqual(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']);
+
+    await click(buttonByText(hours as HTMLElement, '16'));
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    const put = () => calls.filter((c) => c.init?.method === 'PUT').map((c) => JSON.parse(String(c.init?.body)).schedule);
+    expect(put()).toEqual([{ active_hours_utc: [13, 14, 15, 16], active_days: [0, 1, 2, 3, 4] }]);
+
+    const onlyAt = page.container.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(onlyAt.closest('label')?.textContent).toBe('Only open entries at these times');
+    await click(onlyAt);
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    expect(put()[1]).toEqual({});
+  });
+});
+
+describe('BuilderPage bindings round-trip', () => {
+  it('re-saves a hand-written strategy with every condition binding intact', async () => {
+    const rules = {
+      entry_long: {
+        operator: 'AND',
+        conditions: [
+          {
+            indicator: 'rsi',
+            params: { period: 14 },
+            comparator: 'less_than',
+            value: 30,
+            param_key: 'rsi_period',
+            param_overrides: null,
+            value_param_key: 'rsi_lower',
+            value_ref_overrides: null,
+          },
+          {
+            indicator: 'close',
+            params: {},
+            comparator: 'crosses_above',
+            value: 'sma:period=50',
+            param_key: null,
+            param_overrides: {},
+            value_param_key: null,
+            value_ref_overrides: { sma_slow: 'period' },
+          },
+        ],
+      },
+      exit_long: {
+        operator: 'OR',
+        conditions: [
+          {
+            indicator: 'bollinger_upper',
+            params: { period: 20, std_dev: 2 },
+            comparator: 'greater_than',
+            value: 'close',
+            param_key: null,
+            param_overrides: { bb_len: 'period', bb_width: 'std_dev' },
+            value_param_key: null,
+            value_ref_overrides: null,
+          },
+        ],
+      },
+      entry_short: null,
+      exit_short: null,
+    };
+    const r = routes();
+    r['/api/strategies/strat-1'] = { ...STRATEGY, rules };
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+
+    const put = calls.find((c) => c.init?.method === 'PUT');
+    const strip = (c: Record<string, unknown>) => Object.fromEntries(Object.entries(c).filter(([, v]) => v !== null));
+    const stored = (g: { operator: string; conditions: Array<Record<string, unknown>> }) => ({
+      operator: g.operator,
+      conditions: g.conditions.map(strip),
+    });
+    expect(JSON.parse(String(put?.init?.body)).rules).toEqual({
+      entry_long: stored(rules.entry_long),
+      exit_long: stored(rules.exit_long),
+      entry_short: null,
+      exit_short: null,
+    });
+  });
+});
+
+describe('BuilderPage tuned parameters', () => {
+  const TUNED = {
+    ...STRATEGY,
+    rules: {
+      entry_long: {
+        operator: 'AND',
+        conditions: [
+          { indicator: 'rsi', params: { period: 14 }, comparator: 'less_than', value: 30, param_key: 'rsi_len', value_param_key: null },
+        ],
+      },
+      exit_long: null,
+      entry_short: null,
+      exit_short: null,
+    },
+    parameters: { rsi_len: 10 },
+  };
+
+  it('shows the stored value on the panel and in the condition, keeps both in step and PUTs it', async () => {
+    const r = routes();
+    r['/api/strategies/strat-1'] = TUNED;
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    // the engine runs the stored 10, not the condition's own 14: the builder shows 10 in both places
+    expect(inputByLabel(page.container, 'rsi_len').value).toBe('10');
+    expect(inputByLabel(page.container, 'period').value).toBe('10');
+    expect(page.container.querySelector('[data-testid="tuned-parameters"]')?.textContent).toContain('Entry long #1 · rsi period');
+
+    await typeInto(inputByLabel(page.container, 'period'), '12');
+    expect(inputByLabel(page.container, 'rsi_len').value).toBe('12');
+
+    await typeInto(inputByLabel(page.container, 'rsi_len'), '9');
+    expect(inputByLabel(page.container, 'period').value).toBe('9');
+
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    const body = JSON.parse(String(calls.find((c) => c.init?.method === 'PUT')?.init?.body));
+    expect(body.parameters).toEqual({ rsi_len: 9 });
+    expect(body.rules.entry_long.conditions[0].params).toEqual({ period: 9 });
+  });
+
+  it('clears a stored value and leaves the condition as it is, then sends {}', async () => {
+    const r = routes();
+    r['/api/strategies/strat-1'] = TUNED;
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    await click(page.container.querySelector('button[aria-label="Clear rsi_len"]') as HTMLButtonElement);
+    expect(page.container.querySelector('button[aria-label="Clear rsi_len"]')).toBeNull();
+    expect(inputByLabel(page.container, 'period').value).toBe('10');
+
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    const body = JSON.parse(String(calls.find((c) => c.init?.method === 'PUT')?.init?.body));
+    expect(body.parameters).toEqual({});
   });
 });
 

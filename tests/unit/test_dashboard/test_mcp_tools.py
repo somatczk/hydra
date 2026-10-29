@@ -1013,6 +1013,36 @@ def test_strategy_save_writes_the_schedule_strategy_get_reads_it_back(
     assert json.loads(text)["schedule"] == schedule
 
 
+def test_strategy_tunables_save_get_and_survive_an_update_that_omits_them(
+    mcp: _McpClient, strategies_dir: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    is_error, text = mcp.call(
+        "strategy_save", {"name": "Tuned", "rules": _RULES, "parameters": {"sma_period": 8}}
+    )
+    assert not is_error
+    sid = json.loads(text)["id"]
+    path = strategies_dir / f"{sid}.yaml"
+    assert yaml.safe_load(path.read_text())["parameters"]["sma_period"] == 8
+    is_error, text = mcp.call("strategy_get", {"strategy_id": sid})
+    assert json.loads(text)["parameters"]["sma_period"] == 8
+
+    # an MCP update that omits parameters keeps the stored value of a name still bound
+    is_error, text = mcp.call(
+        "strategy_update", {"strategy_id": sid, "name": "Tuned", "rules": _RULES}
+    )
+    assert not is_error
+    assert yaml.safe_load(path.read_text())["parameters"]["sma_period"] == 8
+
+    is_error, text = mcp.call(
+        "strategy_update",
+        {"strategy_id": sid, "name": "Tuned", "rules": _RULES, "parameters": {"rsi_period": 9}},
+    )
+    assert is_error
+    assert "rsi_period not bound by any rule (bound: sma_period)" in text
+    assert yaml.safe_load(path.read_text())["parameters"]["sma_period"] == 8
+
+
 def test_strategy_export_on_a_file_deleted_after_the_scan_is_the_404_envelope(
     mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

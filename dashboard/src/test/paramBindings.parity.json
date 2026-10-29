@@ -1,0 +1,138 @@
+{
+  "_comment": "One rule set, two resolvers: strategy/builtin/rule_based.py param_bindings and dashboard/src/components/builder/bindings.ts paramBindings must both produce `bindable` and `ambiguous` (tests/unit/test_strategy/test_param_bindings_parity.py, bindings.test.ts).",
+  "rules": {
+    "entry_long": {
+      "operator": "AND",
+      "conditions": [
+        {
+          "indicator": "rsi",
+          "params": {
+            "period": 14
+          },
+          "comparator": "less_than",
+          "value": 30,
+          "param_key": "rsi_len",
+          "value_param_key": "rsi_lower"
+        },
+        {
+          "indicator": "close",
+          "params": {},
+          "comparator": "crosses_above",
+          "value": "sma:period=50",
+          "value_ref_overrides": {
+            "slow_len": "period"
+          }
+        },
+        {
+          "indicator": "ema",
+          "params": {
+            "period": 20
+          },
+          "comparator": "greater_than",
+          "value": "sma:period=100"
+        }
+      ]
+    },
+    "exit_long": {
+      "operator": "OR",
+      "conditions": [
+        {
+          "indicator": "bollinger_upper",
+          "params": {
+            "period": 20,
+            "std_dev": 2.0
+          },
+          "comparator": "less_than",
+          "value": "close",
+          "param_overrides": {
+            "bb_len": "period",
+            "bb_dev": "std_dev"
+          }
+        },
+        {
+          "indicator": "adx",
+          "params": {
+            "period": 14
+          },
+          "comparator": "greater_than",
+          "value": 25,
+          "param_overrides": {}
+        },
+        {
+          "indicator": "close",
+          "params": {},
+          "comparator": "less_than",
+          "value": "sma:period=200",
+          "value_param_key": "ignored_on_a_reference"
+        }
+      ]
+    },
+    "entry_short": null,
+    "exit_short": null
+  },
+  "bindable": {
+    "rsi_len": [
+      {
+        "group": "entry_long",
+        "index": 0,
+        "target": "params",
+        "key": "period",
+        "value": 14,
+        "implicit": false
+      }
+    ],
+    "rsi_lower": [
+      {
+        "group": "entry_long",
+        "index": 0,
+        "target": "value",
+        "key": "value",
+        "value": 30,
+        "implicit": false
+      }
+    ],
+    "slow_len": [
+      {
+        "group": "entry_long",
+        "index": 1,
+        "target": "ref",
+        "key": "period",
+        "value": 50,
+        "implicit": false
+      }
+    ],
+    "ema_period": [
+      {
+        "group": "entry_long",
+        "index": 2,
+        "target": "params",
+        "key": "period",
+        "value": 20,
+        "implicit": true
+      }
+    ],
+    "bb_len": [
+      {
+        "group": "exit_long",
+        "index": 0,
+        "target": "params",
+        "key": "period",
+        "value": 20,
+        "implicit": false
+      }
+    ],
+    "bb_dev": [
+      {
+        "group": "exit_long",
+        "index": 0,
+        "target": "params",
+        "key": "std_dev",
+        "value": 2.0,
+        "implicit": false
+      }
+    ]
+  },
+  "ambiguous": [
+    "sma_period"
+  ]
+}

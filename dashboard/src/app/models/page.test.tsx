@@ -462,6 +462,64 @@ describe('ModelsPage retrain', () => {
     expect(c.textContent).toContain('completed');
     expect(c.textContent).toContain('registered alpha v2');
   });
+
+  it('shows the ml_train job fetching its training bars', async () => {
+    const c = await open({
+      '/api/models/retrain/ml-abc12345': {
+        task_id: 'ml-abc12345',
+        status: 'running',
+        progress: 5,
+        error: null,
+        result: null,
+        metrics: null,
+        provenance: null,
+        fetch: {
+          state: 'fetching',
+          ranges: [['2026-07-01T00:00:00+00:00', '2026-09-30T23:00:00+00:00']],
+          bars_fetched: 1200,
+          weight_spent: 24,
+          elapsed_ms: 30_000,
+          timeframe: '4h',
+        },
+      },
+    });
+
+    await click(c.querySelector('button[aria-label="Show the training job of alpha v2"]') as HTMLButtonElement);
+    expect(c.querySelector('[data-testid="train-fetch"]')?.textContent).toBe(
+      'Fetching missing bars: 1,200 so far over 1 range (1 Jul 2026 – 30 Sep 2026) · weight 24 · 30 s',
+    );
+  });
+
+  it('cancels a running training job behind a confirm, then re-reads its status', async () => {
+    let cancelled = false;
+    const c = await open({
+      '/api/models/retrain/ml-abc12345': () => ({
+        task_id: 'ml-abc12345',
+        status: cancelled ? 'cancelled' : 'running',
+        progress: 30,
+        error: null,
+        result: null,
+        metrics: null,
+        provenance: null,
+      }),
+    }, {
+      'POST /api/models/retrain/ml-abc12345/cancel': () => {
+        cancelled = true;
+        return { task_id: 'ml-abc12345', status: 'cancelling' };
+      },
+    });
+
+    await click(c.querySelector('button[aria-label="Show the training job of alpha v2"]') as HTMLButtonElement);
+    await click(buttonByText(c, 'Cancel job'));
+    const d = dlg(c, 'Cancel this training job?');
+    await click(buttonByText(d, 'Cancel job'));
+    await flush();
+
+    expect(calls.filter((x) => x.path === '/api/models/retrain/ml-abc12345/cancel' && x.init?.method === 'POST')).toHaveLength(1);
+    expect(toast).toHaveBeenCalledWith('info', 'Training job cancel requested');
+    expect(c.textContent).toContain('cancelled');
+    expect(Array.from(c.querySelectorAll('button')).some((b) => b.textContent?.trim() === 'Cancel job' && !b.closest('dialog'))).toBe(false);
+  });
 });
 
 describe('ModelsPage upload', () => {

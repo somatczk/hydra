@@ -8,6 +8,7 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { ApiError, fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
 import {
+  fetchLine,
   jobAgeText,
   jobProgressText,
   jobStatusText,
@@ -44,7 +45,9 @@ export function JobRow({ kind, job, onRefetch, now }: JobRowProps) {
 
   const ageText = jobAgeText(job.status, job.created_at, job.finished_at, now);
   const progressText = jobProgressText(kind, job);
-  const meta = [job.name ? job.strategy_id : null, ageText, progressText].filter(Boolean).join(' · ');
+  const meta = [job.name ? job.strategy_id : null, ageText, progressText, job.worker_id ? `worker ${job.worker_id}` : null]
+    .filter(Boolean)
+    .join(' · ');
 
   let resultHref: string | null = null;
   if (job.status === 'completed') {
@@ -88,6 +91,7 @@ export function JobRow({ kind, job, onRefetch, now }: JobRowProps) {
           </p>
         </div>
         {meta && <p className="mt-1 text-xs text-ink-2">{meta}</p>}
+        {job.fetch && <p className="mt-1 text-xs text-ink-2" data-testid="job-fetch">{fetchLine(job.fetch)}</p>}
         {job.error && <p className="mt-1 text-xs text-danger">{job.error}</p>}
         {notice && <p className="mt-1 text-xs text-caution">{notice}</p>}
       </div>

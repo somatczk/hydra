@@ -4,11 +4,10 @@ import { Plus } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { ConditionRow } from './ConditionRow';
 import type {
-  BuilderCondition,
   BuilderConditionGroup,
-  ConditionParams,
   IndicatorSchema,
   ComparatorSchema,
+  ConditionPatch,
 } from './types';
 
 interface ConditionBuilderProps {
@@ -17,11 +16,7 @@ interface ConditionBuilderProps {
   comparators: ComparatorSchema[];
   onAddCondition: () => void;
   onRemoveCondition: (conditionId: string) => void;
-  onUpdateCondition: (
-    conditionId: string,
-    field: keyof BuilderCondition,
-    value: string | number | ConditionParams,
-  ) => void;
+  onUpdateCondition: (conditionId: string, patch: ConditionPatch, edit?: boolean) => void;
   onSetOperator: (operator: 'AND' | 'OR') => void;
 }
 
@@ -80,7 +75,7 @@ export function ConditionBuilder({
               condition={condition}
               indicators={indicators}
               comparators={comparators}
-              onUpdate={(field, value) => onUpdateCondition(condition.id, field, value)}
+              onUpdate={(patch, edit) => onUpdateCondition(condition.id, patch, edit)}
               onRemove={() => onRemoveCondition(condition.id)}
             />
           </div>

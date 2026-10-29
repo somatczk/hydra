@@ -5,12 +5,15 @@ import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { Button } from '@/components/ui/Button';
 import { ApiError, fetchApi } from '@/lib/api';
 import { describeApiError, parseErrorDetail } from '@/lib/apiState';
+import type { WireSchedule } from '@/lib/schedule';
 
 /** `GET /api/strategies/{id}` drift fields (services.strategies._session_drift). */
 export interface StrategyDrift {
   config_hash: string | null;
   file_changed: boolean;
   running_sessions: Array<{ session_id: string; config_hash: string | null; stale: boolean }>;
+  /** The stored entry schedule; null or absent is always active. */
+  schedule?: WireSchedule | null;
 }
 
 /** `POST /api/strategies/{id}/reload` 200 body (services.strategies.ReloadResponse). */

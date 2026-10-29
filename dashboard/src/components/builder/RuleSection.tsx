@@ -4,11 +4,10 @@ import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { ConditionBuilder } from './ConditionBuilder';
 import type {
-  BuilderCondition,
   BuilderConditionGroup,
-  ConditionParams,
   IndicatorSchema,
   ComparatorSchema,
+  ConditionPatch,
 } from './types';
 
 interface RuleSectionProps {
@@ -20,11 +19,7 @@ interface RuleSectionProps {
   colorClass: string;
   onAddCondition: () => void;
   onRemoveCondition: (conditionId: string) => void;
-  onUpdateCondition: (
-    conditionId: string,
-    field: keyof BuilderCondition,
-    value: string | number | ConditionParams,
-  ) => void;
+  onUpdateCondition: (conditionId: string, patch: ConditionPatch, edit?: boolean) => void;
   onSetOperator: (operator: 'AND' | 'OR') => void;
 }
 

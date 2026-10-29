@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, StrictFloat, StrictInt, ValidationError
 
 from hydra.backtest.data import (
     DataProvenance,
@@ -41,6 +41,7 @@ from hydra.services.errors import (
     require_pool,
     service_error,
 )
+from hydra.strategy.builtin.rule_based import bindable_params
 from hydra.strategy.config import StrategyRiskConfig, config_hash
 from hydra.strategy.engine import validate_strategy_config, write_strategy_config
 
@@ -142,6 +143,38 @@ def _apply_ml_history(config: dict[str, Any]) -> None:
         params["required_history"] = max(
             int(params["required_history"]), DEFAULT_FEATURE_SPEC.window_1h
         )
+
+
+_RESERVED_PARAMETERS = frozenset({"rules", "required_history", "description"})
+
+
+def _tunables(
+    rule_set: Any, provided: dict[str, int | float] | None, stored: Any
+) -> dict[str, int | float]:
+    """The top-level tunables to write: names the rules bind, set by the caller or kept.
+
+    A caller's dict is authoritative (``{}`` clears) and may only name bound parameters;
+    ``None`` keeps the stored values of names the rules still bind. The strategy build
+    that follows applies them, so PARAM_LIMITS and the ambiguity check still refuse.
+    """
+    try:
+        bound = bindable_params(rule_set)
+    except ValueError as exc:
+        raise ServiceError(422, f"Invalid rules: {exc}") from exc
+    if provided is None:
+        old = stored if isinstance(stored, dict) else {}
+        return {k: v for k, v in old.items() if k in bound and k not in _RESERVED_PARAMETERS}
+    unbound = sorted(set(provided) - set(bound))
+    if unbound:
+        raise ServiceError(
+            422,
+            f"Invalid parameters: {', '.join(unbound)} not bound by any rule "
+            f"(bound: {', '.join(sorted(bound)) or 'none'})",
+        )
+    # an integral float stays an int: an int-annotated indicator parameter refuses 14.0
+    return {
+        k: int(v) if isinstance(v, float) and v.is_integer() else v for k, v in provided.items()
+    }
 
 
 def _strategy_not_found(strategy_id: str) -> ServiceError:
@@ -307,6 +340,12 @@ class SaveRequest(BaseModel):
         "stored schedule and {} clears it",
     )
     leverage: int = Field(1, ge=1, le=3, description="perp strategies only (1-3x, isolated)")
+    parameters: dict[str, StrictInt | StrictFloat] | None = Field(
+        None,
+        description="top-level tunables the rules bind (param_key, param_overrides, "
+        "value_param_key, value_ref_overrides, {indicator}_{param}); None keeps the stored "
+        "values of names still bound, {} clears them",
+    )
 
 
 class SaveResponse(BaseModel):
@@ -346,6 +385,7 @@ class StrategyDetailResponse(BaseModel):
     performance_error: str | None = None
     ml_overlay: dict[str, Any] | None = None
     schedule: dict[str, Any] | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
     config_hash: str | None = None
     file_changed: bool = False
     running_sessions: list[RunningSession] = Field(default_factory=list)
@@ -489,6 +529,7 @@ def _extract_strategy_detail(data: dict[str, Any]) -> dict[str, Any]:
     ml_overlay = data.get("ml_overlay")
     if ml_overlay:
         result["ml_overlay"] = ml_overlay
+    result["parameters"] = {k: v for k, v in params.items() if k not in _RESERVED_PARAMETERS}
     return result
 
 
@@ -732,6 +773,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
             "rules": rule_set.model_dump(mode="json"),
             "required_history": existing_required_history,
             "description": body.description,
+            **_tunables(rule_set, body.parameters, data.get("parameters")),
         },
         "position_sizing": {
             "method": body.risk.sizing_method,
@@ -1022,6 +1064,7 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
             "rules": rule_set.model_dump(mode="json"),
             "required_history": 50,
             "description": request.description,
+            **_tunables(rule_set, request.parameters, None),
         },
         "position_sizing": {
             "method": request.risk.sizing_method,

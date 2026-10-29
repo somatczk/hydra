@@ -21,6 +21,8 @@ import { WalkForwardResults, type WalkForwardResult } from '@/components/researc
 import {
   noStoredBars,
   utcDay,
+  wfWindowPlan,
+  type JobFetch,
   type JobKind,
   type ResearchJob,
   type StrategyParamDef,
@@ -44,6 +46,7 @@ interface HyperoptProgress {
   completed_trials: number;
   total_trials: number;
   error?: string | null;
+  fetch?: JobFetch | null;
 }
 
 type Mode = 'hyperopt' | 'walkforward';
@@ -165,6 +168,7 @@ export default function OptimizePage() {
         error: p.error ?? null,
         completed_trials: p.completed_trials,
         total_trials: p.total_trials,
+        fetch: p.fetch ?? null,
       });
       if (TERMINAL.has(p.status)) {
         setHoWatch(null);
@@ -317,6 +321,10 @@ export default function OptimizePage() {
 
   const noBars = runError !== null ? noStoredBars(runError) : null;
   const tooShort = runError !== null && mode === 'walkforward' ? rangeTooShort(runError, folds) : null;
+  const wfPlan = wfWindowPlan(startDate, endDate, folds, train / 100);
+  const wfPlanHint = wfPlan
+    ? `${folds} test windows of ~${wfPlan.oosDays} days after ~${wfPlan.isDays} days of training, rolled by the test window`
+    : `${foldCount || 'k'} folds of at least 30 days train and test do not fit these dates`;
 
   const jobsError = hyperoptJobs.data === null ? hyperoptJobs.error : null;
   const wfJobsError = walkforwardJobs.data === null ? walkforwardJobs.error : null;
@@ -401,6 +409,7 @@ export default function OptimizePage() {
                 max={24}
                 value={foldCount}
                 onChange={(e) => setFoldCount(e.target.value)}
+                hint={wfPlanHint}
               />
               <Input
                 label="Train %"

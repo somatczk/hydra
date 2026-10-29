@@ -76,6 +76,10 @@ class JobListEntry(BaseModel):
     result_id: str | None = None
     completed_trials: int | None = None
     total_trials: int | None = None
+    # the worker's auto-fetch progress (state, ranges, bars_fetched, weight_spent, elapsed_ms)
+    fetch: dict[str, Any] | None = None
+    # the worker holding (or last holding) the job's lease
+    worker_id: str | None = None
 
 
 class DataProvenanceModel(BaseModel):
@@ -409,6 +413,7 @@ async def list_jobs(
     entries: list[dict[str, Any]] = []
     for row in rows[:limit]:
         request = jobs.json_value(row["request"]) or {}
+        detail = jobs.json_value(row["detail"]) or {}
         entry = {
             "task_id": row["id"],
             "kind": row["kind"],
@@ -420,9 +425,10 @@ async def list_jobs(
             "name": str(request.get("name", "")),
             "error": row["error"],
             "result_id": row["result_id"],
+            "fetch": detail.get("fetch"),
+            "worker_id": row["worker_id"],
         }
         if row["kind"] == "hyperopt":
-            detail = jobs.json_value(row["detail"]) or {}
             entry["completed_trials"] = detail.get("completed_trials", 0)
             entry["total_trials"] = detail.get("total_trials", request.get("max_trials", 0))
         entries.append(entry)
@@ -541,7 +547,7 @@ _SHARED_TOKENS: dict[str, str] = {}  # token → result_id
 
 
 async def share_result(pool: Any, result_id: str) -> dict[str, str]:
-    """Generate a public sharing token for a backtest result."""
+    """Mint an in-memory sharing token for a backtest result (it does not bypass auth)."""
     pool = require_pool(pool)
     async with db_errors("checking the backtest result"), pool.acquire() as conn:
         exists = await conn.fetchval("SELECT 1 FROM backtest_results WHERE id = $1", result_id)
@@ -554,7 +560,8 @@ async def share_result(pool: Any, result_id: str) -> dict[str, str]:
 
 
 async def get_shared_result(pool: Any, token: str) -> dict[str, Any]:
-    """Public read-only access to a shared backtest result (no auth required)."""
+    """Read-only access to a shared backtest result: behind API auth like every route, the
+    in-memory token only names the result (a restart ends every token)."""
     result_id = _SHARED_TOKENS.get(token)
     if result_id is None:
         raise ServiceError(404, "Shared link not found or expired")

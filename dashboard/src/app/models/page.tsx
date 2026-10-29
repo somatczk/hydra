@@ -16,6 +16,7 @@ import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
 import { pct, signed, utc } from '@/lib/format';
 import { logger } from '@/lib/logger';
+import { fetchLine, type JobFetch } from '@/lib/research';
 
 /* ---------- Types (the registry-backed routes' own shapes) ---------- */
 
@@ -59,12 +60,15 @@ interface RetrainStatus {
   result: { name?: string; version?: number; stage?: string } | null;
   metrics: Record<string, unknown> | null;
   provenance: Record<string, unknown> | null;
+  /** The worker's fetch of the training bars (`detail.fetch`); it also names the timeframe being fetched. */
+  fetch?: JobFetch | null;
 }
 
 type Dialog =
   | { kind: 'promote'; model: ApiModel }
   | { kind: 'rollback'; model: ApiModel }
   | { kind: 'retrain'; name: string }
+  | { kind: 'cancelTrain'; taskId: string }
   | null;
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
@@ -225,6 +229,20 @@ export default function ModelsPage() {
       logger.error('Models', `Failed to ${action} ${model.name}`, err);
       setDialogError(describeApiError(err, `Failed to ${action} ${model.name}`));
     }
+  };
+
+  const cancelTrain = async (id: string): Promise<void> => {
+    try {
+      await fetchApi(`/api/models/retrain/${id}/cancel`, { method: 'POST' });
+      toast('info', 'Training job cancel requested');
+    } catch (err) {
+      logger.warn('Models', 'Failed to cancel the retrain', err);
+      toast('error', err instanceof ApiError && err.status === 409
+        ? 'This training job already finished.'
+        : describeApiError(err, 'Cancel failed'));
+    }
+    closeDialog();
+    await pollTask(id);
   };
 
   const submitRetrain = async (): Promise<void> => {
@@ -437,8 +455,18 @@ export default function ModelsPage() {
                     {task.result.stage ? ` (${task.result.stage === 'staging' ? 'Staging' : task.result.stage})` : ''}
                   </span>
                 )}
+                {!TERMINAL.has(task.status) && (
+                  <Button variant="outline" size="sm" onClick={() => setDialog({ kind: 'cancelTrain', taskId: task.task_id })}>
+                    Cancel job
+                  </Button>
+                )}
                 <Button variant="ghost" size="sm" onClick={() => setTaskId(null)}>Dismiss</Button>
               </div>
+              {task.fetch && (
+                <p className="text-xs text-ink-2" data-testid="train-fetch">
+                  {fetchLine(task.fetch)}
+                </p>
+              )}
               {task.error && <p className="text-sm text-danger" role="alert">{task.error}</p>}
               {task.status === 'completed' && task.metrics && (
                 <p className="text-sm text-ink-2">
@@ -526,6 +554,21 @@ export default function ModelsPage() {
           refuses with nothing archived.
         </p>
       </TypedConfirm>
+
+      {/* Cancel the training job */}
+      <ConfirmDialog
+        open={dialog?.kind === 'cancelTrain'}
+        destructive
+        title="Cancel this training job?"
+        primaryLabel="Cancel job"
+        secondaryLabel="Keep running"
+        pendingLabel="Cancelling…"
+        pendingHint="Closing this won't undo the cancel."
+        onConfirm={() => (dialog?.kind === 'cancelTrain' ? cancelTrain(dialog.taskId) : Promise.resolve())}
+        onClose={closeDialog}
+      >
+        <p>The worker stops at the next checkpoint and registers no version. Versions already in the registry stay.</p>
+      </ConfirmDialog>
 
       {/* Retrain */}
       <ConfirmDialog

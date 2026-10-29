@@ -44,6 +44,7 @@ def _save_request(
     enable_immediately: bool,
     ml_overlay: dict[str, Any] | None,
     schedule: dict[str, Any] | None,
+    parameters: dict[str, int | float] | None,
 ) -> SaveRequest:
     """The service's save payload, built from the tool's mirrored fields."""
     return SaveRequest(
@@ -57,6 +58,7 @@ def _save_request(
         enable_immediately=enable_immediately,
         ml_overlay=ml_overlay,
         schedule=schedule,
+        parameters=parameters,
     )
 
 
@@ -91,13 +93,16 @@ async def strategy_save(
     enable_immediately: bool = False,
     ml_overlay: dict[str, Any] | None = None,
     schedule: dict[str, Any] | None = None,
+    parameters: dict[str, int | float] | None = None,
 ) -> str:
     """Validate and save a new strategy as a YAML config file; returns its new id.
 
     ``rules`` is the builder's rule set (entry/exit long/short condition groups);
     ``enable_immediately`` also marks it enabled for paper sessions. ``schedule``
     (``active_hours_utc`` 0-23, ``active_days`` 0-6 with Monday=0) limits when entries
-    may open, checked on the primary bar's open time; exits always run. ``symbol``
+    may open, checked on the primary bar's open time; exits always run. ``parameters``
+    sets top-level tunables by name; only names the rules bind are accepted (see
+    ``strategy_params``) and the indicator ranges apply. ``symbol``
     must be a member of the current top-100 universe (``universe_list``): a
     non-member is a 422 ``symbol_not_in_universe`` naming the ranking's
     ``ranked_at`` (running sessions and stored strategies are unaffected).
@@ -114,6 +119,7 @@ async def strategy_save(
             enable_immediately,
             ml_overlay,
             schedule,
+            parameters,
         )
         result = await strategy_svc.save_strategy(_deps.db_pool(), body)
     except ServiceError as exc:
@@ -137,13 +143,15 @@ async def strategy_update(
     enable_immediately: bool = False,
     ml_overlay: dict[str, Any] | None = None,
     schedule: dict[str, Any] | None = None,
+    parameters: dict[str, int | float] | None = None,
 ) -> str:
     """Update an existing rule-based strategy's YAML config; only rule-based strategies
     can be edited (400 otherwise). Omitting ``schedule`` keeps the stored one; ``{}``
-    clears it. ``symbol`` must be a member of the current
-    top-100 universe (``universe_list``): a non-member is a 422
-    ``symbol_not_in_universe`` naming the ranking's ``ranked_at`` (the running
-    sessions and the stored file are unaffected)."""
+    clears it. Omitting ``parameters`` keeps the stored tunables of names the rules still
+    bind; a dict replaces them (``{}`` clears) and may only name bound parameters.
+    ``symbol`` must be a member of the current top-100 universe (``universe_list``): a
+    non-member is a 422 ``symbol_not_in_universe`` naming the ranking's ``ranked_at`` (the
+    running sessions and the stored file are unaffected)."""
     try:
         body = _save_request(
             name,
@@ -156,6 +164,7 @@ async def strategy_update(
             enable_immediately,
             ml_overlay,
             schedule,
+            parameters,
         )
         result = await strategy_svc.update_strategy(_deps.db_pool(), strategy_id, body)
     except ServiceError as exc:
