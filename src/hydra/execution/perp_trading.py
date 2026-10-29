@@ -17,8 +17,13 @@ position pays no funding for its final bar. Funding accruals are recorded as ``F
 fills on the account (visible in ``get_fills``) but are not order fills — they never
 publish ``OrderFillEvent``s. A liquidation force-closes the position at its liquidation
 price (the maintenance margin is the liquidation fee, the wallet gets nothing back), is
-recorded on the account, and halts the session — trading stops for it, only ``flatten``
-still runs.
+recorded on the account, and halts the session — the halt, the fill and the closed
+position persist before anything else can touch the account, so a liquidated session
+restores halted and never resumes; trading stops for it, only ``flatten`` still runs. A
+broken-ledger halt (invariant failure, a second writer) is the opposite: the state is
+never written again. Isolated margin caps every funding debit at the position's equity —
+a payment that would cross the maintenance boundary liquidates the position honestly, at
+the carried price, losing exactly its margin.
 """
 
 from __future__ import annotations
@@ -64,7 +69,7 @@ logger = logging.getLogger(__name__)
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
 _MINUS_ONE = Decimal("-1")
-_STATE_FORMAT = 2
+_STATE_FORMAT = 3
 PERP_EXCHANGE_ID: ExchangeId = "binanceusdm"
 MAINTENANCE_MARGIN_RATE = Decimal("0.005")
 """The lowest USD⌂-M maintenance-margin tier (small notional brackets); a documented
@@ -333,6 +338,7 @@ class PerpPaperTradingExecutor:
         self._state_version = 0
         self._unconfirmed: set[str] = set()
         self._halted: str | None = None
+        self._halt_broken = False
         self._persist_lock = asyncio.Lock()
         self._source = "paper"
 
@@ -462,8 +468,7 @@ class PerpPaperTradingExecutor:
                 raise ValueError(f"No market price available for {symbol}")
             fp = fill_rules.market_fill(s, mark, self._slippage_pct)
             self._check_rules(canon, quantity, fp.price)
-            if self._opens(canon, s):
-                self._require_open_margin(canon, quantity, fp.price, fp.liquidity)
+            self._require_fill_margin(canon, s, quantity, fp)
             fill = self._apply_fill(
                 canon,
                 s,
@@ -497,13 +502,34 @@ class PerpPaperTradingExecutor:
             return True
         return (pos.qty > 0) == (side == "BUY")
 
-    def _require_open_margin(
-        self, canon: str, quantity: Decimal, price: Decimal, liquidity: Liquidity
-    ) -> None:
-        need = self._margin_needed(quantity * price) + quantity * price * self._fee_rate(liquidity)
-        if self._wallet < need:
+    def _require_fill_margin(self, canon: str, side: str, quantity: Decimal, fp: FillPrice) -> None:
+        """Refuse upfront any fill whose open leg the wallet could not fund atomically.
+
+        An opening or increasing fill posts its whole margin; a flip must fund only its
+        open remainder, from the wallet the close leg releases — anything else leaves
+        the ledger half-executed, so it raises before the first mutation.
+        """
+        pos = self._positions.get(canon)
+        fee = quantity * fp.price * self._fee_rate(fp.liquidity)
+        if pos is None or pos.qty == _ZERO or (pos.qty > 0) == (side == "BUY"):
+            need = self._margin_needed(quantity * fp.price) + fee
+            if self._wallet < need:
+                raise InsufficientBalanceError(
+                    f"Insufficient {self._quote} margin: need {need}, wallet {self._wallet}"
+                )
+            return
+        reduce_qty = min(quantity, abs(pos.qty))
+        remainder = quantity - reduce_qty
+        if remainder <= 0:
+            return
+        share = reduce_qty / abs(pos.qty)
+        gross = reduce_qty * (fp.price - pos.entry_price) * (_ONE if pos.qty > 0 else _MINUS_ONE)
+        wallet_after = self._wallet + pos.margin * share + gross - fee * reduce_qty / quantity
+        need = self._margin_needed(remainder * fp.price) + fee * remainder / quantity
+        if wallet_after < need:
             raise InsufficientBalanceError(
-                f"Insufficient {self._quote} margin: need {need}, wallet {self._wallet}"
+                f"Insufficient {self._quote} margin: need {need} for the flip, "
+                f"wallet {wallet_after} after the close"
             )
 
     def _new_resting(
@@ -761,37 +787,34 @@ class PerpPaperTradingExecutor:
 
     def _fill_resting(self, order: _PendingOrder, fp: FillPrice, ts: datetime) -> PaperFill:
         self._remove_order(order)
-        if self._opens(order.symbol, order.side):
-            need = self._margin_needed(order.quantity * fp.price) + (
-                order.quantity * fp.price * self._fee_rate(fp.liquidity)
+        try:
+            self._require_fill_margin(order.symbol, order.side, order.quantity, fp)
+        except InsufficientBalanceError as exc:
+            logger.warning(
+                "Perp %s %s cancelled: fill at %s %s",
+                order.order_type,
+                order.order_id,
+                fp.price,
+                exc,
             )
-            if self._wallet < need:
-                logger.warning(
-                    "Perp %s %s cancelled: fill at %s needs margin %s, wallet %s",
-                    order.order_type,
-                    order.order_id,
-                    fp.price,
-                    need,
-                    self._wallet,
-                )
-                return PaperFill(
-                    order_id=order.order_id,
-                    parent_order_id=order.oco_id,
-                    symbol=self._name(order.symbol),
-                    side=order.side,
-                    order_type=order.order_type,
-                    quantity=order.quantity,
-                    price=fp.price,
-                    fee=_ZERO,
-                    fee_currency=self._quote,
-                    liquidity=fp.liquidity,
-                    gross_pnl=None,
-                    net_pnl=None,
-                    reason="insufficient_margin_on_gap",
-                    timestamp=ts,
-                    fill_seq=0,
-                    status="CANCELLED",
-                )
+            return PaperFill(
+                order_id=order.order_id,
+                parent_order_id=order.oco_id,
+                symbol=self._name(order.symbol),
+                side=order.side,
+                order_type=order.order_type,
+                quantity=order.quantity,
+                price=fp.price,
+                fee=_ZERO,
+                fee_currency=self._quote,
+                liquidity=fp.liquidity,
+                gross_pnl=None,
+                net_pnl=None,
+                reason="insufficient_margin_on_gap",
+                timestamp=ts,
+                fill_seq=0,
+                status="CANCELLED",
+            )
         return self._apply_fill(
             order.symbol,
             order.side,
@@ -815,6 +838,16 @@ class PerpPaperTradingExecutor:
         hit = bar.low <= price if long else bar.high >= price
         if not hit:
             return []
+        return [self._force_liquidation(canon, pos, price, bar.timestamp)]
+
+    def _force_liquidation(
+        self, canon: str, pos: _PerpPosition, price: Decimal, ts: datetime
+    ) -> PaperFill:
+        """Close the position at *price*, lose its margin, record the fill and halt.
+
+        The ledger stays consistent, so this halt persists (a broken-ledger halt does not).
+        """
+        long = pos.qty > 0
         qty = abs(pos.qty)
         gross = qty * (price - pos.entry_price) * (_ONE if long else _MINUS_ONE)
         remaining = pos.margin + gross  # the maintenance margin at the liquidation price
@@ -845,7 +878,7 @@ class PerpPaperTradingExecutor:
             gross_pnl=gross,
             net_pnl=net,
             reason="liquidation",
-            timestamp=bar.timestamp,
+            timestamp=ts,
             fill_seq=self._fill_seq,
         )
         self._filled.append(fill)
@@ -853,18 +886,23 @@ class PerpPaperTradingExecutor:
             self._outbox.append(fill)
         self._halt(
             f"{self._name(canon)} position liquidated at {price} "
-            f"(leverage {self._leverage}x, margin lost {margin_lost})"
+            f"(leverage {self._leverage}x, margin lost {margin_lost})",
+            broken=False,
         )
-        return [fill]
+        return fill
 
     async def _accrue_funding(self, canon: str, last: datetime | None, bar_ts: datetime) -> None:
         """Apply the settled funding rows of ``(last, bar_ts]`` to the open position.
 
         The notional is valued at the mark carried into the bar (the last closed bar's
         close, or the entry price before any bar closed) — never a price from inside the
-        bar. No rows for a window that crossed a settlement boundary counts as missing;
-        no rate is ever fabricated. Accruals are recorded as ``FUNDING`` fills on the
-        account only — they are not order fills and publish no events.
+        bar, so a live mark between bars cannot move the accrual. No rows for a window
+        that crossed a settlement boundary counts as missing; no rate is ever fabricated.
+        Accruals are recorded as ``FUNDING`` fills on the account only — they are not
+        order fills and publish no events. Isolated margin caps every debit at the
+        position's equity: a payment that would cross the maintenance boundary liquidates
+        the position at that event, at the carried price, so the margin is never carried
+        negative and the loss is exactly the margin.
         """
         pos = self._positions.get(canon)
         if pos is None or pos.qty == 0:
@@ -883,13 +921,16 @@ class PerpPaperTradingExecutor:
             if _settlement_boundary_in(last, bar_ts):
                 self._funding_missing += 1
             return
-        mark, _ = self._market_mark(canon)
+        mark = self._marks.get(canon)
         price = mark if mark is not None and mark > 0 else pos.entry_price
         for settled_at, rate in rows:
             if rate == _ZERO:
                 continue
             # longs pay a positive rate, shorts receive it: cash flow = -qty * rate * price
             cash_flow = -(pos.qty * rate * price)
+            payable = max(min(pos.margin, self._position_equity(pos, price)), _ZERO)
+            if cash_flow < -payable:
+                cash_flow = -payable
             pos.margin += cash_flow
             pos.funding_paid -= cash_flow
             self._funding_applied += 1
@@ -914,6 +955,9 @@ class PerpPaperTradingExecutor:
             self._filled.append(fill)
             if self._db_pool is not None:
                 self._outbox.append(fill)
+            if self._position_equity(pos, price) <= self._mmr * abs(pos.qty) * price:
+                self._force_liquidation(canon, pos, price, settled_at)
+                return
 
     # ------------------------------------------------------------------
     # Fills and the margin ledger
@@ -932,6 +976,7 @@ class PerpPaperTradingExecutor:
         ts: datetime,
         mark_source: str | None = None,
     ) -> PaperFill:
+        self._require_fill_margin(canon, side, quantity, fp)
         pos = self._positions.setdefault(canon, _PerpPosition())
         signed = _ONE if side == "BUY" else _MINUS_ONE
         delta = signed * quantity
@@ -1143,10 +1188,12 @@ class PerpPaperTradingExecutor:
         if self._session_id:
             metrics.set_paper_persist_dirty(self._session_id, dirty)
 
-    def _halt(self, reason: str) -> None:
+    def _halt(self, reason: str, *, broken: bool = True) -> None:
+        """Halt the session; a broken-ledger halt never persists, a terminal one does."""
         if self._halted is None:
             logger.error("Perp session %s halted: %s", self._session_id, reason)
             self._halted = reason
+            self._halt_broken = broken
 
     def _require_running(self) -> None:
         if self._halted is not None:
@@ -1176,7 +1223,7 @@ class PerpPaperTradingExecutor:
             await self._write(snapshot_at)
 
     async def _write(self, snapshot_at: datetime | None) -> None:
-        if self._halted is not None:
+        if self._halted is not None and self._halt_broken:
             return
         version = self._state_version + 1
         account = paper_store.AccountRow(
@@ -1341,6 +1388,8 @@ class PerpPaperTradingExecutor:
             "funding_applied": self._funding_applied,
             "funding_missing": self._funding_missing,
             "liquidations": self._liquidations,
+            "halted": self._halted,
+            "halt_broken": self._halt_broken,
         }
 
     @classmethod
@@ -1436,6 +1485,9 @@ class PerpPaperTradingExecutor:
         self._funding_applied = int(state.get("funding_applied", 0))
         self._funding_missing = int(state.get("funding_missing", 0))
         self._liquidations = int(state.get("liquidations", 0))
+        halted = state.get("halted")
+        self._halted = None if halted is None else str(halted)
+        self._halt_broken = bool(state.get("halt_broken", False))
         self._check_invariants()
 
     @classmethod

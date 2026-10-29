@@ -71,6 +71,8 @@ _BETWEEN_BARS = frozenset({"live", "stale_live"})
 class RiskExecutor(Protocol):
     async def get_balance(self) -> dict[str, Decimal]: ...
 
+    async def fetch_balance(self) -> dict[str, Decimal]: ...
+
     async def get_positions(self, symbol: str | None = None) -> list[Position]: ...
 
 
@@ -592,10 +594,12 @@ class RiskService:
         snap = await self._account()
         sleeve, positions, balances = snap.per[session_id]
         account_positions = [p for value in snap.per.values() for p in value[1]]
+        free = await session.executor.fetch_balance()
         return PortfolioState(
             portfolio_value=snap.equity,
             positions=positions,
             balances=balances,
+            spendable_balance=free.get(QUOTE),
             marks=self._marks_for(session.exchange_id),
             sleeve_equity=sleeve,
             account_positions=account_positions,

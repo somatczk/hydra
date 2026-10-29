@@ -197,6 +197,11 @@ class SessionRecoveryMixin:
             self._mark_error(session, PRE_P1_STATE)
             return
         session._executor = executor
+        halted = executor.get_account_snapshot().halted
+        if halted is not None:
+            # a restored halted account (a persisted liquidation) never resumes
+            self._mark_error(session, f"paper ledger halted: {halted}")
+            return
         if risk.kill_switch_active():
             await self._close_restored(session, "kill_switch", None)
             return

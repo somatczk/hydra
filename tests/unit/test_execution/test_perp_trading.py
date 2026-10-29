@@ -8,6 +8,7 @@ window with no stored rows accrues nothing while counting the skip.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -21,6 +22,7 @@ from hydra.execution.perp_trading import (
     PerpPaperTradingExecutor,
     static_funding_reader,
 )
+from tests.unit.test_execution.test_paper_persistence import RecordingPool
 
 D = Decimal
 ZERO = D("0")
@@ -245,6 +247,163 @@ class TestLiquidation:
         assert position["liquidationPrice"] == float(
             (D("100") - (D("50") - D("0.07"))) / (D("1") - D("0.05"))
         )
+
+
+class TestLiquidationPersistence:
+    async def test_the_liquidation_persists_and_restores_halted(self) -> None:
+        pool = RecordingPool()
+        ts = datetime(2026, 1, 5, 9, 0, tzinfo=UTC)
+        ex = PerpPaperTradingExecutor(
+            initial_balances={"USDT": D("1000")},
+            slippage_pct=ZERO,
+            maker_fee=D("0.0004"),
+            taker_fee=D("0.0004"),
+            leverage=2,
+            maintenance_margin_rate=D("0.05"),
+            db_pool=pool,
+            session_id="liq-1",
+            funding_reader=static_funding_reader({}),
+        )
+        await market_buy(ex, "1", "100")
+        liq = (D("100") - D("50")) / (D("1") - D("0.05"))
+        await ex.on_closed_bar("BTCUSDT", bar(ts, "100", "100", str(liq), "100"))
+
+        # the terminal state reaches the DB: the halted account, the closed position,
+        # the LIQUIDATION fill as a trade row
+        state = json.loads(pool.accounts["liq-1"][4])
+        assert state["halted"] is not None and "liquidated" in state["halted"]
+        assert state["positions"]["BTCUSDT"]["qty"] == "0"
+        [row] = [
+            args
+            for sql, args in pool.committed
+            if sql.startswith("INSERT INTO trades") and args[15] == "LIQUIDATION"
+        ]
+        assert (row[1], row[2], row[6]) == ("SELL", liq, -D("50"))
+
+        # a restart restores it halted: the liquidated position stays closed
+        rebuilt = await PerpPaperTradingExecutor.restore(pool, "liq-1")
+        assert rebuilt is not None
+        snap = rebuilt.get_account_snapshot()
+        assert snap.halted is not None and "liquidated" in snap.halted
+        assert snap.liquidations == 1
+        assert (await rebuilt.get_positions()) == []
+        with pytest.raises(PaperSessionHaltedError):
+            await market_buy(rebuilt, "1", "100")
+
+
+class TestFundingMarginFloor:
+    async def test_a_funding_wipe_liquidates_honestly_at_the_carried_price(self) -> None:
+        # the reviewer's repro: a 2.0 rate on a 1x long at 100 owes 200 on a 100 margin;
+        # isolated margin caps the loss at the margin — never a negative margin, never
+        # a liquidation above the market booking phantom PnL
+        settled = datetime(2026, 1, 5, 8, 0, tzinfo=UTC)
+        ex = make(leverage=1, funding={"BTCUSDT": [(settled, D("2.0"))]})
+        await market_buy(ex, "1", "100")
+        await ex.on_closed_bar("BTCUSDT", bar(settled - H, "100", "100", "100", "100"))
+        await ex.on_closed_bar("BTCUSDT", bar(settled + H, "100", "100", "100", "100"))
+        # the next bar would have liquidated at 201.005 on the carried-negative ledger
+        await ex.on_closed_bar("BTCUSDT", bar(settled + 2 * H, "100", "100", "100", "100"))
+
+        snap = ex.get_account_snapshot()
+        assert snap.liquidations == 1
+        assert snap.halted is not None and "liquidated" in snap.halted
+        assert pos(ex).margin == ZERO and pos(ex).qty == ZERO
+        funding = next(f for f in ex.get_fills() if f.side == "FUNDING")
+        liquidation = next(f for f in ex.get_fills() if f.order_type == "LIQUIDATION")
+        # the payment is capped at the margin; the close is at the real carried price
+        assert funding.net_pnl == -D("100")
+        assert funding.price == D("100")
+        assert liquidation.price == D("100")
+        assert not any(f.net_pnl is not None and f.net_pnl > 0 for f in ex.get_fills()), (
+            "a wiped position can never book a positive PnL"
+        )
+        # funding + close = exactly the lost margin; the account kept the rest
+        assert funding.net_pnl + liquidation.net_pnl == -D("100")
+        assert snap.wallet_available == D("1000") - D("100") - D("0.04")
+        assert snap.equity == snap.wallet_available
+
+    async def test_a_funding_wipe_with_adverse_mark_loss_exactly_the_margin(self) -> None:
+        # carried price 90 (unrealized -10): the payment caps at the equity (90) so the
+        # total loss across funding and the honest close is exactly the margin
+        settled = datetime(2026, 1, 5, 8, 0, tzinfo=UTC)
+        ex = make(leverage=1, funding={"BTCUSDT": [(settled, D("2.0"))]})
+        await market_buy(ex, "1", "100")
+        await ex.on_closed_bar("BTCUSDT", bar(settled - H, "100", "100", "100", "90"))
+        await ex.on_closed_bar("BTCUSDT", bar(settled + H, "90", "90", "90", "90"))
+
+        snap = ex.get_account_snapshot()
+        assert snap.halted is not None
+        funding = next(f for f in ex.get_fills() if f.side == "FUNDING")
+        liquidation = next(f for f in ex.get_fills() if f.order_type == "LIQUIDATION")
+        assert (funding.net_pnl, funding.price) == (-D("90"), D("90"))
+        assert (liquidation.price, liquidation.net_pnl) == (D("90"), -D("10"))
+        # funding + close = exactly the lost margin, whichever way it is split
+        assert funding.net_pnl + liquidation.net_pnl == -D("100")
+        assert snap.wallet_available == D("1000") - D("100") - D("0.04")
+        assert pos(ex).margin == ZERO
+
+    async def test_funding_never_values_at_a_live_mark_inside_the_window(self) -> None:
+        settled = datetime(2026, 1, 5, 8, 0, tzinfo=UTC)
+        ex = make(leverage=2, funding={"BTCUSDT": [(settled, D("0.0001"))]})
+        await market_buy(ex, "1", "100")
+        await ex.on_closed_bar("BTCUSDT", bar(settled - H, "100", "100", "100", "100"))
+        ex.set_mark("BTCUSDT", D("120"))  # a live tick inside the settled window
+        await ex.on_closed_bar("BTCUSDT", bar(settled + H, "100", "100", "100", "104"))
+        [row] = [f for f in ex.get_fills() if f.side == "FUNDING"]
+        # the deterministic close carried into the settlement, never the live 120
+        assert row.price == D("100")
+        assert row.net_pnl == -D("0.01")
+        assert pos(ex).margin == D("50") - D("0.01")
+
+
+class TestFlipAtomicity:
+    async def test_a_market_flip_the_wallet_cannot_fund_is_refused_untouched(self) -> None:
+        ex = make(capital="100", leverage=2)
+        await market_sell(ex, "1", "100")  # short 1: margin 50, wallet 49.96
+        before = ex.get_account_snapshot()
+        fills_before = ex.get_fills()
+        with pytest.raises(InsufficientBalanceError):
+            await market_buy(ex, "3", "100")
+        after = ex.get_account_snapshot()
+        # the close leg never ran: the ledger is byte-identical to before the attempt
+        assert (after.wallet_available, after.margin_used, after.realized_net) == (
+            before.wallet_available,
+            before.margin_used,
+            before.realized_net,
+        )
+        assert ex.get_fills() == fills_before
+        assert (pos(ex).qty, pos(ex).margin) == (-D("1"), D("50"))
+
+    async def test_a_funded_market_flip_executes_atomically(self) -> None:
+        ex = make(leverage=2)
+        await market_sell(ex, "1", "100")
+        fill = await market_buy(ex, "3", "100")
+        # the close realized its net (0 gross - 0.04 exit fee - 0.04 entry fee) and the
+        # remainder opened: one fill, a long 2, margin 100 posted
+        assert D(str(fill["net_pnl"])) == -D("0.08")
+        assert (pos(ex).qty, pos(ex).entry_price, pos(ex).margin) == (D("2"), D("100"), D("100"))
+        snap = ex.get_account_snapshot()
+        assert snap.wallet_available == D("1000") - D("50") - D("0.04") + D("50") - D("0.04") - (
+            D("100") + D("0.08")
+        )
+
+    async def test_a_resting_flip_the_wallet_cannot_fund_cancels_untouched(self) -> None:
+        ex = make(capital="100", leverage=2)
+        ts = datetime(2026, 1, 5, 9, 0, tzinfo=UTC)
+        await ex.create_order("BTCUSDT", "BUY", "STOP_MARKET", D("3"), stop_price=D("105"))
+        await market_sell(ex, "1", "100")  # the strategy short under the resting entry
+        before = ex.get_account_snapshot()
+        fills = await ex.on_closed_bar("BTCUSDT", bar(ts, "100", "106", "99", "106"))
+        [cancelled] = fills
+        assert (cancelled.status, cancelled.reason) == ("CANCELLED", "insufficient_margin_on_gap")
+        after = ex.get_account_snapshot()
+        assert (after.wallet_available, after.margin_used, after.realized_net) == (
+            before.wallet_available,
+            before.margin_used,
+            before.realized_net,
+        )
+        assert (pos(ex).qty, pos(ex).margin) == (-D("1"), D("50"))
+        assert ex.get_account_snapshot().open_orders == 0
 
 
 class TestRestingOrders:

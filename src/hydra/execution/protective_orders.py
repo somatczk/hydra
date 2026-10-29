@@ -194,7 +194,8 @@ class ProtectiveOrderManager:
         Direction-agnostic by construction: an entry fill carries its manual spec's tag
         (a short's entry is a SELL just as a long's is a BUY), an exit fill re-arms
         whatever the disarm stashed, and any fill that leaves a position re-sizes the
-        group to it.
+        group to it. Only an exit fill consumes the disarm stash — an entry never does
+        (a stashed spec that survived a refused exit is stale for the new position).
         """
         symbol = str(event.symbol)
         position = await self._position(symbol)
@@ -205,11 +206,11 @@ class ProtectiveOrderManager:
                 await self._arm(position, group.spec)
             return
         manual = self._manual.pop(event.tag, None) if event.tag in self._manual else None
-        spec = (
-            manual
-            or self._disarmed.pop(symbol, None)
-            or (group.spec if group is not None else None)
+        exit_fill = position is None or (position.direction == Direction.LONG) != (
+            event.side == Side.BUY
         )
+        stash = self._disarmed.pop(symbol, None) if exit_fill else None
+        spec = manual or stash or (group.spec if group is not None else None)
         if group is not None:
             await self._cancel(group)
         if position is not None:

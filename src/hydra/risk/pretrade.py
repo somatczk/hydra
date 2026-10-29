@@ -67,6 +67,9 @@ class PortfolioState:
     current_drawdown: Decimal = Decimal("0")
     leverage: int = 1
     """The ordering session's strategy leverage: 1 for spot; perp margin checks divide by it."""
+    spendable_balance: Decimal | None = None
+    """The quote actually payable for a new order's margin (a perp wallet); None falls back
+    to ``balances``, whose perp ``get_balance`` cash an open short inflates."""
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +435,9 @@ class PreTradeRiskManager:
             # an opening perp order (either side) posts notional / leverage of margin
             margin = order.quantity * self._ref(order, state) / Decimal(max(state.leverage, 1))
             cost = margin * (1 + self._config.fee_buffer)
-            have = state.balances.get(state.quote_currency, Decimal("0"))
+            have = state.spendable_balance
+            if have is None:
+                have = state.balances.get(state.quote_currency, Decimal("0"))
             if cost > have:
                 return "balance", (
                     f"insufficient {state.quote_currency} margin: need {cost:f}, have {have:f}"

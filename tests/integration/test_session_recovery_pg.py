@@ -16,12 +16,16 @@ import yaml
 from fastapi import FastAPI
 
 from hydra.core.config import HydraConfig
+from hydra.core.types import OHLCV
 from hydra.dashboard import lifespan
 from hydra.data.migrations.runner import upgrade_to_head
+from hydra.execution import paper_store
 from hydra.execution.client_factory import ClientFactory, bars_repository
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.execution.session_manager import SessionManager
+from hydra.risk.pretrade import RiskConfig
+from hydra.risk.state import InMemoryRiskStateStore
 from hydra.services import strategies as svc
 from hydra.strategy.config import StrategyConfig, config_hash
 from tests.unit.test_execution.session_harness import (
@@ -346,3 +350,105 @@ async def test_perp_session_starts_and_recovers_consistently(
 ) -> None:
     await asyncio.to_thread(upgrade_to_head, fresh_database)
     await perp_restart_scenario(fresh_database, strategies_dir)
+
+
+async def perp_liquidation_restart_scenario(dsn: str, strategies_dir: Path) -> None:
+    """The P4-C review A1 fix: a liquidated perp session persists and restores halted.
+
+    The crash window is real: the liquidation bar persists the halted account inside
+    ``on_closed_bar`` (the fill, the closed position, ``halted`` in the state), while the
+    session row is still ``running`` — a process death right there must not resurrect the
+    liquidated position as a running session.
+    """
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    try:
+        h = Harness(strategies_dir)
+        sid = write_strategy(
+            strategies_dir,
+            "pg-perp-liq",
+            entry_long=rule(("greater_than", 0.0)),
+            risk={"stop_loss_method": "fixed_pct", "stop_loss_value": 45.0},
+            exchange_id="binanceusdm",
+            market_type="FUTURES",
+            leverage=3,
+        )
+        first = SessionManager(
+            db_pool=pool,
+            config=HydraConfig(),
+            clients=_clients(h),
+            risk_store=InMemoryRiskStateStore(
+                paper_capital=D("1000"), config=RiskConfig(max_risk_per_trade=D("0.5"))
+            ),
+        )
+        await first.startup()
+        session_id = await first.start_session(sid, "paper", D("1000"))
+        session = first.get_session(session_id)
+        assert session is not None
+        await h.bar(session, "100", exchange_id="binanceusdm")
+        ex = session._executor
+        assert isinstance(ex, PerpPaperTradingExecutor)
+        assert ex.get_account_snapshot().base_totals == {"BTC": D("3.00000")}
+
+        # the liquidation lands on the executor and persists; the wiring (which would
+        # flip the session row) never runs — the crash window
+        liq_ts = h._next[session_id] + timedelta(hours=1)
+        fills = await ex.on_closed_bar(
+            "BTCUSDT",
+            OHLCV(D("100"), D("100"), D("60"), D("60"), D("10"), liq_ts),
+        )
+        assert [f.order_type for f in fills] == ["LIQUIDATION"]
+        assert ex.get_account_snapshot().halted is not None
+        async with pool.acquire() as conn:
+            stored = await paper_store.load(conn, session_id)
+            orphaned = await paper_store.has_open_positions(conn, session_id)
+            [liq_row] = await conn.fetch(
+                "SELECT net_pnl FROM trades WHERE session_id = $1 AND order_type = 'LIQUIDATION'",
+                session_id,
+            )
+            row = await conn.fetchrow(
+                "SELECT status FROM trading_sessions WHERE id = $1", session_id
+            )
+        assert stored is not None
+        assert stored.state["halted"] is not None and "liquidated" in stored.state["halted"]
+        assert stored.state["positions"]["BTCUSDT"]["qty"] == "0"
+        assert orphaned is False
+        assert liq_row["net_pnl"] == D("-100.100")
+        assert row is not None and row["status"] == "running"  # died before the row flipped
+        await first.graceful_shutdown()  # rows stay running for recovery
+
+        app = FastAPI()
+        app.state.db_pool = pool
+        await lifespan._init_session_manager(app, HydraConfig(), _clients(h))
+        second: SessionManager = app.state.session_manager
+        await settle()
+        try:
+            resumed = second.get_session(session_id)
+            assert resumed is not None
+            # never resumed: the liquidated session restores halted and is marked error
+            assert resumed.status == "error" and not resumed.task_alive
+            assert resumed.error_message is not None and "liquidated" in resumed.error_message
+            ex2 = resumed._executor
+            assert isinstance(ex2, PerpPaperTradingExecutor)
+            snap2 = ex2.get_account_snapshot()
+            assert snap2.halted is not None and snap2.liquidations == 1
+            assert (await ex2.get_positions()) == []
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT status, error_message FROM trading_sessions WHERE id = $1",
+                    session_id,
+                )
+                open_rows = await paper_store.has_open_positions(conn, session_id)
+            assert row is not None and row["status"] == "error"
+            assert "liquidated" in row["error_message"]
+            assert open_rows is False
+        finally:
+            await second.graceful_shutdown()
+    finally:
+        await pool.close()
+
+
+async def test_a_liquidated_perp_session_persists_and_restores_halted(
+    fresh_database: str, strategies_dir: Path
+) -> None:
+    await asyncio.to_thread(upgrade_to_head, fresh_database)
+    await perp_liquidation_restart_scenario(fresh_database, strategies_dir)

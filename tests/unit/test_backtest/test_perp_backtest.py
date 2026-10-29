@@ -24,7 +24,7 @@ import hydra.strategy.engine as engine_module
 from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.runner import BacktestRunner
 from hydra.core.config import HydraConfig
-from hydra.core.events import BarEvent, EntrySignal, ExitSignal
+from hydra.core.events import BarEvent, EntrySignal, ExitSignal, PriceEvent
 from hydra.core.types import OHLCV, Direction, MarketType, Symbol, Timeframe
 from hydra.data.bars import last_closed_open
 from hydra.execution.client_factory import ClientFactory, SharedRestClients
@@ -214,7 +214,8 @@ async def _paper_session(
     assert isinstance(executor, PerpPaperTradingExecutor)
 
     equity: list[D] = []
-    for bar in bars[WARM:]:
+    traded = bars[WARM:]
+    for i, bar in enumerate(traded):
         now[0] = bar.timestamp + H
         await session._event_bus.publish(
             BarEvent(
@@ -226,6 +227,17 @@ async def _paper_session(
         )
         for _ in range(5):
             await asyncio.sleep(0)
+        if i < len(traded) - 1:
+            # a live tick between bars: the backtest has no live marks, so anything the
+            # paper side prices from one (funding values the mark carried into the
+            # settlement) diverges the two runs
+            await session._event_bus.publish(
+                PriceEvent(
+                    symbol=Symbol("BTCUSDT"),
+                    price=bar.close * D("3"),
+                    exchange_id="binanceusdm",
+                )
+            )
         equity.append(await executor.get_equity())
     await mgr.stop_session(sid)
     equity[-1] = await executor.get_equity()
