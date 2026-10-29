@@ -59,6 +59,7 @@ from hydra.services.errors import (
     require_pool,
     service_error,
 )
+from hydra.services.perps_gate import is_perp_strategy, require_perps_gate
 from hydra.services.strategies import build_strategy_name_map
 
 logger = logging.getLogger(__name__)
@@ -249,9 +250,12 @@ async def _require_live_armed(mgr: Any) -> None:
 async def start_session(mgr: Any, actor: str, body: StartSessionRequest) -> dict[str, Any]:
     """Start a paper or live session attributed to *actor*.
 
-    A live start begins with the armed check (R1): the ``live_armed`` system_config row is
-    the single master gate and anything unreadable counts as disarmed. Only then does the
-    manager's live branch check credentials, ``live_capital`` and the kill switch.
+    A live start begins with the venue's gate: the spot ``live_armed`` system_config row
+    is the single master gate for spot strategies and anything unreadable counts as
+    disarmed; a perps strategy instead answers to the separate
+    ``perps_armed``/``perps_capital`` gate (P4-E) — a DB read that works in the trader
+    process. Only then does the manager's live branch check credentials, ``live_capital``
+    and the kill switch.
     """
     mgr = require_manager(mgr)
     if body.trading_mode not in ("paper", "live"):
@@ -259,10 +263,14 @@ async def start_session(mgr: Any, actor: str, body: StartSessionRequest) -> dict
             400, "invalid_trading_mode", "trading_mode must be 'paper' or 'live'", "invalid"
         )
     if body.trading_mode == "live":
-        try:
-            await _require_live_armed(mgr)
-        except LiveNotArmedError as exc:
-            raise _start_error(exc) from exc
+        if is_perp_strategy(body.strategy_id):
+            # P4-E: a perps strategy answers to the separate perps gate, not the spot row
+            await require_perps_gate(getattr(mgr, "_db_pool", None))
+        else:
+            try:
+                await _require_live_armed(mgr)
+            except LiveNotArmedError as exc:
+                raise _start_error(exc) from exc
     try:
         session_id = await mgr.start_session(
             strategy_id=body.strategy_id,

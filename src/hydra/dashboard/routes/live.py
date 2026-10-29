@@ -14,6 +14,13 @@ running under their start's authorization until stopped or the kill switch fires
 and every pending live-arming approval that can still re-arm on its code. The armed
 row is read with a raising read on the disarm path: an unreadable row is 503, never
 a silent ``already_disarmed``.
+
+The perps gate (P4-E) rides the same shapes beside the spot gate: ``/perps/status``,
+``/perps/arm`` and ``/perps/disarm`` are the separate code-gated ceremony for
+leveraged USD⌂-M trading — its own ``perps_armed``/``perps_capital`` rows, its own
+``live_perps_arming`` executor, and its own fail-closed futures-permission re-fetch.
+The session-start and order create routes check whichever gate the target's venue
+answers to; arming spot never arms perps.
 """
 
 from __future__ import annotations
@@ -43,6 +50,17 @@ from hydra.services.live_gate import (
     require_armed,
     running_live_sessions,
     write_armed_transition,
+)
+from hydra.services.perps_gate import (
+    PERPS_SESSION_NOTE,
+    is_perp_strategy,
+    is_perp_venue,
+    positively_perps_disarmed,
+    read_perps_capital,
+    read_perps_state,
+    require_perps_gate,
+    running_live_perps_sessions,
+    write_perps_armed_transition,
 )
 from hydra.services.sessions import QuickTradeRequest
 
@@ -117,6 +135,36 @@ class CredentialDeleteRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
+class PerpsStatusResponse(BaseModel):
+    """The perps gate's state; one source, mirroring the spot ``/api/live/status``."""
+
+    perps_armed: bool
+    armed_by: str | None = None
+    armed_at: str | None = None
+    perps_capital: float | None = None
+    running_live_perps_sessions: list[str] = Field(default_factory=list)
+    running_live_perps_sessions_count: int = 0
+
+
+class PerpsDisarmResponse(PerpsStatusResponse):
+    status: str
+    message: str
+    pending_perps_approvals: list[str] = Field(default_factory=list)
+
+
+class PerpsArmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    perps_capital: float = Field(gt=0, allow_inf_nan=False)
+    reason: str | None = Field(None, min_length=3, max_length=500)
+
+
+class PerpsDisarmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=3, max_length=500)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -142,15 +190,6 @@ def _requester(request: Request) -> str:
             "forbidden",
         )
     return f"{principal.kind}:{principal.name}"
-
-
-async def _session(request: Request, session_id: str) -> dict[str, Any]:
-    """The listed session by id, or the 404; the live check is the caller's."""
-    sessions = await request_trader(request).list_sessions()
-    target = next((s for s in sessions if s.get("session_id") == session_id), None)
-    if target is None:
-        raise api_error(404, "session_not_found", f"Session {session_id} not found", "not_found")
-    return target
 
 
 # ---------------------------------------------------------------------------
@@ -243,15 +282,114 @@ async def disarm(body: DisarmRequest, request: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The perps gate (P4-E): the separate code-gated ceremony for leveraged trading
+# ---------------------------------------------------------------------------
+
+
+@router.get("/perps/status", response_model=PerpsStatusResponse)
+async def perps_status(request: Request) -> dict[str, Any]:
+    """The perps armed state, the ``perps_capital`` baseline and the running live perps
+    sessions — a separate row from the spot gate's; arming spot never arms perps."""
+    pool = request_pool(request)
+    state = await read_perps_state(pool)
+    running = await running_live_perps_sessions(request_trader(request))
+    return {
+        "perps_armed": state["armed"],
+        "armed_by": state["armed_by"],
+        "armed_at": state["armed_at"],
+        "perps_capital": await read_perps_capital(pool),
+        "running_live_perps_sessions": running,
+        "running_live_perps_sessions_count": len(running),
+    }
+
+
+@router.post("/perps/arm", response_model=ApprovalRequiredResponse)
+async def perps_arm(body: PerpsArmRequest, request: Request) -> dict[str, Any]:
+    """Request the perps arming ceremony: the ``perps_capital`` baseline is written as
+    part of arming (one audited transition) once the code is typed.
+
+    The executor re-fetches the connected key's futures permission live and refuses
+    unless ``enableFutures`` reads true with withdrawals disabled — any failure refuses
+    the arm (fail-closed).
+    """
+    actor = _requester(request)
+    reason = body.reason or "arm perps trading"
+    params = {"perps_capital": body.perps_capital, "reason": reason}
+    store = live_approval_store(request.app.state)
+    approval = await create_live_approval(
+        store, action="live_perps_arming", reason=reason, params=params, requested_by=actor
+    )
+    return approval_response(approval)
+
+
+@router.post("/perps/disarm", response_model=PerpsDisarmResponse)
+async def perps_disarm(body: PerpsDisarmRequest, request: Request) -> dict[str, Any]:
+    """Disarm perps directly — ungated toward safety, audited — and report honestly.
+
+    Running live perp sessions are named and keep running under their start's
+    authorization (the R10 pattern); the spot gate is untouched by this ceremony. The
+    armed row is read with a raising read: an unreadable row is 503, never a silent
+    ``already_disarmed``. Pending perps-arming approvals are named too — a surviving arm
+    code can still re-arm after this disarm.
+    """
+    pool = request_pool(request)
+    status = "already_disarmed"
+    if not await positively_perps_disarmed(pool):
+        await write_perps_armed_transition(
+            pool, armed=False, actor=_actor(request), reason=body.reason
+        )
+        status = "disarmed"
+    running = await running_live_perps_sessions(request_trader(request))
+    pending = [
+        a.id
+        for a in await live_approval_store(request.app.state).list_pending()
+        if a.action == "live_perps_arming"
+    ]
+    audit(
+        getattr(request.state, "principal", None),
+        "perps_disarmed",
+        reason=body.reason,
+        running_live_perps_sessions=len(running),
+        pending_perps_approvals=len(pending),
+    )
+    message = (
+        f"Perps trading is disarmed. {len(running)} live perp session(s) keep running "
+        f"under their start's authorization. {PERPS_SESSION_NOTE}"
+    )
+    if pending:
+        message += (
+            f" {len(pending)} pending perps-arming approval(s) requested before this "
+            "disarm can still re-arm on their code; deny them in the Activity review."
+        )
+    return {
+        "status": status,
+        "perps_armed": False,
+        "armed_by": None,
+        "armed_at": None,
+        "perps_capital": await read_perps_capital(pool),
+        "running_live_perps_sessions": running,
+        "running_live_perps_sessions_count": len(running),
+        "pending_perps_approvals": pending,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
 # The per-action code gates
 # ---------------------------------------------------------------------------
 
 
 @router.post("/session-start", response_model=ApprovalRequiredResponse)
 async def session_start(body: LiveSessionStartRequest, request: Request) -> dict[str, Any]:
-    """Request a live session start: its own one-time code on top of the armed gate."""
+    """Request a live session start: its own one-time code on top of the armed gate.
+
+    A perps strategy answers to the separate perps ceremony (P4-E), not the spot gate.
+    """
     actor = _requester(request)
-    await require_armed(request_pool(request))
+    if is_perp_strategy(body.strategy_id):
+        await require_perps_gate(request_pool(request))
+    else:
+        await require_armed(request_pool(request))
     params: dict[str, Any] = {"strategy_id": body.strategy_id, "reason": body.reason}
     if body.paper_capital is not None:
         params["paper_capital"] = body.paper_capital
@@ -268,10 +406,25 @@ async def session_start(body: LiveSessionStartRequest, request: Request) -> dict
 
 @router.post("/order", response_model=ApprovalRequiredResponse)
 async def live_order(body: LiveOrderRequest, request: Request) -> dict[str, Any]:
-    """Request one manual live order on a running live session (per-order code)."""
+    """Request one manual live order on a running live session (per-order code). A live
+    session on the perps venue answers to the separate perps ceremony (P4-E)."""
     actor = _requester(request)
-    await require_armed(request_pool(request))
-    target = await _session(request, body.session_id)
+    target = next(
+        (
+            s
+            for s in await request_trader(request).list_sessions()
+            if s.get("session_id") == body.session_id
+        ),
+        None,
+    )
+    if is_perp_venue(None if target is None else target.get("exchange_id")):
+        await require_perps_gate(request_pool(request))
+    else:
+        await require_armed(request_pool(request))
+    if target is None:
+        raise api_error(
+            404, "session_not_found", f"Session {body.session_id} not found", "not_found"
+        )
     if target.get("trading_mode") != "live" or target.get("status") != "running":
         raise api_error(
             409,

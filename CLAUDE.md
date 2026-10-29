@@ -75,7 +75,10 @@ table in `README.md`. Do not duplicate it here; update that table in the PR that
     MCP session/risk tools call; the routes keep only their models, audit lines and principals.
     `services/live_gate.py` is the live gate: the `live_armed` row, trade-only credential checks
     (the R8 live re-fetch) and the four code-gated live executors `routes/live.py` and the MCP live
-    tools issue challenges against.
+    tools issue challenges against. `services/perps_gate.py` is the separate perps arm ceremony
+    (P4-E): the `perps_armed`/`perps_capital` rows, the `live_perps_arming` executor with its
+    fail-closed futures-permission re-fetch (`enableFutures`), and the gate every live FUTURES
+    surface answers to — arming spot never arms perps.
   - `ops`: Discord/Slack webhook notifier.
 - `dashboard/`: Next.js app (see `dashboard/README.md`).
 - `config/`: `base.yaml`, `strategies/`, `templates/`.
