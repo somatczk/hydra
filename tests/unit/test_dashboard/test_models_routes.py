@@ -20,7 +20,10 @@ import pytest
 import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from structlog.testing import capture_logs
 
+from hydra.core.logging import get_logger
+from hydra.dashboard import security
 from hydra.dashboard.routes import models as routes_models
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.models import (
@@ -51,10 +54,11 @@ class _Acquire:
 
 
 class _NullConn:
-    """SELECTs find nothing (except the universe row); INSERTs are echoed/recorded."""
+    """SELECTs find nothing (except the universe and job rows); INSERTs are echoed/recorded."""
 
     def __init__(self) -> None:
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
+        self.jobs: dict[str, dict[str, Any]] = {}
         self.universe: dict[str, Any] | None = {
             "exchange_id": "binance",
             "quote_asset": "USDT",
@@ -84,6 +88,22 @@ class _NullConn:
             }
         if "FROM system_config" in query:
             return {"value": json.dumps(self.universe)} if self.universe else None
+        if "FROM backtest_jobs" in query:
+            job = self.jobs.get(args[0])
+            if job is None:
+                return None
+            if "kind = 'ml_train'" in query and job["kind"] != "ml_train":
+                return None
+            if "AND kind = $2" in query and args[1] != job["kind"]:
+                return None
+            return job
+        if "UPDATE backtest_jobs" in query:
+            # request_cancel: queued goes straight to cancelled, else cancelling
+            job = self.jobs[args[0]]
+            if job["status"] == "queued":
+                job["status"] = "cancelled"
+            job["cancel_requested"] = True
+            return job
         return None
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
@@ -381,6 +401,55 @@ class TestRetrainSubmit:
         resp = client.get("/api/models/retrain/ml-nobody00")
         assert resp.status_code == 404
         assert resp.json()["detail"]["code"] == "task_not_found"
+
+
+class TestRetrainCancel:
+    def _job(self, pool: _NullPool, job_id: str, kind: str) -> dict[str, Any]:
+        job = {"id": job_id, "kind": kind, "status": "queued", "cancel_requested": False}
+        pool.conn.jobs[job_id] = job
+        return job
+
+    def test_cancelling_a_retrain_cancels_the_ml_train_job(
+        self,
+        client: TestClient,
+        pool: _NullPool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._job(pool, "ml-abc12345", "ml_train")
+        monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
+
+        with capture_logs() as logs:
+            resp = client.post("/api/models/retrain/ml-abc12345/cancel")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"task_id": "ml-abc12345", "status": "cancelled"}
+        job = pool.conn.jobs["ml-abc12345"]
+        assert (job["status"], job["cancel_requested"]) == ("cancelled", True)
+        assert [
+            entry
+            for entry in logs
+            if entry.get("event") == "audit"
+            and entry.get("action") == "model_retrain_cancelled"
+            and entry.get("task_id") == "ml-abc12345"
+        ]
+
+    def test_a_backtest_job_id_is_404_and_is_never_cancelled(
+        self,
+        client: TestClient,
+        pool: _NullPool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The cancel is kind-gated like the status route: only ml_train ids answer."""
+        job = self._job(pool, "task-bt0001", "backtest")
+        monkeypatch.setattr(security, "audit_logger", get_logger("hydra.audit"))
+
+        with capture_logs() as logs:
+            resp = client.post("/api/models/retrain/task-bt0001/cancel")
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "task_not_found"
+        assert (job["status"], job["cancel_requested"]) == ("queued", False)
+        assert not [entry for entry in logs if entry.get("event") == "audit"]
 
 
 # ---------------------------------------------------------------------------

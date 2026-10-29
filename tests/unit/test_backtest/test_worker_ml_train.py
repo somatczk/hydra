@@ -1,14 +1,17 @@
 """The ml_train job: dataset -> trainer -> ONNX export -> registry (the P5-B bridge).
 
-XGBoost and onnxmltools are faked at the ``sys.modules`` seam (CI installs only
-the dev extra), but the fake converter serialises a REAL ONNX model, so the
-artifact on disk is loaded, validated and read back by real onnxruntime, and the
-registry INSERT is the real :class:`~hydra.ml.registry.ModelRegistry` over a
-recording fake pool. The bars are fixture rows; nothing egresses.
+XGBoost and onnxmltools are faked at the ``sys.modules`` seam only when the
+ml-training extra is absent (CI installs just the dev extra); with the extra
+installed the honest-path tests run the real converter. Either way the fake
+serialises a REAL ONNX model, so the artifact on disk is loaded, validated and
+read back by real onnxruntime, and the registry INSERT is the real
+:class:`~hydra.ml.registry.ModelRegistry` over a recording fake pool. The bars
+are fixture rows; nothing egresses.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -27,8 +30,15 @@ from hydra.core.types import Timeframe
 from hydra.data.backfill import GapRange
 from hydra.data.bars import timeframe_seconds
 from hydra.data.errors import DataFetchError, NoMarketDataError
+from hydra.ml.registry import ModelRegistration, ModelRegistry
 from hydra.strategy.config import StrategyConfig
-from tests.fixtures.ml_onnx import FakeModelProto, fake_onnxmltools, fake_xgboost
+from tests.fixtures.ml_onnx import (
+    FakeModelProto,
+    fake_onnxmltools,
+    fake_xgboost,
+    ml_pipeline_fakes,
+    ml_training_extra_installed,
+)
 
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 _H = timedelta(hours=1)
@@ -145,6 +155,8 @@ class _MlConn:
         self.inserts: list[tuple[str, tuple[Any, ...]]] = []
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
         self.ticks: list[tuple[float, dict[str, Any]]] = []
+        self.registered: list[dict[str, Any]] = []
+        self.deletes: list[tuple[str, tuple[Any, ...]]] = []
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         if "GROUP BY source" in query:
@@ -152,17 +164,21 @@ class _MlConn:
         assert "ORDER BY timestamp DESC" in query, query
         return self.bars[str(args[2])]
 
-    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         if "RETURNING cancel_requested" in query:
             self.ticks.append((args[1], json.loads(args[2])))
             return {"cancel_requested": False}
+        if "DELETE FROM ml_models" in query:
+            return self._delete_registered(query, args)
+        if "FROM ml_models WHERE training_job_id = $1" in query:
+            return next((r for r in self.registered if r["training_job_id"] == args[0]), None)
         assert "INSERT INTO ml_models" in query, query
         self.inserts.append((query, args))
         # echo the registration as the row the INSERT ... RETURNING produces
-        return {
+        row = {
             "id": args[0],
             "name": args[1],
-            "version": 1,
+            "version": len(self.registered) + 1,
             "stage": "staging",
             "model_type": args[2],
             "metrics": args[3],
@@ -175,6 +191,22 @@ class _MlConn:
             "training_job_id": args[9],
             "archived_at": None,
         }
+        self.registered.append(row)
+        return row
+
+    def _delete_registered(self, query: str, args: tuple[Any, ...]) -> dict[str, Any] | None:
+        """The registry's staging-only discard, mirrored by the fake."""
+        assert "stage = 'staging'" in query, query
+        self.deletes.append((query, args))
+        kept: list[dict[str, Any]] = []
+        deleted: dict[str, Any] | None = None
+        for row in self.registered:
+            if row["training_job_id"] == args[0] and row["stage"] == "staging":
+                deleted = row
+            else:
+                kept.append(row)
+        self.registered = kept
+        return deleted
 
     async def execute(self, query: str, *args: Any) -> str:
         self.executed.append((query, args))
@@ -242,11 +274,9 @@ def models_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return path
 
 
-async def _run_with_fakes(
-    conn: _MlConn, engine: Any, job: dict[str, Any], run: worker.JobRun
-) -> Any:
-    """run_ml_train_job with xgboost/onnxmltools faked; onnxruntime stays real."""
-    with patch.dict("sys.modules", {**fake_xgboost()[0], **fake_onnxmltools(FakeModelProto())}):
+async def _run_ml_job(conn: _MlConn, engine: Any, job: dict[str, Any], run: worker.JobRun) -> Any:
+    """run_ml_train_job with the pipeline faked only when the extra is absent."""
+    with ml_pipeline_fakes():
         return await worker.run_ml_train_job(_Pool(conn), engine, job, run)
 
 
@@ -393,7 +423,7 @@ async def test_the_round_trip_trains_exports_and_registers(models_dir: Path) -> 
     conn = _MlConn()
     run = worker.JobRun()
 
-    outcome = await _run_with_fakes(conn, None, _ml_job(_request(), _config()), run)
+    outcome = await _run_ml_job(conn, None, _ml_job(_request(), _config()), run)
 
     # the job completed with the real fold metrics
     assert outcome.result is not None
@@ -422,7 +452,18 @@ async def test_the_round_trip_trains_exports_and_registers(models_dir: Path) -> 
     assert metadata["horizon"] == "1"
     assert metadata["feature_names"] == json.dumps(list(jobs.DEFAULT_FEATURE_SPEC.feature_names))
     x = np.linspace(-1.0, 1.0, 128, dtype=np.float32).reshape(4, 32)
-    assert np.allclose(session.run(None, {"x": x})[0], x.max(axis=1))
+    if ml_training_extra_installed():
+        # the real converter's graph: the exporter-named input at the spec's
+        # width, class labels out
+        width = len(jobs.DEFAULT_FEATURE_SPEC.feature_names)
+        sample = np.zeros((4, width), dtype=np.float32)
+        assert session.get_inputs()[0].name == "features"
+        labels = session.run(None, {"features": sample})[0]
+        assert labels.shape == (4,)
+        assert set(labels.tolist()) <= {0, 1}
+    else:
+        # the fake's graph is ReduceMax over the rows, on its own named input
+        assert np.allclose(session.run(None, {"x": x})[0], x.max(axis=1))
 
     # the provenance of what it trained on rides the detail
     coverage = run.detail["provenance"]["coverage"]
@@ -508,7 +549,7 @@ async def test_the_job_dispatches_and_completes_through_the_queue(
     assert worker._HANDLERS["ml_train"] is worker.run_ml_train_job
     conn = _MlConn()
 
-    with patch.dict("sys.modules", {**fake_xgboost()[0], **fake_onnxmltools(FakeModelProto())}):
+    with ml_pipeline_fakes():
         await worker._run_claimed(_Pool(conn), _ml_job(_request(), _config()), tick_s=0.01)
 
     finishes = [(q, a) for q, a in conn.executed if "finished_at = now()" in q]
@@ -520,3 +561,105 @@ async def test_the_job_dispatches_and_completes_through_the_queue(
     assert result["metrics"]["folds"] >= 1
     assert args[3] is None  # no backtest result rows to point at
     assert len(conn.inserts) == 1  # the registry INSERT happened exactly once
+
+
+# ---------------------------------------------------------------------------
+# Idempotency: one training job, one registered version (the requeue story)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_rerun_of_a_job_that_already_registered_serves_the_same_version(
+    models_dir: Path,
+) -> None:
+    """The worker-crash repro: the register commits, the terminal write never does.
+
+    A crash, a SIGTERM in the pool release, or a stale-heartbeat restart leaves
+    the row running with the version already registered; the requeue re-runs
+    the job and must serve that committed version, never register a second one.
+    """
+    conn = _MlConn()
+    job = _ml_job(_request(), _config())
+
+    # the worker dies right after the register commit: the handler ran, the
+    # terminal write never did, so the row is left running with v1 registered
+    first = await _run_ml_job(conn, None, job, worker.JobRun())
+    assert first.result is not None
+    assert first.result["version"] == 1
+    assert len(conn.inserts) == 1
+
+    # the restart requeues the abandoned row and claims it again
+    second = await _run_ml_job(conn, None, job, worker.JobRun())
+
+    assert len(conn.inserts) == 1  # count unchanged: no second registration
+    assert second.result is not None
+    assert second.result["id"] == first.result["id"]  # the SAME version served
+    assert second.result["version"] == 1
+
+
+class _CancelAfterRegisterConn(_MlConn):
+    """The cancel is requested on the row while the job runs.
+
+    The tick only reports it once the registry INSERT has been served, so the
+    cancel lands in the window after the register commit — the straddle the
+    discard exists for.
+    """
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        if "RETURNING cancel_requested" in query:
+            self.ticks.append((args[1], json.loads(args[2])))
+            return {"cancel_requested": bool(self.registered)}
+        return await super().fetchrow(query, *args)
+
+
+class _StallingRegistry(ModelRegistry):
+    """The real registry, held open in the window after the register commit."""
+
+    async def register(self, entry: ModelRegistration) -> Any:
+        version = await super().register(entry)
+        await asyncio.sleep(30)  # cancelled here: post-commit, pre-return
+        return version
+
+
+async def test_a_cancel_landing_after_the_register_discards_the_version(
+    tmp_path: Path, models_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel that straddles the register commit leaves no Staging version behind."""
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+    monkeypatch.setattr(worker, "ModelRegistry", _StallingRegistry)
+    conn = _CancelAfterRegisterConn()
+    job = _ml_job(_request(), _config())
+
+    with ml_pipeline_fakes():
+        await worker._run_claimed(_Pool(conn), job, tick_s=0.01)
+
+    assert len(conn.inserts) == 1  # the register did commit before the cancel
+    finishes = [(q, a) for q, a in conn.executed if "finished_at = now()" in q]
+    assert len(finishes) == 1
+    _, args = finishes[0]
+    assert args[:2] == ("ml-unit0001", "cancelled")
+    # the registered version is discarded with the cancelled job
+    assert [a for _, a in conn.deletes] == [("ml-unit0001",)]
+    assert conn.registered == []
+
+
+@pytest.mark.skipif(
+    not ml_training_extra_installed(), reason="the ml-training extra is not installed"
+)
+async def test_the_real_converter_ran(models_dir: Path) -> None:
+    """With the extra installed the honest path converts through real onnxmltools.
+
+    The guard for the conditional fakes: the fake graph answers on an input
+    named ``x``, the real converter on the exporter's ``features`` — so this
+    fails if the pipeline modules ever go back to patching unconditionally.
+    """
+    conn = _MlConn()
+
+    await _run_ml_job(conn, None, _ml_job(_request(), _config()), worker.JobRun())
+
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(
+        str(models_dir / "ml-unit0001.onnx"), providers=["CPUExecutionProvider"]
+    )
+    assert session.get_inputs()[0].name == "features"
+    assert len(conn.inserts) == 1

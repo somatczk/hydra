@@ -454,9 +454,20 @@ async def run_ml_train_job(
     ``fetch_max_bars`` per read, and the same 6 h job timeout as every kind.
     The parity sample is the most recent fully-warmed window — the rows serving
     will actually see.
+
+    The register happens before the terminal ``jobs.finish`` write, so a worker
+    death in between is bridged idempotently: the re-run serves the committed
+    version (0013 keeps it the only one), and a cancel landing after the
+    register discards it with the job.
     """
     body = MlTrainRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
+
+    # the requeue story: a job that already registered serves its committed version
+    already = await ModelRegistry(pool).get_by_training_job(str(job["id"]))
+    if already is not None:
+        return JobOutcome(result=already.to_dict())
+
     spec = jobs.ml_feature_spec(body)
     exchange = config.exchange.exchange_id
 
@@ -598,20 +609,30 @@ async def _finish_with_retry(
         delay = min(delay * 2, 5.0)
 
 
-async def _discard_partial_result(pool: Any, run: JobRun) -> None:
+async def _discard_partial_result(pool: Any, job: Mapping[str, Any], run: JobRun) -> None:
     """Drop a result a cancelled or timed-out run committed but never finished the job with.
 
-    A cancel is honoured on the next tick, which can land after the result transaction has
-    committed; the job row then says cancelled, so no half-claimed result may stay behind.
+    A cancel is honoured on the next tick, which can land after the result
+    transaction has committed; the job row then says cancelled, so no
+    half-claimed result may stay behind. An ml_train job's half-claimed result
+    is its registered version: the registry is asked by ``training_job_id``, so
+    the discard holds even when the cancel lands between the register commit
+    and the handler's return (and a human promotion outlives the job).
     """
-    if run.persisted_result_id is None:
-        return
-    try:
-        await jobs.delete_result_rows(pool, run.persisted_result_id)
-    except Exception:
-        logger.warning(
-            "Could not drop the partial result %s", run.persisted_result_id, exc_info=True
-        )
+    if run.persisted_result_id is not None:
+        try:
+            await jobs.delete_result_rows(pool, run.persisted_result_id)
+        except Exception:
+            logger.warning(
+                "Could not drop the partial result %s", run.persisted_result_id, exc_info=True
+            )
+    if job["kind"] == "ml_train":
+        try:
+            await ModelRegistry(pool).discard_training_job_version(str(job["id"]))
+        except Exception:
+            logger.warning(
+                "Could not drop the model registered by job %s", job["id"], exc_info=True
+            )
 
 
 async def _run_claimed(
@@ -643,7 +664,7 @@ async def _run_claimed(
         job_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await job_task
-        await _discard_partial_result(pool, run)
+        await _discard_partial_result(pool, job, run)
         await _finish_with_retry(
             pool, job_id, "failed", detail=run.detail, error=f"timed out after {timeout_s}s"
         )
@@ -651,13 +672,13 @@ async def _run_claimed(
         if stop is not None and stop.is_set():
             await jobs.requeue_for_shutdown(pool, job_id)
         else:
-            await _discard_partial_result(pool, run)
+            await _discard_partial_result(pool, job, run)
             await _finish_with_retry(pool, job_id, "cancelled", detail=run.detail)
     except JobError as exc:
         await _finish_with_retry(pool, job_id, "failed", detail=run.detail, error=str(exc))
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
-        await _discard_partial_result(pool, run)
+        await _discard_partial_result(pool, job, run)
         await _finish_with_retry(pool, job_id, "failed", detail=run.detail, error=str(exc))
     else:
         await _finish_with_retry(

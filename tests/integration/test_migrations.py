@@ -315,6 +315,99 @@ async def test_0012_downgrade_drops_the_registry_table(fresh_database: str) -> N
     assert [r["n"] for r in counts] == [0]
 
 
+_ML_INSERT_WITH_JOB_0013 = """
+    INSERT INTO ml_models (id, name, version, model_type, feature_spec,
+                           artifact_file, artifact_sha256, trained_at, created_by,
+                           training_job_id)
+    VALUES ('{id}', 'alpha', {version}, 'xgboost', '{{"spec_version": 3}}',
+            'alpha-v{version}.onnx', '{sha}', '2026-10-28T12:00:00Z', 'job:task-abc12345',
+            '{job_id}')
+"""
+
+_ML_INSERT_UPLOAD_0013 = """
+    INSERT INTO ml_models (id, name, version, model_type, feature_spec,
+                           artifact_file, artifact_sha256, trained_at, created_by)
+    VALUES ('{id}', 'alpha', {version}, 'xgboost', '{{"spec_version": 3}}',
+            'alpha-v{version}.onnx', '{sha}', '2026-10-28T12:00:00Z', 'upload:dev')
+"""
+
+
+async def test_0013_one_version_per_training_job(fresh_database: str) -> None:
+    """The idempotent-rerun backstop: a partial UNIQUE index on training_job_id."""
+    await _upgrade(fresh_database)
+    await _execute(
+        fresh_database,
+        "INSERT INTO backtest_jobs (id, kind, request, strategy_config) "
+        "VALUES ('task-abc12345', 'ml_train', '{}', '{}')",
+    )
+    await _execute(
+        fresh_database,
+        _ML_INSERT_WITH_JOB_0013.format(
+            id="7d5c7e34-1f3e-4f8e-9d34-a91b64f00011",
+            version=1,
+            sha="a" * 64,
+            job_id="task-abc12345",
+        ),
+    )
+
+    # a re-run registering a SECOND version for the same job is refused
+    with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+        await _execute(
+            fresh_database,
+            _ML_INSERT_WITH_JOB_0013.format(
+                id="7d5c7e34-1f3e-4f8e-9d34-a91b64f00012",
+                version=2,
+                sha="b" * 64,
+                job_id="task-abc12345",
+            ),
+        )
+    assert excinfo.value.constraint_name == "ml_models_training_job_id_key"
+
+    # the upload path (no training job) is outside the partial index
+    await _execute(
+        fresh_database,
+        _ML_INSERT_UPLOAD_0013.format(
+            id="7d5c7e34-1f3e-4f8e-9d34-a91b64f00013", version=2, sha="c" * 64
+        ),
+    )
+    await _execute(
+        fresh_database,
+        _ML_INSERT_UPLOAD_0013.format(
+            id="7d5c7e34-1f3e-4f8e-9d34-a91b64f00014", version=3, sha="d" * 64
+        ),
+    )
+
+    # the downgrade drops the index: a same-job insert then succeeds (version 4
+    # is free — the uploads took 2 and 3)
+    await asyncio.to_thread(command.downgrade, alembic_config(fresh_database), "0012_ml_models")
+    await _execute(
+        fresh_database,
+        _ML_INSERT_WITH_JOB_0013.format(
+            id="7d5c7e34-1f3e-4f8e-9d34-a91b64f00012",
+            version=4,
+            sha="b" * 64,
+            job_id="task-abc12345",
+        ),
+    )
+    # the duplicate goes before the index can be recreated
+    await _execute(
+        fresh_database,
+        "DELETE FROM ml_models WHERE version = 4 AND training_job_id = 'task-abc12345'",
+    )
+
+    await _upgrade(fresh_database)
+    assert await current_revision(fresh_database) == head_revision()
+    jobs = await _fetch(
+        fresh_database,
+        "SELECT version, training_job_id FROM ml_models ORDER BY version",
+    )
+    assert [tuple(r) for r in jobs] == [
+        (1, "task-abc12345"),
+        (2, None),
+        (3, None),
+    ]
+
+
 async def test_legacy_2_1_10_schema_upgrades_in_place(fresh_database: str) -> None:
     await _execute(fresh_database, LEGACY_SCHEMA.read_text())
     await _execute(

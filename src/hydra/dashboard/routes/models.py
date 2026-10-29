@@ -590,7 +590,17 @@ async def get_retrain_status(task_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/retrain/{task_id}/cancel", response_model=RetrainResponse)
 async def cancel_retrain(task_id: str, request: Request) -> dict[str, Any]:
-    """Cancel a queued or running retrain; 404 unknown, 409 already terminal."""
-    row = await cancel_job(require_pool(request), task_id)
-    audit(_principal(request), "model_retrain_cancelled", task_id=task_id, status=row["status"])
-    return {"task_id": task_id, "status": row["status"]}
+    """Cancel a queued or running retrain; 404 unknown or not an ml_train job, 409 terminal."""
+    pool = require_pool(request)
+    async with db_errors("reading the ml_train job"):
+        row = await jobs.get(pool, task_id, kind="ml_train")
+    if row is None:
+        raise api_error(404, "task_not_found", f"Task {task_id} not found", "not_found")
+    cancelled = await cancel_job(pool, task_id)
+    audit(
+        _principal(request),
+        "model_retrain_cancelled",
+        task_id=task_id,
+        status=cancelled["status"],
+    )
+    return {"task_id": task_id, "status": cancelled["status"]}

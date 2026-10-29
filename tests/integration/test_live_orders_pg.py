@@ -16,6 +16,7 @@ from hydra.data.migrations.runner import (
     alembic_config,
     current_revision,
     head_revision,
+    heads,
     upgrade_to_head,
 )
 from hydra.execution.live_orders import (
@@ -47,8 +48,8 @@ async def pool(fresh_database: str):
 
 
 def test_0009_is_the_single_head() -> None:
-    # 0012 (P5-A's ml_models registry) is the head; 0009 lands the live schema
-    assert head_revision() == "0012_ml_models"
+    # the chain has exactly one head (0013 at writing); 0009 lands the live schema
+    assert heads() == [head_revision()]
 
 
 async def test_the_schema_lands_idempotently_and_seeds_the_live_row(
@@ -57,7 +58,7 @@ async def test_the_schema_lands_idempotently_and_seeds_the_live_row(
     import asyncio
 
     await asyncio.to_thread(upgrade_to_head, fresh_database)
-    assert await current_revision(fresh_database) == "0012_ml_models"
+    assert await current_revision(fresh_database) == head_revision()
 
     async with pool.acquire() as conn:
         live_scope = await conn.fetchval("SELECT count(*) FROM risk_state WHERE scope = 'live'")
@@ -67,7 +68,7 @@ async def test_the_schema_lands_idempotently_and_seeds_the_live_row(
 
     # a second upgrade changes nothing (idempotent, forward-only)
     await asyncio.to_thread(upgrade_to_head, fresh_database)
-    assert await current_revision(fresh_database) == "0012_ml_models"
+    assert await current_revision(fresh_database) == head_revision()
 
 
 async def test_the_downgrade_drops_the_live_schema_and_the_seed(fresh_database: str) -> None:
@@ -90,7 +91,7 @@ async def test_the_downgrade_drops_the_live_schema_and_the_seed(fresh_database: 
         await conn.close()
 
     await asyncio.to_thread(upgrade_to_head, fresh_database)
-    assert await current_revision(fresh_database) == "0012_ml_models"
+    assert await current_revision(fresh_database) == head_revision()
 
 
 def _order(cid: str, symbol: str = "BTCUSDT", **overrides: Any) -> LiveOrderRecord:

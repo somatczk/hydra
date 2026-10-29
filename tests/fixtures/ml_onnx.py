@@ -8,12 +8,20 @@ a runtime dependency — loads, runs and reads back the artifact for real. The
 fake classifier predicts each row's NaN-safe maximum, so on any NaN-free sample
 its predictions match the ONNX graph exactly, and its per-row ``(k,)`` output
 shape is what a real ``XGBClassifier.predict`` returns.
+
+When the ml-training extra IS installed (a dev checkout, the ML image), the
+honest-path tests skip the fakes and exercise the REAL converter through
+``ml_pipeline_fakes``; only the tests that need fake misbehaviour (a parity
+failure, a spec-less artifact, a stalling fit) keep the fakes unconditionally.
 """
 
 from __future__ import annotations
 
+import importlib.util
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -171,3 +179,31 @@ def fake_xgboost() -> tuple[dict[str, Any], MagicMock]:
     module = MagicMock()
     module.XGBClassifier = MagicMock(return_value=model)
     return {"xgboost": module}, model
+
+
+def ml_training_extra_installed() -> bool:
+    """True when the ml-training extra's converter stack is importable."""
+    return all(importlib.util.find_spec(name) is not None for name in ("xgboost", "onnxmltools"))
+
+
+def ml_fake_modules(proto: FakeModelProto | None = None) -> dict[str, Any]:
+    """The ``sys.modules`` fakes for the pipeline (the dev-extra tier)."""
+    if proto is None:
+        proto = FakeModelProto()
+    return {**fake_xgboost()[0], **fake_onnxmltools(proto)}
+
+
+@contextmanager
+def ml_pipeline_fakes(proto: FakeModelProto | None = None) -> Iterator[None]:
+    """Patch the training pipeline's modules, unless the real stack is installed.
+
+    With the extra present the patch is skipped entirely — an empty
+    ``patch.dict("sys.modules", ...)`` would erase every module imported inside
+    it on exit — so the honest-path tests train and convert through the real
+    xgboost and onnxmltools; only CI's dev-extra tier gets the fakes.
+    """
+    if ml_training_extra_installed():
+        yield
+        return
+    with patch.dict("sys.modules", ml_fake_modules(proto)):
+        yield

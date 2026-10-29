@@ -4,8 +4,8 @@ Versions are immutable rows, promote/rollback are the registry's own
 transactions, uploads register server-named artifacts, and a retrain submits a
 real ``ml_train`` job whose worker round-trip (train -> ONNX export -> parity
 gate -> register) runs against this database. XGBoost/onnxmltools are faked at
-the ``sys.modules`` seam (CI installs only the dev extra); onnxruntime, the
-registry, the queue and the routes are real.
+the ``sys.modules`` seam only when the ml-training extra is absent (the CI
+tier); onnxruntime, the registry, the queue and the routes are always real.
 
 The app is driven with httpx's ASGI transport on the pytest event loop — the
 same loop the asyncpg pool lives on. A starlette TestClient would run the route
@@ -24,7 +24,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import asyncpg
 import httpx
@@ -32,7 +31,7 @@ import pytest
 import yaml
 from fastapi import FastAPI
 
-from hydra.backtest import worker
+from hydra.backtest import jobs, worker
 from hydra.core.config import load_config
 from hydra.core.types import OHLCV, Timeframe
 from hydra.dashboard import deps
@@ -40,8 +39,8 @@ from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.models import router
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.data.storage import MarketDataRepository
-from hydra.ml.registry import ModelRegistry
-from tests.fixtures.ml_onnx import FakeModelProto, fake_onnxmltools, fake_xgboost, reduce_max_onnx
+from hydra.ml.registry import ModelRegistration, ModelRegistry, ModelVersion
+from tests.fixtures.ml_onnx import ml_pipeline_fakes, reduce_max_onnx
 
 pytestmark = pytest.mark.integration
 
@@ -325,7 +324,7 @@ class TestRetrainRoundTrip:
             )
         assert (row["kind"], row["status"]) == ("ml_train", "queued")
 
-        with patch.dict("sys.modules", {**fake_xgboost()[0], **fake_onnxmltools(FakeModelProto())}):
+        with ml_pipeline_fakes():
             claimed = await worker.run_once(pool)
         assert claimed == task_id
 
@@ -369,7 +368,7 @@ class TestRetrainRoundTrip:
             json={"strategy_id": strategy, "symbol": "BTCUSDT", "window_1h": N_1H},
         )
         assert second.status_code == 202
-        with patch.dict("sys.modules", {**fake_xgboost()[0], **fake_onnxmltools(FakeModelProto())}):
+        with ml_pipeline_fakes():
             await worker.run_once(pool)
         assert await _stages(client, "champ") == {1: "Staging", 2: "Staging"}
 
@@ -418,3 +417,135 @@ class TestRetrainRoundTrip:
         async with pool.acquire() as conn:
             count = await conn.fetchval("SELECT COUNT(*) FROM backtest_jobs")
         assert count == 0
+
+
+async def _submit_retrain(client: httpx.AsyncClient, strategy: str) -> str:
+    resp = await client.post(
+        "/api/models/champ/retrain",
+        json={
+            "strategy_id": strategy,
+            "symbol": "BTCUSDT",
+            "horizon": 1,
+            "window_1h": N_1H,
+            "window_4h": N_4H,
+            "window_1d": N_1D,
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    return resp.json()["task_id"]
+
+
+class TestIdempotentRerun:
+    """The queue's idempotent re-run story, proven for the one non-trivial kind."""
+
+    async def test_a_requeued_rerun_serves_the_registered_version(
+        self,
+        pool: Any,
+        client: httpx.AsyncClient,
+        strategy: str,
+        models_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The worker-crash repro: the register commits, the terminal write never does.
+
+        A worker that dies between the registry INSERT and the finish UPDATE
+        leaves the row running with the version registered; the restart's
+        requeue re-runs the job, which must serve that committed version —
+        never register a second one for the same training job.
+        """
+        await _seed_universe(pool)
+        await _seed_bars(pool)
+        monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+        task_id = await _submit_retrain(client, strategy)
+
+        job = await jobs.claim(pool, "test-worker")
+        assert job is not None and job["id"] == task_id
+
+        # the crash: the handler ran (the register committed) but the worker
+        # died before any terminal write, so the row is left running
+        with ml_pipeline_fakes():
+            await worker.run_ml_train_job(pool, None, job, worker.JobRun())
+        [v1] = await ModelRegistry(pool).list("champ")
+        assert (v1.version, v1.training_job_id, v1.stage) == (1, task_id, "staging")
+
+        # the restart: the abandoned row is requeued and claimed again
+        await jobs.requeue_abandoned(pool)
+        with ml_pipeline_fakes():
+            claimed = await worker.run_once(pool)
+        assert claimed == task_id
+
+        status = (await client.get(f"/api/models/retrain/{task_id}")).json()
+        assert status["status"] == "completed"
+        assert status["result"]["version"] == 1
+        assert status["result"]["id"] == str(v1.id)  # the SAME version served
+        versions = await ModelRegistry(pool).list("champ")
+        assert [v.version for v in versions] == [1]  # count unchanged
+
+    async def test_a_cancel_landing_after_the_register_discards_the_version(
+        self,
+        pool: Any,
+        client: httpx.AsyncClient,
+        strategy: str,
+        models_dir: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cancel that straddles the register commit leaves no Staging version."""
+        await _seed_universe(pool)
+        await _seed_bars(pool)
+        monkeypatch.setattr(worker, "HEARTBEAT_PATH", str(tmp_path / "heartbeat"))
+        task_id = await _submit_retrain(client, strategy)
+        job = await jobs.claim(pool, "test-worker")
+        assert job is not None
+
+        class _StallingRegistry(ModelRegistry):
+            """Holds the job open in the window after the register commit."""
+
+            async def register(self, entry: ModelRegistration) -> ModelVersion:
+                version = await super().register(entry)
+                await asyncio.sleep(30)  # cancelled here: post-commit, pre-return
+                return version
+
+        monkeypatch.setattr(worker, "ModelRegistry", _StallingRegistry)
+
+        with ml_pipeline_fakes():
+            run_task = asyncio.create_task(worker._run_claimed(pool, job, tick_s=0.05))
+            # wait for the register commit, then ask for the cancel mid-stall
+            registered: list[Any] = []
+            for _ in range(500):
+                registered = await ModelRegistry(pool).list("champ")
+                if registered:
+                    break
+                await asyncio.sleep(0.02)
+            assert registered, "the register never committed"
+            await jobs.request_cancel(pool, task_id)
+            await asyncio.wait_for(run_task, 60)
+
+        status = (await client.get(f"/api/models/retrain/{task_id}")).json()
+        assert status["status"] == "cancelled"
+        # the cancelled job leaves no lingering Staging version
+        assert await ModelRegistry(pool).list("champ") == []
+
+
+class TestRetrainCancel:
+    async def test_a_backtest_job_id_cannot_cancel_through_the_models_route(
+        self, pool: Any, client: httpx.AsyncClient, strategy: str
+    ) -> None:
+        """The cancel is kind-gated like the status route: a backtest id is 404."""
+        await _seed_universe(pool)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO backtest_jobs (id, kind, request, strategy_config) "
+                "VALUES ('task-bt0001', 'backtest', '{}', '{}')",
+            )
+
+        resp = await client.post("/api/models/retrain/task-bt0001/cancel")
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "task_not_found"
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, cancel_requested FROM backtest_jobs WHERE id = 'task-bt0001'"
+            )
+        assert (row["status"], row["cancel_requested"]) == ("queued", False)
