@@ -7,48 +7,104 @@ AND/OR operators and indicator conditions.
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import Direction, Symbol
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.condition_schema import ConditionGroup, RuleSet
-from hydra.strategy.context import resolve_indicator
+from hydra.strategy.context import indicator_params, resolve_indicator
 from hydra.strategy.rule_engine import evaluate_condition_group, parse_indicator_ref
 
+logger = logging.getLogger(__name__)
 
-def _apply_value_ref_overrides(
-    value_str: str,
-    overrides: dict[str, str],
-    top_params: dict[str, Any],
-) -> str:
-    """Replace embedded params in a value string reference.
+_GROUPS = ("entry_long", "exit_long", "entry_short", "exit_short")
 
-    Given ``"sma:period=50"`` and overrides ``{"sma_period": "period"}``,
-    if ``top_params["sma_period"]`` is set, replaces ``period=50`` with the
-    new value.
+
+@dataclass(frozen=True, slots=True)
+class ParamBinding:
+    """One condition site a top-level parameter sets: its ``params``, ``value`` or ``ref`` key."""
+
+    group: str
+    index: int
+    target: Literal["params", "value", "ref"]
+    key: str
+    default: Any
+    implicit: bool = False
+
+    def __str__(self) -> str:
+        return f"{self.group}[{self.index}].{self.target}.{self.key}={self.default}"
+
+
+def param_bindings(rules: RuleSet) -> dict[str, list[ParamBinding]]:
+    """Every top-level name the rules bind, with its sites in rule order (see ``Condition``).
+
+    Raises ValueError for a ``param_overrides`` entry naming a parameter its indicator lacks.
     """
-    parts = value_str.split(":", maxsplit=1)
-    if len(parts) < 2:
-        return value_str
+    table: dict[str, list[ParamBinding]] = {}
 
-    ind_name = parts[0]
-    embedded: dict[str, str] = {}
-    for kv in parts[1].split(","):
-        k, _, v = kv.partition("=")
-        embedded[k.strip()] = v.strip()
+    def bind(name: str, site: ParamBinding) -> None:
+        table.setdefault(name, []).append(site)
 
-    for top_key, embedded_key in overrides.items():
-        if top_key in top_params and embedded_key in embedded:
-            raw = top_params[top_key]
-            if isinstance(raw, float) and raw == int(raw):
-                embedded[embedded_key] = str(int(raw))
-            else:
-                embedded[embedded_key] = str(raw)
+    for group in _GROUPS:
+        rule_group: ConditionGroup | None = getattr(rules, group)
+        for i, cond in enumerate(rule_group.conditions if rule_group else []):
+            if cond.param_key and cond.params:
+                key = next(iter(cond.params))
+                bind(cond.param_key, ParamBinding(group, i, "params", key, cond.params[key]))
+            if cond.param_overrides:
+                known = indicator_params(cond.indicator, cond.params)
+                for name, key in cond.param_overrides.items():
+                    if key not in known:
+                        msg = (
+                            f"{group}[{i}] param_overrides {name!r}: {cond.indicator} has no "
+                            f"parameter {key!r} (it takes {', '.join(known) or 'none'})"
+                        )
+                        raise ValueError(msg)
+                    bind(name, ParamBinding(group, i, "params", key, known[key]))
+            if cond.value_param_key and not isinstance(cond.value, str):
+                bind(cond.value_param_key, ParamBinding(group, i, "value", "value", cond.value))
+            ref, embedded = (
+                parse_indicator_ref(cond.value) if isinstance(cond.value, str) else ("", {})
+            )
+            if cond.value_ref_overrides and ref:
+                known = indicator_params(ref, embedded)
+                for name, key in cond.value_ref_overrides.items():
+                    if key in known:
+                        bind(name, ParamBinding(group, i, "ref", key, known[key]))
+            if not cond.param_key and cond.param_overrides is None:
+                for key, default in cond.params.items():
+                    bind(
+                        f"{cond.indicator}_{key}",
+                        ParamBinding(group, i, "params", key, default, True),
+                    )
+            if cond.value_ref_overrides is None:
+                for key, default in embedded.items():
+                    bind(f"{ref}_{key}", ParamBinding(group, i, "ref", key, default, True))
+    return table
 
-    param_str = ",".join(f"{k}={v}" for k, v in embedded.items())
-    return f"{ind_name}:{param_str}"
+
+def ambiguous(sites: list[ParamBinding]) -> bool:
+    """An implicit name-match whose sites hold different values: it never binds."""
+    return any(s.implicit for s in sites) and len({s.default for s in sites}) > 1
+
+
+def bindable_params(rules: RuleSet) -> dict[str, list[ParamBinding]]:
+    """The names a top-level parameter can set: ``param_bindings`` without the ambiguous ones."""
+    return {name: sites for name, sites in param_bindings(rules).items() if not ambiguous(sites)}
+
+
+def _set_ref_param(ref: str, key: str, raw: Any) -> str:
+    """Set *key* in an indicator reference (``"sma:period=50"``); an integral float stays an int."""
+    name, _, rest = ref.partition(":")
+    embedded = {
+        k.strip(): v.strip() for k, _, v in (kv.partition("=") for kv in rest.split(",") if kv)
+    }
+    embedded[key] = str(int(raw)) if isinstance(raw, float) and raw == int(raw) else str(raw)
+    return f"{name}:{','.join(f'{k}={v}' for k, v in embedded.items())}"
 
 
 class RuleBasedStrategy(BaseStrategy):
@@ -80,59 +136,40 @@ class RuleBasedStrategy(BaseStrategy):
         return ConditionGroup(**data)
 
     def _apply_param_overrides(self) -> None:
-        """Override condition params from top-level strategy parameters.
+        """Set every bound condition site from the top-level ``parameters`` (see ``Condition``).
 
-        When a condition has ``param_key`` set, the first key in its ``params``
-        dict is overridden with the matching value from top-level parameters.
-        Similarly ``value_param_key`` overrides the condition's ``value``.
+        An ambiguous implicit name that is set is a ValueError; an implicit one that applies
+        is logged, so a name-match never rewires conditions silently.
         """
-        top_params = self._config.parameters
-        for group in [
-            self._rules.entry_long,
-            self._rules.exit_long,
-            self._rules.entry_short,
-            self._rules.exit_short,
-        ]:
-            if group is None:
+        top = self._config.parameters
+        implicit: list[str] = []
+        for name, sites in param_bindings(self._rules).items():
+            if name not in top:
                 continue
-            for cond in group.conditions:
-                # Explicit param_key → override cond.params[first_key]
-                if cond.param_key and cond.param_key in top_params and cond.params:
-                    primary = next(iter(cond.params))
-                    cond.params[primary] = top_params[cond.param_key]
-                # Explicit value_param_key → override cond.value as float
-                if cond.value_param_key and cond.value_param_key in top_params:
-                    cond.value = float(top_params[cond.value_param_key])
-                # Explicit value_ref_overrides → modify embedded params in value string
-                if cond.value_ref_overrides and isinstance(cond.value, str):
-                    cond.value = _apply_value_ref_overrides(
-                        cond.value, cond.value_ref_overrides, top_params
-                    )
-                # Auto-match: {indicator}_{param_name} → override cond.params
-                if not cond.param_key:
-                    for pname in list(cond.params):
-                        auto_key = f"{cond.indicator}_{pname}"
-                        if auto_key in top_params:
-                            cond.params[pname] = top_params[auto_key]
-                # Auto-match: {ref_indicator}_{param_name} → override value string
-                if (
-                    not cond.value_ref_overrides
-                    and isinstance(cond.value, str)
-                    and ":" in cond.value
-                ):
-                    value_str: str = cond.value
-                    ref_parts = value_str.split(":", maxsplit=1)
-                    ref_ind = ref_parts[0]
-                    auto_overrides: dict[str, str] = {}
-                    for kv in ref_parts[1].split(","):
-                        k = kv.partition("=")[0].strip()
-                        auto_key = f"{ref_ind}_{k}"
-                        if auto_key in top_params:
-                            auto_overrides[auto_key] = k
-                    if auto_overrides:
-                        cond.value = _apply_value_ref_overrides(
-                            value_str, auto_overrides, top_params
-                        )
+            if ambiguous(sites):
+                msg = (
+                    f"parameter {name!r} matches conditions with different values by name "
+                    f"({', '.join(map(str, sites))}); bind the one it is meant for with "
+                    "param_overrides or value_ref_overrides"
+                )
+                raise ValueError(msg)
+            if any(site.implicit for site in sites):
+                implicit.append(name)
+            for site in sites:
+                cond = getattr(self._rules, site.group).conditions[site.index]
+                if site.target == "params":
+                    cond.params[site.key] = top[name]
+                elif site.target == "value":
+                    cond.value = float(top[name])
+                else:
+                    cond.value = _set_ref_param(cond.value, site.key, top[name])
+        if implicit:
+            logger.warning(
+                "strategy %s binds %s to its rules by name ({indicator}_{param}); declare "
+                "param_overrides or value_ref_overrides to bind them explicitly",
+                self.strategy_id,
+                ", ".join(implicit),
+            )
 
     def _validate_indicators(self) -> None:
         """Raise ValueError now for a rule that would raise on every bar (unknown or

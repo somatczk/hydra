@@ -86,6 +86,12 @@ def resolve_indicator(name: str, params: Mapping[str, object]) -> Callable[..., 
     return func
 
 
+def indicator_params(name: str, params: Mapping[str, object]) -> dict[str, object]:
+    """*name*'s own parameters, *params* over the signature defaults; ValueError as resolve does."""
+    sig = _signature(resolve_indicator(name, params))
+    return {k: params.get(k, p.default) for k, p in sig.parameters.items() if k not in DATA_PARAMS}
+
+
 class StrategyContext:
     """Read-only context provided to strategies.
 
