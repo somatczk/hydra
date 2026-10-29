@@ -25,6 +25,7 @@ from hydra.backtest.hyperopt import (
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Timeframe
 from hydra.strategy.base import BaseStrategy
+from hydra.strategy.builtin.rule_based import RuleBasedStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 
@@ -299,10 +300,14 @@ async def test_unknown_param_name_is_rejected_up_front() -> None:
         )
 
 
-def test_unknown_param_names_covers_every_rule_override_surface() -> None:
+def test_unknown_param_names_reads_exactly_what_the_rules_bind() -> None:
+    """A rule-based strategy reads only what its conditions bind: a declared top-level name
+    nothing binds (``level``, ``multiplier``) and an ambiguous name-match are refused."""
     config = _config(
+        strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
         parameters={
             "level": 1,
+            "multiplier": 3.0,
             "rules": {
                 "entry_long": {
                     "operator": "AND",
@@ -328,19 +333,46 @@ def test_unknown_param_names_covers_every_rule_override_surface() -> None:
                             "comparator": "crosses_above",
                             "value": 100,
                         },
+                        {
+                            "indicator": "supertrend_direction",
+                            "params": {"period": 10},
+                            "comparator": "greater_than",
+                            "value": 0,
+                            "param_key": "st_period",
+                            "param_overrides": {"st_mult": "multiplier"},
+                        },
+                        {
+                            "indicator": "sma",
+                            "params": {"period": 20},
+                            "comparator": "greater_than",
+                            "value": "sma:period=50",
+                        },
                     ],
                 }
             },
-        }
+        },
     )
-    space = ParameterSpace(
-        params=[
-            ParamDef(name="level", type="int", low=1, high=2),
-            ParamDef(name="rsi_length", type="int", low=10, high=20),
-            ParamDef(name="rsi_level", type="int", low=20, high=40),
-            ParamDef(name="entry_sma", type="int", low=3, high=8),
-            ParamDef(name="ema_period", type="int", low=10, high=30),
-            ParamDef(name="lvl_typo", type="int", low=1, high=2),
-        ]
+    names = [
+        "level",
+        "multiplier",
+        "rsi_length",
+        "rsi_level",
+        "entry_sma",
+        "ema_period",
+        "st_period",
+        "st_mult",
+        "sma_period",
+        "required_history",
+        "lvl_typo",
+    ]
+    space = ParameterSpace(params=[ParamDef(name=n, type="int", low=1, high=2) for n in names])
+    assert unknown_param_names(space, config, RuleBasedStrategy) == [
+        "level",
+        "lvl_typo",
+        "multiplier",
+        "sma_period",
+    ]
+    # a coded strategy reads its declared parameters, never rule bindings
+    assert unknown_param_names(space, config, _ModeStrategy) == sorted(
+        set(names) - {"level", "multiplier"}
     )
-    assert unknown_param_names(space, config) == ["lvl_typo"]

@@ -22,7 +22,6 @@ import itertools
 import json
 import logging
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -42,6 +41,8 @@ from hydra.backtest.validation import (
 )
 from hydra.core.types import OHLCV, Timeframe
 from hydra.strategy.base import BaseStrategy
+from hydra.strategy.builtin.rule_based import RuleBasedStrategy, bindable_params
+from hydra.strategy.condition_schema import RuleSet
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
 
@@ -151,51 +152,21 @@ class ParameterSpace:
 # ---------------------------------------------------------------------------
 
 
-def unknown_param_names(param_space: ParameterSpace, base_config: StrategyConfig) -> list[str]:
+def unknown_param_names(
+    param_space: ParameterSpace, base_config: StrategyConfig, strategy_class: type[BaseStrategy]
+) -> list[str]:
     """Param-space names the strategy cannot read, sorted; a typo optimises a no-op.
 
-    Readable names are the config's declared ``parameters`` plus, for a rule-based
-    strategy, every name the rule engine's override machinery consults.
+    A rule-based strategy reads ``required_history`` and the names its conditions bind
+    (``bindable_params``, the resolver ``RuleBasedStrategy`` applies; an ambiguous implicit
+    name binds nothing). Any other strategy reads its declared ``parameters``.
     """
-    readable = _readable_param_names(base_config)
+    if issubclass(strategy_class, RuleBasedStrategy):
+        rules = RuleSet.model_validate(base_config.parameters.get("rules") or {})
+        readable = {"required_history", *bindable_params(rules)}
+    else:
+        readable = set(base_config.parameters)
     return sorted({p.name for p in param_space.params if p.name not in readable})
-
-
-def _readable_param_names(config: StrategyConfig) -> set[str]:
-    names = set(config.parameters)
-    rules = config.parameters.get("rules")
-    if not isinstance(rules, Mapping):
-        return names
-    for group in rules.values():
-        conditions = group.get("conditions") if isinstance(group, Mapping) else None
-        if not isinstance(conditions, list):
-            continue
-        for cond in conditions:
-            if isinstance(cond, Mapping):
-                names |= _condition_param_names(cond)
-    return names
-
-
-def _condition_param_names(cond: Mapping[str, Any]) -> set[str]:
-    """Every top-level name ``RuleBasedStrategy._apply_param_overrides`` reads per condition."""
-    names: set[str] = set()
-    params = cond.get("params")
-    param_key = cond.get("param_key")
-    if param_key and isinstance(params, Mapping) and params:
-        names.add(str(param_key))
-    if cond.get("value_param_key"):
-        names.add(str(cond["value_param_key"]))
-    value = cond.get("value")
-    overrides = cond.get("value_ref_overrides")
-    if isinstance(overrides, Mapping) and isinstance(value, str):
-        names |= {str(key) for key in overrides}
-    indicator = cond.get("indicator")
-    if not param_key and isinstance(params, Mapping) and isinstance(indicator, str):
-        names |= {f"{indicator}_{name}" for name in params}
-    if not overrides and isinstance(value, str) and ":" in value:
-        ref, _, rest = value.partition(":")
-        names |= {f"{ref}_{kv.partition('=')[0].strip()}" for kv in rest.split(",")}
-    return names
 
 
 # ---------------------------------------------------------------------------
@@ -422,12 +393,12 @@ class HyperoptRunner:
         if not bars:
             return HyperoptResult()
 
-        unknown = unknown_param_names(param_space, base_config)
+        unknown = unknown_param_names(param_space, base_config, strategy_class)
         if unknown:
             msg = (
                 "param_space names the strategy never reads: "
-                f"{', '.join(unknown)}; optimisable names are the strategy config's "
-                "parameters or its rule conditions' override keys"
+                f"{', '.join(unknown)}; optimisable names are a coded strategy's declared "
+                "parameters or the names a rule-based strategy's conditions bind"
             )
             raise ValueError(msg)
 

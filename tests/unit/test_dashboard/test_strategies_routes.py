@@ -58,6 +58,23 @@ _INVALID_PARAM_RULES: dict[str, Any] = {
     "entry_short": None,
     "exit_short": None,
 }
+_UNKNOWN_BINDING_RULES: dict[str, Any] = {
+    "entry_long": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "supertrend_direction",
+                "params": {"period": 10},
+                "comparator": "greater_than",
+                "value": 0,
+                "param_overrides": {"st_mult": "mult"},
+            }
+        ],
+    },
+    "exit_long": None,
+    "entry_short": None,
+    "exit_short": None,
+}
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -668,8 +685,8 @@ class TestStrategiesFallback:
 
     @pytest.mark.parametrize(
         "rules",
-        [_INVALID_INDICATOR_RULES, _INVALID_PARAM_RULES],
-        ids=["bad_indicator", "bad_param"],
+        [_INVALID_INDICATOR_RULES, _INVALID_PARAM_RULES, _UNKNOWN_BINDING_RULES],
+        ids=["bad_indicator", "bad_param", "unknown_param_override"],
     )
     def test_save_with_invalid_rules_is_422_and_writes_nothing(
         self, tmp_path: Path, rules: dict[str, Any]

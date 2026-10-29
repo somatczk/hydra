@@ -21,10 +21,14 @@ from hydra.data.bars import ceil_to_tf, floor_to_tf, timeframe_seconds
 from hydra.services import strategies as strategy_files
 from hydra.services.backtest import (
     DataProvenanceModel,
+    _invalid_strategy,
     _load_backtest_strategy,
     _preflight,
 )
 from hydra.services.errors import ServiceError, db_errors, service_error
+from hydra.strategy.base import BaseStrategy
+from hydra.strategy.builtin.rule_based import bindable_params
+from hydra.strategy.condition_schema import RuleSet
 from hydra.strategy.config import StrategyConfig
 
 # ---------------------------------------------------------------------------
@@ -70,129 +74,34 @@ def _suggest_range(param_name: str, default: float, param_type: str) -> tuple[fl
     return lo, hi, step
 
 
-def _parse_value_ref(value_str: str) -> tuple[str, dict[str, str]]:
-    """Parse ``'sma:period=50'`` into ``('sma', {'period': '50'})``."""
-    parts = value_str.split(":", maxsplit=1)
-    if len(parts) < 2:
-        return parts[0], {}
-    embedded: dict[str, str] = {}
-    for kv in parts[1].split(","):
-        k, _, v = kv.partition("=")
-        embedded[k.strip()] = v.strip()
-    return parts[0], embedded
-
-
 def _extract_optimizable_params(rules_dict: dict[str, Any]) -> list[dict[str, Any]]:
-    """Walk all conditions and extract optimizable params."""
-    seen: dict[str, dict[str, Any]] = {}
-
-    for group_name in ("entry_long", "exit_long", "entry_short", "exit_short"):
-        group = rules_dict.get(group_name)
-        if not group or not group.get("conditions"):
-            continue
-        for cond in group["conditions"]:
-            indicator = cond.get("indicator", "")
-            params = cond.get("params", {})
-            value = cond.get("value")
-            param_key = cond.get("param_key")
-            value_param_key = cond.get("value_param_key")
-            value_ref_overrides = cond.get("value_ref_overrides")
-
-            # 1. param_key → indicator params
-            if param_key and params:
-                primary_key = next(iter(params))
-                default = params[primary_key]
-                if param_key not in seen:
-                    ptype = _infer_type(default)
-                    lo, hi, step = _suggest_range(primary_key, float(default), ptype)
-                    seen[param_key] = {
-                        "name": param_key,
-                        "label": _humanize_label(param_key),
-                        "type": ptype,
-                        "default": float(default),
-                        "min": lo,
-                        "max": hi,
-                        "step": step,
-                    }
-
-            # 2. value_param_key → numeric threshold
-            if value_param_key and isinstance(value, (int, float)) and value_param_key not in seen:
-                ptype = _infer_type(value)
-                default_val = float(value)
-                lo = max(0, round(default_val * 0.25))
-                hi = round(default_val * 3) if default_val > 0 else 100
-                step = max(1.0, round((hi - lo) / 20, 2))
-                seen[value_param_key] = {
-                    "name": value_param_key,
-                    "label": _humanize_label(value_param_key),
-                    "type": ptype,
-                    "default": default_val,
-                    "min": lo,
-                    "max": hi,
-                    "step": step,
-                }
-
-            # 3. value_ref_overrides → value string embedded params
-            if value_ref_overrides and isinstance(value, str):
-                _, embedded = _parse_value_ref(value)
-                for top_key, embedded_key in value_ref_overrides.items():
-                    if top_key not in seen and embedded_key in embedded:
-                        raw = embedded[embedded_key]
-                        try:
-                            default_val = float(raw)
-                        except ValueError:
-                            continue
-                        ptype = "int" if "." not in raw else "float"
-                        lo, hi, step = _suggest_range(embedded_key, default_val, ptype)
-                        seen[top_key] = {
-                            "name": top_key,
-                            "label": _humanize_label(top_key),
-                            "type": ptype,
-                            "default": default_val,
-                            "min": lo,
-                            "max": hi,
-                            "step": step,
-                        }
-
-            # 4. Auto-extract fallback (no annotations)
-            if not param_key and params:
-                for pname, pval in params.items():
-                    auto_key = f"{indicator}_{pname}"
-                    if auto_key not in seen and isinstance(pval, (int, float)):
-                        ptype = _infer_type(pval)
-                        lo, hi, step = _suggest_range(pname, float(pval), ptype)
-                        seen[auto_key] = {
-                            "name": auto_key,
-                            "label": _humanize_label(auto_key),
-                            "type": ptype,
-                            "default": float(pval),
-                            "min": lo,
-                            "max": hi,
-                            "step": step,
-                        }
-
-            if not value_ref_overrides and isinstance(value, str) and ":" in value:
-                ref_ind, embedded = _parse_value_ref(value)
-                for ek, ev in embedded.items():
-                    auto_key = f"{ref_ind}_{ek}"
-                    if auto_key not in seen:
-                        try:
-                            default_val = float(ev)
-                        except ValueError:
-                            continue
-                        ptype = "int" if "." not in ev else "float"
-                        lo, hi, step = _suggest_range(ek, default_val, ptype)
-                        seen[auto_key] = {
-                            "name": auto_key,
-                            "label": _humanize_label(auto_key),
-                            "type": ptype,
-                            "default": default_val,
-                            "min": lo,
-                            "max": hi,
-                            "step": step,
-                        }
-
-    return list(seen.values())
+    """One entry per name ``bindable_params`` lists, ranged from its first site's value."""
+    params: list[dict[str, Any]] = []
+    for name, sites in bindable_params(RuleSet.model_validate(rules_dict)).items():
+        site = sites[0]
+        default = float(site.default)
+        lo: float
+        hi: float
+        if site.target == "value":
+            ptype = _infer_type(site.default)
+            lo = max(0, round(default * 0.25))
+            hi = round(default * 3) if default > 0 else 100
+            step = max(1.0, round((hi - lo) / 20, 2))
+        else:
+            ptype = "int" if isinstance(site.default, int) else "float"
+            lo, hi, step = _suggest_range(site.key, default, ptype)
+        params.append(
+            {
+                "name": name,
+                "label": _humanize_label(name),
+                "type": ptype,
+                "default": default,
+                "min": lo,
+                "max": hi,
+                "step": step,
+            }
+        )
+    return params
 
 
 def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
@@ -207,7 +116,10 @@ def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
     rules_dict = parameters.get("rules") if isinstance(parameters, dict) else None
     if not rules_dict:
         return []
-    return _extract_optimizable_params(rules_dict)
+    try:
+        return _extract_optimizable_params(rules_dict)
+    except ValueError as exc:
+        raise _invalid_strategy(strategy_id, str(exc)) from exc
 
 
 # ===========================================================================
@@ -321,14 +233,20 @@ def _validated_space(defs: list[ParamDefRequest]) -> ParameterSpace:
         raise service_error(422, "invalid_param_space", str(exc), "invalid") from exc
 
 
-def _check_param_names(space: ParameterSpace, config: StrategyConfig) -> None:
+def _check_param_names(
+    space: ParameterSpace, config: StrategyConfig, strategy_class: type[BaseStrategy]
+) -> None:
     """Reject names the strategy cannot read, before anything is queued."""
-    unknown = unknown_param_names(space, config)
+    try:
+        unknown = unknown_param_names(space, config, strategy_class)
+    except ValueError as exc:
+        raise _invalid_strategy(config.id, str(exc)) from exc
     if unknown:
         raise service_error(
             422,
             "invalid_param_space",
-            f"param_space names the strategy never reads: {', '.join(unknown)}",
+            f"param_space names the strategy never reads: {', '.join(unknown)} "
+            "(strategy_params lists the names a rule-based strategy binds)",
             "invalid",
         )
 
@@ -342,8 +260,8 @@ async def submit_hyperopt(
     on, a range with no stored data is queued anyway — the worker fetches it.
     """
     space = _validated_space(body.param_space)
-    _, config = _load_backtest_strategy(body.strategy_id)
-    _check_param_names(space, config)
+    strategy_class, config = _load_backtest_strategy(body.strategy_id)
+    _check_param_names(space, config, strategy_class)
     pf = await _preflight(
         pool,
         body.strategy_id,
@@ -512,8 +430,8 @@ async def submit_walkforward(
     on the really-loaded span.
     """
     space = _validated_space(body.param_space)
-    _, config = _load_backtest_strategy(body.strategy_id)
-    _check_param_names(space, config)
+    strategy_class, config = _load_backtest_strategy(body.strategy_id)
+    _check_param_names(space, config, strategy_class)
     pf = await _preflight(
         pool,
         body.strategy_id,
