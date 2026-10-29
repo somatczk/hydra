@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   actionPhrase,
+  askPhrase,
   breakerRow,
   dataAnswer,
   exchangeStopRow,
@@ -297,6 +298,13 @@ describe('needsYou', () => {
     expect(actionPhrase('live_session_start')).toBe('start a live session');
     expect(actionPhrase('live_order')).toBe('place a live order');
     expect(actionPhrase('credential_delete')).toBe('delete the stored exchange keys');
+  });
+
+  it('phrases the MCP-ML model registry actions (promote_model / rollback_model)', () => {
+    expect(askPhrase('service:mcp', 'promote_model')).toBe('Claude asks to promote a model to Production');
+    expect(askPhrase('service:mcp', 'rollback_model')).toBe(
+      'Claude asks to roll a model back to its previous Production version',
+    );
   });
 
   it('renders a user-initiated approval as your own action, never "Claude asks to" (must-fix 7)', () => {

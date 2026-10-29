@@ -329,7 +329,7 @@ export interface NeedsYou {
 
 /** The gated action as a phrase: 'kill_switch_release' → 'release the kill switch' (06 §2 approval row).
  * The four P3 live executors (seam #1) read as sentences after 'Claude asks to …'; the P4-E perps
- * ceremony's action reads as its own leveraged sentence. */
+ * ceremony's action reads as its own leveraged sentence; MCP-ML's model registry actions name the stage. */
 export function actionPhrase(action: string): string {
   if (action === 'kill_switch_release') return 'release the kill switch';
   if (action === 'live_arming') return 'turn on live trading';
@@ -337,6 +337,8 @@ export function actionPhrase(action: string): string {
   if (action === 'live_session_start') return 'start a live session';
   if (action === 'live_order') return 'place a live order';
   if (action === 'credential_delete') return 'delete the stored exchange keys';
+  if (action === 'promote_model') return 'promote a model to Production';
+  if (action === 'rollback_model') return 'roll a model back to its previous Production version';
   return action.replaceAll('_', ' ');
 }
 
