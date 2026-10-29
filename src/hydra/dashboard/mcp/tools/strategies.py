@@ -43,6 +43,7 @@ def _save_request(
     risk: RiskInput,
     enable_immediately: bool,
     ml_overlay: dict[str, Any] | None,
+    schedule: dict[str, Any] | None,
 ) -> SaveRequest:
     """The service's save payload, built from the tool's mirrored fields."""
     return SaveRequest(
@@ -55,6 +56,7 @@ def _save_request(
         risk=risk,
         enable_immediately=enable_immediately,
         ml_overlay=ml_overlay,
+        schedule=schedule,
     )
 
 
@@ -88,11 +90,14 @@ async def strategy_save(
     risk: RiskInput = _DEFAULT_RISK,
     enable_immediately: bool = False,
     ml_overlay: dict[str, Any] | None = None,
+    schedule: dict[str, Any] | None = None,
 ) -> str:
     """Validate and save a new strategy as a YAML config file; returns its new id.
 
     ``rules`` is the builder's rule set (entry/exit long/short condition groups);
-    ``enable_immediately`` also marks it enabled for paper sessions. ``symbol``
+    ``enable_immediately`` also marks it enabled for paper sessions. ``schedule``
+    (``active_hours_utc`` 0-23, ``active_days`` 0-6 with Monday=0) limits when entries
+    may open, checked on the primary bar's open time; exits always run. ``symbol``
     must be a member of the current top-100 universe (``universe_list``): a
     non-member is a 422 ``symbol_not_in_universe`` naming the ranking's
     ``ranked_at`` (running sessions and stored strategies are unaffected).
@@ -108,6 +113,7 @@ async def strategy_save(
             risk,
             enable_immediately,
             ml_overlay,
+            schedule,
         )
         result = await strategy_svc.save_strategy(_deps.db_pool(), body)
     except ServiceError as exc:
@@ -130,9 +136,11 @@ async def strategy_update(
     risk: RiskInput = _DEFAULT_RISK,
     enable_immediately: bool = False,
     ml_overlay: dict[str, Any] | None = None,
+    schedule: dict[str, Any] | None = None,
 ) -> str:
     """Update an existing rule-based strategy's YAML config; only rule-based strategies
-    can be edited (400 otherwise). ``symbol`` must be a member of the current
+    can be edited (400 otherwise). Omitting ``schedule`` keeps the stored one; ``{}``
+    clears it. ``symbol`` must be a member of the current
     top-100 universe (``universe_list``): a non-member is a 422
     ``symbol_not_in_universe`` naming the ranking's ``ranked_at`` (the running
     sessions and the stored file are unaffected)."""
@@ -147,6 +155,7 @@ async def strategy_update(
             risk,
             enable_immediately,
             ml_overlay,
+            schedule,
         )
         result = await strategy_svc.update_strategy(_deps.db_pool(), strategy_id, body)
     except ServiceError as exc:

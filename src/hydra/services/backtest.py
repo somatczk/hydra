@@ -258,9 +258,13 @@ async def _preflight(
     strategy_cls, config = _load_backtest_strategy(strategy_id, allow_futures=allow_futures)
     tf = timeframe or config.timeframes.primary
     if tf != config.timeframes.primary:
-        config = config.model_copy(
-            update={"timeframes": config.timeframes.model_copy(update={"primary": tf})}
-        )
+        timeframes = config.timeframes.model_copy(update={"primary": tf})
+        try:  # revalidated: a schedule must still match a bar of the requested timeframe
+            config = StrategyConfig.model_validate(
+                {**config.model_dump(), "timeframes": timeframes}
+            )
+        except ValidationError as exc:
+            raise _invalid_strategy(strategy_id, f"invalid config on {tf}: {exc}") from exc
     pool = require_pool(pool)
     exchange = config.exchange.exchange_id
     symbol = config.symbols[0]

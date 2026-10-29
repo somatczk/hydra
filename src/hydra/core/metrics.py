@@ -46,6 +46,9 @@ Contract (name: type, unit / labels / producer):
 - hydra_spot_short_ignored_total: counter, signals
   labels: strategy_id, signal_type
   producer: P1-E signal path
+- hydra_entries_off_schedule_total: counter, signals
+  labels: strategy_id
+  producer: StrategyEngine
 - hydra_event_bus_latency_seconds: histogram, seconds
   labels: -
   producer: InMemoryEventBus.publish
@@ -293,6 +296,14 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "signals",
         "P1-E signal path",
         ("strategy_id", "signal_type"),
+    ),
+    MetricSpec(
+        "hydra_entries_off_schedule_total",
+        "counter",
+        "Entry signals dropped before publication because the bar is outside the schedule",
+        "signals",
+        "StrategyEngine",
+        ("strategy_id",),
     ),
     MetricSpec(
         "hydra_event_bus_latency_seconds",
@@ -785,6 +796,11 @@ def record_spot_short_ignored(strategy_id: str, signal_type: str) -> None:
     _counter("hydra_spot_short_ignored_total").labels(
         strategy_id=strategy_id, signal_type=signal_type
     ).inc()
+
+
+def record_entry_off_schedule(strategy_id: str) -> None:
+    """Count an entry signal dropped outside its strategy's schedule."""
+    _counter("hydra_entries_off_schedule_total").labels(strategy_id=strategy_id).inc()
 
 
 # ---------------------------------------------------------------------------

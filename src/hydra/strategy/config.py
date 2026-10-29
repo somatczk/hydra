@@ -8,13 +8,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from hydra.core.types import ExchangeId, MarketType, Timeframe
+from hydra.data.bars import timeframe_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +99,39 @@ class StrategyRiskConfig(BaseModel):
 
 
 class ScheduleConfig(BaseModel):
-    """Optional schedule for strategy activation windows."""
+    """When a strategy may open a position: an entry filter, never an exit filter.
 
-    active_hours_utc: list[int] = Field(default_factory=lambda: list(range(24)))
-    active_days: list[int] = Field(default_factory=lambda: list(range(7)))
+    An entry signal passes only when the primary bar it was evaluated on has its open
+    timestamp (``OHLCV.timestamp``, UTC: the stamp on fills, trades and charts) at an hour in
+    ``active_hours_utc`` and on a day in ``active_days`` (Python ``weekday()``: Monday=0 ..
+    Sunday=6). The entry is decided and filled at that bar's close, so ``active_hours_utc:
+    [13, ..., 21]`` on 1h bars fills at 14:00-22:00 UTC. 4h bars open only at hours
+    0/4/8/12/16/20 and 1d/1w bars at 00:00 (1w on Mondays), so on daily bars only
+    ``active_days`` selects. Exits, protective stops, flatten, the kill switch and manual
+    orders are never filtered. The default (every hour, every day) is always active.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    active_hours_utc: list[Annotated[int, Field(ge=0, le=23)]] = Field(
+        default_factory=lambda: list(range(24)), min_length=1
+    )
+    active_days: list[Annotated[int, Field(ge=0, le=6)]] = Field(
+        default_factory=lambda: list(range(7)), min_length=1
+    )
+
+    @field_validator("active_hours_utc", "active_days")
+    @classmethod
+    def _no_duplicates(cls, value: list[int], info: ValidationInfo) -> list[int]:
+        repeated = sorted({v for v in value if value.count(v) > 1})
+        if repeated:
+            raise ValueError(f"{info.field_name} lists {repeated} more than once")
+        return value
+
+    def allows(self, bar_open: datetime) -> bool:
+        """True when an entry evaluated on the bar opened at *bar_open* may pass."""
+        utc = bar_open.astimezone(UTC)
+        return utc.hour in self.active_hours_utc and utc.weekday() in self.active_days
 
 
 class MLOverlayConfig(BaseModel):
@@ -148,6 +179,25 @@ class StrategyConfig(BaseModel):
     risk: StrategyRiskConfig = Field(default_factory=StrategyRiskConfig)
     schedule: ScheduleConfig | None = None
     ml_overlay: MLOverlayConfig | None = None
+
+    @model_validator(mode="after")
+    def _schedule_can_match(self) -> StrategyConfig:
+        """Refuse a schedule no primary bar can ever satisfy (it would never enter)."""
+        if self.schedule is None:
+            return self
+        primary = self.timeframes.primary
+        tf_s = timeframe_seconds(primary)
+        opens = {h for h in range(24) if h * 3600 % tf_s == 0}
+        if not opens & set(self.schedule.active_hours_utc):
+            raise ValueError(
+                f"schedule.active_hours_utc never matches a {primary} bar: "
+                f"{primary} bars open only at hours {sorted(opens)} UTC"
+            )
+        if primary == Timeframe.W1 and 0 not in self.schedule.active_days:
+            raise ValueError(
+                "schedule.active_days never matches a 1w bar: 1w bars open on Monday (0)"
+            )
+        return self
 
     def all_timeframes(self) -> list[Timeframe]:
         """Primary, confirmation and entry timeframes, deduplicated, in that order."""
