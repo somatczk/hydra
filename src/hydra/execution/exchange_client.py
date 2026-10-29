@@ -256,7 +256,7 @@ class ExchangeClient:
         with observe_exchange_call(self._exchange_id, "fetch_open_orders"):
             if conditional:
                 result: list[dict[str, Any]] = await exchange.fetch_open_orders(
-                    symbol, {"conditional": True}
+                    symbol, None, None, {"conditional": True}
                 )
             else:
                 result = await exchange.fetch_open_orders(symbol)

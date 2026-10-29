@@ -164,7 +164,7 @@ class ProtectiveOrderManager:
         return dict(self._groups)
 
     def is_protective(self, order_id: str) -> bool:
-        return any(g.order_id == order_id for g in self._groups.values())
+        return any(g.order_id == order_id or order_id in g.leg_ids for g in self._groups.values())
 
     def planned_stop(
         self, symbol: str, reference: Decimal, direction: Direction = Direction.LONG
@@ -283,6 +283,7 @@ class ProtectiveOrderManager:
                     order_type=OrderType.OCO if order.get("oco_id") else OrderType(order["type"]),
                     quantity=Decimal(str(order["amount"])),
                     spec=_spec_from_resting(resting),
+                    leg_ids=tuple(str(leg) for leg in order.get("leg_ids") or ()),
                 )
                 continue
             await self._arm(

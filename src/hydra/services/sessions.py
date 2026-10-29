@@ -49,6 +49,11 @@ from hydra.execution.paper_trading import (
     PaperTradingExecutor,
     PersistenceUnavailableError,
 )
+from hydra.execution.perp_live import (
+    LivePerpTradingExecutor,
+    normalize_perp_leg,
+    verify_perp_ladder,
+)
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.ml.consumers import validate_session_ml
 from hydra.ml.serving import MlServingError
@@ -446,30 +451,43 @@ async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: A
     """A8-live (R12): the exchange is the truth for open orders and each position's stop.
 
     Runs only for an executor that exposes its keyed ``exchange_client`` (the live executor,
-    P3-A); paper positions never carry ``exchange_stop``. Failures per symbol surface as
-    state ``unknown`` with the error string, never ``missing``.
+    P3-A); paper positions never carry ``exchange_stop``. A live PERP session reads BOTH
+    fapi namespaces and verifies through ``verify_perp_ladder`` — futures have no OCO, so
+    the spot reads would answer ``missing`` for a correctly resting ladder. Failures per
+    symbol surface as state ``unknown`` with the error string, never ``missing``.
     """
     client = getattr(executor, "exchange_client", None)
-    if client is None or getattr(client, "fetch_open_order_lists", None) is None:
+    if client is None:
+        return
+    perp = isinstance(executor, LivePerpTradingExecutor)
+    if not perp and getattr(client, "fetch_open_order_lists", None) is None:
         return
     protect = session._runtime.protect if session._runtime is not None else None
     orders: list[dict[str, Any]] = []
     for symbol in session.symbols:
         try:
-            legs = normalize_open_orders(await client.fetch_open_orders(symbol))
+            if perp:
+                legs = [normalize_perp_leg(o) for o in await client.fetch_open_orders(symbol)]
+                legs.extend(
+                    normalize_perp_leg(o)
+                    for o in await client.fetch_open_orders(symbol, conditional=True)
+                )
+            else:
+                legs = normalize_open_orders(await client.fetch_open_orders(symbol))
         except Exception as exc:
             logger.warning("Live open orders of %s unreadable: %s", symbol, exc)
             continue
         for leg in legs:
-            leg["protective"] = (
-                protect.is_protective(str(leg["oco_id"] or leg["id"])) if protect else None
-            )
+            leg["protective"] = _leg_is_protective(protect, leg, perp=perp)
             orders.append(leg)
     detail["open_orders"] = orders
     for position in detail.get("positions") or []:
         expected = protect.armed(position.get("symbol")) if protect is not None else None
         try:
-            state = await verify_exchange_stop(client, position.get("symbol"), expected)
+            if perp:
+                state = await verify_perp_ladder(client, position.get("symbol"), expected)
+            else:
+                state = await verify_exchange_stop(client, position.get("symbol"), expected)
         except Exception as exc:
             state = ExchangeStopState(state="unknown", checked_at=datetime.now(UTC), error=str(exc))
         position["exchange_stop"] = {
@@ -481,6 +499,20 @@ async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: A
             "checked_at": state.checked_at.isoformat(),
             "error": state.error,
         }
+
+
+def _leg_is_protective(protect: Any, leg: dict[str, Any], *, perp: bool) -> bool | None:
+    """Is this exchange leg one of the session's protective groups?
+
+    A perp ladder leg matches by its numeric algo id (a running group's leg ids)
+    or its leg client id (an adopted group's); a spot leg by its OCO list id.
+    """
+    if protect is None:
+        return None
+    if perp:
+        keys = (str(leg.get("id")), str(leg.get("client_order_id") or ""))
+        return any(protect.is_protective(key) for key in keys if key)
+    return bool(protect.is_protective(str(leg.get("oco_id") or leg["id"])))
 
 
 async def _live_reconcile_reads(mgr: Any, detail: dict[str, Any], session: Any) -> None:

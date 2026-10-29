@@ -18,6 +18,9 @@ from typing import Any
 import ccxt
 import ccxt.async_support
 
+from hydra.core.types import MarketType
+from hydra.execution.exchange_client import ExchangeClient
+
 SPOT_IMPLICIT_METHODS: tuple[str, ...] = (
     "privatePostOrderListOco",
     "privateDeleteOrderList",
@@ -161,3 +164,60 @@ def test_binanceusdm_routes_conditional_orders_through_the_algo_api() -> None:
         "a callbackRate order must classify as conditional on binanceusdm"
     )
     assert not exchange.is_conditional_order({"reduceOnly": True})
+
+
+async def test_binanceusdm_routes_the_wrappers_conditional_read_to_the_algo_namespace() -> None:
+    """The SEAM call, pinned on a fresh real binanceusdm (construction-only): the
+    wrapper's ``conditional=True`` read must hit ``fapiPrivateGetOpenAlgoOrders``
+    and the unconditional read ``fapiPrivateGetOpenOrders``. The P4-D review's A1:
+    passing the params dict positionally bound it to ``since`` (the 4.5.88
+    signature is ``(symbol, since, limit, params)``), so the ladder's namespace
+    was never read and every armed perp ladder verified ``missing``."""
+    exchange = ccxt.async_support.binanceusdm({"apiKey": "x", "secret": "y"})
+    try:
+        exchange.set_markets(
+            [
+                {
+                    "id": "BTCUSDT",
+                    "symbol": "BTC/USDT:USDT",
+                    "base": "BTC",
+                    "quote": "USDT",
+                    "type": "swap",
+                    "spot": False,
+                    "swap": True,
+                    "future": False,
+                    "option": False,
+                    "margin": False,
+                    "linear": True,
+                    "inverse": False,
+                    "contract": True,
+                }
+            ]
+        )
+        calls: list[str] = []
+
+        async def _algo_open(request: Any = None, params: Any = None) -> list[dict[str, Any]]:
+            calls.append("algo")
+            return []
+
+        async def _plain_open(request: Any = None, params: Any = None) -> list[dict[str, Any]]:
+            calls.append("plain")
+            return []
+
+        exchange.fapiPrivateGetOpenAlgoOrders = _algo_open
+        exchange.fapiPrivateGetOpenOrders = _plain_open
+        client = ExchangeClient("binanceusdm", {}, market_type=MarketType.FUTURES)
+        client._exchange = exchange
+
+        assert await client.fetch_open_orders("BTC/USDT:USDT", conditional=True) == []
+        assert calls == ["algo"], (
+            "the wrapper's conditional read must hit the fapi ALGO namespace, not the "
+            f"regular one (hit: {calls})"
+        )
+        calls.clear()
+        assert await client.fetch_open_orders("BTC/USDT:USDT") == []
+        assert calls == ["plain"], (
+            f"the wrapper's unconditional read must stay on the regular namespace (hit: {calls})"
+        )
+    finally:
+        await exchange.close()

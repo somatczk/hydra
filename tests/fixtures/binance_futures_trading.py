@@ -448,9 +448,22 @@ class FakeBinanceUsdmTradingClient:
         return self._unified(raw)
 
     async def fetch_open_orders(
-        self, symbol: str | None = None, *, conditional: bool = False
+        self,
+        symbol: str | None = None,
+        since: Any = None,
+        limit: Any = None,
+        params: dict[str, Any] | None = None,
+        *,
+        conditional: bool = False,
     ) -> list[dict[str, Any]]:
-        if conditional:
+        """ccxt 4.5.88's real positional signature ``(symbol, since, limit, params)``.
+
+        The ``conditional`` flag rides ``params`` on the wire (the wrapper passes it
+        positionally, slot 4); the keyword-only ``conditional`` serves hydra's own
+        client seam. A dict in the ``since`` slot reaches neither branch — the
+        silent misbinding the real exchange would do.
+        """
+        if conditional or (params or {}).get("conditional"):
             return [self._unified_algo(o) for o in self.open_algo(symbol)]
         return [self._unified(o) for o in self.open_plain(symbol)]
 

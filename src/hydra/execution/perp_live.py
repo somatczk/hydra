@@ -221,7 +221,9 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
         self._live_orders = store
         # one lock: a poller sweep and a flatten drain never apply one claimed fill twice
         self._collect_lock = asyncio.Lock()
-        self._funding_cursor_ms = 0
+        # the session-start bound: rows settled before this sleeve existed never book
+        # (the shared one-way account's older FUNDING_FEE rows are not this sleeve's)
+        self._funding_cursor_ms = int(datetime.now(UTC).timestamp() * 1000)
 
     @property
     def live_orders(self) -> LiveOrderStore:
@@ -511,6 +513,7 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
                 sl_cid,
                 "stopLossPrice",
                 sl,
+                pair_leg_cids=leg_cids,
             )
         )
         if tp_rests:
@@ -524,6 +527,7 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
                     tp_cid,
                     "takeProfitPrice",
                     tp,
+                    pair_leg_cids=leg_cids,
                 )
             )
         else:
@@ -563,6 +567,7 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
         leg_cid: str,
         trigger_param: str,
         trigger: Decimal,
+        pair_leg_cids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Place one leg of the pair; a definitive failure unwinds the whole pair."""
         wire: dict[str, Any] = {
@@ -577,7 +582,7 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
         except Exception as exc:
             failure = await _classify_submit_failure(self._live_orders, leg_cid, otype, exc)
             if isinstance(failure, OrderRejectedError):
-                await self._unwind_pair(canon, leg_cid)
+                await self._unwind_pair(canon, pair_leg_cids)
                 raise StopUnplaceableError(
                     f"{self._name(canon)}: the {otype} leg was rejected: {exc}"
                 ) from exc
@@ -596,14 +601,19 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
             "reason": "take_profit" if otype == OrderType.TAKE_PROFIT_MARKET.value else "stop_loss",
         }
 
-    async def _unwind_pair(self, canon: str, placed_cid: str) -> None:
-        """A leg landed and the pair failed: cancel the landed leg, best-effort."""
-        try:
-            await self.exchange_client.cancel_order(
-                placed_cid, self._name(canon), {"clientAlgoId": placed_cid, "conditional": True}
-            )
-        except Exception:
-            logger.exception("Unwinding the landed perp leg %s failed", placed_cid)
+    async def _unwind_pair(self, canon: str, leg_cids: tuple[str, ...]) -> None:
+        """A leg failed: cancel EVERY leg of the pair that may have landed, best-effort.
+
+        The failed leg's own cid answers OrderNotFound (never placed) and is
+        skipped quietly; a landed sibling — the STOP when the take-profit is
+        rejected — is cancelled, so no stray stop survives to fire at the old
+        entry's price against a later position.
+        """
+        for leg_cid in leg_cids:
+            try:
+                await self._cancel_leg(leg_cid, self._name(canon))
+            except Exception:
+                logger.exception("Unwinding the landed perp leg %s failed", leg_cid)
 
     def _require_rules(self, canon: str) -> MarketRules:
         # build_live_executor validated real MarketRules; the paper trio cannot price a leg
@@ -903,7 +913,9 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
     async def _book_funding_income(self) -> None:
         """Book the settled FUNDING_FEE rows of every tracked symbol.
 
-        The cursor rides the persisted state and the funding fills persist in
+        The cursor starts at the session (never 0): rows settled before this
+        sleeve existed — including the user's own on the shared one-way account —
+        never book. It rides the persisted state and the funding fills persist in
         the same ``paper_accounts`` write, so a crash either keeps both or
         re-books neither. Each row adjusts the open position's isolated margin,
         or the wallet when the position is already closed — the margin the close
@@ -1031,6 +1043,7 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
                     "filled_quantity": float(row.filled_quantity),
                     "client_order_id": row.client_order_id,
                     "reduce_only": row.reduce_only,
+                    "leg_ids": list(row.leg_client_order_ids),
                 }
             )
         return out
@@ -1096,7 +1109,11 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
 
     def _rebuild_from_state(self, state: Mapping[str, Any]) -> None:
         super()._rebuild_from_state(state)
-        self._funding_cursor_ms = int(state.get("funding_cursor_ms") or 0)
+        persisted = state.get("funding_cursor_ms")
+        # a persisted cursor survives the restart; a falsy one only ever means a
+        # pre-bound executor that swept nothing — the session-start seed stands
+        if persisted:
+            self._funding_cursor_ms = int(persisted)
 
     @classmethod
     async def restore_live(
@@ -1244,17 +1261,22 @@ class LivePerpOrderPoller(LiveOrderPoller):
 
         A leg that already traded resolves through the inherited trades
         cross-check (overridden below to keep the pair's own ids); resting legs
-        resolve the pair as NEW under its pair id; nothing at all falls to the
-        F8 not-found window.
+        resolve the pair as NEW under its pair id; a leg that answers CANCELED
+        (the unwind of a failed pair) is proof it does not rest, so it counts
+        for nothing; nothing at all falls to the F8 not-found window.
         """
         store = self._perp.live_orders
         resting = 0
         for leg_cid in row.leg_client_order_ids:
             try:
-                await self._fetch_conditional(leg_cid, row.symbol, by_client_id=True)
+                resp = await self._fetch_conditional(leg_cid, row.symbol, by_client_id=True)
             except Exception as exc:
                 if not _order_not_found(exc):
                     logger.info("Perp pair leg %s unreadable: %s", leg_cid, exc)
+                continue
+            if map_ccxt_status(resp.get("status"), resp.get("filled")) == (
+                LiveOrderStatus.CANCELED
+            ):
                 continue
             resting += 1
         if resting:
