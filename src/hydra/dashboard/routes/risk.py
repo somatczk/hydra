@@ -18,6 +18,7 @@ from hydra.dashboard.routes._db import (
 )
 from hydra.risk.state import RiskStateUnavailableError, fetch_risk_events
 from hydra.services.live_gate import read_live_state
+from hydra.services.perps_gate import read_perps_state
 
 router = APIRouter(prefix="/api/risk", tags=["risk"], route_class=ServiceErrorRoute)
 logger = logging.getLogger(__name__)
@@ -136,6 +137,8 @@ class RiskStatusLive(BaseModel):
     active_tier: int | None = None
     # additive (R9): the armed gate; fail-safe false when the row is unreadable
     live_armed: bool = False
+    # additive (P4-E): the separate perps gate's row, the same fail-safe read
+    perps_armed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +403,11 @@ async def get_live_risk_status(request: Request, source: str | None = None) -> d
     paper (A6≡S8). ``live_armed`` is the master gate's row, merged here (R9): it reads
     disarmed when the row is absent or unreadable (fail-safe) — and a false row never
     means running live sessions stopped: they keep running under their start's
-    authorization until stopped or the kill switch fires (R10).
+    authorization until stopped or the kill switch fires (R10). ``perps_armed`` is the
+    separate perps ceremony's row, merged the same way (P4-E).
     """
     _validate_source(source)
     body = await request_trader(request).live_status(source=source or "paper")
     state = await read_live_state(request_pool(request))
-    return {**body, "live_armed": state["armed"]}
+    perps = await read_perps_state(request_pool(request))
+    return {**body, "live_armed": state["armed"], "perps_armed": perps["armed"]}

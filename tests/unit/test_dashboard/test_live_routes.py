@@ -126,6 +126,15 @@ class _Backend:
     async def list_sessions(self) -> list[dict[str, Any]]:
         return [dict(s) for s in self.sessions]
 
+    async def live_status(self, source: str = "paper") -> dict[str, Any]:
+        return {
+            "kill_switch_active": False,
+            "kill_switch_state": "inactive",
+            "running_sessions": len(self.sessions),
+            "circuit_breaker_restrictions": None,
+            "circuit_breakers_state": "unavailable",
+        }
+
 
 class _BrokenDb:
     """A pool whose acquisition fails: the disarm path's transient DB outage."""
@@ -624,3 +633,316 @@ class TestCreateRoutes:
             )
         ).json()
         assert again["approval_id"] == first["approval_id"]
+
+
+# ---------------------------------------------------------------------------
+# The perps gate (P4-E): the separate code-gated ceremony beside the spot gate
+# ---------------------------------------------------------------------------
+
+PERP_ARMED_ROW = json.dumps({"armed": True, "by": "user:soma", "at": "2026-10-29T00:00:00+00:00"})
+FUTURES_RESTRICTIONS = {
+    "ipRestrict": False,
+    "enableWithdrawals": False,
+    "enableSpotAndMarginTrading": True,
+    "enableFutures": True,
+}
+
+
+@pytest.fixture()
+def perp_strategies(strategies_dir: Any) -> Any:
+    """One saved perps strategy: the venue the live-start gates dispatch on."""
+    path = strategies_dir / "perp-momentum.yaml"
+    path.write_text(
+        "id: perp-momentum\n"
+        "name: perp-momentum\n"
+        "symbols: [BTCUSDT]\n"
+        "exchange:\n"
+        "  exchange_id: binanceusdm\n"
+        "  market_type: FUTURES\n"
+        "  leverage: 2\n"
+    )
+    return strategies_dir
+
+
+def _live_perp_session(session_id: str = "s-perp", status: str = "running") -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "trading_mode": "live",
+        "status": status,
+        "exchange_id": "binanceusdm",
+    }
+
+
+class TestPerpsStatus:
+    async def test_absent_row_reads_disarmed(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        resp = await browser.get("/api/live/perps/status")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "perps_armed": False,
+            "armed_by": None,
+            "armed_at": None,
+            "perps_capital": None,
+            "running_live_perps_sessions": [],
+            "running_live_perps_sessions_count": 0,
+        }
+
+    async def test_armed_state_names_only_the_perps_sessions(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        db.config["perps_capital"] = "500.0"
+        backend.sessions = [
+            _live_perp_session(),
+            _live_session(),
+            {
+                "session_id": "s-perp-paper",
+                "trading_mode": "paper",
+                "status": "running",
+                "exchange_id": "binanceusdm",
+            },
+        ]
+        body = (await browser.get("/api/live/perps/status")).json()
+        assert (body["perps_armed"], body["armed_by"], body["perps_capital"]) == (
+            True,
+            "user:soma",
+            500.0,
+        )
+        assert (body["running_live_perps_sessions"], body["running_live_perps_sessions_count"]) == (
+            ["s-perp"],
+            1,
+        )
+        # the spot read is untouched by the perps rows
+        spot = (await browser.get("/api/live/status")).json()
+        assert (spot["live_armed"], spot["live_capital"]) == (False, None)
+
+
+class TestPerpsArm:
+    async def test_arm_returns_the_code_and_approve_arms(
+        self,
+        db: _Db,
+        backend: _Backend,
+        monkeypatch: pytest.MonkeyPatch,
+        browser: httpx.AsyncClient,
+    ) -> None:
+        monkeypatch.setattr(ccxt.async_support, "binance", FakeBinance)
+        FakeBinance.restrictions = dict(FUTURES_RESTRICTIONS)
+        resp = await browser.post("/api/live/perps/arm", json={"perps_capital": 500.0})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) == {"status", "approval_id", "code", "expires_at", "params", "note"}
+        assert body["status"] == "approval_required"
+        assert re.fullmatch(r"[0-9]{6}", body["code"])
+        assert body["params"] == {"perps_capital": 500.0, "reason": "arm perps trading"}
+        assert body["note"] == NOTE
+        assert "perps_armed" not in db.config  # nothing armed before the code
+
+        approved = await _approve(browser, body["approval_id"], body["code"])
+        assert approved.status_code == 200, approved.text
+        assert approved.json() == {
+            "executed": True,
+            "result": {
+                "status": "armed",
+                "perps_armed": True,
+                "armed_by": "dev:dev",
+                "armed_at": approved.json()["result"]["armed_at"],
+                "perps_capital": 500.0,
+                "message": "Perps trading is armed; live perp session starts and manual "
+                "live orders now need their own one-time code",
+            },
+            "actor": "dev:dev",
+            "approved_by": "dev:dev",
+        }
+        status = (await browser.get("/api/live/perps/status")).json()
+        assert (status["perps_armed"], status["perps_capital"]) == (True, 500.0)
+        assert [e["kind"] for e in db.events] == [
+            "approval_requested",
+            "approval_approved",
+            "perps_armed",
+        ]
+        assert all(e["actor"] == "dev:dev" for e in db.events)
+        # arming perps never arms spot
+        assert (await browser.get("/api/live/status")).json()["live_armed"] is False
+
+    async def test_wrong_codes_fail_the_approval_and_perps_stays_disarmed(
+        self,
+        db: _Db,
+        backend: _Backend,
+        monkeypatch: pytest.MonkeyPatch,
+        browser: httpx.AsyncClient,
+    ) -> None:
+        monkeypatch.setattr(ccxt.async_support, "binance", FakeBinance)
+        FakeBinance.restrictions = dict(FUTURES_RESTRICTIONS)
+        body = (await browser.post("/api/live/perps/arm", json={"perps_capital": 500.0})).json()
+        wrong = next(c for c in ("000000", "111111", "222222") if c != body["code"])
+        for _ in range(5):
+            resp = await _approve(browser, body["approval_id"], wrong)
+            assert (resp.status_code, _detail(resp)["code"]) == (422, "code_mismatch")
+        failed = await _approve(browser, body["approval_id"], body["code"])
+        assert (failed.status_code, _detail(failed)["code"]) == (410, "approval_failed")
+        assert "perps_armed" not in db.config
+        assert (await browser.get("/api/live/perps/status")).json()["perps_armed"] is False
+
+    async def test_a_key_without_futures_permission_surfaces_the_executors_refusal(
+        self,
+        db: _Db,
+        backend: _Backend,
+        monkeypatch: pytest.MonkeyPatch,
+        browser: httpx.AsyncClient,
+    ) -> None:
+        """R22 through the route: the fail-closed permission re-fetch's 409 reaches the
+        approving caller unchanged and nothing is armed."""
+        monkeypatch.setattr(ccxt.async_support, "binance", FakeBinance)
+        FakeBinance.restrictions = dict(RESTRICTIONS)  # no enableFutures flag at all
+        body = (await browser.post("/api/live/perps/arm", json={"perps_capital": 500.0})).json()
+        resp = await _approve(browser, body["approval_id"], body["code"])
+        assert resp.status_code == 409
+        assert _detail(resp)["code"] == "credentials_not_futures_capable"
+        assert "cannot trade futures" in _detail(resp)["message"]
+        assert "perps_armed" not in db.config
+        detail = (await browser.get(f"/api/activity/approvals/{body['approval_id']}")).json()
+        assert detail["status"] == "failed"
+
+    async def test_service_principals_are_refused_on_the_perps_create_routes(
+        self, db: _Db, backend: _Backend, service: httpx.AsyncClient
+    ) -> None:
+        resp = await service.post("/api/live/perps/arm", json={"perps_capital": 500.0})
+        assert (resp.status_code, _detail(resp)["code"]) == (403, "principal_not_allowed")
+        assert (await service.get("/api/live/perps/status")).status_code == 200
+
+
+class TestPerpsDisarm:
+    async def test_disarm_is_direct_and_names_the_running_perp_sessions(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        db.config["perps_capital"] = "500.0"
+        backend.sessions = [_live_perp_session(), _live_session()]
+        resp = await browser.post("/api/live/perps/disarm", json={"reason": "stop the leverage"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "disarmed"
+        assert body["perps_armed"] is False
+        assert (body["armed_by"], body["armed_at"]) == (None, None)
+        assert (body["running_live_perps_sessions"], body["running_live_perps_sessions_count"]) == (
+            ["s-perp"],
+            1,
+        )
+        assert "keep running under their start's authorization" in body["message"]
+        assert [e["kind"] for e in db.events] == ["perps_disarmed"]
+        assert (await browser.get("/api/live/perps/status")).json()["perps_armed"] is False
+        # the spot gate is untouched by the perps disarm
+        db.config["live_armed"] = ARMED_ROW
+        assert (await browser.get("/api/live/status")).json()["live_armed"] is True
+
+    async def test_disarm_when_disarmed_is_an_honest_no_op(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        resp = await browser.post("/api/live/perps/disarm", json={"reason": "nothing armed"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "already_disarmed"
+        assert resp.json()["pending_perps_approvals"] == []
+        assert db.events == []
+
+    async def test_a_broken_read_never_answers_already_disarmed(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        app.state.db_pool = _BrokenDb()
+        resp = await browser.post("/api/live/perps/disarm", json={"reason": "transient outage"})
+        assert (resp.status_code, _detail(resp)["code"]) == (503, "database_unavailable")
+        app.state.db_pool = db
+        assert (await browser.get("/api/live/perps/status")).json()["perps_armed"] is True
+
+    async def test_disarm_names_pending_perps_arming_approvals(
+        self,
+        db: _Db,
+        backend: _Backend,
+        monkeypatch: pytest.MonkeyPatch,
+        browser: httpx.AsyncClient,
+    ) -> None:
+        monkeypatch.setattr(ccxt.async_support, "binance", FakeBinance)
+        FakeBinance.restrictions = dict(FUTURES_RESTRICTIONS)
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        arm = (
+            await browser.post(
+                "/api/live/perps/arm", json={"perps_capital": 500.0, "reason": "arm it"}
+            )
+        ).json()
+        resp = await browser.post("/api/live/perps/disarm", json={"reason": "stop the leverage"})
+        body = resp.json()
+        assert body["status"] == "disarmed"
+        assert body["pending_perps_approvals"] == [arm["approval_id"]]
+        assert "still re-arm" in body["message"]
+
+
+class TestPerpsGateReach:
+    async def test_a_live_futures_start_create_is_refused_while_perps_is_unarmed(
+        self, db: _Db, backend: _Backend, perp_strategies: Any, browser: httpx.AsyncClient
+    ) -> None:
+        resp = await browser.post(
+            "/api/live/session-start", json={"strategy_id": "perp-momentum", "reason": "go live"}
+        )
+        assert (resp.status_code, _detail(resp)["code"]) == (409, "perps_not_armed")
+        assert "POST /api/live/perps/arm" in _detail(resp)["message"]
+
+    async def test_the_spot_armed_row_does_not_open_the_perps_gate(
+        self, db: _Db, backend: _Backend, perp_strategies: Any, browser: httpx.AsyncClient
+    ) -> None:
+        db.config["live_armed"] = ARMED_ROW
+        db.config["live_capital"] = "500.0"
+        resp = await browser.post(
+            "/api/live/session-start", json={"strategy_id": "perp-momentum", "reason": "go live"}
+        )
+        assert (resp.status_code, _detail(resp)["code"]) == (409, "perps_not_armed")
+
+    async def test_perps_armed_without_capital_is_refused(
+        self, db: _Db, backend: _Backend, perp_strategies: Any, browser: httpx.AsyncClient
+    ) -> None:
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        resp = await browser.post(
+            "/api/live/session-start", json={"strategy_id": "perp-momentum", "reason": "go live"}
+        )
+        assert (resp.status_code, _detail(resp)["code"]) == (403, "perps_capital_missing")
+
+    async def test_perps_armed_with_capital_answers_the_challenge_shape(
+        self, db: _Db, backend: _Backend, perp_strategies: Any, browser: httpx.AsyncClient
+    ) -> None:
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        db.config["perps_capital"] = "500.0"
+        resp = await browser.post(
+            "/api/live/session-start", json={"strategy_id": "perp-momentum", "reason": "go live"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) == {"status", "approval_id", "code", "expires_at", "params", "note"}
+        assert body["status"] == "approval_required"
+        assert re.fullmatch(r"[0-9]{6}", body["code"])
+        assert body["params"] == {"strategy_id": "perp-momentum", "reason": "go live"}
+        assert body["note"] == NOTE
+
+    async def test_a_manual_order_create_on_a_perps_session_checks_the_perps_gate(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        backend.sessions = [_live_perp_session()]
+        order = {"session_id": "s-perp", "side": "buy", "quantity": "1", "reason": "one contract"}
+        resp = await browser.post("/api/live/order", json=order)
+        assert (resp.status_code, _detail(resp)["code"]) == (409, "perps_not_armed")
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        resp = await browser.post("/api/live/order", json=order)
+        assert (resp.status_code, _detail(resp)["code"]) == (403, "perps_capital_missing")
+        db.config["perps_capital"] = "500.0"
+        resp = await browser.post("/api/live/order", json=order)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "approval_required"
+
+
+class TestRiskLiveStatusPerps:
+    async def test_perps_armed_rides_the_live_status_read(
+        self, db: _Db, backend: _Backend, browser: httpx.AsyncClient
+    ) -> None:
+        body = (await browser.get("/api/risk/live-status")).json()
+        assert body["perps_armed"] is False  # fail-safe false when the row is absent
+        db.config["perps_armed"] = PERP_ARMED_ROW
+        assert (await browser.get("/api/risk/live-status")).json()["perps_armed"] is True

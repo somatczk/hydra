@@ -14,7 +14,9 @@ execution time — the approval may have sat — and calls through the ``TraderB
 (``deps.trader``) like every route, so the executors work in both the single-process and
 the split layout. The API surfaces (the session-start and quick-trade routes, the
 quick-trade tool, the webhook) refuse live with 409 ``live_gate_required`` instead; see
-seam #1.
+seam #1. The separate perps ceremony's executor (``live_perps_arming``,
+:mod:`hydra.services.perps_gate`) registers on the same store beside them: it is the
+only ``perps_armed`` write path and never arms spot trading (P4-E).
 
 Trade-only credentials: arming re-fetches Binance ``/sapi/v1/account/apiRestrictions``
 through the keyed client (R8) — not just the connect-time snapshot — and refuses unless
@@ -39,6 +41,12 @@ from hydra.execution.client_factory import build_readonly_client
 from hydra.risk.state import RiskEventRecord
 from hydra.services.approvals import Approval, ApprovalStore, write_approval_event
 from hydra.services.errors import ServiceError, db_errors, require_pool, service_error
+from hydra.services.perps_gate import (
+    execute_perps_arming,
+    is_perp_strategy,
+    is_perp_venue,
+    require_perps_gate,
+)
 from hydra.services.sessions import QuickTradeRequest, StartSessionRequest
 from hydra.services.trader import LocalTrader
 
@@ -393,6 +401,7 @@ def live_approval_store(state: Any) -> ApprovalStore:
     store.register("live_session_start", execute_live_session_start)
     store.register("live_order", execute_live_order)
     store.register("credential_delete", execute_credential_delete)
+    store.register("live_perps_arming", execute_perps_arming)
     return store
 
 
@@ -470,9 +479,14 @@ async def execute_live_session_start(
 ) -> dict[str, Any]:
     """Start a live session; the service layer's armed check is the fail-closed
     backstop, the kill-switch refusal and the credentials/capital checks are the
-    manager's."""
+    manager's. A perps strategy answers to the separate perps ceremony (P4-E), not the
+    spot gate."""
     pool = getattr(deps, "db_pool", None)
-    await require_armed(pool)
+    strategy_id = str(params.get("strategy_id") or "")
+    if is_perp_strategy(strategy_id):
+        await require_perps_gate(pool)
+    else:
+        await require_armed(pool)
     backend = _backend(deps)
     if await backend.kill_switch_active():
         raise service_error(
@@ -481,7 +495,6 @@ async def execute_live_session_start(
             "The kill switch is active; new sessions cannot start",
             "invalid",
         )
-    strategy_id = str(params.get("strategy_id") or "")
     if not strategy_id:
         raise service_error(422, "invalid_params", "strategy_id is required", "invalid")
     try:
@@ -510,10 +523,18 @@ _ORDER_FIELDS = (
 
 
 async def execute_live_order(deps: Any, params: dict[str, Any], actor: str) -> dict[str, Any]:
-    """One manual live order on a running live session (the quick-trade seam)."""
+    """One manual live order on a running live session (the quick-trade seam). A live
+    session on the perps venue answers to the separate perps ceremony (P4-E)."""
     pool = getattr(deps, "db_pool", None)
-    await require_armed(pool)
     backend = _backend(deps)
+    session_id = str(params.get("session_id") or "")
+    target = next(
+        (s for s in await backend.list_sessions() if s.get("session_id") == session_id), None
+    )
+    if is_perp_venue(None if target is None else target.get("exchange_id")):
+        await require_perps_gate(pool)
+    else:
+        await require_armed(pool)
     if await backend.kill_switch_active():
         raise service_error(
             409,
@@ -521,10 +542,6 @@ async def execute_live_order(deps: Any, params: dict[str, Any], actor: str) -> d
             "The kill switch is active; manual live orders cannot be placed",
             "invalid",
         )
-    session_id = str(params.get("session_id") or "")
-    target = next(
-        (s for s in await backend.list_sessions() if s.get("session_id") == session_id), None
-    )
     if target is None:
         raise service_error(
             404, "session_not_found", f"Session {session_id} not found", "not_found"

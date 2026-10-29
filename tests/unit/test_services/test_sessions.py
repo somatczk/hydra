@@ -311,6 +311,110 @@ async def test_live_start_delegates_once_armed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The perps gate (P4-E): a live FUTURES start answers to the separate ceremony
+# ---------------------------------------------------------------------------
+
+PERP_STRATEGY_ID = "perp-momentum"
+
+
+@pytest.fixture()
+def perp_strategy(strategies_dir: Path) -> Path:
+    """One saved perps strategy: the venue the deep live-start gate dispatches on."""
+    path = strategies_dir / f"{PERP_STRATEGY_ID}.yaml"
+    path.write_text(
+        "id: perp-momentum\n"
+        "name: perp-momentum\n"
+        "symbols: [BTCUSDT]\n"
+        "exchange:\n"
+        "  exchange_id: binanceusdm\n"
+        "  market_type: FUTURES\n"
+        "  leverage: 2\n"
+    )
+    return path
+
+
+class _ConfigConn:
+    """Serves the perps/spot system_config rows, keyed (not one row for every key)."""
+
+    def __init__(self, config: dict[str, str]) -> None:
+        self._config = config
+
+    async def fetchrow(self, query: str, *args: Any) -> Any:
+        assert "system_config" in query, query
+        value = self._config.get(args[0])
+        return None if value is None else {"value": value}
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        assert "system_config" in query, query
+        return self._config.get(args[0])
+
+
+class _ConfigPool:
+    def __init__(self, config: dict[str, str]) -> None:
+        self._conn = _ConfigConn(config)
+
+    @contextlib.asynccontextmanager
+    async def acquire(self) -> AsyncIterator[_ConfigConn]:
+        yield self._conn
+
+
+_PERPS_ARMED_ROW = json.dumps({"armed": True, "by": "user:soma", "at": "2026-10-29T00:00:00Z"})
+
+
+async def _start_strategy(mgr: _Manager, strategy_id: str, **body: Any) -> dict[str, Any]:
+    return await sessions_svc.start_session(
+        mgr, "user:soma", StartSessionRequest(strategy_id=strategy_id, **body)
+    )
+
+
+async def test_live_futures_start_refuses_while_perps_is_unarmed(perp_strategy: Path) -> None:
+    """Even with the spot gate armed, the perps start dies at the separate gate."""
+    mgr = _Manager()
+    mgr._db_pool = _ConfigPool({"live_armed": _ARMED_ROW, "live_capital": "500.0"})
+    with pytest.raises(ServiceError) as raised:
+        await _start_strategy(mgr, PERP_STRATEGY_ID, trading_mode="live")
+    assert raised.value.status_code == 409
+    assert _detail(raised.value)["code"] == "perps_not_armed"
+    assert mgr.start_actor is None
+
+
+async def test_live_futures_start_refuses_armed_without_perps_capital(perp_strategy: Path) -> None:
+    mgr = _Manager()
+    mgr._db_pool = _ConfigPool({"perps_armed": _PERPS_ARMED_ROW})
+    with pytest.raises(ServiceError) as raised:
+        await _start_strategy(mgr, PERP_STRATEGY_ID, trading_mode="live")
+    assert raised.value.status_code == 403
+    assert _detail(raised.value)["code"] == "perps_capital_missing"
+    assert mgr.start_actor is None
+
+
+async def test_live_futures_start_delegates_once_perps_armed(perp_strategy: Path) -> None:
+    mgr = _Manager()
+    mgr._db_pool = _ConfigPool({"perps_armed": _PERPS_ARMED_ROW, "perps_capital": "500.0"})
+    d = await _start_strategy(mgr, PERP_STRATEGY_ID, trading_mode="live")
+    assert mgr.start_actor == "user:soma"
+    assert d["session_id"] == "s1"
+
+
+async def test_live_spot_start_ignores_the_perps_rows(perp_strategy: Path) -> None:
+    """The perps rows never satisfy the spot gate: the ceremonies are independent."""
+    mgr = _Manager()
+    mgr._db_pool = _ConfigPool({"perps_armed": _PERPS_ARMED_ROW, "perps_capital": "500.0"})
+    with pytest.raises(ServiceError) as raised:
+        await _start_strategy(mgr, "saw", trading_mode="live")
+    assert _detail(raised.value)["code"] == "live_not_armed"
+    assert mgr.start_actor is None
+
+
+async def test_paper_futures_start_never_consults_the_perps_gate(perp_strategy: Path) -> None:
+    """Paper perp sessions run ungated (P4-C's executor): only live mode answers to it."""
+    mgr = _Manager()
+    d = await _start_strategy(mgr, PERP_STRATEGY_ID)
+    assert mgr.start_actor == "user:soma"
+    assert d["session_id"] == "s1"
+
+
+# ---------------------------------------------------------------------------
 # Parity table: stop, detail, quick trade
 # ---------------------------------------------------------------------------
 

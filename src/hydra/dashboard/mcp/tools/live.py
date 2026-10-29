@@ -25,6 +25,7 @@ from hydra.services.live_gate import (
     live_approval_store,
     require_armed,
 )
+from hydra.services.perps_gate import is_perp_strategy, is_perp_venue, require_perps_gate
 from hydra.services.sessions import QuickTradeRequest
 
 
@@ -53,7 +54,10 @@ async def live_session_start(strategy_id: str, reason: str) -> str:
     """
     try:
         body = _SessionStart(strategy_id=strategy_id, reason=reason)
-        await require_armed(_deps.db_pool())
+        if is_perp_strategy(body.strategy_id):
+            await require_perps_gate(_deps.db_pool())  # the separate perps ceremony (P4-E)
+        else:
+            await require_armed(_deps.db_pool())
         params: dict[str, str] = {"strategy_id": body.strategy_id, "reason": body.reason}
         store = live_approval_store(_deps.engine_state())
         approval = await create_live_approval(
@@ -117,9 +121,12 @@ async def live_order(
             session_id=session_id,
         )
         _reason = _Reason(reason=reason).reason
-        await require_armed(_deps.db_pool())
         sessions = await _deps.trader().list_sessions()
         target = next((s for s in sessions if s.get("session_id") == session_id), None)
+        if is_perp_venue(None if target is None else target.get("exchange_id")):
+            await require_perps_gate(_deps.db_pool())  # the separate perps ceremony (P4-E)
+        else:
+            await require_armed(_deps.db_pool())
         if target is None:
             raise service_error(
                 404, "session_not_found", f"Session {session_id} not found", "not_found"
