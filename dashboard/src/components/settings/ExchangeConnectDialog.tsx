@@ -47,6 +47,9 @@ interface ExchangeConnectDialogProps {
   onUpdated: () => void;
 }
 
+/** The perps venue's connect copy: its keys are the live perp trading keys. */
+const isPerpsVenue = (id: string) => id === 'binanceusdm';
+
 export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: ExchangeConnectDialogProps) {
   const { toast } = useToast();
   const [apiKey, setApiKey] = useState('');
@@ -311,10 +314,25 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
       onConfirm={handleConnect}
       onClose={onClose}
     >
+      {isPerpsVenue(exchange.id) ? (
+        <>
+          <p>
+            Use a <strong>trade-only</strong> Binance USD⌂-M key: withdrawals disabled and futures
+            enabled. Hydra checks it with a read-only call — and refuses keys that cannot trade
+            futures — before storing it, encrypted. The perps arm ceremony re-checks the futures
+            permission live before anything is armed.
+          </p>
+          <p className="text-xs text-ink-2">
+            These keys are what a live perp session trades with; on testnet they come from
+            testnet.binance.vision, on mainnet from your account. Spot sessions are unaffected.
+          </p>
+        </>
+      ) : (
       <p>
         Use a <strong>read-only</strong> API key. Hydra checks it with a read-only call before storing it, encrypted. In
         this version it&apos;s used only to show your balance and open orders.
       </p>
+      )}
       <p className="text-xs text-ink-2" data-testid="connect-target">
         The keys are checked against {exchange.name} {exchange.environment}
         {exchange.environment === 'testnet'

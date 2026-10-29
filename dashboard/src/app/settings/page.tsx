@@ -18,6 +18,7 @@ import { useToast } from '@/components/ui/Toast';
 import { logger } from '@/lib/logger';
 import { ExchangeConnectDialog } from '@/components/settings/ExchangeConnectDialog';
 import { LiveGate } from '@/components/live/LiveGate';
+import { PerpsGate } from '@/components/live/PerpsGate';
 
 /* ---------- Types ---------- */
 
@@ -521,7 +522,9 @@ export default function SettingsPage() {
                       <div>
                         <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-2 mb-2">Positions</h4>
                         <p className="text-xs text-ink-2">
-                          Spot account: there are no positions; holdings are listed under Balances.
+                          {exchange.id === 'binanceusdm'
+                            ? 'USD⌂-M perps account: this panel shows the futures wallet and open orders; held perp positions show on the session page.'
+                            : 'Spot account: there are no positions; holdings are listed under Balances.'}
                         </p>
                       </div>
                     </div>
@@ -536,6 +539,8 @@ export default function SettingsPage() {
       </Section>
 
       <LiveGate />
+
+      <PerpsGate />
 
       <Section title="Alerts">
         <div className="space-y-2 text-sm text-ink-1">

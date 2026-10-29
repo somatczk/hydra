@@ -251,6 +251,45 @@ class TestSaveStrategy:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/strategies/{id} — the builder read the dialog round-trips through
+# ---------------------------------------------------------------------------
+
+
+class TestGetStrategyDetailPerps:
+    """P4-F: the stored perp leverage passes through the detail read, so an edited
+    binanceusdm strategy never silently downgrades to 1x."""
+
+    @pytest.fixture()
+    def client(self, app: FastAPI) -> TestClient:
+        """The builder app with the stored universe row every save reads."""
+        app.state.db_pool = seeded_universe_pool()
+        return TestClient(app)
+
+    def test_detail_passes_the_saved_perps_leverage_through(
+        self, client: TestClient, tmp_path: Path
+    ) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            request = TestSaveStrategy()._valid_save_request()
+            request["exchange_id"] = "binanceusdm"
+            request["leverage"] = 2
+            saved = client.post("/api/strategies/save", json=request).json()
+            assert saved["id"]
+
+            detail = client.get(f"/api/strategies/{saved['id']}").json()
+        assert detail["exchange_id"] == "binanceusdm"
+        assert detail["leverage"] == 2
+
+    def test_detail_keeps_a_spot_strategy_at_1x(self, client: TestClient, tmp_path: Path) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            request = TestSaveStrategy()._valid_save_request()
+            saved = client.post("/api/strategies/save", json=request).json()
+
+            detail = client.get(f"/api/strategies/{saved['id']}").json()
+        assert detail["exchange_id"] == "binance"
+        assert detail["leverage"] == 1
+
+
+# ---------------------------------------------------------------------------
 # POST /api/strategies/preview
 # ---------------------------------------------------------------------------
 

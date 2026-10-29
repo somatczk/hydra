@@ -327,7 +327,8 @@ describe('fills, sides and stop rules', () => {
     expect(sideLabel('long')).toEqual({ text: 'Held', caution: false });
     expect(sideLabel('BUY')).toEqual({ text: 'Buy', caution: false });
     expect(sideLabel('sell')).toEqual({ text: 'Sell', caution: false });
-    expect(sideLabel('Short')).toEqual({ text: 'Short', caution: true });
+    // P4: a perp SHORT is a first-class side, not an unknown vocabulary word.
+    expect(sideLabel('Short')).toEqual({ text: 'Short', caution: false });
   });
 
   it('names the strategy stop rule from StrategyRiskConfig methods (strategy/config.py:45)', () => {

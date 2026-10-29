@@ -12,6 +12,27 @@ vi.mock('@/lib/api', async (orig) => ({
 
 const { StrategyNameDialog } = await import('./StrategyNameDialog');
 
+/** A native select change, the React-controlled way. */
+async function pickByLabel(container: HTMLElement, label: string, value: string): Promise<void> {
+  const el = Array.from(container.querySelectorAll('label')).find((l) => l.textContent === label);
+  if (!el) throw new Error(`no label ${label}`);
+  const select = document.getElementById(el.htmlFor);
+  if (!(select instanceof HTMLSelectElement)) throw new Error(`no select for ${label}`);
+  const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+  await act(async () => {
+    setter?.call(select, value);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+}
+
+function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
+  const el = Array.from(container.querySelectorAll('label')).find((l) => l.textContent === label);
+  if (!el) throw new Error(`no label ${label}`);
+  const select = document.getElementById(el.htmlFor);
+  if (!(select instanceof HTMLSelectElement)) throw new Error(`no select for ${label}`);
+  return select;
+}
+
 const STATE: BuilderState = {
   entryLong: {
     operator: 'AND',
@@ -32,6 +53,7 @@ const STATE: BuilderState = {
   strategyDescription: '',
   exchangeId: 'binance',
   symbol: 'BTCUSDT',
+  leverage: 1,
   baseline: '',
 };
 
@@ -39,7 +61,7 @@ let m: Mounted | null = null;
 let saved: Array<[string, string]>;
 let closes: number;
 
-function render(props: { editingId?: string | null; initialName?: string } = {}) {
+function render(props: { editingId?: string | null; initialName?: string; initialExchangeId?: string; initialLeverage?: number } = {}) {
   return mount(
     <StrategyNameDialog
       open
@@ -51,8 +73,9 @@ function render(props: { editingId?: string | null; initialName?: string } = {})
       editingId={props.editingId ?? null}
       initialName={props.initialName ?? ''}
       initialDescription=""
-      initialExchangeId="binance"
+      initialExchangeId={props.initialExchangeId ?? 'binance'}
       initialSymbol="BTCUSDT"
+      initialLeverage={props.initialLeverage ?? 1}
     />,
   );
 }
@@ -119,6 +142,7 @@ describe('StrategyNameDialog', () => {
       },
       enable_immediately: false,
       ml_overlay: { model_name: 'm1', confidence_threshold: 0.6 },
+      leverage: 1,
     });
     expect(saved).toEqual([['RSI bot', 'strat-7']]);
     expect(closes).toBe(1);
@@ -184,5 +208,98 @@ describe('StrategyNameDialog', () => {
     expect(saved).toHaveLength(0);
     expect(dialog().textContent).toContain('Rules reference unknown indicator');
     expect(dialog().textContent).not.toContain('"detail"');
+  });
+});
+
+describe('StrategyNameDialog perps fields (P4-F: venue / market_type / leverage / isolated)', () => {
+  it('offers the binanceusdm venue and shows the perps region only for it', async () => {
+    fetchApi.mockResolvedValue({ id: 'strat-7' });
+    m = await render({ initialName: 'Perp bot' });
+
+    const dialog = () => m!.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog().textContent).not.toContain('Perps (Binance USD⌂-M)');
+    expect(Array.from(dialog().querySelectorAll('label')).map((l) => l.textContent)).not.toContain('Leverage (1–3×)');
+
+    await pickByLabel(dialog(), 'Exchange', 'binanceusdm');
+    expect(dialog().textContent).toContain('Perps (Binance USD⌂-M)');
+    expect(dialog().textContent).toContain('Market type: FUTURES · Margin mode: isolated (the only mode in 2.8.0).');
+    expect(dialog().textContent).toContain('The account-wide cap (3×) is enforced again at session start; spot strategies stay 1×.');
+  });
+
+  it('sends the picked leverage for a perps venue and 1× for spot', async () => {
+    fetchApi.mockResolvedValue({ id: 'strat-7' });
+    m = await render({ initialName: 'Perp bot' });
+    const dialog = () => m!.container.querySelector('dialog') as HTMLDialogElement;
+
+    await pickByLabel(dialog(), 'Exchange', 'binanceusdm');
+    await pickByLabel(dialog(), 'Leverage (1–3×)', '2');
+    await click(buttonByText(dialog(), 'Save strategy'));
+    expect(JSON.parse(String(fetchApi.mock.calls[0][1]?.body))).toMatchObject({ exchange_id: 'binanceusdm', leverage: 2 });
+
+    fetchApi.mockClear();
+    m?.unmount();
+    m = await render({ initialName: 'Spot bot' });
+    await click(buttonByText(dialog(), 'Save strategy'));
+    expect(JSON.parse(String(fetchApi.mock.calls[0][1]?.body))).toMatchObject({ exchange_id: 'binance', leverage: 1 });
+  });
+
+  it('round-trips a stored perp strategy\u2019s leverage into the select (never silently downgrades it)', async () => {
+    fetchApi.mockResolvedValue({ id: 'strat-9' });
+    m = await render({ editingId: 'strat-9', initialName: 'Saw', initialExchangeId: 'binanceusdm', initialLeverage: 3 });
+    const dialog = () => m!.container.querySelector('dialog') as HTMLDialogElement;
+
+    const sel = selectByLabel(dialog(), 'Leverage (1–3×)');
+    expect(sel.value).toBe('3');
+    await click(buttonByText(dialog(), 'Save strategy'));
+    const [path, init] = fetchApi.mock.calls[0];
+    expect(path).toBe('/api/strategies/strat-9');
+    expect(JSON.parse(String(init?.body))).toMatchObject({ exchange_id: 'binanceusdm', leverage: 3 });
+  });
+
+  it('drops the leverage to 1× when the venue moves back to spot (the venue-pair rule, client-side)', async () => {
+    fetchApi.mockResolvedValue({ id: 'strat-7' });
+    m = await render({ initialName: 'Perp bot', initialExchangeId: 'binanceusdm', initialLeverage: 2 });
+    const dialog = () => m!.container.querySelector('dialog') as HTMLDialogElement;
+
+    await pickByLabel(dialog(), 'Exchange', 'binance');
+    expect(dialog().textContent).not.toContain('Perps (Binance USD⌂-M)');
+    await click(buttonByText(dialog(), 'Save strategy'));
+    expect(JSON.parse(String(fetchApi.mock.calls[0][1]?.body))).toMatchObject({ exchange_id: 'binance', leverage: 1 });
+  });
+
+  it('surfaces the save-path validation refusals verbatim: the pydantic bounds and the venue-pair rule', async () => {
+    fetchApi.mockRejectedValue(
+      new ApiError(
+        422,
+        JSON.stringify({
+          detail: {
+            code: 'value_error',
+            message: 'Input should be less than or equal to 3',
+            state: 'invalid',
+          },
+        }),
+      ),
+    );
+    m = await render({ initialName: 'Perp bot', initialExchangeId: 'binanceusdm', initialLeverage: 2 });
+    await click(buttonByText(dialog(), 'Save strategy'));
+    expect(dialog().textContent).toContain('Input should be less than or equal to 3');
+
+    fetchApi.mockRejectedValue(
+      new ApiError(
+        422,
+        JSON.stringify({
+          detail: {
+            code: 'value_error',
+            message: 'Leverage applies to binanceusdm (futures) strategies only, got 2x',
+            state: 'invalid',
+          },
+        }),
+      ),
+    );
+    m?.unmount();
+    m = await render({ initialName: 'Spot bot' });
+    await click(buttonByText(dialog(), 'Save strategy'));
+    expect(dialog().textContent).toContain('Leverage applies to binanceusdm (futures) strategies only, got 2x');
+    expect(closes).toBe(0);
   });
 });

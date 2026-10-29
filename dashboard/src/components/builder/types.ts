@@ -94,6 +94,8 @@ export interface BuilderState {
   strategyDescription: string;
   exchangeId: string;
   symbol: string;
+  /** P4-F: the perp leverage (1-3×) — applies to binanceusdm FUTURES strategies only; spot stays 1×. */
+  leverage: number;
   baseline: string;
 }
 
@@ -140,6 +142,8 @@ export interface SaveRequest {
   };
   enable_immediately: boolean;
   ml_overlay?: { model_name: string; confidence_threshold: number } | null;
+  /** P4: perp strategies only (1-3×, isolated); the server refuses it on spot venues. */
+  leverage?: number;
 }
 
 export interface SerializedCondition {
@@ -187,6 +191,8 @@ export interface StrategyDetail {
     sizing_params: Record<string, number>;
   };
   ml_overlay?: { model_name: string; confidence_threshold: number } | null;
+  /** P4-F: the stored perp leverage for a binanceusdm strategy, so an edit round-trips it. */
+  leverage?: number;
 }
 
 /* ---------- Reducer actions ---------- */

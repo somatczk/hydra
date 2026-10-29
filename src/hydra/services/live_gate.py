@@ -232,10 +232,15 @@ def stored_permissions(raw: Any) -> dict[str, Any] | None:
 
 
 def is_trade_capable(raw: Any) -> bool:
-    """True when the stored ``validated_permissions`` record a spot-trade-enabled key
-    (the connect-time record; the UI flag source)."""
+    """True when the stored ``validated_permissions`` record a trade-enabled key — spot
+    trading for a spot venue, futures trading for a binanceusdm key (the connect-time
+    record; the UI flag and the delete-gate's source)."""
     permissions = stored_permissions(raw)
-    return permissions is not None and bool(permissions.get("enable_spot_and_margin_trading"))
+    if permissions is None:
+        return False
+    return bool(permissions.get("enable_spot_and_margin_trading")) or bool(
+        permissions.get("enable_futures")
+    )
 
 
 def _not_live_capable(message: str) -> ServiceError:

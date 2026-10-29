@@ -322,6 +322,7 @@ class StrategyDetailResponse(BaseModel):
     editable: bool = False
     exchange_id: str = "binance"
     symbol: str = "BTCUSDT"
+    leverage: int = 1
     rules: RuleSetInput | None = None
     timeframes: TimeframeInput = Field(default_factory=TimeframeInput)
     risk: RiskInput = Field(default_factory=RiskInput)
@@ -445,6 +446,8 @@ def _extract_strategy_detail(data: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "exchange_id": exchange.get("exchange_id", "binance"),
         "symbol": symbols[0] if symbols else "BTCUSDT",
+        # P4-F: pass the stored perp leverage through so an edited strategy round-trips it
+        "leverage": exchange.get("leverage", 1),
         "rules": {
             "entry_long": _to_condition_group_input(rules_data.get("entry_long")),
             "exit_long": _to_condition_group_input(rules_data.get("exit_long")),

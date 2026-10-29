@@ -249,3 +249,67 @@ describe('the L4 delete for trade-capable keys (UI-4c)', () => {
     expect(d.textContent).not.toContain('Getting the one-time code…');
   });
 });
+
+describe('ExchangeConnectDialog perps venue (P4-F: the futures-keys connect gap)', () => {
+  function showPerps(connected = false, tradeEnabled: boolean | null = null) {
+    return mount(
+      <ExchangeConnectDialog
+        open
+        onClose={vi.fn()}
+        onUpdated={vi.fn()}
+        exchange={{
+          id: 'binanceusdm',
+          name: 'Binance USD\u2302-M',
+          connected,
+          environment: 'testnet',
+          ...(tradeEnabled !== null ? { tradeEnabled } : {}),
+        }}
+      />,
+    );
+  }
+
+  it('asks for a trade-only futures key and posts to the binanceusdm connect route', async () => {
+    fetchApi.mockImplementation(routeFetch({}, calls, { 'POST /api/system/exchanges/binanceusdm/connect': { message: 'stored' } }));
+    page = await showPerps();
+    expect(page.container.textContent).toContain('Use a trade-only Binance USD\u2302-M key: withdrawals disabled and futures enabled.');
+    expect(page.container.textContent).toContain('refuses keys that cannot trade futures');
+    expect(page.container.textContent).toContain('The perps arm ceremony re-checks the futures permission live before anything is armed.');
+    expect(page.container.textContent).not.toContain("it's used only to show your balance and open orders.");
+    await typeInto(inputByLabel(page.container, 'API Key'), 'key');
+    await typeInto(inputByLabel(page.container, 'API Secret'), 'secret');
+    await click(buttonByText(page.container, 'Check and save keys'));
+    expect(calls.filter((c) => c.path === '/api/system/exchanges/binanceusdm/connect')).toHaveLength(1);
+  });
+
+  it('surfaces the fail-closed futures refusal verbatim, nothing half-stored', async () => {
+    fetchApi.mockRejectedValue(
+      envelope(
+        422,
+        'credentials_not_futures_capable',
+        'Binance USD\u2302-M mainnet reports these keys cannot trade futures; perps trading needs futures enabled on the key (enable futures trading on the key); nothing was stored',
+        'invalid',
+      ),
+    );
+    page = await showPerps();
+    await typeInto(inputByLabel(page.container, 'API Key'), 'key');
+    await typeInto(inputByLabel(page.container, 'API Secret'), 'secret');
+    await click(buttonByText(page.container, 'Check and save keys'));
+    expect(page.container.textContent).toContain('reports these keys cannot trade futures');
+    expect(page.container.textContent).not.toContain('{"detail"');
+  });
+
+  it('a futures-trade key needs the L4 ceremony to delete, like a spot trade key', async () => {
+    fetchApi.mockImplementation(
+      routeFetch({}, calls, {
+        'POST /api/live/credential-delete': liveChallenge({ params: { exchange_id: 'binanceusdm' } }),
+      }),
+    );
+    page = await showPerps(true, true);
+    expect(page.container.textContent).toContain('These keys can trade, so deleting them also needs the one-time code.');
+    const deleteCall = calls.find((c) => c.path === '/api/live/credential-delete');
+    expect(JSON.parse(deleteCall?.init?.body as string)).toEqual({
+      exchange_id: 'binanceusdm',
+      reason: 'Delete the stored Binance USD\u2302-M keys',
+    });
+  });
+});

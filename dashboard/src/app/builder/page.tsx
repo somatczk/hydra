@@ -63,6 +63,7 @@ const initialDraft: Omit<BuilderState, 'baseline'> = {
   strategyDescription: '',
   exchangeId: 'binance',
   symbol: 'BTCUSDT',
+  leverage: 1,
 };
 
 function snapshot(state: BuilderState): string {
@@ -226,6 +227,7 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         strategyDescription: payload.description,
         exchangeId: payload.exchange_id || 'binance',
         symbol: payload.symbol || 'BTCUSDT',
+        leverage: payload.leverage ?? 1,
         baseline: '',
       };
       return { ...next, baseline: snapshot(next) };
@@ -583,6 +585,7 @@ function BuilderPageContent() {
         initialDescription={state.strategyDescription}
         initialExchangeId={state.exchangeId}
         initialSymbol={state.symbol}
+        initialLeverage={state.leverage}
       />
 
       {/* Draft guard */}

@@ -32,6 +32,7 @@ const STATE: BuilderState = {
   strategyDescription: '',
   exchangeId: 'kraken',
   symbol: 'ETHUSDT',
+  leverage: 1,
   baseline: '',
 };
 

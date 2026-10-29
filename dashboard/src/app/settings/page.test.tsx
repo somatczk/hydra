@@ -15,7 +15,7 @@ import {
 import { CLEAR_WEBHOOK_SECRET_WARNING } from '@/lib/platformConfig';
 import { ThemeProvider } from '@/components/layout/ThemeProvider';
 import { ShellStatusProvider } from '@/components/shell/ShellStatusProvider';
-import { liveStatus } from '@/test/fixtures';
+import { liveStatus, perpsStatus } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
 
@@ -31,6 +31,7 @@ function routes(): Routes {
   return {
     '/api/system/exchanges': [],
     '/api/risk/live-status': liveStatus(),
+    '/api/live/perps/status': perpsStatus(),
     '/api/trading/sessions': [],
     '/api/system/config': {
       default_pair: 'BTC/USDT',
@@ -96,6 +97,27 @@ describe('SettingsPage live gate', () => {
     expect(page.container.textContent).toContain('Live trading is on.');
     expect(page.container.textContent).toContain('Turn off live trading…');
     expect(page.container.textContent).not.toContain('Turn on live trading…');
+  });
+
+  it('mounts the separate perps gate under the spot gate with its own door and honest off-copy', async () => {
+    page = await mountSettings();
+
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('Perps trading (USD⌂-M)');
+    expect(text).toContain('Turn on perps trading…');
+    expect(text).toContain(
+      'Off. Perp strategies keep running paper until this leveraged gate is armed — arming live trading never arms perps.',
+    );
+    // Arming spot never arms perps: the spot row being on leaves the perps door closed.
+    const r = routes();
+    r['/api/risk/live-status'] = liveStatus({ live_armed: true });
+    fetchApi.mockImplementation(routeFetch(r, calls));
+    page?.unmount();
+    page = await mountSettings();
+    const spotOn = page.container.textContent ?? '';
+    expect(spotOn).toContain('Live trading is on.');
+    expect(spotOn).toContain('Turn on perps trading…');
+    expect(spotOn).not.toContain('Perps trading is on');
   });
 
   it('hides the on-button when the code service is down, and the paper settings keep working', async () => {

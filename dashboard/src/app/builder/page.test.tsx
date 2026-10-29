@@ -59,6 +59,13 @@ function loadedRoutes(): Routes {
   return { ...routes(), '/api/strategies/strat-1': STRATEGY };
 }
 
+/** A saved perp strategy as the detail read answers it (the leverage pass-through, P4-F). */
+const PERP_STRATEGY = { ...STRATEGY, exchange_id: 'binanceusdm', leverage: 2 };
+
+function loadedPerpRoutes(): Routes {
+  return { ...routes(), '/api/strategies/strat-1': PERP_STRATEGY };
+}
+
 const byText = (text: string) =>
   Array.from(page!.container.querySelectorAll('button')).filter((b) => b.textContent?.trim() === text);
 
@@ -153,6 +160,20 @@ describe('BuilderPage scope', () => {
 
     const put = calls.find((c) => c.init?.method === 'PUT');
     expect(JSON.parse(String(put?.init?.body)).ml_overlay).toEqual({ model_name: 'm1', confidence_threshold: 0.6 });
+  });
+
+  it('round-trips a loaded perp strategy\u2019s leverage through the dialog\u2019s PUT (P4-F)', async () => {
+    fetchApi.mockImplementation(routeFetch(loadedPerpRoutes(), calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    await flush();
+    await click(buttonByText(page.container, 'Update strategy'));
+    const dialog = page.container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialog.textContent).toContain('Perps (Binance USD⌂-M)');
+    await click(buttonByText(dialog, 'Save strategy'));
+
+    const put = calls.find((c) => c.init?.method === 'PUT');
+    expect(JSON.parse(String(put?.init?.body))).toMatchObject({ exchange_id: 'binanceusdm', leverage: 2 });
   });
 });
 

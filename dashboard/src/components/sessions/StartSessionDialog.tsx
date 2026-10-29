@@ -14,6 +14,7 @@ import type { SessionResponse } from '@/lib/derive';
 import { utc } from '@/lib/format';
 import {
   LIVE_FACTS,
+  PERPS_FACTS,
   liveStartOutcome,
   startOutcome,
   type ApproveResponse,
@@ -32,6 +33,8 @@ interface StrategyOption {
 interface StrategyDetail extends StrategyOption {
   symbol: string;
   timeframes: { primary: string };
+  /** P4: the venue the start's live leg answers to — a binanceusdm strategy gates on the perps ceremony. */
+  exchange_id?: string;
 }
 
 const DECIMAL = /^\d+(\.\d{1,8})?$/;
@@ -95,12 +98,14 @@ export function StartSessionDialog({ strategyId, onClose }: StartSessionDialogPr
     hadCodeError.current = codeError !== null;
   }, [codeError]);
 
-  const armed = live.data?.live_armed === true;
+  // P4-E: a perp strategy's live leg answers to the separate perps gate, never the spot row.
+  const known = detail !== null && !(detail instanceof Error) ? detail : null;
+  const perp = known?.exchange_id === 'binanceusdm';
+  const armed = perp ? live.data?.perps_armed === true : live.data?.live_armed === true;
   const livePicked = mode === 'live';
   const killSwitchOn = live.data?.kill_switch_state === 'active';
   const tier = live.data?.circuit_breaker_restrictions?.active_tier ?? 0;
   const capitalError = capital !== '' && !(DECIMAL.test(capital) && Number(capital) > 0) ? 'Enter an amount above 0 with up to 8 decimals.' : null;
-  const known = detail !== null && !(detail instanceof Error) ? detail : null;
   const locked = phase === 'code';
 
   const start = async () => {
@@ -208,7 +213,7 @@ export function StartSessionDialog({ strategyId, onClose }: StartSessionDialogPr
       {picked && (
         <p>
           {known
-            ? `${known.name} · Binance spot · ${known.symbol} · ${known.timeframes.primary} · ${livePicked ? 'LIVE' : 'PAPER'}`
+            ? `${known.name} · ${perp ? 'Binance USD⌂-M perps' : 'Binance spot'} · ${known.symbol} · ${known.timeframes.primary} · ${livePicked ? 'LIVE' : 'PAPER'}`
             : detail instanceof Error
               ? `Strategy details couldn't be read: ${describeApiError(detail, 'unknown error')}`
               : 'Reading the strategy…'}
@@ -233,7 +238,9 @@ export function StartSessionDialog({ strategyId, onClose }: StartSessionDialogPr
       </div>
       {!armed && (
         <p className="text-xs text-ink-2">
-          Live needs the gate on — turn on live trading in Settings first.{' '}
+          {perp
+            ? 'Live needs the perps gate on — turn on perps trading in Settings first. '
+            : 'Live needs the gate on — turn on live trading in Settings first. '}
           <Link href="/settings" className="underline">
             Settings ›
           </Link>
@@ -251,11 +258,13 @@ export function StartSessionDialog({ strategyId, onClose }: StartSessionDialogPr
           locked
             ? undefined
             : livePicked
-              ? 'Leave empty to use all unallocated live capital.'
+              ? perp
+                ? 'Leave empty to use all unallocated perps capital.'
+                : 'Leave empty to use all unallocated live capital.'
               : 'Leave empty to use all unallocated paper capital.'
         }
       />
-      {livePicked && <p className="font-semibold text-ink-1">{LIVE_FACTS}</p>}
+      {livePicked && <p className="font-semibold text-ink-1">{perp ? PERPS_FACTS : LIVE_FACTS}</p>}
       {phase === 'code' && challenge && (
         <>
           <p className="text-sm text-ink-1">

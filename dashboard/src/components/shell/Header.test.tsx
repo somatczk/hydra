@@ -155,6 +155,14 @@ describe('Header', () => {
     expect(header()).not.toContain('PAPER');
   });
 
+  it('shows LIVE when the separate PERPS gate is armed — leveraged money is real money (P4-E)', async () => {
+    setup({ '/api/risk/live-status': liveStatus({ perps_armed: true }) });
+    m = await shell();
+    expect(header()).toContain('LIVE');
+    expect(header()).toContain('real money');
+    expect(header()).not.toContain('PAPER');
+  });
+
   it('shows LIVE over a running live session even while the config says paper (the safety reading)', async () => {
     setup({ '/api/trading/sessions': [liveSession()] });
     m = await shell();
