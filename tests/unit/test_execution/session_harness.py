@@ -24,6 +24,7 @@ from hydra.core.types import OHLCV, ExchangeId, Symbol, Timeframe
 from hydra.data.bars import last_closed_open
 from hydra.execution.client_factory import ClientFactory, SharedRestClients
 from hydra.execution.paper_trading import PaperTradingExecutor
+from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.execution.session_manager import SessionManager, TradingSession
 from hydra.risk.pretrade import RiskConfig
 from hydra.risk.state import InMemoryRiskStateStore
@@ -67,21 +68,27 @@ def write_strategy(
     entry_long: dict[str, Any] | None = None,
     exit_long: dict[str, Any] | None = None,
     entry_short: dict[str, Any] | None = None,
+    exit_short: dict[str, Any] | None = None,
     risk: dict[str, Any] | None = None,
     exchange_id: str = "binance",
     market_type: str = "SPOT",
+    leverage: int | None = None,
     strategy_class: str = "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
     symbols: Iterable[str] = ("BTCUSDT",),
     timeframes: dict[str, str] | None = None,
     max_position_pct: float = 10.0,
 ) -> str:
+    exchange: dict[str, Any] = {"exchange_id": exchange_id, "market_type": market_type}
+    if leverage is not None:
+        exchange["leverage"] = leverage
+        exchange["margin_mode"] = "isolated"
     data: dict[str, Any] = {
         "id": sid,
         "name": sid,
         "strategy_class": strategy_class,
         "enabled": False,
         "symbols": list(symbols),
-        "exchange": {"exchange_id": exchange_id, "market_type": market_type},
+        "exchange": exchange,
         "timeframes": timeframes or {"primary": "1h"},
         "parameters": {
             "required_history": 2,
@@ -89,7 +96,7 @@ def write_strategy(
                 "entry_long": entry_long or NEVER,
                 "exit_long": exit_long or NEVER,
                 "entry_short": entry_short,
-                "exit_short": None,
+                "exit_short": exit_short,
             },
         },
         "position_sizing": {"max_position_pct": max_position_pct},
@@ -167,6 +174,7 @@ class Harness:
         low: str | None = None,
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
+        exchange_id: ExchangeId = "binance",
     ) -> OHLCV:
         """Publish the next closed bar exactly as the feed does (closed, not replayed)."""
         ts = self._next.get(session.session_id, self.end) + H
@@ -183,7 +191,7 @@ class Harness:
         )
         assert session._event_bus is not None
         await session._event_bus.publish(
-            BarEvent(symbol=Symbol(symbol), timeframe=timeframe, ohlcv=bar, exchange_id="binance")
+            BarEvent(symbol=Symbol(symbol), timeframe=timeframe, ohlcv=bar, exchange_id=exchange_id)
         )
         await settle()
         return bar
@@ -219,6 +227,12 @@ async def settle() -> None:
 def executor(session: TradingSession) -> PaperTradingExecutor:
     ex = session._executor
     assert isinstance(ex, PaperTradingExecutor)
+    return ex
+
+
+def perp_executor(session: TradingSession) -> PerpPaperTradingExecutor:
+    ex = session._executor
+    assert isinstance(ex, PerpPaperTradingExecutor)
     return ex
 
 

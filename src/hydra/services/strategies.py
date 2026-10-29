@@ -53,7 +53,8 @@ logger = logging.getLogger(__name__)
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config" / "strategies"
 _RULE_BASED_CLASS = "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
 _VALID_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d", "1w"}
-_VALID_EXCHANGES = {"binance", "bybit", "kraken", "okx"}
+_VALID_EXCHANGES = {"binance", "binanceusdm", "bybit", "kraken", "okx"}
+_PERP_EXCHANGES = {"binanceusdm"}
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,26 @@ def _strategy_not_found(strategy_id: str) -> ServiceError:
     return service_error(
         404, "strategy_not_found", f"Strategy {strategy_id} not found", "not_found"
     )
+
+
+def _exchange_block(exchange_id: str, leverage: int) -> dict[str, Any]:
+    """The ``exchange`` section of a saved strategy: binanceusdm is the FUTURES venue.
+
+    A perp strategy carries its leverage (1-3x, pydantic-validated here, re-validated at
+    session start against the risk_config cap); spot strategies stay 1x.
+    """
+    if exchange_id in _PERP_EXCHANGES:
+        return {
+            "exchange_id": exchange_id,
+            "market_type": "FUTURES",
+            "leverage": leverage,
+            "margin_mode": "isolated",
+        }
+    if leverage != 1:
+        raise ServiceError(
+            422, f"Leverage applies to binanceusdm (futures) strategies only, got {leverage}x"
+        )
+    return {"exchange_id": exchange_id, "market_type": "SPOT"}
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +290,7 @@ class SaveRequest(BaseModel):
     risk: RiskInput = Field(default_factory=RiskInput)
     enable_immediately: bool = False
     ml_overlay: dict[str, Any] | None = None
+    leverage: int = Field(1, ge=1, le=3, description="perp strategies only (1-3x, isolated)")
 
 
 class SaveResponse(BaseModel):
@@ -682,7 +704,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
         "strategy_class": _RULE_BASED_CLASS,
         "enabled": True if body.enable_immediately else existing_enabled,
         "symbols": [body.symbol],
-        "exchange": {"exchange_id": body.exchange_id, "market_type": "SPOT"},
+        "exchange": _exchange_block(body.exchange_id, body.leverage),
         "timeframes": {"primary": body.timeframes.primary},
         "parameters": {
             "rules": rule_set.model_dump(mode="json"),
@@ -967,7 +989,7 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
         "strategy_class": _RULE_BASED_CLASS,
         "enabled": request.enable_immediately,
         "symbols": [request.symbol],
-        "exchange": {"exchange_id": request.exchange_id, "market_type": "SPOT"},
+        "exchange": _exchange_block(request.exchange_id, request.leverage),
         "timeframes": {"primary": request.timeframes.primary},
         "parameters": {
             "rules": rule_set.model_dump(mode="json"),

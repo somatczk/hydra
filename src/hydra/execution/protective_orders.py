@@ -19,6 +19,7 @@ from typing import Any
 
 from hydra.core.events import OrderFillEvent
 from hydra.core.types import (
+    Direction,
     ExchangeId,
     MarketType,
     OrderRequest,
@@ -39,11 +40,16 @@ DEFAULT_STOP_FRACTION = Decimal(str(DEFAULT_STOP_LOSS_PCT)) / _HUNDRED
 
 @dataclass(frozen=True, slots=True)
 class ProtectionSpec:
-    """Absolute exit levels for one long position; ``trailing_pct`` is a fraction."""
+    """Absolute exit levels for one position; ``trailing_pct`` is a fraction.
+
+    A SHORT position inverts the geometry: its stop-loss sits above the entry and its
+    take-profit below (the validator enforces the side's ordering).
+    """
 
     stop_loss: Decimal | None = None
     take_profit: Decimal | None = None
     trailing_pct: Decimal | None = None
+    direction: Direction = Direction.LONG
 
     def __post_init__(self) -> None:
         if self.trailing_pct is not None and self.stop_loss is not None:
@@ -55,44 +61,54 @@ class ProtectionSpec:
         for name, level in (("stop_loss", self.stop_loss), ("take_profit", self.take_profit)):
             if level is not None and level <= 0:
                 raise ValueError(f"{name} must be > 0, got {level}")
-        if (
-            self.stop_loss is not None
-            and self.take_profit is not None
-            and self.stop_loss >= self.take_profit
-        ):
-            raise ValueError("stop_loss must be below take_profit for a long position")
+        if self.stop_loss is None or self.take_profit is None:
+            return
+        if self.direction == Direction.LONG:
+            if self.stop_loss >= self.take_profit:
+                raise ValueError("stop_loss must be below take_profit for a long position")
+        elif self.stop_loss <= self.take_profit:
+            raise ValueError("stop_loss must be above take_profit for a short position")
 
 
-def default_stop(entry: Decimal) -> ProtectionSpec:
+def default_stop(entry: Decimal, direction: Direction = Direction.LONG) -> ProtectionSpec:
     """The 5 % catastrophe stop every position falls back to."""
-    return ProtectionSpec(stop_loss=entry * (_ONE - DEFAULT_STOP_FRACTION))
+    if direction == Direction.SHORT:
+        return ProtectionSpec(stop_loss=entry * (_ONE + DEFAULT_STOP_FRACTION), direction=direction)
+    return ProtectionSpec(stop_loss=entry * (_ONE - DEFAULT_STOP_FRACTION), direction=direction)
 
 
 def spec_from_policy(
-    policy: StrategyRiskConfig, entry: Decimal, atr: Decimal | None
+    policy: StrategyRiskConfig,
+    entry: Decimal,
+    atr: Decimal | None,
+    direction: Direction = Direction.LONG,
 ) -> ProtectionSpec:
-    """Absolute levels for a long entered at *entry*; an ATR policy without ATR uses the default."""
+    """Absolute levels for a position entered at *entry*; an ATR policy without ATR
+    uses the default."""
+    short = direction == Direction.SHORT
     value = Decimal(str(policy.stop_loss_value))
     if policy.stop_loss_method == "trailing_stop":
-        return ProtectionSpec(trailing_pct=value / _HUNDRED)
+        return ProtectionSpec(trailing_pct=value / _HUNDRED, direction=direction)
     if policy.stop_loss_method == "atr":
         if atr is None or atr <= 0:
             logger.warning(
                 "ATR unavailable for the stop; using the %s%% default", DEFAULT_STOP_LOSS_PCT
             )
-            return default_stop(entry)
-        stop = entry - value * atr
+            return default_stop(entry, direction)
+        stop = entry + value * atr if short else entry - value * atr
     else:
-        stop = entry * (_ONE - value / _HUNDRED)
+        stop = entry * (_ONE + value / _HUNDRED) if short else entry * (_ONE - value / _HUNDRED)
     if stop <= 0:
-        return default_stop(entry)
+        return default_stop(entry, direction)
     take_profit: Decimal | None = None
     tp_value = Decimal(str(policy.take_profit_value))
     if policy.take_profit_method == "fixed_pct":
-        take_profit = entry * (_ONE + tp_value / _HUNDRED)
+        take_profit = (
+            entry * (_ONE - tp_value / _HUNDRED) if short else entry * (_ONE + tp_value / _HUNDRED)
+        )
     elif policy.take_profit_method == "atr" and atr is not None and atr > 0:
-        take_profit = entry + tp_value * atr
-    return ProtectionSpec(stop_loss=stop, take_profit=take_profit)
+        take_profit = entry - tp_value * atr if short else entry + tp_value * atr
+    return ProtectionSpec(stop_loss=stop, take_profit=take_profit, direction=direction)
 
 
 @dataclass(slots=True)
@@ -150,12 +166,16 @@ class ProtectiveOrderManager:
     def is_protective(self, order_id: str) -> bool:
         return any(g.order_id == order_id for g in self._groups.values())
 
-    def planned_stop(self, symbol: str, reference: Decimal) -> Decimal | None:
+    def planned_stop(
+        self, symbol: str, reference: Decimal, direction: Direction = Direction.LONG
+    ) -> Decimal | None:
         """The stop an entry at *reference* would get (for the pre-trade risk_per_trade check)."""
-        return self._policy_spec(symbol, reference).stop_loss
+        return self._policy_spec(symbol, reference, direction).stop_loss
 
-    def _policy_spec(self, symbol: str, entry: Decimal) -> ProtectionSpec:
-        return spec_from_policy(self._policy, entry, self._atr(symbol))
+    def _policy_spec(
+        self, symbol: str, entry: Decimal, direction: Direction = Direction.LONG
+    ) -> ProtectionSpec:
+        return spec_from_policy(self._policy, entry, self._atr(symbol), direction)
 
     # -- Manual specs (quick-trade, webhook) -----------------------------------------
 
@@ -169,7 +189,14 @@ class ProtectiveOrderManager:
     # -- Fills -----------------------------------------------------------------------
 
     async def on_fill(self, event: OrderFillEvent) -> None:
-        """Keep exactly one protective group sized to the open position after every fill."""
+        """Keep exactly one protective group sized to the open position after every fill.
+
+        Direction-agnostic by construction: an entry fill carries its manual spec's tag
+        (a short's entry is a SELL just as a long's is a BUY), an exit fill re-arms
+        whatever the disarm stashed, and any fill that leaves a position re-sizes the
+        group to it. Only an exit fill consumes the disarm stash — an entry never does
+        (a stashed spec that survived a refused exit is stale for the new position).
+        """
         symbol = str(event.symbol)
         position = await self._position(symbol)
         group = self._groups.get(symbol)
@@ -178,22 +205,19 @@ class ProtectiveOrderManager:
             if position is not None:
                 await self._arm(position, group.spec)
             return
-        if event.side == Side.BUY:
-            manual = self._manual.pop(event.tag, None) if event.tag in self._manual else None
-            spec = manual or (group.spec if group is not None else None)
-            if group is not None:
-                await self._cancel(group)
-            if position is not None:
-                await self._arm(
-                    position, spec or self._policy_spec(symbol, position.avg_entry_price)
-                )
-            return
-        spec = self._disarmed.pop(symbol, None) or (group.spec if group is not None else None)
+        manual = self._manual.pop(event.tag, None) if event.tag in self._manual else None
+        exit_fill = position is None or (position.direction == Direction.LONG) != (
+            event.side == Side.BUY
+        )
+        stash = self._disarmed.pop(symbol, None) if exit_fill else None
+        spec = manual or stash or (group.spec if group is not None else None)
         if group is not None:
             await self._cancel(group)
         if position is not None:
-            policy = spec or self._policy_spec(symbol, position.avg_entry_price)
-            await self._arm(position, policy)
+            await self._arm(
+                position,
+                spec or self._policy_spec(symbol, position.avg_entry_price, position.direction),
+            )
 
     # -- Exits -----------------------------------------------------------------------
 
@@ -212,7 +236,10 @@ class ProtectiveOrderManager:
             return
         position = await self._position(symbol)
         if position is not None:
-            await self._arm(position, spec or self._policy_spec(symbol, position.avg_entry_price))
+            await self._arm(
+                position,
+                spec or self._policy_spec(symbol, position.avg_entry_price, position.direction),
+            )
 
     async def clear(self) -> None:
         """Cancel every group (stop / flatten); nothing is re-armed afterwards."""
@@ -237,10 +264,11 @@ class ProtectiveOrderManager:
             position = await self._position(symbol)
             if position is None:
                 continue
+            exit_side = "SELL" if position.direction == Direction.LONG else "BUY"
             resting = [
                 o
                 for o in await self._executor.fetch_open_orders(symbol)
-                if str(o.get("side")) == "SELL"
+                if str(o.get("side")) == exit_side
                 and (
                     not live
                     or str(o.get("client_order_id") or "").startswith(CLIENT_ORDER_ID_PREFIX)
@@ -257,7 +285,9 @@ class ProtectiveOrderManager:
                     spec=_spec_from_resting(resting),
                 )
                 continue
-            await self._arm(position, self._policy_spec(symbol, position.avg_entry_price))
+            await self._arm(
+                position, self._policy_spec(symbol, position.avg_entry_price, position.direction)
+            )
 
     # -- Internals -------------------------------------------------------------------
 
@@ -300,10 +330,13 @@ class ProtectiveOrderManager:
     async def _place(self, position: Position, spec: ProtectionSpec) -> ProtectiveGroup | None:
         symbol = str(position.symbol)
         qty = position.quantity
+        side = Side.SELL if position.direction == Direction.LONG else Side.BUY
+        if spec.direction != position.direction:
+            spec = replace(spec, direction=position.direction)
         if spec.trailing_pct is not None:
             resp = await self._executor.create_order(
                 symbol,
-                "SELL",
+                str(side),
                 OrderType.TRAILING_STOP,
                 qty,
                 params={
@@ -314,12 +347,14 @@ class ProtectiveOrderManager:
             )
             return self._group_from_response(symbol, OrderType.TRAILING_STOP, qty, spec, resp)
         if spec.stop_loss is None:
-            spec = replace(spec, stop_loss=default_stop(position.avg_entry_price).stop_loss)
+            spec = replace(
+                spec, stop_loss=default_stop(position.avg_entry_price, position.direction).stop_loss
+            )
         order_type = OrderType.OCO if spec.take_profit is not None else OrderType.STOP_MARKET
         order_id = await self._om.submit_order(
             OrderRequest(
                 symbol=Symbol(symbol),
-                side=Side.SELL,
+                side=side,
                 order_type=order_type,
                 quantity=qty,
                 strategy_id=self._strategy_id,

@@ -668,3 +668,60 @@ class TestSizing:
                 exchange_id="bybit",
             )
         assert acct.svc.registered_sessions() == []
+
+
+class TestPerpSpendableBalance:
+    async def test_the_futures_check_pays_from_the_wallet_not_short_inflated_cash(self) -> None:
+        from hydra.core.types import MarketType, OrderRequest, OrderType, Symbol
+        from hydra.execution.perp_trading import PerpPaperTradingExecutor
+        from hydra.risk.market_rules import MarketRulesCache
+        from hydra.risk.state import InMemoryRiskStateStore
+        from tests.fixtures.binance_kline import binance_markets
+
+        async def markets(exchange_id: str) -> list[dict[str, Any]]:
+            return list(binance_markets().values())
+
+        ex = PerpPaperTradingExecutor(
+            initial_balances={"USDT": Decimal("1000")},
+            slippage_pct=Decimal("0"),
+            maker_fee=Decimal("0"),
+            taker_fee=Decimal("0"),
+            leverage=1,
+        )
+        ex.set_mark("BTCUSDT", Decimal("100"))
+        await ex.create_order("BTCUSDT", "SELL", "MARKET", Decimal("1"))  # short: margin 100
+        svc = RiskService(
+            InMemoryRiskStateStore(paper_capital=Decimal("1000"), config=permissive()),
+            market_rules=MarketRulesCache(loader=markets, clock=Clock()),
+        )
+        await svc.load()
+        await svc.recovery_complete()
+        await svc.register_session(
+            "perp",
+            ex,
+            allocated=Decimal("1000"),
+            symbols=["BTCUSDT"],
+            exchange_id="binanceusdm",
+            strategy_id="perp",
+            leverage=1,
+        )
+        await svc.on_mark("binanceusdm", "BTCUSDT", Decimal("100"), T0)
+
+        state = await svc.snapshot("perp")
+        assert state.spendable_balance == Decimal("900")
+        # get_balance is the margin-trading cash: the short inflates it by margin+notional
+        assert state.balances["USDT"] == Decimal("1100")
+
+        # 9 more short adds 900 of notional: the inflated cash covers it, the wallet cannot
+        order = OrderRequest(
+            symbol=Symbol("BTCUSDT"),
+            side=Side.SELL,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("9"),
+            strategy_id="perp",
+            exchange_id="binanceusdm",
+            market_type=MarketType.FUTURES,
+        )
+        decision = await svc.check(order, "perp", OPEN)
+        assert not decision.approved and decision.check == "balance"
+        assert "have 900" in decision.reason

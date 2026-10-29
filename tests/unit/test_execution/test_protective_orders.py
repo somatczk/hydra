@@ -744,6 +744,25 @@ class TestLiveGroups:
         assert group is not None and group.order_id != "101"  # a NEW OCO (cancel/replace)
         assert ex.calls[-1]["order_type"] == "OCO"
 
+    async def test_an_entry_fill_never_consumes_the_disarm_stash(self) -> None:
+        # a manual entry arms its manual spec; a disarm before an exit that never fills
+        # leaves it stashed; the NEXT entry must arm the policy spec, never the stale one
+        ex = FakeLiveExecutor([_position("BTCUSDT", "0.01")])
+        protect = _manager(ex)
+        protect.register_manual("manual:1", ProtectionSpec(stop_loss=D("80")))
+        await protect.on_fill(_fill("BTCUSDT", "e1", side=Side.BUY, tag="manual:1"))
+        group = protect.armed("BTCUSDT")
+        assert group is not None and group.spec.stop_loss == D("80")
+
+        await protect.disarm("BTCUSDT")  # the exit submit is refused; the stash survives
+
+        await protect.on_fill(_fill("BTCUSDT", "e2", side=Side.BUY, tag="entry"))
+
+        group = protect.armed("BTCUSDT")
+        assert group is not None
+        assert group.spec == spec_from_policy(StrategyRiskConfig(), D("100"), None)
+        assert group.spec.stop_loss == D("95")
+
     async def test_adopt_attaches_normalized_legs_and_heals_a_gap(self) -> None:
         resting = normalize_open_orders(
             [

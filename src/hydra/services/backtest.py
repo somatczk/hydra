@@ -195,8 +195,15 @@ def _invalid_strategy(strategy_id: str, reason: str) -> ServiceError:
     )
 
 
-def _load_backtest_strategy(strategy_id: str) -> tuple[type[BaseStrategy], StrategyConfig]:
-    """Resolve a strategy YAML into its class and full config; 404 unknown, 422 unusable."""
+def _load_backtest_strategy(
+    strategy_id: str, *, allow_futures: bool = False
+) -> tuple[type[BaseStrategy], StrategyConfig]:
+    """Resolve a strategy YAML into its class and full config; 404 unknown, 422 unusable.
+
+    A USD⌂-M perp strategy runs as a plain backtest (``allow_futures=True``, P4-C: the
+    perp paper executor through the runner's parity path); hyperopt and walk-forward
+    keep refusing futures until their worker paths carry the funding preflight too.
+    """
     path = strategy_files.find_strategy_file(strategy_id)
     if path is None:
         raise service_error(
@@ -215,9 +222,11 @@ def _load_backtest_strategy(strategy_id: str) -> tuple[type[BaseStrategy], Strat
         raise _invalid_strategy(strategy_id, f"invalid config: {exc}") from exc
     if not config.symbols:
         raise _invalid_strategy(strategy_id, "config lists no symbols")
-    if config.exchange.market_type == MarketType.FUTURES:
+    if config.exchange.market_type == MarketType.FUTURES and not allow_futures:
         raise _invalid_strategy(
-            strategy_id, "futures backtests are not supported until perpetuals support lands"
+            strategy_id,
+            "futures strategies run as plain backtests only for now "
+            "(perp hyperopt and walk-forward arrive after 2.8.0)",
         )
     try:
         return import_backtest_strategy(config.strategy_class), config
@@ -235,6 +244,7 @@ async def _preflight(
     require_data: bool = True,
     auto_fetch: bool = False,
     read_span: bool = False,
+    allow_futures: bool = False,
 ) -> Preflight:
     """Validate a job before it is queued: 404 strategy, 422 config/data, 503 database.
 
@@ -242,9 +252,10 @@ async def _preflight(
     a missing range never 422s — the job is queued and the worker owns availability;
     off, the exact P0-B 422 ``no_market_data`` with the available range. ``read_span``
     keeps the stored-span read for callers that size from it (the walk-forward
-    fast-fail) even while fetching.
+    fast-fail) even while fetching. ``allow_futures`` opens the USD⌂-M perp path
+    (plain backtests only).
     """
-    strategy_cls, config = _load_backtest_strategy(strategy_id)
+    strategy_cls, config = _load_backtest_strategy(strategy_id, allow_futures=allow_futures)
     tf = timeframe or config.timeframes.primary
     if tf != config.timeframes.primary:
         config = config.model_copy(
@@ -285,6 +296,7 @@ async def submit_backtest(
         body.end_date,
         require_data=not body.fetch_fresh,
         auto_fetch=auto_fetch,
+        allow_futures=True,
     )
     async with db_errors("queueing the job"):
         task_id = await jobs.enqueue(

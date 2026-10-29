@@ -20,10 +20,12 @@ from hydra.core.types import ExchangeId, MarketType
 from hydra.data.storage import MarketDataRepository
 from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.paper_trading import PaperTradingExecutor, SpotMarketRules
+from hydra.execution.perp_trading import default_funding_reader
 
 if TYPE_CHECKING:
     from hydra.execution.exchange_client import ExchangeClient
     from hydra.execution.live_executor import LiveTradingExecutor
+    from hydra.execution.perp_trading import FundingReader, PerpPaperTradingExecutor
 
 logger = get_logger(__name__)
 
@@ -79,6 +81,11 @@ def ccxt_class_for(exchange_id: str, market_type: MarketType | str = MarketType.
 def _venue_market_type(exchange_id: str) -> MarketType:
     """The market type an allowed exchange id trades: binanceusdm is the USD⌂-M perps venue."""
     return MarketType.FUTURES if exchange_id in USDM_EXCHANGE_CLASS_MAP else MarketType.SPOT
+
+
+def venue_market_type(exchange_id: str) -> MarketType:
+    """Public form of ``_venue_market_type`` (recovery validates a row's own venue pair)."""
+    return _venue_market_type(exchange_id)
 
 
 def _venue_options(exchange_id: str, market_type: MarketType) -> dict[str, Any]:
@@ -145,7 +152,8 @@ def build_paper_executor(
     session_id: str,
     market_rules: Mapping[str, SpotMarketRules] | None = None,
 ) -> PaperTradingExecutor:
-    """Create the paper executor for one session, with the venue's lot and notional rules."""
+    """Create the spot paper executor for one session (the SPOT pair only, A1's hard floor)."""
+    validate_venue(exchange_id, MarketType.SPOT)
     return PaperTradingExecutor(
         exchange_id=exchange_id,
         initial_balances=initial_balances,
@@ -153,6 +161,33 @@ def build_paper_executor(
         strategy_id=strategy_id,
         session_id=session_id,
         market_rules=market_rules,
+    )
+
+
+def build_perp_paper_executor(
+    exchange_id: ExchangeId,
+    initial_balances: dict[str, Decimal],
+    db_pool: Any,
+    strategy_id: str,
+    session_id: str,
+    market_rules: Mapping[str, SpotMarketRules] | None = None,
+    *,
+    leverage: int = 1,
+    funding_reader: FundingReader | None = None,
+) -> PerpPaperTradingExecutor:
+    """Create the perp paper executor for one session (binanceusdm FUTURES only, P4-C)."""
+    from hydra.execution.perp_trading import PerpPaperTradingExecutor
+
+    validate_venue(exchange_id, MarketType.FUTURES)
+    return PerpPaperTradingExecutor(
+        exchange_id=exchange_id,
+        initial_balances=initial_balances,
+        db_pool=db_pool,
+        strategy_id=strategy_id,
+        session_id=session_id,
+        market_rules=market_rules,
+        leverage=leverage,
+        funding_reader=funding_reader,
     )
 
 
@@ -327,6 +362,7 @@ def bars_repository(db_pool: Any) -> MarketDataRepository | None:
 
 MarketsLoader = Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]]
 TradingClientFactory = Callable[[str, Mapping[str, Any], bool], Any]
+FundingReaderFactory = Callable[[Any, ExchangeId], "FundingReader | None"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +373,8 @@ class ClientFactory:
     and the paper smoke inject fakes. The REST client comes from the shared refcounted pool
     (S10b); the WebSocket client stays per feed. ``trading_client_factory`` builds the keyed
     live client from stored credentials — the seam the live tests use to inject the fake.
+    ``funding_reader_factory`` builds the perp sessions' funding source (P4-C): the PG reader
+    over ``ts.funding_rates`` in production, a preloaded reader in tests and backtests.
     """
 
     ws_factory: Callable[[str], Callable[[], Any]] = feed_exchange_factory
@@ -347,3 +385,4 @@ class ClientFactory:
     trading_client_factory: TradingClientFactory = lambda eid, creds, testnet: build_trading_client(
         eid, creds, testnet=testnet
     )
+    funding_reader_factory: FundingReaderFactory = default_funding_reader

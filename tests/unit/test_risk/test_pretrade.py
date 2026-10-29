@@ -211,6 +211,45 @@ class TestOpeningChecks:
         assert _check(_order("0.01"), state, max_orders_per_minute=6)[1] == "rate_limit"
 
 
+class TestFuturesMargin:
+    def _fut(self, qty: str) -> OrderRequest:
+        return OrderRequest(
+            symbol=Symbol("BTCUSDT"),
+            side=Side.SELL,
+            order_type=OrderType.MARKET,
+            quantity=Decimal(qty),
+            strategy_id="s",
+            exchange_id="binanceusdm",
+            market_type=MarketType.FUTURES,
+        )
+
+    def test_the_balance_check_pays_from_the_spendable_wallet(self) -> None:
+        # an open short inflates get_balance by margin + notional; margin posts from the
+        # wallet, so a passing check must mean payable
+        state = _state(
+            balances={"USDT": Decimal("700")},
+            spendable_balance=Decimal("100"),
+            leverage=1,
+        )
+        ok, check, reason = _check(self._fut("0.01"), state)
+        assert (ok, check) == (False, "balance")
+        assert "have 100" in reason
+
+    def test_a_futures_order_within_the_wallet_passes(self) -> None:
+        state = _state(
+            balances={"USDT": Decimal("700")},
+            spendable_balance=Decimal("650"),
+            leverage=1,
+        )
+        assert _check(self._fut("0.01"), state) == (True, "all", "All checks approved")
+
+    def test_a_state_without_a_spendable_read_falls_back_to_balances(self) -> None:
+        state = _state(balances={"USDT": Decimal("10")}, leverage=1)
+        ok, check, reason = _check(self._fut("0.01"), state)
+        assert (ok, check) == (False, "balance")
+        assert "have 10" in reason
+
+
 class TestLegacyPath:
     async def test_constructor_tier_blocks_when_no_restrictions(self) -> None:
         mgr = PreTradeRiskManager(circuit_breaker_tier=2)
