@@ -148,6 +148,29 @@ async def test_the_store_round_trips_on_the_real_schema(pool: Any) -> None:
     assert unsettled == []
 
 
+async def test_leg_client_order_ids_round_trip_and_track(pool: Any) -> None:
+    """The perp ladder's pair row tracks its legs by client id at the DB (P4-D):
+    the array round-trips and the account-wide leg lookup an exchange leg's own
+    client id resolves to is answered by ANY row that carries it."""
+    store = PgLiveOrderStore(pool)
+    await store.create(
+        _order(
+            "hyd-pair-1",
+            exchange_id="binanceusdm",
+            order_type="OCO",
+            status=LiveOrderStatus.NEW,
+            leg_client_order_ids=("hyd-tp-1", "hyd-sl-1"),
+        )
+    )
+    row = await store.by_client_order_id("hyd-pair-1")
+    assert row is not None
+    assert row.leg_client_order_ids == ("hyd-tp-1", "hyd-sl-1")
+
+    assert await store.tracked_by_leg_client_order_id("hyd-sl-1")
+    assert not await store.tracked_by_leg_client_order_id("hyd-untracked")
+    assert not await store.tracked_by_leg_client_order_id("hyd-pair-1")
+
+
 async def test_concurrent_apply_status_pairs_cannot_regress_a_terminal_row(pool: Any) -> None:
     """F7: one conditional UPDATE — a filled/canceled pair racing on one row can never
     leave the loser's status written over the winner's terminal one."""

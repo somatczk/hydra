@@ -30,7 +30,7 @@ import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from hydra.core.types import OHLCV, OrderType
 from hydra.execution.errors import (
@@ -79,6 +79,23 @@ _ZERO = Decimal("0")
 _ONE = Decimal("1")
 _LIVE_TYPES = (OrderType.MARKET, OrderType.LIMIT)
 _LADDER_TYPES = (OrderType.STOP_MARKET, OrderType.OCO, OrderType.TRAILING_STOP)
+
+
+class LivePollExecutor(Protocol):
+    """The poller's structural view of a live executor (spot or perp).
+
+    Type-only seam: the spot poller stays runtime-identical while the perp
+    poller (``perp_live``) subclasses it over its own executor type.
+    """
+
+    _session_id: str
+    resolve_grace: float
+    exchange_client: Any
+
+    @property
+    def live_orders(self) -> LiveOrderStore: ...
+
+    async def collect_exchange_fills(self, symbols: list[str] | None = None) -> list[PaperFill]: ...
 
 
 def _order_not_found(exc: BaseException) -> bool:
@@ -806,7 +823,7 @@ class LiveOrderPoller:
 
     def __init__(
         self,
-        executor: LiveTradingExecutor,
+        executor: LivePollExecutor,
         om: OrderManager,
         *,
         interval: float,

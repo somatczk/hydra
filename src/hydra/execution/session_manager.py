@@ -40,7 +40,9 @@ from hydra.execution.errors import (
     SessionPersistError,
 )
 from hydra.execution.flatten import FlattenResult
+from hydra.execution.live_executor import LiveTradingExecutor
 from hydra.execution.paper_trading import PaperStateUnavailableError, PaperTradingExecutor
+from hydra.execution.perp_live import LivePerpTradingExecutor, reconcile_perp_session
 from hydra.execution.perp_trading import PaperExecutor, PerpPaperTradingExecutor
 from hydra.execution.reconcile import (
     NEVER_STATUS,
@@ -390,7 +392,16 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
     async def _start_live_session(
         self, cfg: StrategyConfig, exchange_id: ExchangeId, actor: str | None
     ) -> str:
-        """Credentials, capital, the keyed client, then the same launch path (Q1's live scope)."""
+        """Credentials, capital, the keyed client, then the same launch path (Q1's live scope).
+
+        A perp strategy builds the LIVE PERP executor (P4-D): every live surface
+        has already answered to the separate perps gate (P4-E — armed +
+        capital, the permission verified at arm), and this branch then checks
+        the binanceusdm credentials, the perps budget, the leverage cap, the
+        fapi venue setup and the kill switch before anything is built.
+        """
+        if cfg.exchange.market_type is MarketType.FUTURES:
+            return await self._start_live_perp_session(cfg, exchange_id, actor)
         creds = await self._live_credentials(exchange_id)
         allocation = await self._live_allocation()
         await self._ensure_live_risk()
@@ -446,6 +457,137 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         await session_store.persist_session(self._db_pool, session)
         logger.info("Started live session %s for strategy %s", session_id, cfg.id)
         return session_id
+
+    async def _start_live_perp_session(
+        self, cfg: StrategyConfig, exchange_id: ExchangeId, actor: str | None
+    ) -> str:
+        """The live perp branch: the perps budget, the fapi setup, the perp executor.
+
+        The perps gate has already passed at every live surface (armed +
+        ``perps_capital``, the futures permission verified at arm, P4-E); this
+        branch then enforces its own money checks: stored binanceusdm
+        credentials validated for the environment, the ``perps_capital`` budget
+        (minus every other live perp session's allocation), the strategy's
+        leverage re-validated against the live risk config's cap, the account's
+        one-way position mode, and the leverage + ISOLATED margin per symbol on
+        the fapi endpoints before a single order can go out.
+        """
+        creds = await self._live_credentials(exchange_id)
+        allocation = await self._perps_allocation()
+        live = await self._ensure_live_risk()
+        _validate_perp_leverage(cfg, live)
+        client = self._clients.trading_client_factory(
+            exchange_id, creds, self._config.trading.testnet, MarketType.FUTURES
+        )
+        try:
+            free = (await client.fetch_balance()).get(_QUOTE, Decimal("0"))
+        except Exception as exc:
+            await _close_client_quietly(client)
+            raise LiveCredentialsError(
+                f"stored {exchange_id} credentials could not read the account: {exc}"
+            ) from exc
+        seed = min(free, allocation)
+        if seed <= 0:
+            await _close_client_quietly(client)
+            raise ValueError(
+                f"no free {_QUOTE} to allocate for a live perp session (free {free}, "
+                f"perps_capital {allocation})"
+            )
+        try:
+            await client.set_one_way_position_mode()
+            for symbol in cfg.symbols:
+                await client.set_margin_mode(symbol, "isolated")
+                await client.set_leverage(symbol, cfg.exchange.leverage)
+        except Exception as exc:
+            await _close_client_quietly(client)
+            raise LiveCredentialsError(
+                f"the {exchange_id} venue setup failed (one-way positions, isolated "
+                f"margin, {cfg.exchange.leverage}x leverage): {exc}"
+            ) from exc
+        required_history = await probe_strategy(cfg, self._config)
+        session_id = str(uuid.uuid4())
+        session = TradingSession(
+            session_id=session_id,
+            strategy_id=cfg.id,
+            trading_mode="live",
+            exchange_id=exchange_id,
+            symbols=list(cfg.symbols),
+            timeframe=str(cfg.timeframes.primary),
+            paper_capital=seed,
+            strategy_config=cfg.model_dump(mode="json"),
+            config_hash=config_hash(cfg),
+            created_by=actor,
+        )
+        rules = await self._market_rules.get(exchange_id, cfg.symbols)
+        executor = client_factory.build_live_executor(
+            exchange_id,
+            client=client,
+            market_rules=rules,
+            db_pool=self._db_pool,
+            strategy_id=cfg.id,
+            session_id=session_id,
+            initial_quote=seed,
+            poll_interval=float(self._config.trading.live_poll_interval_s),
+            market_type=MarketType.FUTURES,
+            leverage=cfg.exchange.leverage,
+        )
+        await executor.checkpoint()
+        runtime = self._runtime(session, cfg, executor, required_history)
+        await self._launch(runtime, seed, recovering=False)
+        session.status = "running"
+        session.started_at = datetime.now(UTC)
+        self._sessions[session_id] = session
+        self._ensure_cleanup_loop()
+        await session_store.persist_session(self._db_pool, session)
+        logger.info(
+            "Started live perp session %s for strategy %s (%dx isolated)",
+            session_id,
+            cfg.id,
+            cfg.exchange.leverage,
+        )
+        return session_id
+
+    async def _perps_allocation(self) -> Decimal:
+        """The live budget a NEW perp session may seed: ``perps_capital`` minus every
+        other running-or-holding live PERP session's allocation (the venue decides
+        which sessions are perp; the spot live budget stays ``live_capital``'s)."""
+        if self._db_pool is None:
+            raise LiveCapitalUnavailableError("live perps need system_config perps_capital")
+        async with self._db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM system_config WHERE key = 'perps_capital'")
+        if row is None:
+            raise LiveCapitalUnavailableError(
+                "system_config has no 'perps_capital' row; it is set by the perps ceremony"
+            )
+        raw = row["value"]
+        try:
+            value = json.loads(raw) if isinstance(raw, str) else raw
+            capital = Decimal(str(value))
+        except (ValueError, ArithmeticError) as exc:
+            raise LiveCapitalUnavailableError(
+                f"system_config perps_capital is unreadable: {exc}"
+            ) from exc
+        if capital <= 0:
+            raise LiveCapitalUnavailableError(
+                f"system_config perps_capital must be > 0, got {capital}"
+            )
+        allocated = sum(
+            (
+                s.paper_capital
+                for s in self._sessions.values()
+                if s.trading_mode == "live"
+                and client_factory.venue_market_type(s.exchange_id) is MarketType.FUTURES
+                and (s.status == "running" or s.holdings > 0)
+                and s.paper_capital
+            ),
+            Decimal("0"),
+        )
+        available = capital - allocated
+        if available <= 0:
+            raise ValueError(
+                f"Insufficient perps capital: perps_capital={capital}, allocated={allocated}"
+            )
+        return available
 
     async def _live_credentials(self, exchange_id: ExchangeId) -> dict[str, str | None]:
         """Stored, decryptable, environment-validated keys; 403 when any leg is missing."""
@@ -530,11 +672,16 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         Restore or rebuild failure marks the session error and flattens exactly like the
         paper path; fills that happened while down are applied exactly once by the
         poller's first sweep (the live_fills unique constraint is the guard) and the
-        protective group is re-adopted from the tracked rows.
+        protective group is re-adopted from the tracked rows. A live PERP row recovers
+        through the perp executor — the same venue pair it started on — and re-applies
+        the fapi venue setup (one-way positions, ISOLATED margin, the strategy's
+        leverage) before the resume, so the sleeve's assumptions hold on the exchange.
         """
-        from hydra.execution.live_executor import LiveTradingExecutor
 
-        exchange_id = client_factory.validate_venue(session.exchange_id)
+        is_perp = client_factory.venue_market_type(session.exchange_id) is MarketType.FUTURES
+        exchange_id = client_factory.validate_venue(
+            session.exchange_id, client_factory.venue_market_type(session.exchange_id)
+        )
         rules_error: Exception | None = None
         rules: dict[str, Any] | None = None
         try:
@@ -544,9 +691,14 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         try:
             creds = await self._live_credentials(exchange_id)
             await self._ensure_live_risk()
-            client = self._clients.trading_client_factory(
-                exchange_id, creds, self._config.trading.testnet
-            )
+            if is_perp:
+                client = self._clients.trading_client_factory(
+                    exchange_id, creds, self._config.trading.testnet, MarketType.FUTURES
+                )
+            else:
+                client = self._clients.trading_client_factory(
+                    exchange_id, creds, self._config.trading.testnet
+                )
         except Exception as exc:
             logger.exception("Live session %s cannot rebuild its client", session.session_id)
             await self._close_restored(session, "recovery_failed", f"live setup failed: {exc}")
@@ -554,13 +706,23 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
         try:
             if rules_error is not None:
                 raise rules_error
-            executor = await LiveTradingExecutor.restore_live(
-                self._db_pool,
-                session.session_id,
-                client=client,
-                market_rules=rules,
-                poll_interval=float(self._config.trading.live_poll_interval_s),
-            )
+            executor: LiveTradingExecutor | LivePerpTradingExecutor | None
+            if is_perp:
+                executor = await LivePerpTradingExecutor.restore_live(
+                    self._db_pool,
+                    session.session_id,
+                    client=client,
+                    market_rules=rules,
+                    poll_interval=float(self._config.trading.live_poll_interval_s),
+                )
+            else:
+                executor = await LiveTradingExecutor.restore_live(
+                    self._db_pool,
+                    session.session_id,
+                    client=client,
+                    market_rules=rules,
+                    poll_interval=float(self._config.trading.live_poll_interval_s),
+                )
             if executor is None:
                 raise PaperStateUnavailableError(f"no stored live state for {session.session_id!r}")
             if self.kill_switch_active():
@@ -571,6 +733,12 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                 raise LiveCapitalUnavailableError("the session row has no live allocation")
             cfg = self._recovery_config(session)
             client_factory.validate_venue(session.exchange_id, cfg.exchange.market_type)
+            if is_perp:
+                _validate_perp_leverage(cfg, await self._ensure_live_risk())
+                await client.set_one_way_position_mode()
+                for symbol in cfg.symbols:
+                    await client.set_margin_mode(symbol, "isolated")
+                    await client.set_leverage(symbol, cfg.exchange.leverage)
             required_history = await probe_strategy(cfg, self._config)
             session._executor = executor
             runtime = self._runtime(session, cfg, executor, required_history)
@@ -1305,13 +1473,22 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             runtime = session._runtime
             previous = self._reconcile.get(session.session_id)
             try:
-                status = await reconcile_live_session(
-                    store,
-                    client,
-                    executor,
-                    poller=runtime._poller if runtime is not None else None,
-                    previous=previous,
-                )
+                if isinstance(executor, LivePerpTradingExecutor):
+                    status = await reconcile_perp_session(
+                        store,
+                        client,
+                        executor,
+                        poller=runtime._poller if runtime is not None else None,
+                        previous=previous,
+                    )
+                else:
+                    status = await reconcile_live_session(
+                        store,
+                        client,
+                        executor,
+                        poller=runtime._poller if runtime is not None else None,
+                        previous=previous,
+                    )
             except Exception:
                 logger.exception("Reconcile pass failed for %s", session.session_id)
                 continue

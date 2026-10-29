@@ -286,6 +286,8 @@ class LiveOrderStore(Protocol):
 
     async def tracked_by_order_list_id(self, order_list_id: str) -> bool: ...
 
+    async def tracked_by_leg_client_order_id(self, leg_client_order_id: str) -> bool: ...
+
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]: ...
 
     async def refreshable(self, session_id: str) -> list[LiveOrderRecord]: ...
@@ -572,6 +574,15 @@ class PgLiveOrderStore:
             )
         return found is not None
 
+    async def tracked_by_leg_client_order_id(self, leg_client_order_id: str) -> bool:
+        # the perp ladder's legs carry their own client ids inside a pair row
+        async with self._pool.acquire() as conn:
+            found = await conn.fetchval(
+                "SELECT 1 FROM live_orders WHERE $1 = ANY(leg_client_order_ids) LIMIT 1",
+                leg_client_order_id,
+            )
+        return found is not None
+
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -847,6 +858,9 @@ class InMemoryLiveOrderStore:
 
     async def tracked_by_order_list_id(self, order_list_id: str) -> bool:
         return any(o.order_list_id == order_list_id for o in self._orders.values())
+
+    async def tracked_by_leg_client_order_id(self, leg_client_order_id: str) -> bool:
+        return any(leg_client_order_id in o.leg_client_order_ids for o in self._orders.values())
 
     async def unsettled(self, session_id: str, older_than: datetime) -> list[LiveOrderRecord]:
         return [
