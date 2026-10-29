@@ -5,6 +5,7 @@ import { Save, Plus, FlaskConical } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { RuleSection } from '@/components/builder/RuleSection';
 import { TimeframeSelector } from '@/components/builder/TimeframeSelector';
+import { ScheduleEditor } from '@/components/builder/ScheduleEditor';
 import { RiskConfigurator } from '@/components/builder/RiskConfigurator';
 import { SignalPreview } from '@/components/builder/SignalPreview';
 import { StrategyNameDialog } from '@/components/builder/StrategyNameDialog';
@@ -15,6 +16,7 @@ import { fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
 import { DataStateErrorCard } from '@/components/ui/DataStateBadge';
 import { logger } from '@/lib/logger';
+import { scheduleFromWire } from '@/lib/schedule';
 import type {
   BuilderState,
   BuilderAction,
@@ -64,6 +66,7 @@ const initialDraft: Omit<BuilderState, 'baseline'> = {
   exchangeId: 'binance',
   symbol: 'BTCUSDT',
   leverage: 1,
+  schedule: null,
 };
 
 function snapshot(state: BuilderState): string {
@@ -191,6 +194,8 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
       };
     case 'SET_ML_OVERLAY':
       return { ...state, mlOverlay: action.mlOverlay };
+    case 'SET_SCHEDULE':
+      return { ...state, schedule: action.schedule };
     case 'LOAD_STRATEGY': {
       const { payload } = action;
       const next: BuilderState = {
@@ -228,6 +233,7 @@ function builderReducer(state: BuilderState, action: BuilderAction): BuilderStat
         exchangeId: payload.exchange_id || 'binance',
         symbol: payload.symbol || 'BTCUSDT',
         leverage: payload.leverage ?? 1,
+        schedule: scheduleFromWire(payload.schedule),
         baseline: '',
       };
       return { ...next, baseline: snapshot(next) };
@@ -534,6 +540,12 @@ function BuilderPageContent() {
         onChange={(field: keyof TimeframeConfig, value: string) =>
           dispatch({ type: 'SET_TIMEFRAME', field, value })
         }
+      />
+
+      <ScheduleEditor
+        schedule={state.schedule}
+        primary={state.timeframes.primary}
+        onChange={(schedule) => dispatch({ type: 'SET_SCHEDULE', schedule })}
       />
 
       {/* Risk configurator */}

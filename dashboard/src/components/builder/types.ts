@@ -1,5 +1,7 @@
 /** Type definitions for the visual strategy builder. */
 
+import type { Schedule, WireSchedule } from '@/lib/schedule';
+
 /* ---------- Indicator API types ---------- */
 
 export interface ParamSchema {
@@ -96,6 +98,8 @@ export interface BuilderState {
   symbol: string;
   /** P4-F: the perp leverage (1-3×) — applies to binanceusdm FUTURES strategies only; spot stays 1×. */
   leverage: number;
+  /** The entry schedule (strategy/config.py ScheduleConfig); null is always active. */
+  schedule: Schedule | null;
   baseline: string;
 }
 
@@ -144,6 +148,8 @@ export interface SaveRequest {
   ml_overlay?: { model_name: string; confidence_threshold: number } | null;
   /** P4: perp strategies only (1-3×, isolated); the server refuses it on spot venues. */
   leverage?: number;
+  /** On update `{}` clears the stored schedule; on save it writes none. */
+  schedule?: WireSchedule;
 }
 
 export interface SerializedCondition {
@@ -193,6 +199,7 @@ export interface StrategyDetail {
   ml_overlay?: { model_name: string; confidence_threshold: number } | null;
   /** P4-F: the stored perp leverage for a binanceusdm strategy, so an edit round-trips it. */
   leverage?: number;
+  schedule?: WireSchedule | null;
 }
 
 /* ---------- Reducer actions ---------- */
@@ -214,6 +221,7 @@ export type BuilderAction =
   | { type: 'SET_TAKE_PROFIT'; takeProfit: Partial<TakeProfitConfig> }
   | { type: 'SET_SIZING'; sizing: Partial<SizingConfig> }
   | { type: 'SET_ML_OVERLAY'; mlOverlay: MlOverlay | null }
+  | { type: 'SET_SCHEDULE'; schedule: Schedule | null }
   | { type: 'LOAD_STRATEGY'; payload: StrategyDetail }
   | { type: 'MARK_CLEAN' }
   | { type: 'RESET' };

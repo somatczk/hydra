@@ -134,6 +134,34 @@ describe('BuilderPage error paths', () => {
   });
 });
 
+describe('BuilderPage schedule', () => {
+  it('loads the stored schedule into the editor and puts it back, or {} once switched off', async () => {
+    const r = routes();
+    r['/api/strategies/strat-1'] = { ...STRATEGY, schedule: { active_hours_utc: [13, 14, 15], active_days: [0, 1, 2, 3, 4] } };
+    fetchApi.mockImplementation(routeFetch(r, calls, { 'PUT /api/strategies/strat-1': { id: 'strat-1' } }));
+    page = await mount(<BuilderPage />);
+
+    const hours = page.container.querySelector('[role="group"][aria-label="Entry hours (UTC)"]')!;
+    const pressed = (group: Element) =>
+      Array.from(group.querySelectorAll('button[aria-pressed="true"]')).map((b) => b.textContent);
+    expect(pressed(hours)).toEqual(['13', '14', '15']);
+    expect(pressed(page.container.querySelector('[aria-label="Entry days"]')!)).toEqual(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']);
+
+    await click(buttonByText(hours as HTMLElement, '16'));
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    const put = () => calls.filter((c) => c.init?.method === 'PUT').map((c) => JSON.parse(String(c.init?.body)).schedule);
+    expect(put()).toEqual([{ active_hours_utc: [13, 14, 15, 16], active_days: [0, 1, 2, 3, 4] }]);
+
+    const onlyAt = page.container.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(onlyAt.closest('label')?.textContent).toBe('Only open entries at these times');
+    await click(onlyAt);
+    await click(buttonByText(page.container, 'Update strategy'));
+    await click(buttonByText(page.container, 'Save strategy'));
+    expect(put()[1]).toEqual({});
+  });
+});
+
 describe('BuilderPage scope', () => {
   it('has one h1 and no DCA, Grid or ML overlay controls', async () => {
     fetchApi.mockImplementation(routeFetch(routes(), calls));

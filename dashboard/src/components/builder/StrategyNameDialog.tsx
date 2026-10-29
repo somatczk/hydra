@@ -7,6 +7,7 @@ import { Select } from '@/components/ui/Select';
 import { fetchApi } from '@/lib/api';
 import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
+import { scheduleProblem, scheduleToWire } from '@/lib/schedule';
 import { UniversePicker, symbolInUniverse, type UniverseSnapshot } from './UniversePicker';
 import type { BuilderState, SerializedConditionGroup } from './types';
 
@@ -93,6 +94,7 @@ export function StrategyNameDialog({
   const symbolGateBlocks = universe !== null && !symbolInUniverse(symbol.trim(), universe);
   const gate = saveError !== null ? parseErrorDetail(saveError) : null;
   const isUniverseGate = gate?.code === 'symbol_not_in_universe';
+  const badSchedule = scheduleProblem(state.schedule, state.timeframes.primary);
 
   const handleSave = async () => {
     setSaveError(null);
@@ -138,6 +140,8 @@ export function StrategyNameDialog({
       // P4-F: the perps fields — leverage applies to binanceusdm FUTURES only (isolated is the sole
       // mode in 2.8.0); a spot venue always sends 1× or the save refuses it.
       leverage: perps ? Number(leverage) : 1,
+      // the builder owns the schedule once loaded: {} clears a stored one on update
+      schedule: scheduleToWire(state.schedule),
     };
 
     try {
@@ -169,7 +173,7 @@ export function StrategyNameDialog({
       secondaryLabel="Cancel"
       pendingLabel="Saving…"
       pendingHint="Closing this won't cancel the save."
-      primaryDisabled={!name.trim() || symbolGateBlocks}
+      primaryDisabled={!name.trim() || symbolGateBlocks || badSchedule !== null}
       onConfirm={handleSave}
       onClose={onClose}
     >
@@ -225,6 +229,12 @@ export function StrategyNameDialog({
         />
         <span className="text-sm text-ink-2">Enable strategy immediately</span>
       </label>
+
+      {badSchedule && (
+        <p role="alert" className="text-sm text-danger">
+          Trading schedule: {badSchedule}
+        </p>
+      )}
 
       {/* Error */}
       {saveError !== null && isUniverseGate && (
