@@ -337,7 +337,7 @@ const DEFAULT_INDICATORS: IndicatorSchema[] = [
     category: 'volatility',
     description: 'Average True Range (Wilder)',
     params: [{ name: 'period', type: 'int', default: 14, min: 2, max: 200 }],
-  },
+  },  { name: 'close', category: 'other', description: 'close indicator', params: [] },
 ];
 
 const DEFAULT_COMPARATORS: ComparatorSchema[] = [
