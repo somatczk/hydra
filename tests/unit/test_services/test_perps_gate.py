@@ -22,6 +22,7 @@ import yaml
 from cryptography.fernet import Fernet
 
 from hydra.core.encryption import encrypt
+from hydra.core.types import MarketType
 from hydra.services.approvals import ApprovalStore
 from hydra.services.errors import ServiceError
 from hydra.services.live_gate import (
@@ -44,18 +45,35 @@ from hydra.services.perps_gate import (
     running_live_perps_sessions,
     write_perps_armed_transition,
 )
+from hydra.strategy.config import load_strategy_config
 
 ARMED_ROW = json.dumps({"armed": True, "by": "user:soma", "at": "2026-10-29T00:00:00+00:00"})
 
 PERP_CONFIG: dict[str, Any] = {
     "id": "perp-momentum",
     "name": "perp-momentum",
+    "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
     "symbols": ["BTCUSDT"],
     "exchange": {"exchange_id": "binanceusdm", "market_type": "FUTURES", "leverage": 2},
 }
 SPOT_CONFIG: dict[str, Any] = {
     "id": "spot-momentum",
     "name": "spot-momentum",
+    "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+    "symbols": ["BTCUSDT"],
+    "exchange": {"exchange_id": "binance", "market_type": "SPOT"},
+}
+HAND_PERP_CONFIG: dict[str, Any] = {
+    "id": "hand-perp",
+    "name": "hand-perp",
+    "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+    "symbols": ["BTCUSDT"],
+    "exchange": {"exchange_id": "binanceusdm", "market_type": "FUTURES", "leverage": 2},
+}
+HAND_SPOT_CONFIG: dict[str, Any] = {
+    "id": "hand-spot",
+    "name": "hand-spot",
+    "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
     "symbols": ["BTCUSDT"],
     "exchange": {"exchange_id": "binance", "market_type": "SPOT"},
 }
@@ -391,6 +409,7 @@ class TestRequirePerpsGate:
             "perps_capital_missing",
             403,
         )
+        assert "disarm" in _detail(exc.value)["message"]  # re-arming alone is a no-op
 
     async def test_armed_with_capital_returns_the_state(self) -> None:
         db = _Db(config={"perps_armed": ARMED_ROW, "perps_capital": "500.0"})
@@ -629,6 +648,19 @@ class TestVenueTruth:
         assert is_perp_strategy("spot-momentum") is False
         assert is_perp_strategy("missing") is False
 
+    def test_a_hand_written_yml_strategy_reads_the_same_venue_truth(
+        self, strategies_dir: Any
+    ) -> None:
+        """The A1 corner: a hand-written ``.yml`` config is invisible to the shared
+        ``.yaml``-only scan the gate used to borrow, yet the manager's loader accepts
+        it — the gate must read the venue the loader reads."""
+        (strategies_dir / "hand-perp.yml").write_text(yaml.safe_dump(HAND_PERP_CONFIG))
+        (strategies_dir / "hand-spot.yml").write_text(yaml.safe_dump(HAND_SPOT_CONFIG))
+        assert is_perp_strategy("hand-perp") is True  # was False while the loader saw FUTURES
+        assert is_perp_strategy("hand-spot") is False
+        loaded = load_strategy_config(strategies_dir / "hand-perp.yml")
+        assert loaded.exchange.market_type is MarketType.FUTURES  # the manager's own truth
+
     def test_is_perp_venue(self) -> None:
         assert is_perp_venue("binanceusdm") is True
         assert is_perp_venue("binance") is False
@@ -714,6 +746,29 @@ class TestTheGateReach:
         with pytest.raises(ServiceError) as exc:
             await execute_live_session_start(
                 deps, {"strategy_id": "spot-momentum", "reason": "go live"}, "user:soma"
+            )
+        assert _detail(exc.value)["code"] == "live_not_armed"
+
+    async def test_a_yml_perp_strategy_answers_to_the_perps_ceremony_even_spot_armed(
+        self, strategies_dir: Any
+    ) -> None:
+        """The A1 hole, pre-fix: a hand-written ``.yml`` FUTURES config dispatched to
+        the spot gate, so a fully-armed spot ceremony authorized its live start."""
+        (strategies_dir / "hand-perp.yml").write_text(yaml.safe_dump(HAND_PERP_CONFIG))
+        deps = _Deps(_Db(config={"live_armed": ARMED_ROW, "live_capital": "500.0"}), _Backend())
+        with pytest.raises(ServiceError) as exc:
+            await execute_live_session_start(
+                deps, {"strategy_id": "hand-perp", "reason": "go live"}, "user:soma"
+            )
+        assert (_detail(exc.value)["code"], exc.value.status_code) == ("perps_not_armed", 409)
+        assert deps.trader.start_calls == []
+
+    async def test_a_yml_spot_strategy_keeps_the_spot_gate(self, strategies_dir: Any) -> None:
+        (strategies_dir / "hand-spot.yml").write_text(yaml.safe_dump(HAND_SPOT_CONFIG))
+        deps = _Deps(_Db(), _Backend())
+        with pytest.raises(ServiceError) as exc:
+            await execute_live_session_start(
+                deps, {"strategy_id": "hand-spot", "reason": "go live"}, "user:soma"
             )
         assert _detail(exc.value)["code"] == "live_not_armed"
 

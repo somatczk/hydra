@@ -324,6 +324,7 @@ def perp_strategy(strategies_dir: Path) -> Path:
     path.write_text(
         "id: perp-momentum\n"
         "name: perp-momentum\n"
+        "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
         "symbols: [BTCUSDT]\n"
         "exchange:\n"
         "  exchange_id: binanceusdm\n"

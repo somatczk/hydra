@@ -655,6 +655,7 @@ def perp_strategies(strategies_dir: Any) -> Any:
     path.write_text(
         "id: perp-momentum\n"
         "name: perp-momentum\n"
+        "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
         "symbols: [BTCUSDT]\n"
         "exchange:\n"
         "  exchange_id: binanceusdm\n"
@@ -894,6 +895,29 @@ class TestPerpsGateReach:
         db.config["live_capital"] = "500.0"
         resp = await browser.post(
             "/api/live/session-start", json={"strategy_id": "perp-momentum", "reason": "go live"}
+        )
+        assert (resp.status_code, _detail(resp)["code"]) == (409, "perps_not_armed")
+
+    async def test_a_yml_perp_strategy_never_authorizes_under_the_spot_gate(
+        self, db: _Db, backend: _Backend, strategies_dir: Any, browser: httpx.AsyncClient
+    ) -> None:
+        """The A1 corner end to end: a hand-written ``.yml`` FUTURES config the
+        manager's loader accepts must refuse under the armed spot ceremony, not
+        ride it (pre-fix this answered the spot challenge with 200)."""
+        (strategies_dir / "hand-perp.yml").write_text(
+            "id: hand-perp\n"
+            "name: hand-perp\n"
+            "strategy_class: hydra.strategy.builtin.rule_based.RuleBasedStrategy\n"
+            "symbols: [BTCUSDT]\n"
+            "exchange:\n"
+            "  exchange_id: binanceusdm\n"
+            "  market_type: FUTURES\n"
+            "  leverage: 2\n"
+        )
+        db.config["live_armed"] = ARMED_ROW
+        db.config["live_capital"] = "500.0"
+        resp = await browser.post(
+            "/api/live/session-start", json={"strategy_id": "hand-perp", "reason": "go live"}
         )
         assert (resp.status_code, _detail(resp)["code"]) == (409, "perps_not_armed")
 

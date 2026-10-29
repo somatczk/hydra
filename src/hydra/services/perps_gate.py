@@ -31,10 +31,13 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+import yaml
+
 from hydra.core.types import MarketType
 from hydra.execution.client_factory import build_readonly_client, venue_market_type
+from hydra.services import strategies
 from hydra.services.errors import ServiceError, db_errors, require_pool, service_error
-from hydra.services.strategies import iter_strategy_yamls
+from hydra.strategy.config import load_strategy_config
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +157,8 @@ async def require_perps_gate(pool: Any) -> dict[str, Any]:
         raise service_error(
             403,
             "perps_capital_missing",
-            "Perps trading is armed but system_config has no perps_capital; re-arm "
-            "through the ceremony to set it",
+            "Perps trading is armed but system_config has no perps_capital; disarm and "
+            "re-arm through the ceremony to set it",
             "invalid",
         )
     return state
@@ -310,17 +313,24 @@ async def require_futures_capable_credentials(pool: Any) -> dict[str, bool]:
 def is_perp_strategy(strategy_id: str) -> bool:
     """True only when the strategy's saved YAML positively reads the perps venue.
 
-    The same file ``SessionManager._find_strategy_config`` loads decides the venue, so
-    this never disagrees with the manager: an unreadable or missing file is not a perp
-    (that start refuses with ``strategy_not_found`` anyway).
+    The same file ``SessionManager._find_strategy_config`` loads decides the venue: the
+    gate scans that loader's own directory, over both extensions it accepts (``.yaml``
+    and ``.yml``), in its order, with its loader and its skip semantics — so this never
+    disagrees with the manager: an unreadable or missing file is not a perp (that start
+    refuses with ``strategy_not_found`` anyway).
     """
-    for _, data in iter_strategy_yamls():
-        if data.get("id") == strategy_id:
-            exchange = data.get("exchange")
-            return (
-                isinstance(exchange, dict)
-                and str(exchange.get("market_type", "")).upper() == MarketType.FUTURES.value
-            )
+    config_dir = strategies._CONFIG_DIR
+    if not config_dir.is_dir():
+        return False
+    for path in sorted(config_dir.iterdir()):
+        if path.suffix not in (".yaml", ".yml"):
+            continue
+        try:
+            cfg = load_strategy_config(path)
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            continue  # the manager's loader skips bad files the same way (SM-15)
+        if cfg.id == strategy_id:
+            return cfg.exchange.market_type is MarketType.FUTURES
     return False
 
 
