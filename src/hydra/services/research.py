@@ -75,16 +75,26 @@ def _suggest_range(param_name: str, default: float, param_type: str) -> tuple[fl
     return lo, hi, step
 
 
-def _extract_optimizable_params(rules_dict: dict[str, Any]) -> list[dict[str, Any]]:
-    """One entry per name ``bindable_params`` lists, ranged from its first site's value."""
+def _extract_optimizable_params(
+    rules_dict: dict[str, Any], top: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """One entry per name ``bindable_params`` lists, ranged around its value: the stored
+    top-level parameter when there is one (it is what the strategy runs), else its first
+    site's value."""
     params: list[dict[str, Any]] = []
     for name, sites in bindable_params(RuleSet.model_validate(rules_dict)).items():
         site = sites[0]
-        default = float(site.default)
+        stored = (top or {}).get(name)
+        value = (
+            stored
+            if isinstance(stored, int | float) and not isinstance(stored, bool)
+            else site.default
+        )
+        default = float(value)
         lo: float
         hi: float
         if site.target == "value":
-            ptype = _infer_type(site.default)
+            ptype = _infer_type(value)
             lo = max(0, round(default * 0.25))
             hi = round(default * 3) if default > 0 else 100
             step = max(1.0, round((hi - lo) / 20, 2))
@@ -118,7 +128,7 @@ def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
     if not rules_dict:
         return []
     try:
-        return _extract_optimizable_params(rules_dict)
+        return _extract_optimizable_params(rules_dict, parameters)
     except ValueError as exc:
         raise _invalid_strategy(strategy_id, str(exc)) from exc
 

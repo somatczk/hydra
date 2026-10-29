@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
+import yaml
 
 from hydra.backtest.jobs import Preflight, WalkForwardRunRequest
 from hydra.core.types import Timeframe
@@ -126,3 +128,47 @@ class TestSubmitRangeTooShort:
             "status": "queued",
         }
         assert queued == ["walkforward"]
+
+
+def test_strategy_params_seed_from_the_stored_top_level_values(strategies_dir: Path) -> None:
+    """A hand-written YAML whose top-level values differ from its conditions': the defaults
+    (and the heuristic range) follow the top-level values, which are what the strategy runs."""
+    rules = {
+        "entry_long": {
+            "operator": "AND",
+            "conditions": [
+                {
+                    "indicator": "close",
+                    "params": {},
+                    "comparator": "crosses_above",
+                    "value": "sma:period=50",
+                    "value_ref_overrides": {"sma_period": "period"},
+                },
+                {
+                    "indicator": "rsi",
+                    "params": {"period": 14},
+                    "comparator": "less_than",
+                    "value": 30,
+                    "param_key": "rsi_len",
+                    "value_param_key": "rsi_low",
+                },
+            ],
+        }
+    }
+    config = {
+        "id": "drift",
+        "name": "Drift",
+        "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        "symbols": ["BTCUSDT"],
+        "parameters": {"rules": rules, "sma_period": 120, "rsi_low": 20, "rsi_len": True},
+    }
+    (strategies_dir / "drift.yaml").write_text(yaml.safe_dump(config))
+
+    params = {p["name"]: p for p in research.get_strategy_params("drift")}
+    assert params["sma_period"]["default"] == 120.0
+    assert (params["sma_period"]["min"], params["sma_period"]["max"]) == (2.0, 200.0)
+    # a threshold's heuristic range is centred on the stored value: 25 % to 3x of 20
+    assert (params["rsi_low"]["default"], params["rsi_low"]["min"]) == (20.0, 5)
+    assert params["rsi_low"]["max"] == 60
+    # a non-numeric stored value falls back to the condition's own
+    assert params["rsi_len"]["default"] == 14.0
