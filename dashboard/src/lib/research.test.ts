@@ -10,6 +10,7 @@ import {
   jobStatusTone,
   noStoredBars,
   paramSpaceBody,
+  stageBadge,
   trialStatusText,
   validationLines,
   wfFoldRow,
@@ -269,5 +270,14 @@ describe('fetchLine', () => {
   it('names the failure reason, including a failure before any progress (state and reason only)', () => {
     expect(fetchLine({ state: 'failed', reason: 'rate_limited' })).toBe('Fetching missing bars failed (rate_limited) after 0 bars');
     expect(fetchLine(null)).toBeNull();
+  });
+});
+
+describe('stageBadge', () => {
+  it('reads either casing of a registry stage as one badge', () => {
+    expect(stageBadge('Production')).toEqual({ label: 'Production', variant: 'success' });
+    expect(stageBadge('production')).toEqual({ label: 'Production', variant: 'success' });
+    expect(stageBadge('staging')).toEqual({ label: 'Staging', variant: 'info' });
+    expect(stageBadge('Archived')).toEqual({ label: 'Archived', variant: 'neutral' });
   });
 });

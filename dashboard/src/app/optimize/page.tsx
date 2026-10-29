@@ -17,6 +17,7 @@ import { usePoll } from '@/hooks/usePoll';
 import { ResearchNav } from '@/components/research/ResearchNav';
 import { JobRow } from '@/components/research/JobRow';
 import { ParamSpaceEditor } from '@/components/research/ParamSpaceEditor';
+import { ModelVersionSelect } from '@/components/research/ModelVersionSelect';
 import { WalkForwardResults, type WalkForwardResult } from '@/components/research/WalkForwardResults';
 import {
   noStoredBars,
@@ -34,6 +35,7 @@ import {
 interface StrategyOption {
   id: string;
   name: string;
+  model_names?: string[];
 }
 
 type JobsRow = ResearchJob & { kind: JobKind };
@@ -97,6 +99,7 @@ export default function OptimizePage() {
   const [trainPct, setTrainPct] = useState('75');
   const [anchored, setAnchored] = useState(false);
   const [trialsPerFold, setTrialsPerFold] = useState('20');
+  const [modelVersionId, setModelVersionId] = useState<string | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
   const [runError, setRunError] = useState<unknown>(null);
@@ -139,6 +142,7 @@ export default function OptimizePage() {
     setDefs(null);
     setParamsError(null);
     setParamSpace(null);
+    setModelVersionId(null);
     // a slower previous strategy must not bind its param space to this one
     let cancelled = false;
     fetchApi<StrategyParamDef[]>(`/api/backtest/strategies/${strategyId}/params`)
@@ -259,6 +263,7 @@ export default function OptimizePage() {
     setWfResult(null);
     setWfResultError(null);
     setHoJob(null);
+    const pin = modelVersionId ? { model_version_id: modelVersionId } : {};
     try {
       if (mode === 'hyperopt') {
         const res = await fetchApi<{ task_id: string }>('/api/backtest/hyperopt', {
@@ -271,6 +276,7 @@ export default function OptimizePage() {
             start_date: startDate,
             end_date: endDate,
             initial_capital: capital,
+            ...pin,
           }),
         });
         setHoWatch(res.task_id);
@@ -291,6 +297,7 @@ export default function OptimizePage() {
             start_date: startDate,
             end_date: endDate,
             initial_capital: capital,
+            ...pin,
           }),
         });
         setWfWatchId(res.task_id);
@@ -391,6 +398,12 @@ export default function OptimizePage() {
           />
           <Input label="Start Date" type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
           <Input label="End Date" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+          <ModelVersionSelect
+            modelNames={strategies.find((s) => s.id === strategyId)?.model_names ?? []}
+            value={modelVersionId}
+            onChange={setModelVersionId}
+            disabled={submitting}
+          />
           {mode === 'hyperopt' ? (
             <Input
               label="Max Trials"

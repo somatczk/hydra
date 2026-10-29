@@ -26,7 +26,7 @@ from hydra.backtest.jobs import (
 )
 from hydra.core.types import MarketType, Timeframe
 from hydra.data.storage import MarketDataRepository
-from hydra.ml.consumers import pinned_version
+from hydra.ml.consumers import consumed_model_names, pinned_version
 from hydra.ml.serving import MlServingError
 from hydra.services import strategies as strategy_files
 from hydra.services.errors import ServiceError, db_errors, require_pool, service_error
@@ -203,6 +203,7 @@ class BacktestStrategyOption(BaseModel):
     id: str
     name: str
     primary_timeframe: str | None = None
+    model_names: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -524,16 +525,22 @@ async def verify_result(pool: Any, result_id: str) -> dict[str, Any]:
 
 
 def list_backtest_strategies() -> list[dict[str, Any]]:
-    """List strategies available for backtesting, with their primary timeframe."""
+    """List strategies available for backtesting: the primary timeframe and the registry
+    names a run serves (what a ``model_version_id`` pin may name)."""
     strategies: list[dict[str, Any]] = []
     for path, data in strategy_files.iter_strategy_yamls():
         timeframes = data.get("timeframes")
         primary = timeframes.get("primary") if isinstance(timeframes, dict) else None
+        try:
+            model_names = consumed_model_names(StrategyConfig(**data))
+        except (TypeError, ValueError):  # an unloadable config refuses at submit anyway
+            model_names = []
         strategies.append(
             {
                 "id": data.get("id", path.stem),
                 "name": data.get("name", path.stem),
                 "primary_timeframe": str(primary) if primary is not None else None,
+                "model_names": model_names,
             }
         )
     return strategies

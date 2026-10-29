@@ -117,6 +117,24 @@ describe('BacktestDetailPage', () => {
     expect(panel?.textContent).toContain('before the requested end');
   });
 
+  it("names the model versions the result's job served", async () => {
+    const served = [{ id: 'a2', name: 'alpha', version: 2, stage: 'staging', pinned: true }];
+    fetchApi.mockImplementation(
+      routeFetch(
+        {
+          ...routes(DETAIL),
+          '/api/backtest/status/task-1': { task_id: 'task-1', provenance: { ml_models: served } },
+        },
+        calls,
+      ),
+    );
+    page = await mount(<BacktestDetailPage />);
+
+    const panel = page.container.querySelector('[data-testid="provenance-panel"]');
+    expect(panel?.textContent).toContain('Model alpha v2StagingPinned for this run');
+    expect(panel?.textContent).toContain('binance BTCUSDT 1h');
+  });
+
   it('warns when a result has no provenance', async () => {
     fetchApi.mockImplementation(routeFetch(routes({ ...DETAIL, provenance: null }), calls));
     page = await mount(<BacktestDetailPage />);

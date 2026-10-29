@@ -129,6 +129,23 @@ export async function typeInto(input: HTMLInputElement, value: string): Promise<
   });
 }
 
+export function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
+  const el = Array.from(container.querySelectorAll('label')).find((l) => l.textContent === label);
+  if (!el) throw new Error(`no label ${label}`);
+  const select = document.getElementById(el.htmlFor);
+  if (!(select instanceof HTMLSelectElement)) throw new Error(`no select for ${label}`);
+  return select;
+}
+
+export async function choose(select: HTMLSelectElement, value: string): Promise<void> {
+  const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+  await act(async () => {
+    setter?.call(select, value);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  await flush();
+}
+
 export function buttonByText(container: HTMLElement, text: string): HTMLButtonElement {
   const btn = Array.from(container.querySelectorAll('button')).find(
     (b) => b.textContent?.trim() === text,

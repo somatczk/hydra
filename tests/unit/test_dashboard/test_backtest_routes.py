@@ -37,6 +37,7 @@ from hydra.services.backtest import (
 from hydra.services.errors import ServiceError
 from hydra.services.research import HyperoptProgressResponse
 from hydra.strategy.base import BaseStrategy
+from hydra.strategy.builtin.ml_ensemble import STRATEGY_CLASS as ML_NATIVE_CLASS
 from hydra.strategy.config import StrategyConfig
 
 SRC = Path(__file__).resolve().parents[3] / "src" / "hydra"
@@ -425,6 +426,30 @@ class TestPreflightErrors:
             "names a rule-based strategy binds)"
         )
 
+    @pytest.mark.parametrize("path", ["/api/backtest/hyperopt", "/api/backtest/walkforward"])
+    def test_varying_the_ml_native_model_name_is_422_before_the_db(
+        self, client: TestClient, strategies_dir: Path, path: str
+    ) -> None:
+        _write_strategy(
+            strategies_dir,
+            "native",
+            strategy_class=ML_NATIVE_CLASS,
+            parameters={"model_name": "alpha", "entry_threshold": 0.6, "required_history": 60},
+        )
+        space = [
+            {"name": "entry_threshold", "type": "float", "low": 0.55, "high": 0.7},
+            {"name": "model_name", "type": "categorical", "choices": ["alpha", "beta"]},
+        ]
+        resp = client.post(path, json=_hyperopt_body("native", param_space=space))
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert (detail["code"], detail["state"], detail["param"]) == (
+            "param_not_tunable",
+            "invalid",
+            "model_name",
+        )
+        assert "model_version_id" in detail["message"]
+
     async def test_request_timeframe_overrides_strategy_primary(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "saw", timeframes={"primary": "4h"})
 
@@ -709,8 +734,26 @@ class TestStrategyOptions:
     def test_lists_primary_timeframe(self, client: TestClient, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "saw", timeframes={"primary": "4h"})
         assert client.get("/api/backtest/strategies").json() == [
-            {"id": "saw", "name": "Strategy saw", "primary_timeframe": "4h"}
+            {"id": "saw", "name": "Strategy saw", "primary_timeframe": "4h", "model_names": []}
         ]
+
+    def test_lists_the_model_names_a_run_serves(
+        self, client: TestClient, strategies_dir: Path
+    ) -> None:
+        _write_strategy(
+            strategies_dir,
+            "native",
+            strategy_class=ML_NATIVE_CLASS,
+            parameters={"model_name": "alpha", "required_history": 60},
+            ml_overlay={"enabled": True, "model_name": "gate"},
+        )
+        _write_strategy(strategies_dir, "off", ml_overlay={"enabled": False, "model_name": "x"})
+        _write_strategy(strategies_dir, "overlay", ml_overlay={"enabled": True, "model_name": "g"})
+        _write_strategy(
+            strategies_dir, "broken", symbols=7, ml_overlay={"enabled": True, "model_name": "g"}
+        )
+        names = {s["id"]: s["model_names"] for s in client.get("/api/backtest/strategies").json()}
+        assert names == {"broken": [], "native": ["alpha", "gate"], "off": [], "overlay": ["g"]}
 
     def test_empty_dir_lists_nothing(self, client: TestClient) -> None:
         assert client.get("/api/backtest/strategies").json() == []

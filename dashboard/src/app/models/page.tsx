@@ -16,7 +16,7 @@ import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
 import { pct, signed, utc } from '@/lib/format';
 import { logger } from '@/lib/logger';
-import { fetchLine, type JobFetch } from '@/lib/research';
+import { fetchLine, stageBadge, type JobFetch } from '@/lib/research';
 
 /* ---------- Types (the registry-backed routes' own shapes) ---------- */
 
@@ -77,14 +77,6 @@ const MAX_POLL_FAILURES = 5;
 const json = (body: unknown): RequestInit => ({ body: JSON.stringify(body) });
 
 /* ---------- Helpers ---------- */
-
-function stageToVariant(stage: string): 'success' | 'info' | 'neutral' {
-  switch (stage) {
-    case 'Production': return 'success';
-    case 'Staging': return 'info';
-    default: return 'neutral';
-  }
-}
 
 /** The drift badge's bands are the shared 0.2/0.25 thresholds the backend applies. */
 function driftToVariant(ds: ApiModel['drift_status']): 'success' | 'warning' | 'error' | 'neutral' {
@@ -314,7 +306,7 @@ export default function ModelsPage() {
       key: 'status',
       header: 'Stage',
       render: (row: ApiModel) => (
-        <StatusBadge status={row.stage} variant={stageToVariant(row.stage)} size="sm" />
+        <StatusBadge status={row.stage} variant={stageBadge(row.stage).variant} size="sm" />
       ),
     },
     {

@@ -20,6 +20,7 @@ import { signed } from '@/lib/format';
 import { usePoll } from '@/hooks/usePoll';
 import { ResearchNav } from '@/components/research/ResearchNav';
 import { JobRow } from '@/components/research/JobRow';
+import { ModelVersionSelect } from '@/components/research/ModelVersionSelect';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import {
   jobStatusText,
@@ -68,6 +69,7 @@ interface StrategyOption {
   id: string;
   name: string;
   primary_timeframe?: string | null;
+  model_names?: string[];
 }
 
 const TIMEFRAME_OPTIONS = [
@@ -133,6 +135,7 @@ function BacktestPageContent() {
   const [timeframe, setTimeframe] = useState('1h');
   const [initialCapital, setInitialCapital] = useState('10000');
   const [backtestName, setBacktestName] = useState('');
+  const [modelVersionId, setModelVersionId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [compareIds, setCompareIds] = useState<string[]>([]);
   const autorunTriggered = useRef(false);
@@ -191,6 +194,7 @@ function BacktestPageContent() {
           initial_capital: Number(initialCapital),
           name: backtestName,
           timeframe,
+          ...(modelVersionId ? { model_version_id: modelVersionId } : {}),
         }),
       });
       toast('info', 'Backtest started');
@@ -206,6 +210,7 @@ function BacktestPageContent() {
 
   const handleStrategyChange = (id: string) => {
     setStrategyId(id);
+    setModelVersionId(null);
     const primary = strategies.find((s) => s.id === id)?.primary_timeframe;
     if (primary) setTimeframe(primary);
   };
@@ -343,6 +348,12 @@ function BacktestPageContent() {
           <Input label="End Date" type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
           <Input label="Initial Capital ($)" type="number" value={initialCapital} onChange={(e) => setInitialCapital(e.target.value)} />
           <Input label="Name (optional)" type="text" value={backtestName} onChange={(e) => setBacktestName(e.target.value)} placeholder="e.g. Q1 BTC 1h" />
+          <ModelVersionSelect
+            modelNames={strategies.find((s) => s.id === strategyId)?.model_names ?? []}
+            value={modelVersionId}
+            onChange={setModelVersionId}
+            disabled={submitting}
+          />
         </div>
         {noBars ? (
           <div className="mt-4 flex flex-col gap-2" data-testid="run-error">
