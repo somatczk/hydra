@@ -8,6 +8,7 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { ApiError, fetchApi } from '@/lib/api';
 import { describeApiError } from '@/lib/apiState';
 import {
+  fetchLine,
   jobAgeText,
   jobProgressText,
   jobStatusText,
@@ -88,6 +89,7 @@ export function JobRow({ kind, job, onRefetch, now }: JobRowProps) {
           </p>
         </div>
         {meta && <p className="mt-1 text-xs text-ink-2">{meta}</p>}
+        {job.fetch && <p className="mt-1 text-xs text-ink-2" data-testid="job-fetch">{fetchLine(job.fetch)}</p>}
         {job.error && <p className="mt-1 text-xs text-danger">{job.error}</p>}
         {notice && <p className="mt-1 text-xs text-caution">{notice}</p>}
       </div>

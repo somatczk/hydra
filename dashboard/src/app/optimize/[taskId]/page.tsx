@@ -17,10 +17,12 @@ import { ResearchNav } from '@/components/research/ResearchNav';
 import { JobRow } from '@/components/research/JobRow';
 import { WalkForwardResults, type WalkForwardResult } from '@/components/research/WalkForwardResults';
 import {
+  fetchLine,
   holdoutLines,
   trialStatusText,
   utcDay,
   validationLines,
+  type JobFetch,
   type ResearchJob,
 } from '@/lib/research';
 
@@ -45,6 +47,7 @@ interface HyperoptProgress {
   completed_trials: number;
   total_trials: number;
   error?: string | null;
+  fetch?: JobFetch | null;
 }
 
 interface HyperoptResult {
@@ -202,6 +205,7 @@ function HyperoptView({ taskId }: { taskId: string }) {
     error: progress.error ?? null,
     completed_trials: progress.completed_trials,
     total_trials: progress.total_trials,
+    fetch: progress.fetch ?? null,
   };
 
   const holdout = result ? holdoutLines(result.holdout, result) : null;
@@ -336,6 +340,11 @@ function HyperoptView({ taskId }: { taskId: string }) {
             </div>
           )}
           {result.provenance && <ProvenancePanel provenance={result.provenance} />}
+          {progress.fetch && (
+            <p className="text-xs text-ink-2" data-testid="run-fetch">
+              {fetchLine(progress.fetch)}
+            </p>
+          )}
           <Section title="Trials" action={<span className="text-xs text-ink-2">{result.trials.length} recorded</span>}>
             <Table
               columns={trialColumns}
@@ -449,7 +458,14 @@ function WalkforwardView({ taskId }: { taskId: string }) {
         onBack={() => router.push('/optimize')}
       />
       {result !== null ? (
-        <WalkForwardResults result={result} />
+        <>
+          {row?.fetch && (
+            <p className="text-xs text-ink-2" data-testid="run-fetch">
+              {fetchLine(row.fetch)}
+            </p>
+          )}
+          <WalkForwardResults result={result} />
+        </>
       ) : (
         <>
           {row ? (

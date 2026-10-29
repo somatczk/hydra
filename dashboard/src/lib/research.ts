@@ -1,6 +1,6 @@
 /** Pure derivations behind the research screens (08 §4); shapes mirror the API models. No React. */
 
-import { age, pct } from './format';
+import { age, duration, pct } from './format';
 import { parseErrorDetail } from './apiState';
 
 export type Tone = 'none' | 'caution' | 'danger';
@@ -20,6 +20,18 @@ export interface ResearchJob {
   result_id?: string | null;
   completed_trials?: number | null;
   total_trials?: number | null;
+  /** The worker's auto-fetch of missing bars, as the job row's `detail.fetch` carries it. */
+  fetch?: JobFetch | null;
+}
+
+/** `detail.fetch` (data/on_demand.py `_emit`, worker `_fetch_failed`): a failure before any progress has only state and reason. */
+export interface JobFetch {
+  state: string;
+  ranges?: string[][];
+  bars_fetched?: number;
+  weight_spent?: number;
+  elapsed_ms?: number;
+  reason?: string;
 }
 
 /** A `GET /api/backtest/strategies/{id}/params` row; the editor collects min/max overrides on top. */
@@ -237,4 +249,29 @@ export function wfWindowPlan(
   const windowDays = 30 * (isMonths + oosMonths);
   if (days < windowDays) return null;
   return { isMonths, oosMonths, folds: Math.floor((days - windowDays) / (30 * oosMonths)) + 1 };
+}
+
+const MAX_RANGES_SHOWN = 3;
+
+/** The auto-fetch as one sentence: what is being (or was) fetched, how much, the request weight and the time spent. */
+export function fetchLine(fetch: JobFetch | null | undefined): string | null {
+  if (!fetch) return null;
+  const ranges = fetch.ranges ?? [];
+  const bars = (fetch.bars_fetched ?? 0).toLocaleString('en-US');
+  const spans = ranges.slice(0, MAX_RANGES_SHOWN).map(([a, b]) => `${utcDay(a)} – ${utcDay(b)}`);
+  if (ranges.length > MAX_RANGES_SHOWN) spans.push(`${ranges.length - MAX_RANGES_SHOWN} more`);
+  const where = ranges.length > 0 ? ` over ${ranges.length === 1 ? '1 range' : `${ranges.length} ranges`} (${spans.join('; ')})` : '';
+  const cost = [
+    fetch.weight_spent !== undefined ? `weight ${fetch.weight_spent}` : null,
+    fetch.elapsed_ms !== undefined ? duration(fetch.elapsed_ms) : null,
+  ].filter(Boolean);
+  const tail = cost.length > 0 ? ` · ${cost.join(' · ')}` : '';
+  if (fetch.state === 'fetching') return `Fetching missing bars: ${bars} so far${where}${tail}`;
+  if (fetch.state === 'fetched') {
+    return ranges.length === 0 ? 'No missing bars: every bar was already stored' : `Fetched ${bars} missing bars${where} before the run${tail}`;
+  }
+  if (fetch.state === 'failed') {
+    return `Fetching missing bars failed${fetch.reason ? ` (${fetch.reason})` : ''} after ${bars} bars${where}${tail}`;
+  }
+  return `Auto-fetch ${fetch.state}: ${bars} bars${where}${tail}`;
 }

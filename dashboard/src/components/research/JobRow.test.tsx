@@ -74,6 +74,25 @@ describe('JobRow', () => {
     expect(cancelTriggers(m.container)).toHaveLength(1);
   });
 
+  it('shows the worker fetching missing bars while the job is in its fetch phase', async () => {
+    const fetch = {
+      state: 'fetching',
+      ranges: [['2026-01-01T00:00:00+00:00', '2026-01-31T23:00:00+00:00']],
+      bars_fetched: 300,
+      weight_spent: 6,
+      elapsed_ms: 4200,
+    };
+    m = await mount(<JobRow kind="walkforward" job={{ ...RUNNING, progress: 6, fetch }} now={NOW} />);
+    expect(m.container.querySelector('[data-testid="job-fetch"]')?.textContent).toBe(
+      'Fetching missing bars: 300 so far over 1 range (1 Jan 2026 – 31 Jan 2026) · weight 6 · 4 s',
+    );
+  });
+
+  it('shows no fetch line for a job the worker never fetched for', async () => {
+    m = await mount(<JobRow kind="backtest" job={{ ...RUNNING, fetch: null }} now={NOW} />);
+    expect(m.container.querySelector('[data-testid="job-fetch"]')).toBeNull();
+  });
+
   it('links a completed backtest to its result and offers no cancel', async () => {
     m = await mount(
       <JobRow
