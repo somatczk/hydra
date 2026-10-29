@@ -68,6 +68,8 @@ type Dialog =
   | null;
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
+/** After this many consecutive status reads the page stops polling: the error card's Retry re-arms. */
+const MAX_POLL_FAILURES = 5;
 const json = (body: unknown): RequestInit => ({ body: JSON.stringify(body) });
 
 /* ---------- Helpers ---------- */
@@ -156,6 +158,7 @@ export default function ModelsPage() {
   const [taskId, setTaskId] = useState<string | null>(null);
   const [task, setTask] = useState<RetrainStatus | null>(null);
   const [taskError, setTaskError] = useState<unknown>(null);
+  const [pollFailures, setPollFailures] = useState(0);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -186,23 +189,27 @@ export default function ModelsPage() {
       const status = await fetchApi<RetrainStatus>(`/api/models/retrain/${id}`);
       setTask(status);
       setTaskError(null);
+      setPollFailures(0);
       if (TERMINAL.has(status.status)) await loadData();
     } catch (err) {
       logger.warn('Models', 'Failed to read the retrain job', err);
       setTaskError(err);
+      setPollFailures((n) => n + 1);
     }
   }, [loadData]);
 
   useEffect(() => {
-    if (!taskId) { setTask(null); setTaskError(null); return; }
+    if (!taskId) { setTask(null); setTaskError(null); setPollFailures(0); return; }
+    setPollFailures(0);
     void pollTask(taskId);
   }, [taskId, pollTask]);
 
   useEffect(() => {
-    if (!taskId || !task || TERMINAL.has(task.status)) return;
+    if (!taskId || pollFailures >= MAX_POLL_FAILURES) return;
+    if (task && TERMINAL.has(task.status)) return;
     const timer = setInterval(() => void pollTask(taskId), 2000);
     return () => clearInterval(timer);
-  }, [taskId, task, pollTask]);
+  }, [taskId, task, pollFailures, pollTask]);
 
   const closeDialog = () => { setDialog(null); setDialogError(null); };
 
@@ -411,8 +418,11 @@ export default function ModelsPage() {
       {/* Retrain job status */}
       {taskId && (
         <DataCard title="Training job" description="The ml_train job this page queued or a version's own job">
-          {taskError !== null && task === null ? (
-            <ErrorCard message="Failed to read the training job" onRetry={() => void pollTask(taskId)} />
+          {taskError !== null && (task === null || pollFailures >= MAX_POLL_FAILURES) ? (
+            <ErrorCard
+              message="Failed to read the training job"
+              onRetry={() => { setPollFailures(0); void pollTask(taskId); }}
+            />
           ) : task === null ? (
             <p className="text-sm text-ink-2">Reading job {taskId}…</p>
           ) : (

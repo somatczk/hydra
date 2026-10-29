@@ -335,6 +335,95 @@ describe('ModelsPage retrain', () => {
     expect(c.textContent).toContain('53.00%');
   });
 
+  it('re-arms the poll after a transient status-read failure and recovers on its own', async () => {
+    let polls = 0;
+    const c = await open({
+      '/api/models/retrain/ml-new12345': () => {
+        polls += 1;
+        if (polls === 1) return refusal(503, 'engine_unreachable', 'the engine is unreachable');
+        return {
+          task_id: 'ml-new12345',
+          status: polls === 2 ? 'running' : 'completed',
+          progress: polls === 2 ? 40 : 100,
+          error: null,
+          result: polls === 2 ? null : { name: 'alpha', version: 3, stage: 'staging' },
+          metrics: polls === 2 ? null : { oos_accuracy: 0.53, oos_base_rate: 0.5, oos_mean_signed_return: 0.0007 },
+          provenance: null,
+        };
+      },
+    }, {
+      'POST /api/models/alpha/retrain': { task_id: 'ml-new12345', status: 'queued' },
+    });
+
+    await click(buttonByText(c, 'Retrain'));
+    const d = dlg(c, 'Retrain alpha');
+    await choose(selectByLabel(c, 'Strategy'), 'saw');
+    await typeInto(inputByLabel(c, 'Symbol'), 'BTCUSDT');
+
+    vi.useFakeTimers();
+    await click(buttonByText(d, 'Queue retrain'));
+    await flush();
+
+    // the first read failed: the error card shows while the interval stays armed
+    expect(c.textContent).toContain('Failed to read the training job');
+
+    // the poll must re-arm itself: the second read recovers without the manual Retry
+    await advance(2000);
+    expect(c.textContent).toContain('running');
+    expect(c.textContent).not.toContain('Failed to read the training job');
+
+    await advance(2000);
+    expect(c.textContent).toContain('completed');
+    expect(c.textContent).toContain('registered alpha v3');
+  });
+
+  it('gives up polling after repeated status-read failures until Retry re-arms it', async () => {
+    let broken = true;
+    let polls = 0;
+    const c = await open({
+      '/api/models/retrain/ml-new12345': () => {
+        polls += 1;
+        if (broken) return refusal(503, 'engine_unreachable', 'the engine is unreachable');
+        return {
+          task_id: 'ml-new12345',
+          status: 'completed',
+          progress: 100,
+          error: null,
+          result: { name: 'alpha', version: 3, stage: 'staging' },
+          metrics: { oos_accuracy: 0.53, oos_base_rate: 0.5, oos_mean_signed_return: 0.0007 },
+          provenance: null,
+        };
+      },
+    }, {
+      'POST /api/models/alpha/retrain': { task_id: 'ml-new12345', status: 'queued' },
+    });
+
+    await click(buttonByText(c, 'Retrain'));
+    const d = dlg(c, 'Retrain alpha');
+    await choose(selectByLabel(c, 'Strategy'), 'saw');
+    await typeInto(inputByLabel(c, 'Symbol'), 'BTCUSDT');
+
+    vi.useFakeTimers();
+    await click(buttonByText(d, 'Queue retrain'));
+    await flush();
+    expect(polls).toBe(1);
+
+    // five consecutive failures exhaust the bounded retry; the interval goes quiet
+    for (let i = 0; i < 4; i += 1) await advance(2000);
+    expect(polls).toBe(5);
+    await advance(2000);
+    await advance(2000);
+    expect(polls).toBe(5);
+    expect(c.textContent).toContain('Failed to read the training job');
+
+    // Retry re-arms: the read now succeeds and the panel shows the finished job
+    broken = false;
+    await click(buttonByText(c, 'Retry'));
+    await flush();
+    expect(c.textContent).toContain('completed');
+    expect(c.textContent).toContain('registered alpha v3');
+  });
+
   it('surfaces the 422 of a symbol outside the universe inside the dialog', async () => {
     const c = await open({}, {
       'POST /api/models/alpha/retrain': refusal(

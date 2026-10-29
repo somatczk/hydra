@@ -17,6 +17,7 @@ from prometheus_client.utils import floatToGoString
 
 from hydra.core import metrics
 from hydra.core.metrics import CONTRACT
+from hydra.ml.retraining import PSI_ALERT_THRESHOLD, PSI_RETRAIN_THRESHOLD
 from hydra.risk.circuit_breakers import _TIERS
 from tests.unit.test_execution.session_harness import Harness, held, rule, write_strategy
 
@@ -131,10 +132,40 @@ def test_bucket_matchers_name_a_real_bucket_bound(path: Path) -> None:
 
 @pytest.mark.parametrize("path", DASHBOARDS, ids=lambda p: p.name)
 def test_no_panel_without_an_honest_source(path: Path) -> None:
+    """p1-decisions #29 keeps panels without an honest source off the dashboards:
+    Sharpe (no daily-return series) and Accuracy stay gone, and the only ML series a
+    panel may read is the drift pair the trader's startup task produces — the
+    inference-latency histogram still has no runtime producer and stays off."""
     titles = [p["title"] for p in _panels(path)]
-    for word in ("Sharpe", "Accuracy", "PSI", "ML"):
+    for word in ("Sharpe", "Accuracy"):
         assert not [t for t in titles if word in t], (path.name, word)
-    assert "hydra_ml_" not in path.read_text(), path.name
+    ml_series = {n for n in HYDRA_NAME.findall(path.read_text()) if n.startswith("hydra_ml_")}
+    assert ml_series <= {"hydra_ml_drift_psi", "hydra_ml_drift_nan_ratio"}, (path.name, ml_series)
+
+
+def test_ml_drift_panels_read_the_startup_gauges() -> None:
+    """A1: the ML drift panels the P5 plan pays for (p1-decisions #29's 'ML in P5')
+    read the trader's startup gauges per model, with retraining.py's shared 0.2/0.25
+    thresholds as visible references — the gauges exist, so the panels are honest."""
+    titles = {p["title"]: p for p in _panels(DASHBOARDS[0])}
+    (row,) = [p for p in _panels(DASHBOARDS[0]) if p["type"] == "row" and p["title"] == "ML Drift"]
+    psi = titles["Drift PSI by Model"]
+    nan = titles["Drift NaN Ratio by Model"]
+    for panel in (psi, nan):
+        assert panel["type"] == "timeseries"
+        assert panel["datasource"] == {"type": "prometheus", "uid": "prometheus"}
+    assert [(t["expr"], t["legendFormat"]) for t in psi["targets"]] == [
+        ("hydra_ml_drift_psi", "{{ model_name }}")
+    ]
+    assert [(t["expr"], t["legendFormat"]) for t in nan["targets"]] == [
+        ("hydra_ml_drift_nan_ratio", "{{ model_name }}")
+    ]
+    assert _threshold_values(psi) == [PSI_ALERT_THRESHOLD, PSI_RETRAIN_THRESHOLD]
+    assert psi["fieldConfig"]["defaults"]["custom"]["thresholdsStyle"] == {"mode": "line"}
+    assert nan["fieldConfig"]["defaults"]["unit"] == "percentunit"
+    assert _threshold_values(nan) == [1.0]
+    assert row["gridPos"]["y"] < psi["gridPos"]["y"]
+    assert psi["gridPos"]["x"] < nan["gridPos"]["x"]
 
 
 def _producers() -> dict[str, set[str]]:

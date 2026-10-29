@@ -4,19 +4,23 @@ The whole task runs for real — registry scan, training-job provenance, the
 DatasetBuilder read, the quantile-PSI against the stored reference deciles,
 the drift write and the gauges — with only the database canned: the fake pool
 answers the exact SQL the real code issues, so the PSI numbers asserted here
-are the numbers the trader would publish. Startup-only wiring is pinned on
-the AST: one awaited call between ``mgr.startup()`` and ``_serve``, never
-inside a loop, and ``SessionManager.startup`` never measures drift.
+are the numbers the trader would publish. Startup-only wiring is pinned on the
+AST: one call, a task ``_serve`` starts after the heartbeat loop — never an
+inline await before serving, never inside a loop — and ``SessionManager.startup``
+never measures drift; the runtime test pins that serving and the heartbeat
+begin while the scan is still running.
 """
 
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -477,14 +481,15 @@ class TestStartupDriftMeasurement:
 # ---------------------------------------------------------------------------
 
 
-def _awaited_calls(tree: ast.Module, name: str) -> list[ast.Await]:
-    def _called_name(func: ast.expr) -> str | None:
-        if isinstance(func, ast.Name):
-            return func.id
-        if isinstance(func, ast.Attribute):
-            return func.attr
-        return None
+def _called_name(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
 
+
+def _awaited_calls(tree: ast.Module, name: str) -> list[ast.Await]:
     return [
         node
         for node in ast.walk(tree)
@@ -494,24 +499,70 @@ def _awaited_calls(tree: ast.Module, name: str) -> list[ast.Await]:
     ]
 
 
-def test_the_drift_task_is_awaited_once_between_startup_and_serving() -> None:
+def _scan_calls(tree: ast.Module) -> list[ast.Call]:
+    """Every call of the scan — its single scheduling site, wherever it sits."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _called_name(node.func) == "measure_startup_drift"
+    ]
+
+
+def _task_scheduling_calls(tree: ast.Module, name: str) -> list[ast.Call]:
+    """The ``asyncio.create_task(<name>(...))`` calls: a background task, never an await."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _called_name(node.func) == "create_task"
+        and node.args
+        and isinstance(node.args[0], ast.Call)
+        and _called_name(node.args[0].func) == name
+    ]
+
+
+def test_the_drift_scan_is_one_task_serving_never_waits_for() -> None:
+    """A3: the scan is a task ``_serve`` starts after the heartbeat loop, so the
+    healthcheck stays fresh and the internal API answers through a slow scan. The old
+    inline await let a cold-PG scan push past ``HEARTBEAT_MAX_AGE_S`` — the Docker
+    healthcheck restart-looped the trader before it ever served."""
     tree = ast.parse(Path(trader_main.__file__).read_text())
-    drift = _awaited_calls(tree, "measure_startup_drift")
-    assert len(drift) == 1, "main() must await measure_startup_drift exactly once"
+    scans = _scan_calls(tree)
+    (task,) = _task_scheduling_calls(tree, "measure_startup_drift")
+    assert len(scans) == 1, "the drift scan is scheduled exactly once"
+    assert task.args[0] is scans[0], "the one scheduling is asyncio.create_task"
+    assert _awaited_calls(tree, "measure_startup_drift") == [], (
+        "the drift scan must never be awaited inline before serving"
+    )
+    serve_def = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_serve"
+    )
+    assert serve_def.lineno < task.lineno < (serve_def.end_lineno or 0), (
+        "the scan task is started by _serve, once serving is wired"
+    )
+    (heartbeat,) = _task_scheduling_calls(tree, "_heartbeat_loop")
+    assert heartbeat.lineno < task.lineno, "the heartbeat loop runs before the scan starts"
+    uvicorn_serve = _awaited_calls(tree, "serve")
+    assert uvicorn_serve and task.lineno < uvicorn_serve[0].lineno, (
+        "the scan is in flight before uvicorn blocks, so serving never waits for it"
+    )
+    # main() still starts the engine before it serves — and so before the scan
     startup = _awaited_calls(tree, "startup")
-    serve = _awaited_calls(tree, "_serve")
-    assert startup and serve
-    assert startup[0].lineno < drift[0].lineno < serve[0].lineno
+    main_serve = _awaited_calls(tree, "_serve")
+    assert startup and main_serve
+    assert startup[0].lineno < main_serve[0].lineno
 
 
 def test_the_drift_task_is_never_wired_into_a_loop() -> None:
     """Startup-only: no periodic task, by construction and by test."""
     tree = ast.parse(Path(trader_main.__file__).read_text())
-    (drift,) = _awaited_calls(tree, "measure_startup_drift")
+    (task,) = _task_scheduling_calls(tree, "measure_startup_drift")
     for node in ast.walk(tree):
         if isinstance(node, (ast.While, ast.For, ast.AsyncFor)):
             for child in ast.walk(node):
-                if child is drift:
+                if child is task:
                     pytest.fail("the drift task is scheduled inside a loop")
 
 
@@ -522,6 +573,80 @@ def test_session_manager_startup_never_measures_drift() -> None:
     ).read_text()
     assert "measure_startup_drift" not in source
     assert "hydra_ml_drift" not in source
+
+
+async def test_serving_and_the_heartbeat_begin_while_the_scan_is_still_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A3's runtime pin: uvicorn is serving and the heartbeat file keeps refreshing
+    while a slow scan is still reading. The old inline shape awaited the scan before
+    ``_serve``, so nothing refreshed the heartbeat through it and the split API's
+    trader-readiness check got connection-refused for the scan's whole duration."""
+    import uvicorn
+
+    import hydra.dashboard.health as dashboard_health
+    import hydra.trader.server as trader_server
+
+    scan_started = asyncio.Event()
+    scan_release = asyncio.Event()
+    scan_finished = asyncio.Event()
+    serve_started = asyncio.Event()
+    serve_release = asyncio.Event()
+
+    async def slow_scan(pool: object) -> None:
+        scan_started.set()
+        await scan_release.wait()
+        scan_finished.set()
+
+    class _Monitor:
+        def __init__(self, app: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    class _Server:
+        def __init__(self, config: object) -> None:
+            pass
+
+        async def serve(self) -> None:
+            serve_started.set()
+            await serve_release.wait()
+
+    def fake_app(cfg: object, pool: object, mgr: object) -> object:
+        return SimpleNamespace(state=SimpleNamespace())
+
+    async def graceful_shutdown() -> None:
+        return None
+
+    monkeypatch.setattr(trader_main, "measure_startup_drift", slow_scan)
+    monkeypatch.setattr(trader_main, "HEARTBEAT_PATH", str(tmp_path / "hydra-trader.heartbeat"))
+    monkeypatch.setattr(trader_main, "HEARTBEAT_TOUCH_S", 0.01)
+    monkeypatch.setattr(dashboard_health, "HealthMonitor", _Monitor)
+    monkeypatch.setattr(trader_server, "build_app", fake_app)
+    monkeypatch.setattr(uvicorn, "Server", _Server)
+
+    serve = asyncio.create_task(
+        trader_main._serve(object(), object(), SimpleNamespace(graceful_shutdown=graceful_shutdown))
+    )
+    try:
+        await asyncio.wait_for(scan_started.wait(), timeout=2)
+        await asyncio.wait_for(serve_started.wait(), timeout=2)
+        assert not scan_finished.is_set(), "serving began before the scan finished"
+        heartbeat = tmp_path / "hydra-trader.heartbeat"
+        await asyncio.sleep(0.03)
+        first = heartbeat.stat().st_mtime_ns
+        await asyncio.sleep(0.06)
+        assert heartbeat.stat().st_mtime_ns > first, (
+            "the heartbeat loop must keep refreshing the file while the scan runs"
+        )
+    finally:
+        scan_release.set()
+        serve_release.set()
+        await asyncio.wait_for(serve, timeout=5)
 
 
 def test_the_distinct_value_floor_knows_the_bin_count() -> None:

@@ -3,12 +3,14 @@
 ``main()`` loads the config, validates the credential key, creates the pool with a retry
 budget, waits for the schema at the Alembic head (the API process owns migrations, like the
 engine the worker waits for), starts the engine (``SessionManager.startup()``: risk state,
-recovery, display rows), measures every Production model's feature drift once
-(``measure_startup_drift``, P5-D — startup-only, never a periodic task), then serves the
-internal API on :8000 with the full-check HealthMonitor until SIGTERM — and shuts the engine
-down gracefully. The heartbeat file (``python -m hydra.trader check``) is the Docker
-healthcheck's freshness anchor: the schema wait keeps it alive, and the serving loop
-refreshes it every 10 s, so a stalled process goes unhealthy within ``HEARTBEAT_MAX_AGE_S``.
+recovery, display rows) and serves the internal API on :8000 with the full-check
+HealthMonitor until SIGTERM — then shuts the engine down gracefully. Every Production
+model's feature drift is measured once at startup (``measure_startup_drift``, P5-D —
+startup-only, never a periodic task) as a task ``_serve`` starts beside the heartbeat
+loop, so a slow scan never delays serving or the heartbeat. The heartbeat file
+(``python -m hydra.trader check``) is the Docker healthcheck's freshness anchor: the
+schema wait keeps it alive, and the serving loop refreshes it every 10 s, so a stalled
+process goes unhealthy within ``HEARTBEAT_MAX_AGE_S``.
 """
 
 from __future__ import annotations
@@ -305,7 +307,13 @@ async def _measure_one_model(pool: Any, version: Any) -> None:
 
 
 async def _serve(cfg: Any, pool: Any, mgr: Any) -> None:
-    """Serve the internal API with the full-check monitor until SIGTERM (uvicorn traps it)."""
+    """Serve the internal API with the full-check monitor until SIGTERM (uvicorn traps it).
+
+    The startup drift scan is a task started here, after the heartbeat loop, so it runs
+    beside serving: the healthcheck stays fresh through a slow scan and the internal API
+    answers while the registry and the bars are still being read. SIGTERM cancels a scan
+    that has not finished — the next start re-measures.
+    """
     import uvicorn
 
     from hydra.dashboard.health import HealthMonitor
@@ -316,14 +324,18 @@ async def _serve(cfg: Any, pool: Any, mgr: Any) -> None:
     app.state.health_monitor = monitor
     await monitor.start()
     heartbeat = asyncio.create_task(_heartbeat_loop(), name="trader-heartbeat")
+    drift = asyncio.create_task(measure_startup_drift(pool), name="ml-drift-scan")
     try:
         await uvicorn.Server(
             uvicorn.Config(app, host="0.0.0.0", port=8000, log_config=None, proxy_headers=False)
         ).serve()
     finally:
         heartbeat.cancel()
+        drift.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat
+        with contextlib.suppress(asyncio.CancelledError):
+            await drift
         await monitor.stop()
         await mgr.graceful_shutdown()
         logger.info("Trader process shut down")
@@ -350,7 +362,6 @@ async def main() -> None:
         mgr = SessionManager(db_pool=pool, config=cfg)
         await mgr.startup()
         logger.info("Trader engine started")
-        await measure_startup_drift(pool)
         await _serve(cfg, pool, mgr)
     finally:
         await pool.close()
