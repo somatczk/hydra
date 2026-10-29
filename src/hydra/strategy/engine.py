@@ -12,8 +12,9 @@ from typing import Any
 
 import yaml
 
+from hydra.core import metrics
 from hydra.core.config import HydraConfig
-from hydra.core.events import BarEvent, Event
+from hydra.core.events import BarEvent, EntrySignal, Event
 from hydra.core.protocols import EventBus
 from hydra.core.types import OHLCV, Timeframe
 from hydra.strategy.base import BaseStrategy
@@ -199,7 +200,8 @@ class StrategyEngine:
 
         Every declared timeframe (primary, confirmation, entry) reaches the context; only
         strategies whose primary timeframe matches are evaluated, and never on a replayed
-        catch-up bar.
+        catch-up bar. An entry signal on a bar outside the strategy's ``schedule`` is dropped
+        here, before publication, so paper, live and backtest sessions all skip it; exits pass.
         """
         if not isinstance(event, BarEvent) or event.ohlcv is None:
             return
@@ -222,6 +224,20 @@ class StrategyEngine:
                 self.last_error = f"{sid}: {exc!r}"
                 continue
             for signal in signals:
+                if (
+                    isinstance(signal, EntrySignal)
+                    and cfg.schedule is not None
+                    and not cfg.schedule.allows(event.ohlcv.timestamp)
+                ):
+                    metrics.record_entry_off_schedule(sid)
+                    logger.debug(
+                        "Entry %s %s from %s skipped: bar %s is outside its schedule",
+                        signal.direction,
+                        symbol,
+                        sid,
+                        event.ohlcv.timestamp.isoformat(),
+                    )
+                    continue
                 await self._event_bus.publish(signal)
                 try:
                     from hydra.core.metrics import record_signal

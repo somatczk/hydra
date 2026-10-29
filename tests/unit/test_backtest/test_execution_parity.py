@@ -5,6 +5,7 @@ the fake REST client and fed closed bars on its session bus exactly as the feed 
 The backtest side is ``BacktestRunner.run`` on the same bars with the same risk config. Fills,
 bar-by-bar equity, balances and realized PnL must be identical, and the fixture must hit a
 take-profit, a gap-through stop, a bar touching both OCO legs, a partial and a full strategy exit.
+A strategy ``schedule`` vetoes the same entries on both sides.
 """
 
 from __future__ import annotations
@@ -242,13 +243,14 @@ async def _assert_parity(
     cls: type[BaseStrategy],
     strategies_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    **extra: Any,
 ) -> list[PaperFill]:
     # P2-E2's class allowlist refuses anything outside hydra.strategy.builtin.*; this fixture's
     # test-double strategies are the one legitimate exception (real parity harness, not user input).
     monkeypatch.setattr(
         engine_module, "ALLOWED_CLASS_PREFIX", (engine_module.ALLOWED_CLASS_PREFIX, __name__)
     )
-    config = {**CONFIG, "strategy_class": f"{__name__}.{cls.__name__}"}
+    config = {**CONFIG, "strategy_class": f"{__name__}.{cls.__name__}", **extra}
     paper, paper_equity = await _paper(bars, strategies_dir, config)
 
     built: list[PaperTradingExecutor] = []
@@ -306,6 +308,19 @@ async def test_same_size_reentries_are_not_deduplicated_on_either_side(
         D("0.00999"),
         D("0.00998"),
     ]
+
+
+async def test_a_schedule_vetoes_the_same_entries_on_both_sides(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bars = _flat_bars(last_closed_open(datetime.now(UTC), Timeframe.H1), WARM + 12)
+    # bar hours move with the wall clock, so the excluded hours are read off the bars
+    excluded = {bars[WARM].timestamp.hour, bars[WARM + 5].timestamp.hour}
+    schedule = {"active_hours_utc": [h for h in range(24) if h not in excluded]}
+    fills = await _assert_parity(bars, FlipStrategy, strategies_dir, monkeypatch, schedule=schedule)
+    buys = [f.timestamp for f in fills if f.side == "BUY"]
+    assert buys == [bars[WARM + i].timestamp for i in (1, 3, 6, 8, 10)]
+    assert all(t.hour not in excluded for t in buys)
 
 
 def _assert_fixture_hits_every_case(fills: list[PaperFill], by_ts: dict[datetime, OHLCV]) -> None:

@@ -290,6 +290,11 @@ class SaveRequest(BaseModel):
     risk: RiskInput = Field(default_factory=RiskInput)
     enable_immediately: bool = False
     ml_overlay: dict[str, Any] | None = None
+    schedule: dict[str, Any] | None = Field(
+        None,
+        description="entry hours (UTC) and weekdays (Monday=0); on update None keeps the "
+        "stored schedule and {} clears it",
+    )
     leverage: int = Field(1, ge=1, le=3, description="perp strategies only (1-3x, isolated)")
 
 
@@ -329,6 +334,7 @@ class StrategyDetailResponse(BaseModel):
     performance: StrategyPerformance | None = None
     performance_error: str | None = None
     ml_overlay: dict[str, Any] | None = None
+    schedule: dict[str, Any] | None = None
     config_hash: str | None = None
     file_changed: bool = False
     running_sessions: list[RunningSession] = Field(default_factory=list)
@@ -579,6 +585,7 @@ async def get_strategy(pool: Any, strategy_id: str) -> dict[str, Any]:
                 "status": _status_from_enabled(enabled),
                 "enabled": enabled,
                 "editable": is_rule_based,
+                "schedule": data.get("schedule"),
             }
             if is_rule_based:
                 result.update(_extract_strategy_detail(data))
@@ -724,6 +731,10 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
 
     if body.ml_overlay:
         config_dict["ml_overlay"] = body.ml_overlay
+    # the builder never sends a schedule: keep the stored one rather than silently drop it
+    schedule = data.get("schedule") if body.schedule is None else body.schedule
+    if schedule:
+        config_dict["schedule"] = schedule
 
     if body.timeframes.confirmation:
         config_dict["timeframes"]["confirmation"] = body.timeframes.confirmation
@@ -1009,6 +1020,8 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
 
     if request.ml_overlay:
         config_dict["ml_overlay"] = request.ml_overlay
+    if request.schedule:
+        config_dict["schedule"] = request.schedule
 
     if request.timeframes.confirmation:
         config_dict["timeframes"]["confirmation"] = request.timeframes.confirmation

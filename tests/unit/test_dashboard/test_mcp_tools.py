@@ -997,6 +997,22 @@ def test_strategy_save_refuses_an_out_of_range_adx_period(
     assert list(strategies_dir.glob("*.yaml")) == []
 
 
+def test_strategy_save_writes_the_schedule_strategy_get_reads_it_back(
+    mcp: _McpClient, strategies_dir: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    schedule = {"active_hours_utc": [13, 14], "active_days": [0, 1, 2, 3, 4]}
+    is_error, text = mcp.call(
+        "strategy_save", {"name": "Scheduled", "rules": _RULES, "schedule": schedule}
+    )
+    assert not is_error
+    sid = json.loads(text)["id"]
+    assert yaml.safe_load((strategies_dir / f"{sid}.yaml").read_text())["schedule"] == schedule
+    is_error, text = mcp.call("strategy_get", {"strategy_id": sid})
+    assert not is_error
+    assert json.loads(text)["schedule"] == schedule
+
+
 def test_strategy_export_on_a_file_deleted_after_the_scan_is_the_404_envelope(
     mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

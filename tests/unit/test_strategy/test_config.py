@@ -1,13 +1,22 @@
-"""config_hash and load_all_strategy_configs (bad files are skipped and logged, SM-15)."""
+"""config_hash, load_all_strategy_configs (bad files skipped and logged, SM-15) and schedule."""
 
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from hydra.strategy.config import StrategyConfig, config_hash, load_all_strategy_configs
+from hydra.strategy.config import (
+    ScheduleConfig,
+    StrategyConfig,
+    config_hash,
+    load_all_strategy_configs,
+)
+
+HOUR = timedelta(hours=1)
 
 _BASE: dict[str, object] = {
     "id": "cfg-1",
@@ -69,3 +78,57 @@ class TestLoadAllStrategyConfigs:
 
     def test_missing_dir_returns_empty(self, tmp_path: Path) -> None:
         assert load_all_strategy_configs(tmp_path / "nope") == []
+
+
+class TestSchedule:
+    def _cfg(self, primary: str = "1h", **schedule: object) -> StrategyConfig:
+        return StrategyConfig(**{**_BASE, "timeframes": {"primary": primary}, "schedule": schedule})
+
+    def test_default_is_every_hour_every_day(self) -> None:
+        sched = ScheduleConfig()
+        assert sched.active_hours_utc == list(range(24))
+        assert sched.active_days == list(range(7))
+        assert all(sched.allows(datetime(2026, 1, 5, tzinfo=UTC) + i * HOUR) for i in range(168))
+
+    def test_open_time_hour_and_monday_zero(self) -> None:
+        sched = ScheduleConfig(active_hours_utc=[13], active_days=[0])
+        monday_13 = datetime(2026, 1, 5, 13, tzinfo=UTC)  # 2026-01-05 is a Monday
+        assert sched.allows(monday_13)
+        assert not sched.allows(monday_13 - HOUR)  # 12:00 bar: closes at 13:00, still out
+        assert not sched.allows(monday_13 + HOUR)
+        assert not sched.allows(monday_13 + 24 * HOUR)  # Tuesday
+        assert sched.allows(datetime(2026, 1, 5, 14, tzinfo=timezone(timedelta(hours=1))))
+
+    @pytest.mark.parametrize(
+        ("schedule", "message"),
+        [
+            ({"active_hours_utc": [24]}, "less than or equal to 23"),
+            ({"active_hours_utc": [-1]}, "greater than or equal to 0"),
+            ({"active_days": [7]}, "less than or equal to 6"),
+            ({"active_hours_utc": []}, "at least 1 item"),
+            ({"active_days": []}, "at least 1 item"),
+            ({"active_hours_utc": [9, 13, 9, 13, 2]}, r"active_hours_utc lists \[9, 13\] more"),
+            ({"active_days": [1, 1]}, r"active_days lists \[1\] more than once"),
+            ({"hours": [13]}, "Extra inputs are not permitted"),
+        ],
+    )
+    def test_invalid_schedules_are_refused(self, schedule: dict[str, object], message: str) -> None:
+        with pytest.raises(ValidationError, match=message):
+            self._cfg(**schedule)
+
+    def test_hours_no_primary_bar_opens_at_are_refused(self) -> None:
+        with pytest.raises(ValidationError, match=r"1d bars open only at hours \[0\] UTC"):
+            self._cfg("1d", active_hours_utc=list(range(13, 22)))
+        with pytest.raises(ValidationError, match=r"\[0, 4, 8, 12, 16, 20\]"):
+            self._cfg("4h", active_hours_utc=[13, 14, 15])
+        with pytest.raises(ValidationError, match="1w bars open on Monday"):
+            self._cfg("1w", active_days=[1, 2])
+
+    def test_schedules_a_primary_bar_can_match_are_accepted(self) -> None:
+        assert self._cfg("4h", active_hours_utc=[13, 16]).schedule is not None
+        assert self._cfg("1d", active_hours_utc=[0], active_days=[5, 6]).schedule is not None
+        assert self._cfg("15m", active_hours_utc=[13]).schedule is not None
+
+    def test_the_schedule_is_part_of_the_config_hash(self) -> None:
+        assert StrategyConfig(**_BASE).schedule is None
+        assert config_hash(StrategyConfig(**_BASE)) != config_hash(self._cfg(active_days=[0]))

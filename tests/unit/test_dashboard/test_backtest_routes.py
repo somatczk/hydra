@@ -405,6 +405,19 @@ class TestPreflightErrors:
         default = await _preflight(pool, "saw", None, start, end, require_data=False)
         assert default.timeframe == Timeframe.H4
 
+    async def test_a_schedule_no_bar_of_the_requested_timeframe_matches_is_422(
+        self, strategies_dir: Path
+    ) -> None:
+        _write_strategy(strategies_dir, "saw", schedule={"active_hours_utc": [13, 14]})
+        start, end = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 2, 1, tzinfo=UTC)
+        pf = await _preflight(object(), "saw", Timeframe.H1, start, end, require_data=False)
+        assert pf.config.schedule is not None
+        with pytest.raises(ServiceError) as exc:
+            await _preflight(object(), "saw", Timeframe.D1, start, end, require_data=False)
+        assert exc.value.status_code == 422
+        assert exc.value.detail["code"] == "invalid_strategy"
+        assert "1d bars open only at hours [0] UTC" in exc.value.detail["message"]
+
 
 # ---------------------------------------------------------------------------
 # Status / results

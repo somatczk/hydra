@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from prometheus_client import REGISTRY
 
 from hydra.core.config import HydraConfig
 from hydra.core.event_bus import InMemoryEventBus
@@ -16,7 +18,7 @@ from hydra.core.events import BarEvent, EntrySignal, Event, ExitSignal
 from hydra.core.types import OHLCV, Symbol, Timeframe
 from hydra.data.bars import timeframe_seconds
 from hydra.strategy.base import BaseStrategy
-from hydra.strategy.config import StrategyConfig
+from hydra.strategy.config import ScheduleConfig, StrategyConfig
 from hydra.strategy.context import StrategyContext
 from hydra.strategy.engine import StrategyEngine, validate_strategy_config, write_strategy_config
 
@@ -365,6 +367,61 @@ class TestClosedBarRouting:
 # ---------------------------------------------------------------------------
 # validate_strategy_config / write_strategy_config (P2-E2)
 # ---------------------------------------------------------------------------
+
+
+class EntryAndExitStrategy(BaseStrategy):
+    """Signals one entry and one exit on every bar."""
+
+    @property
+    def required_history(self) -> int:
+        return 1
+
+    async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
+        return [
+            EntrySignal(symbol=bar.symbol, strategy_id=self.strategy_id),
+            ExitSignal(symbol=bar.symbol, strategy_id=self.strategy_id),
+        ]
+
+
+class TestSchedule:
+    async def test_off_schedule_entries_are_dropped_counted_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sid = "sched-engine"
+        cfg = _recording_cfg(sid).model_copy(
+            update={"schedule": ScheduleConfig(active_hours_utc=[_T0.hour + 1])}
+        )
+        bus = InMemoryEventBus()
+        engine = StrategyEngine(config=HydraConfig(), event_bus=bus, context=StrategyContext())
+        await engine.load_strategy_from_config(cfg, cls=EntryAndExitStrategy)
+        await engine.start()
+        published: list[Event] = []
+
+        async def record(event: Event) -> None:
+            published.append(event)
+
+        await bus.subscribe("entry_signal", record)
+        await bus.subscribe("exit_signal", record)
+        counted = {"strategy_id": sid}
+        before = REGISTRY.get_sample_value("hydra_entries_off_schedule_total", counted) or 0.0
+
+        with caplog.at_level(logging.DEBUG, logger="hydra.strategy.engine"):
+            for i in range(3):
+                await bus.publish(_closed(Timeframe.H1, i))
+
+        # only the bar opened at _T0 + 1h is in the schedule; every exit passes
+        assert [e.event_type for e in published] == [
+            "exit_signal",
+            "entry_signal",
+            "exit_signal",
+            "exit_signal",
+        ]
+        after = REGISTRY.get_sample_value("hydra_entries_off_schedule_total", counted)
+        assert after == before + 2
+        skipped = [r.getMessage() for r in caplog.records if "outside its schedule" in r.message]
+        assert len(skipped) == 2
+        assert _T0.isoformat() in skipped[0]
+
 
 _VALID_RULE_BASED: dict[str, object] = {
     "id": "v1",

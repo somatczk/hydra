@@ -286,6 +286,7 @@ class TestConfigReload:
                 ),
                 "parameters.rules",
             ),
+            (lambda d: d.__setitem__("schedule", {"active_hours_utc": [13]}), "schedule"),
         ],
         ids=[
             "symbols",
@@ -294,6 +295,7 @@ class TestConfigReload:
             "risk",
             "position_sizing",
             "rules",
+            "schedule",
         ],
     )
     async def test_reload_refused_for_non_parameter_changes(

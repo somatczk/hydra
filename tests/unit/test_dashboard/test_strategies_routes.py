@@ -1221,6 +1221,81 @@ class TestUniverseWriteGate:
         assert yaml_file.read_bytes() == before
 
 
+_SCHEDULE = {"active_hours_utc": [13, 14, 15], "active_days": [0, 1, 2, 3, 4]}
+
+
+def _scheduled_yaml(strategy_id: str, strategy_class: str = "") -> str:
+    data = yaml.safe_load(_rule_based_yaml(strategy_id))
+    if strategy_class:
+        data["strategy_class"] = strategy_class
+    return yaml.safe_dump({**data, "schedule": _SCHEDULE})
+
+
+class TestScheduleRoundTrip:
+    def test_get_returns_the_stored_schedule(self, tmp_path: Path) -> None:
+        (tmp_path / "s.yaml").write_text(_scheduled_yaml("sched_1"))
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            assert client.get("/api/strategies/sched_1").json()["schedule"] == _SCHEDULE
+
+    def test_get_returns_it_for_a_non_rule_based_strategy_too(self, tmp_path: Path) -> None:
+        momentum = "hydra.strategy.builtin.momentum.MomentumRSIMACDStrategy"
+        (tmp_path / "s.yaml").write_text(_scheduled_yaml("sched_m", momentum))
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            data = client.get("/api/strategies/sched_m").json()
+        assert data["editable"] is False
+        assert data["schedule"] == _SCHEDULE
+
+    def test_get_without_a_schedule_is_none(self, tmp_path: Path) -> None:
+        (tmp_path / "s.yaml").write_text(_rule_based_yaml("plain_1"))
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=None))
+            assert client.get("/api/strategies/plain_1").json()["schedule"] is None
+
+    def test_save_writes_the_schedule(self, tmp_path: Path) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post("/api/strategies/save", json={**_save_body(), "schedule": _SCHEDULE})
+        assert resp.status_code == 201
+        (written,) = tmp_path.glob("*.yaml")
+        assert yaml.safe_load(written.read_text())["schedule"] == _SCHEDULE
+
+    def test_an_update_without_a_schedule_keeps_the_stored_one(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "s.yaml"
+        yaml_file.write_text(_scheduled_yaml("sched_1"))
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.put("/api/strategies/sched_1", json=_save_body())
+        assert resp.status_code == 200
+        assert yaml.safe_load(yaml_file.read_text())["schedule"] == _SCHEDULE
+
+    def test_an_update_replaces_or_clears_the_schedule(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "s.yaml"
+        yaml_file.write_text(_scheduled_yaml("sched_1"))
+        nights = {"active_hours_utc": [0, 1, 2]}
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            client.put("/api/strategies/sched_1", json={**_save_body(), "schedule": nights})
+            assert yaml.safe_load(yaml_file.read_text())["schedule"] == nights
+            client.put("/api/strategies/sched_1", json={**_save_body(), "schedule": {}})
+        assert "schedule" not in yaml.safe_load(yaml_file.read_text())
+
+    def test_an_invalid_schedule_is_422_and_writes_nothing(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "s.yaml"
+        yaml_file.write_text(_scheduled_yaml("sched_1"))
+        before = yaml_file.read_bytes()
+        bad = {"active_hours_utc": [13, 13], "active_days": [7]}
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.put("/api/strategies/sched_1", json={**_save_body(), "schedule": bad})
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert "active_hours_utc lists [13] more than once" in detail
+        assert "active_days.0" in detail
+        assert yaml_file.read_bytes() == before
+
+
 def test_shipped_strategy_and_template_symbols_stay_savable() -> None:
     """No shipped config may be stranded by the write gate: every committed strategy
     and template symbol (all BTCUSDT — rank 1 in the offline ranking) still saves."""
