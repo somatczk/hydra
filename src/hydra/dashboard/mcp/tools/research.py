@@ -220,10 +220,15 @@ async def walkforward_run(
     """Queue a walk-forward validation on stored bars (in-sample optimisation,
     out-of-sample verification per fold).
 
-    ``max_trials`` is per fold; the stored range must fit one in-sample plus
-    out-of-sample window per fold or the call fails 422 ``range_too_short`` with the
-    stored coverage. Returns ``{"task_id", "status": "queued"}``; read
-    ``walkforward_results`` once completed.
+    ``fold_count`` is the number of out-of-sample folds you get back: the range is
+    split into one in-sample window plus ``fold_count`` out-of-sample windows, with the
+    in-sample window ``train_pct / (1 - train_pct)`` times an out-of-sample one
+    (rolling windows step by the out-of-sample length; anchored ones train from the
+    first bar). Every window must span at least 30 days or the call fails 422
+    ``range_too_short`` with the stored coverage and about how many days the folds need
+    (2 folds at 0.75 need ~150 days, 6 folds ~270). ``max_trials`` is per fold.
+    Returns ``{"task_id", "status": "queued"}``; read ``walkforward_results`` once
+    completed.
     ``model_version_id`` (a ``model_list`` id, any stage) serves that registry
     version in place of its name's Production version for this job only — evaluate
     a Staging version before anyone promotes it; sessions never take a pin.

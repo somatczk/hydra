@@ -1,12 +1,20 @@
-"""Unit pins for the research service: the walk-forward submit fast-fail predicate."""
+"""Unit pins for the research service: the walk-forward submit fast-fail predicate and 422."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from hydra.backtest.jobs import WalkForwardRunRequest
+import pytest
+import yaml
+
+from hydra.backtest.jobs import Preflight, WalkForwardRunRequest
 from hydra.core.types import Timeframe
+from hydra.services import research
+from hydra.services.errors import ServiceError
 from hydra.services.research import _span_covers
+from hydra.strategy.builtin.rule_based import RuleBasedStrategy
+from hydra.strategy.config import StrategyConfig
 
 
 def _wfo_body(
@@ -26,7 +34,7 @@ def _wfo_body(
 
 
 class TestSpanCovers:
-    """A covered span may fast-fail at submit only when it is also dense: ``window_fits``
+    """A covered span may fast-fail at submit only when it is also dense: ``fold_windows``
     sizes the windows from the stored ``bar_count``, so a sparse interior could still be
     filled in by a fetch and change that sizing — the worker owns that answer.
     """
@@ -45,3 +53,122 @@ class TestSpanCovers:
     def test_a_span_short_of_the_request_never_covers(self) -> None:
         stored = (datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 6, 30, tzinfo=UTC), 200)
         assert _span_covers(stored, _wfo_body(), Timeframe.D1) is False
+
+
+_SMA_RULES = {
+    "entry_long": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "close",
+                "params": {},
+                "comparator": "crosses_above",
+                "value": "sma:period=5",
+                "value_ref_overrides": {"sma_period": "period"},
+            }
+        ],
+    }
+}
+
+
+class TestSubmitRangeTooShort:
+    """The submit-time 422 on a covered, dense span uses the worker's own window sizing."""
+
+    @staticmethod
+    def _stub(monkeypatch: pytest.MonkeyPatch, days: int) -> list[str]:
+        first = datetime(2024, 1, 1, tzinfo=UTC)
+        stored = (first, first + timedelta(days=days), days + 1)
+        config = StrategyConfig(
+            id="saw_d",
+            name="Saw",
+            strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+            symbols=["BTCUSDT"],
+            timeframes={"primary": "1d"},
+            parameters={"rules": _SMA_RULES, "sma_period": 5},
+        )
+        queued: list[str] = []
+
+        async def preflight(*_args: object, **_kwargs: object) -> Preflight:
+            return Preflight(
+                RuleBasedStrategy, config, "binance", "BTCUSDT", Timeframe.D1, None, stored
+            )
+
+        async def enqueue(_pool: object, kind: str, *_args: object) -> str:
+            queued.append(kind)
+            return "wf-1"
+
+        monkeypatch.setattr(
+            research, "_load_backtest_strategy", lambda _sid: (RuleBasedStrategy, config)
+        )
+        monkeypatch.setattr(research, "_preflight", preflight)
+        monkeypatch.setattr(research.jobs, "enqueue", enqueue)
+        return queued
+
+    async def test_too_short_for_the_folds_is_the_422_naming_the_days_needed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queued = self._stub(monkeypatch, days=149)
+        body = _wfo_body(start="2024-01-01", end="2024-05-29")
+        with pytest.raises(ServiceError) as exc:
+            await research.submit_walkforward(None, body)
+        detail = exc.value.detail
+        assert isinstance(detail, dict)
+        assert detail["code"] == "range_too_short"
+        assert detail["message"].startswith("range too short for 2 folds: stored bars span ")
+        assert "need about 150 days" in detail["message"]
+        assert queued == []
+
+    async def test_a_span_that_fits_the_folds_is_queued(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queued = self._stub(monkeypatch, days=155)
+        body = _wfo_body(start="2024-01-01", end="2024-06-04")
+        assert await research.submit_walkforward(None, body) == {
+            "task_id": "wf-1",
+            "status": "queued",
+        }
+        assert queued == ["walkforward"]
+
+
+def test_strategy_params_seed_from_the_stored_top_level_values(strategies_dir: Path) -> None:
+    """A hand-written YAML whose top-level values differ from its conditions': the defaults
+    (and the heuristic range) follow the top-level values, which are what the strategy runs."""
+    rules = {
+        "entry_long": {
+            "operator": "AND",
+            "conditions": [
+                {
+                    "indicator": "close",
+                    "params": {},
+                    "comparator": "crosses_above",
+                    "value": "sma:period=50",
+                    "value_ref_overrides": {"sma_period": "period"},
+                },
+                {
+                    "indicator": "rsi",
+                    "params": {"period": 14},
+                    "comparator": "less_than",
+                    "value": 30,
+                    "param_key": "rsi_len",
+                    "value_param_key": "rsi_low",
+                },
+            ],
+        }
+    }
+    config = {
+        "id": "drift",
+        "name": "Drift",
+        "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        "symbols": ["BTCUSDT"],
+        "parameters": {"rules": rules, "sma_period": 120, "rsi_low": 20, "rsi_len": True},
+    }
+    (strategies_dir / "drift.yaml").write_text(yaml.safe_dump(config))
+
+    params = {p["name"]: p for p in research.get_strategy_params("drift")}
+    assert params["sma_period"]["default"] == 120.0
+    assert (params["sma_period"]["min"], params["sma_period"]["max"]) == (2.0, 200.0)
+    # a threshold's heuristic range is centred on the stored value: 25 % to 3x of 20
+    assert (params["rsi_low"]["default"], params["rsi_low"]["min"]) == (20.0, 5)
+    assert params["rsi_low"]["max"] == 60
+    # a non-numeric stored value falls back to the condition's own
+    assert params["rsi_len"]["default"] == 14.0

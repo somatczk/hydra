@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from hydra.backtest import jobs
-from hydra.backtest.hyperopt import ParamDef, ParameterSpace, unknown_param_names
+from hydra.backtest.hyperopt import ParamDef, ParameterSpace, param_space_problems
 from hydra.backtest.jobs import (
     HyperoptRunRequest,
     ParamDefRequest,
     WalkForwardRunRequest,
-    walkforward_months,
-    window_fits,
 )
+from hydra.backtest.walkforward import MIN_WINDOW_DAYS, fold_windows
 from hydra.core.types import Timeframe
 from hydra.data.bars import ceil_to_tf, floor_to_tf, timeframe_seconds
 from hydra.services import strategies as strategy_files
@@ -75,16 +75,26 @@ def _suggest_range(param_name: str, default: float, param_type: str) -> tuple[fl
     return lo, hi, step
 
 
-def _extract_optimizable_params(rules_dict: dict[str, Any]) -> list[dict[str, Any]]:
-    """One entry per name ``bindable_params`` lists, ranged from its first site's value."""
+def _extract_optimizable_params(
+    rules_dict: dict[str, Any], top: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """One entry per name ``bindable_params`` lists, ranged around its value: the stored
+    top-level parameter when there is one (it is what the strategy runs), else its first
+    site's value."""
     params: list[dict[str, Any]] = []
     for name, sites in bindable_params(RuleSet.model_validate(rules_dict)).items():
         site = sites[0]
-        default = float(site.default)
+        stored = (top or {}).get(name)
+        value = (
+            stored
+            if isinstance(stored, int | float) and not isinstance(stored, bool)
+            else site.default
+        )
+        default = float(value)
         lo: float
         hi: float
         if site.target == "value":
-            ptype = _infer_type(site.default)
+            ptype = _infer_type(value)
             lo = max(0, round(default * 0.25))
             hi = round(default * 3) if default > 0 else 100
             step = max(1.0, round((hi - lo) / 20, 2))
@@ -118,7 +128,7 @@ def get_strategy_params(strategy_id: str) -> list[dict[str, Any]]:
     if not rules_dict:
         return []
     try:
-        return _extract_optimizable_params(rules_dict)
+        return _extract_optimizable_params(rules_dict, parameters)
     except ValueError as exc:
         raise _invalid_strategy(strategy_id, str(exc)) from exc
 
@@ -230,19 +240,17 @@ def _validated_space(defs: list[ParamDefRequest]) -> ParameterSpace:
 def _check_param_names(
     space: ParameterSpace, config: StrategyConfig, strategy_class: type[BaseStrategy]
 ) -> None:
-    """Reject names the strategy cannot read, before anything is queued."""
+    """Reject names the strategy cannot read, before anything is queued.
+
+    A rule-based name that matches conditions holding different values by name binds
+    nothing; the 422 names it with its sites instead of calling it unread.
+    """
     try:
-        unknown = unknown_param_names(space, config, strategy_class)
+        problems = param_space_problems(space, config, strategy_class)
     except ValueError as exc:
         raise _invalid_strategy(config.id, str(exc)) from exc
-    if unknown:
-        raise service_error(
-            422,
-            "invalid_param_space",
-            f"param_space names the strategy never reads: {', '.join(unknown)} "
-            "(strategy_params lists the names a rule-based strategy binds)",
-            "invalid",
-        )
+    if problems:
+        raise service_error(422, "invalid_param_space", "; ".join(problems), "invalid")
 
 
 async def submit_hyperopt(
@@ -402,7 +410,7 @@ def _span_covers(
 ) -> bool:
     """True when no fetch could change the window sizing: the stored span covers the
     requested grid's ends AND its bar count saturates that span's grid. A covered span
-    with a sparse interior still defers — ``window_fits`` sizes from the bar count, and
+    with a sparse interior still defers — ``fold_windows`` sizes from the bar count, and
     the worker fetches the gaps first, then sizes from the real bars."""
     first, last, bar_count = stored
     if first > ceil_to_tf(body.start_date, timeframe) or last < floor_to_tf(
@@ -438,14 +446,16 @@ async def submit_walkforward(
     )
     if pf.stored is not None and _span_covers(pf.stored, body, pf.timeframe):
         first, last, bar_count = pf.stored
-        in_sample, out_of_sample = walkforward_months(first, last, body.fold_count, body.train_pct)
-        if not window_fits(first, last, bar_count, in_sample, out_of_sample):
+        k, ratio = body.fold_count, body.train_pct / (1 - body.train_pct)
+        if fold_windows(bar_count, (last - first).days, k, body.train_pct) is None:
+            needed = math.ceil(MIN_WINDOW_DAYS * (k + ratio) * max(1.0, 1 / ratio))
             raise service_error(
                 422,
                 "range_too_short",
-                f"range too short for {body.fold_count} folds: stored bars span "
-                f"{first.isoformat()} to {last.isoformat()}, one window needs "
-                f"{in_sample + out_of_sample} months",
+                f"range too short for {k} folds: stored bars span {first.isoformat()} to "
+                f"{last.isoformat()}; {k} out-of-sample windows and one in-sample window at "
+                f"train_pct {body.train_pct} of at least {MIN_WINDOW_DAYS} days each need "
+                f"about {needed} days",
                 "invalid",
                 available_first_ts=first.isoformat(),
                 available_last_ts=last.isoformat(),

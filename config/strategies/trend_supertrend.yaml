@@ -72,7 +72,7 @@ parameters:
           comparator: greater_than
           value: 65
           param_key: rsi_period
-  required_history: 200
+  required_history: 602
   description: Trend-following strategy using EMA(50)/EMA(200) crossover with RSI momentum filter. Confirms trend direction on 4H.
 position_sizing:
   method: fixed_fractional

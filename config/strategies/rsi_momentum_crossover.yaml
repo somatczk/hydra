@@ -51,7 +51,7 @@ parameters:
           value: 30
           param_key: rsi_period
           value_param_key: rsi_oversold
-  required_history: 50
+  required_history: 86
   description: >-
     RSI crossover strategy on 4H timeframe. Research shows Sharpe 5.13,
     60% win rate, -5.2% max drawdown. Enters long on RSI recovering above 30,

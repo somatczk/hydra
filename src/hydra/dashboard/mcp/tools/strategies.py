@@ -45,6 +45,7 @@ def _save_request(
     ml_overlay: dict[str, Any] | None,
     schedule: dict[str, Any] | None,
     parameters: dict[str, int | float] | None,
+    leverage: int,
 ) -> SaveRequest:
     """The service's save payload, built from the tool's mirrored fields."""
     return SaveRequest(
@@ -59,6 +60,7 @@ def _save_request(
         ml_overlay=ml_overlay,
         schedule=schedule,
         parameters=parameters,
+        leverage=leverage,
     )
 
 
@@ -94,6 +96,7 @@ async def strategy_save(
     ml_overlay: dict[str, Any] | None = None,
     schedule: dict[str, Any] | None = None,
     parameters: dict[str, int | float] | None = None,
+    leverage: int = 1,
 ) -> str:
     """Validate and save a new strategy as a YAML config file; returns its new id.
 
@@ -106,6 +109,8 @@ async def strategy_save(
     must be a member of the current top-100 universe (``universe_list``): a
     non-member is a 422 ``symbol_not_in_universe`` naming the ranking's
     ``ranked_at`` (running sessions and stored strategies are unaffected).
+    ``leverage`` (1-3, isolated margin) applies to ``binanceusdm`` perp strategies
+    only; any other venue with ``leverage != 1`` is a 422.
     """
     try:
         body = _save_request(
@@ -120,6 +125,7 @@ async def strategy_save(
             ml_overlay,
             schedule,
             parameters,
+            leverage,
         )
         result = await strategy_svc.save_strategy(_deps.db_pool(), body)
     except ServiceError as exc:
@@ -144,6 +150,7 @@ async def strategy_update(
     ml_overlay: dict[str, Any] | None = None,
     schedule: dict[str, Any] | None = None,
     parameters: dict[str, int | float] | None = None,
+    leverage: int = 1,
 ) -> str:
     """Update an existing rule-based strategy's YAML config; only rule-based strategies
     can be edited (400 otherwise). Omitting ``schedule`` keeps the stored one; ``{}``
@@ -151,7 +158,9 @@ async def strategy_update(
     bind; a dict replaces them (``{}`` clears) and may only name bound parameters.
     ``symbol`` must be a member of the current top-100 universe (``universe_list``): a
     non-member is a 422 ``symbol_not_in_universe`` naming the ranking's ``ranked_at`` (the
-    running sessions and the stored file are unaffected)."""
+    running sessions and the stored file are unaffected). ``leverage`` (1-3) applies to
+    ``binanceusdm`` perp strategies only; like every other field it is replaced, so an
+    update that omits it writes 1x."""
     try:
         body = _save_request(
             name,
@@ -165,6 +174,7 @@ async def strategy_update(
             ml_overlay,
             schedule,
             parameters,
+            leverage,
         )
         result = await strategy_svc.update_strategy(_deps.db_pool(), strategy_id, body)
     except ServiceError as exc:

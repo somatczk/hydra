@@ -88,16 +88,18 @@ async def test_donchian_breakout_fires_on_a_new_60_bar_high() -> None:
 
 async def test_momentum_extremes_enters_on_a_20_bar_max() -> None:
     cfg = _load(CONFIG / "strategies" / "research_momentum_extremes.yaml")
-    closes = [100.0 - 0.5 * i for i in range(30)] + [110.0, 105.0]
-    assert await _entry_bars(cfg, closes) == [30]
+    # 50 bars of history (its required_history), then the breakout
+    closes = [100.0 - 0.5 * i for i in range(50)] + [110.0, 105.0]
+    assert await _entry_bars(cfg, closes) == [50]
 
 
 async def test_bollinger_templates_trade_the_bands() -> None:
-    calm = [100.0 + (i % 2) for i in range(60)]
+    # 90 calm bars cover the RSI(14) template's 86 bars of required history
+    calm = [100.0 + (i % 2) for i in range(90)]
     breakout = _load(CONFIG / "templates" / "breakout_volume.yaml")
-    assert await _entry_bars(breakout, [*calm, 110.0, 111.0]) == [60]
+    assert await _entry_bars(breakout, [*calm, 110.0, 111.0]) == [90]
     bounce = _load(CONFIG / "templates" / "mean_reversion_bb.yaml")
-    assert await _entry_bars(bounce, [*calm, 90.0]) == [60]
+    assert await _entry_bars(bounce, [*calm, 90.0]) == [90]
 
 
 async def test_sma_crossover_tunes_each_leg_separately() -> None:

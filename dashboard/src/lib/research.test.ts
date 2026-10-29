@@ -260,6 +260,12 @@ describe('fetchLine', () => {
     );
   });
 
+  it('says the job waits while another worker fetches the same dataset', () => {
+    expect(fetchLine({ state: 'waiting', ranges: [], bars_fetched: 0, weight_spent: 0, elapsed_ms: 2 })).toBe(
+      "Waiting for another worker's fetch of these bars to finish",
+    );
+  });
+
   it('names the failure reason, including a failure before any progress (state and reason only)', () => {
     expect(fetchLine({ state: 'failed', reason: 'rate_limited' })).toBe('Fetching missing bars failed (rate_limited) after 0 bars');
     expect(fetchLine(null)).toBeNull();

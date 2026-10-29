@@ -41,7 +41,7 @@ from hydra.backtest.validation import (
 )
 from hydra.core.types import OHLCV, Timeframe
 from hydra.strategy.base import BaseStrategy
-from hydra.strategy.builtin.rule_based import RuleBasedStrategy, bindable_params
+from hydra.strategy.builtin.rule_based import RuleBasedStrategy, bindable_params, param_bindings
 from hydra.strategy.condition_schema import RuleSet
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
@@ -167,6 +167,37 @@ def unknown_param_names(
     else:
         readable = set(base_config.parameters)
     return sorted({p.name for p in param_space.params if p.name not in readable})
+
+
+def param_space_problems(
+    param_space: ParameterSpace, base_config: StrategyConfig, strategy_class: type[BaseStrategy]
+) -> list[str]:
+    """Why the strategy cannot read each ``unknown_param_names`` name; empty when all bind.
+
+    A rule-based name matching conditions that hold different values (``param_bindings``)
+    is named with its sites; any other unread name is listed once. Raises ValueError for
+    rules that fail to bind.
+    """
+    unknown = unknown_param_names(param_space, base_config, strategy_class)
+    sites = (
+        param_bindings(RuleSet.model_validate(base_config.parameters.get("rules") or {}))
+        if unknown and issubclass(strategy_class, RuleBasedStrategy)
+        else {}
+    )
+    problems = [
+        f"param_space name {name!r} matches conditions with different values by name "
+        f"({', '.join(map(str, sites[name]))}), so it binds nothing; bind the one it is "
+        "meant for with param_overrides or value_ref_overrides"
+        for name in unknown
+        if name in sites
+    ]
+    unread = [name for name in unknown if name not in sites]
+    if unread:
+        problems.append(
+            f"param_space names the strategy never reads: {', '.join(unread)} "
+            "(strategy_params lists the names a rule-based strategy binds)"
+        )
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -393,14 +424,9 @@ class HyperoptRunner:
         if not bars:
             return HyperoptResult()
 
-        unknown = unknown_param_names(param_space, base_config, strategy_class)
-        if unknown:
-            msg = (
-                "param_space names the strategy never reads: "
-                f"{', '.join(unknown)}; optimisable names are a coded strategy's declared "
-                "parameters or the names a rule-based strategy's conditions bind"
-            )
-            raise ValueError(msg)
+        problems = param_space_problems(param_space, base_config, strategy_class)
+        if problems:
+            raise ValueError("; ".join(problems))
 
         if method == "bayesian":
             return await self._run_bayesian(

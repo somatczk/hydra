@@ -1,13 +1,15 @@
 """Walk-forward optimisation.
 
-Per fold: optimise on the in-sample window with the caller's parameter space, freeze
-the best parameters, then run them out-of-sample warmed up with ``required_history``
-in-sample bars (the warm-up bars only seed the context: no on_bar, no orders, no
-equity points). The out-of-sample equity curves are stitched with their timestamps
-and aggregated; the result carries the probabilistic Sharpe of the stitched curve and
-the OOS/IS efficiency. Rolling (default) and anchored (IS always starts at bar 0)
-windows are supported. A fold in which no parameter set trades in-sample fails the
-whole run with an error naming the fold.
+``fold_count`` is the number of out-of-sample folds: ``fold_windows`` sizes one
+in-sample and one out-of-sample window in bars so the in-sample window plus
+``fold_count`` out-of-sample windows tile the whole range. Per fold: optimise on the
+in-sample window with the caller's parameter space, freeze the best parameters, then run
+them out-of-sample warmed up with ``required_history`` in-sample bars (the warm-up bars
+only seed the context: no on_bar, no orders, no equity points). The out-of-sample
+equity curves are stitched with their timestamps and aggregated; the result carries the
+probabilistic Sharpe of the stitched curve and the OOS/IS efficiency. Rolling (default)
+and anchored (IS always starts at bar 0) windows are supported. A fold in which no
+parameter set trades in-sample fails the whole run with an error naming the fold.
 """
 
 from __future__ import annotations
@@ -112,15 +114,29 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def window_bar_counts(
-    bar_count: int, total_days: int, in_sample_months: int, out_of_sample_months: int
-) -> tuple[int, int]:
-    """In-sample / out-of-sample bar counts for 30-day months at the bars' real density."""
-    bars_per_day = bar_count / total_days
-    return (
-        int(in_sample_months * 30 * bars_per_day),
-        int(out_of_sample_months * 30 * bars_per_day),
-    )
+MIN_WINDOW_DAYS = 30
+"""The shortest in-sample or out-of-sample window, in days at the bars' real density."""
+
+
+def fold_windows(
+    bar_count: int, total_days: int, fold_count: int, train_pct: float
+) -> tuple[int, int] | None:
+    """In-sample / out-of-sample bars for exactly ``fold_count`` out-of-sample folds.
+
+    The out-of-sample window O is the largest with ``I + fold_count * O <= bar_count``
+    for ``I = O * train_pct / (1 - train_pct)``; the in-sample window takes the rest,
+    ``bar_count - fold_count * O`` (that ratio plus the floor's remainder), so rolling
+    folds step by O and the last one ends on the last bar. ``None`` when the range is
+    too short: either window under ``MIN_WINDOW_DAYS`` at the bars' density over
+    ``total_days``.
+    """
+    if bar_count <= 0 or total_days <= 0:
+        return None
+    oos = int(bar_count * (1 - train_pct) / (fold_count * (1 - train_pct) + train_pct))
+    in_sample = bar_count - fold_count * oos
+    if min(in_sample, oos) * total_days < MIN_WINDOW_DAYS * bar_count:
+        return None
+    return in_sample, oos
 
 
 # ---------------------------------------------------------------------------
@@ -146,50 +162,41 @@ class WalkForwardAnalyzer:
         strategy_class: type[BaseStrategy],
         strategy_config: StrategyConfig,
         param_space: ParameterSpace,
-        in_sample_months: int = 6,
-        out_of_sample_months: int = 2,
+        fold_count: int = 6,
+        train_pct: float = 0.75,
         method: Literal["bayesian", "grid"] = "grid",
         max_trials: int = 20,
         anchored: bool = False,
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
     ) -> WalkForwardResult:
-        """Run rolling walk-forward optimisation.
+        """Run exactly ``fold_count`` walk-forward folds over ``bars``.
 
-        Slides a window forward by ``out_of_sample_months`` at each step. Each window
-        optimises on ``in_sample_months`` of training data (anchored windows always
-        train from the first bar) and runs the selected config on the following
-        ``out_of_sample_months`` of test data, warmed up from the train tail.
+        ``fold_windows`` sizes the windows; fold k optimises on the in-sample window
+        ending where its out-of-sample window starts (anchored windows always train from
+        the first bar) and runs the selected config on the out-of-sample window, warmed
+        up from the train tail. Rolling windows step by the out-of-sample length.
         ``max_trials`` caps the trials per fold (grid search is additionally capped by
-        the true combination count).
+        the true combination count). A range too short for the folds gives no folds.
         """
         empty = WalkForwardResult(anchored=anchored)
         if not bars:
             return empty
-
-        # Approximate months to bar counts using bar timestamps
-        total_days = (bars[-1].timestamp - bars[0].timestamp).days
-        if total_days <= 0:
-            return empty
-
-        is_bars, oos_bars = window_bar_counts(
-            len(bars), total_days, in_sample_months, out_of_sample_months
+        windows = fold_windows(
+            len(bars), (bars[-1].timestamp - bars[0].timestamp).days, fold_count, train_pct
         )
-        step_bars = oos_bars
-        window_bars = is_bars + oos_bars
-
-        if is_bars <= 0 or oos_bars <= 0 or window_bars > len(bars):
+        if windows is None:
             return empty
+        is_bars, oos_bars = windows
 
         hyperopt = HyperoptRunner(self._runner, commission=self._commission)
         folds: list[FoldResult] = []
-        fold_idx = 0
-        start = 0
 
-        while start + window_bars <= len(bars):
+        for fold_idx in range(fold_count):
+            start = fold_idx * oos_bars
             is_start_idx = 0 if anchored else start
             is_end = start + is_bars
-            oos_end = start + window_bars
+            oos_end = is_end + oos_bars
 
             is_data = bars[is_start_idx:is_end]
             oos_data = bars[is_end:oos_end]
@@ -240,12 +247,6 @@ class WalkForwardAnalyzer:
                     oos_end=oos_data[-1].timestamp,
                 )
             )
-
-            fold_idx += 1
-            start += step_bars
-
-        if not folds:
-            return empty
 
         # Stitch the OOS equity curves: each fold starts a fresh session at the
         # analyzer's capital, so every point — the first bar's P&L included —

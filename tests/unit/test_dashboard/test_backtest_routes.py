@@ -23,10 +23,8 @@ from hydra.backtest.jobs import (
     MAX_RESULT_SUMMARIES,
     BacktestRunRequest,
     detail_from_row,
-    walkforward_months,
-    window_fits,
 )
-from hydra.backtest.walkforward import WalkForwardAnalyzer
+from hydra.backtest.walkforward import WalkForwardAnalyzer, fold_windows
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Timeframe
 from hydra.dashboard.routes._db import install_error_handlers
@@ -394,6 +392,39 @@ class TestPreflightErrors:
         assert detail["code"] == "invalid_param_space"
         assert "sma_perod" in detail["message"]
 
+    @pytest.mark.parametrize("route", ["hyperopt", "walkforward"])
+    def test_an_ambiguous_implicit_name_is_422_naming_its_sites(
+        self, client: TestClient, strategies_dir: Path, route: str
+    ) -> None:
+        """Two SMAs of different periods: ``sma_period`` binds nothing, and the 422 says
+        why (the sites) instead of claiming the strategy never reads it."""
+
+        def sma(period: int, comparator: str) -> dict[str, Any]:
+            cond = {"indicator": "sma", "params": {"period": period}}
+            return {**cond, "comparator": comparator, "value": "close"}
+
+        rules = {
+            "entry_long": {"operator": "AND", "conditions": [sma(20, "less_than")]},
+            "exit_long": {"operator": "AND", "conditions": [sma(50, "greater_than")]},
+        }
+        _write_strategy(strategies_dir, "saw", parameters={"rules": rules, "required_history": 60})
+        space = [
+            {"name": "sma_period", "type": "int", "low": 10, "high": 60},
+            {"name": "sma_perod", "type": "int", "low": 3, "high": 8},
+        ]
+        body = _hyperopt_body if route == "hyperopt" else _walkforward_body
+        resp = client.post(f"/api/backtest/{route}", json=body(param_space=space))
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "invalid_param_space"
+        assert detail["message"] == (
+            "param_space name 'sma_period' matches conditions with different values by name "
+            "(entry_long[0].params.period=20, exit_long[0].params.period=50), so it binds "
+            "nothing; bind the one it is meant for with param_overrides or value_ref_overrides; "
+            "param_space names the strategy never reads: sma_perod (strategy_params lists the "
+            "names a rule-based strategy binds)"
+        )
+
     async def test_request_timeframe_overrides_strategy_primary(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "saw", timeframes={"primary": "4h"})
 
@@ -735,28 +766,20 @@ class _AlternatingStrategy(BaseStrategy):
         return [ExitSignal(symbol=bar.symbol, strategy_id=self.strategy_id)]
 
 
-class TestWalkForwardMonths:
-    def test_months_from_span(self) -> None:
-        first = datetime(2025, 1, 1, tzinfo=UTC)
-        last = first + timedelta(days=399)
-        assert walkforward_months(first, last, fold_count=2, train_pct=0.75) == (5, 2)
-        assert window_fits(first, last, 400, 5, 2)
+class TestWalkForwardWindows:
+    def test_windows_from_span(self) -> None:
+        # 400 daily bars over 399 days, 2 folds at 75 %: 240 IS + 2 x 80 OOS
+        assert fold_windows(400, 399, fold_count=2, train_pct=0.75) == (240, 80)
 
     def test_thirty_days_cannot_fit_a_window(self) -> None:
-        first = datetime(2025, 1, 1, tzinfo=UTC)
-        last = first + timedelta(days=30)
-        in_sample, out_of_sample = walkforward_months(first, last, fold_count=2, train_pct=0.75)
-        assert (in_sample, out_of_sample) == (1, 1)
-        assert not window_fits(first, last, 31, in_sample, out_of_sample)
+        assert fold_windows(31, 30, fold_count=2, train_pct=0.75) is None
 
     def test_weekly_bars_are_sized_at_their_real_density(self) -> None:
-        first = datetime(2025, 1, 1, tzinfo=UTC)
-        last = first + timedelta(weeks=56)
-        assert walkforward_months(first, last, fold_count=2, train_pct=0.75) == (4, 2)
-        assert window_fits(first, last, 57, 4, 2)
-        assert not window_fits(first, first + timedelta(weeks=4), 5, 1, 1)
+        # 57 weekly bars: 11 bars (77 days) per OOS fold
+        assert fold_windows(57, 392, fold_count=2, train_pct=0.75) == (35, 11)
+        assert fold_windows(5, 28, fold_count=2, train_pct=0.75) is None
 
-    async def test_weekly_walkforward_windows_match_the_reported_months(self) -> None:
+    async def test_weekly_walkforward_windows_match_the_sizing(self) -> None:
         start = datetime(2025, 1, 1, tzinfo=UTC)
         bars = [
             OHLCV(
@@ -783,15 +806,15 @@ class TestWalkForwardMonths:
             param_space=ParameterSpace(
                 params=[ParamDef(name="level", type="categorical", choices=[1])]
             ),
-            in_sample_months=4,
-            out_of_sample_months=2,
+            fold_count=2,
+            train_pct=0.75,
             timeframe=Timeframe.W1,
         )
-        # 57 bars over 392 days: 4 months = 17 weekly bars, 2 months = 8, stepping 8.
-        assert len(result.folds) == 5
+        # 57 bars: 35 IS + 2 x 11 OOS weekly bars, stepping 11.
+        assert len(result.folds) == 2
         for fold in result.folds:
-            assert len(fold.in_sample_metrics.equity_curve) == 17
-            assert len(fold.out_of_sample_metrics.equity_curve) == 8
+            assert len(fold.in_sample_metrics.equity_curve) == 35
+            assert len(fold.out_of_sample_metrics.equity_curve) == 11
             assert fold.selected_params == {"level": 1}
             assert fold.n_trials == 1
             assert fold.out_of_sample_metrics.total_trades >= 1

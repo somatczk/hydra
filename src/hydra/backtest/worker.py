@@ -51,7 +51,7 @@ from hydra.backtest.jobs import (
     import_backtest_strategy,
 )
 from hydra.backtest.runner import BacktestRunner
-from hydra.backtest.walkforward import WalkForwardAnalyzer
+from hydra.backtest.walkforward import WalkForwardAnalyzer, fold_windows
 from hydra.core.types import ExchangeId, MarketType, Timeframe
 from hydra.data.bars import timeframe_seconds
 from hydra.data.errors import DataFetchError, NoMarketDataError
@@ -364,11 +364,15 @@ async def run_walkforward_job(
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
     run.detail["provenance"] = {**jobs.provenance_payload(provenance, config), "ml_models": served}
 
-    in_sample, out_of_sample = jobs.walkforward_months(
-        provenance.first_ts, provenance.last_ts, body.fold_count, body.train_pct
+    windows = fold_windows(
+        provenance.bar_count,
+        (provenance.last_ts - provenance.first_ts).days,
+        body.fold_count,
+        body.train_pct,
     )
-    run.detail["in_sample_months"] = in_sample
-    run.detail["out_of_sample_months"] = out_of_sample
+    if windows is None:
+        raise JobError(f"range too short for {body.fold_count} folds")
+    run.detail["in_sample_bars"], run.detail["out_of_sample_bars"] = windows
 
     space = ParameterSpace(
         params=[
@@ -383,16 +387,14 @@ async def run_walkforward_job(
             strategy_class=strategy_cls,
             strategy_config=config,
             param_space=space,
-            in_sample_months=in_sample,
-            out_of_sample_months=out_of_sample,
+            fold_count=body.fold_count,
+            train_pct=body.train_pct,
             method=body.method,
             max_trials=body.max_trials,
             anchored=body.anchored,
             symbol=config.symbols[0],
             timeframe=config.timeframes.primary,
         )
-    if not result.folds:
-        raise JobError(f"range too short for {body.fold_count} folds")
     run.detail["fold_count"] = len(result.folds)
     return JobOutcome(result=result.to_dict())
 

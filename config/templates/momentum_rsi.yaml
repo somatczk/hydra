@@ -10,7 +10,7 @@ timeframes:
   primary: 1h
 parameters:
   description: Classic RSI oversold/overbought mean-reversion strategy. Buys when RSI drops below 30, sells when it rises above 70.
-  required_history: 50
+  required_history: 86
   rules:
     entry_long:
       operator: AND

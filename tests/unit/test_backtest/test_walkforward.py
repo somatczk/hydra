@@ -19,7 +19,7 @@ from hydra.backtest.hyperopt import ParamDef, ParameterSpace
 from hydra.backtest.walkforward import (
     WalkForwardAnalyzer,
     WalkForwardResult,
-    window_bar_counts,
+    fold_windows,
 )
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal
 from hydra.core.types import OHLCV, Direction, Timeframe
@@ -160,8 +160,8 @@ async def _run_sawtooth(
         strategy_class=_PhaseStrategy,
         strategy_config=_config(),
         param_space=_phase_space(0, 5),
-        in_sample_months=2,
-        out_of_sample_months=2,
+        fold_count=3,
+        train_pct=0.5,
         anchored=anchored,
         timeframe=Timeframe.D1,
     )
@@ -195,8 +195,8 @@ class TestRegimeChange:
             strategy_class=_NeedsHistoryStrategy,
             strategy_config=_config(parameters={"phase": 0}),
             param_space=_phase_space(0),
-            in_sample_months=2,
-            out_of_sample_months=2,
+            fold_count=3,
+            train_pct=0.5,
             timeframe=Timeframe.D1,
         )
         assert len(result.folds) == 3
@@ -233,8 +233,8 @@ class TestRegimeChange:
             strategy_class=_RecordingStrategy,
             strategy_config=_config(),
             param_space=_phase_space(0, 5),
-            in_sample_months=2,
-            out_of_sample_months=2,
+            fold_count=3,
+            train_pct=0.5,
             anchored=True,
             timeframe=Timeframe.D1,
         )
@@ -334,8 +334,8 @@ class TestFailureModes:
                 strategy_class=_IdleStrategy,
                 strategy_config=_config(),
                 param_space=_phase_space(0, 5),
-                in_sample_months=2,
-                out_of_sample_months=2,
+                fold_count=3,
+                train_pct=0.5,
                 timeframe=Timeframe.D1,
             )
 
@@ -348,8 +348,8 @@ class TestFailureModes:
                 param_space=ParameterSpace(
                     params=[ParamDef(name="fase", type="categorical", choices=[0, 5])]
                 ),
-                in_sample_months=2,
-                out_of_sample_months=2,
+                fold_count=3,
+                train_pct=0.5,
                 timeframe=Timeframe.D1,
             )
 
@@ -370,15 +370,89 @@ class TestFailureModes:
             strategy_class=_PhaseStrategy,
             strategy_config=_config(),
             param_space=_phase_space(0),
-            in_sample_months=2,
-            out_of_sample_months=2,
+            fold_count=3,
+            train_pct=0.5,
             timeframe=Timeframe.D1,
         )
         assert result.folds == []
 
 
-def test_window_bar_counts_at_real_density() -> None:
-    # 240 daily bars over 239 days: 2 months of IS and OOS are 60 bars each
-    assert window_bar_counts(240, 239, 2, 2) == (60, 60)
-    # weekly bars: one month is ~4.3 bars
-    assert window_bar_counts(57, 392, 4, 2) == (17, 8)
+class TestFoldCount:
+    """``fold_count`` is the number of out-of-sample folds, whatever the span or split."""
+
+    @pytest.mark.parametrize("days", [120, 365, 730, 2830])
+    @pytest.mark.parametrize("fold_count", [2, 3, 5, 6, 12, 24])
+    @pytest.mark.parametrize("train_pct", [0.5, 0.6, 0.75, 0.8, 0.9])
+    def test_the_windows_tile_the_span_with_exactly_fold_count_folds(
+        self, days: int, fold_count: int, train_pct: float
+    ) -> None:
+        for bars_per_day in (1, 24):
+            bar_count = days * bars_per_day + 1
+            windows = fold_windows(bar_count, days, fold_count, train_pct)
+            if windows is None:
+                continue
+            in_sample, oos = windows
+            assert in_sample + fold_count * oos == bar_count
+            # the in-sample window keeps the requested ratio up to the floor's remainder
+            ratio = train_pct / (1 - train_pct)
+            assert ratio * oos <= in_sample < ratio * oos + fold_count + ratio
+            assert min(in_sample, oos) * days >= 30 * bar_count
+
+    def test_93_months_at_fold_count_5_is_5_folds_not_16(self) -> None:
+        # the old month sizing gave IS 14 / OOS 5 months, stepping 5: 16 folds
+        in_sample, oos = fold_windows(2831, 2830, 5, 0.75) or (0, 0)
+        assert (in_sample, oos) == (1066, 353)
+        assert in_sample + 5 * oos == 2831
+
+    def test_under_30_days_per_window_is_too_short(self) -> None:
+        # 120 days, 6 folds at 75 %: OOS 13 days
+        assert fold_windows(121, 120, 6, 0.75) is None
+        # 31 daily bars cannot fit two folds of even one month
+        assert fold_windows(31, 30, 2, 0.75) is None
+        # a 10 % train split keeps the in-sample window >= 30 days too
+        assert fold_windows(366, 365, 2, 0.1) is None
+        assert fold_windows(0, 30, 2, 0.75) is None
+        assert fold_windows(10, 0, 2, 0.75) is None
+
+    async def test_the_analyzer_runs_exactly_fold_count_folds(
+        self, analyzer: WalkForwardAnalyzer
+    ) -> None:
+        bars = _saw_bars(400)
+        for fold_count in (2, 4, 5):
+            result = await analyzer.run_walkforward(
+                bars=bars,
+                strategy_class=_PhaseStrategy,
+                strategy_config=_config(),
+                param_space=_phase_space(0, 5),
+                fold_count=fold_count,
+                train_pct=0.6,
+                timeframe=Timeframe.D1,
+            )
+            in_sample, oos = fold_windows(400, 399, fold_count, 0.6) or (0, 0)
+            assert len(result.folds) == fold_count
+            assert result.folds[-1].oos_end == bars[-1].timestamp
+            for k, fold in enumerate(result.folds):
+                assert fold.is_start == bars[k * oos].timestamp
+                assert fold.oos_start == bars[k * oos + in_sample].timestamp
+                assert len(fold.out_of_sample_metrics.equity_curve) == oos
+
+    async def test_anchored_runs_the_same_oos_windows_from_bar_0(
+        self, analyzer: WalkForwardAnalyzer
+    ) -> None:
+        bars = _saw_bars(400)
+        kwargs: dict[str, Any] = {
+            "bars": bars,
+            "strategy_class": _PhaseStrategy,
+            "strategy_config": _config(),
+            "param_space": _phase_space(0, 5),
+            "fold_count": 4,
+            "train_pct": 0.6,
+            "timeframe": Timeframe.D1,
+        }
+        rolling = await analyzer.run_walkforward(**kwargs)
+        anchored = await analyzer.run_walkforward(**kwargs, anchored=True)
+        assert len(anchored.folds) == 4
+        for roll, anch in zip(rolling.folds, anchored.folds, strict=True):
+            assert anch.is_start == bars[0].timestamp
+            assert (anch.oos_start, anch.oos_end) == (roll.oos_start, roll.oos_end)
+            assert anch.is_end == roll.is_end

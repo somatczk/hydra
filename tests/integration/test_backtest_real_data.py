@@ -568,7 +568,6 @@ async def test_walkforward_uses_the_real_span(
     await _drain(pool)
     task_id = resp.json()["task_id"]
     result = (await client.get(f"/api/backtest/walkforward/{task_id}/results")).json()
-    assert len(result["folds"]) >= 1
     assert result["provenance"]["bar_count"] == D1_COUNT
     assert result["provenance"]["first_ts"] == _iso(daily[0].timestamp)
     assert result["provenance"]["last_ts"] == _iso(daily[-1].timestamp)
@@ -580,9 +579,10 @@ async def test_walkforward_uses_the_real_span(
         raw_detail = await conn.fetchval("SELECT detail FROM backtest_jobs WHERE id = $1", task_id)
     assert raw_detail is not None
     detail = json.loads(raw_detail)
-    assert (detail["in_sample_months"], detail["out_of_sample_months"]) == (5, 2)
-    # 400 daily bars over 399 days: 150 IS + 60 OOS bars per window, stepping 60 bars.
-    assert len(result["folds"]) == 4
+    assert (detail["in_sample_bars"], detail["out_of_sample_bars"]) == (240, 80)
+    # fold_count is the OOS fold count: 400 daily bars = 240 IS + 2 x 80 OOS, stepping 80
+    assert len(result["folds"]) == 2
+    assert result["folds"][-1]["oos_end"] == _z(daily[-1].timestamp)
     for fold in result["folds"]:
         # every fold re-optimised in-sample and froze one of the two configs
         assert fold["selected_params"] in ({"sma_period": 4}, {"sma_period": 5})
@@ -609,6 +609,7 @@ async def test_walkforward_uses_the_real_span(
     assert short.status_code == 422
     assert short.json()["detail"]["code"] == "range_too_short"
     assert "range too short for 2 folds" in short.json()["detail"]["message"]
+    assert "about 150 days" in short.json()["detail"]["message"]
 
 
 async def test_walkforward_fast_fail_fires_only_when_the_stored_span_covers_the_request(
@@ -657,7 +658,7 @@ async def test_walkforward_fast_fail_fires_only_when_the_stored_span_covers_the_
     await _drain(pool)
     async with _client_on(pool, config=HydraConfig()) as client:
         result = (await client.get(f"/api/backtest/walkforward/{task_id}/results")).json()
-    assert len(result["folds"]) == 4
+    assert len(result["folds"]) == 2
     assert result["provenance"]["bar_count"] == D1_COUNT
 
 
@@ -724,15 +725,14 @@ async def test_walkforward_sparse_interior_span_defers_to_the_worker(
     async with pool.acquire() as conn:
         raw_detail = await conn.fetchval("SELECT detail FROM backtest_jobs WHERE id = $1", task_id)
     detail = json.loads(raw_detail)
-    assert (detail["in_sample_months"], detail["out_of_sample_months"]) == (4, 1)
+    assert (detail["in_sample_bars"], detail["out_of_sample_bars"]) == (220, 73)
 
     async with _client_on(pool, config=HydraConfig()) as client:
         result = (await client.get(f"/api/backtest/walkforward/{task_id}/results")).json()
     assert result["provenance"]["bar_count"] == 366
     assert result["provenance"]["gap_count"] == 0
-    # honest sizing from the dense 366-bar span: 120 IS + 30 OOS bars per window,
-    # stepping 30 bars -> 8 folds
-    assert len(result["folds"]) == 8
+    # honest sizing from the dense 366-bar span: 220 IS + 2 x 73 OOS bars -> 2 folds
+    assert len(result["folds"]) == 2
     for fold in result["folds"]:
         assert fold["in_sample_trades"] > 0
         assert fold["out_of_sample_trades"] > 0

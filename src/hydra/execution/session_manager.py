@@ -75,6 +75,7 @@ from hydra.risk.state import (
     RiskStateStore,
     RiskStateUnavailableError,
 )
+from hydra.strategy.condition_schema import RuleSet
 from hydra.strategy.config import StrategyConfig, config_hash, load_strategy_config
 from hydra.strategy.engine import validate_strategy_config
 
@@ -115,9 +116,15 @@ def _non_parameter_changes(old: StrategyConfig, new: StrategyConfig) -> list[str
     a = old.model_dump(mode="json", exclude={"enabled", "name", "parameters"})
     b = new.model_dump(mode="json", exclude={"enabled", "name", "parameters"})
     changed = sorted(k for k in a if a[k] != b[k])
-    if (old.parameters.get("rules") or None) != (new.parameters.get("rules") or None):
+    if _parsed_rules(old) != _parsed_rules(new):
         changed.append("parameters.rules")
     return changed
+
+
+def _parsed_rules(cfg: StrategyConfig) -> dict[str, Any]:
+    """The rule trees as the strategy parses them: an absent field and an explicit null (a
+    builder re-save writes ``param_overrides: null``) are the same rule."""
+    return RuleSet.model_validate(cfg.parameters.get("rules") or {}).model_dump(mode="json")
 
 
 async def _close_client_quietly(client: Any) -> None:

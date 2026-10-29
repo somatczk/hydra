@@ -17,7 +17,11 @@ from hydra.core.types import Direction, Symbol
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.condition_schema import ConditionGroup, RuleSet
 from hydra.strategy.context import indicator_params, resolve_indicator
-from hydra.strategy.rule_engine import evaluate_condition_group, parse_indicator_ref
+from hydra.strategy.rule_engine import (
+    evaluate_condition_group,
+    parse_indicator_ref,
+    rules_required_history,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +120,10 @@ class RuleBasedStrategy(BaseStrategy):
         self._apply_param_overrides()
         self._validate_indicators()
         self._validate_required_history()
+        # a parameter that lengthens a declared window (a hyperopt trial) warms up by as much
+        self._override_headroom = max(
+            0, rules_required_history(self._rules) - rules_required_history(self._parse_rules())
+        )
 
     def _parse_rules(self) -> RuleSet:
         """Parse the ``rules`` dict from strategy parameters into a RuleSet."""
@@ -197,7 +205,10 @@ class RuleBasedStrategy(BaseStrategy):
 
     @property
     def required_history(self) -> int:
-        return self._config.parameters.get("required_history", 50)
+        """The declared ``parameters.required_history`` (any value: the explicit override),
+        plus the lookback that parameter overrides add beyond the declared rules."""
+        declared: int = self._config.parameters.get("required_history", 50)
+        return declared + self._override_headroom
 
     async def on_bar(self, bar: BarEvent) -> list[EntrySignal | ExitSignal]:
         signals: list[EntrySignal | ExitSignal] = []

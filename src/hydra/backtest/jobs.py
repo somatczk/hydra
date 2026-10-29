@@ -11,7 +11,6 @@ import hashlib
 import importlib
 import json
 import logging
-import math
 import re
 import uuid
 from dataclasses import dataclass, replace
@@ -27,7 +26,6 @@ from hydra.backtest.data import (
     load_bars,
 )
 from hydra.backtest.metrics import BacktestResult, Trade
-from hydra.backtest.walkforward import window_bar_counts
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
 from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
 from hydra.data.storage import MarketDataRepository
@@ -131,6 +129,7 @@ class WalkForwardRunRequest(_DateRange):
     method: Literal["bayesian", "grid"] = "grid"
     max_trials: int = Field(default=20, ge=1, le=200)  # per fold
     anchored: bool = False
+    # the number of out-of-sample folds (``walkforward.fold_windows`` sizes them)
     fold_count: int = Field(default=6, ge=2, le=24)
     train_pct: float = Field(default=0.75, gt=0.0, lt=1.0)
     timeframe: Timeframe | None = None
@@ -825,30 +824,3 @@ async def requeue_for_shutdown(pool: Any, job_id: str, worker_id: str) -> None:
             job_id,
             worker_id,
         )
-
-
-# ---------------------------------------------------------------------------
-# Walk-forward window sizing from the real span
-# ---------------------------------------------------------------------------
-
-_DAYS_PER_MONTH = 30.44
-
-
-def walkforward_months(
-    first: datetime, last: datetime, fold_count: int, train_pct: float
-) -> tuple[int, int]:
-    """In-sample / out-of-sample months per window, derived from the real data span."""
-    total_months = max(1, math.floor((last - first).days / _DAYS_PER_MONTH))
-    in_sample = max(1, round(total_months * train_pct / fold_count))
-    out_of_sample = max(1, round(total_months * (1 - train_pct) / fold_count))
-    return in_sample, out_of_sample
-
-
-def window_fits(
-    first: datetime, last: datetime, bar_count: int, in_sample: int, out_of_sample: int
-) -> bool:
-    days = (last - first).days
-    if days <= 0:
-        return False
-    is_bars, oos_bars = window_bar_counts(bar_count, days, in_sample, out_of_sample)
-    return is_bars > 0 and oos_bars > 0 and is_bars + oos_bars <= bar_count

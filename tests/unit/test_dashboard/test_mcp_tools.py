@@ -1043,6 +1043,52 @@ def test_strategy_tunables_save_get_and_survive_an_update_that_omits_them(
     assert yaml.safe_load(path.read_text())["parameters"]["sma_period"] == 8
 
 
+def test_strategy_save_and_update_write_a_perps_leverage(
+    mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    perp = {"name": "Perp", "rules": _RULES, "exchange_id": "binanceusdm"}
+    is_error, text = mcp.call("strategy_save", {**perp, "leverage": 3})
+    assert not is_error, text
+    sid = json.loads(text)["id"]
+    path = strategies_dir / f"{sid}.yaml"
+    assert yaml.safe_load(path.read_text())["exchange"] == {
+        "exchange_id": "binanceusdm",
+        "market_type": "FUTURES",
+        "leverage": 3,
+        "margin_mode": "isolated",
+    }
+
+    is_error, text = mcp.call("strategy_update", {"strategy_id": sid, **perp, "leverage": 2})
+    assert not is_error, text
+    assert yaml.safe_load(path.read_text())["exchange"]["leverage"] == 2
+    is_error, text = mcp.call("strategy_get", {"strategy_id": sid})
+    assert not is_error
+    assert json.loads(text)["leverage"] == 2
+
+
+def test_strategy_save_refuses_leverage_on_spot_and_past_3x(
+    mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
+    is_error, text = mcp.call("strategy_save", {"name": "Spot", "rules": _RULES, "leverage": 2})
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool strategy_save: "))
+    assert envelope["status"] == 422
+    assert "Leverage applies to binanceusdm (futures) strategies only, got 2x" in str(envelope)
+
+    is_error, text = mcp.call(
+        "strategy_save",
+        {"name": "Perp", "rules": _RULES, "exchange_id": "binanceusdm", "leverage": 4},
+    )
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool strategy_save: "))
+    assert envelope["status"] == 422
+    assert envelope["detail"]["code"] == "validation_error"
+    assert envelope["detail"]["message"].startswith("leverage:")
+    assert list(strategies_dir.glob("*.yaml")) == []
+
+
 def test_strategy_export_on_a_file_deleted_after_the_scan_is_the_404_envelope(
     mcp: _McpClient, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

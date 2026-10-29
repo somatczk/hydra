@@ -79,7 +79,7 @@ parameters:
           comparator: greater_than
           value: 0
           param_key: macd_fast
-  required_history: 50
+  required_history: 143
   description: >-
     Multi-indicator confirmation strategy on 4H combining RSI and MACD.
     Research: MACD combined with RSI achieves 77% win rate. Requires both

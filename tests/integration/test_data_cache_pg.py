@@ -19,6 +19,7 @@ import pytest
 from hydra.core.types import OHLCV, Timeframe
 from hydra.data.backfill import ExchangeBackfillService
 from hydra.data.migrations.runner import upgrade_to_head
+from hydra.data.on_demand import FetchReport, OnDemandFetchService
 from hydra.data.storage import (
     MarketDataRepository,
     cache_totals,
@@ -242,3 +243,88 @@ async def test_set_cache_status_flips_only_the_status(pool: Any) -> None:
     assert seeded[0].status == "fetching"
     assert seeded[0].rows == 0
     assert (seeded[0].first_ts, seeded[0].last_ts) == (T0, T0 + 9 * M)
+
+
+class _PausingExchange(FakeRestExchange):
+    """Parks the first page request until ``resume`` is set, so a peer can contend."""
+
+    def __init__(self, rows: list[list[Any]]) -> None:
+        super().__init__(rows)
+        self.paused = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def fetch_ohlcv(
+        self, symbol: str, timeframe: str, since: int | None = None, limit: int | None = None
+    ) -> list[list[Any]]:
+        if not self.paused.is_set():
+            self.paused.set()
+            await self.resume.wait()
+        return await super().fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+
+
+async def _advisory_locks(pool: Any) -> list[bool]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT granted FROM pg_locks WHERE locktype = 'advisory' AND database = "
+            "(SELECT oid FROM pg_database WHERE datname = current_database())"
+        )
+    return sorted(bool(r["granted"]) for r in rows)
+
+
+async def test_two_processes_fetch_one_dataset_once(pool: Any, fresh_database: str) -> None:
+    """Two fetch engines on two pools (two backtest workers' sessions), one dataset: the
+    second blocks on the advisory lock while the first is mid-fetch, then re-detects and
+    fetches nothing; the ledger reads ``fetching`` until the only writer is done."""
+    other = await asyncpg.create_pool(fresh_database, min_size=1, max_size=2)
+    try:
+        rows = [[_ms(T0 + i * M), 100.0, 101.0, 99.5, 100.0, 1.0] for i in range(10)]
+        exchange = _PausingExchange(rows)
+
+        async def client(_exchange_id: str) -> FakeRestExchange:
+            return exchange
+
+        later = datetime(2030, 1, 1, tzinfo=UTC)
+        worker_a = OnDemandFetchService(client, page_size=3, now=later)
+        worker_b = OnDemandFetchService(client, page_size=3, now=later)
+
+        states: list[str] = []
+
+        async def ensure(service: OnDemandFetchService, db: Any) -> FetchReport:
+            repo = MarketDataRepository.from_pool(db)
+            return await service.ensure_available(
+                repo,
+                "binance",
+                "BTCUSDT",
+                Timeframe.M1,
+                T0,
+                T0 + 9 * M,
+                on_progress=lambda p: states.append(p["state"]) if service is worker_b else None,
+            )
+
+        first = asyncio.create_task(ensure(worker_a, pool))
+        await asyncio.wait_for(exchange.paused.wait(), 10)
+        second = asyncio.create_task(ensure(worker_b, other))
+        for _ in range(200):
+            if await _advisory_locks(pool) == [False, True]:
+                break
+            await asyncio.sleep(0.05)
+        # one session holds the dataset's lock, the other waits on it
+        assert await _advisory_locks(pool) == [False, True]
+        assert (await list_cache_entries(pool))[0].status == "fetching"
+        assert states == ["waiting"]
+
+        exchange.resume.set()
+        a, b = await asyncio.wait_for(asyncio.gather(first, second), 30)
+    finally:
+        # a failed assertion must still let both fetches finish, or the pools never close
+        exchange.resume.set()
+        await other.close()
+
+    assert (a.bars_fetched, a.ranges_fetched) == (10, 1)
+    assert (b.bars_fetched, b.weight_spent, b.ranges_fetched) == (0, 0, 0)
+    assert states == ["waiting", "fetched"]
+    assert len(exchange.calls) == 4
+    entry = (await list_cache_entries(pool))[0]
+    assert (entry.status, entry.rows) == ("ready", 10)
+    assert set((await _sources(pool)).values()) == {"auto"}
+    assert await _advisory_locks(pool) == []

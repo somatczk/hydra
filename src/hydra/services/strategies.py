@@ -44,6 +44,7 @@ from hydra.services.errors import (
 from hydra.strategy.builtin.rule_based import bindable_params
 from hydra.strategy.config import StrategyRiskConfig, config_hash
 from hydra.strategy.engine import validate_strategy_config, write_strategy_config
+from hydra.strategy.rule_engine import rules_required_history
 
 logger = logging.getLogger(__name__)
 
@@ -735,7 +736,8 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
 
     The symbol must be a member of the current top-100 universe (422
     ``symbol_not_in_universe`` otherwise); running sessions and the stored file
-    are never retro-invalidated.
+    are never retro-invalidated. ``required_history`` is re-derived from the new
+    rules (``rules_required_history``); a larger stored value is kept.
     """
     path = find_strategy_file(strategy_id)
     if path is None:
@@ -747,6 +749,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
 
     try:
         rule_set = _validate_rules(body.rules)
+        derived_history = rules_required_history(rule_set)
     except (ValueError, KeyError) as exc:
         raise ServiceError(422, f"Invalid rules: {exc}") from exc
 
@@ -759,7 +762,10 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
     await universe.validate_symbol(pool, body.symbol)
 
     existing_enabled = data.get("enabled", False)
-    existing_required_history = data.get("parameters", {}).get("required_history", 50)
+    # a larger hand-set (YAML-imported) value survives a builder edit
+    stored_history = data.get("parameters", {}).get("required_history")
+    if isinstance(stored_history, int):
+        derived_history = max(derived_history, stored_history)
 
     config_dict: dict[str, Any] = {
         "id": strategy_id,
@@ -771,7 +777,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
         "timeframes": {"primary": body.timeframes.primary},
         "parameters": {
             "rules": rule_set.model_dump(mode="json"),
-            "required_history": existing_required_history,
+            "required_history": derived_history,
             "description": body.description,
             **_tunables(rule_set, body.parameters, data.get("parameters")),
         },
@@ -785,7 +791,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
 
     if body.ml_overlay:
         config_dict["ml_overlay"] = body.ml_overlay
-    # the builder never sends a schedule: keep the stored one rather than silently drop it
+    # a caller that omits the schedule (MCP, an older client) keeps the stored one; {} clears it
     schedule = data.get("schedule") if body.schedule is None else body.schedule
     if schedule:
         config_dict["schedule"] = schedule
@@ -1033,10 +1039,12 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
 
     The symbol must be a member of the current top-100 universe (422
     ``symbol_not_in_universe`` otherwise); nothing already stored or running
-    is ever retro-invalidated.
+    is ever retro-invalidated. ``required_history`` is derived from the rules
+    (``rules_required_history``); a YAML import keeps any explicit value.
     """
     try:
         rule_set = _validate_rules(request.rules)
+        required_history = rules_required_history(rule_set)
     except (ValueError, KeyError) as exc:
         raise ServiceError(422, f"Invalid rules: {exc}") from exc
 
@@ -1062,7 +1070,7 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
         "timeframes": {"primary": request.timeframes.primary},
         "parameters": {
             "rules": rule_set.model_dump(mode="json"),
-            "required_history": 50,
+            "required_history": required_history,
             "description": request.description,
             **_tunables(rule_set, request.parameters, None),
         },
