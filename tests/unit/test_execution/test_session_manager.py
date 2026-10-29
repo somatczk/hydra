@@ -339,6 +339,28 @@ class TestConfigReload:
         result2 = await h.mgr.reload_config(sid)
         assert result2.session_id == session.session_id
 
+    async def test_a_builder_re_save_of_the_same_rules_is_not_a_rule_change(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """The builder writes every condition field (``param_overrides: null``) and every
+        group; the same rules in that shape plus a new parameter still reload."""
+        assert h.mgr is not None
+        sid = write_strategy(strategies_dir, "reload-resave")
+        session = await h.session(sid)
+        path = strategies_dir / f"{sid}.yaml"
+
+        data = yaml.safe_load(path.read_text())
+        rules = data["parameters"]["rules"]
+        for group in rules.values():
+            for cond in group["conditions"] if group else []:
+                cond.update(param_overrides=None, value_ref_overrides=None, param_key=None)
+        data["parameters"]["rules"] = dict(reversed(rules.items()))
+        data["parameters"]["rsi_threshold"] = 5
+        path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+        result = await h.mgr.reload_config(sid)
+        assert result.session_id == session.session_id
+
     async def test_reload_unknown_strategy_is_not_running(self, h: Harness) -> None:
         assert h.mgr is not None
         with pytest.raises(SessionNotRunningError):
