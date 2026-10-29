@@ -122,6 +122,61 @@ class TestRegister:
         )
         assert v1.training_job_id == "task-abc12345"
 
+    async def test_a_rerun_registering_the_same_training_job_serves_its_version(
+        self, pool: Any, artifact: Path
+    ) -> None:
+        """One training job, one version: a re-run's register is idempotent.
+
+        The requeue story: a worker that died between the register commit and
+        the terminal jobs.finish write re-runs the job; the re-run must serve
+        the committed version, never register a second one.
+        """
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO backtest_jobs (id, kind, request, strategy_config) "
+                "VALUES ($1, 'ml_train', '{}', '{}')",
+                "task-abc12345",
+            )
+        registry = ModelRegistry(pool)
+        v1 = await registry.register(_registration(artifact, training_job_id="task-abc12345"))
+
+        rerun = await registry.register(_registration(artifact, training_job_id="task-abc12345"))
+
+        assert rerun.id == v1.id  # the SAME version, never a second one
+        assert rerun.version == 1
+        assert [v.version for v in await registry.list("alpha")] == [1]  # count unchanged
+
+    async def test_uploads_without_a_training_job_id_still_register_versions(
+        self, pool: Any, artifact: Path
+    ) -> None:
+        """The upload path is outside the one-version-per-job index: distinct versions."""
+        registry = ModelRegistry(pool)
+        assert (await registry.register(_registration(artifact))).version == 1
+        assert (await registry.register(_registration(artifact))).version == 2
+        assert [v.version for v in await registry.list("alpha")] == [1, 2]
+
+    async def test_the_training_job_discard_drops_only_the_staging_version(
+        self, pool: Any, artifact: Path
+    ) -> None:
+        """A cancelled job's half-claimed Staging version goes; a promoted one stays."""
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO backtest_jobs (id, kind, request, strategy_config) "
+                "VALUES ($1, 'ml_train', '{}', '{}')",
+                "task-abc12345",
+            )
+        registry = ModelRegistry(pool)
+        v1 = await registry.register(_registration(artifact, training_job_id="task-abc12345"))
+        assert await registry.discard_training_job_version("task-abc12345") == v1
+        assert await registry.list("alpha") == []
+        assert await registry.discard_training_job_version("task-abc12345") is None
+
+        # a version a human promoted is not the job's to discard
+        v2 = await registry.register(_registration(artifact, training_job_id="task-abc12345"))
+        await registry.promote("alpha", v2.version)
+        assert await registry.discard_training_job_version("task-abc12345") is None
+        assert (await registry.get_production("alpha")) is not None
+
     async def test_sha256_mismatch_is_refused_and_stores_nothing(
         self, pool: Any, artifact: Path
     ) -> None:

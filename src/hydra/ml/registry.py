@@ -62,6 +62,30 @@ _GET_VERSION_SQL = """
     FROM ml_models WHERE name = $1 AND version = $2
 """
 
+_GET_BY_ID_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE id = $1
+"""
+
+_GET_BY_TRAINING_JOB_SQL = """
+    SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
+           artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+           archived_at
+    FROM ml_models WHERE training_job_id = $1
+"""
+
+_DISCARD_TRAINING_JOB_SQL = """
+    DELETE FROM ml_models WHERE training_job_id = $1 AND stage = 'staging'
+    RETURNING id, name, version, stage, model_type, metrics, feature_spec, drift,
+              artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
+              archived_at
+"""
+
+TRAINING_JOB_UNIQUE_INDEX = "ml_models_training_job_id_key"
+"""The 0013 partial unique index: one registered version per training job."""
+
 _GET_PRODUCTION_SQL = """
     SELECT id, name, version, stage, model_type, metrics, feature_spec, drift,
            artifact_file, artifact_sha256, trained_at, created_by, training_job_id,
@@ -202,7 +226,11 @@ class ModelRegistry:
         """Insert the next immutable version of ``name``; refuse an artifact hash mismatch.
 
         The version is assigned atomically (max + 1 per name); a concurrent
-        duplicate loses on the ``UNIQUE (name, version)`` constraint.
+        duplicate loses on the ``UNIQUE (name, version)`` constraint. The one
+        idempotent case is a training job's re-run: a register whose
+        ``training_job_id`` already has a version (the 0013 partial unique
+        index) returns that committed version instead of raising, so the
+        requeue story holds — one training job, one registered version.
         """
         actual = _sha256_file(entry.artifact_path)
         if actual != entry.artifact_sha256:
@@ -230,6 +258,21 @@ class ModelRegistry:
                     entry.training_job_id,
                 )
             except asyncpg.UniqueViolationError as exc:
+                if (
+                    entry.training_job_id is not None
+                    and exc.constraint_name == TRAINING_JOB_UNIQUE_INDEX
+                ):
+                    existing = await conn.fetchrow(_GET_BY_TRAINING_JOB_SQL, entry.training_job_id)
+                    if existing is not None:
+                        version = _row_to_version(existing)
+                        logger.info(
+                            "ml model already registered for this training job; "
+                            "serving the committed version",
+                            name=version.name,
+                            version=version.version,
+                            training_job_id=entry.training_job_id,
+                        )
+                        return version
                 msg = f"model '{entry.name}' already has the next version; retry the register"
                 raise ModelRegistryError(msg) from exc
         if row is None:
@@ -262,6 +305,38 @@ class ModelRegistry:
             else:
                 row = await conn.fetchrow(_GET_VERSION_SQL, name, version)
         return None if row is None else _row_to_version(row)
+
+    async def get_by_id(self, model_id: uuid.UUID) -> ModelVersion | None:
+        """One version by its registry id — the identity the HTTP surface addresses."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_GET_BY_ID_SQL, model_id)
+        return None if row is None else _row_to_version(row)
+
+    async def get_by_training_job(self, training_job_id: str) -> ModelVersion | None:
+        """The version a training job registered; None when it registered none."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_GET_BY_TRAINING_JOB_SQL, training_job_id)
+        return None if row is None else _row_to_version(row)
+
+    async def discard_training_job_version(self, training_job_id: str) -> ModelVersion | None:
+        """Drop the job's half-claimed Staging version; the deleted row, or None.
+
+        A cancelled or timed-out job leaves no lingering Staging version. A
+        version a human already promoted or archived is not the job's to
+        discard, so it stays.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_DISCARD_TRAINING_JOB_SQL, training_job_id)
+        if row is None:
+            return None
+        version = _row_to_version(row)
+        logger.info(
+            "ml model version discarded with its job",
+            name=version.name,
+            version=version.version,
+            training_job_id=training_job_id,
+        )
+        return version
 
     async def get_production(self, name: str) -> ModelVersion | None:
         """The version currently in Production for the name; None when there is none."""

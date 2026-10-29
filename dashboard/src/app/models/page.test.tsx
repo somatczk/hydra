@@ -1,6 +1,6 @@
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount, routeFetch, type Mounted } from '@/test/pageHarness';
+import { mount, routeFetch, flush, type Mounted } from '@/test/pageHarness';
 
 const fetchApi = vi.fn();
 const toast = vi.fn();
@@ -110,5 +110,36 @@ describe('ModelsPage banner', () => {
     expect(page.container.querySelector('[role="note"]')?.textContent).toBe(
       "Models aren't used for trading until a later release. Promoting a model here has no effect on sessions.",
     );
+  });
+});
+
+describe('ModelsPage registry table', () => {
+  it('renders the Last Trained column from the served trained_at', async () => {
+    fetchApi.mockImplementation(
+      routeFetch(
+        {
+          '/api/models': [
+            {
+              id: '00000000-0000-0000-0000-000000000001',
+              name: 'alpha',
+              version: '1',
+              stage: 'Staging',
+              metrics: { accuracy: null, precision: null },
+              drift: null,
+              drift_status: 'unknown',
+              trained_at: '2026-10-28T12:00:00+00:00',
+              file_size: 2048,
+              file_name: 'abc123.onnx',
+            },
+          ],
+        },
+        [],
+      ),
+    );
+    page = await mount(<ModelsPage />);
+    await flush();
+
+    expect(page.container.textContent).toContain('Last Trained');
+    expect(page.container.textContent).toContain('2026-10-28T12:00:00+00:00');
   });
 });

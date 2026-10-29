@@ -46,7 +46,7 @@ interface ApiModel {
   metrics: { accuracy: number | null; precision: number | null };
   drift: number | null;
   drift_status: string;
-  last_trained: string;
+  trained_at: string;
   file_size: number;
   file_name: string;
 }
@@ -90,7 +90,7 @@ function mapApiModels(data: ApiModel[]): Model[] {
     precision: m.metrics.precision != null ? `${m.metrics.precision}%` : 'N/A',
     drift: m.drift != null ? m.drift.toFixed(2) : 'N/A',
     driftStatus: driftToStatus(m.drift_status),
-    lastTrained: m.last_trained,
+    lastTrained: m.trained_at,
     fileSize: fmtFileSize(m.file_size ?? 0),
   }));
 }

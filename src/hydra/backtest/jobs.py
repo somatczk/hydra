@@ -14,7 +14,7 @@ import logging
 import math
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from importlib.metadata import version
@@ -31,6 +31,7 @@ from hydra.backtest.walkforward import window_bar_counts
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
 from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
 from hydra.data.storage import MarketDataRepository
+from hydra.ml.features import DEFAULT_FEATURE_SPEC, FeatureSpec
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 
@@ -125,6 +126,67 @@ class WalkForwardRunRequest(_DateRange):
     train_pct: float = Field(default=0.75, gt=0.0, lt=1.0)
     timeframe: Timeframe | None = None
     initial_capital: float = Field(default=10000.0, gt=0)
+
+
+# ---------------------------------------------------------------------------
+# The ml_train job
+# ---------------------------------------------------------------------------
+
+SAFE_MODEL_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+"""A registry name: plain identifier characters only, never a path component."""
+
+MAX_TRAIN_HORIZON = 168
+MAX_TRAIN_WINDOW_1H = 20_000
+MAX_TRAIN_WINDOW_4H = 5_000
+MAX_TRAIN_WINDOW_1D = 3_650
+"""The request bounds that keep an ml_train job finite: the dataset cannot exceed
+the three window sums and each fetch read is additionally capped by
+``data.fetch_max_bars`` (on top of the queue's 6 h timeout)."""
+
+
+class MlTrainRunRequest(BaseModel):
+    """What one ml_train job trains on: the symbol's stored bars, one bounded spec.
+
+    The feature set itself is pinned by ``DEFAULT_FEATURE_SPEC`` (training and
+    serving share it); the request only picks the horizon and the per-timeframe
+    window lengths, each bounded above so the job can never run unbounded.
+    """
+
+    name: str
+    strategy_id: str
+    symbol: str
+    timeframe: Timeframe | None = None
+    horizon: int = Field(default=DEFAULT_FEATURE_SPEC.horizon, ge=1, le=MAX_TRAIN_HORIZON)
+    window_1h: int = Field(default=DEFAULT_FEATURE_SPEC.window_1h, ge=1, le=MAX_TRAIN_WINDOW_1H)
+    window_4h: int = Field(default=DEFAULT_FEATURE_SPEC.window_4h, ge=1, le=MAX_TRAIN_WINDOW_4H)
+    window_1d: int = Field(default=DEFAULT_FEATURE_SPEC.window_1d, ge=1, le=MAX_TRAIN_WINDOW_1D)
+
+    @field_validator("name")
+    @classmethod
+    def _plain_name(cls, value: str) -> str:
+        if not SAFE_MODEL_NAME.match(value) or ".." in value:
+            msg = "name must be a plain identifier (letters, digits, '.', '_', '-')"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("timeframe")
+    @classmethod
+    def _primary_grid(cls, value: Timeframe | None) -> Timeframe | None:
+        if value is not None and value is not Timeframe.H1:
+            msg = "ml_train runs on the 1h grid, the pinned feature spec's primary timeframe"
+            raise ValueError(msg)
+        return value
+
+
+def ml_feature_spec(body: MlTrainRunRequest) -> FeatureSpec:
+    """The pinned spec with the request's horizon and windows; names and version never vary."""
+    return replace(
+        DEFAULT_FEATURE_SPEC,
+        horizon=body.horizon,
+        window_1h=body.window_1h,
+        window_4h=body.window_4h,
+        window_1d=body.window_1d,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -541,10 +603,15 @@ def detail_from_row(row: Any, trade_rows: list[Any]) -> dict[str, Any]:
 # The durable job queue
 # ---------------------------------------------------------------------------
 
-JobKind = Literal["backtest", "hyperopt", "walkforward"]
+JobKind = Literal["backtest", "hyperopt", "walkforward", "ml_train"]
 TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
-_ID_PREFIX: dict[JobKind, str] = {"backtest": "task", "hyperopt": "ho", "walkforward": "wf"}
+_ID_PREFIX: dict[JobKind, str] = {
+    "backtest": "task",
+    "hyperopt": "ho",
+    "walkforward": "wf",
+    "ml_train": "ml",
+}
 
 
 class JobOutcome(NamedTuple):
