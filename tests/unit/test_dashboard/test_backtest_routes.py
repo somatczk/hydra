@@ -392,6 +392,39 @@ class TestPreflightErrors:
         assert detail["code"] == "invalid_param_space"
         assert "sma_perod" in detail["message"]
 
+    @pytest.mark.parametrize("route", ["hyperopt", "walkforward"])
+    def test_an_ambiguous_implicit_name_is_422_naming_its_sites(
+        self, client: TestClient, strategies_dir: Path, route: str
+    ) -> None:
+        """Two SMAs of different periods: ``sma_period`` binds nothing, and the 422 says
+        why (the sites) instead of claiming the strategy never reads it."""
+
+        def sma(period: int, comparator: str) -> dict[str, Any]:
+            cond = {"indicator": "sma", "params": {"period": period}}
+            return {**cond, "comparator": comparator, "value": "close"}
+
+        rules = {
+            "entry_long": {"operator": "AND", "conditions": [sma(20, "less_than")]},
+            "exit_long": {"operator": "AND", "conditions": [sma(50, "greater_than")]},
+        }
+        _write_strategy(strategies_dir, "saw", parameters={"rules": rules, "required_history": 60})
+        space = [
+            {"name": "sma_period", "type": "int", "low": 10, "high": 60},
+            {"name": "sma_perod", "type": "int", "low": 3, "high": 8},
+        ]
+        body = _hyperopt_body if route == "hyperopt" else _walkforward_body
+        resp = client.post(f"/api/backtest/{route}", json=body(param_space=space))
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "invalid_param_space"
+        assert detail["message"] == (
+            "param_space name 'sma_period' matches conditions with different values by name "
+            "(entry_long[0].params.period=20, exit_long[0].params.period=50), so it binds "
+            "nothing; bind the one it is meant for with param_overrides or value_ref_overrides; "
+            "param_space names the strategy never reads: sma_perod (strategy_params lists the "
+            "names a rule-based strategy binds)"
+        )
+
     async def test_request_timeframe_overrides_strategy_primary(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "saw", timeframes={"primary": "4h"})
 

@@ -28,7 +28,7 @@ from hydra.services.backtest import (
 )
 from hydra.services.errors import ServiceError, db_errors, service_error
 from hydra.strategy.base import BaseStrategy
-from hydra.strategy.builtin.rule_based import bindable_params
+from hydra.strategy.builtin.rule_based import RuleBasedStrategy, bindable_params, param_bindings
 from hydra.strategy.condition_schema import RuleSet
 from hydra.strategy.config import StrategyConfig
 
@@ -230,19 +230,35 @@ def _validated_space(defs: list[ParamDefRequest]) -> ParameterSpace:
 def _check_param_names(
     space: ParameterSpace, config: StrategyConfig, strategy_class: type[BaseStrategy]
 ) -> None:
-    """Reject names the strategy cannot read, before anything is queued."""
+    """Reject names the strategy cannot read, before anything is queued.
+
+    A rule-based name that matches conditions holding different values by name binds
+    nothing; the 422 names it with its sites instead of calling it unread.
+    """
     try:
         unknown = unknown_param_names(space, config, strategy_class)
+        sites = (
+            param_bindings(RuleSet.model_validate(config.parameters.get("rules") or {}))
+            if unknown and issubclass(strategy_class, RuleBasedStrategy)
+            else {}
+        )
     except ValueError as exc:
         raise _invalid_strategy(config.id, str(exc)) from exc
-    if unknown:
-        raise service_error(
-            422,
-            "invalid_param_space",
-            f"param_space names the strategy never reads: {', '.join(unknown)} "
-            "(strategy_params lists the names a rule-based strategy binds)",
-            "invalid",
+    problems = [
+        f"param_space name {name!r} matches conditions with different values by name "
+        f"({', '.join(map(str, sites[name]))}), so it binds nothing; bind the one it is "
+        "meant for with param_overrides or value_ref_overrides"
+        for name in unknown
+        if name in sites
+    ]
+    unread = [name for name in unknown if name not in sites]
+    if unread:
+        problems.append(
+            f"param_space names the strategy never reads: {', '.join(unread)} "
+            "(strategy_params lists the names a rule-based strategy binds)"
         )
+    if problems:
+        raise service_error(422, "invalid_param_space", "; ".join(problems), "invalid")
 
 
 async def submit_hyperopt(
