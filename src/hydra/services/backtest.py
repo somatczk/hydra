@@ -78,6 +78,8 @@ class JobListEntry(BaseModel):
     total_trials: int | None = None
     # the worker's auto-fetch progress (state, ranges, bars_fetched, weight_spent, elapsed_ms)
     fetch: dict[str, Any] | None = None
+    # the worker holding (or last holding) the job's lease
+    worker_id: str | None = None
 
 
 class DataProvenanceModel(BaseModel):
@@ -424,6 +426,7 @@ async def list_jobs(
             "error": row["error"],
             "result_id": row["result_id"],
             "fetch": detail.get("fetch"),
+            "worker_id": row["worker_id"],
         }
         if row["kind"] == "hyperopt":
             entry["completed_trials"] = detail.get("completed_trials", 0)
@@ -544,7 +547,7 @@ _SHARED_TOKENS: dict[str, str] = {}  # token → result_id
 
 
 async def share_result(pool: Any, result_id: str) -> dict[str, str]:
-    """Generate a public sharing token for a backtest result."""
+    """Mint an in-memory sharing token for a backtest result (it does not bypass auth)."""
     pool = require_pool(pool)
     async with db_errors("checking the backtest result"), pool.acquire() as conn:
         exists = await conn.fetchval("SELECT 1 FROM backtest_results WHERE id = $1", result_id)
@@ -557,7 +560,8 @@ async def share_result(pool: Any, result_id: str) -> dict[str, str]:
 
 
 async def get_shared_result(pool: Any, token: str) -> dict[str, Any]:
-    """Public read-only access to a shared backtest result (no auth required)."""
+    """Read-only access to a shared backtest result: behind API auth like every route, the
+    in-memory token only names the result (a restart ends every token)."""
     result_id = _SHARED_TOKENS.get(token)
     if result_id is None:
         raise ServiceError(404, "Shared link not found or expired")

@@ -1043,6 +1043,7 @@ JOB_LIST_FIELDS = {
     "completed_trials",
     "total_trials",
     "fetch",
+    "worker_id",
 }
 
 
@@ -1086,6 +1087,7 @@ def _jobs_row(**overrides: Any) -> dict[str, Any]:
         "detail": "{}",
         "created_at": datetime(2026, 10, 25, 12, tzinfo=UTC),
         "finished_at": None,
+        "worker_id": None,
     }
     row.update(overrides)
     return row
@@ -1148,6 +1150,7 @@ class TestJobListRoute:
             "completed_trials": None,
             "total_trials": None,
             "fetch": None,
+            "worker_id": None,
         }
         hyperopt = body[2]
         assert hyperopt["completed_trials"] == 37
@@ -1168,13 +1171,17 @@ class TestJobListRoute:
             [
                 _jobs_row(id="wf-1", kind="walkforward", detail=json.dumps({"fetch": fetch})),
                 _jobs_row(
-                    id="task-1", detail='{"fetch": {"state": "failed", "reason": "rate_limited"}}'
+                    id="task-1",
+                    detail='{"fetch": {"state": "failed", "reason": "rate_limited"}}',
+                    worker_id="hydra-backtest-worker-2",
                 ),
             ]
         )
         body = {e["task_id"]: e for e in _jobs_client(conn).get("/api/backtest/jobs").json()}
         assert body["wf-1"]["fetch"] == fetch
         assert body["task-1"]["fetch"] == {"state": "failed", "reason": "rate_limited"}
+        assert body["task-1"]["worker_id"] == "hydra-backtest-worker-2"
+        assert body["wf-1"]["worker_id"] is None
 
     def test_kind_filter_reads_only_that_kind(self) -> None:
         conn = _JobsConn([_jobs_row(), _jobs_row(id="ho-1", kind="hyperopt")])

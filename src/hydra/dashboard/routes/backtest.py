@@ -185,11 +185,12 @@ async def get_walkforward_results(task_id: str, request: Request) -> dict[str, A
 
 @router.post("/results/{result_id}/share")
 async def share_result(result_id: str, request: Request) -> dict[str, str]:
-    """Generate a public sharing token for a backtest result."""
+    """Mint an in-memory sharing token for a backtest result (it does not bypass auth)."""
     return await svc.share_result(request_pool(request), result_id)
 
 
 @router.get("/shared/{token}")
 async def get_shared_result(token: str, request: Request) -> dict[str, Any]:
-    """Public read-only access to a shared backtest result (no auth required)."""
+    """Read-only access to a shared backtest result: behind API auth like every route, the
+    in-memory token only names the result (a restart ends every token)."""
     return await svc.get_shared_result(request_pool(request), token)
