@@ -70,6 +70,12 @@ Contract (name: type, unit / labels / producer):
 - hydra_ml_overlay_decisions_total: counter, decisions
   labels: strategy_id, model_name, decision
   producer: ml.consumers (the P5-C overlay seam)
+- hydra_ml_drift_psi: gauge, PSI
+  labels: model_name
+  producer: trader main, the startup drift task (P5-D)
+- hydra_ml_drift_nan_ratio: gauge, ratio
+  labels: model_name
+  producer: trader main, the startup drift task (P5-D)
 - hydra_feed_last_message_timestamp_seconds: gauge, unix seconds
   labels: exchange_id, symbol, timeframe
   producer: P1-B feed
@@ -356,6 +362,24 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "decisions",
         "ml.consumers (the P5-C overlay seam)",
         ("strategy_id", "model_name", "decision"),
+    ),
+    MetricSpec(
+        "hydra_ml_drift_psi",
+        "gauge",
+        "The startup drift measurement's max per-feature quantile-PSI of a "
+        "Production model's current window against its stored reference deciles",
+        "PSI",
+        "trader main, the startup drift task (P5-D)",
+        ("model_name",),
+    ),
+    MetricSpec(
+        "hydra_ml_drift_nan_ratio",
+        "gauge",
+        "The worst per-feature NaN rate of the same drift window (a fully-NaN "
+        "feature scores 1 even at PSI 0)",
+        "ratio",
+        "trader main, the startup drift task (P5-D)",
+        ("model_name",),
     ),
     MetricSpec(
         "hydra_feed_last_message_timestamp_seconds",
@@ -838,6 +862,20 @@ def record_ml_overlay_decision(strategy_id: str, model_name: str, decision: str)
     _counter("hydra_ml_overlay_decisions_total").labels(
         strategy_id=strategy_id, model_name=model_name, decision=decision
     ).inc()
+
+
+def set_ml_drift(model_name: str, psi: float, nan_ratio: float) -> None:
+    """Set one Production model's measured drift PSI and worst-feature NaN rate (P5-D).
+
+    The trader's startup drift task is the only producer; ``hydra.ml`` never
+    writes these gauges (§8).
+    """
+    if psi < 0:
+        raise ValueError(f"psi must be >= 0, got {psi}")
+    if not 0 <= nan_ratio <= 1:
+        raise ValueError(f"nan_ratio must be a fraction in [0, 1], got {nan_ratio}")
+    _gauge("hydra_ml_drift_psi").labels(model_name=model_name).set(psi)
+    _gauge("hydra_ml_drift_nan_ratio").labels(model_name=model_name).set(nan_ratio)
 
 
 # ---------------------------------------------------------------------------

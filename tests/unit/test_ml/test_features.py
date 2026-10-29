@@ -178,6 +178,53 @@ class TestFeatureSpec:
             "reference_quantiles": [[0.1, 0.2, 0.3], None],
         }
 
+    def test_from_dict_roundtrips_to_dict(self) -> None:
+        """The jsonb a registry row stores parses back into the same frozen spec."""
+        spec = FeatureSpec(
+            3,
+            2,
+            10,
+            5,
+            3,
+            ("a", "b"),
+            reference_quantiles=((0.1, 0.2, 0.3), None),
+        )
+        parsed = FeatureSpec.from_dict(spec.to_dict())
+        assert parsed == spec
+        assert parsed.reference_quantiles == ((0.1, 0.2, 0.3), None)
+        assert FeatureSpec.from_dict(DEFAULT_FEATURE_SPEC.to_dict()) == DEFAULT_FEATURE_SPEC
+
+    def test_from_dict_refuses_anything_else(self) -> None:
+        """The drift task reads the stored spec off a registry row: an absent,
+        partial or unreadable spec refuses, never falls back to a default."""
+        with pytest.raises(ValueError, match="not a stored feature spec"):
+            FeatureSpec.from_dict({})
+        with pytest.raises(ValueError, match="not a stored feature spec"):
+            FeatureSpec.from_dict({"spec_version": 3})  # every other field missing
+        with pytest.raises(ValueError, match="not a stored feature spec"):
+            FeatureSpec.from_dict(
+                {
+                    "spec_version": "three",
+                    "horizon": 2,
+                    "window_1h": 10,
+                    "window_4h": 5,
+                    "window_1d": 3,
+                    "feature_names": ["a"],
+                }
+            )
+        with pytest.raises(ValueError, match="not a stored feature spec"):
+            FeatureSpec.from_dict(
+                {
+                    "spec_version": 3,
+                    "horizon": 2,
+                    "window_1h": 10,
+                    "window_4h": 5,
+                    "window_1d": 3,
+                    "feature_names": ["a"],
+                    "reference_quantiles": "nope",
+                }
+            )
+
     def test_invalid_spec_is_refused(self) -> None:
         names = tuple(_all_feature_names())
         with pytest.raises(ValueError, match="spec_version"):

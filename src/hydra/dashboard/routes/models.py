@@ -127,6 +127,12 @@ class ModelUploadResponse(BaseModel):
     message: str
 
 
+class PromoteRequest(BaseModel):
+    """The typed confirm's audited reason; optional, never required to act."""
+
+    reason: str | None = None
+
+
 class PromoteResponse(BaseModel):
     id: str
     name: str
@@ -246,7 +252,9 @@ async def get_model(model_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.post("/{model_id}/promote", response_model=PromoteResponse)
-async def promote_model(model_id: str, request: Request) -> dict[str, Any]:
+async def promote_model(
+    model_id: str, request: Request, body: PromoteRequest | None = None
+) -> dict[str, Any]:
     """Promote a version to Production; the previous Production is archived and recorded."""
     registry = _registry(request)
     model_uuid = _model_id_or_400(model_id)
@@ -264,6 +272,7 @@ async def promote_model(model_id: str, request: Request) -> dict[str, Any]:
         model=str(promoted.id),
         name=promoted.name,
         version=promoted.version,
+        reason=body.reason if body else None,
     )
     return {
         "id": str(promoted.id),
@@ -275,7 +284,9 @@ async def promote_model(model_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.post("/{model_id}/rollback", response_model=RollbackResponse)
-async def rollback_model(model_id: str, request: Request) -> dict[str, Any]:
+async def rollback_model(
+    model_id: str, request: Request, body: PromoteRequest | None = None
+) -> dict[str, Any]:
     """Roll the model back to its most recently archived Production version."""
     registry = _registry(request)
     model_uuid = _model_id_or_400(model_id)
@@ -293,6 +304,7 @@ async def rollback_model(model_id: str, request: Request) -> dict[str, Any]:
         model=str(restored.id),
         name=restored.name,
         restored_version=restored.version,
+        reason=body.reason if body else None,
     )
     return {
         "id": str(restored.id),

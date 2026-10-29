@@ -114,13 +114,52 @@ def test_every_hydra_series_in_rules_is_in_the_contract() -> None:
 
 
 def test_rules_without_an_honest_producer_are_gone() -> None:
+    """The drift alert is the one honest ML rule; the inference-latency one stays gone."""
     rules = _rules()
     assert "HydraReconciliationMismatch" not in rules
     assert "HydraDataGapDetected" not in rules
     exprs = " ".join(r["expr"] for r in rules.values())
     assert "hydra_reconciliation_mismatch" not in exprs
     assert "HydraMLInferenceLatencyHigh" not in rules
-    assert "hydra_ml_" not in exprs
+    assert "hydra_ml_inference_latency" not in exprs
+    # P5-D: the startup drift task produces hydra_ml_drift_psi in the trader
+    assert rules["HydraMLDriftHigh"]["expr"].strip() == "hydra_ml_drift_psi > 0.2"
+    assert "hydra_ml_drift_psi" in exprs
+
+
+def test_ml_drift_alert_pins_retrainings_shared_constants() -> None:
+    """The rule's numbers are retraining.py's thresholds, and it pages for a manual retrain."""
+    from hydra.ml.retraining import PSI_ALERT_THRESHOLD, PSI_RETRAIN_THRESHOLD
+
+    alert = _rules()["HydraMLDriftHigh"]
+    match = re.fullmatch(r"hydra_ml_drift_psi\s*>\s*([\d.]+)", alert["expr"].strip())
+    assert match, alert["expr"]
+    assert float(match.group(1)) == PSI_ALERT_THRESHOLD
+    description = alert["annotations"]["description"]
+    assert str(PSI_RETRAIN_THRESHOLD) in description
+    assert str(PSI_ALERT_THRESHOLD) in description
+    # the manual-retrain cut: the alert says what to do and never claims to do it
+    assert "POST /api/models" in description
+    assert "manual by design" in description
+    assert "never triggers" in description
+    assert alert["labels"] == {"severity": "critical", "team": "trading"}
+    # startup-only: the gauge refreshes only on the next trader restart
+    assert "trader startup only" in description
+
+
+def test_ml_drift_gauge_producer_is_the_trader_not_hydra_ml() -> None:
+    """§8: trader/main.py's startup task is the drift gauges' only producer."""
+    from hydra.trader import main as trader_main
+
+    source = Path(trader_main.__file__).read_text()
+    assert "set_ml_drift(" in source
+    ml_dir = Path(__file__).resolve().parents[3] / "src" / "hydra" / "ml"
+    offenders = [
+        str(path.relative_to(ml_dir.parent))
+        for path in sorted(ml_dir.rglob("*.py"))
+        if "hydra_ml_drift" in path.read_text()
+    ]
+    assert offenders == [], f"hydra.ml must not produce the drift gauges: {offenders}"
 
 
 def test_feed_staleness_rules_compare_against_prometheus_time() -> None:

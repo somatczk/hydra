@@ -388,6 +388,30 @@ class TestDataCacheSweep:
         assert all(name in metrics.__doc__ for name in expected)
 
 
+class TestMlDrift:
+    def test_set_ml_drift_writes_both_gauges(self) -> None:
+        metrics.set_ml_drift("alpha", 0.21, 0.05)
+        assert _value("hydra_ml_drift_psi", {"model_name": "alpha"}) == 0.21
+        assert _value("hydra_ml_drift_nan_ratio", {"model_name": "alpha"}) == 0.05
+        metrics.set_ml_drift("alpha", 0.31, 0.0)
+        assert _value("hydra_ml_drift_psi", {"model_name": "alpha"}) == 0.31
+
+    def test_set_ml_drift_rejects_impossible_values(self) -> None:
+        with pytest.raises(ValueError, match="psi must be >= 0"):
+            metrics.set_ml_drift("alpha", -0.1, 0.0)
+        with pytest.raises(ValueError, match="nan_ratio must be a fraction"):
+            metrics.set_ml_drift("alpha", 0.1, 1.5)
+        assert _value("hydra_ml_drift_psi", {"model_name": "alpha"}) is None
+
+    def test_the_two_drift_families_match_the_contract(self) -> None:
+        """The P5-D families: gauges per model name, in the docstring table."""
+        expected = {"hydra_ml_drift_psi": "gauge", "hydra_ml_drift_nan_ratio": "gauge"}
+        contract = {s.name: (s.kind, s.labels) for s in metrics.CONTRACT}
+        assert {name: contract[name][0] for name in expected} == expected
+        assert all(contract[name][1] == ("model_name",) for name in expected)
+        assert all(name in metrics.__doc__ for name in expected)
+
+
 class TestReconciliation:
     def test_hard_coded_no_mismatch_exports_no_sample(self) -> None:
         metrics.update_reconciliation("binance", "BTC/USDT", mismatch=False)

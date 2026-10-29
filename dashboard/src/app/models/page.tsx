@@ -1,73 +1,110 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
-import { Brain, ArrowUpCircle, RotateCcw, Upload } from 'lucide-react';
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-  Cell,
-} from 'recharts';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowUpCircle, Brain, RotateCcw, Upload } from 'lucide-react';
 import { DataCard } from '@/components/ui/DataCard';
 import { Table } from '@/components/ui/Table';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { Button } from '@/components/ui/Button';
 import { ErrorCard } from '@/components/ui/ErrorCard';
+import { Input } from '@/components/ui/Input';
+import { Select } from '@/components/ui/Select';
+import { TypedConfirm } from '@/components/ui/TypedConfirm';
+import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { ApiError, apiHeaders, fetchApi } from '@/lib/api';
 import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { useToast } from '@/components/ui/Toast';
+import { pct, signed, utc } from '@/lib/format';
 import { logger } from '@/lib/logger';
 
-/* ---------- Types ---------- */
-
-interface Model {
-  id: string;
-  name: string;
-  version: string;
-  status: string;
-  statusVariant: 'success' | 'warning' | 'info' | 'neutral';
-  accuracy: string;
-  precision: string;
-  drift: string;
-  driftStatus: 'success' | 'warning' | 'error' | 'neutral';
-  lastTrained: string;
-  fileSize: string;
-}
+/* ---------- Types (the registry-backed routes' own shapes) ---------- */
 
 interface ApiModel {
   id: string;
   name: string;
-  version: string;
-  stage: string;
-  metrics: { accuracy: number | null; precision: number | null };
+  version: number;
+  stage: string; // Staging | Production | Archived
+  model_type: string;
+  metrics: {
+    folds?: number | null;
+    oos_accuracy?: number | null;
+    oos_base_rate?: number | null;
+    oos_mean_signed_return?: number | null;
+    [key: string]: unknown;
+  };
+  feature_spec: Record<string, unknown>;
   drift: number | null;
-  drift_status: string;
+  drift_status: 'unknown' | 'low' | 'moderate' | 'high';
+  artifact_file: string;
+  artifact_sha256: string;
   trained_at: string;
+  created_by: string;
+  training_job_id: string | null;
+  archived_at: string | null;
   file_size: number;
   file_name: string;
 }
 
+interface StrategyOption {
+  id: string;
+  name: string;
+  primary_timeframe?: string | null;
+}
+
+interface RetrainStatus {
+  task_id: string;
+  status: string; // queued | running | completed | failed | cancelled
+  progress: number;
+  error: string | null;
+  result: { name?: string; version?: number; stage?: string } | null;
+  metrics: Record<string, unknown> | null;
+  provenance: Record<string, unknown> | null;
+}
+
+type Dialog =
+  | { kind: 'promote'; model: ApiModel }
+  | { kind: 'rollback'; model: ApiModel }
+  | { kind: 'retrain'; name: string }
+  | null;
+
+const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
+/** After this many consecutive status reads the page stops polling: the error card's Retry re-arms. */
+const MAX_POLL_FAILURES = 5;
+const json = (body: unknown): RequestInit => ({ body: JSON.stringify(body) });
+
 /* ---------- Helpers ---------- */
 
-function stageToVariant(stage: string): 'success' | 'warning' | 'info' | 'neutral' {
+function stageToVariant(stage: string): 'success' | 'info' | 'neutral' {
   switch (stage) {
     case 'Production': return 'success';
     case 'Staging': return 'info';
-    case 'Training': return 'warning';
     default: return 'neutral';
   }
 }
 
-// Drift is only labelled when the backend has a measured drift value
-function driftToStatus(ds: string): 'success' | 'warning' | 'error' | 'neutral' {
+/** The drift badge's bands are the shared 0.2/0.25 thresholds the backend applies. */
+function driftToVariant(ds: ApiModel['drift_status']): 'success' | 'warning' | 'error' | 'neutral' {
   switch (ds) {
     case 'low': return 'success';
     case 'moderate': return 'warning';
     case 'high': return 'error';
+    default: return 'neutral';
+  }
+}
+
+const driftLabels: Record<ApiModel['drift_status'], string> = {
+  low: 'Low',
+  moderate: 'Moderate',
+  high: 'High',
+  unknown: 'Unknown',
+};
+
+function jobStatusVariant(status: string): 'success' | 'warning' | 'info' | 'error' | 'neutral' {
+  switch (status) {
+    case 'completed': return 'success';
+    case 'running': return 'info';
+    case 'queued': return 'info';
+    case 'failed': return 'error';
     default: return 'neutral';
   }
 }
@@ -79,53 +116,56 @@ function fmtFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function mapApiModels(data: ApiModel[]): Model[] {
-  return data.map((m) => ({
-    id: m.id,
-    name: m.name,
-    version: m.version,
-    status: m.stage,
-    statusVariant: stageToVariant(m.stage),
-    accuracy: m.metrics.accuracy != null ? `${m.metrics.accuracy}%` : 'N/A',
-    precision: m.metrics.precision != null ? `${m.metrics.precision}%` : 'N/A',
-    drift: m.drift != null ? m.drift.toFixed(2) : 'N/A',
-    driftStatus: driftToStatus(m.drift_status),
-    lastTrained: m.trained_at,
-    fileSize: fmtFileSize(m.file_size ?? 0),
-  }));
+/** An honest fraction metric as a percent, or null when the metric is absent. */
+function fraction(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-const driftLabels: Record<string, string> = {
-  success: 'Low',
-  warning: 'Moderate',
-  error: 'High',
-  neutral: 'Unknown',
-};
+function metricCell(
+  metrics: ApiModel['metrics'],
+  key: 'oos_accuracy' | 'oos_base_rate',
+): string {
+  const value = fraction(metrics[key]);
+  return pct(value == null ? null : value * 100) ?? 'N/A';
+}
+
+function signedReturnCell(metrics: ApiModel['metrics']): string {
+  const value = fraction(metrics.oos_mean_signed_return);
+  if (value == null) return 'N/A';
+  const text = signed(value * 100);
+  return text == null ? 'N/A' : `${text}%`;
+}
 
 /* ---------- Page ---------- */
 
 export default function ModelsPage() {
   const { toast } = useToast();
   useEffect(() => { logger.info('Models', 'Page mounted'); }, []);
-  const [models, setModels] = useState<Model[] | null>(null);
+  const [models, setModels] = useState<ApiModel[] | null>(null);
   const [loading, setLoading] = useState(true);
-  const [isDark, setIsDark] = useState(false);
-  const [fetchErrors, setFetchErrors] = useState<Record<string, boolean>>({});
-  const [actionLoading, setActionLoading] = useState<Record<string, string | null>>({});
+  const [fetchError, setFetchError] = useState(false);
+  const [dialog, setDialog] = useState<Dialog>(null);
+  const [dialogError, setDialogError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    setIsDark(document.documentElement.classList.contains('dark'));
-  }, []);
+  /* the retrain form */
+  const [strategies, setStrategies] = useState<StrategyOption[]>([]);
+  const [strategyId, setStrategyId] = useState('');
+  const [symbol, setSymbol] = useState('');
+
+  /* the running or finished ml_train job's status */
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [task, setTask] = useState<RetrainStatus | null>(null);
+  const [taskError, setTaskError] = useState<unknown>(null);
+  const [pollFailures, setPollFailures] = useState(0);
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    setFetchErrors({});
-
+    setFetchError(false);
     await fetchApi<ApiModel[]>('/api/models')
-      .then((data) => setModels(mapApiModels(data)))
-      .catch(() => { setFetchErrors((prev) => ({ ...prev, models: true })); })
+      .then((data) => setModels(data))
+      .catch(() => { setFetchError(true); })
       .finally(() => setLoading(false));
   }, []);
 
@@ -135,41 +175,83 @@ export default function ModelsPage() {
     return () => clearInterval(interval);
   }, [loadData]);
 
-  const handlePromote = async (model: Model) => {
-    if (!confirm(`Promote "${model.name}" ${model.version} to production?`)) return;
-    setActionLoading((prev) => ({ ...prev, [model.id]: 'promote' }));
+  useEffect(() => {
+    fetchApi<StrategyOption[]>('/api/backtest/strategies')
+      .then((data) => {
+        setStrategies(data);
+        if (data.length > 0) setStrategyId((current) => current || data[0].id);
+      })
+      .catch((err) => logger.warn('Models', 'Failed to fetch strategies', err));
+  }, []);
+
+  const pollTask = useCallback(async (id: string) => {
     try {
-      await fetchApi(`/api/models/${model.id}/promote`, { method: 'POST' });
-      toast('success', `${model.name} promoted to production`);
-      loadData();
+      const status = await fetchApi<RetrainStatus>(`/api/models/retrain/${id}`);
+      setTask(status);
+      setTaskError(null);
+      setPollFailures(0);
+      if (TERMINAL.has(status.status)) await loadData();
     } catch (err) {
-      logger.error('Models', `Failed to promote ${model.name}`, err);
-      toast('error', describeApiError(err, `Failed to promote ${model.name}`));
-    } finally {
-      setActionLoading((prev) => ({ ...prev, [model.id]: null }));
+      logger.warn('Models', 'Failed to read the retrain job', err);
+      setTaskError(err);
+      setPollFailures((n) => n + 1);
+    }
+  }, [loadData]);
+
+  useEffect(() => {
+    if (!taskId) { setTask(null); setTaskError(null); setPollFailures(0); return; }
+    setPollFailures(0);
+    void pollTask(taskId);
+  }, [taskId, pollTask]);
+
+  useEffect(() => {
+    if (!taskId || pollFailures >= MAX_POLL_FAILURES) return;
+    if (task && TERMINAL.has(task.status)) return;
+    const timer = setInterval(() => void pollTask(taskId), 2000);
+    return () => clearInterval(timer);
+  }, [taskId, task, pollFailures, pollTask]);
+
+  const closeDialog = () => { setDialog(null); setDialogError(null); };
+
+  const attempt = async (model: ApiModel, action: 'promote' | 'rollback', reason: string): Promise<void> => {
+    try {
+      await fetchApi(`/api/models/${model.id}/${action}`, { method: 'POST', ...json({ reason }) });
+      toast('success', action === 'promote'
+        ? `${model.name} v${model.version} promoted to Production`
+        : `${model.name} rolled back`);
+      closeDialog();
+      await loadData();
+    } catch (err) {
+      logger.error('Models', `Failed to ${action} ${model.name}`, err);
+      setDialogError(describeApiError(err, `Failed to ${action} ${model.name}`));
     }
   };
 
-  const handleRollback = async (model: Model) => {
-    if (!confirm(`ROLLBACK "${model.name}" ${model.version}? This will revert to the previous version.`)) return;
-    setActionLoading((prev) => ({ ...prev, [model.id]: 'rollback' }));
+  const submitRetrain = async (): Promise<void> => {
+    if (!dialog || dialog.kind !== 'retrain') return;
+    if (!strategyId || !symbol.trim()) {
+      setDialogError('Pick a strategy and a symbol to train on');
+      return;
+    }
     try {
-      await fetchApi(`/api/models/${model.id}/rollback`, { method: 'POST' });
-      toast('success', `${model.name} rolled back`);
-      loadData();
+      const queued = await fetchApi<{ task_id: string }>(`/api/models/${dialog.name}/retrain`, {
+        method: 'POST',
+        ...json({ strategy_id: strategyId, symbol: symbol.trim() }),
+      });
+      toast('success', `Retrain of ${dialog.name} queued`);
+      setSymbol('');
+      closeDialog();
+      setTaskId(queued.task_id);
     } catch (err) {
-      logger.error('Models', `Failed to rollback ${model.name}`, err);
-      toast('error', describeApiError(err, `Failed to rollback ${model.name}`));
-    } finally {
-      setActionLoading((prev) => ({ ...prev, [model.id]: null }));
+      logger.error('Models', 'Failed to queue the retrain', err);
+      setDialogError(describeApiError(err, 'Failed to queue the retrain'));
     }
   };
 
-  const postUpload = async (file: File, replace: boolean): Promise<void> => {
+  const postUpload = async (file: File): Promise<void> => {
     const formData = new FormData();
     formData.append('file', file);
-    const qs = replace ? '?replace=true' : '';
-    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/models/upload${qs}`, {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/models/upload`, {
       method: 'POST',
       body: formData,
       credentials: 'include',
@@ -183,18 +265,13 @@ export default function ModelsPage() {
     if (!file) return;
     setUploading(true);
     try {
-      try {
-        await postUpload(file, false);
-      } catch (err) {
-        if (parseErrorDetail(err)?.code !== 'model_exists') throw err;
-        if (!confirm(`A model named "${file.name}" already exists. Replace it?`)) return;
-        await postUpload(file, true);
-      }
-      toast('success', `Model "${file.name}" uploaded`);
+      await postUpload(file);
+      toast('success', `Model "${file.name}" uploaded as the next Staging version`);
       loadData();
     } catch (err) {
       logger.error('Models', 'Failed to upload model', err);
-      toast('error', describeApiError(err, 'Upload failed'));
+      const detail = parseErrorDetail(err);
+      toast('error', detail?.message ?? describeApiError(err, 'Upload failed'));
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -205,54 +282,79 @@ export default function ModelsPage() {
     {
       key: 'name',
       header: 'Model',
-      render: (row: Model) => (
+      render: (row: ApiModel) => (
         <div className="flex items-center gap-2">
           <Brain className="h-4 w-4 text-ink-2 shrink-0" aria-hidden="true" />
           <div>
             <p className="text-sm font-medium text-ink-1">{row.name}</p>
-            <p className="text-xs text-ink-2">{row.version}</p>
+            <p className="text-xs text-ink-2">v{row.version} · {fmtFileSize(row.file_size)}</p>
           </div>
         </div>
       ),
     },
     {
       key: 'status',
-      header: 'Status',
-      render: (row: Model) => (
-        <StatusBadge status={row.status} variant={row.statusVariant} size="sm" />
+      header: 'Stage',
+      render: (row: ApiModel) => (
+        <StatusBadge status={row.stage} variant={stageToVariant(row.stage)} size="sm" />
       ),
     },
-    { key: 'accuracy', header: 'Accuracy' },
-    { key: 'precision', header: 'Precision', hideOnMobile: true },
-    { key: 'fileSize', header: 'Size', hideOnMobile: true },
+    {
+      key: 'trained',
+      header: 'Trained',
+      hideOnMobile: true,
+      render: (row: ApiModel) => <span className="text-sm">{utc(row.trained_at) ?? '—'}</span>,
+    },
+    {
+      key: 'createdBy',
+      header: 'Created by',
+      hideOnMobile: true,
+      render: (row: ApiModel) => (
+        <span className="font-mono text-xs text-ink-2">{row.created_by}</span>
+      ),
+    },
+    {
+      key: 'job',
+      header: 'Job',
+      hideOnMobile: true,
+      render: (row: ApiModel) => (
+        row.training_job_id ? (
+          <button
+            type="button"
+            className="font-mono text-xs text-accent underline-offset-2 hover:underline"
+            onClick={() => setTaskId(row.training_job_id)}
+            aria-label={`Show the training job of ${row.name} v${row.version}`}
+          >
+            {row.training_job_id.slice(0, 12)}
+          </button>
+        ) : (
+          <span className="text-sm text-ink-2">{'\u2014'}</span>
+        )
+      ),
+    },
+    { key: 'accuracy', header: 'OOS Acc', numeric: true, render: (row: ApiModel) => metricCell(row.metrics, 'oos_accuracy') },
+    { key: 'baseRate', header: 'Base Rate', numeric: true, hideOnMobile: true, render: (row: ApiModel) => metricCell(row.metrics, 'oos_base_rate') },
+    { key: 'signedReturn', header: 'Signed Ret', numeric: true, hideOnMobile: true, render: (row: ApiModel) => signedReturnCell(row.metrics) },
     {
       key: 'drift',
       header: 'Drift',
-      render: (row: Model) => (
+      render: (row: ApiModel) => (
         <div className="flex items-center gap-2">
-          <span className="text-sm text-ink-1">{row.drift}</span>
-          <StatusBadge
-            status={driftLabels[row.driftStatus]}
-            variant={row.driftStatus}
-            size="sm"
-          />
+          <span className="text-sm text-ink-1">{row.drift != null ? row.drift.toFixed(3) : '\u2014'}</span>
+          <StatusBadge status={driftLabels[row.drift_status]} variant={driftToVariant(row.drift_status)} size="sm" />
         </div>
       ),
     },
-    { key: 'lastTrained', header: 'Last Trained', hideOnMobile: true },
     {
       key: 'actions',
       header: 'Actions',
-      render: (row: Model) => {
-        const currentAction = actionLoading[row.id];
-        return (
+      render: (row: ApiModel) => (
           <div className="flex items-center gap-1">
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => handlePromote(row)}
-              loading={currentAction === 'promote'}
-              disabled={!!currentAction || row.status === 'Production'}
+              onClick={() => { setDialogError(null); setDialog({ kind: 'promote', model: row }); }}
+              disabled={row.stage === 'Production'}
             >
               <ArrowUpCircle className="h-3.5 w-3.5" />
               <span className="hidden lg:inline">Promote</span>
@@ -260,32 +362,36 @@ export default function ModelsPage() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => handleRollback(row)}
-              loading={currentAction === 'rollback'}
-              disabled={!!currentAction}
+              onClick={() => { setDialogError(null); setDialog({ kind: 'rollback', model: row }); }}
             >
               <RotateCcw className="h-3.5 w-3.5" />
               <span className="hidden lg:inline">Rollback</span>
             </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => { setDialogError(null); setSymbol(''); setDialog({ kind: 'retrain', name: row.name }); }}
+            >
+              <span className="hidden lg:inline">Retrain</span>
+            </Button>
           </div>
-        );
-      },
+      ),
     },
   ];
 
-  const accuracyChartData = models
-    ? models.map((m) => ({ name: m.name, accuracy: parseFloat(m.accuracy) || 0 })).filter((m) => m.accuracy > 0)
-    : [];
-
-  const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(226,232,240,0.8)';
-  const textMuted = isDark ? 'rgba(255,255,255,0.44)' : '#475569';
+  const retrainName = dialog?.kind === 'retrain' ? dialog.name : null;
 
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-xl font-semibold text-ink-1">Models</h1>
-      <p role="note" className="rounded-lg border border-caution bg-caution-soft p-3 text-sm text-ink-1">
-        Models aren&apos;t used for trading until a later release. Promoting a model here has no effect on sessions.
+      <p role="note" className="rounded-lg border border-line bg-surface p-3 text-sm text-ink-1">
+        Production models are consumed: the ML overlay gates entry signals of strategies carrying
+        an <span className="font-mono text-xs">ml_overlay</span> block and the ML-native strategy
+        trades its predictions. Promoting, rolling back and retraining are human actions — the
+        drift badge reads the trader&apos;s startup measurement and the HydraMLDriftHigh alert
+        pages you when it is high; nothing retrains on its own.
       </p>
+
       {/* Header with upload */}
       <div className="flex items-center justify-between">
         <div />
@@ -309,63 +415,46 @@ export default function ModelsPage() {
         </div>
       </div>
 
-      {/* Model accuracy chart */}
-      <DataCard title="Model Performance" description="Accuracy over time across deployed models">
-        {fetchErrors.models ? (
-          <ErrorCard message="Failed to load model data" onRetry={loadData} />
-        ) : loading ? (
-          <div className="h-56 animate-pulse rounded-lg bg-raised" />
-        ) : accuracyChartData.length > 0 ? (
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={accuracyChartData}
-                margin={{ top: 4, right: 4, left: 0, bottom: 0 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />
-                <XAxis
-                  dataKey="name"
-                  tickFormatter={(name: string) => name.length > 14 ? `${name.slice(0, 13)}...` : name}
-                  tick={{ fontSize: 11, fill: textMuted }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <YAxis
-                  domain={[0, 100]}
-                  tickFormatter={(v: number) => `${v}%`}
-                  tick={{ fontSize: 11, fill: textMuted }}
-                  axisLine={false}
-                  tickLine={false}
-                  width={36}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: isDark ? '#1e2433' : '#ffffff',
-                    border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
-                    borderRadius: '8px',
-                    fontSize: '12px',
-                  }}
-                  formatter={(v) => [`${Number(v).toFixed(1)}%`, 'Accuracy']}
-                />
-                <Bar dataKey="accuracy" radius={[3, 3, 0, 0]}>
-                  {accuracyChartData.map((entry, index) => (
-                    <Cell
-                      key={`cell-${index}`}
-                      fill={entry.accuracy > 70 ? '#22c55e' : entry.accuracy >= 60 ? '#f59e0b' : '#ef4444'}
-                    />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        ) : (
-          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
-        )}
-      </DataCard>
+      {/* Retrain job status */}
+      {taskId && (
+        <DataCard title="Training job" description="The ml_train job this page queued or a version's own job">
+          {taskError !== null && (task === null || pollFailures >= MAX_POLL_FAILURES) ? (
+            <ErrorCard
+              message="Failed to read the training job"
+              onRetry={() => { setPollFailures(0); void pollTask(taskId); }}
+            />
+          ) : task === null ? (
+            <p className="text-sm text-ink-2">Reading job {taskId}…</p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+                <StatusBadge status={task.status} variant={jobStatusVariant(task.status)} size="sm" />
+                <span className="font-mono text-xs text-ink-2">{task.task_id}</span>
+                <span className="text-ink-2">{Math.round(task.progress)}%</span>
+                {task.result?.name != null && task.result?.version != null && (
+                  <span className="text-ink-1">
+                    registered {task.result.name} v{task.result.version}
+                    {task.result.stage ? ` (${task.result.stage === 'staging' ? 'Staging' : task.result.stage})` : ''}
+                  </span>
+                )}
+                <Button variant="ghost" size="sm" onClick={() => setTaskId(null)}>Dismiss</Button>
+              </div>
+              {task.error && <p className="text-sm text-danger" role="alert">{task.error}</p>}
+              {task.status === 'completed' && task.metrics && (
+                <p className="text-sm text-ink-2">
+                  OOS accuracy {metricCell(task.metrics as ApiModel['metrics'], 'oos_accuracy')}
+                  {' · '}base rate {metricCell(task.metrics as ApiModel['metrics'], 'oos_base_rate')}
+                  {' · '}signed return {signedReturnCell(task.metrics as ApiModel['metrics'])}
+                </p>
+              )}
+            </div>
+          )}
+        </DataCard>
+      )}
 
       {/* Model registry table */}
-      <DataCard title="Model Registry" description="All registered ML models">
-        {fetchErrors.models ? (
+      <DataCard title="Model Registry" description="Every immutable version the registry holds">
+        {fetchError ? (
           <ErrorCard message="Failed to load models" onRetry={loadData} />
         ) : loading ? (
           <div className="space-y-3">
@@ -380,9 +469,100 @@ export default function ModelsPage() {
             keyExtractor={(row) => row.id}
           />
         ) : (
-          <p className="text-sm text-ink-2 text-center py-8">No data yet</p>
+          <p className="text-sm text-ink-2 text-center py-8">No models yet</p>
         )}
       </DataCard>
+
+      {/* Promote */}
+      <TypedConfirm
+        open={dialog?.kind === 'promote'}
+        title={`Promote ${dialog?.kind === 'promote' ? `${dialog.model.name} v${dialog.model.version}` : ''} to Production?`}
+        token="PROMOTE"
+        primaryLabel="Promote to Production"
+        secondaryLabel="Keep it"
+        pendingLabel="Promoting…"
+        error={dialog?.kind === 'promote' ? dialogError : null}
+        onClose={closeDialog}
+        onConfirm={(reason) =>
+          dialog?.kind === 'promote'
+            ? attempt(dialog.model, 'promote', reason)
+            : Promise.resolve()
+        }
+      >
+        {dialog?.kind === 'promote' && (
+          <>
+            <p>
+              The current Production of {dialog.model.name} is archived with the demotion time;
+              running sessions keep the model they pinned.
+            </p>
+            <p>
+              OOS accuracy {metricCell(dialog.model.metrics, 'oos_accuracy')} against a base rate of{' '}
+              {metricCell(dialog.model.metrics, 'oos_base_rate')} over{' '}
+              {fraction(dialog.model.metrics.folds) ?? 0} folds.
+            </p>
+          </>
+        )}
+      </TypedConfirm>
+
+      {/* Rollback */}
+      <TypedConfirm
+        open={dialog?.kind === 'rollback'}
+        title={`Roll back ${dialog?.kind === 'rollback' ? dialog.model.name : ''}?`}
+        token="ROLLBACK"
+        primaryLabel="Roll back"
+        secondaryLabel="Keep it"
+        pendingLabel="Rolling back…"
+        error={dialog?.kind === 'rollback' ? dialogError : null}
+        onClose={closeDialog}
+        onConfirm={(reason) =>
+          dialog?.kind === 'rollback'
+            ? attempt(dialog.model, 'rollback', reason)
+            : Promise.resolve()
+        }
+      >
+        <p>
+          Rollback restores the most recently archived Production of{' '}
+          {dialog?.kind === 'rollback' ? dialog.model.name : ''} and archives the current one. It
+          refuses with nothing archived.
+        </p>
+      </TypedConfirm>
+
+      {/* Retrain */}
+      <ConfirmDialog
+        open={dialog?.kind === 'retrain'}
+        title={`Retrain ${retrainName ?? ''}`}
+        primaryLabel="Queue retrain"
+        secondaryLabel="Cancel"
+        pendingLabel="Queueing…"
+        pendingHint="Closing this won't cancel the job."
+        onConfirm={() => submitRetrain()}
+        onClose={closeDialog}
+        primaryDisabled={!strategyId || !symbol.trim()}
+      >
+        <p>
+          Queues a bounded ml_train job on the worker: it trains a challenger version of{' '}
+          {retrainName} on the symbol&apos;s stored bars and registers it in Staging — promotion
+          stays yours.
+        </p>
+        <Select
+          label="Strategy"
+          placeholder={strategies.length === 0 ? 'No strategies found' : 'Pick a strategy'}
+          options={strategies.map((s) => ({ value: s.id, label: s.name }))}
+          value={strategyId}
+          onChange={(e) => setStrategyId(e.target.value)}
+        />
+        <Input
+          label="Symbol"
+          value={symbol}
+          onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+          placeholder="BTCUSDT"
+          hint="Must be a member of the current top-100 universe."
+          autoComplete="off"
+        />
+        {dialog?.kind === 'retrain' && dialogError && (
+          <p role="alert" className="text-sm font-semibold text-danger">{dialogError}</p>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }
