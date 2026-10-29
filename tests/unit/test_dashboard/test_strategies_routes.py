@@ -594,7 +594,7 @@ class TestStrategiesFallback:
             "timeframes:\n"
             "  primary: 1h\n"
             "parameters:\n"
-            "  required_history: 75\n"
+            "  required_history: 120\n"
             "  rules:\n"
             "    entry_long:\n"
             "      operator: AND\n"
@@ -650,8 +650,8 @@ class TestStrategiesFallback:
         written = yaml.safe_load(yaml_file.read_text())
         assert written["id"] == "original_id_123"
         assert written["name"] == "Completely Different Name"
-        # Verify required_history preserved from original
-        assert written["parameters"]["required_history"] == 75
+        # a stored required_history above the rules' derived 86 is kept
+        assert written["parameters"]["required_history"] == 120
 
     def test_import_rejects_wrong_extension_without_reading_upload(
         self, client_no_pool: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1359,6 +1359,91 @@ class TestScheduleRoundTrip:
         assert "active_hours_utc lists [13] more than once" in detail
         assert "active_days.0" in detail
         assert yaml_file.read_bytes() == before
+
+
+_EMA_TREND_RULES: dict[str, Any] = {
+    "entry_long": {
+        "operator": "AND",
+        "conditions": [
+            {
+                "indicator": "ema",
+                "params": {"period": 50},
+                "comparator": "crosses_above",
+                "value": "ema:period=200",
+            }
+        ],
+    },
+    "exit_long": {
+        "operator": "OR",
+        "conditions": [
+            {
+                "indicator": "close",
+                "params": {},
+                "comparator": "crosses_below",
+                "value": "rolling_low:period=150",
+            }
+        ],
+    },
+}
+
+
+class TestDerivedRequiredHistory:
+    """The builder writes the rules' lookback, not a constant 50 (an EMA(200) gated on 50
+    bars traded its first 150 on a NaN EMA in every walk-forward OOS window)."""
+
+    def test_save_writes_the_rules_lookback(self, tmp_path: Path) -> None:
+        body = {**_save_body(), "rules": _EMA_TREND_RULES}
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post("/api/strategies/save", json=body)
+        assert resp.status_code == 201
+        (written,) = tmp_path.glob("*.yaml")
+        assert yaml.safe_load(written.read_text())["parameters"]["required_history"] == 602
+
+    def test_update_re_derives_from_the_new_rules(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "gate.yaml"
+        yaml_file.write_text(_rule_based_yaml("gate_1"))
+        body = {**_save_body(), "rules": _EMA_TREND_RULES}
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.put("/api/strategies/gate_1", json=body)
+        assert resp.status_code == 200
+        assert yaml.safe_load(yaml_file.read_text())["parameters"]["required_history"] == 602
+
+    def test_update_keeps_a_larger_hand_set_value(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "gate.yaml"
+        data = yaml.safe_load(_rule_based_yaml("gate_1"))
+        data["parameters"]["required_history"] = 900
+        yaml_file.write_text(yaml.safe_dump(data))
+        body = {**_save_body(), "rules": _EMA_TREND_RULES}
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.put("/api/strategies/gate_1", json=body)
+        assert resp.status_code == 200
+        assert yaml.safe_load(yaml_file.read_text())["parameters"]["required_history"] == 900
+
+    def test_a_malformed_value_reference_is_the_422_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        bad = {
+            "entry_long": {
+                "operator": "AND",
+                "conditions": [
+                    {
+                        "indicator": "close",
+                        "params": {},
+                        "comparator": "greater_than",
+                        "value": "sma:period=abc",
+                    }
+                ],
+            }
+        }
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post("/api/strategies/save", json={**_save_body(), "rules": bad})
+        assert resp.status_code == 422
+        assert "Invalid rules" in str(resp.json()["detail"])
+        assert list(tmp_path.glob("*.yaml")) == []
 
 
 def test_shipped_strategy_and_template_symbols_stay_savable() -> None:

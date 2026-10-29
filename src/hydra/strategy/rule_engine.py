@@ -1,10 +1,12 @@
 """Rule evaluation engine for the RuleBasedStrategy.
 
-Evaluates condition trees against indicator values from the strategy context.
+Evaluates condition trees against indicator values from the strategy context, and
+derives the bar history a rule set needs before its indicators are valid.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Mapping
 
@@ -12,15 +14,40 @@ import numpy as np
 from numpy import ndarray
 
 from hydra.core.types import Timeframe
+from hydra.indicators import library as ind_lib
 from hydra.strategy.condition_schema import (
     Comparator,
     Condition,
     ConditionGroup,
     LogicOperator,
+    RuleSet,
 )
 from hydra.strategy.context import StrategyContext
 
 logger = logging.getLogger(__name__)
+
+MIN_REQUIRED_HISTORY = 50
+"""The floor of a derived ``required_history`` (the builder's constant before it derived one)."""
+
+_EMA = ("ema", "macd", "macd_signal", "macd_hist")
+_WILDER = (
+    "rsi",
+    "atr",
+    "atr_pct",
+    "plus_di",
+    "minus_di",
+    "supertrend",
+    "supertrend_direction",
+    "keltner_upper",
+    "keltner_lower",
+)
+WINDOW_MULTIPLE: dict[str, int] = {**dict.fromkeys(_EMA, 3), **dict.fromkeys(_WILDER, 6), "adx": 8}
+"""Windows a recursive smoother needs before its seed has faded (windowed indicators: 1).
+
+A smoother is seeded from its first window and carries that seed afterwards. Three spans
+bring an EMA within 0.1 % of its value on unlimited history; a Wilder average (alpha 1/N,
+the span of a 2N-1 EMA) needs six windows for about 1 %, and ADX, a Wilder average of DX
+whose first value comes two windows in, needs eight."""
 
 
 def _get_indicator_values(
@@ -127,3 +154,39 @@ def evaluate_condition_group(
     if group.operator == LogicOperator.AND:
         return all(results)
     return any(results)
+
+
+def indicator_lookback(name: str, params: Mapping[str, object]) -> int:
+    """Bars before ``name(**params)`` has a trustworthy current and previous value.
+
+    The sum of the indicator's integer windows (declared defaults included; that sum is
+    exact for chained windows like MACD's slow + signal and an over-estimate otherwise),
+    times its ``WINDOW_MULTIPLE``, plus the first valid bar and the previous bar a cross
+    compares. An unknown name is 0: validation reports it, not this.
+    """
+    func = getattr(ind_lib, name, None)
+    if not inspect.isfunction(func):
+        return 0
+    window = 0
+    for key, param in inspect.signature(func).parameters.items():
+        value = params.get(key, param.default)
+        if param.annotation in (int, "int") and type(value) is int:
+            window += value
+    return window * WINDOW_MULTIPLE.get(name, 1) + 2
+
+
+def rules_required_history(rules: RuleSet) -> int:
+    """The ``required_history`` a rule set needs: its longest indicator lookback, at least
+    ``MIN_REQUIRED_HISTORY``.
+
+    Every condition's indicator and every indicator-reference value counts. Anything else
+    a strategy reads (an ``ml_overlay``'s feature window) is the caller's to ``max`` in.
+    Raises ``ValueError`` for an unparsable value reference.
+    """
+    lookbacks = [MIN_REQUIRED_HISTORY]
+    for group in (rules.entry_long, rules.exit_long, rules.entry_short, rules.exit_short):
+        for cond in group.conditions if group else []:
+            lookbacks.append(indicator_lookback(cond.indicator, cond.params))
+            if isinstance(cond.value, str):
+                lookbacks.append(indicator_lookback(*parse_indicator_ref(cond.value)))
+    return max(lookbacks)
