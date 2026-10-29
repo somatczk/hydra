@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flush, mount, routeFetch, typeInto, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
 import { UniversePicker, type UniverseSnapshot } from './UniversePicker';
 
+/** The picker's own compact format, so assertions never pin an ICU string. */
+const VOLUME = new Intl.NumberFormat('en-GB', { notation: 'compact', maximumFractionDigits: 1 });
+
 const fetchApi = vi.fn();
 vi.mock('@/lib/api', async (orig) => ({
   ...(await orig<typeof import('@/lib/api')>()),
@@ -108,7 +111,7 @@ describe('UniversePicker', () => {
     await focusInput();
 
     await typeInto(input(), 'SOL');
-    expect(options().map((o) => o.textContent)).toEqual(['#3SOLUSDT24h 300M']);
+    expect(options().map((o) => o.textContent)).toEqual([`#3SOLUSDT24h ${VOLUME.format(300_000_000)}`]);
 
     await press('Enter');
     expect(symbol).toBe('SOLUSDT');

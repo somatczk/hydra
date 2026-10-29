@@ -90,7 +90,7 @@ export function StrategyNameDialog({
   const isEditing = !!editingId;
   const perps = exchangeId === 'binanceusdm';
   /* The write gate at the UI layer: only universe members are committable; an unreadable universe leaves the refusal to the engine's 422. */
-  const symbolGateBlocks = universe !== null && !symbolInUniverse(symbol, universe);
+  const symbolGateBlocks = universe !== null && !symbolInUniverse(symbol.trim(), universe);
   const gate = saveError !== null ? parseErrorDetail(saveError) : null;
   const isUniverseGate = gate?.code === 'symbol_not_in_universe';
 

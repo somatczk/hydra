@@ -9,6 +9,9 @@ vi.mock('@/lib/api', async (orig) => ({
 
 const { default: DataPage } = await import('./page');
 
+/** The page's own compact format, so assertions never pin an ICU string. */
+const VOLUME = new Intl.NumberFormat('en-GB', { notation: 'compact', maximumFractionDigits: 1 });
+
 /** The stored ranking exactly as GET /api/market/universe serves it. */
 const UNIVERSE = {
   exchange_id: 'binance',
@@ -98,7 +101,7 @@ describe('DataPage universe', () => {
     const cells = Array.from(m!.container.querySelectorAll('table td')).map((td) => td.textContent);
     expect(cells).toContain('#1');
     expect(cells).toContain('BTCUSDT');
-    expect(cells).toContain('2B');
+    expect(cells).toContain(VOLUME.format(2_000_000_000));
     expect(cells).toContain('#3');
     expect(cells).toContain('SOLUSDT');
     expect(m!.container.querySelector('[data-state="stale"]')).toBeNull();
@@ -120,7 +123,7 @@ describe('DataPage universe', () => {
     expect(m!.container.querySelector('[data-state="unavailable"]')).not.toBeNull();
     expect(text).toContain('The top-100 universe has not been computed yet');
     expect(text).not.toContain('#1');
-    expect(text).not.toContain('BTCUSDT2B');
+    expect(text).not.toContain(`BTCUSDT${VOLUME.format(2_000_000_000)}`);
   });
 
   it('renders the loading skeletons before the first answer, never an empty table', async () => {

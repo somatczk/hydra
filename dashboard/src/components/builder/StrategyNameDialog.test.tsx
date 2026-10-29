@@ -86,6 +86,9 @@ const UNIVERSE: UniverseSnapshot = {
   ],
 };
 
+/** The picker's own compact format, so assertions never pin an ICU string. */
+const VOLUME = new Intl.NumberFormat('en-GB', { notation: 'compact', maximumFractionDigits: 1 });
+
 /** The exact 422 the write gate answers (`services/universe.py::validate_symbol`). */
 function gateRefusal(symbol: string): ApiError {
   const message =
@@ -404,7 +407,11 @@ describe('StrategyNameDialog symbol picker (P6-UI)', () => {
     const listbox = dialog().querySelector('[role="listbox"]');
     expect(listbox).not.toBeNull();
     const options = Array.from(listbox!.querySelectorAll('[role="option"]'));
-    expect(options.map((o) => o.textContent)).toEqual(['#1BTCUSDT24h 2B', '#2ETHUSDT24h 800M', '#3SOLUSDT24h 300M']);
+    expect(options.map((o) => o.textContent)).toEqual([
+      `#1BTCUSDT24h ${VOLUME.format(2_000_000_000)}`,
+      `#2ETHUSDT24h ${VOLUME.format(800_000_000)}`,
+      `#3SOLUSDT24h ${VOLUME.format(300_000_000)}`,
+    ]);
     expect(options[0].id).toBe(input.getAttribute('aria-activedescendant'));
 
     await typeInto(input, 'SOL');
@@ -444,6 +451,24 @@ describe('StrategyNameDialog symbol picker (P6-UI)', () => {
 
     expect(input.getAttribute('aria-invalid')).not.toBe('true');
     expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(false);
+  });
+
+  it('judges the trimmed draft the request sends: a padded member commits, a padded non-member still blocks', async () => {
+    m = await render({ initialName: 'RSI bot', initialSymbol: ' BTCUSDT' });
+    await flush();
+
+    expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(false);
+    await click(buttonByText(dialog(), 'Save strategy'));
+    const post = calls.find((c) => c.init?.method === 'POST');
+    expect(JSON.parse(String(post?.init?.body)).symbol).toBe('BTCUSDT');
+    expect(saved).toEqual([['RSI bot', 'strat-7']]);
+
+    m?.unmount();
+    const savesBefore = calls.filter((c) => c.path === '/api/strategies/save').length;
+    m = await render({ initialName: 'RSI bot', initialSymbol: ' FOOBAR' });
+    await flush();
+    expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(true);
+    expect(calls.filter((c) => c.path === '/api/strategies/save')).toHaveLength(savesBefore);
   });
 
   it('renders the engine 422 guided when a call bypasses the picker: the backend copy verbatim plus the pointer', async () => {
