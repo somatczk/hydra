@@ -1,16 +1,18 @@
 """THE SPLIT SMOKE (D5): both processes on one loop, real HTTP and one real WebSocket.
 
 The trader is the real ``hydra.trader`` startup against one TimescaleDB — the pool with its
-retry budget, the schema wait (the API owns migrations), ``SessionManager.startup()`` on the
-replay exchange, its own app with the full-check HealthMonitor — served by real uvicorn;
-the API is the real ``hydra.dashboard.api`` app under its real lifespan with
-``HYDRA_TRADER__URL`` pointed at the trader, so it binds a ``RemoteTrader`` and never
-constructs a SessionManager. Start → detail → the WS fill tick flow through the real HTTP
-boundary, then the trader disappears: readiness fails on the trader check, the kill switch
-latches in the database with the honest 503 (R7), the release through the dead trader stays
-latched, and the trader's cleanup tick applies the latch exactly once to the still-running
-session. The single-process mode (``HYDRA_TRADER__URL`` unset) is ``test_paper_smoke.py``,
-unchanged.
+retry budget, the Redis ping (the fan-out flag is on: P7-E), the schema wait (the API owns
+migrations), ``SessionManager.startup()`` on the replay exchange, its own app with the
+full-check HealthMonitor — served by real uvicorn; the API is the real ``hydra.dashboard.api``
+app under its real lifespan with ``HYDRA_TRADER__URL`` pointed at the trader, so it binds a
+``RemoteTrader`` and never constructs a SessionManager. Start → detail → the WS fill tick flow
+through the real HTTP boundary, the session's events reach a test-side ``RedisEventSubscriber``
+cross-process, and both processes' readiness lists the required redis check, then the trader
+disappears: readiness fails on the trader check, the kill switch latches in the database with
+the honest 503 (R7), the release through the dead trader stays latched, and the trader's
+cleanup tick applies the latch exactly once to the still-running session. The single-process
+mode (``HYDRA_TRADER__URL`` unset) is ``test_paper_smoke.py``, unchanged — it pins the
+fan-out's default-off posture.
 """
 
 from __future__ import annotations
@@ -35,8 +37,10 @@ from pydantic import SecretStr
 from websockets.asyncio.client import connect
 
 from hydra.core import metrics
-from hydra.core.config import HydraConfig, TraderConfig
-from hydra.core.types import Timeframe
+from hydra.core.config import EventsConfig, HydraConfig, TraderConfig
+from hydra.core.event_bus import RedisEventSubscriber, require_redis
+from hydra.core.events import Event, OrderFillEvent
+from hydra.core.types import Side, Symbol, Timeframe
 from hydra.dashboard.api import app
 from hydra.dashboard.health import HealthMonitor
 from hydra.data.bars import last_closed_open
@@ -129,6 +133,7 @@ async def test_the_split_serves_the_ui_while_the_trader_holds_the_sessions(
     trader_port, api_port = _free_port(), _free_port()
     monkeypatch.setenv("DATABASE_URL", fresh_database)
     monkeypatch.setenv("REDIS_URL", redis_url)
+    monkeypatch.setenv("HYDRA_EVENTS__BUS", "redis")
     monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("HYDRA_API_TOKEN", token)
     monkeypatch.setenv("HYDRA_API__AUTH_MODE", "token")
@@ -141,14 +146,16 @@ async def test_the_split_serves_the_ui_while_the_trader_holds_the_sessions(
         async with _served(app, api_port):
             write_strategy(strategies_dir, STRATEGY_ID)
             market = ReplayMarket(WARMUP)
-            trader = await _start_trader(fresh_database, token, trader_port, market)
+            trader = await _start_trader(fresh_database, token, trader_port, market, redis_url)
             try:
                 async with httpx.AsyncClient(
                     base_url=f"http://127.0.0.1:{api_port}",
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=10.0,
                 ) as client:
-                    await _the_split_story(Split(client, trader, api_port, token), market)
+                    await _the_split_story(
+                        Split(client, trader, api_port, token), market, redis_url
+                    )
             finally:
                 await trader.close()
     finally:
@@ -174,18 +181,23 @@ async def _served(app_to_serve: Any, port: int) -> AsyncIterator[uvicorn.Server]
         await task
 
 
-async def _start_trader(dsn: str, token: str, port: int, market: ReplayMarket) -> Trader:
+async def _start_trader(
+    dsn: str, token: str, port: int, market: ReplayMarket, redis_url: str
+) -> Trader:
     """The trader's real startup order, composed like ``hydra.trader.main``."""
     cfg = HydraConfig(
         DATABASE_URL=SecretStr(dsn),
+        REDIS_URL=SecretStr(redis_url),
         HYDRA_CREDENTIAL_KEY=SecretStr(Fernet.generate_key().decode()),
         HYDRA_API_TOKEN=SecretStr(token),
+        events=EventsConfig(bus="redis"),
         trader=TraderConfig(),  # the trader never points at itself: full-check monitor
     )
     pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
     try:
         assert await current_revision(dsn) == head_revision()  # the API migrated first
         await trader_main.wait_for_schema(dsn)
+        await require_redis(redis_url)  # the fan-out flag is on: tier-1, fail-fast
         mgr = SessionManager(
             db_pool=pool,
             config=cfg,
@@ -201,15 +213,22 @@ async def _start_trader(dsn: str, token: str, port: int, market: ReplayMarket) -
         raise
 
 
-async def _the_split_story(split: Split, market: ReplayMarket) -> None:
+async def _the_split_story(split: Split, market: ReplayMarket, redis_url: str) -> None:
     client, trader = split.client, split.trader
 
-    # both processes are up: the API's readiness embeds the trader's own body
+    # both processes are up: the API's readiness embeds the trader's own body, and
+    # with the fan-out flag on both list the required redis check
     await _poll(lambda: client.get("/livez"), lambda r: r.status_code == 200)
     await _poll(lambda: client.get("/readyz"), lambda r: r.status_code == 200)
     ready = (await client.get("/readyz")).json()
     assert set(ready["checks"]) == {"db", "migrations", "trader"}
     assert ready["checks"]["trader"]["detail"]["checks"]["risk"]["ok"] is True
+    assert ready["checks"]["trader"]["detail"]["checks"]["redis"]["ok"] is True
+    trader_ready = await _poll(
+        lambda: client.get(f"http://127.0.0.1:{trader.port}/readyz"),
+        lambda r: r.status_code == 200,
+    )
+    assert trader_ready.json()["checks"]["redis"]["ok"] is True
 
     # the session starts through the boundary and runs in the trader process only
     sid = await _start_session_through_the_api(split, market)
@@ -225,18 +244,44 @@ async def _the_split_story(split: Split, market: ReplayMarket) -> None:
     )
     await _poll(_relay_anchored, lambda anchored: anchored)
 
+    # P7-E: the test-side consumer (its own group) listens on Redis before the fill —
+    # the trader's session must mirror its events there, cross-process
+    fanout: list[OrderFillEvent] = []
+
+    async def _record_fanout(event: Event) -> None:
+        if isinstance(event, OrderFillEvent):
+            fanout.append(event)
+
+    subscriber = RedisEventSubscriber(redis_url, group="test")
+    await subscriber.connect()
+    await subscriber.subscribe("order_fill", _record_fanout)
+    await subscriber.start_listening()
+
     # one entry fill lands in the trader's engine and its trades row crosses the boundary
     (_, entry) = Reference(market).entries_exits(len(market.live) - 1)[0]
     watch = BarWatch()
     assert session._event_bus is not None
     await session._event_bus.subscribe("bar", watch)
-    market.release_through(entry)
-    await watch.wait_for(market.live[entry].open_time)
-    detail = (await client.get(f"/api/trading/sessions/{sid}/detail")).json()
-    assert len(detail["trades"]) == 1
-    [row] = await _fetch(
-        trader.pool, "SELECT id FROM trades WHERE session_id = $1 ORDER BY id", sid
-    )
+    try:
+        market.release_through(entry)
+        await watch.wait_for(market.live[entry].open_time)
+        detail = (await client.get(f"/api/trading/sessions/{sid}/detail")).json()
+        assert len(detail["trades"]) == 1
+        [row] = await _fetch(
+            trader.pool, "SELECT id FROM trades WHERE session_id = $1 ORDER BY id", sid
+        )
+
+        # the same fill reaches the Redis consumer cross-process (the fan-out mirror)
+        async with asyncio.timeout(POLL_TIMEOUT_S):
+            while not any(fill.session_id == sid for fill in fanout):
+                await asyncio.sleep(0.05)
+        [fill] = [f for f in fanout if f.session_id == sid]
+        assert fill.symbol == Symbol("BTCUSDT")
+        assert fill.side is Side.BUY
+        assert fill.tag == "entry"
+        assert fill.order_id
+    finally:
+        await subscriber.close()
 
     # the R6 relay tick reaches the real WebSocket client through the API process
     try:

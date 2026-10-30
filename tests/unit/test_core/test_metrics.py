@@ -107,6 +107,7 @@ class TestContract:
             "hydra_event_bus_latency_seconds_bucket",
             "hydra_event_bus_latency_seconds_count",
             "hydra_event_bus_latency_seconds_sum",
+            "hydra_event_bus_redis_reclaimed_total",
             "hydra_order_fill_latency_seconds_bucket",
             "hydra_order_fill_latency_seconds_count",
             "hydra_order_fill_latency_seconds_sum",
@@ -333,7 +334,33 @@ class TestRiskAndHealthSetters:
         assert _value("hydra_ready", {"check": "db"}) == 0.0
         assert _value("hydra_health_monitor_last_run_timestamp_seconds") == 1_760_000_123.0
         with pytest.raises(ValueError):
-            metrics.set_ready("redis", True)
+            metrics.set_ready("not_a_check", True)
+
+    def test_the_redis_fanout_counters(self) -> None:
+        """P7-E: drops by type and reason, and XAUTOCLAIM reclaims."""
+        metrics.record_event_bus_redis_drop("bar", "buffer_full")
+        metrics.record_event_bus_redis_drop("bar", "buffer_full")
+        metrics.record_event_bus_redis_drop("order_fill", "publish_failed")
+        assert (
+            _value(
+                "hydra_event_bus_redis_drops_total",
+                {"event_type": "bar", "reason": "buffer_full"},
+            )
+            == 2.0
+        )
+        assert (
+            _value(
+                "hydra_event_bus_redis_drops_total",
+                {"event_type": "order_fill", "reason": "publish_failed"},
+            )
+            == 1.0
+        )
+        with pytest.raises(ValueError):
+            metrics.record_event_bus_redis_drop("bar", "exploded")
+        metrics.record_event_bus_redis_reclaimed(3)
+        assert _value("hydra_event_bus_redis_reclaimed_total") == 3.0
+        with pytest.raises(ValueError):
+            metrics.record_event_bus_redis_reclaimed(0)
 
     def test_latency_helpers(self) -> None:
         metrics.observe_event_bus_latency(0.004)

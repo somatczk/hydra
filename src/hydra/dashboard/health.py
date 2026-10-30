@@ -17,7 +17,10 @@ Two check sets (D5): the engine-side set (``REQUIRED_CHECKS``: db, migrations, s
 risk — the full set the trader process and the single-process app run, with the engine reads
 routed through the backend) and the split-API set (``SPLIT_CHECKS``: db, migrations, trader),
 where the ``trader`` check embeds the remote trader's own ``/readyz`` body — the API process
-beside a remote trader has no engine to check.
+beside a remote trader has no engine to check. While the opt-in event fan-out is on
+(``events.bus: redis``), the engine-side set additionally requires ``redis`` (the check exists
+exactly when the dependency exists); the split API's set is unchanged — its trader check embeds
+the trader's own redis result.
 
 Feed freshness uses the same thresholds as ``HydraFeedStale`` and ``HydraClosedBarOverdue``,
 measured against the monitor's clock from the feed gauges.
@@ -109,7 +112,9 @@ class HealthMonitor:
     ``checks`` selects the set: ``REQUIRED_CHECKS`` (default — the engine-side full set)
     or ``SPLIT_CHECKS``. Unset, it follows the app's config: an app whose
     ``trader.url`` is set runs beside a remote trader and has no engine of its own, so it
-    runs the split set with the remote-trader check.
+    runs the split set with the remote-trader check; an engine-side app whose
+    ``events.bus`` is ``redis`` additionally requires the redis check (the split set never
+    grows it — the trader check embeds the trader's own).
     """
 
     def __init__(
@@ -128,7 +133,12 @@ class HealthMonitor:
         if checks is None:
             cfg = getattr(app.state, "config", None)
             url = getattr(getattr(cfg, "trader", None), "url", None)
-            checks = SPLIT_CHECKS if url is not None else REQUIRED_CHECKS
+            if url is not None:
+                checks = SPLIT_CHECKS
+            elif getattr(getattr(cfg, "events", None), "bus", "memory") == "redis":
+                checks = (*REQUIRED_CHECKS, "redis")
+            else:
+                checks = REQUIRED_CHECKS
         self._checks = checks
         self._task: asyncio.Task[None] | None = None
         self._started = False
@@ -233,6 +243,8 @@ class HealthMonitor:
             "db": await self._check_db(pool),
             "migrations": await self._check_migrations(pool),
         }
+        if "redis" in self._checks:
+            checks["redis"] = await self._check_redis()
         snap: HealthSnapshot | None = None
         if "trader" in self._checks:
             checks["trader"] = await self._check_trader()
@@ -282,6 +294,27 @@ class HealthMonitor:
         except Exception as exc:
             return {"ok": False, "required": True, "head": head, "error": _error(exc)}
         return {"ok": current == head, "required": True, "current": current, "head": head}
+
+    async def _check_redis(self) -> dict[str, Any]:
+        """The event fan-out's Redis answers a PING (the DB_TIMEOUT_S pattern)."""
+        cfg = getattr(self._app.state, "config", None)
+        secret = getattr(cfg, "redis_url", None)
+        url = secret.get_secret_value() if secret is not None else None
+        if url is None:
+            return {"ok": False, "required": True, "error": "no redis configured"}
+        import redis.asyncio as aioredis
+
+        started = time.perf_counter()
+        try:
+            client: Any = aioredis.from_url(url, decode_responses=False)
+            try:
+                await asyncio.wait_for(client.ping(), DB_TIMEOUT_S)
+            finally:
+                await client.aclose()
+        except Exception as exc:
+            return {"ok": False, "required": True, "error": _error(exc)}
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {"ok": True, "required": True, "latency_ms": latency_ms}
 
     async def _check_sessions(
         self, snap: HealthSnapshot | None, error: str | None, pool: Any

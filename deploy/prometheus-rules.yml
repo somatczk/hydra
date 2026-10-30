@@ -166,6 +166,17 @@ groups:
           summary: "Hydra data cache sweeper stalled"
           description: "The data cache sweeper last completed a cycle {{ $value | printf \"%.0f\" }} seconds ago, over two sweep intervals; the cache can grow past its budget unchecked. Check hydra_data_sweep_errors_total and the sweeper logs."
 
+      - alert: HydraEventFanoutDropping
+        # fire-and-forget: consumers lose ticks, the trading path is unaffected
+        expr: rate(hydra_event_bus_redis_drops_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: info
+          team: infra
+        annotations:
+          summary: "Redis event fan-out dropping events"
+          description: "The Redis event fan-out has dropped {{ $labels.event_type }} events ({{ $labels.reason }}) at a non-zero rate for 10 minutes; cross-process consumers are losing events while the trading path is unaffected. Check Redis health and hydra_event_bus_redis_drops_total."
+
   - name: hydra-health
     interval: 30s
     rules:

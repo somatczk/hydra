@@ -110,8 +110,11 @@ git status --porcelain --untracked-files=all # must print nothing after the test
   `RemoteTrader` (`hydra.dashboard.trader_client`) that calls the trader process (`python -m hydra.trader`, the same
   image: the engine behind its internal bearer-gated FastAPI on :8000 with `HYDRA_API_TOKEN`, no MCP, no CORS) one
   endpoint per `TraderBackend` op. The wire format is the shared error envelope, transport errors are 503
-  `engine_unreachable`, and the DB is the only durable state they share. Redis is only health-pinged; it is not on
-  the trading path.
+  `engine_unreachable`, and the DB is the only durable state they share. Redis carries the opt-in event fan-out
+  (`events.bus: redis`, default `memory`): each session keeps its in-memory bus as the trading bus while a
+  fire-and-forget `RedisEventPublisher` mirrors every event to Redis Streams — an outage can never raise into or
+  block the bar path; drops are counted. With the flag on, Redis is tier-1 (fail-fast startup, a required readiness
+  check); trading consumers never read it. The box enables the flag at the phase's final deploy.
 - **Signal path.** ccxt.pro closed bar → the session's bar handler (the executor fills resting orders and marks) →
   StrategyEngine → the veto-only ML overlay on entries (when configured) → OrderManager (checked by the process-wide
   RiskService) → the session's executor: paper spot, paper perp, live spot or live perp. Backtests replay bars through

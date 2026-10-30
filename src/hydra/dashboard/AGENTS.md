@@ -38,8 +38,9 @@ uv run mypy src/hydra/dashboard/ --strict   # the package is on CI's strict line
   executor registered on the store. A `ServiceError` becomes a tool error through `_deps.tool_error`.
 - Probes (`health.py`, `routes/health.py`): `HealthMonitor` runs every 15 s and is the only writer of the readiness
   gauges. `/livez` needs startup done and a monitor run within 3 intervals; `/readyz` serves the last result while
-  at most 2 intervals old. Engine checks: db, migrations, sessions (no zombie), feeds, risk; the split API checks
-  db, migrations, trader (`test_health_routes.py`, `test_health_split.py`).
+  at most 2 intervals old. Engine checks: db, migrations, sessions (no zombie), feeds, risk, plus redis only while
+  the opt-in event fan-out is on (`events.bus: redis`; the split API checks db, migrations, trader — its trader check
+  embeds the trader's own redis result) (`test_health_routes.py`, `test_health_split.py`).
 - Unit tests call the real app as the bearer-token service (autouse `default_api_auth` in
   `tests/unit/test_dashboard/conftest.py`); auth tests override that fixture to send exact headers.
 

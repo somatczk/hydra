@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from hydra.core.config import HydraConfig, load_config
-from hydra.core.event_bus import InMemoryEventBus, RedisEventBus
+from hydra.core.event_bus import InMemoryEventBus, RedisEventPublisher, RedisEventSubscriber
 from hydra.core.events import (
     BarEvent,
     CircuitBreakerEvent,
@@ -71,7 +71,8 @@ __all__ = [
     "OrderStatus",
     "OrderType",
     "Position",
-    "RedisEventBus",
+    "RedisEventPublisher",
+    "RedisEventSubscriber",
     "RiskCheckResult",
     "Side",
     # Types

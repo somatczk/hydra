@@ -55,6 +55,12 @@ Contract (name: type, unit / labels / producer):
 - hydra_event_handler_errors_total: counter, errors
   labels: event_type
   producer: P1-B event bus isolation
+- hydra_event_bus_redis_drops_total: counter, events
+  labels: event_type, reason
+  producer: P7-E RedisEventPublisher
+- hydra_event_bus_redis_reclaimed_total: counter, entries
+  labels: -
+  producer: P7-E RedisEventSubscriber
 - hydra_exchange_api_latency_seconds: histogram, seconds
   labels: exchange_id, endpoint, outcome
   producer: ExchangeClient
@@ -181,8 +187,8 @@ MetricKind = Literal["counter", "gauge", "histogram"]
 EXCHANGE_CALL_OUTCOMES = ("ok", "error", "timeout", "cancelled")
 FEED_BAR_SOURCES = ("ws", "rest_gap", "warmup")
 RISK_INTENTS = ("open", "reduce")
-# trader: the split-API monitor's remote-trader check (D5)
-READY_CHECKS = ("db", "migrations", "sessions", "feeds", "risk", "trader")
+# each check exists exactly when its dependency exists (trader: D5; redis: P7-E)
+READY_CHECKS = ("db", "migrations", "sessions", "feeds", "risk", "trader", "redis")
 SPOT_SHORT_SIGNALS = ("entry_short", "exit_short")
 CIRCUIT_BREAKER_TIERS = range(5)
 
@@ -321,6 +327,23 @@ CONTRACT: tuple[MetricSpec, ...] = (
         "errors",
         "P1-B event bus isolation",
         ("event_type",),
+    ),
+    MetricSpec(
+        "hydra_event_bus_redis_drops_total",
+        "counter",
+        "Session events the opt-in Redis fan-out dropped: buffer_full (the bounded "
+        "queue was full) or publish_failed (the XADD failed); the trading path is "
+        "never blocked either way",
+        "events",
+        "P7-E RedisEventPublisher",
+        ("event_type", "reason"),
+    ),
+    MetricSpec(
+        "hydra_event_bus_redis_reclaimed_total",
+        "counter",
+        "Stream entries a Redis event subscriber reclaimed from a dead consumer via XAUTOCLAIM",
+        "entries",
+        "P7-E RedisEventSubscriber",
     ),
     MetricSpec(
         "hydra_exchange_api_latency_seconds",
@@ -545,7 +568,8 @@ CONTRACT: tuple[MetricSpec, ...] = (
     MetricSpec(
         "hydra_ready",
         "gauge",
-        "1 when a readiness check passes (db, migrations, sessions, feeds, risk, trader)",
+        "1 when a readiness check passes (db, migrations, sessions, feeds, risk, trader; "
+        "redis only while the events fan-out is on)",
         "1",
         "P1-G1 HealthMonitor",
         ("check",),
@@ -816,6 +840,22 @@ def observe_event_bus_latency(seconds: float) -> None:
 def record_event_handler_error(event_type: str) -> None:
     """Count one subscriber callback that raised."""
     _counter("hydra_event_handler_errors_total").labels(event_type=event_type).inc()
+
+
+EVENT_BUS_REDIS_DROP_REASONS = ("buffer_full", "publish_failed")
+
+
+def record_event_bus_redis_drop(event_type: str, reason: str) -> None:
+    """Count one event the Redis fan-out mirror dropped (buffer full or XADD failed)."""
+    _check(reason, EVENT_BUS_REDIS_DROP_REASONS, "reason")
+    _counter("hydra_event_bus_redis_drops_total").labels(event_type=event_type, reason=reason).inc()
+
+
+def record_event_bus_redis_reclaimed(entries: int = 1) -> None:
+    """Count stream entries a subscriber reclaimed from a dead consumer."""
+    if entries < 1:
+        raise ValueError(f"entries must be >= 1, got {entries}")
+    _counter("hydra_event_bus_redis_reclaimed_total").inc(entries)
 
 
 def _call_outcome(exc: BaseException) -> str:

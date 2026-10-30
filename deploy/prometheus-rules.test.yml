@@ -1031,3 +1031,31 @@ tests:
       - eval_time: 179m
         alertname: HydraDataSweepStalled
         exp_alerts: []
+
+  - name: event fan-out dropping for 10m fires at info
+    interval: 1m
+    input_series:
+      - series: 'hydra_event_bus_redis_drops_total{event_type="bar", reason="publish_failed"}'
+        values: "0+2x30"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HydraEventFanoutDropping
+        exp_alerts:
+          - exp_labels:
+              event_type: bar
+              reason: publish_failed
+              severity: info
+              team: infra
+            exp_annotations:
+              summary: "Redis event fan-out dropping events"
+              description: "The Redis event fan-out has dropped bar events (publish_failed) at a non-zero rate for 10 minutes; cross-process consumers are losing events while the trading path is unaffected. Check Redis health and hydra_event_bus_redis_drops_total."
+
+  - name: a one-off fan-out drop burst does not fire
+    interval: 1m
+    input_series:
+      - series: 'hydra_event_bus_redis_drops_total{event_type="bar", reason="buffer_full"}'
+        values: "0 0 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HydraEventFanoutDropping
+        exp_alerts: []

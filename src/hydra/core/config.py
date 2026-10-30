@@ -272,6 +272,19 @@ class TraderConfig(_Section):
         return v
 
 
+class EventsConfig(_Section):
+    """The event fan-out transport.
+
+    ``memory`` (default) keeps every event in-process: the session bus is the only
+    bus and Redis stays a health ping. ``redis`` additionally mirrors every session
+    event to Redis Streams through a fire-and-forget publisher — the opt-in fan-out
+    (``HYDRA_EVENTS__BUS=redis``); it requires ``REDIS_URL`` and makes Redis tier-1
+    (fail-fast startup, a required readiness check).
+    """
+
+    bus: Literal["memory", "redis"] = "memory"
+
+
 class MlConfig(_Section):
     """Machine learning settings."""
 
@@ -344,6 +357,7 @@ class HydraConfig(BaseSettings):
     mcp: McpConfig = Field(default_factory=McpConfig)
     ml: MlConfig = Field(default_factory=MlConfig)
     trader: TraderConfig = Field(default_factory=TraderConfig)
+    events: EventsConfig = Field(default_factory=EventsConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 
@@ -389,6 +403,15 @@ class HydraConfig(BaseSettings):
         if v is not None and len(v.get_secret_value()) < 32:
             raise ValueError("HYDRA_MCP_TOKEN must be at least 32 characters")
         return v
+
+    @model_validator(mode="after")
+    def _redis_bus_needs_redis_url(self) -> HydraConfig:
+        if self.events.bus == "redis" and self.redis_url is None:
+            raise ValueError(
+                "events.bus 'redis' requires REDIS_URL: the event fan-out mirrors every "
+                "session event to Redis Streams"
+            )
+        return self
 
     @model_validator(mode="after")
     def _trader_url_needs_token(self) -> HydraConfig:
