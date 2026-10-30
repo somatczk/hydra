@@ -242,7 +242,7 @@ class TestTelegramCredentials:
     """The Telegram pair: encrypted write-only rows, shape-validated, pair-checked at use."""
 
     BOT_ID = "123456789"
-    BOT_BODY = "AAEhBOweik6ad9r_QXMENQjcrGbqCr4K-4c"
+    BOT_BODY = "AAEhBOweik6ad9r_QXMENQjcrGbqCr4K"
     TOKEN = f"{BOT_ID}:{BOT_BODY}"
     CHAT = "-1002146360582"
     SEND_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -277,9 +277,9 @@ class TestTelegramCredentials:
         "token",
         [
             "not-a-token",
-            "123:AAEhBOweik6ad9r_QXMENQjcrGbqCr4K-4c",  # bot id too short
+            "123:AAEhBOweik6ad9r_QXMENQjcrGbqCr4K",  # bot id too short
             "123456789:AAEh-short",  # token body too short
-            "123456789:AAEhBOweik6ad9r_QXMENQjcrGbqCr4K-4c:extra",
+            "123456789:AAEhBOweik6ad9r_QXMENQjcrGbqCr4K:extra",
             "123456789:a bad token with spaces and symbols!",
         ],
     )
