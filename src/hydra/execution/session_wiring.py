@@ -61,7 +61,7 @@ from hydra.execution.errors import (
     SubmitUnknownError,
     UnsupportedStrategyError,
 )
-from hydra.execution.exchange_stops import ExchangeStopState, verify_exchange_stop
+from hydra.execution.exchange_stops import ExchangeStopState
 from hydra.execution.flatten import FlattenResult, flatten_session
 from hydra.execution.live_executor import LiveOrderPoller, LiveTradingExecutor
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
@@ -80,6 +80,7 @@ from hydra.execution.perp_live import (
 )
 from hydra.execution.perp_trading import PaperExecutor
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
+from hydra.execution.venue_stops import verify_protective_stop
 from hydra.risk.service import RiskService
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig, config_hash
@@ -416,8 +417,11 @@ class SessionRuntime:
                     live_executor.exchange_client, symbol, expected
                 )
             else:
-                states[symbol] = await verify_exchange_stop(
-                    live_executor.exchange_client, symbol, expected
+                states[symbol] = await verify_protective_stop(
+                    str(live_executor._exchange_id),
+                    live_executor.exchange_client,
+                    symbol,
+                    expected,
                 )
         return states
 

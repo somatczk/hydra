@@ -31,7 +31,10 @@ uv run mypy src/hydra/execution/ src/hydra/risk/ --strict   # part of CI's stric
 - A `paper_capital` change goes through `RiskService.reload_config`: an audited rebase of the ledger that
   keeps the breaker tier (`tests/unit/test_risk/test_risk_service.py::TestPaperReset`).
 - Sizes are `Decimal` base units (`sizing.py`); market rules come from public ccxt metadata, no keys
-  (`market_rules.py`). Perp trailing bounds are the fapi `callbackRate` percent, not spot's bips.
+  (`market_rules.py`), for the registered venues only — binance, binanceusdm and bybit (the registry's
+  venue ids). Perp trailing bounds are the fapi `callbackRate` percent, not spot's bips; bybit has no
+  percent trail at all (the registry's trailing kind NONE), so its rules carry no trailing bounds and the
+  protective ladder falls back to the fixed stop.
 
 ## Where things are
 

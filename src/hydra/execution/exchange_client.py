@@ -1,8 +1,9 @@
-"""Unified exchange client wrapping CCXT Pro for Binance/Bybit/Kraken/OKX.
+"""Unified exchange client wrapping CCXT Pro for the registered venues (Binance, Bybit).
 
-The ``ExchangeClient`` is exchange-agnostic: all exchange-specific behavior is
-handled internally by CCXT.  ``ccxt`` is **not** imported at module level so that
-test environments without the package installed can still import this module.
+The ``ExchangeClient`` is exchange-agnostic at the unified surface: every exchange-specific
+behavior lives in the registry (``hydra.core.venues``) and CCXT itself.  ``ccxt`` is **not**
+imported at module level so that test environments without the package installed can still
+import this module.
 
 The single outgoing money boundary: every outgoing ccxt call converts Decimal to
 float at the wire (``create_order``'s amount/price/stopPrice) — ccxt's typed API is
@@ -24,7 +25,9 @@ from typing import Any
 
 from hydra.core.metrics import observe_exchange_call, record_ws_reconnect
 from hydra.core.types import Direction, ExchangeId, MarketType, OrderType, Position, Symbol
+from hydra.core.venues import KeyCheck, VenueSpec, find_venue
 from hydra.execution.client_factory import ccxt_class_for
+from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.exchange_stops import normalize_exchange_leg
 
 logger = logging.getLogger(__name__)
@@ -47,7 +50,12 @@ class ExchangeClient:
         Whether to connect to the testnet/sandbox endpoint.
     market_type:
         Selects the ccxt class through ``client_factory.ccxt_class_for`` (binance SPOT,
-        binanceusdm FUTURES).
+        binanceusdm FUTURES, bybit SPOT — P7-F).
+
+    The OCO/list surface below is Binance-spot-only by construction (bybit has no list
+    orders); every one of its three methods refuses a non-binance venue with
+    ``UnsupportedVenueError`` BEFORE any exchange call, so the bybit protective path can
+    never touch them.
     """
 
     def __init__(
@@ -86,8 +94,10 @@ class ExchangeClient:
         if exchange_cls is None:
             raise ValueError(f"Unknown exchange class: {class_name}")
 
+        # the registry's client options pin bybit's 'swap' defaultType to spot (P7-F)
         opts: dict[str, Any] = {
             "enableRateLimit": True,
+            "options": dict(self._venue().client_options),
             **self._config,
         }
         if self._testnet:
@@ -95,6 +105,22 @@ class ExchangeClient:
 
         self._exchange = exchange_cls(opts)
         return self._exchange
+
+    def _venue(self) -> VenueSpec:
+        """The registry spec for this client's (venue, market type) pair."""
+        spec = find_venue(self._exchange_id, self._market_type)
+        if spec is None:
+            raise UnsupportedVenueError(
+                f"{self._exchange_id} {self._market_type.value} is not supported and not scheduled"
+            )
+        return spec
+
+    def _require_binance_list_surface(self, call: str) -> None:
+        """The OCO/list order surface exists only on Binance spot (bybit has none)."""
+        if self._exchange_id != "binance" or self._market_type is not MarketType.SPOT:
+            raise UnsupportedVenueError(
+                f"{call} is a Binance-spot-only call; {self._exchange_id} has no OCO or list orders"
+            )
 
     # ------------------------------------------------------------------
     # Order API
@@ -135,12 +161,15 @@ class ExchangeClient:
         return result
 
     async def cancel_order(
-        self, order_id: str, symbol: str, params: dict[str, Any] | None = None
+        self, order_id: str | None, symbol: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """Cancel an order on the exchange.
 
         *params* reaches ccxt untouched: a perp conditional leg cancels through the
-        fapi ALGO namespace by passing ``{'clientAlgoId': ..., 'conditional': True}``.
+        fapi ALGO namespace by passing ``{'clientAlgoId': ..., 'conditional': True}``;
+        a bybit spot tpsl leg cancels through ``{'orderLinkId': ..., 'orderFilter':
+        'tpslOrder'}``. *order_id* is ``None`` only on that bybit client-id cancel —
+        no ``orderId`` key goes on the wire, the link id alone identifies the order.
         """
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "cancel_order"):
@@ -158,12 +187,16 @@ class ExchangeClient:
     ) -> dict[str, Any]:
         """Place a spot OCO (POST /api/v3/orderList/oco); returns the paper OCO shape.
 
+        Binance spot only (``_require_binance_list_surface``); bybit's protective pair
+        never calls this.
+
         *quantity*, *take_profit* and *stop_loss* are pre-formatted exchange strings
         (tick/lot aligned by the caller, ``exchange_stops``). The response is normalized to
         the paper shape with ``id`` = the orderListId and per-leg dicts in ``legs``; the
         echoed amount/price/stop are the caller's own strings as exact Decimals (never
         through ``float``).
         """
+        self._require_binance_list_surface("create_oco")
         exchange = self._get_exchange()
         request: dict[str, Any] = {
             "symbol": symbol,
@@ -197,7 +230,8 @@ class ExchangeClient:
         }
 
     async def cancel_order_list(self, order_list_id: str, symbol: str) -> dict[str, Any]:
-        """Cancel a whole OCO list (DELETE /api/v3/orderList)."""
+        """Cancel a whole OCO list (DELETE /api/v3/orderList) — Binance spot only."""
+        self._require_binance_list_surface("cancel_order_list")
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "cancel_order_list"):
             result: dict[str, Any] = await exchange.privateDeleteOrderList(
@@ -208,10 +242,13 @@ class ExchangeClient:
     async def cancel_all_orders(self, symbol: str) -> dict[str, Any]:
         """Cancel EVERY open order on *symbol*, hydra's or not.
 
-        Futures conditional (ladder) orders rest in their own fapi algo namespace,
+        Binance futures conditional (ladder) orders rest in their own fapi algo namespace,
         so the futures sweep cancels both: the regular open orders
         (DELETE /fapi/v1/allOpenOrders) and the open algo orders
-        (DELETE /fapi/v1/algoOpenOrders). Spot keeps the single historic call.
+        (DELETE /fapi/v1/algoOpenOrders). Binance spot keeps the single historic call.
+        Bybit spot keeps conditional orders in the ``tpslOrder`` filter, so its sweep
+        cancels both namespaces too (POST /v5/order/cancel-all for 'Order', then for
+        'tpslOrder').
         """
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "cancel_all_orders"):
@@ -220,6 +257,10 @@ class ExchangeClient:
                     {"symbol": symbol}
                 )
                 await exchange.fapiPrivateDeleteAlgoOpenOrders({"symbol": symbol})
+                return result
+            if self._exchange_id == "bybit":
+                result = await exchange.cancel_all_orders(symbol)
+                await exchange.cancel_all_orders(symbol, {"orderFilter": "tpslOrder"})
                 return result
             result = await exchange.privateDeleteOpenOrders({"symbol": symbol})
         return result
@@ -252,11 +293,20 @@ class ExchangeClient:
         return totals
 
     async def fetch_api_restrictions(self) -> dict[str, Any]:
-        """The key's permissions (GET /sapi/v1/account/apiRestrictions): a read-only
-        sapi call that never trades; the caller maps ccxt errors."""
+        """The key's permissions, read through the venue's registry key check (R8's read).
+
+        Binance: GET /sapi/v1/account/apiRestrictions (``sapiGetAccountApiRestrictions``),
+        a read-only sapi call that never trades. Bybit: GET /v5/user/query-api
+        (``privateGetV5UserQueryApi``). Both answers stay RAW here — the caller maps
+        them to the canonical flags through ``live_gate.normalize_restrictions``.
+        """
         exchange = self._get_exchange()
+        if self._venue().key_check is KeyCheck.BYBIT_QUERY_API:
+            with observe_exchange_call(self._exchange_id, "fetch_api_restrictions"):
+                result: dict[str, Any] = await exchange.privateGetV5UserQueryApi()
+            return result
         with observe_exchange_call(self._exchange_id, "fetch_api_restrictions"):
-            result: dict[str, Any] = await exchange.sapiGetAccountApiRestrictions()
+            result = await exchange.sapiGetAccountApiRestrictions()
         return result
 
     async def fetch_open_orders(
@@ -266,20 +316,29 @@ class ExchangeClient:
 
         Futures conditional (ladder) orders live in the separate fapi algo namespace:
         ``conditional=True`` reads the open algo orders instead of the regular ones.
-        The regular call is unchanged — one argument, no params.
+        Bybit's spot conditional orders (the protective tpsl legs) live behind the
+        ``tpslOrder`` filter of the same realtime endpoint: ``conditional=True`` reads
+        that filter. The regular call is unchanged — one argument, no params.
         """
         exchange = self._get_exchange()
         with observe_exchange_call(self._exchange_id, "fetch_open_orders"):
             if conditional:
-                result: list[dict[str, Any]] = await exchange.fetch_open_orders(
-                    symbol, None, None, {"conditional": True}
-                )
+                if self._exchange_id == "bybit":
+                    result: list[dict[str, Any]] = await exchange.fetch_open_orders(
+                        symbol, None, None, {"orderFilter": "tpslOrder"}
+                    )
+                else:
+                    result = await exchange.fetch_open_orders(
+                        symbol, None, None, {"conditional": True}
+                    )
             else:
                 result = await exchange.fetch_open_orders(symbol)
         return result
 
     async def fetch_open_order_lists(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Fetch open OCO lists (GET /api/v3/openOrderList): the A8 verification read."""
+        """Fetch open OCO lists (GET /api/v3/openOrderList): the A8 verification read —
+        Binance spot only."""
+        self._require_binance_list_surface("fetch_open_order_lists")
         exchange = self._get_exchange()
         request: dict[str, Any] = {"symbol": symbol} if symbol else {}
         with observe_exchange_call(self._exchange_id, "fetch_open_order_lists"):
@@ -287,14 +346,51 @@ class ExchangeClient:
         return result
 
     async def fetch_order(
-        self, order_id: str, symbol: str, params: dict[str, Any] | None = None
+        self, order_id: str | None, symbol: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """One order by exchange id, or by ``params={'clientOrderId': ...}`` (ccxt maps it
         to Binance's ``origClientOrderId``; a lookup by our own id never needs the exchange
-        id, so mid-submit timeouts stay resolvable)."""
+        id, so mid-submit timeouts stay resolvable).
+
+        Bybit reads add ``acknowledged`` (ccxt refuses the realtime read without it) and
+        fall back from the ``tpslOrder`` filter to the regular one — a triggered
+        conditional order graduates there. A ``params['orderLinkId']`` lookup rides the
+        same realtime endpoint through ``fetch_open_orders`` instead: ccxt's bybit
+        ``fetch_order`` writes ``orderId`` on the wire unconditionally, so an id-less read
+        through it would send the literal ``orderId=None`` — the link id alone identifies
+        the order (``venue_stops.fetch_bybit_leg``, which bybit answers whatever the
+        order's status).
+        """
         exchange = self._get_exchange()
+        merged: dict[str, Any] = dict(params or {})
+        if self._exchange_id == "bybit":
+            import ccxt
+
+            if merged.get("orderLinkId") is not None:
+                link_params = {k: v for k, v in merged.items() if k != "acknowledged"}
+                for order_filter in ("tpslOrder", "Order"):
+                    with observe_exchange_call(self._exchange_id, "fetch_order"):
+                        found: list[dict[str, Any]] = await exchange.fetch_open_orders(
+                            symbol, None, None, {**link_params, "orderFilter": order_filter}
+                        )
+                    if found:
+                        return found[0]
+                raise ccxt.OrderNotFound(
+                    f"bybit order with orderLinkId {merged['orderLinkId']} was not found"
+                )
+            merged["acknowledged"] = True
+            with observe_exchange_call(self._exchange_id, "fetch_order"):
+                try:
+                    result: dict[str, Any] = await exchange.fetch_order(
+                        order_id, symbol, {**merged, "orderFilter": "tpslOrder"}
+                    )
+                except ccxt.OrderNotFound:
+                    result = await exchange.fetch_order(
+                        order_id, symbol, {**merged, "orderFilter": "Order"}
+                    )
+            return result
         with observe_exchange_call(self._exchange_id, "fetch_order"):
-            result: dict[str, Any] = await exchange.fetch_order(order_id, symbol, params or {})
+            result = await exchange.fetch_order(order_id, symbol, merged)
         return result
 
     async def fetch_my_trades(

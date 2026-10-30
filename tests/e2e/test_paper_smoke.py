@@ -566,15 +566,29 @@ async def test_restart_recovers_the_position_without_a_zombie_and_stop_flattens(
         assert (await eng.readyz()).json()["checks"]["sessions"]["sessions"] == []
 
 
-async def test_only_binance_paper_sessions_start(romulus_env: str, strategies_dir: Path) -> None:
+async def test_paper_sessions_refuse_the_non_binance_venues(
+    romulus_env: str, strategies_dir: Path
+) -> None:
+    """P7-F's honest refusal, at the P1 acceptance surface: bybit is LIVE-ONLY (a paper
+    start names the mode cap; the e2e itself stays on Binance's replayed bars), and
+    Kraken and OKX are not registered at all — every refusal comes before anything is
+    built, and the messages say exactly which case it is."""
     write_strategy(strategies_dir, STRATEGY_ID)
     write_strategy(strategies_dir, "smoke-bybit", exchange_id="bybit")
+    write_strategy(strategies_dir, "smoke-kraken", exchange_id="kraken")
+    write_strategy(strategies_dir, "smoke-okx", exchange_id="okx")
     async with engine(romulus_env, ReplayMarket(WARMUP), MonitorClock()) as eng:
-        bybit = await eng.client.post(
-            "/api/trading/sessions", json={"strategy_id": "smoke-bybit", "trading_mode": "paper"}
-        )
-        assert bybit.status_code == 400
-        assert bybit.json()["detail"]["code"] == "unsupported_venue"
+        for sid, phrase in (
+            ("smoke-bybit", "live-only venue"),
+            ("smoke-kraken", "not supported and not scheduled"),
+            ("smoke-okx", "not supported and not scheduled"),
+        ):
+            refused = await eng.client.post(
+                "/api/trading/sessions", json={"strategy_id": sid, "trading_mode": "paper"}
+            )
+            assert refused.status_code == 400
+            assert refused.json()["detail"]["code"] == "unsupported_venue"
+            assert phrase in refused.json()["detail"]["message"], refused.json()
         live = await eng.client.post(
             "/api/trading/sessions", json={"strategy_id": STRATEGY_ID, "trading_mode": "live"}
         )

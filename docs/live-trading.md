@@ -45,6 +45,28 @@ connect through Settings like spot's (`binanceusdm`); on mainnet a key that can 
 `credentials_can_withdraw` and a key without futures 422 `credentials_not_futures_capable`, with nothing stored.
 Unarmed, every live FUTURES surface answers 409 `perps_not_armed` (403 `perps_capital_missing` when armed without the capital).
 
+**Bybit spot is the second live venue, LIVE ONLY** (P7-F): paper sessions, backtests and previews stay
+Binance-only — a bybit start of one is refused by name — and a live bybit session runs through exactly the same
+armed gate and one-time codes as Binance's.
+
+- **The bybit key recipe**: enable *Spot Trading* on the key, disable everything else — in particular
+  **Withdrawal must be off** (bybit names it `Withdraw` inside the key's `Wallet` permission). Connecting a
+  withdrawal-capable key on mainnet is refused 422 `credentials_can_withdraw` with nothing stored. The
+  permission read is GET `/v5/user/query-api`; arming re-fetches it live for every **connected** supported
+  spot venue — an unconnected venue is skipped, so arming binance never waits on bybit, but a connected
+  bybit key that has since gained withdrawals refuses the whole arm (fail-closed by design).
+- **Bybit has no OCO**: a stop-plus-take-profit is a TP+SL conditional pair behind the spot `tpslOrder`
+  filter, the **stop leg placed first**; a filled leg cancels its sibling on both the fill and the reconcile
+  path (hydra does the cancelling — bybit has no list to do it). A trailing spec degrades to the fixed stop
+  (bybit's trailing order is amount-based, so no percent trail is invented). The kill-switch sweep cancels
+  both bybit namespaces (regular orders and `tpslOrder`) per traded symbol.
+- **Testnet**: bybit has a real one (`api-testnet.bybit.com`); keys checked there store no permission
+  record, like Binance's testnet.
+- **Not yet proven on the real exchange**: bybit's live semantics are verified against the wire-contract
+  fake (`tests/fixtures/bybit_trading.py`, written from the ccxt source) and the offline ccxt surface
+  guard until the on-box testnet battery runs as the first post-deploy action — the perps precedent. The
+  battery's first check: a triggered `tpslOrder` keeps the client id (`orderLinkId`) fills are matched on.
+
 **Risk disclosure**: live trading can lose the `live_capital` allocation and more if a stop is rejected or the
 exchange fails; the dead-man section states the residual risks. The first real mainnet order is the W8 on-box
 battery, testnet first.

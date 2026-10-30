@@ -28,9 +28,7 @@ interface StrategyNameDialogProps {
 const EXCHANGE_OPTIONS = [
   { value: 'binance', label: 'Binance' },
   { value: 'binanceusdm', label: 'Binance USD⌂-M (perps)' },
-  { value: 'bybit', label: 'Bybit' },
-  { value: 'kraken', label: 'Kraken' },
-  { value: 'okx', label: 'OKX' },
+  { value: 'bybit', label: 'Bybit (live only)' },
 ];
 
 const LEVERAGE_OPTIONS = [

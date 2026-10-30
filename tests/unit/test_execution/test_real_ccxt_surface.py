@@ -17,8 +17,10 @@ from typing import Any
 
 import ccxt
 import ccxt.async_support
+import pytest
 
 from hydra.core.types import MarketType
+from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.exchange_client import ExchangeClient
 
 SPOT_IMPLICIT_METHODS: tuple[str, ...] = (
@@ -75,6 +77,38 @@ FAPI_LIVE_IMPLICIT_METHODS: tuple[str, ...] = (
 FUNDING_IMPLICIT_METHODS: tuple[str, ...] = (
     "fapiPublicGetFundingRate",
     "fetchFundingRateHistory",
+)
+
+BYBIT_IMPLICIT_METHODS: tuple[str, ...] = (
+    # the key-permission read (the Settings connect and the R8 arm re-fetch)
+    "privateGetV5UserQueryApi",
+    # POST /v5/order/create: every plain order and every protective conditional leg
+    "privatePostV5OrderCreate",
+    # DELETE /v5/order/cancel: leg cancels and the orderLinkId cancels
+    "privatePostV5OrderCancel",
+    # GET /v5/order/realtime: the plain read, the tpslOrder-filter read and the
+    # orderLinkId lookups (ccxt's fetch_order rides the same endpoint)
+    "privateGetV5OrderRealtime",
+    # POST /v5/order/cancel-all: the kill-switch sweep, once per orderFilter namespace
+    "privatePostV5OrderCancelAll",
+)
+"""Every implicit name the bybit live path (P7-F) reaches through the unified methods —
+pinned on a fresh real ccxt.bybit. Bybit routes conditional spot orders (the protective
+tpsl legs) through the same endpoints with the ``orderFilter`` param, so the create/read/
+cancel trio plus the query-api read is the whole surface."""
+
+BYBIT_UNIFIED_METHODS: tuple[str, ...] = (
+    "create_order",
+    "fetch_open_orders",
+    "fetch_order",
+    "cancel_order",
+    "cancel_all_orders",
+    "fetch_balance",
+    "fetch_my_trades",
+    "fetch_ticker",
+    "fetch_tickers",
+    "fetch_ohlcv",
+    "load_markets",
 )
 
 
@@ -181,6 +215,178 @@ def test_binanceusdm_routes_conditional_orders_through_the_algo_api() -> None:
         "a callbackRate order must classify as conditional on binanceusdm"
     )
     assert not exchange.is_conditional_order({"reduceOnly": True})
+
+
+def test_bybit_implicit_methods_exist_sync() -> None:
+    missing = _missing(ccxt.bybit(), BYBIT_IMPLICIT_METHODS)
+    assert not missing, f"ccxt {ccxt.__version__} bybit lacks implicit methods: {missing}"
+
+
+async def test_bybit_implicit_methods_exist_async() -> None:
+    exchange = ccxt.async_support.bybit()
+    try:
+        missing = _missing(exchange, BYBIT_IMPLICIT_METHODS)
+        assert not missing, f"ccxt {ccxt.__version__} async bybit lacks: {missing}"
+    finally:
+        await exchange.close()
+
+
+def test_bybit_unified_surface_exists() -> None:
+    """The unified methods the bybit path calls, pinned with their ``has`` flags on a
+    fresh real bybit (construction only; nothing is fetched)."""
+    exchange = ccxt.bybit()
+    missing = _missing(exchange, BYBIT_UNIFIED_METHODS)
+    assert not missing, f"ccxt {ccxt.__version__} bybit lacks unified methods: {missing}"
+    for flag in ("createOrder", "fetchOpenOrders", "fetchOrder", "cancelOrder", "cancelAllOrders"):
+        assert exchange.has.get(flag) is True, f"bybit has {flag} disabled"
+    # the wire assumption the pair is built on: bybit spot has NO list orders
+    assert exchange.has.get("createOrderList") is not True
+
+
+async def test_bybit_routes_the_conditional_read_to_the_tpsl_namespace() -> None:
+    """The SEAM call, pinned on a fresh real bybit (construction-only): the wrapper's
+    ``conditional=True`` read must carry ``orderFilter: 'tpslOrder'`` — bybit's
+    conditional spot orders rest behind that filter of the realtime endpoint."""
+    exchange = ccxt.async_support.bybit({"apiKey": "x", "secret": "y"})
+    try:
+        exchange.set_markets(
+            [
+                {
+                    "id": "BTCUSDT",
+                    "symbol": "BTC/USDT",
+                    "base": "BTC",
+                    "quote": "USDT",
+                    "type": "spot",
+                    "spot": True,
+                    "swap": False,
+                    "future": False,
+                    "option": False,
+                    "margin": False,
+                    "linear": False,
+                    "inverse": False,
+                    "contract": False,
+                }
+            ]
+        )
+        filters: list[Any] = []
+
+        async def _realtime(request: Any = None, params: Any = None) -> list[dict[str, Any]]:
+            filters.append((request or {}).get("orderFilter"))
+            return []
+
+        exchange.privateGetV5OrderRealtime = _realtime
+        client = ExchangeClient("bybit", {}, market_type=MarketType.SPOT)
+        client._exchange = exchange
+
+        assert await client.fetch_open_orders("BTC/USDT", conditional=True) == []
+        assert filters == ["tpslOrder"], (
+            "the bybit conditional read must hit the tpslOrder filter, not the regular "
+            f"one (hit: {filters})"
+        )
+        filters.clear()
+        assert await client.fetch_open_orders("BTC/USDT") == []
+        assert filters == [None], (
+            f"the unconditional bybit read must stay on the regular namespace (hit: {filters})"
+        )
+    finally:
+        await exchange.close()
+
+
+async def test_bybit_by_client_id_reads_never_put_an_orderid_on_the_wire() -> None:
+    """The #210/#218 class, pinned on a fresh real bybit (construction-only): ccxt 4.5.88's
+    bybit ``fetch_order`` ALWAYS sets ``request['orderId'] = id``, so a by-client-id read
+    routed through it put the literal ``orderId=None`` on the wire (10001 on the real
+    exchange — every by-cid leg read failed). The wrapper must route the by-cid read
+    through ``fetch_open_orders``, which passes ``orderLinkId`` through untouched."""
+    exchange = ccxt.async_support.bybit({"apiKey": "x", "secret": "y"})
+    try:
+        # a UTA account: the capability flags a real session caches after its first check
+        exchange.options["enableUnifiedMargin"] = False
+        exchange.options["enableUnifiedAccount"] = True
+        exchange.set_markets(
+            [
+                {
+                    "id": "BTCUSDT",
+                    "symbol": "BTC/USDT",
+                    "base": "BTC",
+                    "quote": "USDT",
+                    "type": "spot",
+                    "spot": True,
+                    "swap": False,
+                    "future": False,
+                    "option": False,
+                    "margin": False,
+                    "linear": False,
+                    "inverse": False,
+                    "contract": False,
+                }
+            ]
+        )
+        requests: list[dict[str, Any]] = []
+
+        async def _realtime(request: Any = None, params: Any = None) -> dict[str, Any]:
+            requests.append(dict(request or {}))
+            return {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "orderId": "bybit-1",
+                            "orderLinkId": "hyd-sl-1",
+                            "orderFilter": "tpslOrder",
+                            "orderType": "Market",
+                            "side": "Sell",
+                            "orderStatus": "New",
+                            "qty": "0.00999",
+                            "price": "",
+                            "triggerPrice": "95000.00",
+                            "reduceOnly": True,
+                            "createdTime": "1786000000000",
+                        }
+                    ]
+                },
+                "retExtInfo": {},
+                "time": 1,
+            }
+
+        exchange.privateGetV5OrderRealtime = _realtime
+        client = ExchangeClient("bybit", {}, market_type=MarketType.SPOT)
+        client._exchange = exchange
+
+        order = await client.fetch_order(
+            None, "BTC/USDT", {"acknowledged": True, "orderLinkId": "hyd-sl-1"}
+        )
+        assert order["id"] == "bybit-1"
+        assert order["clientOrderId"] == "hyd-sl-1"
+        [wire] = requests
+        assert "orderId" not in wire, f"no exchange id may ride a by-cid read: {wire}"
+        assert wire == {
+            "symbol": "BTCUSDT",
+            "category": "spot",
+            "orderLinkId": "hyd-sl-1",
+            "orderFilter": "tpslOrder",
+        }, f"the by-cid read's wire params: {wire}"
+    finally:
+        await exchange.close()
+
+
+async def test_the_oco_list_surface_refuses_non_binance_venues() -> None:
+    """The guard: create_oco/cancel_order_list/fetch_open_order_lists are Binance-spot
+    calls; a bybit client refuses them BEFORE any exchange call — the pair path provably
+    never touches them."""
+    for market_type, exchange_id in (
+        (MarketType.SPOT, "bybit"),
+        (MarketType.FUTURES, "binanceusdm"),
+    ):
+        client = ExchangeClient(exchange_id, {}, market_type=market_type)
+        with pytest.raises(UnsupportedVenueError, match="Binance-spot-only"):
+            await client.create_oco("BTCUSDT", "SELL", "0.01", "103000", "95000")
+        with pytest.raises(UnsupportedVenueError, match="Binance-spot-only"):
+            await client.cancel_order_list("1", "BTCUSDT")
+        with pytest.raises(UnsupportedVenueError, match="Binance-spot-only"):
+            await client.fetch_open_order_lists("BTCUSDT")
 
 
 async def test_binanceusdm_routes_the_wrappers_conditional_read_to_the_algo_namespace() -> None:

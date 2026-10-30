@@ -752,6 +752,14 @@ async def test_default_rest_factory_builds_the_venues_class() -> None:
         assert spot.options["fetchMarkets"]["types"] == ["spot"]
     finally:
         await spot.close()
+    bybit = ingestion._default_rest_factory("bybit")
+    try:
+        # the registry pins bybit's spot category (its own defaultType default is 'swap')
+        assert bybit.id == "bybit"
+        assert bybit.options["defaultType"] == "spot"
+        assert bybit.options["fetchMarkets"]["types"] == ["spot"]
+    finally:
+        await bybit.close()
 
 
 async def test_consumer_lag_marks_stale_then_live() -> None:

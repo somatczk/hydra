@@ -246,6 +246,58 @@ def binance(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinance]:
     return FakeBinance
 
 
+BYBIT_KEY_INFO: dict[str, Any] = {
+    "retCode": 0,
+    "retMsg": "",
+    "result": {
+        "id": "42",
+        "note": "hydra",
+        "readOnly": 0,
+        "permissions": {
+            "ContractTrade": [],
+            "Spot": ["SpotTrade"],
+            "Wallet": ["AccountTransfer"],
+        },
+        "ips": [],
+    },
+}
+
+
+class FakeBybit:
+    error: ClassVar[BaseException | None] = None
+    key_info: ClassVar[dict[str, Any]] = dict(BYBIT_KEY_INFO)
+    instances: ClassVar[list[FakeBybit]] = []
+
+    def __init__(self, opts: dict[str, Any]) -> None:
+        self.opts = opts
+        self.closed = False
+        self.query_calls = 0
+        FakeBybit.instances.append(self)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def _fake_query_api(fake: FakeBybit, *args: Any) -> dict[str, Any]:
+    fake.query_calls += 1
+    if FakeBybit.error is not None:
+        raise FakeBybit.error
+    return dict(FakeBybit.key_info)
+
+
+# ccxt's camelCase implicit API name, bound as an attribute (pep8-naming flags the def)
+FakeBybit.privateGetV5UserQueryApi = _fake_query_api
+
+
+@pytest.fixture()
+def bybit(monkeypatch: pytest.MonkeyPatch) -> type[FakeBybit]:
+    FakeBybit.error = None
+    FakeBybit.key_info = dict(BYBIT_KEY_INFO)
+    FakeBybit.instances = []
+    monkeypatch.setattr(ccxt.async_support, "bybit", FakeBybit)
+    return FakeBybit
+
+
 @pytest.fixture(autouse=True)
 def credential_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HYDRA_CREDENTIAL_KEY", Fernet.generate_key().decode())
@@ -339,17 +391,74 @@ class TestArmedState:
 
 class TestPermissions:
     def test_normalize_restrictions_maps_the_binance_flags(self) -> None:
-        assert normalize_restrictions(RESTRICTIONS) == {
+        assert normalize_restrictions("binance", RESTRICTIONS) == {
             "enable_spot_and_margin_trading": True,
             "enable_withdrawals": False,
             "ip_restrict": False,
         }
-        assert normalize_restrictions({}) == {
+        assert normalize_restrictions("binance", {}) == {
             "enable_spot_and_margin_trading": False,
             "enable_withdrawals": False,
             "ip_restrict": False,
         }
-        assert normalize_restrictions(None)["enable_spot_and_margin_trading"] is False
+        assert normalize_restrictions("binance", None)["enable_spot_and_margin_trading"] is False
+
+    def test_normalize_restrictions_maps_the_bybit_query_api_answer(self) -> None:
+        """GET /v5/user/query-api (the Bybit apikey-info shape, as ccxt passes it raw):
+        spot trading is 'SpotTrade' in permissions['Spot'], withdrawals are 'Withdraw'
+        in permissions['Wallet'], the IP restriction is a specific (non-'*') ips entry."""
+        assert normalize_restrictions(
+            "bybit",
+            {
+                "retCode": 0,
+                "result": {
+                    "id": "2208369",
+                    "readOnly": 0,
+                    "permissions": {
+                        "ContractTrade": ["Order", "Position"],
+                        "Spot": ["SpotTrade"],
+                        "Wallet": ["AccountTransfer"],
+                        "Options": [],
+                        "Derivatives": [],
+                    },
+                    "ips": ["91.0.0.1"],
+                },
+            },
+        ) == {
+            "enable_spot_and_margin_trading": True,
+            "enable_withdrawals": False,
+            "ip_restrict": True,
+        }
+        # a withdraw-capable key, an unrestricted ips list and the legacy permission
+        # names (either account generation can sit behind the same key) all read honestly
+        assert normalize_restrictions(
+            "bybit",
+            {
+                "result": {
+                    "permissions": {
+                        "Spot": [],
+                        "Wallet": ["AccountTransfer", "Withdraw"],
+                    },
+                    "ips": ["*"],
+                }
+            },
+        ) == {
+            "enable_spot_and_margin_trading": False,
+            "enable_withdrawals": True,
+            "ip_restrict": False,
+        }
+        assert (
+            normalize_restrictions(
+                "bybit",
+                {"result": {"permissions": {"SpotTrading": ["AccountRead", "AccountTrade"]}}},
+            )["enable_spot_and_margin_trading"]
+            is True
+        )
+        assert (
+            normalize_restrictions("bybit", {"retCode": 10003})["enable_spot_and_margin_trading"]
+            is False
+        )
+        assert normalize_restrictions("bybit", None)["enable_withdrawals"] is False
 
     def test_stored_permissions_parses_jsonb_text(self) -> None:
         raw = json.dumps({"enable_spot_and_margin_trading": True})
@@ -403,9 +512,11 @@ class TestRequireLiveCapableCredentials:
     async def test_trade_only_keys_pass_and_are_refetched(self, binance: type[FakeBinance]) -> None:
         db = _Db(credentials={"binance": _creds_row()})
         assert await require_live_capable_credentials(db) == {
-            "enable_spot_and_margin_trading": True,
-            "enable_withdrawals": False,
-            "ip_restrict": False,
+            "binance": {
+                "enable_spot_and_margin_trading": True,
+                "enable_withdrawals": False,
+                "ip_restrict": False,
+            }
         }
         [probe] = FakeBinance.instances
         assert probe.restriction_calls == 1  # R8: the live re-fetch, not the snapshot
@@ -450,6 +561,111 @@ class TestRequireLiveCapableCredentials:
         with pytest.raises(ServiceError) as exc:
             await require_live_capable_credentials(_Db(credentials={"binance": _creds_row()}))
         assert _detail(exc.value)["code"] == "credentials_not_live_capable"
+
+
+# ---------------------------------------------------------------------------
+# The arm loop: every CONNECTED supported spot venue is re-checked (P7-F)
+# ---------------------------------------------------------------------------
+
+
+class TestTheArmLoop:
+    async def test_an_unconnected_bybit_never_blocks_arming_binance(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        """An unconnected venue is skipped: only binance's key is probed."""
+        checked = await require_live_capable_credentials(_Db(credentials={"binance": _creds_row()}))
+        assert checked == {
+            "binance": {
+                "enable_spot_and_margin_trading": True,
+                "enable_withdrawals": False,
+                "ip_restrict": False,
+            }
+        }
+        assert FakeBybit.instances == []
+
+    async def test_bybit_trade_only_keys_pass_and_are_refetched(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        db = _Db(credentials={"binance": _creds_row(), "bybit": _creds_row()})
+        checked = await require_live_capable_credentials(db)
+        assert checked["bybit"] == {
+            "enable_spot_and_margin_trading": True,
+            "enable_withdrawals": False,
+            "ip_restrict": False,
+        }
+        [probe] = FakeBybit.instances
+        assert probe.query_calls == 1  # the v5 query-api re-fetch, not the snapshot
+        assert "sandbox" not in probe.opts  # the mainnet client
+        assert probe.closed is True
+
+    async def test_a_connected_bybit_key_with_withdraw_refuses_the_arm(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        """The fail-closed arm: ANY connected venue's key that can withdraw refuses the
+        arm for all of them, naming the venue."""
+        FakeBybit.key_info = {
+            "retCode": 0,
+            "result": {
+                "permissions": {"Spot": ["SpotTrade"], "Wallet": ["AccountTransfer", "Withdraw"]},
+                "ips": [],
+            },
+        }
+        db = _Db(credentials={"binance": _creds_row(), "bybit": _creds_row()})
+        with pytest.raises(ServiceError) as exc:
+            await require_live_capable_credentials(db)
+        assert _detail(exc.value)["code"] == "credentials_not_live_capable"
+        assert "bybit key has withdrawals enabled" in _detail(exc.value)["message"]
+
+    async def test_a_connected_bybit_key_that_cannot_trade_refuses_the_arm(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        FakeBybit.key_info = {
+            "retCode": 0,
+            "result": {"permissions": {"Spot": [], "Wallet": ["AccountTransfer"]}, "ips": []},
+        }
+        db = _Db(credentials={"binance": _creds_row(), "bybit": _creds_row()})
+        with pytest.raises(ServiceError) as exc:
+            await require_live_capable_credentials(db)
+        assert _detail(exc.value)["code"] == "credentials_not_live_capable"
+        assert "bybit key cannot trade spot" in _detail(exc.value)["message"]
+
+    async def test_bybit_testnet_keys_refuse_the_arm(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        db = _Db(
+            credentials={
+                "binance": _creds_row(),
+                "bybit": _creds_row(environment="testnet"),
+            }
+        )
+        with pytest.raises(ServiceError) as exc:
+            await require_live_capable_credentials(db)
+        assert _detail(exc.value)["code"] == "credentials_not_live_capable"
+        assert "bybit credentials are not validated for mainnet" in _detail(exc.value)["message"]
+        assert FakeBybit.instances == []  # never reached the exchange
+
+    async def test_a_bybit_outage_refuses_the_arm_for_every_venue(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        """Fail-closed by design (documented): a connected venue whose permissions
+        cannot be re-read refuses the arm for binance too."""
+        FakeBybit.error = ccxt.NetworkError("dns")
+        db = _Db(credentials={"binance": _creds_row(), "bybit": _creds_row()})
+        with pytest.raises(ServiceError) as exc:
+            await require_live_capable_credentials(db)
+        assert _detail(exc.value)["code"] == "credentials_not_live_capable"
+        assert "bybit key permissions could not be re-validated" in _detail(exc.value)["message"]
+
+    async def test_no_stored_keys_on_any_venue_is_403(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        with pytest.raises(ServiceError) as exc:
+            await require_live_capable_credentials(_Db())
+        assert (_detail(exc.value)["code"], exc.value.status_code) == (
+            "live_credentials_missing",
+            403,
+        )
+        assert FakeBinance.instances == [] and FakeBybit.instances == []
 
 
 # ---------------------------------------------------------------------------

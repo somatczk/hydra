@@ -38,7 +38,6 @@ from decimal import Decimal
 from typing import Any, Literal
 
 from hydra.core.types import OrderType
-from hydra.execution.exchange_stops import normalize_open_orders
 from hydra.execution.live_executor import LiveOrderPoller, LiveTradingExecutor
 from hydra.execution.live_orders import (
     TERMINAL_STATUSES,
@@ -48,6 +47,7 @@ from hydra.execution.live_orders import (
     map_ccxt_status,
 )
 from hydra.execution.paper_trading import _opt_d
+from hydra.execution.venue_stops import fetch_bybit_leg, is_pair_venue, normalize_open_orders
 
 logger = logging.getLogger(__name__)
 
@@ -147,10 +147,15 @@ async def _drift_pass(
         set(await store.symbols(session_id))
         | {str(p.symbol) for p in await executor.get_positions() if p.quantity > 0}
     )
+    pair_venue = is_pair_venue(str(executor._exchange_id))
     legs: list[dict[str, Any]] = []
     for symbol in symbols:
         try:
-            legs.extend(normalize_open_orders(await client.fetch_open_orders(symbol)))
+            raw = await client.fetch_open_orders(symbol)
+            if pair_venue:
+                # bybit's conditional legs rest behind the tpslOrder filter: read it too
+                raw += await client.fetch_open_orders(symbol, conditional=True)
+            legs.extend(normalize_open_orders(str(executor._exchange_id), raw))
         except Exception as exc:
             logger.warning("Reconcile open orders of %s unreadable: %s", symbol, exc)
             return _status(
@@ -170,7 +175,7 @@ async def _drift_pass(
         for row in open_rows:
             if any(_leg_matches_row(leg, row) for leg in legs):
                 continue
-            finding = await _terminalize(store, client, row)
+            finding = await _terminalize(store, client, row, pair_venue=pair_venue)
             if finding is not None:
                 findings.append(finding)
     except _OrderReadError as exc:
@@ -214,7 +219,11 @@ async def _tracked(store: LiveOrderStore, leg: dict[str, Any]) -> bool:
     if oco_id and await store.tracked_by_order_list_id(str(oco_id)):
         return True
     client_id = str(leg.get("client_order_id") or "")
-    return bool(client_id) and await store.by_client_order_id(client_id) is not None
+    if not client_id:
+        return False
+    if await store.by_client_order_id(client_id) is not None:
+        return True
+    return await store.tracked_by_leg_client_order_id(client_id)
 
 
 def _leg_matches_row(leg: dict[str, Any], row: LiveOrderRecord) -> bool:
@@ -240,18 +249,24 @@ class _OrderGoneError(Exception):
     """The exchange definitively does not know this order id (-2013: evidence, not an error)."""
 
 
-async def _terminalize(store: LiveOrderStore, client: Any, row: LiveOrderRecord) -> str | None:
+async def _terminalize(
+    store: LiveOrderStore, client: Any, row: LiveOrderRecord, *, pair_venue: bool = False
+) -> str | None:
     """Prove how a row the exchange no longer lists ended, and apply it monotonically.
 
     Positive evidence only: a fetch_order answer, or (for an OCO) every leg answering.
-    A refused or unchanged apply is a benign no-op (R16), not a finding; a lookup the
-    exchange cannot answer is reported as drift and the row is left exactly as it was —
-    never guessed terminal on negative evidence (F8's rule, applied to acked rows too).
+    Bybit pairs resolve by their two leg ids — a list id does not exist there — through
+    the same leg-read primitive the poller uses. A refused or unchanged apply is a
+    benign no-op (R16), not a finding; a lookup the exchange cannot answer is reported
+    as drift and the row is left exactly as it was — never guessed terminal on negative
+    evidence (F8's rule, applied to acked rows too).
     """
     if row.exchange_order_id is None:
         return None  # never acked: A1's resolution path owns this row
     try:
         if row.order_list_id is not None or row.order_type == OrderType.OCO.value:
+            if pair_venue:
+                return await _apply_proven(store, row, await _bybit_pair_answers(client, row))
             return await _apply_proven(store, row, await _oco_answers(client, row))
         answer = await _fetch_order(client, str(row.exchange_order_id), row.symbol)
         return await _apply_proven(store, row, [answer])
@@ -267,6 +282,24 @@ async def _oco_answers(client: Any, row: LiveOrderRecord) -> list[dict[str, Any]
         await _fetch_order(client, leg_cid, row.symbol, by_client_id=True)
         for leg_cid in row.leg_client_order_ids
     ]
+
+
+async def _bybit_pair_answers(client: Any, row: LiveOrderRecord) -> list[dict[str, Any]]:
+    """The bybit pair's landed legs answer by their own client id (the tpsl namespace
+    first, then the regular one) — never a list id, which bybit does not have. A leg cid
+    that answers not-found is a rung that never landed (the degraded ladder's unused
+    cids), not a gone order: only a pair where NOTHING answers is gone."""
+    import ccxt
+
+    answers: list[dict[str, Any]] = []
+    for leg_cid in row.leg_client_order_ids:
+        try:
+            answers.append(await fetch_bybit_leg(client, leg_cid, row.symbol))
+        except ccxt.OrderNotFound:
+            continue
+    if not answers:
+        raise _OrderGoneError
+    return answers
 
 
 async def _fetch_order(

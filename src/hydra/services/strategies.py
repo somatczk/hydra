@@ -22,10 +22,12 @@ from hydra.backtest.data import (
 )
 from hydra.core.config import DataConfig
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
+from hydra.core.venues import registered_venue_ids
 from hydra.data.bars import timeframe_seconds
 from hydra.data.errors import DataFetchError
 from hydra.data.on_demand import OnDemandFetchService
 from hydra.data.storage import MarketDataRepository
+from hydra.data.universe import EXCHANGE_ID as UNIVERSE_VENUE
 from hydra.execution.client_factory import RestHandle, SharedRestClients, validate_venue
 from hydra.execution.errors import (
     ConfigReloadRefusedError,
@@ -33,6 +35,11 @@ from hydra.execution.errors import (
     UnsupportedVenueError,
 )
 from hydra.ml.features import DEFAULT_FEATURE_SPEC
+from hydra.risk.market_rules import (
+    MarketRulesCache,
+    MarketRulesUnavailableError,
+    UnsupportedExchangeError,
+)
 from hydra.services import universe
 from hydra.services.errors import (
     DB_ERRORS,
@@ -56,8 +63,34 @@ logger = logging.getLogger(__name__)
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config" / "strategies"
 _RULE_BASED_CLASS = "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
 _VALID_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d", "1w"}
-_VALID_EXCHANGES = {"binance", "binanceusdm", "bybit", "kraken", "okx"}
+_VALID_EXCHANGES = registered_venue_ids()
+"""The registry's venue ids — you can only save what can start. Kraken and OKX are NOT
+registered (no testnet or no key-permission endpoint — the honest README), so a save
+naming them is refused here instead of saving a strategy no session could ever run."""
 _PERP_EXCHANGES = {"binanceusdm"}
+
+_SAVE_MARKET_RULES = MarketRulesCache()
+"""The save-time venue-existence check's rules cache: one public ``load_markets`` per
+venue per day, the same TTL the session start pays. The test suites swap the loader
+(the ``offline_market_rules`` fixture); nothing here ever needs a key."""
+
+
+async def _require_venue_lists_symbol(exchange_id: str, symbol: str) -> None:
+    """The save-time venue-existence check: the saved venue must list the symbol.
+
+    The universe's own source venue (binance) is exempt — a top-100 member is listed
+    there by construction — every other registered venue (bybit today) is read through
+    ``MarketRulesCache``: a symbol the venue does not list is a 422 naming the venue,
+    at save time, never a session that starts and dies on its first rules load.
+    """
+    if exchange_id == UNIVERSE_VENUE:
+        return
+    try:
+        await _SAVE_MARKET_RULES.get(exchange_id, [symbol])
+    except MarketRulesUnavailableError as exc:
+        raise ServiceError(422, str(exc)) from exc
+    except UnsupportedExchangeError as exc:
+        raise ServiceError(422, f"Invalid exchange: {exchange_id}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +793,7 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
         raise ServiceError(422, f"Invalid timeframe: {body.timeframes.primary}")
 
     await universe.validate_symbol(pool, body.symbol)
+    await _require_venue_lists_symbol(body.exchange_id, body.symbol)
 
     existing_enabled = data.get("enabled", False)
     # a larger hand-set (YAML-imported) value survives a builder edit
@@ -1055,6 +1089,7 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
         raise ServiceError(422, f"Invalid timeframe: {request.timeframes.primary}")
 
     await universe.validate_symbol(pool, request.symbol)
+    await _require_venue_lists_symbol(request.exchange_id, request.symbol)
 
     strategy_id = _name_to_id(request.name)
     unique_suffix = uuid.uuid4().hex[:6]

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
-import { buttonByText, click, dialogPolyfill, inputByLabel, mount, routeFetch, typeInto, unavailable, type Mounted, type Mutations } from '@/test/pageHarness';
+import { buttonByText, click, dialogPolyfill, flush, inputByLabel, mount, routeFetch, typeInto, unavailable, type Mounted, type Mutations } from '@/test/pageHarness';
 import { liveChallenge, liveStatus, platformConfig, session } from '@/test/fixtures';
 
 const fetchApi = vi.fn();
@@ -266,5 +266,33 @@ describe('StartSessionDialog perp door (P4-E: a perp strategy answers to the per
     await typeInto(inputByLabel(m.container, 'One-time code'), '482913');
     await click(buttonByText(m.container, 'Start live session'));
     expect(push).toHaveBeenCalledWith('/trading/new-perp');
+  });
+});
+
+describe('StartSessionDialog bybit strategy (P7-F: the live-only venue)', () => {
+  const BYBIT_DETAIL = {
+    id: 'bybit-bot',
+    name: 'Bybit bot',
+    symbol: 'BTCUSDT',
+    timeframes: { primary: '1h' },
+    exchange_id: 'bybit',
+  };
+
+  it('names the live-only venue on the strategy line', async () => {
+    fetchApi.mockImplementation(
+      routeFetch(
+        {
+          '/api/risk/live-status': liveStatus({ live_armed: true }),
+          '/api/trading/sessions': [],
+          '/api/system/config': platformConfig(),
+          '/api/strategies/bybit-bot': BYBIT_DETAIL,
+        },
+        calls,
+      ),
+    );
+    m = await mount(<ShellStatusProvider><StartSessionDialog strategyId="bybit-bot" onClose={vi.fn()} /></ShellStatusProvider>);
+    await flush();
+    expect(text()).toContain('Bybit bot · Bybit spot (live only) · BTCUSDT · 1h · PAPER');
+    expect(text()).not.toContain('Binance spot');
   });
 });

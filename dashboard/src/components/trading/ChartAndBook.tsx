@@ -19,10 +19,22 @@ interface OrderBook {
 const ORDER_BOOK_MAX_AGE_MS = 15_000;
 const DEPTH = 5;
 
+/** The session's exchange -> TradingView symbol prefix (bybit joins live-only, P7-F). */
+const TRADING_VIEW_PREFIX: Record<string, string> = {
+  binance: 'BINANCE',
+  binanceusdm: 'BINANCE',
+  bybit: 'BYBIT',
+};
+
 /** Cross-origin TradingView widget: no third-party script runs in this origin (DB-17). */
-export function tradingViewSrc(symbol: string, theme: 'dark' | 'light'): string {
+export function tradingViewSrc(
+  symbol: string,
+  theme: 'dark' | 'light',
+  exchangeId: string = 'binance',
+): string {
+  const venue = TRADING_VIEW_PREFIX[exchangeId] ?? 'BINANCE';
   const params = new URLSearchParams({
-    symbol: `BINANCE:${symbol}`,
+    symbol: `${venue}:${symbol}`,
     interval: '60',
     theme,
     style: '1',
@@ -72,7 +84,13 @@ function Book({ symbol }: { symbol: string }) {
 }
 
 /** The session's market: TradingView chart and Hydra's order book; behind a button below 1024 px. */
-export function ChartAndBook({ symbol }: { symbol: string }) {
+export function ChartAndBook({
+  symbol,
+  exchangeId = 'binance',
+}: {
+  symbol: string;
+  exchangeId?: string;
+}) {
   const { resolved } = useTheme();
   const [open, setOpen] = useState(false);
   return (
@@ -91,11 +109,14 @@ export function ChartAndBook({ symbol }: { symbol: string }) {
         </button>
       </div>
       <div className={open ? 'flex flex-col gap-4' : 'hidden flex-col gap-4 lg:flex'}>
-        <DataCard title={symbol} description="TradingView chart (Binance spot data from TradingView, not Hydra's stored bars)">
+        <DataCard
+          title={symbol}
+          description={`TradingView ${exchangeId} data from TradingView, not Hydra's stored bars`}
+        >
           <iframe
             key={resolved}
             title={`TradingView ${symbol} chart`}
-            src={tradingViewSrc(symbol, resolved)}
+            src={tradingViewSrc(symbol, resolved, exchangeId)}
             className="h-[28rem] w-full rounded border-0"
             sandbox="allow-scripts allow-same-origin allow-popups"
             referrerPolicy="no-referrer"

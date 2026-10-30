@@ -37,8 +37,7 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Exchange definitions: id -> display name; Binance spot + Binance USD⌂-M perps are
-# connectable (P4-F closes the futures-keys gap; the others stay decision 4's later cut)
+# Exchange definitions: id -> display name; binance + bybit spot connect, kraken/okx refused
 _EXCHANGE_DEFS: dict[str, str] = {
     "binance": "Binance",
     "binanceusdm": "Binance USD⌂-M",
@@ -46,7 +45,7 @@ _EXCHANGE_DEFS: dict[str, str] = {
     "kraken": "Kraken",
     "okx": "OKX",
 }
-_SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance", "binanceusdm"})
+_SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance", "binanceusdm", "bybit"})
 CONNECT_TIMEOUT_S = 10.0
 
 TradingMode = Literal["paper", "live"]
@@ -492,7 +491,8 @@ def _require_supported(exchange_id: str) -> str:
         raise api_error(
             400,
             "unsupported_exchange",
-            f"{_EXCHANGE_DEFS[exchange_id]} is not supported yet; only Binance can be connected",
+            f"{_EXCHANGE_DEFS[exchange_id]} is not supported and not scheduled; supported "
+            "connections are Binance, Binance USD⌂-M and Bybit",
             "invalid",
         )
     return exchange_id
@@ -1006,8 +1006,10 @@ async def _check_credentials(
 ) -> dict[str, Any] | None:
     """One read-only balance call, then the key's permissions on mainnet (never trades).
 
-    Returns the normalized ``validated_permissions`` record for storage, or ``None``
-    on testnet (the apiRestrictions read is a mainnet-only check). A
+    The permission read goes through the venue's registry key check — Binance's sapi
+    apiRestrictions, bybit's v5 user query-api — and normalizes to the same canonical
+    ``validated_permissions`` shape. Returns the normalized record for storage, or
+    ``None`` on testnet (the permission read is a mainnet-only check). A
     withdrawals-enabled key is refused 422 ``credentials_can_withdraw`` — nothing is
     stored — so a connected key is trade-only.
     """
@@ -1022,7 +1024,7 @@ async def _check_credentials(
         restrictions: dict[str, Any] | None = None
         if environment == "mainnet":
             raw = await _keyed_read(client.fetch_api_restrictions(), name)
-            restrictions = normalize_restrictions(raw)
+            restrictions = normalize_restrictions(exchange_id, raw)
             if restrictions["enable_withdrawals"]:
                 raise api_error(
                     422,

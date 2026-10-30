@@ -14,8 +14,10 @@ uv run pytest tests/integration/test_session_recovery_pg.py -m integration   # n
 ## Invariants
 
 - `client_factory` is the only place that builds exchange clients, executors and feed clients on the
-  session path; `ALLOWED_VENUES` is binance SPOT and binanceusdm FUTURES, anything else is
-  `UnsupportedVenueError` (`tests/unit/test_execution/test_session_split.py::test_only_client_factory_constructs_exchange_clients`,
+  session path; `ALLOWED_VENUES` is binance SPOT, binanceusdm FUTURES and bybit SPOT (live only — the
+  registry's mode caps: `validate_venue`'s `mode` keyword refuses a bybit paper or backtest start by
+  name), anything else is `UnsupportedVenueError`
+  (`tests/unit/test_execution/test_session_split.py::test_only_client_factory_constructs_exchange_clients`,
   `tests/unit/test_execution/test_client_factory.py`).
 - Backtest and paper share one execution path; a change to fills or the paper executor must keep
   `tests/unit/test_backtest/test_execution_parity.py::test_backtest_equals_paper_session_on_the_same_bars` green.
@@ -25,11 +27,19 @@ uv run pytest tests/integration/test_session_recovery_pg.py -m integration   # n
 - Live orders are outbox-first: the `pending_submit` row (a `hyd-` client id) exists before the exchange
   call, and no path resubmits an unsettled row; the poller resolves it by client id
   (`tests/unit/test_execution/test_live_orders.py::test_outbox_first_and_ack_flow`).
-- No live position without a confirmed exchange-side protective order. Spot: `exchange_stops.arm_exchange_stop`
-  ladder (OCO, then STOP_LOSS, then the 5 % default); a definitive rejection of every rung raises
+- No live position without a confirmed exchange-side protective order. Per-venue protective adapters
+  (`venue_stops` dispatches on the registry's protective kind): Binance spot's `exchange_stops.arm_exchange_stop`
+  ladder (OCO, then STOP_LOSS, then the 5 % default); bybit's conditional TP+SL pair, the stop leg placed first
+  (it has no OCO — the perp pair pattern); a definitive rejection of every rung raises
   `StopUnplaceableError` and the position is market-closed (decision 17); a timeout propagates, never falls
-  through the ladder (`tests/unit/test_execution/test_exchange_stops.py`). Operator view:
+  through the ladder (`tests/unit/test_execution/test_exchange_stops.py`,
+  `tests/unit/test_execution/test_bybit_protective.py`). Operator view:
   [docs/live-trading.md](../../../docs/live-trading.md).
+- Bybit spot's conditional orders rest behind the `tpslOrder` filter: every leg read goes through
+  `venue_stops.fetch_bybit_leg`, every leg cancel carries the filter, and a never-acked leg cancels by
+  `orderLinkId` alone. Bybit fills map to their pair row through the order's client id (no list id exists);
+  a filled leg cancels its siblings on both the fill and the reconcile path, exactly like the perps
+  (`tests/unit/test_execution/test_bybit_protective.py`).
 - Every entry fill arms one protective group (stop, OCO with a take-profit, or trailing), 5 % stop by
   default from the strategy `risk:` block (`tests/unit/test_execution/test_protective_orders.py::TestArming::test_every_entry_gets_the_default_five_percent_stop`).
 - Perps have no OCO: the protective pair is two reduce-only conditional orders, stop leg first; a rejected
@@ -53,5 +63,6 @@ uv run pytest tests/integration/test_session_recovery_pg.py -m integration   # n
 - `session_manager.py` (start/stop/recovery), `session_wiring.py` (one session's runtime; the closed-bar
   handler runs before the strategy sees the bar), `order_manager.py` (dedup, clamp, risk check).
 - Paper: `paper_trading.py`, `perp_trading.py`. Live (subclasses of the paper ones): `live_executor.py`,
-  `perp_live.py`, plus `live_orders.py`, `reconcile.py`, `exchange_stops.py`, `protective_orders.py`.
-- Exchange fakes for tests: `tests/fixtures/binance_trading.py`.
+  `perp_live.py`, plus `live_orders.py`, `reconcile.py`, `venue_stops.py` (the per-venue protective
+  dispatch and the bybit pair), `exchange_stops.py` (the Binance spot adapter), `protective_orders.py`.
+- Exchange fakes for tests: `tests/fixtures/binance_trading.py`, `tests/fixtures/bybit_trading.py`.

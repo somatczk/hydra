@@ -311,6 +311,14 @@ async def test_futures_config_is_rejected() -> None:
         await _run(config=config)
 
 
+async def test_bybit_config_is_rejected_as_the_live_only_venue() -> None:
+    """The registry's mode cap: backtests ride the paper cap, so a bybit backtest is
+    refused by name (research and testing stay on Binance data — P7-F)."""
+    config = _config(exchange={"exchange_id": "bybit", "market_type": "SPOT"})
+    with pytest.raises(UnsupportedVenueError, match="live-only venue"):
+        await _run(config=config)
+
+
 async def test_position_sizing_is_honoured() -> None:
     small = await _run(config=_config(position_sizing={"max_position_pct": 5.0}))
     assert small.transactions[0]["quantity"] == 4.71698

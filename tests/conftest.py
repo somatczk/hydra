@@ -90,7 +90,8 @@ def strategies_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def offline_market_rules(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Backtests load the fixture's spot markets (lot step 0.00001), never public Binance."""
+    """Backtests and strategy saves load the fixture's spot markets (lot step 0.00001),
+    never a public exchange."""
     from hydra.risk.market_rules import MarketRulesCache
     from tests.fixtures.binance_kline import binance_markets
 
@@ -98,3 +99,7 @@ def offline_market_rules(monkeypatch: pytest.MonkeyPatch) -> None:
         return list(binance_markets().values())
 
     monkeypatch.setattr("hydra.backtest.runner._MARKET_RULES", MarketRulesCache(loader=loader))
+    # the save-time venue-existence check reads the same offline markets (P7-F)
+    monkeypatch.setattr(
+        "hydra.services.strategies._SAVE_MARKET_RULES", MarketRulesCache(loader=loader)
+    )

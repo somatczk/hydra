@@ -170,8 +170,11 @@ class SessionRecoveryMixin:
             await self._recover_live_one(session)
             return
         risk = self._require_risk()
+        # the row's own mode: a bybit LIVE row recovers live; a bybit paper row is errored
         exchange_id: ExchangeId = client_factory.validate_venue(
-            session.exchange_id, client_factory.venue_market_type(session.exchange_id)
+            session.exchange_id,
+            client_factory.venue_market_type(session.exchange_id),
+            mode="paper",
         )
         rules_error: Exception | None = None
         rules: Any = None
@@ -211,7 +214,9 @@ class SessionRecoveryMixin:
             if rules_error is not None:
                 raise rules_error
             cfg = self._recovery_config(session)
-            client_factory.validate_venue(session.exchange_id, cfg.exchange.market_type)
+            client_factory.validate_venue(
+                session.exchange_id, cfg.exchange.market_type, mode="paper"
+            )
             required_history = await probe_strategy(cfg, self._config)
             if session.paper_capital is None or session.paper_capital <= 0:
                 raise PaperCapitalUnavailableError("the session row has no allocated paper_capital")

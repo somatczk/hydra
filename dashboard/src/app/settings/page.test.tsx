@@ -247,7 +247,9 @@ describe('SettingsPage exchange credential state', () => {
     expect(binance?.textContent).toContain('Validated on testnet');
     expect(binance?.textContent).not.toContain('Active');
     expect(page.container.textContent).toContain('Undecryptable, enter the keys again');
-    expect(page.container.textContent).toContain('Not supported yet (Binance only)');
+    expect(page.container.textContent).toContain(
+      'Not supported and not scheduled (Binance, USD⌂-M and Bybit)',
+    );
     const connect = Array.from(page.container.querySelectorAll('button')).filter(
       (b) => b.textContent?.trim() === 'Connect',
     );
