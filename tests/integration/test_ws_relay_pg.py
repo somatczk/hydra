@@ -110,3 +110,70 @@ async def test_rows_before_the_relay_started_are_not_replayed(
     third = await _insert(pool, session_id="s1")
     await _wait(ws, 1)
     assert ws.messages == [{"event": "order_fill", "session_id": "s1", "trade_id": third}]
+
+
+# ---------------------------------------------------------------------------
+# The session-status diff on the real trading_sessions table
+# ---------------------------------------------------------------------------
+
+
+async def _start_session(pool: asyncpg.Pool, session_id: str, status: str = "running") -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO trading_sessions (id, strategy_id, trading_mode, status) "
+            "VALUES ($1, 'sma5', 'paper', $2)",
+            session_id,
+            status,
+        )
+
+
+async def _stop_session(
+    pool: asyncpg.Pool, session_id: str, status: str, error_message: str | None
+) -> str:
+    async with pool.acquire() as conn:
+        stopped_at = await conn.fetchval(
+            "UPDATE trading_sessions SET status = $2, stopped_at = now(), "
+            "error_message = $3 WHERE id = $1 RETURNING stopped_at",
+            session_id,
+            status,
+            error_message,
+        )
+    assert stopped_at is not None
+    return stopped_at.isoformat()
+
+
+async def test_a_session_leaving_the_running_set_ticks_once(
+    relay: TradesRelay, pool: asyncpg.Pool, ws: Socket
+) -> None:
+    await _start_session(pool, "s1")
+    await _start_session(pool, "s2")
+    await relay.ensure_started()
+    await asyncio.sleep(0.3)
+
+    await _stop_session(pool, "s1", "stopped", None)
+    await _wait(ws, 1)
+    (tick,) = ws.messages
+    assert tick["event"] == "session_status"
+    assert tick["session_id"] == "s1"
+    assert tick["status"] == "stopped"
+    assert tick["stopped_at"] is not None
+    assert tick["error_message"] is None
+    await asyncio.sleep(0.3)
+    assert len(ws.messages) == 1  # one tick per transition, never per poll
+
+    await _stop_session(pool, "s1", "error", "ccxtpro: websocket closed")
+    await asyncio.sleep(0.3)
+    assert len(ws.messages) == 1  # already out of the running set: no re-tick
+
+
+async def test_an_errored_session_carries_its_error_message(
+    relay: TradesRelay, pool: asyncpg.Pool, ws: Socket
+) -> None:
+    await _start_session(pool, "s1")
+    await relay.ensure_started()
+    await asyncio.sleep(0.3)
+
+    await _stop_session(pool, "s1", "error", "ccxtpro: websocket closed")
+    await _wait(ws, 1)
+    assert ws.messages[0]["status"] == "error"
+    assert ws.messages[0]["error_message"] == "ccxtpro: websocket closed"

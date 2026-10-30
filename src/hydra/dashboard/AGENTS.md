@@ -46,6 +46,10 @@ uv run mypy src/hydra/dashboard/ --strict   # the package is on CI's strict line
 
 ## Where things are
 - `api.py` app assembly and WebSocket routes (`/ws/market`, `/ws/trades`, `/ws/portfolio`, `/ws/signals`, `/ws/risk`);
-  `ws_relay.py` polls `trades` every 2 s and ticks `/ws/trades`, so fills reach the browser in both process modes.
+  `ws_relay.py` polls `trades` every 2 s and ticks `/ws/trades` (the fill tick per new row, plus one
+  `session_status` tick when a session leaves the running set), so both reach the browser in both process modes;
+  `risk_relay.py` polls the risk tables every 2 s, ticks `/ws/risk` (a `risk_event` per new row, a diffed
+  `risk_state` heartbeat) and hands every row to the Telegram sink — the lifespan starts it at startup, so the
+  alerter pages with no browser connected.
 - `routes/` one router per area; `routes/_db.py` envelope and pool helpers.
 - `lifespan.py` startup and shutdown order (documented in its docstring).

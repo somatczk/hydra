@@ -144,7 +144,12 @@ describe('SettingsPage', () => {
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
     expect(page.container.querySelector('h1')?.textContent).toBe('Settings');
     const text = page.container.textContent ?? '';
-    expect(text).toContain('Alerts are sent by Alertmanager to Telegram. Change them in the alert rules, not here.');
+    expect(text).toContain(
+      'Risk alerts go to Telegram from the engine itself: every risk event is pushed using the bot token and chat id stored write-only in platform config.',
+    );
+    expect(text).toContain(
+      'Infra paging still rides Alertmanager to Telegram (change it in the alert rules, not here).',
+    );
     expect(text).toContain("Webhook alerts aren't sent in this version.");
     expect(page.container.querySelector('[role="switch"]')).toBeNull();
     expect(text).not.toContain('Discord');

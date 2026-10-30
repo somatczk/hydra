@@ -11,6 +11,7 @@ import {
   inputByLabel,
   mount,
   routeFetch,
+  sectionText,
   selectByLabel,
   typeInto,
   unavailable,
@@ -83,6 +84,39 @@ const STATUS = {
 
 const KS_ON_EVENT = { id: 7, ts: '2026-10-21T12:00:00Z', scope: 'global', kind: 'kill_switch_on', tier: null, actor: 'user:soma', reason: 'kill switch (api)', details: { persisted: true } };
 
+/** The shapes the RiskRelay broadcasts on /ws/risk. */
+const RISK_EVENT_TICK = { event: 'risk_event', id: 8, scope: 'paper', kind: 'cb_escalate', tier: 2, actor: 'risk_engine', reason: 'drawdown' };
+const RISK_STATE_BEAT = {
+  event: 'risk_state',
+  scope: 'paper',
+  equity: 9000.5,
+  peak_equity: 10630.1,
+  day_start_equity: 9632.4,
+  daily_loss: 631.9,
+  current_drawdown: 8.0,
+  consecutive_losses: 4,
+  cb_tier: 3,
+  cb_tier_since: '2026-10-30T11:00:00+00:00',
+  daily_halt_until: null,
+  consecutive_pause_until: null,
+  kill_switch_active: false,
+  updated_at: '2026-10-30T12:00:00+00:00',
+};
+
+class FakeWebSocket {
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  static instances: FakeWebSocket[] = [];
+
+  constructor() {
+    FakeWebSocket.instances.push(this);
+  }
+
+  close() {}
+}
+
 let ksState: 'active' | 'inactive' | 'unknown';
 
 function routes(over: Routes = {}): Routes {
@@ -127,12 +161,84 @@ beforeEach(() => {
   calls = [];
   ksState = 'inactive';
   fetchApi.mockReset();
+  FakeWebSocket.instances = [];
+  vi.stubGlobal('WebSocket', FakeWebSocket);
 });
 
 afterEach(() => {
   page?.unmount();
   page = null;
+  vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+const socket = () => {
+  const ws = FakeWebSocket.instances.at(-1);
+  if (!ws) throw new Error('the page never opened /ws/risk');
+  return ws;
+};
+
+const send = (ws: FakeWebSocket, msg: unknown) =>
+  act(() => {
+    ws.onmessage?.({ data: JSON.stringify(msg) });
+  });
+
+describe('the /ws/risk push', () => {
+  it('opens the channel once on mount and shows the provenance line', async () => {
+    const c = await open();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(c.querySelector('#ledger')?.textContent).toContain('Polling every 10 s');
+
+    act(() => socket().onopen?.());
+    expect(c.querySelector('#ledger')?.textContent).toContain('Push connected');
+
+    act(() => socket().onclose?.());
+    expect(c.querySelector('#ledger')?.textContent).toContain('Polling every 10 s');
+  });
+
+  it('refetches status, events and the session list once per burst of risk events, never the kill-switch query', async () => {
+    await open();
+    const count = (path: string) => calls.filter((x) => x.path === path).length;
+    const before = {
+      status: count('/api/risk/status?source=paper'),
+      events: count('/api/risk/events?limit=500'),
+      sessions: count('/api/trading/sessions'),
+      live: count('/api/risk/live-status'),
+    };
+
+    send(socket(), RISK_EVENT_TICK);
+    send(socket(), { ...RISK_EVENT_TICK, id: 9 });
+    await new Promise((r) => setTimeout(r, 650));
+
+    expect(count('/api/risk/status?source=paper')).toBe(before.status + 1);
+    expect(count('/api/risk/events?limit=500')).toBe(before.events + 1);
+    expect(count('/api/trading/sessions')).toBe(before.sessions + 1);
+    expect(count('/api/risk/live-status')).toBe(before.live); // stays on its own poll
+  });
+
+  it('a heartbeat drives the ledger and loss cards until the next poll is fresher', async () => {
+    const c = await open();
+    expect(c.querySelector('#ledger')?.textContent).toContain('9,512.40 USDT');
+
+    send(socket(), RISK_STATE_BEAT);
+    const ledger = c.querySelector('#ledger')?.textContent ?? '';
+    expect(ledger).toContain('9,000.50 USDT');
+    expect(ledger).toContain('Drawdown8.00%');
+    const loss = sectionText(c, "Today's loss");
+    expect(loss).toContain('631.90');
+    expect(loss).toContain('4 of 5');
+
+    send(socket(), RISK_EVENT_TICK); // the debounced refetch lands newer data
+    await new Promise((r) => setTimeout(r, 650));
+    expect(c.querySelector('#ledger')?.textContent).toContain('9,512.40 USDT');
+    expect(sectionText(c, "Today's loss")).toContain('120.00');
+  });
+
+  it('a heartbeat never drives the kill-switch section', async () => {
+    const c = await open();
+    send(socket(), { ...RISK_STATE_BEAT, kill_switch_active: true });
+    expect(c.querySelector('#kill-switch')?.textContent).toContain('Off');
+  });
 });
 
 describe('kill switch section', () => {

@@ -52,6 +52,19 @@ def _store_secret(db: FakeSystemDb, key: str, value: str) -> None:
     db.config[key] = {"value": json.dumps(encrypt(value)), "updated_by": "test"}
 
 
+@pytest.fixture()
+def outbound(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records every URL httpx posts; no request leaves the process."""
+    sent: list[str] = []
+
+    async def _post(self: httpx.AsyncClient, url: str, **_: Any) -> httpx.Response:
+        sent.append(url)
+        return httpx.Response(204, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    return sent
+
+
 class TestWriteOnlySecrets:
     def test_secrets_write_only(self, db: FakeSystemDb) -> None:
         client = TestClient(_make_app(db))
@@ -225,18 +238,133 @@ class TestWebhookAllowlist:
         assert db.value(field) != url
 
 
+class TestTelegramCredentials:
+    """The Telegram pair: encrypted write-only rows, shape-validated, pair-checked at use."""
+
+    BOT_ID = "123456789"
+    BOT_BODY = "AAEhBOweik6ad9r_QXMENQjcrGbqCr4K"
+    TOKEN = f"{BOT_ID}:{BOT_BODY}"
+    CHAT = "-1002146360582"
+    SEND_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+    def test_a_valid_pair_is_accepted_encrypted_and_write_only(self, db: FakeSystemDb) -> None:
+        client = TestClient(_make_app(db))
+        resp = client.put(
+            "/api/system/config",
+            json={"telegram_bot_token": self.TOKEN, "telegram_chat_id": self.CHAT},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["telegram_bot_token_set"] is True
+        assert data["telegram_chat_id_set"] is True
+        assert "telegram_bot_token" not in data
+        assert "telegram_chat_id" not in data
+        for body in (resp.text, client.get("/api/system/config").text, json.dumps(db.config)):
+            assert self.TOKEN not in body
+            assert self.CHAT not in body
+
+    async def test_the_pair_survives_a_restart_decrypted(self, db: FakeSystemDb) -> None:
+        TestClient(_make_app(db)).put(
+            "/api/system/config",
+            json={"telegram_bot_token": self.TOKEN, "telegram_chat_id": "@hydra_alerts"},
+        )
+        restarted = _make_app(db)
+        await lifespan._load_system_config(restarted)
+        assert restarted.state.system_config["telegram_bot_token"] == self.TOKEN
+        assert restarted.state.system_config["telegram_chat_id"] == "@hydra_alerts"
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "not-a-token",
+            "123:AAEhBOweik6ad9r_QXMENQjcrGbqCr4K",  # bot id too short
+            "123456789:AAEh-short",  # token body too short
+            "123456789:AAEhBOweik6ad9r_QXMENQjcrGbqCr4K:extra",
+            "123456789:a bad token with spaces and symbols!",
+        ],
+    )
+    def test_a_malformed_token_is_rejected(self, db: FakeSystemDb, token: str) -> None:
+        app = _make_app(db)
+        resp = TestClient(app).put("/api/system/config", json={"telegram_bot_token": token})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["errors"][0]["loc"] == ["body", "telegram_bot_token"]
+        assert token not in resp.text
+        assert "telegram_bot_token" not in db.config
+        assert app.state.system_config is None
+
+    @pytest.mark.parametrize(
+        "chat_id",
+        [
+            "not-a-chat",
+            "@abc",  # channel name too short
+            "12.5",
+            "@has space",
+            "@has-dash",
+        ],
+    )
+    def test_a_malformed_chat_id_is_rejected(self, db: FakeSystemDb, chat_id: str) -> None:
+        app = _make_app(db)
+        resp = TestClient(app).put("/api/system/config", json={"telegram_chat_id": chat_id})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["errors"][0]["loc"] == ["body", "telegram_chat_id"]
+        assert chat_id not in resp.text
+        assert "telegram_chat_id" not in db.config
+
+    def test_each_field_clears_with_an_empty_string(self, db: FakeSystemDb) -> None:
+        client = TestClient(_make_app(db))
+        client.put(
+            "/api/system/config",
+            json={"telegram_bot_token": self.TOKEN, "telegram_chat_id": self.CHAT},
+        )
+        resp = client.put("/api/system/config", json={"telegram_bot_token": ""})
+        assert resp.status_code == 200
+        assert resp.json()["telegram_bot_token_set"] is False
+        assert resp.json()["telegram_chat_id_set"] is True
+        resp = client.put("/api/system/config", json={"telegram_chat_id": ""})
+        assert resp.json()["telegram_chat_id_set"] is False
+        assert "telegram_bot_token" not in db.config
+        assert "telegram_chat_id" not in db.config
+
+    def test_the_pair_sends_through_the_test_endpoint(
+        self, db: FakeSystemDb, outbound: list[str]
+    ) -> None:
+        TestClient(_make_app(db)).put(
+            "/api/system/config",
+            json={"telegram_bot_token": self.TOKEN, "telegram_chat_id": self.CHAT},
+        )
+        resp = TestClient(_make_app(db)).post("/api/system/notifications/test")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "discord_sent": False,
+            "slack_sent": False,
+            "telegram_sent": True,
+            "message": "Telegram: ok",
+        }
+        assert outbound == [self.SEND_URL]
+
+    def test_a_half_pair_blocks_the_test_endpoint_and_sends_nothing(
+        self, db: FakeSystemDb, outbound: list[str]
+    ) -> None:
+        _store_secret(db, "telegram_bot_token", self.TOKEN)
+        resp = TestClient(_make_app(db)).post("/api/system/notifications/test")
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "invalid_telegram_credentials"
+        assert resp.json()["detail"]["field"] == "telegram_chat_id"
+        assert outbound == []
+
+    def test_one_bad_telegram_cred_blocks_every_channel(
+        self, db: FakeSystemDb, outbound: list[str]
+    ) -> None:
+        _store_secret(db, "discord_webhook_url", _DISCORD)
+        _store_secret(db, "telegram_bot_token", "garbage-predating-the-validator")
+        _store_secret(db, "telegram_chat_id", self.CHAT)
+        resp = TestClient(_make_app(db)).post("/api/system/notifications/test")
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["field"] == "telegram_bot_token"
+        assert outbound == []
+
+
 class TestNotifications:
-    @pytest.fixture()
-    def outbound(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-        sent: list[str] = []
-
-        async def _post(self: httpx.AsyncClient, url: str, **_: Any) -> httpx.Response:
-            sent.append(url)
-            return httpx.Response(204, request=httpx.Request("POST", url))
-
-        monkeypatch.setattr(httpx.AsyncClient, "post", _post)
-        return sent
-
     def test_notifications_test_revalidates(self, db: FakeSystemDb, outbound: list[str]) -> None:
         _store_secret(db, "slack_webhook_url", "http://127.0.0.1:9/x")
         resp = TestClient(_make_app(db)).post("/api/system/notifications/test")

@@ -1,8 +1,9 @@
 """The /ws/trades DB relay (D5, R6): the fill tick per new trades row, in both modes.
 
-The relay's cursor and the R6 message shape are asserted against a pool that answers the
-relay's own queries; the real SQL (the ``WHERE id > cursor`` and the NULL ``session_id``
-filter) is pinned in ``tests/integration/test_ws_relay_pg.py``, and the whole relay runs
+The relay's cursor, the running-set diff and the R6/session_status message shapes are
+asserted against a pool that answers the relay's own queries; the real SQL (the
+``WHERE id > cursor``, the NULL ``session_id`` filter and the ``ANY($1)`` status read)
+is pinned in ``tests/integration/test_ws_relay_pg.py``, and the whole relay runs
 against a real database inside the split e2e. The handler wiring (the relay starts from the
 app's pool, in both process modes) is asserted through the real ``/ws/trades`` route.
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -34,11 +36,13 @@ class FakeSocket:
 
 
 class FakePool:
-    """Answers the relay's two queries from a mutable trades table."""
+    """Answers the relay's queries from mutable trades and trading_sessions tables."""
 
     def __init__(self) -> None:
         self.rows: list[dict[str, Any]] = []
+        self.sessions: list[dict[str, Any]] = []
         self.fail = False
+        self.fail_on: str | None = None
         self.closed = False
         self.cursors: list[int | None] = []
 
@@ -50,8 +54,13 @@ class FakePool:
         return max((r["id"] for r in self.rows), default=0)
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
-        if self.fail:
+        if self.fail or (self.fail_on is not None and self.fail_on in sql):
             raise RuntimeError("database down")
+        if "FROM trading_sessions WHERE status = 'running'" in sql:
+            return [{"id": r["id"]} for r in self.sessions if r["status"] == "running"]
+        if "FROM trading_sessions" in sql:
+            wanted = set(args[0])
+            return [dict(r) for r in self.sessions if r["id"] in wanted]
         assert "FROM trades" in sql
         (cursor,) = args[:1]
         self.cursors.append(cursor)
@@ -170,6 +179,132 @@ async def test_a_restarted_relay_re_anchors_its_cursor(
     await relay.ensure_started()
     await _drained(relay)
     assert ws.messages == [{"event": "order_fill", "session_id": "s1", "trade_id": 4}]
+
+
+# ---------------------------------------------------------------------------
+# The session-status diff: a session leaving the running set ticks once
+# ---------------------------------------------------------------------------
+
+_STOPPED_AT = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+
+
+def _session(sid: str, status: str = "running", **over: Any) -> dict[str, Any]:
+    return {
+        "id": sid,
+        "status": status,
+        "stopped_at": _STOPPED_AT if status != "running" else None,
+        "error_message": None,
+        **over,
+    }
+
+
+@pytest.fixture()
+async def ws2() -> Iterator[FakeSocket]:
+    socket = FakeSocket()
+    await manager.connect("trades:s2", socket)
+    try:
+        yield socket
+    finally:
+        manager.disconnect("trades:s2", socket)
+
+
+async def test_a_session_leaving_the_running_set_ticks_once(
+    relay: TradesRelay, pool: FakePool, ws: FakeSocket, ws2: FakeSocket
+) -> None:
+    pool.sessions = [_session("s1"), _session("s2")]
+    await relay.ensure_started()
+    await _drained(relay)
+    pool.sessions = [_session("s1", "stopped"), _session("s2")]
+    await _drained(relay)
+
+    assert ws.messages == [
+        {
+            "event": "session_status",
+            "session_id": "s1",
+            "status": "stopped",
+            "stopped_at": _STOPPED_AT.isoformat(),
+            "error_message": None,
+        }
+    ]
+    assert ws2.messages == []  # s2 still runs: no tick on its channel
+    pool.sessions = [_session("s1", "stopped"), _session("s2")]
+    await _drained(relay)
+    assert len(ws.messages) == 1  # one tick for the transition, never per poll
+
+
+async def test_the_error_message_is_carried_in_the_tick(
+    relay: TradesRelay, pool: FakePool, ws: FakeSocket
+) -> None:
+    pool.sessions = [_session("s1")]
+    await relay.ensure_started()
+    await _drained(relay)
+    pool.sessions = [_session("s1", "error", error_message="ccxtpro: websocket closed")]
+    await _drained(relay)
+
+    assert ws.messages == [
+        {
+            "event": "session_status",
+            "session_id": "s1",
+            "status": "error",
+            "stopped_at": _STOPPED_AT.isoformat(),
+            "error_message": "ccxtpro: websocket closed",
+        }
+    ]
+
+
+async def test_a_restarted_relay_re_baselines_the_running_set(
+    relay: TradesRelay, pool: FakePool, ws: FakeSocket
+) -> None:
+    pool.sessions = [_session("s1")]
+    await relay.ensure_started()
+    await _drained(relay)
+    pool.sessions = [_session("s1", "stopped")]  # stopped while the relay was down
+    await relay.stop()
+    await relay.ensure_started()
+    await _drained(relay)
+
+    assert ws.messages == []  # the re-anchored snapshot absorbs the stop
+
+
+async def test_a_failed_poll_keeps_the_running_set_snapshot(
+    relay: TradesRelay, pool: FakePool, ws: FakeSocket
+) -> None:
+    pool.sessions = [_session("s1")]
+    await relay.ensure_started()
+    await _drained(relay)
+    pool.sessions = [_session("s1", "stopped")]
+    pool.fail_on = "trading_sessions"
+    await _drained(relay)
+    assert ws.messages == []  # the diff could not run: the stop is not lost
+
+    pool.fail_on = None
+    await _drained(relay)
+    assert len(ws.messages) == 1
+    assert ws.messages[0]["event"] == "session_status"
+
+
+async def test_a_failed_stopped_refetch_keeps_the_diff_and_the_tick_lands(
+    relay: TradesRelay, pool: FakePool, ws: FakeSocket
+) -> None:
+    pool.sessions = [_session("s1")]
+    await relay.ensure_started()
+    await _drained(relay)
+    pool.sessions = [_session("s1", "stopped")]
+    pool.fail_on = "id = ANY"  # the running-set read ran; only the stopped re-fetch failed
+    await _drained(relay)
+    assert ws.messages == []  # the snapshot was not committed, so the diff is not lost
+
+    pool.fail_on = None
+    await _drained(relay)
+    assert ws.messages == [
+        {
+            "event": "session_status",
+            "session_id": "s1",
+            "status": "stopped",
+            "stopped_at": _STOPPED_AT.isoformat(),
+            "error_message": None,
+        }
+    ]
 
 
 class TestHandlerWiring:

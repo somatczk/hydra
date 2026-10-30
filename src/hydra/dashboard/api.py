@@ -13,6 +13,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import hydra
 from hydra.core.websocket import manager
 from hydra.dashboard import lifespan
+from hydra.dashboard.risk_relay import RiskRelay
 from hydra.dashboard.routes import (
     activity,
     backtest,
@@ -91,6 +92,18 @@ def _ensure_trades_relay(app: FastAPI) -> TradesRelay | None:
     return relay
 
 
+def _ensure_risk_relay(app: FastAPI) -> RiskRelay | None:
+    """The app's risk relay, already started by the lifespan (rebuilt without one)."""
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        return None
+    relay = getattr(app.state, "risk_relay", None)
+    if relay is None:
+        relay = RiskRelay(pool)
+        app.state.risk_relay = relay
+    return relay
+
+
 # ---------------------------------------------------------------------------
 # WebSocket endpoints
 # ---------------------------------------------------------------------------
@@ -151,7 +164,15 @@ async def ws_signals(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/risk")
 async def ws_risk(websocket: WebSocket) -> None:
-    """Risk status changes."""
+    """Risk events and state changes.
+
+    The lifespan starts the relay at app startup (the Telegram sink must page with
+    no browser connected); this only covers a relay the lifespan could not have
+    built (no pool at startup), mirroring the trades route.
+    """
+    relay = _ensure_risk_relay(websocket.app)
+    if relay is not None:
+        await relay.ensure_started()
     await _ws_handler("risk", websocket)
 
 
