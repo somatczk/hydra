@@ -331,7 +331,7 @@ class PlatformConfigUpdate(BaseModel):
     default_pair: str | None = Field(None, min_length=1)
     default_timeframe: str | None = Field(None, min_length=1)
     max_concurrent_strategies: int | None = Field(None, ge=1, le=100)
-    paper_capital: float | None = Field(None, gt=0, allow_inf_nan=False)
+    paper_capital: float | None = Field(None, gt=0, le=1e15, allow_inf_nan=False)
     live_capital: float | None = Field(None, gt=0, allow_inf_nan=False)
     webhook_secret: str | None = None
     discord_webhook_url: str | None = None

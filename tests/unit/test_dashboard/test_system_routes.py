@@ -406,6 +406,31 @@ class TestPaperCapitalChange:
         assert [e.kind for e in store.events] == ["paper_reset"]
         assert store.events[0].details["new_capital"] == Decimal("25000")
 
+    async def test_capital_above_the_bound_is_422_and_writes_nothing(
+        self, db: FakeSystemDb, app: FastAPI
+    ) -> None:
+        """The save bound: far above any real capital, orders below the cents-quantize limit."""
+        svc, store = await _risk(db, recovered=True)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
+        resp = TestClient(app).put("/api/system/config", json={"paper_capital": 1e16})
+        assert resp.status_code == 422
+        detail = _detail(resp)
+        assert detail["code"] == "validation_error"
+        assert "paper_capital" in detail["message"]
+        assert "1000000000000000" in detail["message"]
+        assert db.value("paper_capital") == 10000
+        assert svc.paper_capital == Decimal("10000")
+        assert store.events == []
+
+    async def test_capital_within_the_bound_saves(self, db: FakeSystemDb, app: FastAPI) -> None:
+        svc, _ = await _risk(db, recovered=True)
+        app.state.trader = LocalTrader(app.state.db_pool, _manager(svc))
+        resp = TestClient(app).put("/api/system/config", json={"paper_capital": 1_000_000_000})
+        assert resp.status_code == 200
+        assert resp.json()["paper_capital"] == 1_000_000_000
+        assert db.value("paper_capital") == 1_000_000_000
+        assert svc.paper_capital == Decimal("1000000000")
+
 
 async def test_get_paper_capital_has_no_fallback(db: FakeSystemDb) -> None:
     assert await system.get_paper_capital(db) == 10000.0
