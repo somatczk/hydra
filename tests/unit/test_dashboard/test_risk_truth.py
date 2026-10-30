@@ -772,6 +772,20 @@ class TestVar:
         assert data["sample_days"] == 20
         assert (data["var_95"], data["var_99"], data["cvar_95"]) == (200.0, 300.0, 250.0)
 
+    async def test_var_decimal_hostile_daily_pnls(self, tier2: Account) -> None:
+        # One loss day = three -33.33 trades: exactly -99.99 in Decimal, inexact in float.
+        loss_day = Decimal("-33.33") * 3
+        pnls = [loss_day] * 3 + [Decimal(10 * i) for i in range(37)]
+        pool, conn = _make_pool()
+        conn.fetch = AsyncMock(return_value=[{"daily_pnl": v} for v in pnls])
+        app = _make_app(pool=pool, session_manager=_Mgr(tier2.svc))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://t"
+        ) as c:
+            data = (await c.get("/api/risk/var")).json()
+        assert data["sample_days"] == 40
+        assert (data["var_95"], data["var_99"], data["cvar_95"]) == (99.99, 99.99, 99.99)
+
     def test_var_without_engine_is_503(self) -> None:
         pool, _ = _make_pool()
         resp = TestClient(_make_app(pool=pool)).get("/api/risk/var")

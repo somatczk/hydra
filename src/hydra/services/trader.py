@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _STORE_ERRORS: tuple[type[BaseException], ...] = (RiskStateUnavailableError, *DB_ERRORS)
+_CENTS = Decimal("0.01")
 
 
 @runtime_checkable
@@ -276,9 +277,9 @@ class LocalTrader:
             )
         pool = require_pool(self.db_pool)
 
-        var_95 = 0.0
-        var_99 = 0.0
-        cvar_95 = 0.0
+        var_95 = Decimal("0")
+        var_99 = Decimal("0")
+        cvar_95 = Decimal("0")
 
         async with db_errors("computing VaR"), pool.acquire() as conn:
             rows = await conn.fetch(
@@ -289,20 +290,21 @@ class LocalTrader:
             )
 
         if len(rows) >= 5:
-            daily_pnls = sorted(float(r["daily_pnl"]) for r in rows)
+            # str() avoids Decimal(float)'s binary-expansion noise
+            daily_pnls = sorted(Decimal(str(r["daily_pnl"])) for r in rows)
             n = len(daily_pnls)
-            idx_95 = max(0, int(n * 0.05))
-            idx_99 = max(0, int(n * 0.01))
-            var_95 = abs(min(daily_pnls[idx_95], 0))
-            var_99 = abs(min(daily_pnls[idx_99], 0))
+            idx_95 = max(0, int(n * Decimal("0.05")))
+            idx_99 = max(0, int(n * Decimal("0.01")))
+            var_95 = abs(min(daily_pnls[idx_95], Decimal(0)))
+            var_99 = abs(min(daily_pnls[idx_99], Decimal(0)))
             tail = [v for v in daily_pnls[: idx_95 + 1] if v < 0]
-            cvar_95 = abs(sum(tail) / len(tail)) if tail else var_95
+            cvar_95 = abs(sum(tail, Decimal(0)) / len(tail)) if tail else var_95
 
         return {
-            "var_95": round(var_95, 2),
-            "var_99": round(var_99, 2),
-            "cvar_95": round(cvar_95, 2),
-            "portfolio_value": round(float(equity), 2),
+            "var_95": float(var_95.quantize(_CENTS)),
+            "var_99": float(var_99.quantize(_CENTS)),
+            "cvar_95": float(cvar_95.quantize(_CENTS)),
+            "portfolio_value": float(equity.quantize(_CENTS)),
             "calculation_method": "historical_simulation",
             "sample_days": len(rows),
         }
