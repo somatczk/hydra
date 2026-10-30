@@ -85,9 +85,11 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
         if cfg.trader.url is not None:
             # the split (D5): no SessionManager here — every engine op goes through RemoteTrader
             from hydra.dashboard.trader_client import RemoteTrader
+            from hydra.services.trader import TraderBackend
 
             app.state.session_manager = None
-            app.state.trader = RemoteTrader(cfg)
+            backend: TraderBackend = RemoteTrader(cfg)
+            app.state.trader = backend
         else:
             await _init_session_manager(app, cfg, clients)
         if cfg.mcp_token is not None:

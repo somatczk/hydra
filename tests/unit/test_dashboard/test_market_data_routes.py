@@ -7,6 +7,7 @@ import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -164,6 +165,41 @@ class TestOrderBook:
 
     def test_close_market_clients_without_clients_is_noop(self) -> None:
         asyncio.run(close_market_clients(_make_app()))
+
+
+class TestOrderBookBuildsThroughClientFactory:
+    """The route's default factory is client_factory's public REST client, not its own."""
+
+    def test_default_factory_routes_through_client_factory(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hydra.execution import client_factory
+
+        made = _FakeExchange()
+        seen: list[str] = []
+
+        def recorder(exchange_id: str) -> _FakeExchange:
+            seen.append(exchange_id)
+            return made
+
+        monkeypatch.setattr(client_factory, "rest_exchange_factory", recorder)
+        app = _make_app()
+        resp = TestClient(app).get("/api/market/orderbook")
+        assert resp.status_code == 200
+        assert seen == ["binance"]
+        assert made.calls == [("BTCUSDT", 20)]
+        assert resp.json()["bids"] == _BOOK["bids"]
+        asyncio.run(close_market_clients(app))
+
+    def test_order_book_allowlist_matches_the_factory_venues(self) -> None:
+        from hydra.execution import client_factory
+
+        assert {eid for eid, _ in client_factory.ALLOWED_VENUES} == market_data._ALLOWED_EXCHANGES
+
+    def test_the_route_file_builds_no_ccxt_client_of_its_own(self) -> None:
+        source = Path(market_data.__file__).read_text()
+        assert "ccxt_async" not in source
+        assert "getattr(ccxt" not in source
 
 
 class _ScriptedExchange:

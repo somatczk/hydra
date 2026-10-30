@@ -39,6 +39,7 @@ format:
 
 type-check:
 	uv run mypy src/
+	uv run mypy src/hydra/core/ src/hydra/data/ src/hydra/indicators/ src/hydra/strategy/ src/hydra/backtest/ src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ src/hydra/ml/ src/hydra/dashboard/ src/hydra/services/ src/hydra/trader/ src/hydra/ops/ --strict
 
 security:
 	uv run bandit -r src/ -c pyproject.toml

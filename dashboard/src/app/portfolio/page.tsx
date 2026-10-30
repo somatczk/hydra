@@ -227,7 +227,7 @@ export default function PortfolioPage() {
           ]),
       fetchApi<StrategyOption[]>('/api/strategies')
         .then((data) => setStrategies(data.map((s) => ({ id: s.id, name: s.name }))))
-        .catch(() => {}),
+        .catch((err) => { setFetchErrors((prev) => ({ ...prev, strategies: err ?? true })); }),
     ]);
 
     if (configError !== null) {
@@ -560,14 +560,22 @@ export default function PortfolioPage() {
 
       <Section title="Trade journal">
         <div className="mb-4 flex flex-wrap items-end gap-3">
-          <Select
-            label="Strategy"
-            placeholder="All strategies"
-            options={strategies.map((st) => ({ value: st.id, label: st.name }))}
-            value={filterStrategy}
-            onChange={(e) => setFilterStrategy(e.target.value)}
-            className="w-44 max-lg:w-full"
-          />
+          {fetchErrors.strategies ? (
+            <DataStateErrorCard
+              error={fetchErrors.strategies}
+              fallback="Failed to load strategies"
+              onRetry={loadData}
+            />
+          ) : (
+            <Select
+              label="Strategy"
+              placeholder="All strategies"
+              options={strategies.map((st) => ({ value: st.id, label: st.name }))}
+              value={filterStrategy}
+              onChange={(e) => setFilterStrategy(e.target.value)}
+              className="w-44 max-lg:w-full"
+            />
+          )}
           <Input label="Symbol" placeholder="e.g. BTCUSDT" value={filterSymbol} onChange={(e) => setFilterSymbol(e.target.value)} className="w-36 max-lg:w-full" />
           <Input label="From" type="date" value={filterFromDate} onChange={(e) => setFilterFromDate(e.target.value)} className="w-40 max-lg:w-full" />
           <Input label="To" type="date" value={filterToDate} onChange={(e) => setFilterToDate(e.target.value)} className="w-40 max-lg:w-full" />

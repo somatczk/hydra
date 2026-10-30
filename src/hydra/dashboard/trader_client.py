@@ -111,25 +111,30 @@ class RemoteTrader:
     # -- Sessions -----------------------------------------------------------
 
     async def start_session(self, actor: str, body: StartSessionRequest) -> dict[str, Any]:
-        return await self._call(
+        result: dict[str, Any] = await self._call(
             "POST",
             "/ops/start-session",
             json={"actor": actor, "body": body.model_dump(mode="json")},
         )
+        return result
 
     async def stop_session(self, session_id: str) -> dict[str, Any]:
-        return await self._call("DELETE", f"/ops/sessions/{session_id}")
+        result: dict[str, Any] = await self._call("DELETE", f"/ops/sessions/{session_id}")
+        return result
 
     async def list_sessions(self) -> list[dict[str, Any]]:
-        return await self._call("GET", "/ops/sessions")
+        result: list[dict[str, Any]] = await self._call("GET", "/ops/sessions")
+        return result
 
     async def session_detail(self, session_id: str) -> dict[str, Any]:
-        return await self._call("GET", f"/ops/sessions/{session_id}/detail")
+        result: dict[str, Any] = await self._call("GET", f"/ops/sessions/{session_id}/detail")
+        return result
 
     async def quick_trade(self, order: QuickTradeRequest) -> dict[str, Any]:
-        return await self._call(
+        result: dict[str, Any] = await self._call(
             "POST", "/ops/quick-trade", json={"order": order.model_dump(mode="json")}
         )
+        return result
 
     async def webhook_signal(
         self,
@@ -140,7 +145,7 @@ class RemoteTrader:
         quantity: Decimal | None,
         strategy_id: str,
     ) -> dict[str, Any]:
-        return await self._call(
+        result: dict[str, Any] = await self._call(
             "POST",
             "/ops/webhook-signal",
             json={
@@ -152,19 +157,25 @@ class RemoteTrader:
                 "strategy_id": strategy_id,
             },
         )
+        return result
 
     async def reload_strategy(self, strategy_id: str) -> dict[str, Any]:
-        return await self._call("POST", f"/ops/strategies/{strategy_id}/reload")
+        result: dict[str, Any] = await self._call("POST", f"/ops/strategies/{strategy_id}/reload")
+        return result
 
     # -- Kill switch ----------------------------------------------------------
 
     async def activate_kill_switch(self, actor: str, reason: str) -> dict[str, Any]:
-        return await self._call("POST", "/ops/kill-switch", json={"actor": actor, "reason": reason})
+        result: dict[str, Any] = await self._call(
+            "POST", "/ops/kill-switch", json={"actor": actor, "reason": reason}
+        )
+        return result
 
     async def release_kill_switch(self, actor: str, reason: str) -> dict[str, Any]:
-        return await self._call(
+        result: dict[str, Any] = await self._call(
             "DELETE", "/ops/kill-switch", json={"actor": actor, "reason": reason}
         )
+        return result
 
     async def kill_switch_active(self) -> bool:
         body = await self._call("GET", "/ops/kill-switch/active")
@@ -173,22 +184,26 @@ class RemoteTrader:
     # -- Risk reads and mutations ----------------------------------------------
 
     async def risk_status(self) -> dict[str, Any]:
-        return await self._call("GET", "/ops/risk/status")
+        result: dict[str, Any] = await self._call("GET", "/ops/risk/status")
+        return result
 
     async def var_estimate(self) -> dict[str, Any]:
-        return await self._call("GET", "/ops/risk/var")
+        result: dict[str, Any] = await self._call("GET", "/ops/risk/var")
+        return result
 
     async def circuit_breakers(self) -> list[dict[str, Any]]:
-        return await self._call("GET", "/ops/risk/breakers")
+        result: list[dict[str, Any]] = await self._call("GET", "/ops/risk/breakers")
+        return result
 
     async def reset_breaker(
         self, tier: int, actor: str, reason: str, confirm_tier: int
     ) -> list[dict[str, Any]]:
-        return await self._call(
+        result: list[dict[str, Any]] = await self._call(
             "POST",
             "/ops/risk/breakers/reset",
             json={"actor": actor, "reason": reason, "tier": tier, "confirm_tier": confirm_tier},
         )
+        return result
 
     async def reset_paper_account(self, actor: str, reason: str) -> None:
         await self._call(
@@ -196,10 +211,14 @@ class RemoteTrader:
         )
 
     async def live_status(self, source: str = "paper") -> dict[str, Any]:
-        return await self._call("GET", "/ops/risk/live-status", params={"source": source})
+        result: dict[str, Any] = await self._call(
+            "GET", "/ops/risk/live-status", params={"source": source}
+        )
+        return result
 
     async def positions(self) -> list[dict[str, Any]]:
-        return await self._call("GET", "/ops/positions")
+        result: list[dict[str, Any]] = await self._call("GET", "/ops/positions")
+        return result
 
     async def reload_paper_capital(self, actor: str) -> None:
         await self._call("POST", "/ops/risk/paper-capital/reload", json={"actor": actor})

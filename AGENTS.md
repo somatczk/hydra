@@ -22,7 +22,8 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy src/
 uv run mypy src/hydra/core/ src/hydra/data/ src/hydra/indicators/ src/hydra/strategy/ src/hydra/backtest/ \
-  src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ src/hydra/ml/ --strict
+  src/hydra/execution/ src/hydra/risk/ src/hydra/portfolio/ src/hydra/ml/ src/hydra/dashboard/ \
+  src/hydra/services/ src/hydra/trader/ src/hydra/ops/ --strict
 uv run lint-imports                          # import-linter layers contract
 uv run pytest tests/unit -q -m "not slow"
 git status --porcelain --untracked-files=all # must print nothing after the tests (CI enforces this)
@@ -146,7 +147,9 @@ git status --porcelain --untracked-files=all # must print nothing after the test
 
 - Frozen dataclasses for value objects; Decimal in domain types and fills (floats remain at some boundaries).
   Pydantic for config and request validation. asyncio throughout. Type hints on new code.
-- mypy: `pyproject.toml` sets strict with relaxed overrides for most packages; CI runs the strict command above.
+- mypy: `pyproject.toml` sets strict; a per-module relaxation remains for the strategy built-ins and rule engine,
+  data, backtest, execution, risk and portfolio (the dashboard, services, trader and ops are full-strict). CI runs
+  the strict command above.
 - import-linter (`[tool.importlinter]` in `pyproject.toml`) enforces the layers, top to bottom: trader, dashboard,
   services, portfolio | backtest, execution, risk | ml, strategy, data, indicators, core | ops.
 - Metrics live in `hydra.core.metrics`: every metric is declared in its `CONTRACT`, and producers only call its setters.

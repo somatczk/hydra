@@ -339,7 +339,9 @@ async def _pending_capital(request: Request, pool: Any) -> float | None:
 
 
 @router.get("/summary", response_model=PortfolioSummary)
-async def get_summary(request: Request, source: str | None = None) -> PortfolioSummary | dict:
+async def get_summary(
+    request: Request, source: str | None = None
+) -> PortfolioSummary | dict[str, Any]:
     """Account value and max drawdown from the account curve; PnL and fees from trades.
 
     Paper: total_value is the ledger the RiskService runs on (capital + sleeves, carried PnL
@@ -414,7 +416,7 @@ _LATEST_CLOSE_SQL = (
 
 
 @router.get("/positions", response_model=list[Position])
-async def get_positions(request: Request, source: str | None = None) -> list[dict]:
+async def get_positions(request: Request, source: str | None = None) -> list[dict[str, Any]]:
     """All open positions across exchanges."""
     pool = require_pool(request)
 
@@ -434,7 +436,7 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
             except asyncpg.UndefinedTableError:
                 logger.warning("ts.ohlcv_1m missing; positions use their stored unrealized PnL")
 
-        positions: list[dict] = []
+        positions: list[dict[str, Any]] = []
         for row in rows:
             entry_price = float(row["avg_entry_price"])
             quantity = float(row["quantity"])
@@ -474,7 +476,7 @@ async def get_positions(request: Request, source: str | None = None) -> list[dic
 
 
 @router.get("/equity-curve", response_model=list[EquityPoint])
-async def get_equity_curve(request: Request, source: str | None = None) -> list[dict]:
+async def get_equity_curve(request: Request, source: str | None = None) -> list[dict[str, Any]]:
     """Account equity over time, hourly (paper: the ledger's capital plus per-session sleeves)."""
     pool = require_pool(request)
     capital = await _ledger_capital(request, pool) if source == "paper" else None
@@ -484,7 +486,7 @@ async def get_equity_curve(request: Request, source: str | None = None) -> list[
 
 
 @router.get("/daily-pnl", response_model=list[DailyPnl])
-async def get_daily_pnl(request: Request, source: str | None = None) -> list[dict]:
+async def get_daily_pnl(request: Request, source: str | None = None) -> list[dict[str, Any]]:
     """Net (after fees) realized PnL per UTC day."""
     pool = require_pool(request)
 
@@ -505,7 +507,7 @@ async def get_daily_pnl(request: Request, source: str | None = None) -> list[dic
 
 
 @router.get("/monthly-returns", response_model=list[MonthlyReturn])
-async def get_monthly_returns(request: Request, source: str | None = None) -> list[dict]:
+async def get_monthly_returns(request: Request, source: str | None = None) -> list[dict[str, Any]]:
     """Monthly time-weighted return of the account curve (a capital change is not a return)."""
     pool = require_pool(request)
     capital = await _ledger_capital(request, pool) if source == "paper" else None
@@ -522,7 +524,7 @@ async def get_monthly_returns(request: Request, source: str | None = None) -> li
 
 
 @router.get("/attribution", response_model=list[AttributionItem])
-async def get_attribution(request: Request, source: str | None = None) -> list[dict]:
+async def get_attribution(request: Request, source: str | None = None) -> list[dict[str, Any]]:
     """Net (after fees) realized PnL broken down by strategy."""
     pool = require_pool(request)
 
@@ -555,7 +557,7 @@ async def get_trades(
     max_pnl: float | None = None,
     page: int = 1,
     limit: int = 20,
-) -> dict:
+) -> dict[str, Any]:
     """Filtered, paginated trade journal.
 
     Returns trade records alongside pagination metadata so clients can
@@ -645,7 +647,7 @@ async def get_trades(
 
 
 @router.patch("/trades/{trade_id}", response_model=TradeRecord)
-async def update_trade(trade_id: int, body: TradeUpdateRequest, request: Request) -> dict:
+async def update_trade(trade_id: int, body: TradeUpdateRequest, request: Request) -> dict[str, Any]:
     """Update journal notes and/or tags on a trade record."""
     pool = require_pool(request)
 
@@ -871,7 +873,9 @@ class LiveMetrics(BaseModel):
 
 
 @router.get("/live-metrics", response_model=LiveMetrics)
-async def get_live_metrics(request: Request, source: str | None = None) -> LiveMetrics | dict:
+async def get_live_metrics(
+    request: Request, source: str | None = None
+) -> LiveMetrics | dict[str, Any]:
     """Rolling 30-day performance metrics computed from trade history."""
     pool = require_pool(request)
     capital = await _ledger_capital(request, pool) if source == "paper" else None
