@@ -3,6 +3,15 @@
 The ``ExchangeClient`` is exchange-agnostic: all exchange-specific behavior is
 handled internally by CCXT.  ``ccxt`` is **not** imported at module level so that
 test environments without the package installed can still import this module.
+
+The single outgoing money boundary: every outgoing ccxt call converts Decimal to
+float at the wire (``create_order``'s amount/price/stopPrice) — ccxt's typed API is
+float-based.  The conversion is exact for lot/tick-aligned values: Python's
+shortest-repr round-trip parses the float back to the same Decimal value
+(``Decimal(str(float(d))) == d``), so the pre-formatted exchange strings
+(``exchange_stops.format_price``/``format_qty``) carry their exact value over the
+wire.  Everything coming back is converted at use to exact Decimals
+(``Decimal(str(raw))``), never through ``float``.
 """
 
 from __future__ import annotations
@@ -101,7 +110,12 @@ class ExchangeClient:
         stop_price: Decimal | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Place an order on the exchange.  Returns the CCXT order dict."""
+        """Place an order on the exchange.  Returns the CCXT order dict.
+
+        The single outgoing Decimal->float boundary: amount, price and stopPrice go to
+        the wire as floats (ccxt's typed API), exact for lot/tick-aligned values by the
+        shortest-repr round-trip.
+        """
         exchange = self._get_exchange()
         extra: dict[str, Any] = dict(params or {})
 
@@ -146,7 +160,9 @@ class ExchangeClient:
 
         *quantity*, *take_profit* and *stop_loss* are pre-formatted exchange strings
         (tick/lot aligned by the caller, ``exchange_stops``). The response is normalized to
-        the paper shape with ``id`` = the orderListId and per-leg dicts in ``legs``.
+        the paper shape with ``id`` = the orderListId and per-leg dicts in ``legs``; the
+        echoed amount/price/stop are the caller's own strings as exact Decimals (never
+        through ``float``).
         """
         exchange = self._get_exchange()
         request: dict[str, Any] = {
@@ -170,9 +186,9 @@ class ExchangeClient:
             "symbol": symbol,
             "side": side.upper(),
             "type": OrderType.OCO.value,
-            "amount": float(quantity),
-            "price": float(take_profit),
-            "stop_price": float(stop_loss),
+            "amount": Decimal(quantity),
+            "price": Decimal(take_profit),
+            "stop_price": Decimal(stop_loss),
             "status": str(raw.get("listStatusType") or "EXEC_STARTED"),
             "filled": False,
             "oco_link": order_list_id,

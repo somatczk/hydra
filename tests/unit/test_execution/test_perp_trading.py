@@ -407,6 +407,32 @@ class TestFlipAtomicity:
 
 
 class TestRestingOrders:
+    async def test_open_order_shape_is_exact_decimal(self) -> None:
+        """P7-B3: the perp paper executor serves the same shared open-order shape —
+        exact Decimals, never floats (a resting limit price and a stop trigger keep
+        their full precision; the trailing trigger is computed in Decimal)."""
+        ex = make(leverage=2)
+        await market_buy(ex, "0.4", "100")
+        await ex.create_order("BTCUSDT", "BUY", "LIMIT", D("0.1"), price=D("0.00012345"))
+        await ex.create_order("BTCUSDT", "SELL", "STOP_MARKET", D("0.2"), stop_price=D("9876.5"))
+        await ex.create_order(
+            "BTCUSDT", "SELL", "TRAILING_STOP", D("0.2"), params={"trail_pct": "0.05"}
+        )
+
+        rows = {(o["type"], o["reason"]): o for o in await ex.fetch_open_orders("BTCUSDT")}
+
+        limit = rows[("LIMIT", "limit")]
+        assert (limit["amount"], limit["price"]) == (D("0.1"), D("0.00012345"))
+        assert isinstance(limit["price"], Decimal)
+        stop = rows[("STOP_MARKET", "stop_loss")]
+        assert (stop["amount"], stop["stop_price"]) == (D("0.2"), D("9876.5"))
+        assert isinstance(stop["stop_price"], Decimal)
+        trail = rows[("TRAILING_STOP", "trailing_stop")]
+        assert trail["trail_pct"] == D("0.05")
+        # the trailing trigger is computed in Decimal: 100 * (1 - 0.05), no float()
+        assert trail["stop_price"] == D("95.00")
+        assert isinstance(trail["stop_price"], Decimal)
+
     async def test_the_protective_pair_on_a_long_takes_profit_at_the_trigger(self) -> None:
         ex = make(leverage=2)
         await market_buy(ex, "1", "100")

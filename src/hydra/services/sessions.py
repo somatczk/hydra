@@ -39,6 +39,7 @@ from hydra.execution.errors import (
 )
 from hydra.execution.exchange_stops import (
     ExchangeStopState,
+    json_safe_open_order,
     normalize_open_orders,
     verify_exchange_stop,
 )
@@ -434,12 +435,14 @@ async def get_session_detail(mgr: Any, session_id: str) -> dict[str, Any]:
     elif isinstance(executor, PaperTradingExecutor):
         rt = session._runtime
         detail["open_orders"] = [
-            {
-                **o,
-                # a LIMIT's stop_price is only its risk-check stop: nothing rests there
-                "stop_price": None if o["type"] == OrderType.LIMIT else o["stop_price"],
-                "protective": rt.protect.is_protective(o["oco_id"] or o["id"]) if rt else None,
-            }
+            json_safe_open_order(
+                {
+                    **o,
+                    # a LIMIT's stop_price is only its risk-check stop: nothing rests there
+                    "stop_price": None if o["type"] == OrderType.LIMIT else o["stop_price"],
+                    "protective": rt.protect.is_protective(o["oco_id"] or o["id"]) if rt else None,
+                }
+            )
             for o in await executor.fetch_open_orders()
         ]
     if session is not None and session.trading_mode == "live":
@@ -479,7 +482,7 @@ async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: A
             continue
         for leg in legs:
             leg["protective"] = _leg_is_protective(protect, leg, perp=perp)
-            orders.append(leg)
+            orders.append(json_safe_open_order(leg))
     detail["open_orders"] = orders
     for position in detail.get("positions") or []:
         expected = protect.armed(position.get("symbol")) if protect is not None else None

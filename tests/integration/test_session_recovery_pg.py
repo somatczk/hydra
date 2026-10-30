@@ -92,7 +92,7 @@ async def restart_scenario(dsn: str, strategies_dir: Path) -> None:
             assert (await ex.get_balance())["USDT"] == D("899.7999")
             stops = await ex.fetch_open_orders("BTCUSDT")
             assert [(o["type"], o["amount"], o["stop_price"]) for o in stops] == [
-                ("STOP_MARKET", 1.0, 95.095)
+                ("STOP_MARKET", D("1.00000"), D("95.09500"))
             ]
             live = second.get_session("live-1")
             # live rows now resume when they can; without stored credentials this one

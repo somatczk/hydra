@@ -217,7 +217,7 @@ async def test_a_partially_filled_stop_round_trips_and_keeps_slicing() -> None:
     assert b.get_account_snapshot() == a.get_account_snapshot()
     [resting] = await b.fetch_open_orders(BTC)
     assert resting["id"] == slice_fill.order_id  # the same id, no format bump
-    assert resting["amount"] == 0.8
+    assert resting["amount"] == D("0.8")
 
     # the restored remainder keeps slicing identically on the next thin bar
     nxt = bar(2, "92", "92", "91", "92", "2")

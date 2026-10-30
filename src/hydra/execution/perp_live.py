@@ -1020,7 +1020,11 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
         return fills
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """The tracked (DB) rows in the paper open-order shape plus status and filled qty."""
+        """The tracked (DB) rows in the paper open-order shape plus status and filled qty.
+
+        The row values are exact Decimals (the shared open-order shape); JSON-facing
+        callers render them through ``exchange_stops.json_safe_open_order``.
+        """
         wanted = None if symbol is None else self._symbol(symbol)
         rows = await self._live_orders.open_orders(self._session_id)
         out: list[dict[str, Any]] = []
@@ -1033,14 +1037,14 @@ class LivePerpTradingExecutor(PerpPaperTradingExecutor):
                     "symbol": row.symbol,
                     "side": row.side,
                     "type": row.order_type,
-                    "amount": float(row.quantity),
-                    "price": None if row.price is None else float(row.price),
-                    "stop_price": None if row.stop_price is None else float(row.stop_price),
+                    "amount": row.quantity,
+                    "price": row.price,
+                    "stop_price": row.stop_price,
                     "reason": _row_reason(row),
                     "oco_id": row.order_list_id,
                     "trail_pct": None,
                     "status": row.status.value,
-                    "filled_quantity": float(row.filled_quantity),
+                    "filled_quantity": row.filled_quantity,
                     "client_order_id": row.client_order_id,
                     "reduce_only": row.reduce_only,
                     "leg_ids": list(row.leg_client_order_ids),
@@ -1398,7 +1402,11 @@ class LivePerpOrderPoller(LiveOrderPoller):
 
 
 def normalize_perp_leg(order: Mapping[str, Any]) -> dict[str, Any]:
-    """One unified ccxt futures order (plain or algo) -> the paper open-order shape."""
+    """One unified ccxt futures order (plain or algo) -> the paper open-order shape.
+
+    The exchange's decimal strings (price, trigger, amount) become exact Decimals —
+    the ingest side of the single exchange boundary.
+    """
     trigger = order.get("triggerPrice")
     info = order.get("info")
     raw: Mapping[str, Any] = info if isinstance(info, Mapping) else {}
@@ -1413,18 +1421,18 @@ def normalize_perp_leg(order: Mapping[str, Any]) -> dict[str, Any]:
         else "limit"
     )
     raw_price = order.get("price")
-    stop_price: float | None = None
-    price: float | None = None
+    stop_price: Decimal | None = None
+    price: Decimal | None = None
     if raw_price is not None and raw_price != 0 and raw_price != "0":
-        price = float(raw_price)
+        price = Decimal(str(raw_price))
     if trigger is not None and trigger != 0 and trigger != "0":
-        stop_price = float(trigger)
+        stop_price = Decimal(str(trigger))
     return {
         "id": str(order.get("id") or ""),
         "symbol": str(order.get("symbol") or ""),
         "side": str(order.get("side") or "").upper(),
         "type": order.get("type"),
-        "amount": float(order.get("amount") or 0),
+        "amount": Decimal(str(order.get("amount") or 0)),
         "price": price,
         "stop_price": stop_price,
         "status": str(order.get("status") or "").upper(),
@@ -1471,7 +1479,10 @@ async def verify_perp_ladder(
             return ExchangeStopState(state="missing", checked_at=checked_at)
         stop = next((leg["stop_price"] for leg in matched if leg["stop_price"] is not None), None)
         return ExchangeStopState(
-            state="confirmed", checked_at=checked_at, kind="stop", stop_price=stop
+            state="confirmed",
+            checked_at=checked_at,
+            kind="stop",
+            stop_price=None if stop is None else float(stop),
         )
     expected_id = str(expected.order_id)
     expected_legs = {str(leg) for leg in expected.leg_ids}
@@ -1506,8 +1517,8 @@ async def verify_perp_ladder(
             state="confirmed",
             checked_at=checked_at,
             kind="oco" if len(expected_legs) > 1 else "stop",
-            stop_price=stop,
-            take_profit=take_profit,
+            stop_price=None if stop is None else float(stop),
+            take_profit=None if take_profit is None else float(take_profit),
             order_list_id=expected_id,
         )
     return ExchangeStopState(state="missing", checked_at=checked_at)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -98,7 +99,10 @@ async def test_builder_sl_tp_is_persisted_read_back_and_enforced(
             for o in await executor(session).fetch_open_orders()
         )
         # entry 100.1: stop 100.1 x 0.97, take-profit 100.1 x 1.06
-        assert legs == [("LIMIT", None, 106.106), ("STOP_MARKET", 97.097, None)]
+        assert legs == [
+            ("LIMIT", None, Decimal("106.10600")),
+            ("STOP_MARKET", Decimal("97.0970"), None),
+        ]
     finally:
         await h.close()
 

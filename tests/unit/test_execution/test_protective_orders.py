@@ -73,7 +73,7 @@ async def h(strategies_dir: Path) -> AsyncIterator[Harness]:
     await harness.close()
 
 
-async def _open(session: Any) -> list[tuple[str, str, float, Any, Any]]:
+async def _open(session: Any) -> list[tuple[str, str, Decimal, Any, Any]]:
     return [
         (o["side"], o["type"], o["amount"], o["stop_price"], o["price"])
         for o in await executor(session).fetch_open_orders("BTCUSDT")
@@ -92,7 +92,7 @@ class TestArming:
         self, h: Harness, strategies_dir: Path
     ) -> None:
         session = await _entered(h, strategies_dir, "default")
-        assert await _open(session) == [("SELL", "STOP_MARKET", 1.0, 95.095, None)]
+        assert await _open(session) == [("SELL", "STOP_MARKET", D("1.00000"), D("95.09500"), None)]
         group = session._runtime.protect.armed("BTCUSDT")
         assert group is not None
         om = session._order_manager
@@ -107,7 +107,7 @@ class TestArming:
         om = session._order_manager
         om._stale_order_timeout = 0.0
         assert await om.cleanup_stale_orders() == []
-        assert await _open(session) == [("SELL", "STOP_MARKET", 1.0, 95.095, None)]
+        assert await _open(session) == [("SELL", "STOP_MARKET", D("1.00000"), D("95.09500"), None)]
 
     async def test_trailing_stop_from_the_risk_block(
         self, h: Harness, strategies_dir: Path
@@ -120,7 +120,7 @@ class TestArming:
         )
         orders = await executor(session).fetch_open_orders("BTCUSDT")
         assert [(o["type"], o["amount"], o["trail_pct"]) for o in orders] == [
-            ("TRAILING_STOP", 1.0, 0.03)
+            ("TRAILING_STOP", D("1.00000"), D("0.03"))
         ]
         await h.bar(session, "110", open="100", high="110", low="100")
         await h.bar(session, "105", open="110", high="110", low="105")
@@ -139,7 +139,7 @@ class TestStopFills:
             "stop2",
             risk={"stop_loss_method": "fixed_pct", "stop_loss_value": 2.0},
         )
-        assert await _open(session) == [("SELL", "STOP_MARKET", 1.0, 98.098, None)]
+        assert await _open(session) == [("SELL", "STOP_MARKET", D("1.00000"), D("98.09800"), None)]
         seen: list[OrderFillEvent] = []
 
         async def record(event: Any) -> None:
@@ -196,8 +196,8 @@ class TestStopFills:
         )
         legs = sorted(await _open(session), key=lambda o: o[1])
         assert legs == [
-            ("SELL", "LIMIT", 1.0, None, 105.105),
-            ("SELL", "STOP_MARKET", 1.0, 98.098, None),
+            ("SELL", "LIMIT", D("1.00000"), None, D("105.10500")),
+            ("SELL", "STOP_MARKET", D("1.00000"), D("98.09800"), None),
         ]
         await h.bar(session, "104", open="100", high="105.2", low="99.5")
         fill = executor(session).get_fills()[-1]
@@ -213,7 +213,7 @@ class TestStopFills:
             ExitSignal(symbol=Symbol("BTCUSDT"), strategy_id="partial", close_pct=0.5)
         )
         assert await held(session) == D("0.50000")
-        assert await _open(session) == [("SELL", "STOP_MARKET", 0.5, 95.095, None)]
+        assert await _open(session) == [("SELL", "STOP_MARKET", D("0.50000"), D("95.09500"), None)]
 
     async def test_a_sliced_stop_resizes_in_place_then_a_close_disarms_it(
         self, h: Harness, strategies_dir: Path
@@ -258,7 +258,7 @@ class TestStopFills:
         # in place: the SAME order still rests, alone, and the group is sized to the rest
         assert resized.order_id == stop_id
         assert resized.quantity == D("0.80000")
-        assert await _open(session) == [("SELL", "STOP_MARKET", 0.8, 98.098, None)]
+        assert await _open(session) == [("SELL", "STOP_MARKET", D("0.80000"), D("98.09800"), None)]
         assert not runtime.protect.failures
 
         # the close: disarm cancels the resized remainder, the exit sells the rest
@@ -323,7 +323,7 @@ class TestStopFills:
         [(order)] = await executor(session).fetch_open_orders("BTCUSDT")
         assert (order["id"], order["amount"], order["oco_id"]) == (
             resized.order_id,
-            0.6,
+            D("0.60000"),
             None,
         )
         assert not runtime.protect.failures
@@ -363,7 +363,7 @@ class TestUnprotected:
         self, h: Harness, strategies_dir: Path
     ) -> None:
         session = await _entered(h, strategies_dir, "halt-exit")
-        assert await _open(session) == [("SELL", "STOP_MARKET", 1.0, 95.095, None)]
+        assert await _open(session) == [("SELL", "STOP_MARKET", D("1.00000"), D("95.09500"), None)]
         executor(session)._halt("second writer")
         await session._runtime.bus.publish(
             ExitSignal(symbol=Symbol("BTCUSDT"), strategy_id="halt-exit")
@@ -536,8 +536,8 @@ class TestManualProtection:
         assert result.status == "FILLED" and result.protection == "armed"
         legs = sorted(await _open(session), key=lambda o: o[1])
         assert legs == [
-            ("SELL", "LIMIT", 0.5, None, 120.0),
-            ("SELL", "STOP_MARKET", 0.5, 90.0, None),
+            ("SELL", "LIMIT", D("0.50000"), None, D("120")),
+            ("SELL", "STOP_MARKET", D("0.50000"), D("90"), None),
         ]
 
     async def test_a_live_shaped_group_reports_armed_only_when_it_exists(

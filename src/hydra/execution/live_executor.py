@@ -663,7 +663,11 @@ class LiveTradingExecutor(PaperTradingExecutor):
         return fills
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """The tracked (DB) rows in the paper open-order shape plus status and filled qty."""
+        """The tracked (DB) rows in the paper open-order shape plus status and filled qty.
+
+        The row values are exact Decimals (the shared open-order shape); JSON-facing
+        callers render them through ``exchange_stops.json_safe_open_order``.
+        """
         wanted = None if symbol is None else self._symbol(symbol)
         rows = await self._live_orders.open_orders(self._session_id)
         out: list[dict[str, Any]] = []
@@ -676,16 +680,16 @@ class LiveTradingExecutor(PaperTradingExecutor):
                     "symbol": row.symbol,
                     "side": row.side,
                     "type": row.order_type,
-                    "amount": float(row.quantity),
-                    "price": None if row.price is None else float(row.price),
-                    "stop_price": None if row.stop_price is None else float(row.stop_price),
+                    "amount": row.quantity,
+                    "price": row.price,
+                    "stop_price": row.stop_price,
                     "reason": _row_reason(row),
                     "oco_id": (
                         row.exchange_order_id if row.order_type == OrderType.OCO.value else None
                     ),
                     "trail_pct": None,
                     "status": row.status.value,
-                    "filled_quantity": float(row.filled_quantity),
+                    "filled_quantity": row.filled_quantity,
                     "client_order_id": row.client_order_id,
                 }
             )

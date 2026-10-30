@@ -175,7 +175,7 @@ class TestTargeting:
         assert (await sessions["momentum"].get_balance())["USDT"] == Decimal("498.997999")
         stops = await sessions["momentum"].fetch_open_orders("BTCUSDT")
         assert [(o["type"], o["amount"], o["stop_price"]) for o in stops] == [
-            ("STOP_MARKET", 0.01, 95.095)
+            ("STOP_MARKET", Decimal("0.01"), Decimal("95.095000"))
         ]
         assert await _untouched(sessions["breakout"])
 

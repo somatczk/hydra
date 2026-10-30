@@ -209,6 +209,19 @@ def _key(f: PaperFill) -> tuple[object, ...]:
     )
 
 
+async def _open_order_fingerprint(ex: PaperTradingExecutor) -> list[str]:
+    """The open-order rows as comparable text: per-run uuid ids normalised, value
+    types visible, so a Decimal/float drift between the two paths fails loudly."""
+    out: list[str] = []
+    for row in await ex.fetch_open_orders("BTCUSDT"):
+        norm = dict(row)
+        for key in ("id", "oco_id"):
+            if norm.get(key) is not None:
+                norm[key] = "<id>"
+        out.append(repr(norm))
+    return out
+
+
 async def _paper(
     bars: list[OHLCV], strategies_dir: Path, config: dict[str, Any]
 ) -> tuple[PaperTradingExecutor, list[D]]:
@@ -309,6 +322,18 @@ async def _assert_parity(
     )
     assert b.realized_net == p.realized_net
     assert CAPITAL + sum((t.pnl for t in result.trades), D("0")) == result.equity_curve[-1]
+
+    # P7-B3: the shared open-order shape is byte-identical between backtest and paper.
+    # Both executors flattened (neither carries run leftovers), then one resting order
+    # of every family is placed on each through the public API and the rows compared.
+    for ex in (paper, backtest):
+        await ex.flatten()
+        await ex.create_order("BTCUSDT", "BUY", "LIMIT", D("0.001"), price=D("90"))
+        await ex.create_order("BTCUSDT", "BUY", "STOP_MARKET", D("0.001"), stop_price=D("95"))
+        await ex.create_order(
+            "BTCUSDT", "BUY", "TRAILING_STOP", D("0.001"), params={"trail_pct": "0.02"}
+        )
+    assert await _open_order_fingerprint(paper) == await _open_order_fingerprint(backtest)
     return paper.get_fills()
 
 

@@ -361,7 +361,7 @@ class TestQuickTrade:
         assert (body["fill_price"], body["mark_source"]) == (100.1, "last_close")
         orders = await executor(session).fetch_open_orders()
         assert [(o["type"], o["amount"], o["stop_price"], o["id"]) for o in orders] == [
-            ("STOP_MARKET", 0.3, 92.0, body["protective_order_id"])
+            ("STOP_MARKET", D("0.3"), D("92"), body["protective_order_id"])
         ]
 
     async def test_market_fill_reports_the_live_price_it_used(
@@ -409,7 +409,10 @@ class TestQuickTrade:
             (o["type"], o["amount"], o["stop_price"], o["price"])
             for o in await executor(session).fetch_open_orders()
         )
-        assert legs == [("LIMIT", 0.2, None, 110.0), ("STOP_MARKET", 0.2, 90.0, None)]
+        assert legs == [
+            ("LIMIT", D("0.2"), None, D("110")),
+            ("STOP_MARKET", D("0.2"), D("90"), None),
+        ]
 
     async def test_limit_buy_outlives_the_stale_cleanup_until_a_bar_fills_it(
         self, h: Harness, session: Any, api: httpx.AsyncClient
