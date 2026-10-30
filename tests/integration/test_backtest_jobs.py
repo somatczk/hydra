@@ -778,7 +778,7 @@ async def test_a_perp_backtest_job_runs_through_the_queue(
 async def test_a_futures_hyperopt_is_queued(
     client: httpx.AsyncClient, pool: Any, strategies_dir: Path
 ) -> None:
-    await _seed_hourly(pool)
+    await _seed(pool, "binanceusdm", Timeframe.H1, _saw(H1_START, H1_COUNT, timedelta(hours=1)))
     _write_perp_strategy(strategies_dir, "perp-ho")
     resp = await client.post(
         "/api/backtest/hyperopt",
