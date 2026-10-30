@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
@@ -127,10 +127,13 @@ class RiskConfig:
 def effective_limits(config: RiskConfig, override: StrategyLimits) -> RiskConfig:
     """Tighter-only: each overridable cap enforces min(global, override) at check time.
 
-    An unset field passes the global value through. Breaker multipliers and leverage
-    multiply after the min, so an override never relaxes a tier's halving.
+    An unset field passes the global value through, and every other field of ``config``
+    is preserved exactly as loaded — a stored global must never fall back to the
+    dataclass defaults. Breaker multipliers and leverage multiply after the min, so an
+    override never relaxes a tier's halving.
     """
-    return RiskConfig(
+    return replace(
+        config,
         max_position_pct=(
             config.max_position_pct
             if override.max_position_pct is None

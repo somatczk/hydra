@@ -178,14 +178,14 @@ describe('kill switch section', () => {
     expect(primary.disabled).toBe(true);
 
     await typeInto(inputByLabel(d, 'Type RELEASE to confirm'), 'release');
-    await typeInto(inputByLabel(c, 'Reason'), 'market calm');
+    await typeInto(inputByLabel(d, 'Reason'), 'market calm');
     expect(primary.disabled).toBe(true);
 
     await typeInto(inputByLabel(d, 'Type RELEASE to confirm'), 'RELEASE');
-    await typeInto(inputByLabel(c, 'Reason'), '  ab ');
+    await typeInto(inputByLabel(d, 'Reason'), '  ab ');
     expect(primary.disabled).toBe(true);
 
-    await typeInto(inputByLabel(c, 'Reason'), '  market calm  ');
+    await typeInto(inputByLabel(d, 'Reason'), '  market calm  ');
     expect(primary.disabled).toBe(false);
     await click(primary);
 
@@ -477,16 +477,39 @@ describe('per-strategy limits', () => {
     expect(sent('PUT', '/api/risk/config/saw')).toEqual([]);
   });
 
-  it('removes a stored override through DELETE after a confirm', async () => {
+  it('removes a stored override only after the id is typed and a reason given', async () => {
     const c = await open({ '/api/risk/config': OVERRIDE_CFG });
     await click(buttonByText(c, 'Remove override'));
     const d = dlg(c, 'Remove the override for saw?');
     expect(d.textContent).toContain('The global limits apply to saw again');
-    await click(buttonByText(d, 'Remove override'));
+    const primary = buttonByText(d, 'Remove override');
+    expect(primary.disabled).toBe(true);
+
+    await typeInto(inputByLabel(d, 'Type saw to confirm'), 'SAW');
+    await typeInto(inputByLabel(d, 'Reason'), 'back to the global cap');
+    expect(primary.disabled).toBe(true);
+
+    await typeInto(inputByLabel(d, 'Type saw to confirm'), 'saw');
+    expect(primary.disabled).toBe(false);
+    await click(primary);
 
     const deletes = calls.filter((x) => x.path === '/api/risk/config/saw' && x.init?.method === 'DELETE');
     expect(deletes).toHaveLength(1);
+    expect(JSON.parse(String(deletes[0].init?.body))).toEqual({ reason: 'back to the global cap' });
     expect(c.querySelector('[role="status"][aria-label="Outcome"]')?.textContent).toContain('Override for saw removed.');
+  });
+
+  it('offers Remove for an all-null stored row, so a legacy empty row is cleanable', async () => {
+    const c = await open({
+      '/api/risk/config': {
+        ...CONFIG,
+        overrides: [{ strategy_id: 'saw', max_position_pct: null, max_risk_per_trade: null, max_concurrent_positions: null }],
+      },
+    });
+    const remove = Array.from(c.querySelectorAll('button')).filter(
+      (b) => b.textContent?.trim() === 'Remove override' && !b.closest('dialog'),
+    );
+    expect(remove).toHaveLength(1);
   });
 
   it('says what went wrong when the engine did not reload a saved override', async () => {

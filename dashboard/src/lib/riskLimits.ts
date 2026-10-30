@@ -162,10 +162,6 @@ export function buildStrategyOverrideUpdate(
   return { ok: true, update, clamped };
 }
 
-export function hasOverride(over: StrategyOverrideValues): boolean {
-  return STRATEGY_FIELDS.some((f) => over[f] !== null);
-}
-
 /** "5%" / "3" for a stored override, "—" when that cap is not overridden. */
 export function strategyLimitText(field: StrategyField, value: number | null): string {
   return value === null ? '—' : isCount(field) ? String(value) : `${fractionToPercentInput(value)}%`;

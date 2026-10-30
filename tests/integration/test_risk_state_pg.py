@@ -229,10 +229,17 @@ async def test_strategy_override_round_trip_and_mid_session_tightening(
             "max_concurrent_positions": 2,
         }
 
-        resp = await client.delete("/api/risk/config/saw")
+        resp = await client.request(
+            "DELETE", "/api/risk/config/saw", json={"reason": "back to the global cap"}
+        )
         assert resp.status_code == 200
         assert resp.json()["overrides"]["max_position_pct"] is None
         assert resp.json()["effective"]["max_position_pct"] == 0.10
+
+        cleared = (await client.get("/api/risk/events?limit=5")).json()
+        assert cleared[0]["kind"] == "strategy_override_cleared"
+        assert cleared[0]["reason"] == "back to the global cap"
+        assert cleared[0]["details"] == {"strategy_id": "saw"}
     finally:
         await client.aclose()
     assert (await svc.check(probe, "s1", OPEN)).approved is True

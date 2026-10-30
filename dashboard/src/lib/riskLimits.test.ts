@@ -4,7 +4,6 @@ import {
   buildStrategyOverrideUpdate,
   effectiveOverride,
   fractionToPercentInput,
-  hasOverride,
   limitChanges,
   limitText,
   riskLimitsToForm,
@@ -160,8 +159,6 @@ describe('strategy override text', () => {
     expect(strategyLimitText('max_position_pct', null)).toBe('—');
     expect(strategyLimitText('max_position_pct', 0.05)).toBe('5%');
     expect(strategyLimitText('max_concurrent_positions', 2)).toBe('2');
-    expect(hasOverride({ max_position_pct: null, max_risk_per_trade: null, max_concurrent_positions: null })).toBe(false);
-    expect(hasOverride({ max_position_pct: 0.05, max_risk_per_trade: null, max_concurrent_positions: null })).toBe(true);
   });
 
   it('round-trips a stored override through the form', () => {

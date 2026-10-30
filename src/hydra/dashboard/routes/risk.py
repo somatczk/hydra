@@ -102,6 +102,14 @@ class StrategyOverrideUpdate(BaseModel):
     max_concurrent_positions: int | None = Field(None, ge=1, le=100)
 
 
+class StrategyOverrideClear(BaseModel):
+    """The removal's typed-confirm reason; a bare DELETE sends no body at all."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(None, min_length=3, max_length=500)
+
+
 class RiskConfig(BaseModel):
     scope: str = "global"
     max_position_pct: float
@@ -351,14 +359,19 @@ async def _reload_engine(request: Request, actor: str) -> None:
 
 
 async def _append_override_event(
-    conn: Any, kind: str, actor: str, strategy_id: str, details: dict[str, Any]
+    conn: Any,
+    kind: str,
+    actor: str,
+    strategy_id: str,
+    details: dict[str, Any],
+    reason: str | None = None,
 ) -> None:
     await conn.execute(
         "INSERT INTO risk_events (scope, kind, tier, actor, reason, details) "
         "VALUES ('paper', $1, NULL, $2, $3, $4::jsonb)",
         kind,
         actor,
-        f"per-strategy override for {strategy_id}",
+        reason or f"per-strategy override for {strategy_id}",
         json.dumps(details),
     )
 
@@ -452,8 +465,8 @@ async def get_var(request: Request, source: str | None = None) -> dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _no_fields() -> HTTPException:
-    return api_error(400, "no_fields", "No fields to update", "invalid")
+def _no_fields(message: str = "No fields to update") -> HTTPException:
+    return api_error(400, "no_fields", message, "invalid")
 
 
 @router.get("/config", response_model=RiskConfig)
@@ -506,12 +519,19 @@ async def update_strategy_risk_config(
 
     The body replaces the whole stored override: a field left out or set to null clears
     that cap. Any in-bounds value is accepted — the enforced limit is always
-    min(global, override) — and a value looser than the global one has no effect.
+    min(global, override) — and a value looser than the global one has no effect. A
+    body that leaves every cap null is refused: it would store a row that overrides
+    nothing; DELETE clears a stored override.
     """
     pool = require_pool(request)
     if not body.model_fields_set:
         raise _no_fields()
     updates = body.model_dump()
+    if all(value is None for value in updates.values()):
+        raise _no_fields(
+            f"An override with every field null caps nothing; "
+            f"DELETE /api/risk/config/{strategy_id} clears a stored override"
+        )
     actor = _actor(request)
     async with (
         db_errors_to_503("saving strategy overrides"),
@@ -542,13 +562,17 @@ async def update_strategy_risk_config(
 
 
 @router.delete("/config/{strategy_id}", response_model=StrategyRiskConfig)
-async def delete_strategy_risk_config(strategy_id: str, request: Request) -> dict[str, Any]:
+async def delete_strategy_risk_config(
+    strategy_id: str, request: Request, body: StrategyOverrideClear | None = None
+) -> dict[str, Any]:
     """Clear one strategy's override; the global limits apply again after the reload.
 
     Clearing matters: a stale row would keep clamping after the global limit loosens.
+    A typed-confirm UI sends ``{"reason": ...}``; the reason lands in the audit trail.
     """
     pool = require_pool(request)
     actor = _actor(request)
+    reason = body.reason if body is not None else None
     async with (
         db_errors_to_503("clearing strategy overrides"),
         pool.acquire() as conn,
@@ -565,11 +589,19 @@ async def delete_strategy_risk_config(strategy_id: str, request: Request) -> dic
                 "not_found",
                 strategy_id=strategy_id,
             )
-        await _append_override_event(conn, "strategy_override_cleared", actor, strategy_id, {})
+        await _append_override_event(
+            conn,
+            "strategy_override_cleared",
+            actor,
+            strategy_id,
+            {"strategy_id": strategy_id},
+            reason,
+        )
     audit(
         getattr(request.state, "principal", None),
         "strategy_override_cleared",
         strategy_id=strategy_id,
+        **({"reason": reason} if reason else {}),
     )
     await _reload_engine(request, actor)
     return await get_strategy_risk_config(strategy_id, request)

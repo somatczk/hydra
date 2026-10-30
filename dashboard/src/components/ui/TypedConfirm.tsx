@@ -51,7 +51,11 @@ export function TypedConfirm({
   const trimmed = reason.trim();
   const tokenOk = typed === token;
   const reasonOk = trimmed.length >= MIN_REASON && trimmed.length <= MAX_REASON;
-  const tokenError = /^\d+$/.test(token) ? `Type ${token} to confirm.` : `Type ${token} in capitals to confirm.`;
+  const tokenError = /^\d+$/.test(token)
+    ? `Type ${token} to confirm.`
+    : token === token.toUpperCase()
+      ? `Type ${token} in capitals to confirm.`
+      : `Type ${token} exactly to confirm.`;
   const reasonError =
     trimmed.length > MAX_REASON ? `Keep the reason to ${MAX_REASON} characters or fewer.` : `Add a reason of at least ${MIN_REASON} characters.`;
 

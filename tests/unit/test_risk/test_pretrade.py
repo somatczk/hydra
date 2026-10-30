@@ -300,6 +300,55 @@ class TestStrategyOverrides:
             cfg.max_perp_leverage,
         )
 
+    def test_effective_limits_preserves_the_stored_global_not_the_defaults(self) -> None:
+        """The min-render must carry every other field of the stored global through;
+        building a fresh RiskConfig would silently reset them to the defaults."""
+        cfg = RiskConfig(
+            max_position_pct=Decimal("0.10"),
+            max_risk_per_trade=Decimal("0.02"),
+            max_portfolio_heat=Decimal("0.10"),
+            max_daily_loss_pct=Decimal("0.01"),
+            max_consecutive_losses=2,
+            consecutive_loss_cooldown_hours=2.5,
+            max_liquidity_pct=Decimal("0.005"),
+            correlation_threshold=Decimal("0.50"),
+            max_drawdown_pct=Decimal("0.20"),
+            max_concurrent_positions=8,
+            max_orders_per_minute=3,
+            fee_buffer=Decimal("0.001"),
+            max_perp_leverage=2,
+        )
+        effective = effective_limits(cfg, StrategyLimits(max_position_pct=Decimal("0.04")))
+        assert (
+            effective.max_portfolio_heat,
+            effective.max_daily_loss_pct,
+            effective.max_drawdown_pct,
+            effective.max_consecutive_losses,
+            effective.consecutive_loss_cooldown_hours,
+            effective.max_liquidity_pct,
+            effective.correlation_threshold,
+            effective.max_orders_per_minute,
+            effective.fee_buffer,
+            effective.max_perp_leverage,
+        ) == (
+            Decimal("0.10"),
+            Decimal("0.01"),
+            Decimal("0.20"),
+            2,
+            2.5,
+            Decimal("0.005"),
+            Decimal("0.50"),
+            3,
+            Decimal("0.001"),
+            2,
+        )
+        # the min itself applies only to the three overridable caps
+        assert (
+            effective.max_position_pct,
+            effective.max_risk_per_trade,
+            effective.max_concurrent_positions,
+        ) == (Decimal("0.04"), Decimal("0.02"), 8)
+
 
 class TestFuturesMargin:
     def _fut(self, qty: str) -> OrderRequest:

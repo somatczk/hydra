@@ -184,10 +184,10 @@ export default function RiskPage() {
     return 'ok' in result;
   };
 
-  const clearStrategyOverride = async (): Promise<boolean> => {
+  const clearStrategyOverride = async (reason: string): Promise<boolean> => {
     const id = selectedId;
-    retry.current = () => clearStrategyOverride();
-    const result = await settle(fetchApi(`/api/risk/config/${id}`, { method: 'DELETE' }));
+    retry.current = () => clearStrategyOverride(reason);
+    const result = await settle(fetchApi(`/api/risk/config/${id}`, { method: 'DELETE', ...json({ reason }) }));
     setOutcome(strategyOverrideOutcome(result, id, 'clear'));
     void Promise.all([config.refetch(), events.refetch()]);
     return 'ok' in result;
@@ -363,6 +363,7 @@ export default function RiskPage() {
                   strategyId={selectedId}
                   cfg={config.data}
                   stored={stored}
+                  hasStoredRow={storedOverride !== undefined}
                   onSave={saveStrategyOverride}
                   onClear={clearStrategyOverride}
                 />

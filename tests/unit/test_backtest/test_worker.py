@@ -140,9 +140,11 @@ class _BarsThenFailingWrites:
         self,
         rows: list[dict[str, Any]],
         strategy_rows: list[dict[str, Any]] | None = None,
+        global_row: dict[str, Any] | None = None,
     ) -> None:
         self._rows = rows
         self._strategy_rows = strategy_rows if strategy_rows is not None else []
+        self._global_row = global_row if global_row is not None else {"kill_switch_active": False}
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         if "FROM risk_config" in query:  # the worker's strategy-override read
@@ -154,7 +156,7 @@ class _BarsThenFailingWrites:
         # the two reads PgRiskStateStore.load_config does before a backtest runs
         assert "risk_config" in query or "system_config" in query, query
         if "risk_config" in query:
-            return {"kill_switch_active": False}
+            return dict(self._global_row)
         return {"value": "10000"}
 
     def transaction(self) -> _Transaction:
@@ -169,8 +171,9 @@ class _BarsThenRecordedWrites(_BarsThenFailingWrites):
         self,
         rows: list[dict[str, Any]],
         strategy_rows: list[dict[str, Any]] | None = None,
+        global_row: dict[str, Any] | None = None,
     ) -> None:
-        super().__init__(rows, strategy_rows)
+        super().__init__(rows, strategy_rows, global_row)
         self.inserts: list[tuple[str, tuple[Any, ...]]] = []
 
     async def execute(self, query: str, *args: Any) -> str:
@@ -494,6 +497,68 @@ async def test_a_backtest_min_renders_the_strategy_override_into_the_runners_con
     assert risk_config.max_risk_per_trade == Decimal("0.02")
     assert risk_config.max_concurrent_positions == 3
     assert risk_config.max_portfolio_heat == Decimal("0.30")
+
+
+async def test_a_backtest_preserves_the_stored_global_limits_not_the_defaults(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The min-render must not reset the non-overridable caps: the runner enforces
+    exactly the stored global row, never the dataclass defaults."""
+    _write_strategy(strategies_dir, "saw")
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    pf = await _preflighted("saw", body)
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 60, timedelta(hours=1))
+    global_row = {
+        "kill_switch_active": False,
+        "max_position_pct": Decimal("0.10"),
+        "max_risk_per_trade": Decimal("0.02"),
+        "max_portfolio_heat": Decimal("0.10"),  # the default would be 0.30
+        "max_daily_loss_pct": Decimal("0.01"),  # the default would be 0.03
+        "max_drawdown_pct": Decimal("0.12"),  # the default would be 0.15
+        "max_consecutive_losses": 2,  # the default would be 5
+        "max_concurrent_positions": 8,  # the default would be 10
+        "max_perp_leverage": 2,  # the default would be 3
+    }
+    strategy_rows = [
+        {
+            "scope": "strategy:saw",
+            "max_position_pct": Decimal("0.04"),
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": 3,
+        }
+    ]
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 60)])
+    run = worker.JobRun()
+
+    seen: list[Any] = []
+    real_runner = worker.BacktestRunner
+
+    class _RecordingRunner(real_runner):
+        async def run(self, *args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs.get("risk_config"))
+            return await super().run(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "BacktestRunner", _RecordingRunner)
+    outcome = await worker.run_backtest_job(
+        _Pool(_BarsThenRecordedWrites(rows, strategy_rows, global_row)),
+        engine,
+        _job(body, pf.config),
+        run,
+    )
+    assert outcome.result_id == "bt-task-unit"
+    assert len(seen) == 1
+    risk_config = seen[0]
+    # every non-overridable cap passes the stored global through untouched
+    assert risk_config.max_portfolio_heat == Decimal("0.10")
+    assert risk_config.max_daily_loss_pct == Decimal("0.01")
+    assert risk_config.max_drawdown_pct == Decimal("0.12")
+    assert risk_config.max_consecutive_losses == 2
+    assert risk_config.max_perp_leverage == 2
+    # the three overridable caps take the min: 0.10 -> 0.04 and 8 -> 3; the unset
+    # risk-per-trade keeps the stored global 0.02
+    assert risk_config.max_position_pct == Decimal("0.04")
+    assert risk_config.max_risk_per_trade == Decimal("0.02")
+    assert risk_config.max_concurrent_positions == 3
 
 
 async def test_hyperopt_handler_ensures_bars_through_the_engine(strategies_dir: Path) -> None:

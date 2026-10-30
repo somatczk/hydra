@@ -612,6 +612,31 @@ class TestRiskConfig:
         assert resp.status_code == 400
         assert resp.json()["detail"]["code"] == "no_fields"
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {
+                "max_position_pct": None,
+                "max_risk_per_trade": None,
+                "max_concurrent_positions": None,
+            },
+            {"max_risk_per_trade": None},
+        ],
+    )
+    def test_strategy_override_put_all_null_is_400_naming_delete(
+        self, body: dict[str, None]
+    ) -> None:
+        """An all-null PUT would store a row that caps nothing while hiding the
+        removal; the way to clear is DELETE."""
+        pool, conn = _make_pool()
+        conn.execute = AsyncMock()
+        resp = TestClient(_make_app(pool=pool)).put("/api/risk/config/strat-x", json=body)
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "no_fields"
+        assert "DELETE /api/risk/config/strat-x" in detail["message"]
+        conn.execute.assert_not_awaited()
+
     def test_strategy_override_put_db_error_is_503(self) -> None:
         resp = TestClient(_make_app(pool=_refusing_pool())).put(
             "/api/risk/config/strat-x", json={"max_position_pct": 0.05}
@@ -664,6 +689,21 @@ class TestRiskConfig:
         assert deletes[0].args[1] == "strategy:strat-x"
         events = [c for c in conn.execute.await_args_list if "INSERT INTO risk_events" in c.args[0]]
         assert events[0].args[1] == "strategy_override_cleared"
+        # no typed reason: the fixed identifying line stays
+        assert events[0].args[3] == "per-strategy override for strat-x"
+
+    def test_strategy_override_delete_records_the_typed_reason(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, None])
+        conn.execute = AsyncMock(return_value="DELETE 1")
+        resp = TestClient(_make_app(pool=pool)).request(
+            "DELETE", "/api/risk/config/strat-x", json={"reason": "back to the global cap"}
+        )
+        assert resp.status_code == 200
+        events = [c for c in conn.execute.await_args_list if "INSERT INTO risk_events" in c.args[0]]
+        assert events[0].args[1] == "strategy_override_cleared"
+        assert events[0].args[3] == "back to the global cap"
+        assert json.loads(events[0].args[4]) == {"strategy_id": "strat-x"}
 
     def test_strategy_override_delete_without_a_row_is_404(self) -> None:
         pool, conn = _make_pool()

@@ -4,13 +4,13 @@ import { useState } from 'react';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
+import { TypedConfirm } from '@/components/ui/TypedConfirm';
 import { plural } from '@/lib/derive';
 import {
   LIMIT_LABELS,
   STRATEGY_FIELDS,
   buildStrategyOverrideUpdate,
   effectiveOverride,
-  hasOverride,
   isCount,
   riskLimitsToForm,
   strategyLimitText,
@@ -26,19 +26,23 @@ interface StrategyLimitsSheetProps {
   /** The global limits the override can only tighten. */
   cfg: RiskLimitValues;
   stored: StrategyOverrideValues;
+  /** True whenever a row exists in risk_config, all-null or not: any stored row is removable. */
+  hasStoredRow: boolean;
   /** Resolves true once the engine has the new override; the editor then closes. */
   onSave: (update: StrategyOverrideValues) => Promise<boolean>;
-  /** Resolves true once the engine dropped the override (DELETE). */
-  onClear: () => Promise<boolean>;
+  /** Resolves true once the engine dropped the override (DELETE); receives the typed reason. */
+  onClear: (reason: string) => Promise<boolean>;
 }
 
 /** One strategy's tighter-only override: stored + effective limits, an editor that
- * clamps looser entries to the global value (with the reason shown), and a clear. */
-export function StrategyLimitsSheet({ strategyId, cfg, stored, onSave, onClear }: StrategyLimitsSheetProps) {
+ * clamps looser entries to the global value (with the reason shown), and a typed
+ * removal. */
+export function StrategyLimitsSheet({ strategyId, cfg, stored, hasStoredRow, onSave, onClear }: StrategyLimitsSheetProps) {
   const [form, setForm] = useState<StrategyOverrideForm | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clamping, setClamping] = useState<{ update: StrategyOverrideValues; fields: StrategyField[] } | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
   const effective = effectiveOverride(cfg, stored);
 
   const save = async (update: StrategyOverrideValues) => {
@@ -80,28 +84,39 @@ export function StrategyLimitsSheet({ strategyId, cfg, stored, onSave, onClear }
           >
             Edit override
           </Button>
-          {hasOverride(stored) && (
-            <Button variant="ghost" size="sm" onClick={() => setClearing(true)}>
+          {hasStoredRow && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setClearing(true);
+                setClearError(null);
+              }}
+            >
               Remove override
             </Button>
           )}
         </div>
-        <ConfirmDialog
+        <TypedConfirm
           open={clearing}
           title={`Remove the override for ${strategyId}?`}
+          token={strategyId}
           primaryLabel="Remove override"
           secondaryLabel="Keep it"
           pendingLabel="Removing…"
-          pendingHint="Closing this won't cancel the removal."
-          destructive
+          error={clearError}
           onClose={() => setClearing(false)}
-          onConfirm={async () => {
-            await onClear();
-            setClearing(false);
+          onConfirm={async (reason) => {
+            if (await onClear(reason)) {
+              setClearing(false);
+              setClearError(null);
+            } else {
+              setClearError('Not removed.');
+            }
           }}
         >
           <p>The global limits apply to {strategyId} again once the engine reloads.</p>
-        </ConfirmDialog>
+        </TypedConfirm>
       </>
     );
   }
