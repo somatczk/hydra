@@ -193,14 +193,15 @@ class NotificationDispatcher:
         self,
         discord_url: str = "",
         slack_url: str = "",
-        telegram_token: str = "",
+        telegram_token: str | None = None,
         telegram_chat_id: str = "",
         telegram_base_url: str = TELEGRAM_API_URL,
     ) -> None:
         """Set or replace webhook targets.
 
-        Passing an empty string for a channel leaves it unconfigured (disabled);
-        the Telegram channel needs both the token and the chat id.
+        Passing an empty string (``None`` for the token) for a channel leaves it
+        unconfigured (disabled); the Telegram channel needs both the token and
+        the chat id.
         ``telegram_base_url`` is the notifier's test seam and never overridden
         in production.
         """

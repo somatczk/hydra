@@ -283,6 +283,30 @@ async def test_a_failed_poll_keeps_the_running_set_snapshot(
     assert ws.messages[0]["event"] == "session_status"
 
 
+async def test_a_failed_stopped_refetch_keeps_the_diff_and_the_tick_lands(
+    relay: TradesRelay, pool: FakePool, ws: FakeSocket
+) -> None:
+    pool.sessions = [_session("s1")]
+    await relay.ensure_started()
+    await _drained(relay)
+    pool.sessions = [_session("s1", "stopped")]
+    pool.fail_on = "id = ANY"  # the running-set read ran; only the stopped re-fetch failed
+    await _drained(relay)
+    assert ws.messages == []  # the snapshot was not committed, so the diff is not lost
+
+    pool.fail_on = None
+    await _drained(relay)
+    assert ws.messages == [
+        {
+            "event": "session_status",
+            "session_id": "s1",
+            "status": "stopped",
+            "stopped_at": _STOPPED_AT.isoformat(),
+            "error_message": None,
+        }
+    ]
+
+
 class TestHandlerWiring:
     """The /ws/trades handler starts the app's relay from its pool, whatever the mode."""
 

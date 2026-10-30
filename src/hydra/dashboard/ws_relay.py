@@ -105,8 +105,8 @@ class TradesRelay:
             self._running = running  # the first poll anchors: stops before it are not replayed
             return
         gone = self._running - running
-        self._running = running
         if not gone:
+            self._running = running
             return
         stopped = await self._pool.fetch(
             "SELECT id, status, stopped_at, error_message FROM trading_sessions WHERE id = ANY($1)",
@@ -125,3 +125,5 @@ class TradesRelay:
                     "error_message": row["error_message"],
                 },
             )
+        # committed last: a failed fetch or broadcast retries the diff, it never drops it
+        self._running = running
