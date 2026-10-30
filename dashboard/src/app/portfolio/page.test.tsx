@@ -203,3 +203,25 @@ describe('PortfolioPage source pinning, export scope and chart data', () => {
     expect(daily?.textContent).toContain('12.50');
   });
 });
+
+describe('PortfolioPage when the strategy list is unavailable', () => {
+  it('shows the reason in place of the Strategy filter and keeps the journal usable with raw ids', async () => {
+    const routes = {
+      ...paperRoutes(),
+      '/api/strategies': unavailable('the strategies table is unavailable'),
+    };
+    fetchApi.mockImplementation(routeFetch(routes, calls));
+    page = await mount(<PortfolioPage />);
+    await click(buttonByText(page.container, 'Apply filters'));
+
+    const journal = Array.from(page.container.querySelectorAll('section')).find((sec) =>
+      sec.textContent?.startsWith('Trade journal'),
+    );
+    const text = journal?.textContent ?? '';
+    expect(text).toContain('the strategies table is unavailable');
+    expect(journal?.querySelector('select')).toBeNull();
+    const row = journal?.querySelector('tbody tr')?.textContent ?? '';
+    expect(row).toContain('saw');
+    expect(row).not.toContain('Saw');
+  });
+});

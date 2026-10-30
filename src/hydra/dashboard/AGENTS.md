@@ -7,6 +7,7 @@ this file covers the local mechanics.
 ```bash
 uv run pytest tests/unit/test_dashboard -q -m "not slow"   # from a worktree only (root rule)
 uv run pytest tests/unit/test_dashboard/test_auth_coverage.py -q   # after any route, path or middleware change
+uv run mypy src/hydra/dashboard/ --strict   # the package is on CI's strict line (no relaxation)
 ```
 
 ## Invariants

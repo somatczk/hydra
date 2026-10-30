@@ -130,7 +130,7 @@ module = ["msgpack", "msgpack.*", "asyncpg", "asyncpg.*", "ccxt", "ccxt.*", "tal
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["hydra.strategy.builtin.*", "hydra.strategy.rule_engine", "hydra.strategy.indicator_registry", "hydra.data.*", "hydra.backtest.*", "hydra.execution.*", "hydra.risk.*", "hydra.portfolio.*", "hydra.dashboard.*", "hydra.dashboard.routes.*"]
+module = ["hydra.strategy.builtin.*", "hydra.strategy.rule_engine", "hydra.strategy.indicator_registry", "hydra.data.*", "hydra.backtest.*", "hydra.execution.*", "hydra.risk.*", "hydra.portfolio.*"]
 disallow_any_expr = false
 warn_return_any = false
 disallow_untyped_defs = false

@@ -9,6 +9,7 @@ approval store. Repo-wide rules are in the root `AGENTS.md`.
 uv run pytest tests/unit/test_services -q
 uv run pytest tests/unit/test_dashboard/test_live_routes.py tests/unit/test_dashboard/test_activity_routes.py tests/unit/test_dashboard/test_mcp_tools.py -q
 uv run mypy src/
+uv run mypy src/hydra/services/ --strict   # the package is on CI's strict line (no relaxation)
 ```
 
 ## Invariants

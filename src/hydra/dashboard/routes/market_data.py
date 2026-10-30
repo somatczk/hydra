@@ -230,9 +230,9 @@ _ALLOWED_EXCHANGES = frozenset({"binance", "binanceusdm"})
 
 
 def _default_exchange_factory(exchange_id: str) -> Any:
-    import ccxt.async_support as ccxt_async
+    from hydra.execution.client_factory import rest_exchange_factory
 
-    return getattr(ccxt_async, exchange_id)({"enableRateLimit": True})
+    return rest_exchange_factory(exchange_id)
 
 
 _exchange_factory: Callable[[str], Any] = _default_exchange_factory

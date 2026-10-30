@@ -164,6 +164,32 @@ def test_import_contract_runs_in_ci_and_make_check() -> None:
     assert "imports" in check.split()
 
 
+def test_the_strict_mypy_line_names_every_package_and_the_makefile_mirrors_it() -> None:
+    [strict] = [run for run in _runs(_jobs()["type-check"]) if "--strict" in run]
+    packages = {part.split("/")[2] for part in strict.split() if part.startswith("src/hydra/")}
+    on_disk = {
+        p.name
+        for p in (_ROOT / "src" / "hydra").iterdir()
+        if p.is_dir() and p.name != "__pycache__"
+    }
+    assert packages == on_disk
+    makefile = (_ROOT / "Makefile").read_text()
+    [recipe] = re.findall(r"^type-check:\n\tuv run mypy src/\n\t(.+)$", makefile, re.M)
+    assert recipe == strict
+    # AGENTS.md wraps the strict command over backslash continuations: join before comparing
+    [gates] = [
+        block
+        for block in re.findall(r"```bash\n(.*?)\n```", (_ROOT / "AGENTS.md").read_text(), re.S)
+        if "--strict" in block
+    ]
+    [doc_strict] = [
+        line
+        for line in gates.replace("\\\n", "").splitlines()
+        if line.startswith("uv run mypy") and "--strict" in line
+    ]
+    assert " ".join(doc_strict.split()) == " ".join(strict.split())
+
+
 # ---------------------------------------------------------------------------
 # HYDRA_REQUIRE_INFRA: the conftest hook and the tests/infra.py fixtures
 # ---------------------------------------------------------------------------
