@@ -40,7 +40,7 @@ def _ms(ts: datetime) -> int:
 
 def history_rows(end: datetime, n: int, close: float = 100.0) -> list[list[Any]]:
     """*n* flat closed hourly bars ending at *end* (all four prices = *close*)."""
-    return [[_ms(end - i * H), close, close, close, close, 10.0] for i in range(n)][::-1]
+    return [[_ms(end - i * H), close, close, close, close, 1000.0] for i in range(n)][::-1]
 
 
 async def markets_loader(exchange_id: str) -> list[dict[str, Any]]:
@@ -194,7 +194,7 @@ class Harness:
             high=D(high) if high is not None else max(o, c),
             low=D(low) if low is not None else min(o, c),
             close=c,
-            volume=D("10"),
+            volume=D("1000"),
             timestamp=ts,
         )
         assert session._event_bus is not None

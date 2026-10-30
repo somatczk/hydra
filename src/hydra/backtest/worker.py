@@ -204,7 +204,9 @@ async def _ensure_bars(
 ) -> None:
     """The fetch phase: make the range's bars available before the handlers load them.
 
-    ``fetch_engine=None`` (the kill switch) skips the phase — today's behaviour. A
+    Every declared timeframe fetches its own stream (a confirmation stream with no
+    stored bars would silently never veto). ``fetch_engine=None`` (the kill switch)
+    skips the phase — today's behaviour. A
     fetch past patience fails the job retryable with the reason on the row; a range
     the exchange genuinely lacks re-raises the P0-B no-market-data vocabulary.
     """
@@ -218,7 +220,7 @@ async def _ensure_bars(
             start,
             end,
             force=force,
-            on_progress=_fetch_progress(run, config.timeframes.primary),
+            progress_for=lambda tf: _fetch_progress(run, tf),
         )
     except DataFetchError as exc:
         _fetch_failed(run, reason=exc.reason)
@@ -279,7 +281,11 @@ async def run_backtest_job(
         pool, fetch_engine, config, body.start_date, body.end_date, run, force=body.fetch_fresh
     )
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
-    run.detail["provenance"] = {**jobs.provenance_payload(provenance, config), "ml_models": served}
+    extras = await jobs.load_job_extra_bars(pool, config, body.start_date, body.end_date)
+    run.detail["provenance"] = {
+        **jobs.provenance_payload(provenance, config, extras),
+        "ml_models": served,
+    }
     run.progress = 30.0
 
     funding = await _funding_preflight(pool, fetch_engine, config, body, run)
@@ -299,6 +305,7 @@ async def run_backtest_job(
             on_progress=_report,
             risk_config=risk_config,
             funding=funding,
+            extra_bars=extras,
         )
     run.progress = 90.0
 
@@ -315,7 +322,13 @@ async def run_backtest_job(
 async def run_hyperopt_job(
     pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
 ) -> JobOutcome:
-    """Execute a hyperopt run on stored bars; the result payload is stored on the row."""
+    """Execute a hyperopt run on stored bars; the result payload is stored on the row.
+
+    A FUTURES config gets the plain backtest's funding preflight: the stored
+    ``ts.funding_rates`` rows are topped up for the window and loaded once, so every
+    trial and the holdout accrue only from the rows inside their own bars. Every
+    declared non-primary timeframe is loaded and replayed with the primary stream.
+    """
     body = HyperoptRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
@@ -323,7 +336,11 @@ async def run_hyperopt_job(
 
     await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
-    provenance_dict = {**jobs.provenance_payload(provenance, config), "ml_models": served}
+    extras = await jobs.load_job_extra_bars(pool, config, body.start_date, body.end_date)
+    provenance_dict = {
+        **jobs.provenance_payload(provenance, config, extras),
+        "ml_models": served,
+    }
     run.detail["provenance"] = provenance_dict
     funding = await _funding_preflight(pool, fetch_engine, config, body, run)
 
@@ -359,6 +376,7 @@ async def run_hyperopt_job(
             timeframe=config.timeframes.primary,
             on_trial_complete=_on_trial,
             funding=funding,
+            extra_bars=extras,
         )
     payload = result.to_dict()
     payload["provenance"] = provenance_dict
@@ -368,7 +386,14 @@ async def run_hyperopt_job(
 async def run_walkforward_job(
     pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
 ) -> JobOutcome:
-    """Execute a walk-forward analysis on stored bars; the folds are stored on the row."""
+    """Execute a walk-forward analysis on stored bars; the folds are stored on the row.
+
+    A FUTURES config gets the plain backtest's funding preflight: the stored
+    ``ts.funding_rates`` rows are topped up for the window and loaded once — the
+    full-range dict serves every sub-window, and the executor accrues only the rows
+    inside each run's own bars. Every declared non-primary timeframe is loaded and
+    replayed with the primary stream in every fold.
+    """
     body = WalkForwardRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
@@ -376,7 +401,11 @@ async def run_walkforward_job(
 
     await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
-    run.detail["provenance"] = {**jobs.provenance_payload(provenance, config), "ml_models": served}
+    extras = await jobs.load_job_extra_bars(pool, config, body.start_date, body.end_date)
+    run.detail["provenance"] = {
+        **jobs.provenance_payload(provenance, config, extras),
+        "ml_models": served,
+    }
     funding = await _funding_preflight(pool, fetch_engine, config, body, run)
 
     windows = fold_windows(
@@ -410,6 +439,7 @@ async def run_walkforward_job(
             symbol=config.symbols[0],
             timeframe=config.timeframes.primary,
             funding=funding,
+            extra_bars=extras,
         )
     run.detail["fold_count"] = len(result.folds)
     return JobOutcome(result=result.to_dict())

@@ -22,19 +22,19 @@ SYM = "BTCUSDT"
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def bar(i: int, o: str, h: str, low: str, c: str) -> OHLCV:
+def bar(i: int, o: str, h: str, low: str, c: str, volume: str = "1000") -> OHLCV:
     return OHLCV(
         open=D(o),
         high=D(h),
         low=D(low),
         close=D(c),
-        volume=D("1"),
+        volume=D(volume),
         timestamp=T0 + timedelta(hours=i),
     )
 
 
-def flat_bar(i: int, price: str) -> OHLCV:
-    return bar(i, price, price, price, price)
+def flat_bar(i: int, price: str, volume: str = "1000") -> OHLCV:
+    return bar(i, price, price, price, price, volume)
 
 
 def executor(capital: str, fee: str = "0.001", slippage: str = "0") -> PaperTradingExecutor:
@@ -220,7 +220,7 @@ async def test_gap_cancelled_buy_oco_reports_its_parent() -> None:
 async def test_get_balance_plus_position_value_equals_equity() -> None:
     ex = executor("10000", fee="0")
     doge = "DOGEUSDT"
-    await ex.on_closed_bar(doge, flat_bar(0, "0.5"))
+    await ex.on_closed_bar(doge, flat_bar(0, "0.5", "1000000"))
     await ex.create_order(doge, "BUY", "MARKET", D("10000"))
     await ex.create_order(doge, "BUY", "LIMIT", D("1000"), price=D("0.4"))
 

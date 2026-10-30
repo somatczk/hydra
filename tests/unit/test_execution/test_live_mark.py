@@ -16,6 +16,7 @@ import pytest
 
 from hydra.core.events import Event, FeedStatusEvent, OrderFillEvent
 from hydra.core.types import OrderType, Side
+from hydra.execution.paper_trading import OrderRejectedError
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.execution.session_manager import TradingSession
 from hydra.execution.session_wiring import ManualOrderResult
@@ -266,6 +267,39 @@ class TestStaleFeed:
         result = await _sell(h)
 
         assert (result.fill_price, result.mark_source) == (D("96.903"), "stale_live")
+
+    async def test_a_manual_buy_on_a_stale_feed_is_refused_and_returns_after_live(
+        self, h: Harness, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The session seam refuses a stale-feed BUY twice over: the entry pause first
+        (session_wiring), and the executor's stale-mark refusal beneath it
+        (test_volume_model names the mark). The manual exit still fills (the test above)."""
+        session = await h.session(write_strategy(strategies_dir, "manual"))
+        runtime = session._runtime
+        assert runtime is not None
+        await h.price(session, "103")
+        live = {"value": False}
+        monkeypatch.setattr(runtime.feed, "is_live", lambda _eid: live["value"])
+        await runtime.bus.publish(FeedStatusEvent(status="stale", reason="ws_silence"))
+        await settle()
+        assert h.mgr is not None
+
+        with pytest.raises(ValueError, match="entries are paused \\(feed stale"):
+            await h.mgr.submit_manual_order(symbol="BTCUSDT", side=Side.BUY, quantity=D("0.5"))
+
+        # nothing filled and nothing was locked behind the refusal
+        assert executor(session).get_fills() == []
+        assert await usdt(session) == D("1000")
+
+        # the outage lifts and a fresh price arrives: the same order fills at the new mark
+        # (the aged mark alone still refuses an opening — the executor's second line)
+        live["value"] = True
+        await runtime.bus.publish(FeedStatusEvent(status="live"))
+        with pytest.raises(OrderRejectedError, match="the mark 103 is stale"):
+            await h.mgr.submit_manual_order(symbol="BTCUSDT", side=Side.BUY, quantity=D("0.5"))
+        await h.price(session, "104")
+        result = await _buy(h, "0.6")  # a different size: the refused attempt holds the dedup key
+        assert (result.fill_price, result.mark_source) == (D("104.104"), "live")
 
     async def test_a_fresh_price_after_the_outage_is_live_again(
         self, h: Harness, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch

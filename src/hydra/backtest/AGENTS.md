@@ -56,6 +56,14 @@ Test files without a `tests/` prefix are in `tests/unit/test_backtest/`.
   job window's rows once and hyperopt and walk-forward pass them to every runner call; the executor accrues only rows
   inside each run's own bars (`tests/unit/test_backtest/test_perp_research.py`,
   `tests/unit/test_services/test_research.py::test_hyperopt_and_walkforward_accept_a_futures_strategy`).
+- Every declared timeframe is its own stream: `jobs.ensure_job_bars` fetches each, `load_job_extra_bars`
+  loads the non-primary ones (a missing one refuses by name), the runner replays them merged with the
+  primary stream in close-time order, and the submit preflight 422s naming a declared timeframe with no
+  stored data — an empty confirmation stream would silently never veto.
+- Every fill is capped to `max_participation` (10 % by default) of the bar's volume: entry market
+  orders fill the fillable slice and cancel the remainder; resting orders slice per bar and the
+  remainder keeps working, same order id. One logical exit's slices aggregate into one round trip
+  (`tests/unit/test_backtest/test_volume_fills.py`).
 
 ## Where things are
 

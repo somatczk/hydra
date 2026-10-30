@@ -160,6 +160,10 @@ class ProtectiveOrderManager:
     def armed(self, symbol: str) -> ProtectiveGroup | None:
         return self._groups.get(symbol)
 
+    def _is_live(self) -> bool:
+        """Live executors carry an exchange client; paper ones never do."""
+        return getattr(self._executor, "exchange_client", None) is not None
+
     def groups(self) -> dict[str, ProtectiveGroup]:
         return dict(self._groups)
 
@@ -196,11 +200,29 @@ class ProtectiveOrderManager:
         whatever the disarm stashed, and any fill that leaves a position re-sizes the
         group to it. Only an exit fill consumes the disarm stash — an entry never does
         (a stashed spec that survived a refused exit is stale for the new position).
+
+        A *partial* exit fill (the volume model slices a resting protective order per
+        bar) leaves the same order still resting: the group is re-sized in place to the
+        remaining position instead of re-armed — a re-arm beside the resting remainder
+        would double-lock its base and trip the decision-17 close path. Live executors
+        never slice locally, so they keep the re-arm contract.
         """
         symbol = str(event.symbol)
         position = await self._position(symbol)
         group = self._groups.get(symbol)
         if group is not None and event.order_id in (group.order_id, *group.leg_ids):
+            remainder = None if self._is_live() else await self._resting_exit(symbol, position)
+            if remainder is not None:
+                # the filling order still rests: adopt its remainder as the group
+                self._groups[symbol] = ProtectiveGroup(
+                    symbol=symbol,
+                    order_id=remainder,
+                    order_type=group.order_type,
+                    quantity=position.quantity if position is not None else group.quantity,
+                    spec=group.spec,
+                    leg_ids=group.leg_ids,
+                )
+                return
             del self._groups[symbol]
             if position is not None:
                 await self._arm(position, group.spec)
@@ -218,6 +240,16 @@ class ProtectiveOrderManager:
                 position,
                 spec or self._policy_spec(symbol, position.avg_entry_price, position.direction),
             )
+
+    async def _resting_exit(self, symbol: str, position: Position | None) -> str | None:
+        """The id of the still-resting exit order of a partially filled group, if any."""
+        if position is None:
+            return None
+        side = "SELL" if position.direction == Direction.LONG else "BUY"
+        for order in await self._executor.fetch_open_orders(symbol):
+            if str(order.get("side")) == side:
+                return str(order.get("oco_id") or order["id"])
+        return None
 
     # -- Exits -----------------------------------------------------------------------
 
@@ -259,7 +291,7 @@ class ProtectiveOrderManager:
         """
         from hydra.execution.live_orders import CLIENT_ORDER_ID_PREFIX
 
-        live = getattr(self._executor, "exchange_client", None) is not None
+        live = self._is_live()
         for symbol in symbols:
             position = await self._position(symbol)
             if position is None:

@@ -25,13 +25,13 @@ BTC = "BTCUSDT"
 T0 = datetime(2026, 3, 1, tzinfo=UTC)
 
 
-def bar(i: int, o: str, h: str, low: str, c: str) -> OHLCV:
+def bar(i: int, o: str, h: str, low: str, c: str, volume: str = "1000") -> OHLCV:
     return OHLCV(
         open=D(o),
         high=D(h),
         low=D(low),
         close=D(c),
-        volume=D("1"),
+        volume=D(volume),
         timestamp=T0 + timedelta(hours=i),
     )
 
@@ -195,6 +195,36 @@ async def test_restored_executor_fills_like_the_original() -> None:
 
     assert [(f.order_id, f.price, f.net_pnl, f.fill_seq) for f in fa] == [
         (f.order_id, f.price, f.net_pnl, f.fill_seq) for f in fb
+    ]
+    assert b.to_state() == a.to_state()
+
+
+async def test_a_partially_filled_stop_round_trips_and_keeps_slicing() -> None:
+    """The volume model's state: a sliced stop's quantity and lock persist, and the
+    restored remainder keeps filling under the same order id."""
+    a = PaperTradingExecutor(initial_balances={"USDT": D("1000")})
+    await a.on_closed_bar(BTC, bar(0, "100", "100", "100", "100"))
+    await a.create_order(BTC, "BUY", "MARKET", D("1"))
+    await a.create_order(BTC, "SELL", "STOP_MARKET", D("1"), stop_price=D("95"))
+    # a thin bar slices 0.2 of the 1-unit stop; 0.8 keeps resting, locked
+    (slice_fill,) = await a.on_closed_bar(BTC, bar(1, "94", "94", "93", "94", "2"))
+    assert slice_fill.quantity == D("0.2")
+
+    state = paper_store.loads_state(paper_store.dumps_state(a.to_state()))
+    b = PaperTradingExecutor.from_state(state)
+
+    assert b.to_state() == a.to_state()
+    assert b.get_account_snapshot() == a.get_account_snapshot()
+    [resting] = await b.fetch_open_orders(BTC)
+    assert resting["id"] == slice_fill.order_id  # the same id, no format bump
+    assert resting["amount"] == 0.8
+
+    # the restored remainder keeps slicing identically on the next thin bar
+    nxt = bar(2, "92", "92", "91", "92", "2")
+    fa = await a.on_closed_bar(BTC, nxt)
+    fb = await b.on_closed_bar(BTC, nxt)
+    assert [(f.order_id, f.quantity, f.price) for f in fa] == [
+        (f.order_id, f.quantity, f.price) for f in fb
     ]
     assert b.to_state() == a.to_state()
 

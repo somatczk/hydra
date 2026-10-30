@@ -148,6 +148,24 @@ def _bar(ts: datetime, close: float) -> OHLCV:
     )
 
 
+def _folded(bars: list[OHLCV], per: int) -> list[OHLCV]:
+    """Fold every *per* 1h bars into one higher-timeframe bar, on that timeframe's grid."""
+    out: list[OHLCV] = []
+    for i in range(0, len(bars) - per + 1, per):
+        window = bars[i : i + per]
+        out.append(
+            OHLCV(
+                open=window[0].open,
+                high=max(b.high for b in window),
+                low=min(b.low for b in window),
+                close=window[-1].close,
+                volume=sum((b.volume for b in window), Decimal("0")),
+                timestamp=window[0].timestamp,
+            )
+        )
+    return out
+
+
 def _rising() -> list[OHLCV]:
     """Strictly rising closes: RSI(14) = 100, so the permissive model answers 1.0."""
     return [_bar(H1_START + i * H, 1000.0 + 5.0 * i) for i in range(BARS)]
@@ -159,8 +177,12 @@ def _sawtooth() -> list[OHLCV]:
 
 
 async def _seed(pool: Any, bars: list[OHLCV]) -> None:
+    """Seed the 1h stream and the declared extras folded from it (real stored bars,
+    never resampled at replay: the loader reads each timeframe separately)."""
     repo = MarketDataRepository.from_pool(pool)
     await repo.store_bars([("binance", "BTCUSDT", Timeframe.H1, b) for b in bars])
+    await repo.store_bars([("binance", "BTCUSDT", Timeframe.H4, b) for b in _folded(bars, 4)])
+    await repo.store_bars([("binance", "BTCUSDT", Timeframe.D1, b) for b in _folded(bars, 24)])
 
 
 async def _register(

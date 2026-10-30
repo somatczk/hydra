@@ -33,7 +33,7 @@ def bar(i: int, o: str, h: str, low: str, c: str) -> OHLCV:
         high=D(h),
         low=D(low),
         close=D(c),
-        volume=D("1"),
+        volume=D("1000"),
         timestamp=T0 + timedelta(hours=i),
     )
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -22,14 +23,16 @@ import ccxt
 import pytest
 
 from hydra.core.event_bus import InMemoryEventBus
-from hydra.core.events import ExitSignal, OrderFillEvent
+from hydra.core.events import BarEvent, ExitSignal, OrderFillEvent
 from hydra.core.types import (
+    OHLCV,
     Direction,
     MarketType,
     OrderStatus,
     Position,
     Side,
     Symbol,
+    Timeframe,
 )
 from hydra.execution.exchange_stops import (
     StopBreachedError,
@@ -211,6 +214,128 @@ class TestStopFills:
         )
         assert await held(session) == D("0.50000")
         assert await _open(session) == [("SELL", "STOP_MARKET", 0.5, 95.095, None)]
+
+    async def test_a_sliced_stop_resizes_in_place_then_a_close_disarms_it(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """The volume model's subtlest change, adversarially.
+
+        A thin bar slices the protective stop (0.2 of the 1 held); the group must resize
+        IN PLACE to the remainder — a re-arm beside the resting remainder would
+        double-lock its base and trip the decision-17 market close. The strategy exit
+        that follows must then disarm the resized remainder and sell the rest.
+        """
+        session = await _entered(
+            h,
+            strategies_dir,
+            "slice",
+            risk={"stop_loss_method": "fixed_pct", "stop_loss_value": 2.0},
+        )
+        runtime = session._runtime
+        group = runtime.protect.armed("BTCUSDT")
+        assert group is not None
+        stop_id = group.order_id
+
+        async def thin_bar(hours: int, op: str, low: str) -> None:
+            ts = h.end + timedelta(hours=hours)
+            await runtime.bus.publish(
+                BarEvent(
+                    symbol=Symbol("BTCUSDT"),
+                    timeframe=Timeframe.H1,
+                    ohlcv=OHLCV(
+                        open=D(op), high=D(op), low=D(low), close=D(op), volume=D("2"), timestamp=ts
+                    ),
+                )
+            )
+            await settle()
+
+        # volume 2 -> cap 0.2: the stop fills a 0.2 slice and keeps resting
+        await thin_bar(2, "97.5", "97")
+
+        assert await held(session) == D("0.80000")
+        resized = runtime.protect.armed("BTCUSDT")
+        assert resized is not None
+        # in place: the SAME order still rests, alone, and the group is sized to the rest
+        assert resized.order_id == stop_id
+        assert resized.quantity == D("0.80000")
+        assert await _open(session) == [("SELL", "STOP_MARKET", 0.8, 98.098, None)]
+        assert not runtime.protect.failures
+
+        # the close: disarm cancels the resized remainder, the exit sells the rest
+        await runtime.bus.publish(ExitSignal(symbol=Symbol("BTCUSDT"), strategy_id="slice"))
+        assert await held(session) == 0
+        assert await _open(session) == []
+        assert runtime.protect.armed("BTCUSDT") is None
+        assert not runtime.protect.failures
+        sells = [f for f in executor(session).get_fills() if f.side == "SELL"]
+        assert [f.quantity for f in sells] == [D("0.20000"), D("0.80000")]
+
+    async def test_a_sliced_oco_leg_resizes_its_group_and_a_close_disarms_it(
+        self, h: Harness, strategies_dir: Path
+    ) -> None:
+        """The OCO-group variant: the take-profit leg slices, drops its stop sibling,
+        and the group adopts the detached remainder's own id — the OCO parent id the
+        group held names an order that no longer rests."""
+        session = await _entered(
+            h,
+            strategies_dir,
+            "oco-slice",
+            risk={
+                "stop_loss_method": "fixed_pct",
+                "stop_loss_value": 2.0,
+                "take_profit_method": "fixed_pct",
+                "take_profit_value": 5.0,
+            },
+        )
+        runtime = session._runtime
+        group = runtime.protect.armed("BTCUSDT")
+        assert group is not None
+        oco_id = group.order_id
+
+        async def thin_bar(hours: int, op: str, high: str, low: str) -> None:
+            ts = h.end + timedelta(hours=hours)
+            await runtime.bus.publish(
+                BarEvent(
+                    symbol=Symbol("BTCUSDT"),
+                    timeframe=Timeframe.H1,
+                    ohlcv=OHLCV(
+                        open=D(op),
+                        high=D(high),
+                        low=D(low),
+                        close=D(op),
+                        volume=D("2"),
+                        timestamp=ts,
+                    ),
+                )
+            )
+            await settle()
+
+        # two thin bars through the take-profit level: the TP leg slices 0.2 twice,
+        # its stop sibling is dropped, and the remainder continues standalone
+        await thin_bar(2, "104", "105.5", "103")
+        await thin_bar(3, "104", "105.5", "103")
+
+        assert await held(session) == D("0.60000")
+        resized = runtime.protect.armed("BTCUSDT")
+        assert resized is not None
+        # the group adopted the detached leg's own id, not the dead OCO parent's
+        assert resized.order_id != oco_id
+        [(order)] = await executor(session).fetch_open_orders("BTCUSDT")
+        assert (order["id"], order["amount"], order["oco_id"]) == (
+            resized.order_id,
+            0.6,
+            None,
+        )
+        assert not runtime.protect.failures
+
+        # the close disarms the resized remainder and sells the rest
+        await runtime.bus.publish(ExitSignal(symbol=Symbol("BTCUSDT"), strategy_id="oco-slice"))
+        assert await held(session) == 0
+        assert await _open(session) == []
+        assert runtime.protect.armed("BTCUSDT") is None
+        assert not runtime.protect.failures
+        sells = [f for f in executor(session).get_fills() if f.side == "SELL"]
+        assert [f.quantity for f in sells] == [D("0.20000"), D("0.20000"), D("0.60000")]
 
 
 async def _failure_handled() -> None:

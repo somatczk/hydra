@@ -69,6 +69,23 @@ class TestGapAndLimitRules:
         assert fill_rules.market_fill("SELL", D("100"), D("0.01")).price == D("99.00")
 
 
+class TestParticipationCap:
+    def test_the_slice_is_the_capped_share_of_the_bar(self) -> None:
+        assert fill_rules.participation_fillable(D("15"), D("100"), D("0.1")) == D("10")
+        assert fill_rules.participation_fillable(D("5"), D("100"), D("0.1")) == D("5")
+        assert fill_rules.participation_fillable(D("15"), D("0"), D("0.1")) == D("0")
+
+    def test_a_full_cap_and_a_zero_volume_bar(self) -> None:
+        assert fill_rules.participation_fillable(D("15"), D("10"), D("1")) == D("10")
+        assert fill_rules.participation_fillable(D("15"), D("150"), D("0.1")) == D("15")
+
+    def test_the_cap_bounds_are_validated(self) -> None:
+        with pytest.raises(ValueError, match="max_participation"):
+            fill_rules.participation_fillable(D("15"), D("100"), D("1.5"))
+        with pytest.raises(ValueError, match="max_participation"):
+            fill_rules.participation_fillable(D("15"), D("100"), D("-0.1"))
+
+
 class TestStopLimit:
     def test_triggered_and_marketable_fills_at_trigger_not_limit(self) -> None:
         out = fill_rules.stop_limit_fill("SELL", D("95"), D("94"), bar("100", "101", "93", "96"))

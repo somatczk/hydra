@@ -10,6 +10,10 @@ with ``oco_stop_first``, so paper and backtest share one rule.
 
 Gap-through stops fill at the worse of the stop and the open; resting limits fill at the better
 of the limit and the open (the backtester's rule). Slippage applies to stop and market fills only.
+
+Volume model: no order takes more than ``max_participation`` (10 % by default) of the bar it
+fills on — an entry market order fills the fillable slice and the remainder is cancelled; a
+resting order fills its slice and the remainder keeps working (``participation_fillable``).
 """
 
 from __future__ import annotations
@@ -22,6 +26,10 @@ from hydra.core.types import OHLCV
 
 Liquidity = Literal["maker", "taker"]
 _ONE = Decimal("1")
+ZERO = Decimal("0")
+
+DEFAULT_MAX_PARTICIPATION = Decimal("0.1")
+"""The share of one bar's volume any order may take (the paper and backtest default)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +94,20 @@ def market_fill(side: str, reference: Decimal, slippage: Decimal) -> FillPrice:
     if reference <= 0:
         raise ValueError(f"reference price must be positive, got {reference}")
     return FillPrice(slipped(reference, side, slippage), "taker")
+
+
+def participation_fillable(
+    requested: Decimal, bar_volume: Decimal, max_participation: Decimal
+) -> Decimal:
+    """How much of ``requested`` one bar's volume may absorb: min(requested, cap x volume).
+
+    A bar with no volume absorbs nothing; ``max_participation`` is a fraction in [0, 1].
+    """
+    if not ZERO <= max_participation <= _ONE:
+        raise ValueError(f"max_participation must be in [0, 1], got {max_participation}")
+    if bar_volume <= 0:
+        return ZERO
+    return min(requested, max_participation * bar_volume)
 
 
 def limit_fill(side: str, limit: Decimal, bar: OHLCV) -> FillPrice | None:

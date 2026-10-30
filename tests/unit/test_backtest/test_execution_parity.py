@@ -139,6 +139,31 @@ def _flat_bars(end: datetime, count: int) -> list[OHLCV]:
     return [OHLCV(p, p, p, p, D("100"), start + i * H) for i in range(count)]
 
 
+def _thin_bars(end: datetime) -> list[OHLCV]:
+    """The parity walk on volume-3 bars: every fill the 10 % cap binds (0.3/bar)."""
+    rng = np.random.default_rng(7)
+    start = end - (WARM - 1) * H
+    out: list[OHLCV] = []
+    close = 100.0
+    for i in range(WARM + TRADED):
+        open_ = close * (0.96 if i % 23 == 22 else 1.0)
+        close = open_ * (1 + rng.normal(0, 0.008))
+        wick = 0.045 if i % 31 == 30 else abs(rng.normal(0, 0.004))
+        o, c = round(open_, 2), round(close, 2)
+        out.append(
+            OHLCV(
+                open=D(str(o)),
+                high=D(str(round(max(o, c) * (1 + wick), 2))),
+                low=D(str(round(min(o, c) * (1 - wick), 2))),
+                close=D(str(c)),
+                volume=D("3"),
+                timestamp=start + i * H,
+            )
+        )
+        close = c
+    return out
+
+
 def _bars(end: datetime) -> list[OHLCV]:
     """Random walk with a 4 % gap down every 23rd bar and a wide range every 31st."""
     rng = np.random.default_rng(7)
@@ -156,7 +181,7 @@ def _bars(end: datetime) -> list[OHLCV]:
                 high=D(str(round(max(o, c) * (1 + wick), 2))),
                 low=D(str(round(min(o, c) * (1 - wick), 2))),
                 close=D(str(c)),
-                volume=D("100"),
+                volume=D("1000"),
                 timestamp=start + i * H,
             )
         )
@@ -293,6 +318,26 @@ async def test_backtest_equals_paper_session_on_the_same_bars(
     bars = _bars(last_closed_open(datetime.now(UTC), Timeframe.H1))
     fills = await _assert_parity(bars, ParityStrategy, strategies_dir, monkeypatch)
     _assert_fixture_hits_every_case(fills, {b.timestamp: b for b in bars})
+
+
+async def test_a_cap_binds_case_stays_identical_on_low_volume_bars(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parity extension: the volume model ships on BOTH sides with the same default.
+
+    Thin bars (volume 3) make the 10 % cap bind on every entry and slice every resting
+    exit — a paper session and the runner must still agree fill for fill, including the
+    ``participation_cap`` CANCELLED records and the locked-fund shrinkage.
+    """
+    end = last_closed_open(datetime.now(UTC), Timeframe.H1)
+    bars = _thin_bars(end)
+    fills = await _assert_parity(bars, ParityStrategy, strategies_dir, monkeypatch)
+    kinds = [f.status for f in fills]
+    assert "CANCELLED" in kinds, "the fixture must exercise the participation cap"
+    sliced = [f for f in fills if f.status == "FILLED" and f.reason == "stop_loss"]
+    assert any(f.quantity == D("0.3") for f in sliced), "a stop must have sliced (10 % of 3)"
+    capped_entries = [f for f in fills if f.reason == "participation_cap"]
+    assert capped_entries, "an entry remainder must have been cancelled"
 
 
 async def test_same_size_reentries_are_not_deduplicated_on_either_side(
