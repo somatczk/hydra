@@ -673,6 +673,40 @@ async def test_detail_on_a_real_session_includes_created_by(
     assert detail["metrics"]["balance"]["USDT"] == 1000.0
 
 
+async def test_paper_open_orders_egress_is_json_safe_floats(
+    h: Harness, strategies_dir: Path
+) -> None:
+    """P7-B3: the executors' open-order shape is exact Decimal interior, but the served
+    rows are JSON-safe floats — a bare Decimal would serialize as a string (a pydantic
+    extra field, or the MCP tool's ``json.dumps(default=str)``) and change the wire."""
+    sid = write_strategy(
+        strategies_dir,
+        "svc-trail",
+        entry_long=rule(("less_than", 100.5), ("greater_than", 99.5)),
+        risk={"stop_loss_method": "trailing_stop", "stop_loss_value": 3.0},
+    )
+    session = await h.session(sid)
+    await h.bar(session, "100")
+    assert await held(session) == D("1.00000")
+
+    detail = await sessions_svc.get_session_detail(h.mgr, session.session_id)
+
+    (row,) = detail["open_orders"]
+    assert row["type"] == "TRAILING_STOP"
+    for key in ("amount", "trail_pct", "stop_price"):
+        assert isinstance(row[key], float), key
+    assert (row["amount"], row["trail_pct"], row["stop_price"]) == (1.0, 0.03, 97.0)
+    # the exact bytes the MCP tool (json.dumps default=str) and the route model emit
+    assert json.dumps(detail["open_orders"]) == (
+        '[{"id": "<uuid>", "symbol": "BTCUSDT", "side": "SELL", "type": "TRAILING_STOP", '
+        '"amount": 1.0, "price": null, "stop_price": 97.0, "status": "PENDING", '
+        '"filled": false, "reason": "trailing_stop", "oco_id": null, "trail_pct": 0.03, '
+        '"protective": true}]'.replace("<uuid>", row["id"])
+    )
+    model = SessionDetailResponse.model_validate(detail)
+    assert model.open_orders[0].trail_pct == 0.03
+
+
 async def test_quick_trade_round_trip_on_the_real_seam(h: Harness, strategies_dir: Path) -> None:
     sid = write_strategy(strategies_dir, "svc")
     assert h.mgr is not None

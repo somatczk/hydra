@@ -190,7 +190,7 @@ async def test_recovery_resumes_paper_and_errors_live_rows_without_credentials(
         assert (await ex.get_balance())["USDT"] == D("1000") - D("5.005") - D("0.005005")
         stops = await ex.fetch_open_orders("BTCUSDT")
         assert [(o["type"], o["amount"], o["stop_price"]) for o in stops] == [
-            ("STOP_MARKET", 0.05, 95.095)
+            ("STOP_MARKET", D("0.05"), D("95.09500"))
         ]
         assert mgr.risk is not None and not mgr.risk.recovering
         assert mgr.risk.registered_sessions() == ["s1"]

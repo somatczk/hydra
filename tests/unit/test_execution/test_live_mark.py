@@ -63,7 +63,7 @@ async def _sell(h: Harness) -> ManualOrderResult:
     return result
 
 
-async def _resting(session: TradingSession) -> list[tuple[str, float | None]]:
+async def _resting(session: TradingSession) -> list[tuple[str, Decimal | None]]:
     orders = await executor(session).fetch_open_orders("BTCUSDT")
     return [(o["type"], o["stop_price"]) for o in orders]
 
@@ -198,13 +198,13 @@ class TestEntryBarAfterALiveFill:
         session = await h.session(write_strategy(strategies_dir, "manual"))
         await h.price(session, "106")
         await _buy(h)
-        assert await _resting(session) == [("STOP_MARKET", 100.8007)]  # 106.106 x 0.95
+        assert await _resting(session) == [("STOP_MARKET", D("100.80070"))]  # 106.106 x 0.95
 
         await h.bar(session, "106", open="100", low="100", high="106")
 
         assert [f.side for f in executor(session).get_fills()] == ["BUY"]
         assert await held(session) == D("0.5")
-        assert await _resting(session) == [("STOP_MARKET", 100.8007)]
+        assert await _resting(session) == [("STOP_MARKET", D("100.80070"))]
 
     async def test_a_close_through_the_stop_fills_at_the_stop(
         self, h: Harness, strategies_dir: Path
@@ -242,7 +242,7 @@ class TestEntryBarAfterALiveFill:
         await h.bar(session, "106", open="100", low="100", high="106")
 
         assert [f.side for f in executor(session).get_fills()] == ["BUY"]
-        assert await _resting(session) == [("TRAILING_STOP", 100.7)]  # 106 x 0.95
+        assert await _resting(session) == [("TRAILING_STOP", D("100.70"))]  # 106 x 0.95
 
         await h.bar(session, "100", open="106", high="110", low="100")
 

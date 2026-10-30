@@ -229,15 +229,44 @@ class TestClosedBarSemantics:
     async def test_trailing_stop_sell_follows_peak_then_triggers(self) -> None:
         ex = await holding("1", "100", fee="0", slippage="0")
         await ex.create_order(BTC, "SELL", "TRAILING_STOP", D("1"), params={"trail_pct": "0.05"})
-        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [95.0]
+        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [D("95.00")]
 
         assert await ex.on_closed_bar(BTC, bar(1, "100", "120", "99", "118")) == []
         (order,) = await ex.fetch_open_orders()
-        assert (order["trail_pct"], order["price"], order["stop_price"]) == (0.05, None, 114.0)
+        assert (order["trail_pct"], order["price"], order["stop_price"]) == (
+            D("0.05"),
+            None,
+            D("114.00"),
+        )
 
         (fill,) = await ex.on_closed_bar(BTC, bar(2, "118", "119", "110", "111"))
         assert fill.reason == "trailing_stop"
         assert fill.price == D("114.00")
+
+    async def test_open_order_shape_is_exact_decimal(self) -> None:
+        """P7-B3: the shared open-order shape carries exact Decimals, never floats.
+
+        A resting limit price and a stop trigger survive to the shape with their full
+        precision, and a trailing trigger is computed in Decimal.
+        """
+        ex = await holding("1", "100", fee="0", slippage="0")
+        await ex.create_order(BTC, "BUY", "LIMIT", D("0.1"), price=D("0.00012345"))
+        await ex.create_order(BTC, "SELL", "STOP_MARKET", D("0.4"), stop_price=D("9876.5"))
+        await ex.create_order(BTC, "SELL", "TRAILING_STOP", D("0.3"), params={"trail_pct": "0.05"})
+
+        rows = {(o["type"], o["reason"]): o for o in await ex.fetch_open_orders(BTC)}
+
+        limit = rows[("LIMIT", "limit")]
+        assert (limit["amount"], limit["price"]) == (D("0.1"), D("0.00012345"))
+        assert isinstance(limit["price"], Decimal)
+        stop = rows[("STOP_MARKET", "stop_loss")]
+        assert (stop["amount"], stop["stop_price"]) == (D("0.4"), D("9876.5"))
+        assert isinstance(stop["stop_price"], Decimal)
+        trail = rows[("TRAILING_STOP", "trailing_stop")]
+        assert trail["trail_pct"] == D("0.05")
+        # the trailing trigger is computed in Decimal: 100 * (1 - 0.05), no float()
+        assert trail["stop_price"] == D("95.00")
+        assert isinstance(trail["stop_price"], Decimal)
 
     async def test_trailing_stop_requires_trail_pct(self) -> None:
         ex = await holding("1", "100")
@@ -251,7 +280,7 @@ class TestClosedBarSemantics:
         assert ex.get_account_snapshot().quote_locked == D("105.00")
 
         assert await ex.on_closed_bar(BTC, bar(1, "100", "101", "80", "83")) == []
-        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [84.0]
+        assert [o["stop_price"] for o in await ex.fetch_open_orders()] == [D("84.00")]
         (fill,) = await ex.on_closed_bar(BTC, bar(2, "82", "90", "81", "89"))
         assert fill.price == D("84.00")
         assert await ex.fetch_balance() == {"USDT": D("916.00"), "BTC": D("1")}

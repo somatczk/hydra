@@ -12,7 +12,9 @@ keys a client (the keyed acquisition is P3-A's). It owns four contracts the live
 * ``normalize_open_orders`` — the ONE open-orders shape (paper dicts) for adopt, flatten,
   the A8 live read and P3-A's reconcile; live fills carry ``parent_order_id`` = the
   orderListId of their OCO, and every leg carries its ``client_order_id`` — the
-  ownership marker live adopt gates on (R5: the user's orders are never hijacked).
+  ownership marker live adopt gates on (R5: the user's orders are never hijacked). The
+  shape's numeric values are exact Decimals (the exchange's decimal strings, converted
+  at use); ``json_safe_open_order`` renders one row to floats for JSON egress.
 * ``verify_exchange_stop`` — the A8-live read per held position. ``confirmed`` only from a
   real openOrderList / resting-leg match at ``checked_at``; an unreadable exchange is
   ``unknown``, never ``missing``.
@@ -44,6 +46,7 @@ from hydra.risk.market_rules import MarketRules
 logger = logging.getLogger(__name__)
 
 _ONE = Decimal("1")
+_ZERO = Decimal("0")
 _BIPS_PER_UNIT = Decimal("10000")
 _STOP_TYPES = (OrderType.STOP_MARKET, OrderType.TRAILING_STOP)
 
@@ -349,9 +352,9 @@ def _dec(value: Any) -> Decimal | None:
         return None
 
 
-def _price(value: Any) -> float | None:
+def _price(value: Any) -> Decimal | None:
     dec = _dec(value)
-    return float(dec) if dec is not None and dec > 0 else None
+    return dec if dec is not None and dec > 0 else None
 
 
 def _client_order_id(order: Mapping[str, Any]) -> str | None:
@@ -361,7 +364,11 @@ def _client_order_id(order: Mapping[str, Any]) -> str | None:
 
 
 def normalize_exchange_leg(order: Mapping[str, Any]) -> dict[str, Any]:
-    """One raw Binance order (an ``openOrders`` leg or an OCO ``orderReport``) -> paper dict."""
+    """One raw Binance order (an ``openOrders`` leg or an OCO ``orderReport``) -> paper dict.
+
+    The exchange's decimal strings (price, stop, quantity, trailing delta) become exact
+    Decimals — the ingest side of the single exchange boundary.
+    """
     raw_type = str(_leg_field(order, "type", "") or "").upper()
     order_list_id = _leg_field(order, "orderListId")
     oco_id = None if order_list_id in (None, "", -1, "-1") else str(order_list_id)
@@ -369,7 +376,7 @@ def normalize_exchange_leg(order: Mapping[str, Any]) -> dict[str, Any]:
     if trailing_delta is not None and trailing_delta > 0:
         order_type: OrderType = OrderType.TRAILING_STOP
         reason = "trailing_stop"
-        trail_pct: float | None = float(trailing_delta / _BIPS_PER_UNIT)
+        trail_pct: Decimal | None = trailing_delta / _BIPS_PER_UNIT
     elif raw_type == "LIMIT_MAKER":
         order_type, reason, trail_pct = OrderType.LIMIT, "take_profit", None
     elif raw_type in ("STOP_LOSS", "STOP_LOSS_LIMIT"):
@@ -386,7 +393,7 @@ def normalize_exchange_leg(order: Mapping[str, Any]) -> dict[str, Any]:
         "symbol": str(_leg_field(order, "symbol", order.get("symbol", ""))),
         "side": str(_leg_field(order, "side", "")).upper(),
         "type": order_type,
-        "amount": float(amount) if amount is not None else 0.0,
+        "amount": _ZERO if amount is None else amount,
         "price": _price(_leg_field(order, "price")),
         "stop_price": _price(_leg_field(order, "stopPrice", order.get("stopPrice"))),
         "status": str(_leg_field(order, "status", "PENDING") or "PENDING").upper(),
@@ -401,6 +408,20 @@ def normalize_exchange_leg(order: Mapping[str, Any]) -> dict[str, Any]:
 def normalize_open_orders(raw: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Exchange legs -> the paper open-order shape for adopt, flatten, A8 and reconcile."""
     return [normalize_exchange_leg(order) for order in raw]
+
+
+def json_safe_open_order(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One open-order row with its numeric fields as floats: Decimal interior, float egress.
+
+    A bare Decimal in a JSON response serializes as a string (pydantic extras, ``json.dumps``
+    with ``default=str``), so every JSON-facing consumer of the shape renders through this.
+    """
+    out = dict(row)
+    for key in ("amount", "price", "stop_price", "trail_pct", "filled_quantity"):
+        value = out.get(key)
+        if isinstance(value, Decimal):
+            out[key] = float(value)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -461,8 +482,8 @@ async def verify_exchange_stop(
     return ExchangeStopState(
         state="confirmed",
         checked_at=checked_at,
-        stop_price=stop["stop_price"] if stop is not None else None,
-        take_profit=take_profit["price"] if take_profit is not None else None,
+        stop_price=None if stop is None else float(stop["stop_price"]),
+        take_profit=None if take_profit is None else float(take_profit["price"]),
         kind=kind,
         order_list_id=next((o["oco_id"] for o in matched if o["oco_id"] is not None), None),
     )

@@ -1769,9 +1769,9 @@ class PerpPaperTradingExecutor:
             "symbol": self._name(order.symbol),
             "side": order.side,
             "type": order.order_type,
-            "amount": float(order.quantity),
-            "price": None if order.price is None else float(order.price),
-            "stop_price": None if order.stop_price is None else float(order.stop_price),
+            "amount": order.quantity,
+            "price": order.price,
+            "stop_price": order.stop_price,
             "status": "PENDING",
             "filled": False,
         }
@@ -1848,7 +1848,11 @@ class PerpPaperTradingExecutor:
         return list(self._filled)
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Resting orders, including each stop's current trigger, reason and OCO id."""
+        """Resting orders, including each stop's current trigger, reason and OCO id.
+
+        The row values are exact Decimals (the shared open-order shape); JSON-facing
+        callers render them through ``exchange_stops.json_safe_open_order``.
+        """
         wanted = None if symbol is None else _canon_symbol(symbol)
         return [
             {
@@ -1856,7 +1860,7 @@ class PerpPaperTradingExecutor:
                 "stop_price": _stop_trigger(o),
                 "reason": o.reason,
                 "oco_id": o.oco_id,
-                "trail_pct": None if o.trail_pct is None else float(o.trail_pct),
+                "trail_pct": o.trail_pct,
                 "reduce_only": o.reduce_only,
             }
             for o in sorted(self._pending, key=lambda o: o.seq)
@@ -1868,11 +1872,11 @@ def _opt_float(price: Decimal | None) -> float | None:
     return None if price is None else float(price)
 
 
-def _stop_trigger(o: _PendingOrder) -> float | None:
+def _stop_trigger(o: _PendingOrder) -> Decimal | None:
     """The stop's trigger; a trailing stop's moves with the peak (SELL) or trough (BUY)."""
     if o.extreme is not None and o.trail_pct is not None:
-        return float(o.extreme * (_ONE - o.trail_pct if o.side == "SELL" else _ONE + o.trail_pct))
-    return None if o.stop_price is None else float(o.stop_price)
+        return o.extreme * (_ONE - o.trail_pct if o.side == "SELL" else _ONE + o.trail_pct)
+    return o.stop_price
 
 
 def _state_digest(state: dict[str, Any]) -> str:
