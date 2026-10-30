@@ -10,19 +10,19 @@ authors = [{ name = "somatczk" }]
 dependencies = [
     # Core
     "pydantic>=2.10,<3",
-    "pydantic-settings>=2.16.0,<3",
+    "pydantic-settings>=2.16.1,<3",
     "pyyaml>=6.0,<7",
     "structlog>=26.1.0,<27",
     "msgpack>=1.2.1,<2",
     "redis[hiredis]>=8.1.0,<9",
     # Data
-    "ccxt>=4.4,<5",
+    "ccxt>=4.5.90,<5",
     "asyncpg>=0.30,<1",
-    "alembic>=1.14,<2",
+    "alembic>=1.20.1,<2",
     "sqlalchemy[asyncio]>=2.1.4,<3",
     # Indicators
     "numpy>=2.1,<3",
-    "pandas>=3.0.6,<4",
+    "pandas>=3.1.0,<4",
     "ta-lib>=0.5,<1; sys_platform != 'win32'",
     # ML
     "onnxruntime>=1.20,<2",
@@ -31,9 +31,9 @@ dependencies = [
     # Execution
     "ccxt[async]>=4.5.88,<5",
     # Dashboard backend
-    "fastapi>=0.115,<1",
+    "fastapi>=0.162.0,<1",
     "uvicorn[standard]>=0.54.0,<1",
-    "websockets>=17.2,<18",
+    "websockets>=17.3,<18",
     # MCP server
     "mcp>=2.3,<3",
     # HTTP client
@@ -64,7 +64,7 @@ dev = [
     "factory-boy>=3.3,<4",
     "faker>=40.43.0,<41",
     "testcontainers[postgres,redis]>=4.9,<5",
-    "ruff>=0.15.7,<1",
+    "ruff>=0.17.2,<1",
     "mypy>=2.4.0,<3",
     "bandit>=1.8,<2",
     "import-linter>=2.1,<3",
