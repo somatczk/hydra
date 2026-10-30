@@ -1,4 +1,4 @@
-FROM nvidia/cuda:13.4.2-runtime-ubuntu22.04
+FROM nvidia/cuda:13.4.3-runtime-ubuntu22.04
 WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
