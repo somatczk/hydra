@@ -4,12 +4,14 @@ import { ApiError } from '@/lib/api';
 import { breaker, liveStatus, platformConfig, session } from '@/test/fixtures';
 import {
   buttonByText,
+  choose,
   click,
   dialogPolyfill,
   flush,
   inputByLabel,
   mount,
   routeFetch,
+  selectByLabel,
   typeInto,
   unavailable,
   type Mounted,
@@ -36,7 +38,18 @@ const CONFIG = {
   max_concurrent_positions: 3,
   max_consecutive_losses: 5,
   kill_switch_active: false,
+  overrides: [] as Array<{
+    strategy_id: string;
+    max_position_pct: number | null;
+    max_risk_per_trade: number | null;
+    max_concurrent_positions: number | null;
+  }>,
 };
+
+const STRATEGIES = [
+  { id: 'saw', name: 'Saw' },
+  { id: 'grid', name: 'Grid' },
+];
 
 const BREAKERS = [
   breaker({ tier: 1, label: 'Reduce size 50%', threshold_pct: 3, status: 'Tripped', current_value: 10.5, active_since: '2026-10-20T09:00:00Z' }),
@@ -80,6 +93,7 @@ function routes(over: Routes = {}): Routes {
     '/api/risk/status?source=paper': STATUS,
     '/api/risk/events?limit=500': [KS_ON_EVENT],
     '/api/risk/config': CONFIG,
+    '/api/strategies': STRATEGIES,
     '/api/risk/var?source=paper': { var_95: 210.5, var_99: 380, cvar_95: 260.25, portfolio_value: 9512.4, calculation_method: 'historical_simulation', sample_days: 12 },
     ...over,
   };
@@ -164,14 +178,14 @@ describe('kill switch section', () => {
     expect(primary.disabled).toBe(true);
 
     await typeInto(inputByLabel(d, 'Type RELEASE to confirm'), 'release');
-    await typeInto(inputByLabel(c, 'Reason'), 'market calm');
+    await typeInto(inputByLabel(d, 'Reason'), 'market calm');
     expect(primary.disabled).toBe(true);
 
     await typeInto(inputByLabel(d, 'Type RELEASE to confirm'), 'RELEASE');
-    await typeInto(inputByLabel(c, 'Reason'), '  ab ');
+    await typeInto(inputByLabel(d, 'Reason'), '  ab ');
     expect(primary.disabled).toBe(true);
 
-    await typeInto(inputByLabel(c, 'Reason'), '  market calm  ');
+    await typeInto(inputByLabel(d, 'Reason'), '  market calm  ');
     expect(primary.disabled).toBe(false);
     await click(primary);
 
@@ -381,6 +395,129 @@ describe('limits', () => {
 
     expect(c.querySelector('[role="status"][aria-label="Outcome"]')?.textContent).toContain('Kill switch released at');
     expect(c.querySelector('#limits [aria-label="Limits not in force"]')).not.toBeNull();
+  });
+});
+
+describe('per-strategy limits', () => {
+  const OVERRIDE_CFG = {
+    ...CONFIG,
+    overrides: [
+      { strategy_id: 'saw', max_position_pct: 0.05, max_risk_per_trade: null, max_concurrent_positions: 20 },
+    ],
+  };
+
+  const editOverride = async (c: HTMLElement, label: string, value: string) => {
+    await click(buttonByText(c, 'Edit override'));
+    await typeInto(inputByLabel(c, label), value);
+  };
+
+  it('shows the stored override and the effective (tighter-only) limits per strategy', async () => {
+    const c = await open({ '/api/risk/config': OVERRIDE_CFG });
+    const section = c.querySelector('#strategy-limits')?.textContent ?? '';
+    // stored: 5% position, no risk-per-trade cap, 20 concurrent
+    expect(section).toContain('override 5%');
+    expect(section).toContain('override —');
+    expect(section).toContain('override 20');
+    // effective: min(global, stored) — 5%, the global 0.5%, the global 3
+    expect(section).toContain('5%');
+    expect(section).toContain('0.5%');
+    expect(section).toContain('3');
+
+    await choose(selectByLabel(c, 'Strategy'), 'grid');
+    const grid = c.querySelector('#strategy-limits')?.textContent ?? '';
+    expect(grid).toContain('override —');
+    const removeButtons = Array.from(c.querySelectorAll('button')).filter(
+      (b) => b.textContent?.trim() === 'Remove override' && !b.closest('dialog'),
+    );
+    expect(removeButtons).toHaveLength(0);
+  });
+
+  it('saves a tighter override, sending all three caps with nulls for the empty ones', async () => {
+    const c = await open();
+    await editOverride(c, 'Max position size (%)', '5');
+    await click(buttonByText(c, 'Save override'));
+
+    expect(sent('PUT', '/api/risk/config/saw')).toEqual([
+      { max_position_pct: 0.05, max_risk_per_trade: null, max_concurrent_positions: null },
+    ]);
+    expect(c.querySelector('[role="status"][aria-label="Outcome"]')?.textContent).toContain('Override for saw saved.');
+  });
+
+  it('clamps a looser entry to the global value and says why before saving', async () => {
+    const c = await open();
+    await editOverride(c, 'Max position size (%)', '50');
+    await click(buttonByText(c, 'Save override'));
+
+    expect(sent('PUT', '/api/risk/config/saw')).toEqual([]);
+    const d = dlg(c, 'Clamp 1 looser value to the global limits?');
+    expect(d.textContent).toContain('Max position size 50 → 10%');
+    expect(d.textContent).toContain('only the tighter of the strategy and global limits is ever enforced');
+    await click(buttonByText(d, 'Save clamped override'));
+
+    expect(sent('PUT', '/api/risk/config/saw')).toEqual([
+      { max_position_pct: CONFIG.max_position_pct, max_risk_per_trade: null, max_concurrent_positions: null },
+    ]);
+  });
+
+  it('does not save a clamped override when the dialog is declined', async () => {
+    const c = await open();
+    await editOverride(c, 'Max concurrent positions', '9');
+    await click(buttonByText(c, 'Save override'));
+    const d = dlg(c, 'Clamp 1 looser value to the global limits?');
+    await click(buttonByText(d, 'Keep editing'));
+    expect(sent('PUT', '/api/risk/config/saw')).toEqual([]);
+    expect(inputByLabel(c, 'Max concurrent positions').value).toBe('9');
+  });
+
+  it('refuses a non-integer count with the field named', async () => {
+    const c = await open();
+    await editOverride(c, 'Max concurrent positions', '2.5');
+    await click(buttonByText(c, 'Save override'));
+    expect(c.querySelector('#strategy-limits [role="alert"]')?.textContent).toContain('Max concurrent positions needs a valid number.');
+    expect(sent('PUT', '/api/risk/config/saw')).toEqual([]);
+  });
+
+  it('removes a stored override only after the id is typed and a reason given', async () => {
+    const c = await open({ '/api/risk/config': OVERRIDE_CFG });
+    await click(buttonByText(c, 'Remove override'));
+    const d = dlg(c, 'Remove the override for saw?');
+    expect(d.textContent).toContain('The global limits apply to saw again');
+    const primary = buttonByText(d, 'Remove override');
+    expect(primary.disabled).toBe(true);
+
+    await typeInto(inputByLabel(d, 'Type saw to confirm'), 'SAW');
+    await typeInto(inputByLabel(d, 'Reason'), 'back to the global cap');
+    expect(primary.disabled).toBe(true);
+
+    await typeInto(inputByLabel(d, 'Type saw to confirm'), 'saw');
+    expect(primary.disabled).toBe(false);
+    await click(primary);
+
+    const deletes = calls.filter((x) => x.path === '/api/risk/config/saw' && x.init?.method === 'DELETE');
+    expect(deletes).toHaveLength(1);
+    expect(JSON.parse(String(deletes[0].init?.body))).toEqual({ reason: 'back to the global cap' });
+    expect(c.querySelector('[role="status"][aria-label="Outcome"]')?.textContent).toContain('Override for saw removed.');
+  });
+
+  it('offers Remove for an all-null stored row, so a legacy empty row is cleanable', async () => {
+    const c = await open({
+      '/api/risk/config': {
+        ...CONFIG,
+        overrides: [{ strategy_id: 'saw', max_position_pct: null, max_risk_per_trade: null, max_concurrent_positions: null }],
+      },
+    });
+    const remove = Array.from(c.querySelectorAll('button')).filter(
+      (b) => b.textContent?.trim() === 'Remove override' && !b.closest('dialog'),
+    );
+    expect(remove).toHaveLength(1);
+  });
+
+  it('says what went wrong when the engine did not reload a saved override', async () => {
+    const failed = new ApiError(503, JSON.stringify({ detail: { code: 'risk_reload_failed', message: 'x', state: 'unavailable' } }));
+    const c = await open({}, { 'PUT /api/risk/config/saw': failed });
+    await editOverride(c, 'Max position size (%)', '5');
+    await click(buttonByText(c, 'Save override'));
+    expect(c.querySelector('[role="alert"][aria-label="Outcome alert"]')?.textContent).toContain('Saved, but not in force.');
   });
 });
 

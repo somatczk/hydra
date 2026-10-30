@@ -17,7 +17,7 @@ from hydra.core import metrics
 from hydra.core.types import Side
 from hydra.execution.order_manager import RiskRejectedError
 from hydra.risk.circuit_breakers import CircuitBreakerState, TierNotActiveError
-from hydra.risk.pretrade import OPEN
+from hydra.risk.pretrade import OPEN, StrategyLimits
 from hydra.risk.service import RiskService
 from hydra.risk.state import RiskState, RiskStateUnavailableError
 from tests.unit.test_risk.harness import (
@@ -654,6 +654,48 @@ class TestSizing:
         await tier1.add_session("s1", "2000")
         await tier1.mark("61234.56")
         assert await tier1.svc.size_entry("s1", BTC, Decimal("0.10")) == Decimal("0.00163")
+
+
+class TestStrategyLimits:
+    """Per-strategy overrides on the service: the snapshot attaches them and size_entry
+    takes min(strategy fraction, global, override) before any multiplier."""
+
+    async def test_snapshot_attaches_and_checks_enforce_the_override(self) -> None:
+        acct = await make_account(permissive())
+        await acct.add_session("s1", "10000", strategy_id="saw")
+        await acct.mark("60000")
+        probe = order(BUY, "0.01")  # notional 600
+        assert (await acct.svc.check(probe, "s1", OPEN)).approved is True
+        assert (await acct.svc.snapshot("s1")).strategy_limits == StrategyLimits()
+
+        # mid-session tightening: the stored override lands through reload_config
+        acct.store.strategy_overrides["saw"] = StrategyLimits(max_position_pct=Decimal("0.05"))
+        await acct.svc.reload_config()
+        snap = await acct.svc.snapshot("s1")
+        assert snap.strategy_limits.max_position_pct == Decimal("0.05")
+        decision = await acct.svc.check(probe, "s1", OPEN)  # 600 > 0.05 x 10000
+        assert (decision.approved, decision.check) == (False, "position_size")
+
+        # a reduce-only exit is never blocked by the override
+        await acct.submit("s1", BUY, "0.001")
+        assert await acct.submit("s1", SELL, "0.001", reduce_only=True) is not None
+
+    async def test_size_entry_takes_the_tighter_of_strategy_global_and_override(self) -> None:
+        acct = await make_account(permissive(max_position_pct=Decimal("0.50")))
+        await acct.add_session("s1", "2000000", strategy_id="saw")
+        await acct.mark("60000")
+        # strategy fraction 0.50, global 0.50: 2000000 x 0.50 / 60000 = 16.66666
+        assert await acct.svc.size_entry("s1", BTC, Decimal("0.50")) == Decimal("16.66666")
+
+        acct.store.strategy_overrides["saw"] = StrategyLimits(max_position_pct=Decimal("0.30"))
+        await acct.svc.reload_config()
+        # min(0.50, 0.50, 0.30) = 0.30: 2000000 x 0.30 / 60000 = 10
+        assert await acct.svc.size_entry("s1", BTC, Decimal("0.50")) == Decimal("10.000")
+
+        # a looser override never loosens: min stays the global 0.50
+        acct.store.strategy_overrides["saw"] = StrategyLimits(max_position_pct=Decimal("0.80"))
+        await acct.svc.reload_config()
+        assert await acct.svc.size_entry("s1", BTC, Decimal("0.50")) == Decimal("16.66666")
 
     async def test_unsupported_exchange_aborts_registration(self) -> None:
         acct = await make_account(permissive())

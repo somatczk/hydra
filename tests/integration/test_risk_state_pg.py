@@ -8,19 +8,23 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from hydra.core.types import Side
 from hydra.dashboard.routes.risk import router
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.execution.paper_trading import PaperTradingExecutor
 from hydra.risk.circuit_breakers import CircuitBreakerState
+from hydra.risk.pretrade import OPEN
 from hydra.risk.service import RiskService
 from hydra.risk.state import PgRiskStateStore, RiskState
-from tests.unit.test_risk.harness import Clock, rules_cache
+from hydra.services.trader import LocalTrader
+from tests.unit.test_risk.harness import Clock, order, rules_cache
 
 REVISION = (
     Path(__file__).resolve().parents[2] / "src/hydra/data/migrations/versions/0003_risk_state.py"
@@ -147,3 +151,135 @@ async def test_kill_switch_and_audit_trail_persist(pool: asyncpg.Pool) -> None:
 
     await restarted.release_kill_switch("user:alice", "drill over")
     assert (await _service(pool, clock)).kill_switch_active() is False
+
+
+class _Mgr:
+    """The LocalTrader's session-manager shim: only the risk service is needed here."""
+
+    def __init__(self, svc: RiskService) -> None:
+        self.risk = svc
+
+    def list_sessions(self) -> list[Any]:
+        return []
+
+
+async def _client(pool: asyncpg.Pool, svc: RiskService) -> httpx.AsyncClient:
+    app = FastAPI()
+    app.state.db_pool = pool
+    app.state.trader = LocalTrader(pool, _Mgr(svc))
+    app.include_router(router)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+
+async def _registered(svc: RiskService) -> PaperTradingExecutor:
+    ex = PaperTradingExecutor(initial_balances={"USDT": Decimal("10000")})
+    await svc.register_session(
+        "s1",
+        ex,
+        allocated=Decimal("10000"),
+        symbols=["BTCUSDT"],
+        exchange_id="binance",
+        strategy_id="saw",
+    )
+    await svc.on_mark("binance", "BTCUSDT", Decimal("60000"), T0 + timedelta(hours=1))
+    return ex
+
+
+async def test_strategy_override_round_trip_and_mid_session_tightening(
+    pool: asyncpg.Pool,
+) -> None:
+    """The full flow on real PG: PUT reloads into the running service (no restart), a
+    restart picks the override up, and DELETE clears it."""
+    clock = Clock(T0)
+    svc = await _service(pool, clock)
+    await _registered(svc)
+    probe = order(Side.BUY, "0.01")  # notional 600 against the global cap 0.10 x 10000
+    assert (await svc.check(probe, "s1", OPEN)).approved is True
+
+    client = await _client(pool, svc)
+    try:
+        resp = await client.get("/api/risk/config/saw")
+        assert resp.status_code == 200
+        assert resp.json()["overrides"]["max_position_pct"] is None
+        assert resp.json()["effective"]["max_position_pct"] == 0.10
+
+        resp = await client.put(
+            "/api/risk/config/saw",
+            json={"max_position_pct": 0.05, "max_concurrent_positions": 2},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["overrides"] == {
+            "strategy_id": "saw",
+            "max_position_pct": 0.05,
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": 2,
+        }
+        assert resp.json()["effective"]["max_position_pct"] == 0.05
+
+        # mid-session tightening: the same probe that passed is now refused, no restart
+        decision = await svc.check(probe, "s1", OPEN)
+        assert (decision.approved, decision.check) == (False, "position_size")
+
+        events = (await client.get("/api/risk/events?limit=5")).json()
+        assert events[0]["kind"] == "strategy_override_set"
+        assert events[0]["actor"] == "anonymous"
+        assert events[0]["details"] == {
+            "max_position_pct": 0.05,
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": 2,
+        }
+
+        resp = await client.request(
+            "DELETE", "/api/risk/config/saw", json={"reason": "back to the global cap"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["overrides"]["max_position_pct"] is None
+        assert resp.json()["effective"]["max_position_pct"] == 0.10
+
+        cleared = (await client.get("/api/risk/events?limit=5")).json()
+        assert cleared[0]["kind"] == "strategy_override_cleared"
+        assert cleared[0]["reason"] == "back to the global cap"
+        assert cleared[0]["details"] == {"strategy_id": "saw"}
+    finally:
+        await client.aclose()
+    assert (await svc.check(probe, "s1", OPEN)).approved is True
+
+    # PUT again, then prove a restart enforces the stored override from the first load
+    client = await _client(pool, svc)
+    try:
+        resp = await client.put("/api/risk/config/saw", json={"max_position_pct": 0.05})
+        assert resp.status_code == 200
+    finally:
+        await client.aclose()
+    restarted = await _service(pool, clock)
+    await _registered(restarted)
+    decision = await restarted.check(probe, "s1", OPEN)
+    assert (decision.approved, decision.check) == (False, "position_size")
+
+    # a looser stored value never loosens past the global
+    client = await _client(pool, restarted)
+    try:
+        resp = await client.put("/api/risk/config/saw", json={"max_position_pct": 0.50})
+        assert resp.json()["effective"]["max_position_pct"] == 0.10
+        resp = await client.delete("/api/risk/config/saw")  # clean up for other readers
+        assert resp.status_code == 200
+    finally:
+        await client.aclose()
+
+
+async def test_a_strategy_rows_kill_switch_is_never_read(pool: asyncpg.Pool) -> None:
+    """A poisoned strategy row with kill_switch_active = TRUE never latches or blocks."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO risk_config (scope, kill_switch_active) "
+            "VALUES ('strategy:saw', TRUE) ON CONFLICT (scope) DO NOTHING"
+        )
+    clock = Clock(T0)
+    svc = await _service(pool, clock)
+    assert svc.kill_switch_active() is False
+    await _registered(svc)
+    probe = order(Side.BUY, "0.001")
+    assert (await svc.check(probe, "s1", OPEN)).approved is True
+
+    restarted = await _service(pool, clock)
+    assert restarted.kill_switch_active() is False

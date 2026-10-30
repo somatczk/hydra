@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -18,9 +19,10 @@ from hydra.dashboard.routes import risk
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.risk import router
 from hydra.risk.pretrade import RiskConfig
-from hydra.risk.state import RiskStateUnavailableError
+from hydra.risk.service import RiskService
+from hydra.risk.state import InMemoryRiskStateStore, LoadedConfig, RiskStateUnavailableError
 from hydra.services.trader import LocalTrader
-from tests.unit.test_risk.harness import Account, make_account
+from tests.unit.test_risk.harness import Account, Clock, make_account, rules_cache
 
 _GLOBAL_ROW: dict[str, Any] = {
     "scope": "global",
@@ -59,6 +61,7 @@ def _make_app(pool: Any = None, session_manager: Any = None) -> FastAPI:
 
 def _make_pool() -> tuple[MagicMock, MagicMock]:
     conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[])
     pool = MagicMock()
     pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
     pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -483,23 +486,235 @@ class TestRiskConfig:
         assert data["kill_switch_active"] is True
         assert "leverage" not in data and "margin_mode" not in data
 
-    def test_strategy_config_returns_enforced_global_limits(self) -> None:
+    def test_strategy_config_returns_stored_and_effective_limits(self) -> None:
         pool, conn = _make_pool()
-        conn.fetchrow = AsyncMock(return_value=_GLOBAL_ROW)
+        stored = {
+            "scope": "strategy:strat-x",
+            "max_position_pct": Decimal("0.05"),
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": 20,
+        }
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, stored])
         resp = TestClient(_make_app(pool=pool)).get("/api/risk/config/strat-x")
         assert resp.status_code == 200
-        assert resp.json()["scope"] == "global"
-        assert conn.fetchrow.await_args.args[1] == "global"
+        data = resp.json()
+        assert data["strategy_id"] == "strat-x"
+        assert data["overrides"] == {
+            "strategy_id": "strat-x",
+            "max_position_pct": 0.05,
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": 20,
+        }
+        # tighter-only: 0.05 < the global 0.10 binds; the missing risk-per-trade cap
+        # and the looser concurrent cap (20 > 10) both fall back to the global
+        assert data["effective"] == {
+            "strategy_id": "strat-x",
+            "max_position_pct": 0.05,
+            "max_risk_per_trade": 0.02,
+            "max_concurrent_positions": 10,
+        }
+        assert [c.args[1] for c in conn.fetchrow.await_args_list] == ["global", "strategy:strat-x"]
 
-    def test_strategy_override_put_is_501(self) -> None:
+    def test_strategy_config_without_a_stored_row_reports_the_global_limits(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, None])
+        data = TestClient(_make_app(pool=pool)).get("/api/risk/config/strat-x").json()
+        assert data["overrides"]["max_position_pct"] is None
+        assert data["effective"]["max_position_pct"] == 0.10
+        assert data["effective"]["max_concurrent_positions"] == 10
+
+    def test_global_config_lists_the_stored_overrides(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow = AsyncMock(return_value=_GLOBAL_ROW)
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "scope": "strategy:strat-x",
+                    "max_position_pct": Decimal("0.05"),
+                    "max_risk_per_trade": None,
+                    "max_concurrent_positions": 3,
+                }
+            ]
+        )
+        data = TestClient(_make_app(pool=pool)).get("/api/risk/config").json()
+        assert data["overrides"] == [
+            {
+                "strategy_id": "strat-x",
+                "max_position_pct": 0.05,
+                "max_risk_per_trade": None,
+                "max_concurrent_positions": 3,
+            }
+        ]
+
+    def test_strategy_override_put_writes_the_row_audits_and_reloads(self) -> None:
+        pool, conn = _make_pool()
+        stored = {
+            "scope": "strategy:strat-x",
+            "max_position_pct": Decimal("0.05"),
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": None,
+        }
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, stored])
+        conn.execute = AsyncMock()
+        mgr = _Mgr()
+        resp = TestClient(_make_app(pool=pool, session_manager=mgr)).put(
+            "/api/risk/config/strat-x", json={"max_position_pct": 0.05}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["effective"]["max_position_pct"] == 0.05
+        writes = [c for c in conn.execute.await_args_list if "risk_config" in c.args[0]]
+        assert len(writes) == 1
+        query, *params = writes[0].args
+        assert "INSERT INTO risk_config" in query
+        assert "ON CONFLICT (scope) DO UPDATE" in query
+        assert params == ["strategy:strat-x", 0.05, None, None]
+        events = [c for c in conn.execute.await_args_list if "INSERT INTO risk_events" in c.args[0]]
+        assert len(events) == 1
+        assert events[0].args[1] == "strategy_override_set"
+        assert events[0].args[2] == "anonymous"
+        assert events[0].args[3] == "per-strategy override for strat-x"
+        assert json.loads(events[0].args[4]) == {
+            "max_position_pct": 0.05,
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": None,
+        }
+
+    def test_strategy_override_put_replaces_the_whole_override(self) -> None:
+        pool, conn = _make_pool()
+        stored = {
+            "scope": "strategy:strat-x",
+            "max_position_pct": None,
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": 4,
+        }
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, stored])
+        conn.execute = AsyncMock()
+        resp = TestClient(_make_app(pool=pool)).put(
+            "/api/risk/config/strat-x", json={"max_position_pct": 0.05}
+        )
+        assert resp.status_code == 200
+        writes = [c for c in conn.execute.await_args_list if "risk_config" in c.args[0]]
+        assert writes[0].args[1:] == ("strategy:strat-x", 0.05, None, None)
+
+    def test_strategy_override_put_out_of_bounds_is_422(self) -> None:
         pool, conn = _make_pool()
         conn.execute = AsyncMock()
         resp = TestClient(_make_app(pool=pool)).put(
-            "/api/risk/config/strat-x", json={"max_position_pct": 0.2}
+            "/api/risk/config/strat-x", json={"max_position_pct": 1.5}
         )
-        assert resp.status_code == 501
-        assert resp.json()["detail"]["state"] == "not_implemented"
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["state"] == "invalid"
         conn.execute.assert_not_awaited()
+
+    def test_strategy_override_put_empty_body_is_400(self) -> None:
+        pool, _ = _make_pool()
+        resp = TestClient(_make_app(pool=pool)).put("/api/risk/config/strat-x", json={})
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["code"] == "no_fields"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {
+                "max_position_pct": None,
+                "max_risk_per_trade": None,
+                "max_concurrent_positions": None,
+            },
+            {"max_risk_per_trade": None},
+        ],
+    )
+    def test_strategy_override_put_all_null_is_400_naming_delete(
+        self, body: dict[str, None]
+    ) -> None:
+        """An all-null PUT would store a row that caps nothing while hiding the
+        removal; the way to clear is DELETE."""
+        pool, conn = _make_pool()
+        conn.execute = AsyncMock()
+        resp = TestClient(_make_app(pool=pool)).put("/api/risk/config/strat-x", json=body)
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "no_fields"
+        assert "DELETE /api/risk/config/strat-x" in detail["message"]
+        conn.execute.assert_not_awaited()
+
+    def test_strategy_override_put_db_error_is_503(self) -> None:
+        resp = TestClient(_make_app(pool=_refusing_pool())).put(
+            "/api/risk/config/strat-x", json={"max_position_pct": 0.05}
+        )
+        assert resp.status_code == 503
+
+    async def test_strategy_override_put_reload_failure_is_503(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, None])
+        conn.execute = AsyncMock()
+
+        class _FailingReloadStore(InMemoryRiskStateStore):
+            """Serves the first load (startup), fails the reload."""
+
+            def __init__(self) -> None:
+                super().__init__(paper_capital=Decimal("10000"))
+                self.loads = 0
+
+            async def load_config(self) -> LoadedConfig:
+                self.loads += 1
+                if self.loads > 1:
+                    raise RiskStateUnavailableError("store down")
+                return LoadedConfig(RiskConfig(), False, self.paper_capital)
+
+        clock = Clock()
+        store = _FailingReloadStore()
+        svc = RiskService(store, clock=clock, market_rules=rules_cache(clock))
+        await svc.load()
+        resp = TestClient(_make_app(pool=pool, session_manager=_Mgr(svc))).put(
+            "/api/risk/config/strat-x", json={"max_position_pct": 0.05}
+        )
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "risk_reload_failed"
+
+    def test_strategy_override_delete_clears_the_row_and_reloads(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, None])
+        conn.execute = AsyncMock(return_value="DELETE 1")
+        mgr = _Mgr()
+        resp = TestClient(_make_app(pool=pool, session_manager=mgr)).delete(
+            "/api/risk/config/strat-x"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["overrides"]["max_position_pct"] is None
+        assert data["effective"]["max_position_pct"] == 0.10
+        deletes = [
+            c for c in conn.execute.await_args_list if "DELETE FROM risk_config" in c.args[0]
+        ]
+        assert deletes[0].args[1] == "strategy:strat-x"
+        events = [c for c in conn.execute.await_args_list if "INSERT INTO risk_events" in c.args[0]]
+        assert events[0].args[1] == "strategy_override_cleared"
+        # no typed reason: the fixed identifying line stays
+        assert events[0].args[3] == "per-strategy override for strat-x"
+
+    def test_strategy_override_delete_records_the_typed_reason(self) -> None:
+        pool, conn = _make_pool()
+        conn.fetchrow = AsyncMock(side_effect=[_GLOBAL_ROW, None])
+        conn.execute = AsyncMock(return_value="DELETE 1")
+        resp = TestClient(_make_app(pool=pool)).request(
+            "DELETE", "/api/risk/config/strat-x", json={"reason": "back to the global cap"}
+        )
+        assert resp.status_code == 200
+        events = [c for c in conn.execute.await_args_list if "INSERT INTO risk_events" in c.args[0]]
+        assert events[0].args[1] == "strategy_override_cleared"
+        assert events[0].args[3] == "back to the global cap"
+        assert json.loads(events[0].args[4]) == {"strategy_id": "strat-x"}
+
+    def test_strategy_override_delete_without_a_row_is_404(self) -> None:
+        pool, conn = _make_pool()
+        conn.execute = AsyncMock(return_value="DELETE 0")
+        resp = TestClient(_make_app(pool=pool)).delete("/api/risk/config/strat-x")
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "strategy_override_not_found"
+
+    def test_strategy_override_delete_db_error_is_503(self) -> None:
+        resp = TestClient(_make_app(pool=_refusing_pool())).delete("/api/risk/config/strat-x")
+        assert resp.status_code == 503
 
     def test_put_risk_config_missing_scope_404(self) -> None:
         pool, conn = _make_pool()

@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from hydra.risk.circuit_breakers import CircuitBreakerState
-from hydra.risk.pretrade import RiskConfig
+from hydra.risk.pretrade import RiskConfig, StrategyLimits
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +59,23 @@ class LoadedConfig:
     paper_capital: Decimal
 
 
+STRATEGY_SCOPE_PREFIX = "strategy:"
+
+
+def strategy_scope(strategy_id: str) -> str:
+    """The risk_config scope a strategy's override row lives at."""
+    return STRATEGY_SCOPE_PREFIX + strategy_id
+
+
+def parse_strategy_scope(scope: str) -> str:
+    """``strategy:<id>`` -> ``<id>``; any other scope is not a strategy row."""
+    return scope[len(STRATEGY_SCOPE_PREFIX) :] if scope.startswith(STRATEGY_SCOPE_PREFIX) else ""
+
+
 class RiskStateStore(Protocol):
     async def load_config(self) -> LoadedConfig: ...
+
+    async def load_strategy_overrides(self) -> dict[str, StrategyLimits]: ...
 
     async def load_state(self) -> RiskState: ...
 
@@ -143,6 +158,32 @@ class PgRiskStateStore:
             kill_switch=bool(row["kill_switch_active"]),
             paper_capital=parse_paper_capital(capital["value"]),
         )
+
+    async def load_strategy_overrides(self) -> dict[str, StrategyLimits]:
+        """Every stored ``strategy:<id>`` row; ``kill_switch_active`` is never selected."""
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT scope, max_position_pct, max_risk_per_trade, "
+                    "max_concurrent_positions FROM risk_config "
+                    "WHERE scope LIKE $1",
+                    STRATEGY_SCOPE_PREFIX + "%",
+                )
+        except Exception as exc:
+            raise RiskStateUnavailableError(f"reading strategy overrides failed: {exc}") from exc
+        return {
+            strategy_id: StrategyLimits(
+                max_position_pct=_dec(row["max_position_pct"]),
+                max_risk_per_trade=_dec(row["max_risk_per_trade"]),
+                max_concurrent_positions=(
+                    None
+                    if row["max_concurrent_positions"] is None
+                    else int(row["max_concurrent_positions"])
+                ),
+            )
+            for row in rows
+            if (strategy_id := parse_strategy_scope(str(row["scope"])))
+        }
 
     async def load_state(self) -> RiskState:
         try:
@@ -292,16 +333,21 @@ class InMemoryRiskStateStore:
         config: RiskConfig | None = None,
         kill_switch: bool = False,
         state: RiskState | None = None,
+        strategy_overrides: dict[str, StrategyLimits] | None = None,
     ) -> None:
         self.config = config or RiskConfig()
         self.paper_capital = paper_capital
         self.kill_switch = kill_switch
         self.state = state or RiskState()
+        self.strategy_overrides = strategy_overrides or {}
         self.events: list[RiskEventRecord] = []
         self.saves = 0
 
     async def load_config(self) -> LoadedConfig:
         return LoadedConfig(self.config, self.kill_switch, self.paper_capital)
+
+    async def load_strategy_overrides(self) -> dict[str, StrategyLimits]:
+        return dict(self.strategy_overrides)
 
     async def load_state(self) -> RiskState:
         return _copy_state(self.state)
