@@ -46,6 +46,9 @@ function showLive(mutations: Mutations = {}) {
 
 const primary = () => m.container.querySelector<HTMLButtonElement>('button[type="submit"]') as HTMLButtonElement;
 const side = (label: string) => buttonByText(m.container, label);
+/** P7-G: the perp both-sides screen's two action blocks, found by their headings. */
+const block = (heading: string) =>
+  Array.from(m.container.querySelectorAll<HTMLButtonElement>('button[aria-pressed]')).find((b) => b.textContent?.includes(heading)) as HTMLButtonElement;
 const radio = (label: string) =>
   Array.from(m.container.querySelectorAll('label')).find((l) => l.textContent === label)?.querySelector('input') as HTMLInputElement;
 
@@ -172,13 +175,18 @@ describe('QuickTrade', () => {
 });
 
 describe('QuickTrade on perps (§4(2): manual orders are long-only in 2.8.0)', () => {
-  const cut = 'long-only in 2.8.0';
+  const cut = 'Manual SELL is long-only on perps this release — strategy sessions trade shorts; use a strategy to short.';
 
-  it('visibly disables the Sell side with no long held and names the cut — never half-broken', async () => {
+  it('shows both sides as two separated action blocks: BUY opens a long, SELL states its long-only cut', async () => {
     m = await showPerp([]);
-    const sell = side('Sell');
+    const buy = block('Buy / Long');
+    const sell = block('Sell / Short');
+    expect(buy.textContent).toContain('Opens a long');
+    expect(sell.textContent).toContain('Long-only this release');
+    expect(buy.disabled).toBe(false);
     expect(sell.disabled).toBe(true);
-    expect(m.container.textContent).toContain(`No BTC long held: manual orders on perpetual sessions are ${cut} (use a strategy session to trade shorts).`);
+    // The disabled side's reason stands visible without clicking it (never half-broken).
+    expect(m.container.textContent).toContain(cut);
     // Long-only means exactly that: the BUY stays available and posts.
     await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
     expect(primary().disabled).toBe(false);
@@ -188,8 +196,10 @@ describe('QuickTrade on perps (§4(2): manual orders are long-only in 2.8.0)', (
 
   it('keeps the Sell side enabled when a long is held — reducing it is the safety net, not a short', async () => {
     m = await showPerp(HELD);
-    expect(side('Sell').disabled).toBe(false);
-    await click(side('Sell'));
+    const sell = block('Sell / Short');
+    expect(sell.disabled).toBe(false);
+    expect(sell.textContent).toContain('Reduces the held long');
+    await click(sell);
     await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
     expect(primary().disabled).toBe(false);
     expect(m.container.textContent).not.toContain(cut);
@@ -197,8 +207,8 @@ describe('QuickTrade on perps (§4(2): manual orders are long-only in 2.8.0)', (
 
   it('refuses the manual BUY over a strategy-held short: the strategy closes its own (BUY-back)', async () => {
     m = await showPerp(SHORT);
-    expect(side('Buy').disabled).toBe(true);
-    expect(m.container.textContent).toContain(`BTCUSDT is held short by the strategy: manual orders on perpetual sessions are ${cut} — its own exit rules and the kill switch close it (BUY-back).`);
+    expect(block('Buy / Long').disabled).toBe(true);
+    expect(m.container.textContent).toContain(`BTCUSDT is held short by the strategy: manual orders on perpetual sessions are long-only in 2.8.0 — its own exit rules and the kill switch close it (BUY-back).`);
     await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
     expect(primary().disabled).toBe(true);
     await click(primary());
@@ -212,13 +222,14 @@ describe('QuickTrade on perps (§4(2): manual orders are long-only in 2.8.0)', (
     expect(m.container.textContent).not.toContain('About ');
   });
 
-  it('keeps the spot rules byte-identical: Sell with nothing held is the spot refusal, not the perp cut', async () => {
+  it('keeps the spot rules byte-identical: the segmented side control and the spot refusal', async () => {
     m = await show(detail(), []);
+    expect(Array.from(m.container.querySelectorAll('button[aria-pressed]')).some((b) => b.textContent?.includes('Opens a long'))).toBe(false);
     expect(side('Sell').disabled).toBe(false);
     await click(side('Sell'));
     await typeInto(inputByLabel(m.container, 'Quantity (BTC)'), '0.001');
     expect(m.container.textContent).toContain("Nothing to sell. Spot can't go short.");
-    expect(m.container.textContent).not.toContain(cut);
+    expect(m.container.textContent).not.toContain('long-only');
   });
 
   it('the live perp review names the leveraged venue, not plain Binance spot', async () => {

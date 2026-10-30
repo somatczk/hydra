@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/lib/api';
 import { buttonByText, click, dialogPolyfill, flush, inputByLabel, mount, routeFetch, typeInto, type Mounted, type Mutations, type Routes } from '@/test/pageHarness';
-import { detail, exchangeStop, liveChallenge, liveStatus, paperFill, perpSession, perpsState, platformConfig, reconcile, session } from '@/test/fixtures';
+import { detail, exchangeStop, liveChallenge, liveStatus, paperFill, perpHedgedPositions, perpPair, perpSession, perpTrailingStop, perpsState, platformConfig, reconcile, session } from '@/test/fixtures';
+import type { OpenOrder } from '@/lib/derive';
 
 const ID = 'a1b2c3d4-0000-4000-8000-000000000001';
 const fetchApi = vi.fn();
@@ -327,7 +328,7 @@ describe('session detail perps surfaces (P4)', () => {
     setup(detail({ ...perpSession(), positions: [{ ...HELD, direction: 'short' }] }));
     m = await page();
     const rows = Array.from(m.container.querySelectorAll('tbody tr')).map((r) => r.textContent ?? '');
-    expect(rows.some((r) => r.includes('Short'))).toBe(true);
+    expect(rows.some((r) => r.includes('SHORT'))).toBe(true);
     expect(rows.some((r) => r.includes('-0.00150'))).toBe(true);
     expect(text()).toContain("A short closes by buying it back. Its strategy's exit rules and the kill switch close it; manual orders are long-only in 2.8.0.");
   });
@@ -339,5 +340,57 @@ describe('session detail perps surfaces (P4)', () => {
     expect(rows.some((r) => r.includes('Held'))).toBe(true);
     expect(rows.some((r) => r.includes('-0.00150'))).toBe(false);
     expect(text()).not.toContain('closes by buying it back');
+    expect(text()).not.toContain('LONG');
+  });
+});
+
+describe('session detail hedge-mode surfaces (P7-G)', () => {
+  it('renders LONG/SHORT chips with per-side summaries for a hedged perp session', async () => {
+    setup(detail({ ...perpSession(), symbols: ['BTCUSDT', 'ETHUSDT'], positions: perpHedgedPositions(), perps: perpsState() }));
+    m = await page();
+    const chips = Array.from(m.container.querySelectorAll('tbody span')).map((s) => s.textContent);
+    expect(chips).toContain('LONG');
+    expect(chips).toContain('SHORT');
+    expect(text()).toContain('1 position · 0.00200 BTC · unrealised +10.00 USDT');
+    expect(text()).toContain('1 position · 0.00150 ETH · unrealised −2.50 USDT');
+    expect(text()).toContain("A short closes by buying it back. Its strategy's exit rules and the kill switch close it; manual orders are long-only in 2.8.0.");
+  });
+
+  it('renders the resting protective pair as ONE two-leg card with both prices named', async () => {
+    setup(detail({ ...perpSession(), perps: perpsState(), open_orders: perpPair() }));
+    m = await page();
+    const perps = document.getElementById('perps-heading')?.parentElement?.textContent ?? '';
+    expect(perps).toContain('Protective pair — one two-leg unit, no OCO on futures');
+    expect(perps).toContain('Take-profit 71,000.00 · Stop 64,000.00 · 0.00200 BTC (SELL)');
+    expect(perps).toContain('reduce-only — one leg fills and the other cancels');
+    expect((perps.match(/Protective pair/g) ?? []).length).toBe(1);
+    // The Health row no longer double-lists the pair's legs as two unrelated stops.
+    expect(text()).not.toContain('Stop at 71,000.00');
+    expect(text()).not.toContain('Stop at 64,000.00 (');
+  });
+
+  it('renders a trailing protective group as its trail note', async () => {
+    setup(detail({ ...perpSession(), perps: perpsState(), open_orders: [perpTrailingStop()] }));
+    m = await page();
+    expect(text()).toContain('Trailing stop 2% · stop at 64,800.00 · 0.00200 BTC (SELL)');
+  });
+
+  it('names the one-way, isolated and leverage mode line in the perps block', async () => {
+    setup(detail({ ...perpSession(), perps: perpsState() }));
+    m = await page();
+    const perps = document.getElementById('perps-heading')?.parentElement?.textContent ?? '';
+    expect(perps).toContain("One-way position mode · Isolated margin · the strategy's leverage 2× (1-3×)");
+  });
+
+  it("keeps a spot session's resting OCO in the Health Stops row — no pair card", async () => {
+    const oco: OpenOrder[] = [
+      { id: 'oco-tp', symbol: 'BTCUSDT', side: 'SELL', type: 'LIMIT', amount: 0.0015, price: 71000, stop_price: null, reason: 'take_profit', protective: true, oco_id: 'oco-1' },
+      { id: 'oco-sl', symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', amount: 0.0015, price: null, stop_price: 64256, reason: 'stop_loss', protective: true, oco_id: 'oco-1' },
+    ];
+    setup(detail({ open_orders: oco }));
+    m = await page();
+    expect(text()).toContain('Stop at 64,256.00 (BTCUSDT)');
+    expect(text()).not.toContain('Protective pair');
+    expect(text()).not.toContain('Take-profit');
   });
 });

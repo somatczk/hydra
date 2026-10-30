@@ -99,7 +99,7 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
   // §4(2): manual/quick-trade on perps is LONG-ONLY in 2.8.0 — the SELL that would open a SHORT
   // entry is refused up front with the cut named, and so is the BUY over a strategy-held short.
   const perpSellCut = isPerpSession(session) && longHeld <= 0
-    ? `No ${base} long held: ${PERP_MANUAL_LONG_ONLY} (use a strategy session to trade shorts).`
+    ? 'Manual SELL is long-only on perps this release — strategy sessions trade shorts; use a strategy to short.'
     : null;
   const perpShortBuyCut = isPerpSession(session) && shortHeld
     ? `${symbol} is held short by the strategy: ${PERP_MANUAL_LONG_ONLY} — its own exit rules and the kill switch close it (BUY-back).`
@@ -200,16 +200,54 @@ export function QuickTrade({ session, positions, onOutcome, onSent }: QuickTrade
       }}
     >
       <div className="flex flex-col gap-1.5">
-        <Segmented
-          label="Side"
-          value={side}
-          options={[
-            { value: 'buy', label: 'Buy', disabled: perpShortBuyCut !== null },
-            // §4(2): the visibly-disabled SHORT side on perps — manual orders are long-only in 2.8.0.
-            { value: 'sell', label: 'Sell', disabled: perpSellCut !== null },
-          ]}
-          onChange={setSide}
-        />
+        {isPerpSession(session) ? (
+          <>
+            {/* P7-G: the both-sides screen on perps — BUY opens a long; SELL stays visibly
+                present, disabled while the manual long-only cut stands (never half-broken). */}
+            <div role="group" aria-label="Side" className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                aria-pressed={buy}
+                disabled={perpShortBuyCut !== null}
+                onClick={() => setSide('buy')}
+                className={cn(
+                  'flex min-h-16 flex-col items-center justify-center gap-0.5 rounded border px-4 max-lg:min-h-11',
+                  buy ? 'border-accent bg-hover text-ink-1' : 'border-line-strong text-ink-2 hover:bg-hover',
+                  perpShortBuyCut !== null && 'cursor-not-allowed opacity-50 hover:bg-transparent',
+                )}
+              >
+                <span className="text-sm font-medium">Buy / Long</span>
+                <span className="text-xs font-normal text-ink-2">Opens a long</span>
+              </button>
+              <button
+                type="button"
+                aria-pressed={!buy}
+                disabled={perpSellCut !== null}
+                onClick={() => setSide('sell')}
+                className={cn(
+                  'flex min-h-16 flex-col items-center justify-center gap-0.5 rounded border px-4 max-lg:min-h-11',
+                  !buy ? 'border-accent bg-hover text-ink-1' : 'border-line-strong text-ink-2 hover:bg-hover',
+                  perpSellCut !== null && 'cursor-not-allowed opacity-50 hover:bg-transparent',
+                )}
+              >
+                <span className="text-sm font-medium">Sell / Short</span>
+                <span className="text-xs font-normal text-ink-2">
+                  {longHeld > 0 ? 'Reduces the held long' : 'Long-only this release'}
+                </span>
+              </button>
+            </div>
+          </>
+        ) : (
+          <Segmented
+            label="Side"
+            value={side}
+            options={[
+              { value: 'buy', label: 'Buy' },
+              { value: 'sell', label: 'Sell' },
+            ]}
+            onChange={setSide}
+          />
+        )}
         {/* The disabled side's reason stands visible without clicking it (never half-broken). */}
         {errors.side ? (
           <p role="alert" className="text-xs text-danger">

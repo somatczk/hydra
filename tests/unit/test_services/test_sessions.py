@@ -41,6 +41,7 @@ from hydra.execution.live_executor import LiveTradingExecutor
 from hydra.execution.order_manager import OrderManager, RiskRejectedError
 from hydra.execution.paper_trading import PaperSessionHaltedError, PersistenceUnavailableError
 from hydra.execution.perp_live import LivePerpTradingExecutor
+from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.execution.protective_orders import ProtectionSpec, ProtectiveOrderManager
 from hydra.execution.session_manager import KillSwitchReport, SessionManager, TradingSession
 from hydra.execution.session_wiring import ManualOrderResult
@@ -57,7 +58,13 @@ from hydra.services.sessions import (
 from hydra.strategy.config import StrategyRiskConfig
 from tests.fixtures.binance_futures_trading import FakeBinanceUsdmTradingClient
 from tests.fixtures.binance_trading import FakeBinanceTradingClient
-from tests.unit.test_execution.session_harness import Harness, held, rule, write_strategy
+from tests.unit.test_execution.session_harness import (
+    Harness,
+    held,
+    perp_clients,
+    rule,
+    write_strategy,
+)
 
 pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
 
@@ -705,6 +712,52 @@ async def test_paper_open_orders_egress_is_json_safe_floats(
     )
     model = SessionDetailResponse.model_validate(detail)
     assert model.open_orders[0].trail_pct == 0.03
+
+
+async def test_paper_perp_detail_carries_the_protective_pair(strategies_dir: Path) -> None:
+    """P7-G (the #245 review, A1): a paper perp session's detail carries its resting
+    protective orders — the TAKE_PROFIT_MARKET + STOP_MARKET pair sharing one oco_id,
+    each leg reduce-only — so the pair card's gate (``open_orders`` on a paper perp
+    session) is fed by the real seam, never the route's empty default."""
+    sid = write_strategy(
+        strategies_dir,
+        "svc-perp-pair",
+        exchange_id="binanceusdm",
+        market_type="FUTURES",
+        entry_long=rule(("less_than", 100.5), ("greater_than", 99.5)),
+        risk={
+            "stop_loss_method": "fixed_pct",
+            "stop_loss_value": 2.0,
+            "take_profit_method": "fixed_pct",
+            "take_profit_value": 3.0,
+        },
+    )
+    h = Harness(strategies_dir)
+    await h.start()
+    assert h.mgr is not None
+    h.mgr._clients = perp_clients(h)
+    try:
+        session = await h.session(sid)
+        await h.bar(session, "100", exchange_id="binanceusdm")
+        assert isinstance(session._executor, PerpPaperTradingExecutor)
+        detail = await sessions_svc.get_session_detail(h.mgr, session.session_id)
+    finally:
+        await h.close()
+
+    sl, tp = sorted(detail["open_orders"], key=lambda o: o["stop_price"])
+    assert (tp["type"], tp["reason"]) == ("TAKE_PROFIT_MARKET", "take_profit")
+    assert (sl["type"], sl["reason"]) == ("STOP_MARKET", "stop_loss")
+    assert tp["oco_id"] is not None and tp["oco_id"] == sl["oco_id"]
+    assert (tp["amount"], sl["amount"]) == (1.0, 1.0)
+    # levels off the real fill (100.1 = 100 with the executor's 0.1% slippage)
+    assert (tp["stop_price"], sl["stop_price"]) == (103.103, 98.098)
+    assert (tp["side"], sl["side"]) == ("SELL", "SELL")
+    for leg in (tp, sl):
+        assert isinstance(leg["stop_price"], float)
+        assert leg["reduce_only"] is True
+        assert leg["protective"] is True
+    model = SessionDetailResponse.model_validate(detail)
+    assert model.open_orders[0].oco_id == tp["oco_id"]
 
 
 async def test_quick_trade_round_trip_on_the_real_seam(h: Harness, strategies_dir: Path) -> None:

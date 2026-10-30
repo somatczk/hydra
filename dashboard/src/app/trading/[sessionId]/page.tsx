@@ -23,6 +23,7 @@ import { exchangeStopRow, fillQty, isPerpSession, perpsRows, plural, sessionName
 import { money, pct, price, qty, signed, utc } from '@/lib/format';
 import { baseAsset } from '@/lib/outcomes';
 import { classifySessionWsMessage, debounce } from '@/lib/sessionWs';
+import { PerpProtection } from '@/components/trading/PerpProtection';
 
 const FILL_REFETCH_DEBOUNCE_MS = 500;
 
@@ -47,8 +48,8 @@ function Stat({ label, value, note }: { label: string; value: string | null; not
             <span aria-hidden="true">—</span> <DataStateBadge state="unavailable" reason={`${label} isn't reported yet`} />
           </>
         )}
+        {note && <p className="mt-0.5 text-xs font-normal text-ink-2">{note}</p>}
       </dd>
-      {note && <p className="mt-0.5 text-xs text-ink-2">{note}</p>}
     </div>
   );
 }
@@ -87,16 +88,61 @@ function Account({ d }: { d: SessionDetail }) {
   );
 }
 
+/** P7-G: the hedge-capable display's per-side summary — count, the side's unrealised P&L,
+ * and its total quantity only when the side's rows share one base (quantities across
+ * different bases don't add). Longs first; a side renders only when it holds something. */
+function sideSummaries(positions: PositionItem[]): Array<{ side: 'long' | 'short'; count: number; quantity: number; base: string | null; unrealizedPnl: number }> {
+  const out: Array<{ side: 'long' | 'short'; count: number; quantity: number; base: string | null; unrealizedPnl: number }> = [];
+  for (const side of ['long', 'short'] as const) {
+    const rows = positions.filter((p) => (side === 'short' ? p.direction === 'short' : p.direction !== 'short'));
+    if (rows.length === 0) continue;
+    const bases = new Set(rows.map((p) => baseAsset(p.symbol)));
+    out.push({
+      side,
+      count: rows.length,
+      quantity: rows.reduce((n, p) => n + p.quantity, 0),
+      base: bases.size === 1 ? [...bases][0] : null,
+      unrealizedPnl: rows.reduce((n, p) => n + p.unrealized_pnl, 0),
+    });
+  }
+  return out;
+}
+
 function Positions({ d }: { d: SessionDetail }) {
   const base = baseAsset(d.symbols[0] ?? '');
   const live = d.trading_mode === 'live';
+  const perp = isPerpSession(d);
+  const sides = perp ? sideSummaries(d.positions) : [];
   if (d.positions.length > 0) {
     return (
       <>
+        {sides.length > 0 && (
+          <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            {sides.map((s) => (
+              <div key={s.side} className="flex items-center gap-2 rounded border border-line bg-surface p-2">
+                <StatusBadge status={s.side === 'long' ? 'LONG' : 'SHORT'} variant={s.side === 'long' ? 'success' : 'error'} size="sm" />
+                <p className="text-sm text-ink-1">
+                  {plural(s.count, 'position')}
+                  {s.base !== null ? ` · ${qty(s.quantity)} ${s.base}` : ''}
+                  {` · unrealised ${signed(s.unrealizedPnl)} USDT`}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
         <Table<PositionItem>
         columns={[
           { key: 'symbol', header: 'Symbol' },
-          { key: 'direction', header: 'Side', render: (p) => sideLabel(p.direction).text },
+          {
+            key: 'direction',
+            header: 'Side',
+            render: (p) =>
+              perp ? (
+                <StatusBadge status={p.direction === 'short' ? 'SHORT' : 'LONG'} variant={p.direction === 'short' ? 'error' : 'success'} size="sm" />
+              ) : (
+                sideLabel(p.direction).text
+              ),
+          },
           // A perp SHORT renders its quantity signed (it closes by buying back); spot stays unsigned.
           { key: 'quantity', header: `Qty (${base})`, render: (p) => (p.direction === 'short' ? `-${qty(p.quantity)}` : qty(p.quantity)) },
           { key: 'avg_entry_price', header: 'Avg entry', render: (p) => price(p.avg_entry_price) },
@@ -125,7 +171,7 @@ function Positions({ d }: { d: SessionDetail }) {
         data={d.positions}
         keyExtractor={(p) => p.symbol}
       />
-        {isPerpSession(d) && d.positions.some((p) => p.direction === 'short') && (
+        {perp && d.positions.some((p) => p.direction === 'short') && (
           <p className="mt-2 text-sm text-ink-2">
             {"A short closes by buying it back. Its strategy's exit rules and the kill switch close it; manual orders are long-only in 2.8.0."}
           </p>
@@ -141,31 +187,40 @@ function Positions({ d }: { d: SessionDetail }) {
 }
 
 /** P4-C's perp session reads (the detail's `perps` block): the margin wallet, leverage and
- * isolated mode, the funding accrual with its skips visible, and the liquidation state. */
+ * isolated mode, the funding accrual with its skips visible, and the liquidation state.
+ * P7-G adds the one-line mode facts. */
 function Perps({ d }: { d: SessionDetail }) {
   const rows = perpsRows(d.perps);
-  if (!rows) return null;
+  const perps = d.perps;
+  if (!rows || !perps) return null;
+  // P7-G: the mode facts in one muted line — one-way position mode and isolated margin are
+  // the venue setup the session manager enforces before any order; the leverage is the
+  // strategy's own pick within the 1-3× platform cap.
+  const mode = `One-way position mode · Isolated margin · the strategy's leverage ${perps.leverage}× (1-3×)`;
   return (
-    <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-      <div className="rounded border border-line bg-surface p-3">
-        <dt className="text-sm text-ink-2">Leverage</dt>
-        <dd className="mt-1 text-lg font-semibold text-ink-1">{rows.leverage}</dd>
-      </div>
-      <div className="rounded border border-line bg-surface p-3">
-        <dt className="text-sm text-ink-2">Margin wallet (USDT)</dt>
-        <dd className="mt-1 text-lg font-semibold text-ink-1">{rows.wallet}</dd>
-      </div>
-      <div className="rounded border border-line bg-surface p-3 sm:col-span-2">
-        <dt className="text-sm text-ink-2">Funding</dt>
-        <dd className={rows.funding.tone === 'caution' ? 'text-sm text-caution' : 'text-sm text-ink-1'}>{rows.funding.text}</dd>
-      </div>
-      {rows.liquidations && (
-        <div className="rounded border border-line bg-surface p-3 sm:col-span-2">
-          <dt className="text-sm text-ink-2">Liquidations</dt>
-          <dd className="text-sm font-semibold text-danger">{rows.liquidations.text}</dd>
+    <>
+      <p className="mb-3 text-sm text-ink-2">{mode}</p>
+      <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="rounded border border-line bg-surface p-3">
+          <dt className="text-sm text-ink-2">Leverage</dt>
+          <dd className="mt-1 text-lg font-semibold text-ink-1">{rows.leverage}</dd>
         </div>
-      )}
-    </dl>
+        <div className="rounded border border-line bg-surface p-3">
+          <dt className="text-sm text-ink-2">Margin wallet (USDT)</dt>
+          <dd className="mt-1 text-lg font-semibold text-ink-1">{rows.wallet}</dd>
+        </div>
+        <div className="rounded border border-line bg-surface p-3 sm:col-span-2">
+          <dt className="text-sm text-ink-2">Funding</dt>
+          <dd className={rows.funding.tone === 'caution' ? 'text-sm text-caution' : 'text-sm text-ink-1'}>{rows.funding.text}</dd>
+        </div>
+        {rows.liquidations && (
+          <div className="rounded border border-line bg-surface p-3 sm:col-span-2">
+            <dt className="text-sm text-ink-2">Liquidations</dt>
+            <dd className="text-sm font-semibold text-danger">{rows.liquidations.text}</dd>
+          </div>
+        )}
+      </dl>
+    </>
   );
 }
 
@@ -327,6 +382,9 @@ export default function SessionDetailPage() {
       {d.perps && (
         <Section id="perps-heading" title="Perps">
           <Perps d={d} />
+          {/* P7-G: a paper perp session's resting protective orders render here as units
+              (the NO-OCO pair as ONE two-leg card); live perps read stops via the A8 verify. */}
+          {isPerpSession(d) && d.trading_mode !== 'live' && <PerpProtection orders={d.open_orders} />}
         </Section>
       )}
 

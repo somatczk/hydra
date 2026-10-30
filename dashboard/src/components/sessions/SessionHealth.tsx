@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import { cn } from '@/components/ui/cn';
 import { DataStateBadge } from '@/components/ui/DataStateBadge';
-import { exchangeStopRow, isOverdue, plural, reconcileRow, type SessionDetail } from '@/lib/derive';
+import { exchangeStopRow, isOverdue, isPerpSession, plural, reconcileRow, type SessionDetail } from '@/lib/derive';
 import { duration, price, utc } from '@/lib/format';
 
 type Tone = 'none' | 'caution' | 'danger';
@@ -44,68 +44,70 @@ export function SessionHealth({ detail: d, push, now }: SessionHealthProps) {
   const ended = d.stopped_at ? Date.parse(d.stopped_at) : now;
 
   return (
-    <dl className="flex flex-col gap-2">
-      <Row label="Status">
-        {d.status}
-        {Number.isNaN(started) ? '' : ` · ${duration((running ? now : ended) - started)}`}
-      </Row>
-      <Row label="Last bar" tone={overdue ? 'caution' : 'none'}>
-        {d.last_bar_at
-          ? `processed ${utc(d.last_bar_at, now)}${overdue === null ? '' : overdue ? ' · overdue' : ' · on time'}`
-          : running
-            ? `Waiting for the first closed ${d.timeframe} bar`
-            : 'No bar processed'}
-      </Row>
-      <Row label="Entries" tone={d.entries_paused ? 'caution' : 'none'}>
-        {d.entries_paused ?? 'Allowed'}
-      </Row>
-      <Row label="Stop failures" tone={failures.length > 0 ? 'caution' : 'none'}>
-        {!running
-          ? 'Stop failures: not tracked (session not running)'
-          : failures.length === 0
-            ? 'Stop failures: none since start'
-            : `${plural(failures.length, 'stop failure')} since start. Last: ${failures[failures.length - 1]}`}
-      </Row>
-      {liveStops !== null && liveStops.length > 0 && (
-        <Row label="Stops" tone={stopTone}>
-          {/* S2: an unreadable verify names the server's error when it reported one. */}
-          {d.positions.map((p, i) => liveStops[i]?.text ?? p.exchange_stop?.error ?? 'UNKNOWN').join(' · ')}
+    <>
+      <dl className="flex flex-col gap-2">
+        <Row label="Status">
+          {d.status}
+          {Number.isNaN(started) ? '' : ` · ${duration((running ? now : ended) - started)}`}
         </Row>
-      )}
-      {!live && stops.length > 0 && (
-        <Row label="Stops">
-          {stops.map((o) => `Stop at ${price(o.stop_price)} (${o.symbol})`).join(' · ')}
+        <Row label="Last bar" tone={overdue ? 'caution' : 'none'}>
+          {d.last_bar_at
+            ? `processed ${utc(d.last_bar_at, now)}${overdue === null ? '' : overdue ? ' · overdue' : ' · on time'}`
+            : running
+              ? `Waiting for the first closed ${d.timeframe} bar`
+              : 'No bar processed'}
         </Row>
-      )}
-      {d.reconcile && (
-        <Row label="Reconcile" tone={reconcile?.tone ?? 'caution'}>
-          {reconcile ? reconcile.text : <DataStateBadge state="unknown" reason="The reconcile state couldn't be read" />}
+        <Row label="Entries" tone={d.entries_paused ? 'caution' : 'none'}>
+          {d.entries_paused ?? 'Allowed'}
         </Row>
-      )}
-      {running && d.feed_live === false && (
-        <Row label="Feed" tone="caution">
-          Feed not live
+        <Row label="Stop failures" tone={failures.length > 0 ? 'caution' : 'none'}>
+          {!running
+            ? 'Stop failures: not tracked (session not running)'
+            : failures.length === 0
+              ? 'Stop failures: none since start'
+              : `${plural(failures.length, 'stop failure')} since start. Last: ${failures[failures.length - 1]}`}
         </Row>
-      )}
-      <Row label="Saved" tone={d.persist_error || d.persist_dirty ? 'caution' : 'none'}>
-        {[
-          d.persist_error ? `Session status saved: no. ${d.persist_error}` : 'Session status saved: yes',
-          d.persist_dirty ? 'Unsaved ledger changes' : null,
-        ]
-          .filter(Boolean)
-          .join(' · ')}
-      </Row>
-      {d.error_message && (
-        <Row label="Error" tone="danger">
-          {d.error_message}
+        {liveStops !== null && liveStops.length > 0 && (
+          <Row label="Stops" tone={stopTone}>
+            {/* S2: an unreadable verify names the server's error when it reported one. */}
+            {d.positions.map((p, i) => liveStops[i]?.text ?? p.exchange_stop?.error ?? 'UNKNOWN').join(' · ')}
+          </Row>
+        )}
+        {/* P7-G: a paper perp session's resting protective orders render as the Perps section's
+            named units (the pair as ONE two-leg card), not as this row's unrelated stops. */}
+        {!live && !isPerpSession(d) && stops.length > 0 && (
+          <Row label="Stops">
+            {stops.map((o) => `Stop at ${price(o.stop_price)} (${o.symbol})`).join(' · ')}
+          </Row>
+        )}
+        {d.reconcile && (
+          <Row label="Reconcile" tone={reconcile?.tone ?? 'caution'}>
+            {reconcile ? reconcile.text : <DataStateBadge state="unknown" reason="The reconcile state couldn't be read" />}
+          </Row>
+        )}
+        {running && d.feed_live === false && (
+          <Row label="Feed" tone="caution">
+            Feed not live
+          </Row>
+        )}
+        <Row label="Saved" tone={d.persist_error || d.persist_dirty ? 'caution' : 'none'}>
+          {[
+            d.persist_error ? `Session status saved: no. ${d.persist_error}` : 'Session status saved: yes',
+            d.persist_dirty ? 'Unsaved ledger changes' : null,
+          ]
+            .filter(Boolean)
+            .join(' · ')}
         </Row>
-      )}
-      <Row label="Market">
-        {d.exchange_id} · {d.symbols.join(', ')} · {d.timeframe}
-      </Row>
-      {running && (
-        <p className="text-sm text-ink-2">{push ? 'Push connected' : 'Polling every 15 s'}</p>
-      )}
-    </dl>
+        {d.error_message && (
+          <Row label="Error" tone="danger">
+            {d.error_message}
+          </Row>
+        )}
+        <Row label="Market">
+          {d.exchange_id} · {d.symbols.join(', ')} · {d.timeframe}
+        </Row>
+      </dl>
+      {running && <p className="mt-2 text-sm text-ink-2">{push ? 'Push connected' : 'Polling every 15 s'}</p>}
+    </>
   );
 }
