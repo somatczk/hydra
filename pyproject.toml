@@ -29,7 +29,7 @@ dependencies = [
     # Backtest
     "optuna>=5.0.0,<6",
     # Execution
-    "ccxt[async]>=4.5.88,<5",
+    "ccxt[async]>=4.5.90,<5",
     # Dashboard backend
     "fastapi>=0.162.0,<1",
     "uvicorn[standard]>=0.54.0,<1",
