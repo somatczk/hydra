@@ -113,9 +113,7 @@ class InMemoryEventBus:
 
 
 # ---------------------------------------------------------------------------
-# The opt-in Redis Streams fan-out (P7-E): a publish-only mirror, plus a
-# consumer API for cross-process readers. Trading consumers never read these
-# streams; every session keeps its InMemoryEventBus as the trading bus.
+# The opt-in Redis Streams fan-out (P7-E)
 # ---------------------------------------------------------------------------
 
 _RETRY_MAX_DELAY_S = 5.0
@@ -310,7 +308,12 @@ class RedisEventSubscriber:
     # -- Subscription management ----------------------------------------------
 
     async def subscribe(self, event_type: str, callback: EventCallback) -> None:
-        """Subscribe a callback to one event type's stream ('*' is not a stream key)."""
+        """Subscribe a callback to one event type's stream ('*' is not a stream key).
+
+        Requires :meth:`connect` first: the subscription creates the consumer group.
+        """
+        if self._client is None:
+            raise RuntimeError("connect() before subscribe()")
         if event_type == "*":
             raise ValueError(
                 "subscribe to concrete event types: the mirror's streams are keyed by event type"
@@ -329,7 +332,12 @@ class RedisEventSubscriber:
             self._subscribers[event_type].remove(callback)
 
     async def start_listening(self) -> None:
-        """Start one background reader per subscribed stream."""
+        """Start one background reader per subscribed stream.
+
+        Requires :meth:`connect` first.
+        """
+        if self._client is None:
+            raise RuntimeError("connect() before start_listening()")
         self._running = True
         for event_type in list(self._subscribers):
             if event_type not in self._listen_tasks:
@@ -365,7 +373,14 @@ class RedisEventSubscriber:
         return f"{self._stream_prefix}{event_type}"
 
     async def _listen_loop(self, event_type: str) -> None:
-        """Read new entries, then reclaim abandoned ones, forever until stopped."""
+        """Read new entries, then reclaim abandoned ones, forever until stopped.
+
+        A group or stream deleted mid-listen (``FLUSHALL``, ``XGROUP DESTROY``)
+        surfaces as a ``NOGROUP`` reply; the loop re-creates the group once per
+        detection instead of retrying into the same error forever.
+        """
+        from redis.exceptions import ResponseError
+
         stream_key = self._stream_key(event_type)
         while self._running:
             try:
@@ -381,9 +396,28 @@ class RedisEventSubscriber:
                 await self._reclaim(stream_key, event_type)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Redis event subscriber loop for %s failed; retrying", event_type)
-                await asyncio.sleep(1)
+            except Exception as exc:
+                if isinstance(exc, ResponseError) and str(exc).startswith("NOGROUP"):
+                    logger.warning(
+                        "Consumer group %s vanished on %s; re-creating it",
+                        self._group,
+                        stream_key,
+                    )
+                    self._ensured_groups.discard(stream_key)
+                    try:
+                        await self._ensure_group(event_type)
+                    except Exception:
+                        logger.exception(
+                            "Re-creating consumer group %s on %s failed; retrying",
+                            self._group,
+                            stream_key,
+                        )
+                        await asyncio.sleep(1)
+                else:
+                    logger.exception(
+                        "Redis event subscriber loop for %s failed; retrying", event_type
+                    )
+                    await asyncio.sleep(1)
 
     async def _deliver(
         self, stream_key: str, event_type: str, messages: list[tuple[bytes, dict[bytes, bytes]]]

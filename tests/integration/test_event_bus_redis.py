@@ -3,7 +3,8 @@
 Real Redis, real sockets: cross-group fan-out (every group gets every event), the
 one-group-per-role rule (consumers sharing a group load-balance — each event exactly
 once across the group), a mid-session outage through a TCP proxy (delivered, dropped
-+ counted, delivered again), redelivery dedup on ``event_id``, the dead-consumer
++ counted, delivered again), the FLUSHALL mid-listen recovery (the group re-created,
+delivery resumes), redelivery dedup on ``event_id``, the dead-consumer
 XAUTOCLAIM reclaim, and the slow-consumer pin (a hung consumer never backpressures
 the publisher's mirror callback).
 """
@@ -275,6 +276,35 @@ class TestFanOut:
         assert received == ["up1", "up2", "up3", "back1", "back2"]
         assert _drops("publish_failed") == 5.0
         assert _drops("buffer_full") == 0.0
+
+    async def test_a_flushall_mid_listen_is_recovered_by_recreating_the_group(
+        self, redis_url: str
+    ) -> None:
+        """FLUSHALL deletes the stream and group mid-listen; the loop re-creates
+        the group (no NOGROUP spin) and the post-flush events still arrive."""
+        import redis.asyncio as aioredis
+
+        prefix = _prefix()
+        publisher = RedisEventPublisher(redis_url, stream_prefix=prefix)
+        await publisher.connect()
+        received: list[str] = []
+        subscriber = await _subscriber(redis_url, prefix, "flush", received)
+        raw = aioredis.from_url(redis_url, decode_responses=False)
+        try:
+            await subscriber.start_listening()
+            for event_id in ("pre1", "pre2"):
+                await publisher.on_event(_entry(event_id))
+            await _until(lambda: len(received) == 2)
+
+            await raw.flushall()  # the stream and its consumer group vanish mid-listen
+            for event_id in ("post1", "post2"):
+                await publisher.on_event(_entry(event_id))
+            await _until(lambda: len(received) == 4)
+        finally:
+            await raw.aclose()
+            await subscriber.close()
+            await publisher.close()
+        assert received == ["pre1", "pre2", "post1", "post2"]
 
     async def test_a_redelivered_event_id_is_processed_once(self, redis_url: str) -> None:
         """Two stream entries carrying one event_id (the XAUTOCLAIM-redelivery shape):

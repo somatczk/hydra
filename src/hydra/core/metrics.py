@@ -187,8 +187,7 @@ MetricKind = Literal["counter", "gauge", "histogram"]
 EXCHANGE_CALL_OUTCOMES = ("ok", "error", "timeout", "cancelled")
 FEED_BAR_SOURCES = ("ws", "rest_gap", "warmup")
 RISK_INTENTS = ("open", "reduce")
-# trader: the split-API monitor's remote-trader check (D5); redis joins only while the
-# events fan-out is on (P7-E: the check exists exactly when the dependency exists)
+# each check exists exactly when its dependency exists (trader: D5; redis: P7-E)
 READY_CHECKS = ("db", "migrations", "sessions", "feeds", "risk", "trader", "redis")
 SPOT_SHORT_SIGNALS = ("entry_short", "exit_short")
 CIRCUIT_BREAKER_TIERS = range(5)

@@ -163,8 +163,7 @@ class SessionRuntime:
         self.primary: Timeframe = cfg.timeframes.primary
         self.required_history = required_history
         self.bus = InMemoryEventBus()
-        # the opt-in fan-out (P7-E): None unless events.bus is 'redis'; the trading
-        # bus above stays in-memory either way
+        # the opt-in mirror (P7-E); the trading bus above stays in-memory
         self.mirror: RedisEventPublisher | None = None
         if hydra_config.events.bus == "redis":
             secret = hydra_config.redis_url

@@ -3,8 +3,10 @@
 The publisher's contract is the point: ``on_event`` never awaits the wire and never
 raises, a full buffer and a failed XADD drop events that are counted, and the drain
 loop survives every failure. The subscriber's contract: redeliveries are deduped,
-callbacks are isolated, and the XACK lands after them. The wire format itself (every
-event class through the publisher's msgpack path and back) is pinned here too.
+callbacks are isolated, the XACK lands after them, connect comes before
+subscribe/start_listening (a named RuntimeError), and a group deleted mid-listen is
+re-created rather than spun on. The wire format itself (every event class through
+the publisher's msgpack path and back) is pinned here too.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Any
 import msgpack
 import pytest
 from prometheus_client import REGISTRY
+from redis.exceptions import ResponseError
 
 from hydra.core import metrics
 from hydra.core.event_bus import RedisEventPublisher, RedisEventSubscriber
@@ -105,14 +108,17 @@ class StubRedis:
         xadd_delay_s: float | None = None,
         fail_execute: bool = False,
         ping_fails: bool = False,
+        nogroup_errors: int = 0,
     ) -> None:
         self.xadd_delay_s = xadd_delay_s
         self.fail_execute = fail_execute
         self.ping_fails = ping_fails
+        self.nogroup_errors = nogroup_errors
         self.xadd_calls: list[tuple[str, dict[bytes, bytes]]] = []
         self.failed_batches = 0
         self.read_batches: list[list[tuple[bytes, dict[bytes, bytes]]]] = []
         self.xack_calls: list[bytes] = []
+        self.xgroup_calls: list[tuple[str, str]] = []
         self.closed = False
 
     async def ping(self) -> bool:
@@ -131,6 +137,12 @@ class StubRedis:
         count: int = 10,
         block: int = 1000,
     ) -> list[list[Any]]:
+        if self.nogroup_errors > 0:
+            self.nogroup_errors -= 1
+            raise ResponseError(
+                f"NOGROUP No such key '{next(iter(streams))}' or "
+                f"consumer group '{groupname}' in XREADGROUP"
+            )
         await asyncio.sleep(0.01)  # a bounded fake of the blocking read
         if not self.read_batches:
             return []
@@ -150,6 +162,7 @@ class StubRedis:
     async def xgroup_create(
         self, stream: str, group: str, id: str = "0", mkstream: bool = False
     ) -> None:
+        self.xgroup_calls.append((stream, group))
         return None
 
     async def xack(self, stream: str, group: str, *msg_ids: bytes) -> None:
@@ -356,6 +369,42 @@ class TestSubscriberDelivery:
 
         with pytest.raises(ValueError, match="concrete event types"):
             await subscriber.subscribe("*", record)
+
+    async def test_a_vanished_group_is_recreated_and_reading_resumes(self) -> None:
+        stub = StubRedis(nogroup_errors=1)
+        subscriber = RedisEventSubscriber("redis://stub", client=stub, group="g")
+        stub.read_batches = [[_message(_entry("after"), b"1-1")]]
+        received: list[Event] = []
+
+        async def record(event: Event) -> None:
+            received.append(event)
+
+        await subscriber.connect()
+        await subscriber.subscribe("entry_signal", record)
+        await subscriber.start_listening()
+        try:
+            await _until(lambda: len(stub.xack_calls) == 1)
+        finally:
+            await subscriber.close()
+        assert len(stub.xgroup_calls) == 2  # the NOGROUP re-created the group once
+        assert [e.event_id for e in received] == ["after"]
+
+
+class TestSubscriberConnectOrder:
+    async def test_subscribing_before_connect_names_the_required_order(self) -> None:
+        subscriber = RedisEventSubscriber("redis://stub")
+
+        async def record(event: Event) -> None:
+            return None
+
+        with pytest.raises(RuntimeError, match=r"connect\(\) before subscribe\(\)"):
+            await subscriber.subscribe("entry_signal", record)
+
+    async def test_starting_listening_before_connect_names_the_required_order(self) -> None:
+        subscriber = RedisEventSubscriber("redis://stub")
+
+        with pytest.raises(RuntimeError, match=r"connect\(\) before start_listening\(\)"):
+            await subscriber.start_listening()
 
 
 # ---------------------------------------------------------------------------
