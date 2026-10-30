@@ -2,7 +2,17 @@ import axe from 'axe-core';
 import type { ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { dialogPolyfill, mount, routeFetch, unavailable, type Mounted, type Routes } from '@/test/pageHarness';
-import { liveStatus } from '@/test/fixtures';
+import {
+  detail,
+  liveStatus,
+  paperFill,
+  perpHedgedPositions,
+  perpPair,
+  perpSession,
+  perpsState,
+  platformConfig,
+  session,
+} from '@/test/fixtures';
 
 const fetchApi = vi.fn();
 
@@ -14,7 +24,7 @@ vi.mock('@/components/ui/Toast', () => ({ useToast: () => ({ toast: vi.fn() }) }
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: vi.fn() }),
   useSearchParams: () => new URLSearchParams(),
-  useParams: () => ({ id: 'a1b2c3d4-0000-4000-8000-000000000001' }),
+  useParams: () => ({ id: 'a1b2c3d4-0000-4000-8000-000000000001', sessionId: 'a1b2c3d4-0000-4000-8000-000000000001' }),
 }));
 
 const { ThemeProvider } = await import('@/components/layout/ThemeProvider');
@@ -31,6 +41,7 @@ const pages: Array<[string, () => Promise<{ default: () => ReactNode }>]> = [
   ['/data', () => import('@/app/data/page')],
   ['/activity', () => import('@/app/activity/page')],
   ['/activity/approvals/[id]', () => import('@/app/activity/approvals/[id]/page')],
+  ['/trading/[sessionId]', () => import('@/app/trading/[sessionId]/page')],
 ];
 
 let page: Mounted | null = null;
@@ -173,6 +184,34 @@ const populated: Array<[string, () => Promise<{ default: () => ReactNode }>, Rou
     },
     'Completed',
   ],
+  [
+    '/trading/[sessionId]',
+    () => import('@/app/trading/[sessionId]/page'),
+    {
+      // P7-G's hedge-mode surfaces: both-side positions, the perps block and the resting pair.
+      '/api/trading/sessions/a1b2c3d4-0000-4000-8000-000000000001/detail': detail({
+        ...perpSession(),
+        symbols: ['BTCUSDT', 'ETHUSDT'],
+        positions: perpHedgedPositions(),
+        perps: perpsState(),
+        open_orders: perpPair(),
+        trades: [paperFill()],
+      }),
+      '/api/risk/live-status': liveStatus(),
+      '/api/trading/sessions': [session()],
+      '/api/system/config': platformConfig(),
+      '/api/market/orderbook?symbol=BTCUSDT': {
+        symbol: 'BTCUSDT',
+        bids: [[65000.5, 1.25]],
+        asks: [[65001, 0.75]],
+        spread: 0.5,
+        timestamp: null,
+        fetched_at: new Date().toISOString(),
+      },
+      '/api/strategies/sma-cross-btc-1h': { risk: { stop_loss_method: 'fixed_pct', stop_loss_value: 5 } },
+    },
+    'One-way position mode',
+  ],
 ];
 
 /** The populated pages' paper fixtures in one route set, plus the shell's own paper sources. */
@@ -199,6 +238,9 @@ async function mountPage(load: () => Promise<{ default: () => ReactNode }>) {
 
 async function axeViolations(load: () => Promise<{ default: () => ReactNode }>) {
   await mountPage(load);
+  // The session page's TradingView chart is a cross-origin iframe jsdom cannot host, and
+  // axe cannot walk into it (its internals are TradingView's, not this app's surface).
+  page!.container.querySelectorAll('iframe').forEach((f) => f.remove());
   const results = await axe.run(page!.container, {
     rules: { 'color-contrast': { enabled: false }, region: { enabled: false } },
   });

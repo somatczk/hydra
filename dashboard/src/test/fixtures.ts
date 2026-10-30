@@ -5,9 +5,11 @@ import type {
   CircuitBreaker,
   ExchangeStopState,
   LiveStatus,
+  OpenOrder,
   PendingApproval,
   PerpsSessionState,
   PlatformConfig,
+  PositionItem,
   ReconcileState,
   SessionDetail,
   SessionResponse,
@@ -112,6 +114,57 @@ export function perpsState(over: Partial<PerpsSessionState> = {}): PerpsSessionS
     margin_used: 99.5,
     ...over,
   };
+}
+
+/** P7-G: a paper perp session's resting NO-OCO protective pair as `fetch_open_orders`
+ * serves it (perp_trading.py `_create_oco` through services/sessions.py
+ * `json_safe_open_order`): both legs share `oco_id`, each carries its trigger in
+ * `stop_price` (the take-profit leg is TAKE_PROFIT_MARKET, not a LIMIT), reduce-only. */
+export function perpPair(over: Partial<OpenOrder> = {}): OpenOrder[] {
+  const shared = {
+    symbol: 'BTCUSDT',
+    side: 'SELL',
+    amount: 0.002,
+    price: null,
+    protective: true,
+    oco_id: 'p7g-pair-1',
+    trail_pct: null,
+    reduce_only: true,
+    ...over,
+  };
+  return [
+    { ...shared, id: 'p7g-tp', type: 'TAKE_PROFIT_MARKET', stop_price: 71000, reason: 'take_profit' },
+    { ...shared, id: 'p7g-sl', type: 'STOP_MARKET', stop_price: 64000, reason: 'stop_loss' },
+  ];
+}
+
+/** P7-G: a perp trailing protective leg — `trail_pct` is the fraction in (0, 1)
+ * (`ProtectionSpec`'s own doc), `stop_price` the trigger after the peak moved. */
+export function perpTrailingStop(over: Partial<OpenOrder> = {}): OpenOrder {
+  return {
+    id: 'p7g-trail',
+    symbol: 'BTCUSDT',
+    side: 'SELL',
+    type: 'TRAILING_STOP',
+    amount: 0.002,
+    price: null,
+    stop_price: 64800,
+    reason: 'trailing_stop',
+    protective: true,
+    oco_id: null,
+    trail_pct: 0.02,
+    reduce_only: true,
+    ...over,
+  };
+}
+
+/** P7-G: a perp session's hedge-capable positions — one-way position mode holds one
+ * signed position per symbol, so both sides live on different symbols. */
+export function perpHedgedPositions(): PositionItem[] {
+  return [
+    { symbol: 'BTCUSDT', direction: 'long', quantity: 0.002, avg_entry_price: 60000, unrealized_pnl: 10 },
+    { symbol: 'ETHUSDT', direction: 'short', quantity: 0.0015, avg_entry_price: 3400, unrealized_pnl: -2.5 },
+  ];
 }
 
 /** risk.py:130-135 RiskStatusLive as returned by `get_live_risk_status` (risk.py:532-567). */

@@ -77,7 +77,11 @@ export interface PositionItem {
   exchange_stop?: ExchangeStopState | null;
 }
 
-/** trading.py OpenOrderItem: `stop_price` is where a resting stop triggers (null on a LIMIT). */
+/** trading.py OpenOrderItem: `stop_price` is where a resting stop triggers (null on a LIMIT).
+ * The perp executors' rows carry three extras (P7-B3's shared shape, served through
+ * `json_safe_open_order`): `oco_id` — the id both legs of the NO-OCO TP+SL pair share,
+ * null on a single-leg group; `trail_pct` — a trailing group's distance as a fraction
+ * in (0, 1); `reduce_only`. */
 export interface OpenOrder {
   id: string;
   symbol: string;
@@ -88,6 +92,9 @@ export interface OpenOrder {
   stop_price: number | null;
   reason: string;
   protective: boolean | null;
+  oco_id?: string | null;
+  trail_pct?: number | null;
+  reduce_only?: boolean | null;
 }
 
 /** trading.py SessionMetrics; the account numbers are null until the paper ledger reports them. */
