@@ -50,7 +50,7 @@ from hydra.backtest.jobs import (
     WalkForwardRunRequest,
     import_backtest_strategy,
 )
-from hydra.backtest.runner import BacktestRunner
+from hydra.backtest.runner import BacktestRunner, strategy_warmup
 from hydra.backtest.walkforward import WalkForwardAnalyzer, fold_windows
 from hydra.core.types import ExchangeId, MarketType, Timeframe
 from hydra.data.bars import timeframe_seconds
@@ -312,6 +312,7 @@ async def run_backtest_job(
             symbol=config.symbols[0],
             timeframe=config.timeframes.primary,
             on_progress=_report,
+            warmup_bars=strategy_warmup(strategy_cls, config),
             risk_config=risk_config,
             funding=funding,
             extra_bars=extras,

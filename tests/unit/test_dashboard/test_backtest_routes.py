@@ -584,7 +584,14 @@ _HYPEROPT_RESULT = {
     "train_end": "2026-01-24T00:00:00+00:00",
     "holdout_start": "2026-01-25T00:00:00+00:00",
     "holdout_end": "2026-01-31T00:00:00+00:00",
-    "holdout": {"sharpe": 0.9, "total_return": 0.01, "max_drawdown": 0.005, "total_trades": 2},
+    "holdout": {
+        "sharpe": 0.9,
+        "total_return": 0.01,
+        "max_drawdown": 0.005,
+        "total_trades": 2,
+        "benchmark_return": 0.03,
+        "benchmark_sharpe": 1.1,
+    },
     "holdout_psr": 0.88,
     "dsr": 0.77,
     "pbo": None,
@@ -677,6 +684,8 @@ class TestStatusAndResults:
             "total_return": 0.01,
             "max_drawdown": 0.005,
             "total_trades": 2,
+            "benchmark_return": 0.03,
+            "benchmark_sharpe": 1.1,
         }
         assert body["holdout_psr"] == 0.88
         assert body["dsr"] == 0.77
@@ -856,7 +865,8 @@ class TestWalkForwardWindows:
         # 57 bars: 35 IS + 2 x 11 OOS weekly bars, stepping 11.
         assert len(result.folds) == 2
         for fold in result.folds:
-            assert len(fold.in_sample_metrics.equity_curve) == 35
+            # fold 0 has no bars before its window, so its trial's 1 warm-up bar comes out of it
+            assert len(fold.in_sample_metrics.equity_curve) == (34 if fold.fold_index == 0 else 35)
             assert len(fold.out_of_sample_metrics.equity_curve) == 11
             assert fold.selected_params == {"level": 1}
             assert fold.n_trials == 1

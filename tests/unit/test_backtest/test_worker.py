@@ -835,11 +835,13 @@ async def test_curves_carry_their_own_timestamps_and_metrics_persist(
     equity = json.loads(row["equity_curve"])
     bench = json.loads(row["benchmark_equity"])
     labels = [p["timestamp"] for p in equity]
-    assert labels[-len(rows) :] == [r["timestamp"].isoformat() for r in rows]
+    # the strategy's 10 warm-up bars are replayed but not scored: curves start at the 11th bar
+    scored = rows[10:]
+    assert labels == [r["timestamp"].isoformat() for r in scored]
     assert [p["timestamp"] for p in bench] == labels
     close_at = {r["timestamp"].isoformat(): r["close"] for r in rows}
     for point in bench:
-        assert point["value"] == float(10000 * close_at[point["timestamp"]] / rows[0]["close"])
+        assert point["value"] == float(10000 * close_at[point["timestamp"]] / scored[0]["close"])
     metrics = summary_from_row(row)["metrics"]
     assert metrics["total_return"] == round((equity[-1]["value"] / equity[0]["value"] - 1) * 100, 2)
     assert isinstance(metrics["max_drawdown_duration_s"], int)

@@ -25,6 +25,7 @@ profit_factor      sum(winning pnl) / |sum(losing pnl)|                         
 expectancy         mean trade pnl (= win_rate*avg_win - loss_rate*avg_loss)     0
 benchmark_equity   initial_capital * p_i / p_0 on ``benchmark_prices``, which   [] if no prices
                    are aligned 1:1 with the equity curve (frictionless)
+benchmark_sharpe   the Sharpe formula on the benchmark equity's returns r_b      0.0
 beta               cov(r, r_b, ddof=1) / var(r_b, ddof=1)                       0.0
 alpha              Jensen, annualised: (mean(r) - beta * mean(r_b)) * ppy       0.0
 ================== ============================================================ ================
@@ -118,6 +119,7 @@ class BacktestResult:
     # Benchmark (buy-and-hold)
     benchmark_equity: list[Decimal] = field(default_factory=list)
     benchmark_return: Decimal = Decimal("0")
+    benchmark_sharpe: float = 0.0
     alpha: float = 0.0
     beta: float = 0.0
 
@@ -441,12 +443,14 @@ def calculate_metrics(
     # Benchmark (buy-and-hold)
     benchmark_equity: list[Decimal] = []
     benchmark_return = Decimal("0")
+    benchmark_sharpe = 0.0
     alpha = 0.0
     beta = 0.0
     if benchmark_prices:
         benchmark_equity = _compute_benchmark_equity(initial_capital, benchmark_prices)
         benchmark_return = _compute_total_return(benchmark_equity)
         benchmark_returns = _compute_returns(_decimal_to_float_array(benchmark_equity))
+        benchmark_sharpe = _compute_sharpe(benchmark_returns, ppy)
         alpha, beta = _compute_alpha_beta(returns, benchmark_returns, ppy)
 
     # Consecutive wins/losses and expectancy
@@ -471,6 +475,7 @@ def calculate_metrics(
         avg_trade_duration=tstats["avg_trade_duration"],
         benchmark_equity=benchmark_equity,
         benchmark_return=benchmark_return,
+        benchmark_sharpe=benchmark_sharpe,
         alpha=alpha,
         beta=beta,
         max_consecutive_wins=max_consecutive_wins,
