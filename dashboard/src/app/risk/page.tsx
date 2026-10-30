@@ -15,10 +15,12 @@ import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBad
 import { Select } from '@/components/ui/Select';
 import { TypedConfirm } from '@/components/ui/TypedConfirm';
 import { usePoll } from '@/hooks/usePoll';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, connectWebSocket } from '@/lib/api';
 import { parseErrorDetail } from '@/lib/apiState';
 import { plural, sessionName, stoppedHolders, type CircuitBreaker, type Restrictions } from '@/lib/derive';
 import { duration, money, pct, utc } from '@/lib/format';
+import { classifyRiskWsMessage, type RiskHeartbeat } from '@/lib/riskWs';
+import { debounce } from '@/lib/sessionWs';
 import {
   breakerResetOutcome,
   ledgerResetOutcome,
@@ -63,6 +65,8 @@ interface StrategyOption {
 }
 
 const MIN_VAR_SAMPLE_DAYS = 5;
+/** A burst of risk events collapses into one refetch, 500 ms after the last tick. */
+const RISK_EVENT_REFETCH_DEBOUNCE_MS = 500;
 const json = (body: unknown): RequestInit => ({ body: JSON.stringify(body) });
 
 async function settle<T>(p: Promise<T>): Promise<Result<T>> {
@@ -102,6 +106,47 @@ export default function RiskPage() {
   const dialogRef = useRef<Dialog>(null);
 
   const st = status.data;
+  const [push, setPush] = useState(false);
+  const [beat, setBeat] = useState<{ at: number; data: RiskHeartbeat } | null>(null);
+  const refetchStatus = status.refetch;
+  const { refetch: refetchEvents } = events;
+  const refetchSessions = shell.sessions.refetch;
+
+  useEffect(() => {
+    const refetchOnEvent = debounce(() => {
+      void refetchStatus();
+      void refetchEvents();
+      // the shell's session list (a breaker may have stopped sessions); the kill-switch
+      // query is deliberately not here — it stays sourced from the live-status poll
+      void refetchSessions();
+    }, RISK_EVENT_REFETCH_DEBOUNCE_MS);
+    const ws = connectWebSocket('/ws/risk', (msg) => {
+      const classified = classifyRiskWsMessage(msg);
+      if (classified.action === 'refetch') refetchOnEvent.trigger();
+      else if (classified.action === 'heartbeat') setBeat({ at: Date.now(), data: classified.beat });
+    });
+    if (ws) {
+      ws.onopen = () => setPush(true);
+      ws.onclose = () => setPush(false);
+      ws.onerror = () => setPush(false);
+    }
+    return () => {
+      refetchOnEvent.cancel();
+      ws?.close();
+      setPush(false);
+    };
+  }, [refetchStatus, refetchEvents, refetchSessions]);
+
+  /** The fresher of the pushed heartbeat and the last poll drives the ledger cards. */
+  const hb =
+    beat !== null && (status.fetchedAt === null || beat.at >= status.fetchedAt) ? beat.data : null;
+  const equity = hb ? hb.equity : st?.equity ?? null;
+  const peakEquity = hb ? hb.peak_equity : st?.peak_equity ?? null;
+  const dayStartEquity = hb ? hb.day_start_equity : st?.day_start_equity ?? null;
+  const currentDrawdown = hb ? hb.current_drawdown : st?.current_drawdown ?? null;
+  const dailyLoss = hb ? hb.daily_loss : st?.daily_loss ?? null;
+  const lossStreak = hb ? hb.consecutive_losses : st?.consecutive_losses ?? null;
+
   const ks = live.data?.kill_switch_state ?? (live.state === 'loading' ? 'loading' : 'unknown');
   const activeTier = st?.restrictions?.active_tier ?? live.data?.circuit_breaker_restrictions?.active_tier ?? 0;
   const lastKs = events.data?.find((e) => e.kind === 'kill_switch_on' || e.kind === 'kill_switch_off');
@@ -109,13 +154,11 @@ export default function RiskPage() {
   const resetTier = typeof dialog === 'number' ? dialog : 0;
   const holders = stoppedHolders(sessions.data ?? []);
 
-  const { refetch: refetchEvents } = events;
   const prevKs = useRef(ks);
   useEffect(() => {
     if (prevKs.current !== ks) void refetchEvents();
     prevKs.current = ks;
   }, [ks, refetchEvents]);
-
   const show = (d: Dialog) => {
     dialogRef.current = d;
     setDialog(d);
@@ -270,15 +313,19 @@ export default function RiskPage() {
       </section>
 
       <DataCard title="Today's loss">
-        {st === null ? (
+        {st === null && hb === null ? (
           <DataStateBadge state="unknown" />
         ) : (
           <dl className="flex flex-col gap-1">
             <Row label="Daily loss">
-              {st.daily_loss === null ? <DataStateBadge state="unknown" /> : `${money(st.daily_loss)} of ${money(st.daily_loss_limit) ?? '—'} USDT`}
+              {dailyLoss === null ? (
+                <DataStateBadge state="unknown" />
+              ) : (
+                `${money(dailyLoss)} of ${money(st?.daily_loss_limit) ?? '—'} USDT`
+              )}
             </Row>
             <Row label="Loss streak">
-              {st.consecutive_losses} of {st.max_consecutive_losses}
+              {lossStreak ?? '—'} of {st?.max_consecutive_losses ?? '—'}
             </Row>
           </dl>
         )}
@@ -289,18 +336,21 @@ export default function RiskPage() {
           <h2 id="ledger-h" className="text-sm font-semibold text-ink-1">
             Paper ledger
           </h2>
-          {st === null ? (
+          {st === null && hb === null ? (
             <div className="mt-2">
               <DataStateBadge state="unknown" />
             </div>
           ) : (
             <>
               <dl className="mt-2 flex flex-col gap-1">
-                <Row label="Equity">{usdt(st.equity)}</Row>
-                <Row label="Peak">{usdt(st.peak_equity)}</Row>
-                <Row label="Day start">{usdt(st.day_start_equity)}</Row>
-                <Row label="Drawdown">{pct(st.current_drawdown) ?? '—'}</Row>
+                <Row label="Equity">{usdt(equity)}</Row>
+                <Row label="Peak">{usdt(peakEquity)}</Row>
+                <Row label="Day start">{usdt(dayStartEquity)}</Row>
+                <Row label="Drawdown">{currentDrawdown === null ? '—' : pct(currentDrawdown)}</Row>
               </dl>
+              <p className="mt-2 text-sm text-ink-2">
+                {push ? 'Push connected' : 'Polling every 10 s'}
+              </p>
               <Button className="mt-4" variant="secondary" size="sm" aria-haspopup="dialog" onClick={() => open('ledger')}>
                 Reset paper ledger…
               </Button>

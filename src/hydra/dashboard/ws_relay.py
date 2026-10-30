@@ -9,9 +9,11 @@ is connected to. The relay closes the gap through the only durable shared state:
 
 ``{"event": "order_fill", "session_id": ..., "trade_id": ...}``
 
-Status transitions are not relayed (a trades cursor cannot see them); the session page's
-15 s detail poll covers them — as does the serial-cursor late-commit window: a lower id
-committing after a higher one the relay already consumed is announced only by that poll,
+Status transitions cross the same gap through a running-set diff: each poll reads the ids
+the database says are ``running``, and a session that left the set gets one
+``session_status`` broadcast on its own ``trades:{session_id}`` channel — the same
+vocabulary ``session_wiring.broadcast_status`` speaks, so the page's classifier refetches
+unchanged. The serial-cursor late-commit window still needs the page's 15 s detail poll,
 and the database stays the truth.
 """
 
@@ -35,14 +37,15 @@ class TradesRelay:
 
     The cursor starts at the current ``MAX(id)`` when the relay starts (the first
     ``/ws/trades`` connection does), so rows written before it are not re-announced; a
-    failed poll keeps the cursor and retries on the next tick, so a DB blip delays a tick,
-    it never drops it.
+    failed poll keeps the cursor and the running-set snapshot, so a DB blip delays a
+    tick, it never drops it.
     """
 
     def __init__(self, pool: Any, *, poll_s: float = RELAY_POLL_S) -> None:
         self._pool = pool
         self._poll_s = poll_s
         self._cursor: int | None = None
+        self._running: set[str] | None = None
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -53,6 +56,7 @@ class TradesRelay:
         """Start the poll task if it is not running; a restart re-anchors the cursor."""
         if self._task is None or self._task.done():
             self._cursor = None
+            self._running = None
             self._task = asyncio.create_task(self._loop(), name="trades-relay")
 
     async def stop(self) -> None:
@@ -89,5 +93,35 @@ class TradesRelay:
                     "event": "order_fill",
                     "session_id": str(row["session_id"]),
                     "trade_id": int(row["id"]),
+                },
+            )
+        await self._session_status_tick()
+
+    async def _session_status_tick(self) -> None:
+        """Diff the running set; a session that left it gets one status broadcast."""
+        rows = await self._pool.fetch("SELECT id FROM trading_sessions WHERE status = 'running'")
+        running = {str(row["id"]) for row in rows}
+        if self._running is None:
+            self._running = running  # the first poll anchors: stops before it are not replayed
+            return
+        gone = self._running - running
+        self._running = running
+        if not gone:
+            return
+        stopped = await self._pool.fetch(
+            "SELECT id, status, stopped_at, error_message FROM trading_sessions WHERE id = ANY($1)",
+            sorted(gone),
+        )
+        for row in stopped:
+            await manager.broadcast(
+                f"trades:{row['id']}",
+                {
+                    "event": "session_status",
+                    "session_id": str(row["id"]),
+                    "status": str(row["status"]),
+                    "stopped_at": (
+                        None if row["stopped_at"] is None else row["stopped_at"].isoformat()
+                    ),
+                    "error_message": row["error_message"],
                 },
             )

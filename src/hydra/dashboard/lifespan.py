@@ -16,8 +16,12 @@ sweeper (the bounded LRU over auto-fetched bars, only with a pool; a failed swee
 one metric and yields to the next cycle, never blocking startup or a read), then the
 funding-rate refresher (the binanceusdm top-up for the running perp sessions' symbols,
 only with a pool; with no running perp sessions each cycle is a no-op, and a failed cycle
-is a warning retried hourly, never blocking startup). Shutdown cancels the funding
-refresher first, then the universe refresher, then the cache sweeper, then closes the MCP session
+is a warning retried hourly, never blocking startup), then the risk relay (the ``/ws/risk``
+producer and the Telegram alerter, only with a pool; it must page with no browser
+connected, so it starts here rather than on the first connection, and a failed poll is
+retried on its next tick, never blocking startup). Shutdown cancels the risk relay first,
+then the funding
+refresher, then the universe refresher, then the cache sweeper, then closes the MCP session
 manager, unmounts ``/mcp`` and
 resets ``app.state.mcp`` (the session manager is
 single-use, so a re-entered lifespan remounts a fresh transport instead of finding the closed
@@ -28,8 +32,9 @@ no pool, no migration and no key requirement. ``app.state.session_clients`` (a
 session, and ``app.state.health_monitor_factory`` builds the ``HealthMonitor`` (the paper smoke
 test injects its fakes and a monitor clock there), as does
 ``app.state.universe_refresher_factory`` for the universe refresher,
-``app.state.data_cache_sweeper_factory`` for the cache sweeper and
-``app.state.funding_refresher_factory`` for the funding-rate refresher.
+``app.state.data_cache_sweeper_factory`` for the cache sweeper,
+``app.state.funding_refresher_factory`` for the funding-rate refresher and
+``app.state.risk_relay_factory`` for the risk relay.
 """
 
 from __future__ import annotations
@@ -73,6 +78,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
     app.state.universe_refresher = None
     app.state.data_cache_sweeper = None
     app.state.funding_refresher = None
+    app.state.risk_relay = None
     clients: ClientFactory | None = getattr(app.state, "session_clients", None)
     mcp_stack: AsyncExitStack | None = None
     try:
@@ -107,8 +113,10 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
         await _start_universe_refresher(app)
         await _start_data_cache_sweeper(app)
         await _start_funding_refresher(app)
+        await _start_risk_relay(app)
         yield
     finally:
+        await _stop_risk_relay(app)
         await _stop_funding_refresher(app)
         await _stop_universe_refresher(app)
         await _stop_data_cache_sweeper(app)
@@ -246,6 +254,37 @@ async def _close_remote_trader(app: FastAPI) -> None:
 async def _stop_trades_relay(app: FastAPI) -> None:
     """Stop the /ws/trades relay started by the first trades connection, if any."""
     relay = getattr(app.state, "trades_relay", None)
+    if relay is not None:
+        await relay.stop()
+
+
+def _default_risk_relay(app: FastAPI) -> Any:
+    from hydra.dashboard.risk_relay import RiskRelay
+
+    return RiskRelay(app.state.db_pool)
+
+
+async def _start_risk_relay(app: FastAPI) -> None:
+    """Start the risk relay at startup; only with a pool, never a check.
+
+    The relay is the ``/ws/risk`` producer and the Telegram alerter, so it runs
+    whether or not a browser ever connects. A failed poll is caught inside the
+    relay's loop (warning + retry next tick), so startup and readiness never
+    depend on it. Tests install their own through ``app.state.risk_relay_factory``
+    — the ``health_monitor_factory`` pattern.
+    """
+    if getattr(app.state, "db_pool", None) is None:
+        return
+    factory: Callable[[FastAPI], Any] = (
+        getattr(app.state, "risk_relay_factory", None) or _default_risk_relay
+    )
+    relay = factory(app)
+    app.state.risk_relay = relay
+    await relay.ensure_started()
+
+
+async def _stop_risk_relay(app: FastAPI) -> None:
+    relay = getattr(app.state, "risk_relay", None)
     if relay is not None:
         await relay.stop()
 

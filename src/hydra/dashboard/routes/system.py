@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -58,7 +59,17 @@ _SETTING_FIELDS: tuple[str, ...] = (
     "max_concurrent_strategies",
     "paper_capital",
 )
-_SECRET_FIELDS: tuple[str, ...] = ("webhook_secret", "discord_webhook_url", "slack_webhook_url")
+_SECRET_FIELDS: tuple[str, ...] = (
+    "webhook_secret",
+    "discord_webhook_url",
+    "slack_webhook_url",
+    "telegram_bot_token",
+    "telegram_chat_id",
+)
+
+# Telegram credential shapes: a BotFather token and a numeric or @channel chat id.
+_TELEGRAM_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
+_TELEGRAM_CHAT_RE = re.compile(r"-?\d+|@[A-Za-z0-9_]{4,}")
 
 # allowed host -> required path prefix
 _WEBHOOK_HOSTS: dict[str, str] = {
@@ -135,6 +146,8 @@ class StoredConfig(BaseModel):
     webhook_secret: str = ""
     discord_webhook_url: str = ""
     slack_webhook_url: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
 
 async def load_system_config(pool: Any) -> dict[str, Any]:
@@ -318,6 +331,8 @@ class PlatformConfig(BaseModel):
     webhook_secret_set: bool
     discord_webhook_url_set: bool
     slack_webhook_url_set: bool
+    telegram_bot_token_set: bool
+    telegram_chat_id_set: bool
 
 
 class PlatformConfigUpdate(BaseModel):
@@ -336,6 +351,8 @@ class PlatformConfigUpdate(BaseModel):
     webhook_secret: str | None = None
     discord_webhook_url: str | None = None
     slack_webhook_url: str | None = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
 
     @field_validator("discord_webhook_url")
     @classmethod
@@ -346,6 +363,24 @@ class PlatformConfigUpdate(BaseModel):
     @classmethod
     def _check_slack(cls, v: str | None) -> str | None:
         return _validate_webhook_url(v, "hooks.slack.com") if v else v
+
+    @field_validator("telegram_bot_token")
+    @classmethod
+    def _check_telegram_token(cls, v: str | None) -> str | None:
+        if v and not _TELEGRAM_TOKEN_RE.fullmatch(v):
+            raise ValueError(
+                "telegram_bot_token must be the BotFather token, '<bot id>:<token body>'"
+            )
+        return v
+
+    @field_validator("telegram_chat_id")
+    @classmethod
+    def _check_telegram_chat(cls, v: str | None) -> str | None:
+        if v and not _TELEGRAM_CHAT_RE.fullmatch(v):
+            raise ValueError(
+                "telegram_chat_id must be a numeric chat id or an @channelname (4+ chars)"
+            )
+        return v
 
 
 class ServiceHealth(BaseModel):
@@ -791,31 +826,76 @@ async def update_notifications(body: NotificationPreferences, request: Request) 
 class NotificationTestResponse(BaseModel):
     discord_sent: bool
     slack_sent: bool
+    telegram_sent: bool
     message: str
+
+
+def _revalidate_telegram(token: str, chat_id: str) -> None:
+    """Re-check the stored Telegram pair before any request leaves the server.
+
+    A half-set pair or a value predating the validators refuses 422 (nothing is
+    sent on any channel — the one-bad-credential precedent).
+    """
+    if not token and not chat_id:
+        return
+    if not (token and chat_id):
+        missing = "telegram_chat_id" if token else "telegram_bot_token"
+        raise api_error(
+            422,
+            "invalid_telegram_credentials",
+            f"{missing}: Telegram needs both the bot token and the chat id; nothing was sent",
+            "invalid",
+            field=missing,
+        )
+    for field, value, pattern in (
+        ("telegram_bot_token", token, _TELEGRAM_TOKEN_RE),
+        ("telegram_chat_id", chat_id, _TELEGRAM_CHAT_RE),
+    ):
+        if not pattern.fullmatch(value):
+            raise api_error(
+                422,
+                "invalid_telegram_credentials",
+                f"{field}: the stored value does not look like a Telegram {field.split('_', 1)[1]}",
+                "invalid",
+                field=field,
+            )
 
 
 @router.post("/notifications/test", response_model=NotificationTestResponse)
 async def test_notifications(request: Request) -> NotificationTestResponse:
-    """Send a test message to all configured webhook channels.
+    """Send a test message to all configured notification channels.
 
-    Stored URLs are re-validated before any request leaves the server, because
-    state can predate the allowlist.
+    Stored credentials are re-validated before any request leaves the server,
+    because state can predate the allowlist; one bad credential blocks every
+    channel (nothing is sent on a partial configuration).
     """
-    from hydra.ops.notifications import DiscordWebhookNotifier, SlackWebhookNotifier
+    from hydra.ops.notifications import (
+        DiscordWebhookNotifier,
+        SlackWebhookNotifier,
+        TelegramNotifier,
+    )
 
     pool = require_pool(request)
     async with db_errors_to_503("reading system config"):
         cfg_dict = await load_system_config(pool)
     discord_url = str(cfg_dict.get("discord_webhook_url") or "")
     slack_url = str(cfg_dict.get("slack_webhook_url") or "")
+    telegram_token = str(cfg_dict.get("telegram_bot_token") or "")
+    telegram_chat_id = str(cfg_dict.get("telegram_chat_id") or "")
 
-    if not discord_url and not slack_url:
+    # a half-set Telegram pair is a misconfiguration, not an empty configuration:
+    # it refuses (with everything else) instead of quietly answering "nothing set"
+    _revalidate_telegram(telegram_token, telegram_chat_id)
+
+    if not discord_url and not slack_url and not (telegram_token and telegram_chat_id):
         return NotificationTestResponse(
             discord_sent=False,
             slack_sent=False,
+            telegram_sent=False,
             message=(
-                "No webhook URLs configured. "
-                "Set discord_webhook_url or slack_webhook_url in platform config."
+                "No notification channel configured. Set discord_webhook_url, "
+                "slack_webhook_url or the telegram_bot_token/telegram_chat_id pair "
+                "in platform config."
             ),
         )
 
@@ -839,16 +919,24 @@ async def test_notifications(request: Request) -> NotificationTestResponse:
         await DiscordWebhookNotifier(discord_url).send(title, body) if discord_url else False
     )
     slack_sent = await SlackWebhookNotifier(slack_url).send(title, body) if slack_url else False
+    telegram_sent = (
+        await TelegramNotifier(telegram_token, telegram_chat_id).send(title, body)
+        if telegram_token and telegram_chat_id
+        else False
+    )
 
     parts: list[str] = []
     if discord_url:
         parts.append(f"Discord: {'ok' if discord_sent else 'failed'}")
     if slack_url:
         parts.append(f"Slack: {'ok' if slack_sent else 'failed'}")
+    if telegram_token and telegram_chat_id:
+        parts.append(f"Telegram: {'ok' if telegram_sent else 'failed'}")
 
     return NotificationTestResponse(
         discord_sent=discord_sent,
         slack_sent=slack_sent,
+        telegram_sent=telegram_sent,
         message=", ".join(parts),
     )
 

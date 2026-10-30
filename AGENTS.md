@@ -97,7 +97,7 @@ git status --porcelain --untracked-files=all # must print nothing after the test
   exchange stops, reconcile. `risk`: pre-trade checks, sizing, circuit breakers. `portfolio`: P&L, positions,
   reconciliation. `ml`: features, dataset, training, serving, export, registry, drift. `dashboard`: the FastAPI app,
   `routes/`, and `mcp/`. `services`: the operations routes and MCP tools both call (no FastAPI), including the live
-  and perps gates. `ops`: Discord/Slack webhook notifier.
+  and perps gates. `ops`: Discord/Slack webhook and Telegram sendMessage notifiers.
 - `dashboard/`: the Next.js app. `config/`: `base.yaml`, `strategies/`, `templates/`. `deploy/`: local compose,
   Prometheus rules and promtool tests, Grafana dashboard. `docker/<image>/Dockerfile`: engine, dashboard, backtest,
   ml. `tests/`: `unit/`, `integration/`, `e2e/`, `performance/`. `docs/`: paper fill rules and the live-trading

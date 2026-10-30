@@ -544,8 +544,14 @@ export default function SettingsPage() {
 
       <Section title="Alerts">
         <div className="space-y-2 text-sm text-ink-1">
-          <p>Alerts are sent by Alertmanager to Telegram. Change them in the alert rules, not here.</p>
-          <p className="text-ink-2">Webhook alerts aren&apos;t sent in this version.</p>
+          <p>
+            Risk alerts go to Telegram from the engine itself: every risk event is pushed using
+            the bot token and chat id stored write-only in platform config.
+          </p>
+          <p className="text-ink-2">
+            Infra paging still rides Alertmanager to Telegram (change it in the alert rules, not
+            here). Webhook alerts aren&apos;t sent in this version.
+          </p>
           {grafanaUrl && (
             <p>
               <a href={grafanaUrl} className="underline underline-offset-2" target="_blank" rel="noreferrer">

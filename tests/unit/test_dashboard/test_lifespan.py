@@ -659,6 +659,98 @@ async def test_a_running_lifespan_leaves_no_funding_refresher_without_a_pool(
         assert getattr(app.state, "funding_refresher", None) is None
 
 
+# ---------------------------------------------------------------------------
+# The risk relay (P7-D): started at app startup, stopped first on shutdown
+# ---------------------------------------------------------------------------
+
+
+class _FakeRiskRelay:
+    """The ``risk_relay_factory`` seam's test double."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    async def ensure_started(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def test_risk_relay_starts_with_a_pool_and_stops_on_shutdown() -> None:
+    app = FastAPI()
+    app.state.db_pool = object()
+    fake = _FakeRiskRelay()
+    app.state.risk_relay_factory = lambda _app: fake
+    await lifespan._start_risk_relay(app)
+    assert fake.started
+    assert app.state.risk_relay is fake
+    await lifespan._stop_risk_relay(app)
+    assert fake.stopped
+
+
+async def test_without_a_pool_no_risk_relay_starts() -> None:
+    app = FastAPI()
+    app.state.db_pool = None
+    calls: list[FastAPI] = []
+
+    def factory(target: FastAPI) -> _FakeRiskRelay:
+        calls.append(target)
+        return _FakeRiskRelay()
+
+    app.state.risk_relay_factory = factory
+    await lifespan._start_risk_relay(app)
+    assert calls == []
+    assert getattr(app.state, "risk_relay", None) is None
+
+
+async def test_the_default_factory_builds_the_real_risk_relay() -> None:
+    from hydra.dashboard.risk_relay import RiskRelay
+
+    app = FastAPI()
+    app.state.db_pool = object()
+    relay = lifespan._default_risk_relay(app)
+    assert isinstance(relay, RiskRelay)
+    await relay.stop()  # never started: stopping is safe
+
+
+async def test_a_running_lifespan_starts_the_risk_relay_and_stops_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole lifespan: the relay runs with a pool and does not outlive shutdown."""
+
+    class _PoolStub:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    app = FastAPI()
+    fake = _FakeRiskRelay()
+    app.state.risk_relay_factory = lambda _app: fake
+    pool = _PoolStub()
+    async with lifespan.run(app):
+        app.state.db_pool = pool  # a pool arriving after startup still gets a relay
+        await lifespan._start_risk_relay(app)
+        assert fake.started and not fake.stopped
+    assert fake.stopped
+    assert pool.closed
+
+
+async def test_a_running_lifespan_leaves_no_risk_relay_without_a_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dev mode (no DATABASE_URL) starts no risk relay; state stays None."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert getattr(app.state, "risk_relay", None) is None
+
+
 def _recorder(order: list[str], label: str) -> Any:
     """An async stand-in for a lifespan step that records its call order."""
 

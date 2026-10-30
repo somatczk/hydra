@@ -115,6 +115,8 @@ class TestGetConfig:
             "webhook_secret_set": False,
             "discord_webhook_url_set": False,
             "slack_webhook_url_set": False,
+            "telegram_bot_token_set": False,
+            "telegram_chat_id_set": False,
         }
 
     def test_stored_values_win(self, db: FakeSystemDb, client: TestClient) -> None:
