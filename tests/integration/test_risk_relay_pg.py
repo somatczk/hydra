@@ -24,7 +24,7 @@ from hydra.ops.notifications import TelegramNotifier
 from tests.unit.test_ops.test_notifications import _start
 
 BOT_ID = "123456789"
-BOT_BODY = "AAEhBOweik6ad9r_QXMENQjcrGbqCr4K-4c"
+BOT_BODY = "AAEhBOweik6ad9r_QXMENQjcrGbqCr4K"
 TOKEN = f"{BOT_ID}:{BOT_BODY}"
 CHAT = "-1002146360582"
 
