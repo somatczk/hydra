@@ -12,7 +12,7 @@ op set is pinned for all of P3 — additive optional parameters only, no new ops
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from hydra.risk.circuit_breakers import CircuitBreakerRestrictions, TierNotActiveError
@@ -300,11 +300,20 @@ class LocalTrader:
             tail = [v for v in daily_pnls[: idx_95 + 1] if v < 0]
             cvar_95 = abs(sum(tail, Decimal(0)) / len(tail)) if tail else var_95
 
+        try:
+            portfolio_value = float(equity.quantize(_CENTS))
+        except InvalidOperation as exc:
+            raise service_error(
+                503,
+                "equity_out_of_range",
+                "Account equity is too large to report in cents; check the paper_capital setting",
+                "unavailable",
+            ) from exc
         return {
             "var_95": float(var_95.quantize(_CENTS)),
             "var_99": float(var_99.quantize(_CENTS)),
             "cvar_95": float(cvar_95.quantize(_CENTS)),
-            "portfolio_value": float(equity.quantize(_CENTS)),
+            "portfolio_value": portfolio_value,
             "calculation_method": "historical_simulation",
             "sample_days": len(rows),
         }
