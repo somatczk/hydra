@@ -340,6 +340,28 @@ async def test_the_heartbeat_payload_is_riskstatus_shaped(
     }
 
 
+async def test_the_heartbeat_derives_the_hostile_half_like_the_status_route(
+    relay: RiskRelay, pool: FakePool, ws: _Socket
+) -> None:
+    """The exact Decimal derivations the status route serves, not the float products'.
+
+    Drawdown 0.02675 and the day start 107 against equity 104.325 both sit on the
+    hostile half — the float derivations round 2.675 to 2.67 while ``/api/risk/status``
+    serves the exact 2.68 — and the heartbeat agrees with the status route.
+    """
+    pool.state = _state(
+        equity=Decimal("104.325"),
+        peak_portfolio_value=Decimal("10000"),
+        day_start_equity=Decimal("107"),
+        current_drawdown=Decimal("0.02675"),
+    )
+    await relay.ensure_started()
+    await _drained(relay)
+    (beat,) = _beats_of(ws)
+    assert beat["current_drawdown"] == 2.68
+    assert beat["daily_loss"] == 2.68
+
+
 async def test_a_state_without_established_numbers_keeps_them_null(
     relay: RiskRelay, pool: FakePool, ws: _Socket
 ) -> None:

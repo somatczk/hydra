@@ -39,8 +39,10 @@ async def _hostile_trader() -> LocalTrader:
     """State and config picked so every percent derivation sits on a float-hostile half.
 
     Drawdown 0.02675 -> 2.675 %, day start 107 against equity 104.325 -> a daily loss
-    of 2.675, the same day start at the 2.5 % daily-loss cap -> a limit of 2.675, and a
-    3.35 % max-drawdown limit whose unrounded float product leaked as 3.3500000000000005.
+    of 2.675, the same day start at the 2.5 % daily-loss cap -> a limit of 2.675: three
+    hostile halves the float rounding sends to 2.67. The 3.35 % max-drawdown limit is
+    the unrounded-product case — ``float(pct) * 100`` with no rounding — which leaks for
+    other caps (``0.0035`` -> ``0.35000000000000003``); 0.0335 itself lands clean.
     """
     store = InMemoryRiskStateStore(
         paper_capital=D("10000"),
@@ -78,7 +80,7 @@ async def test_percent_derivations_are_exact_not_float_products() -> None:
     assert body["current_drawdown"] == D("2.68")  # round(float(0.02675) * 100, 2) == 2.67
     assert body["daily_loss"] == D("2.68")  # round(float(2.675), 2) == 2.67
     assert body["daily_loss_limit"] == D("2.68")  # 107 * 0.025 == 2.675, float: 2.67
-    assert body["max_drawdown_limit"] == D("3.35")  # float(0.0335) * 100 == 3.3500000000000005
+    assert body["max_drawdown_limit"] == D("3.35")  # the unrounded-product class, not a 0.0335 leak
     # the pass-throughs keep the ledger's own Decimals
     assert body["equity"] == D("104.325")
     assert body["peak_equity"] == D("10000")

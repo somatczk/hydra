@@ -29,6 +29,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from hydra.core.websocket import manager
@@ -38,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 RELAY_POLL_S = 2.0
 RELAY_BATCH = 500
+
+_HUNDRED = Decimal("100")
+_CENTS = Decimal("0.01")
 
 NotifierFactory = Callable[[Any], Awaitable[TelegramNotifier | None]]
 
@@ -74,12 +78,24 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _state_payload(state: Mapping[str, Any], kill_switch: bool | None) -> dict[str, Any]:
-    """The ``risk_state`` heartbeat; RiskStatus-shaped, and None stays null."""
+    """The ``risk_state`` heartbeat; RiskStatus-shaped, and None stays null.
+
+    The two derived numbers follow ``_account_fields``: exact Decimal math quantized
+    at the cent, floated only here, so the heartbeat and ``/api/risk/status`` agree
+    on a hostile half instead of straddling it.
+    """
     equity = None if state["equity"] is None else float(state["equity"])
     peak = None if state["peak_portfolio_value"] is None else float(state["peak_portfolio_value"])
     day_start = None if state["day_start_equity"] is None else float(state["day_start_equity"])
     daily_loss = (
-        None if equity is None or day_start is None else round(max(0.0, day_start - equity), 2)
+        None
+        if equity is None or day_start is None
+        else float(
+            max(
+                Decimal("0"),
+                Decimal(str(state["day_start_equity"])) - Decimal(str(state["equity"])),
+            ).quantize(_CENTS)
+        )
     )
     return {
         "event": "risk_state",
@@ -88,7 +104,9 @@ def _state_payload(state: Mapping[str, Any], kill_switch: bool | None) -> dict[s
         "peak_equity": peak,
         "day_start_equity": day_start,
         "daily_loss": daily_loss,
-        "current_drawdown": round(float(state["current_drawdown"] or 0) * 100, 2),
+        "current_drawdown": float(
+            (Decimal(str(state["current_drawdown"] or 0)) * _HUNDRED).quantize(_CENTS)
+        ),
         "consecutive_losses": int(state["consecutive_losses"] or 0),
         "cb_tier": int(state["cb_tier"] or 0),
         "cb_tier_since": _iso(state["cb_tier_since"]),
