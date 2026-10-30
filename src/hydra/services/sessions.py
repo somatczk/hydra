@@ -40,7 +40,6 @@ from hydra.execution.errors import (
 from hydra.execution.exchange_stops import (
     ExchangeStopState,
     json_safe_open_order,
-    normalize_open_orders,
     verify_exchange_stop,
 )
 from hydra.execution.live_orders import LiveOrderRecord, PgLiveOrderStore
@@ -57,6 +56,12 @@ from hydra.execution.perp_live import (
 )
 from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.execution.protective_orders import ProtectionSpec
+from hydra.execution.venue_stops import (
+    is_pair_venue,
+    normalize_bybit_leg,
+    normalize_open_orders,
+    verify_protective_stop,
+)
 from hydra.ml.consumers import validate_session_ml
 from hydra.ml.serving import MlServingError
 from hydra.risk.market_rules import MarketRulesUnavailableError
@@ -457,14 +462,18 @@ async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: A
     Runs only for an executor that exposes its keyed ``exchange_client`` (the live executor,
     P3-A); paper positions never carry ``exchange_stop``. A live PERP session reads BOTH
     fapi namespaces and verifies through ``verify_perp_ladder`` — futures have no OCO, so
-    the spot reads would answer ``missing`` for a correctly resting ladder. Failures per
-    symbol surface as state ``unknown`` with the error string, never ``missing``.
+    the spot reads would answer ``missing`` for a correctly resting ladder. A live BYBIT
+    spot session reads the tpsl namespace the same way and verifies through
+    ``verify_bybit_pair`` — bybit has no list orders, so the binance list reads would
+    answer ``missing`` for a correctly resting pair (P7-F). Failures per symbol surface
+    as state ``unknown`` with the error string, never ``missing``.
     """
     client = getattr(executor, "exchange_client", None)
     if client is None:
         return
     perp = isinstance(executor, LivePerpTradingExecutor)
-    if not perp and getattr(client, "fetch_open_order_lists", None) is None:
+    pair_venue = is_pair_venue(str(getattr(executor, "_exchange_id", "")))
+    if not perp and not pair_venue and getattr(client, "fetch_open_order_lists", None) is None:
         return
     protect = session._runtime.protect if session._runtime is not None else None
     orders: list[dict[str, Any]] = []
@@ -476,8 +485,17 @@ async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: A
                     normalize_perp_leg(o)
                     for o in await client.fetch_open_orders(symbol, conditional=True)
                 )
+            elif pair_venue:
+                legs = [
+                    normalize_bybit_leg(o)
+                    for o in await client.fetch_open_orders(symbol, conditional=True)
+                ]
+                legs.extend(normalize_bybit_leg(o) for o in await client.fetch_open_orders(symbol))
             else:
-                legs = normalize_open_orders(await client.fetch_open_orders(symbol))
+                legs = normalize_open_orders(
+                    str(getattr(executor, "_exchange_id", "")),
+                    await client.fetch_open_orders(symbol),
+                )
         except Exception as exc:
             logger.warning("Live open orders of %s unreadable: %s", symbol, exc)
             continue
@@ -490,6 +508,13 @@ async def _live_exchange_state(detail: dict[str, Any], session: Any, executor: A
         try:
             if perp:
                 state = await verify_perp_ladder(client, position.get("symbol"), expected)
+            elif pair_venue:
+                state = await verify_protective_stop(
+                    str(getattr(executor, "_exchange_id", "")),
+                    client,
+                    position.get("symbol"),
+                    expected,
+                )
             else:
                 state = await verify_exchange_stop(client, position.get("symbol"), expected)
         except Exception as exc:

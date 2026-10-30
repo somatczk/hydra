@@ -15,6 +15,7 @@ from prometheus_client import REGISTRY
 from pydantic import BaseModel
 
 from hydra.core.config import DataConfig
+from hydra.core.venues import registered_venue_ids
 from hydra.dashboard.routes._db import (
     ServiceErrorRoute,
     api_error,
@@ -226,7 +227,9 @@ async def get_data_inventory(request: Request) -> dict[str, Any]:
 # Order book: one cached public CCXT client per exchange, stored on app.state
 # ---------------------------------------------------------------------------
 
-_ALLOWED_EXCHANGES = frozenset({"binance", "binanceusdm"})
+_ALLOWED_EXCHANGES = registered_venue_ids()
+"""The registry's venue ids — bybit spot joins the order book (P7-F); the pinned test
+keeps this set equal to ``client_factory.ALLOWED_VENUES``'s ids."""
 
 
 def _default_exchange_factory(exchange_id: str) -> Any:

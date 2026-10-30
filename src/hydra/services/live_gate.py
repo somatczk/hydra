@@ -18,9 +18,11 @@ seam #1. The separate perps ceremony's executor (``live_perps_arming``,
 :mod:`hydra.services.perps_gate`) registers on the same store beside them: it is the
 only ``perps_armed`` write path and never arms spot trading (P4-E).
 
-Trade-only credentials: arming re-fetches Binance ``/sapi/v1/account/apiRestrictions``
-through the keyed client (R8) — not just the connect-time snapshot — and refuses unless
-the keys are mainnet-validated, spot-trade-enabled and withdrawal-disabled. Credential
+Trade-only credentials: arming re-fetches every CONNECTED supported spot venue's key
+permissions live (R8) — Binance through /sapi/v1/account/apiRestrictions, bybit through
+/v5/user/query-api, each via the venue's registry key check — not just the connect-time
+snapshot — and refuses unless every connected venue's keys are mainnet-validated,
+spot-trade-enabled and withdrawal-disabled (an unconnected venue is skipped). Credential
 delete is code-gated while the stored key can trade; both the gated executor and the
 direct route refuse while any live session runs (the trader's keyed pool entry outlives
 an API-side evict).
@@ -37,6 +39,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from hydra.core.logging import get_logger
+from hydra.core.venues import spot_venue_ids
 from hydra.execution.client_factory import build_readonly_client
 from hydra.risk.state import RiskEventRecord
 from hydra.services.approvals import Approval, ApprovalStore, write_approval_event
@@ -55,7 +58,9 @@ audit_logger = get_logger("hydra.audit")
 
 LIVE_ARMED_KEY = "live_armed"
 LIVE_CAPITAL_KEY = "live_capital"
-LIVE_VENUE = "binance"
+LIVE_VENUES = spot_venue_ids()
+"""The CONNECTED supported spot venues the arm re-fetch loops (binance, bybit — P7-F).
+An unconnected venue is skipped: a venue with no stored key can never start live."""
 RESTRICTIONS_TIMEOUT_S = 10.0
 
 LIVE_ACTIONS = ("live_arming", "live_session_start", "live_order", "credential_delete")
@@ -204,19 +209,54 @@ async def write_armed_transition(
 # ---------------------------------------------------------------------------
 
 
-def normalize_restrictions(raw: Any) -> dict[str, bool]:
-    """Binance ``apiRestrictions`` -> ``{enable_spot_and_margin_trading,
-    enable_withdrawals, ip_restrict}`` (absent flags count as disabled)."""
+def normalize_restrictions(exchange_id: str, raw: Any) -> dict[str, bool]:
+    """The venue's raw key-permission answer -> ``{enable_spot_and_margin_trading,
+    enable_withdrawals, ip_restrict}`` (absent flags count as disabled).
+
+    Binance maps its own ``apiRestrictions`` flags; bybit maps the v5 ``query-api``
+    answer: spot trading is ``SpotTrade`` inside ``permissions['Spot']``, withdrawals
+    are ``Withdraw`` inside ``permissions['Wallet']`` (the Bybit apikey-info
+    permission model — the older shape that named them ``AccountTrade``/
+    ``AccountWithdraw`` under ``SpotTrading`` is accepted too, so keys from either
+    account generation read honestly), and the IP restriction is a non-empty ``ips``
+    list that is not the unrestricted ``*``.
+    """
     if not isinstance(raw, dict):
-        return {
-            "enable_spot_and_margin_trading": False,
-            "enable_withdrawals": False,
-            "ip_restrict": False,
-        }
+        return _disabled_restrictions()
+    if exchange_id == "bybit":
+        return _normalize_bybit_restrictions(raw)
     return {
         "enable_spot_and_margin_trading": bool(raw.get("enableSpotAndMarginTrading")),
         "enable_withdrawals": bool(raw.get("enableWithdrawals")),
         "ip_restrict": bool(raw.get("ipRestrict")),
+    }
+
+
+def _disabled_restrictions() -> dict[str, bool]:
+    return {
+        "enable_spot_and_margin_trading": False,
+        "enable_withdrawals": False,
+        "ip_restrict": False,
+    }
+
+
+def _normalize_bybit_restrictions(raw: dict[str, Any]) -> dict[str, bool]:
+    result = raw.get("result")
+    if not isinstance(result, dict):
+        return _disabled_restrictions()
+    permissions = result.get("permissions")
+    if not isinstance(permissions, dict):
+        return _disabled_restrictions()
+    spot = permissions.get("Spot") or permissions.get("SpotTrading") or []
+    wallet = permissions.get("Wallet") or []
+    ips = result.get("ips")
+    restricted_ips = [ip for ip in (ips or []) if ip not in (None, "*", "")]
+    return {
+        "enable_spot_and_margin_trading": any(p in ("SpotTrade", "AccountTrade") for p in spot),
+        "enable_withdrawals": any(
+            p in ("Withdraw", "AccountWithdraw", "Withdrawal") for p in wallet
+        ),
+        "ip_restrict": bool(restricted_ips),
     }
 
 
@@ -247,80 +287,91 @@ def _not_live_capable(message: str) -> ServiceError:
     return service_error(409, "credentials_not_live_capable", message, "invalid")
 
 
-async def require_live_capable_credentials(pool: Any) -> dict[str, bool]:
-    """Mainnet + spot-trade-enabled + withdrawals-disabled keys, or the refusal.
+async def require_live_capable_credentials(pool: Any) -> dict[str, dict[str, bool]]:
+    """Mainnet + spot-trade-enabled + withdrawals-disabled keys on EVERY connected
+    supported spot venue, or the refusal naming the venue.
 
     R8: the stored snapshot is only the connect-time record — the permissions are
-    RE-FETCHED through the keyed mainnet client here, so a key whose withdrawals were
-    enabled since connecting refuses arming. Anything the re-fetch cannot confirm is
-    refused (fail-closed); only the nothing-stored / undecryptable cases are 403.
+    RE-FETCHED through each venue's registry key check (the keyed mainnet client:
+    Binance sapi apiRestrictions, Bybit v5 user query-api), so a key whose withdrawals
+    were enabled since connecting refuses arming. Anything the re-fetch cannot confirm
+    is refused (fail-closed); only the nothing-stored-at-all / undecryptable cases are
+    403. An unconnected venue is skipped — a venue with no stored key can never start
+    live — so arming binance never waits on bybit; a connected venue that cannot be
+    re-read refuses the arm for all of them (fail-closed by design).
     """
     from cryptography.fernet import InvalidToken
 
     from hydra.core.encryption import decrypt
 
     require_pool(pool)
-    async with db_errors("reading the stored exchange credentials"), pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT encrypted_key, encrypted_secret, encrypted_passphrase, "
-            "validated_environment FROM exchange_credentials WHERE exchange_id = $1",
-            LIVE_VENUE,
-        )
-    if row is None:
+    checked: dict[str, dict[str, bool]] = {}
+    for venue in sorted(LIVE_VENUES):
+        async with db_errors("reading the stored exchange credentials"), pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT encrypted_key, encrypted_secret, encrypted_passphrase, "
+                "validated_environment FROM exchange_credentials WHERE exchange_id = $1",
+                venue,
+            )
+        if row is None:
+            continue  # unconnected: never blocks arming, can never start live
+        try:
+            creds = {
+                "api_key": decrypt(str(row["encrypted_key"])),
+                "api_secret": decrypt(str(row["encrypted_secret"])),
+                "passphrase": (
+                    None
+                    if row["encrypted_passphrase"] is None
+                    else decrypt(str(row["encrypted_passphrase"]))
+                ),
+            }
+        except InvalidToken:
+            raise service_error(
+                403,
+                "live_credentials_missing",
+                f"The stored {venue} credentials cannot be decrypted; reconnect them in Settings",
+                "invalid",
+            ) from None
+        if str(row["validated_environment"] or "") != "mainnet":
+            raise _not_live_capable(
+                f"The stored {venue} credentials are not validated for mainnet; reconnect "
+                "them in Settings with mainnet selected"
+            )
+        client = build_readonly_client(venue, creds, testnet=False)
+        try:
+            raw = await asyncio.wait_for(
+                client.fetch_api_restrictions(), timeout=RESTRICTIONS_TIMEOUT_S
+            )
+        except Exception as exc:
+            raise _not_live_capable(
+                f"The {venue} key permissions could not be re-validated: {exc}; nothing was armed"
+            ) from exc
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                logger.debug("Failed to close the permission-check client", exc_info=True)
+        restrictions = normalize_restrictions(venue, raw)
+        if restrictions["enable_withdrawals"]:
+            raise _not_live_capable(
+                f"The stored {venue} key has withdrawals enabled; live trading needs a "
+                "trade-only key (disable withdrawals on the key and reconnect it in Settings)"
+            )
+        if not restrictions["enable_spot_and_margin_trading"]:
+            raise _not_live_capable(
+                f"The stored {venue} key cannot trade spot; live trading needs a "
+                "trade-enabled key (enable spot trading on the key and reconnect it in Settings)"
+            )
+        checked[venue] = restrictions
+    if not checked:
         raise service_error(
             403,
             "live_credentials_missing",
-            f"No {LIVE_VENUE} credentials are stored; connect trade-only keys in Settings first",
+            "No supported spot venue has credentials stored; connect trade-only keys "
+            "in Settings first",
             "not_found",
         )
-    try:
-        creds = {
-            "api_key": decrypt(str(row["encrypted_key"])),
-            "api_secret": decrypt(str(row["encrypted_secret"])),
-            "passphrase": (
-                None
-                if row["encrypted_passphrase"] is None
-                else decrypt(str(row["encrypted_passphrase"]))
-            ),
-        }
-    except InvalidToken:
-        raise service_error(
-            403,
-            "live_credentials_missing",
-            f"The stored {LIVE_VENUE} credentials cannot be decrypted; reconnect them in Settings",
-            "invalid",
-        ) from None
-    if str(row["validated_environment"] or "") != "mainnet":
-        raise _not_live_capable(
-            f"The stored {LIVE_VENUE} credentials are not validated for mainnet; reconnect "
-            "them in Settings with mainnet selected"
-        )
-    client = build_readonly_client(LIVE_VENUE, creds, testnet=False)
-    try:
-        raw = await asyncio.wait_for(
-            client.fetch_api_restrictions(), timeout=RESTRICTIONS_TIMEOUT_S
-        )
-    except Exception as exc:
-        raise _not_live_capable(
-            f"The {LIVE_VENUE} key permissions could not be re-validated: {exc}; nothing was armed"
-        ) from exc
-    finally:
-        try:
-            await client.close()
-        except Exception:
-            logger.debug("Failed to close the permission-check client", exc_info=True)
-    restrictions = normalize_restrictions(raw)
-    if restrictions["enable_withdrawals"]:
-        raise _not_live_capable(
-            f"The stored {LIVE_VENUE} key has withdrawals enabled; live trading needs a "
-            "trade-only key (disable withdrawals on the key and reconnect it in Settings)"
-        )
-    if not restrictions["enable_spot_and_margin_trading"]:
-        raise _not_live_capable(
-            f"The stored {LIVE_VENUE} key cannot trade spot; live trading needs a "
-            "trade-enabled key (enable spot trading on the key and reconnect it in Settings)"
-        )
-    return restrictions
+    return checked
 
 
 # ---------------------------------------------------------------------------

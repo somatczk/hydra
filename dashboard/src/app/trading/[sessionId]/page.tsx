@@ -59,7 +59,11 @@ function Account({ d }: { d: SessionDetail }) {
   const win = winRate(d.trades);
   return (
     <div className="flex flex-col gap-3">
-      {d.trading_mode === 'live' && <p className="text-sm font-semibold text-live">Real money on Binance.</p>}
+      {d.trading_mode === 'live' && (
+        <p className="text-sm font-semibold text-live">
+          Real money on {d.exchange_id === 'bybit' ? 'Bybit' : 'Binance'}.
+        </p>
+      )}
       <dl className="grid grid-cols-2 gap-3 lg:grid-cols-3">
         <Stat label="Equity (USDT)" value={money(m.equity)} />
         <Stat label="Realised (USDT)" value={signed(m.realized_pnl)} />
@@ -403,7 +407,7 @@ export default function SessionDetailPage() {
             </div>
           )}
         </Section>
-        <ChartAndBook symbol={d.symbols[0] ?? 'BTCUSDT'} />
+        <ChartAndBook symbol={d.symbols[0] ?? 'BTCUSDT'} exchangeId={d.exchange_id} />
       </div>
 
       {running && (

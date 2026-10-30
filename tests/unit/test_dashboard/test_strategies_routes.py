@@ -1186,12 +1186,12 @@ class TestBacktestShare:
 # ---------------------------------------------------------------------------
 
 
-def _save_body(symbol: str = "BTCUSDT") -> dict[str, Any]:
+def _save_body(symbol: str = "BTCUSDT", exchange_id: str = "binance") -> dict[str, Any]:
     """A valid builder save payload for *symbol*."""
     return {
         "name": "Universe Gate",
         "description": "",
-        "exchange_id": "binance",
+        "exchange_id": exchange_id,
         "symbol": symbol,
         "rules": {
             "entry_long": {
@@ -1264,6 +1264,41 @@ class TestUniverseWriteGate:
         assert resp.status_code == 201
         (written,) = tmp_path.glob("*.yaml")
         assert yaml.safe_load(written.read_text())["symbols"] == ["BTCUSDT"]
+
+    def test_a_bybit_save_of_a_symbol_bybit_does_not_list_is_422(self, tmp_path: Path) -> None:
+        """The save-time venue-existence check (P7-F): the top-100 universe stays
+        Binance-ranked, and a member the saved venue does not list refuses at SAVE,
+        naming the venue — never a session that dies on its first rules load."""
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post(
+                "/api/strategies/save", json=_save_body(symbol="SOLUSDT", exchange_id="bybit")
+            )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert "bybit has no spot market 'SOLUSDT'" in str(detail)
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    def test_a_bybit_save_of_a_listed_symbol_writes_the_yaml(self, tmp_path: Path) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post(
+                "/api/strategies/save", json=_save_body(symbol="BTCUSDT", exchange_id="bybit")
+            )
+        assert resp.status_code == 201
+        (written,) = tmp_path.glob("*.yaml")
+        assert yaml.safe_load(written.read_text())["exchange"]["exchange_id"] == "bybit"
+
+    def test_kraken_and_okx_saves_are_refused(self, tmp_path: Path) -> None:
+        """The honest reversal: you can only save what can start — Kraken and OKX are
+        not registered (no testnet or no key-permission endpoint; the README says so)."""
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            for exchange_id in ("kraken", "okx"):
+                resp = client.post("/api/strategies/save", json=_save_body(exchange_id=exchange_id))
+                assert resp.status_code == 422
+                assert f"Invalid exchange: {exchange_id}" in str(resp.json()["detail"])
+        assert list(tmp_path.glob("*.yaml")) == []
 
     def test_update_with_a_member_symbol_round_trips(self, tmp_path: Path) -> None:
         (tmp_path / "gate.yaml").write_text(_rule_based_yaml("gate_1"))

@@ -707,7 +707,7 @@ class TestStrategyLimits:
                 acct.executors.get("x") or AsyncMock(),
                 allocated=Decimal("100"),
                 symbols=[BTC],
-                exchange_id="bybit",
+                exchange_id="kraken",
             )
         assert acct.svc.registered_sessions() == []
 

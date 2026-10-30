@@ -6,7 +6,9 @@ the keyed client from stored credentials and ``build_live_executor`` the live se
 ``binanceusdm`` FUTURES — public market data, market rules and funding rates. P4-D extends
 ``build_live_executor`` to FUTURES: behind the perps gate (checked at every live surface) it
 builds the live perp executor — the perp margin sleeve at the strategy's 1-3x isolated
-leverage — instead of refusing the venue.
+leverage — instead of refusing the venue. P7-F adds bybit SPOT, LIVE ONLY: the registry
+(``hydra.core.venues``) owns every venue fact, and ``validate_venue`` gains the mode caps —
+paper and backtest still run on Binance alone.
 """
 
 from __future__ import annotations
@@ -19,6 +21,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 from hydra.core.logging import get_logger
 from hydra.core.types import ExchangeId, MarketType
+from hydra.core.venues import (
+    VENUES,
+    SessionMode,
+    find_venue,
+    registered_venues,
+)
+from hydra.core.venues import venue_market_type as _registry_market_type
 from hydra.data.storage import MarketDataRepository
 from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.paper_trading import PaperTradingExecutor, SpotMarketRules
@@ -30,22 +39,20 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-ALLOWED_VENUES: frozenset[tuple[str, MarketType]] = frozenset(
-    {("binance", MarketType.SPOT), ("binanceusdm", MarketType.FUTURES)}
-)
+ALLOWED_VENUES: frozenset[tuple[str, MarketType]] = registered_venues()
+"""The registered venue pairs — binance SPOT, binanceusdm FUTURES and bybit SPOT (P7-F)."""
 
-SPOT_EXCHANGE_CLASS_MAP: dict[str, str] = {"binance": "binance"}
-
-USDM_EXCHANGE_CLASS_MAP: dict[str, str] = {"binanceusdm": "binanceusdm"}
-
-SPOT_OPTIONS: dict[str, Any] = {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}}
-
-USDM_OPTIONS: dict[str, Any] = {
-    "defaultType": "swap",
-    "defaultSubType": "linear",
-    "fetchMarkets": {"types": ["linear"]},
+SPOT_EXCHANGE_CLASS_MAP: dict[str, str] = {
+    spec.exchange_id: spec.ccxt_class
+    for (_eid, market_type), spec in VENUES.items()
+    if market_type is MarketType.SPOT
 }
-"""Verified against the installed ccxt's ``binanceusdm.describe()`` (4.5.88: swap/linear)."""
+
+USDM_EXCHANGE_CLASS_MAP: dict[str, str] = {
+    spec.exchange_id: spec.ccxt_class
+    for (_eid, market_type), spec in VENUES.items()
+    if market_type is MarketType.FUTURES
+}
 
 _EXCHANGE_CLASS_MAPS: dict[MarketType, dict[str, str]] = {
     MarketType.SPOT: SPOT_EXCHANGE_CLASS_MAP,
@@ -60,28 +67,49 @@ def _market_type(market_type: MarketType | str) -> MarketType:
         raise UnsupportedVenueError(f"unknown market type {market_type!r}") from exc
 
 
-def validate_venue(exchange_id: str, market_type: MarketType | str = MarketType.SPOT) -> ExchangeId:
-    """Return *exchange_id* typed; raise UnsupportedVenueError unless the pair is allowed."""
+def validate_venue(
+    exchange_id: str,
+    market_type: MarketType | str = MarketType.SPOT,
+    *,
+    mode: SessionMode | None = "paper",
+) -> ExchangeId:
+    """Return *exchange_id* typed; raise UnsupportedVenueError unless the pair is allowed
+    for *mode* (the registry's per-venue mode caps).
+
+    The default keeps the pre-P7-F semantics — paper and backtest refuse the live-only
+    venue, exactly as they refused every unregistered one — so the runners and the paper
+    builders pass nothing; only the live builders and the live recovery pass ``live``.
+    ``mode=None`` is the pair-only check, for client construction whose session gate
+    already ran (the keyed live clients) or that carries no mode (the public feeds).
+    """
     mt = _market_type(market_type)
-    if (exchange_id, mt) not in ALLOWED_VENUES:
+    spec = find_venue(exchange_id, mt)
+    if spec is None:
         raise UnsupportedVenueError(
-            f"{exchange_id} {mt.value} is not supported: "
-            "only binance SPOT and binanceusdm FUTURES (USD⌂-M perps) are"
+            f"{exchange_id} {mt.value} is not supported and not scheduled: "
+            "the supported venues are binance SPOT, binanceusdm FUTURES "
+            "(USD⌂-M perps) and bybit SPOT (live only)"
+        )
+    if mode is not None and mode not in spec.allowed_modes:
+        raise UnsupportedVenueError(
+            f"{exchange_id} {mt.value} is a live-only venue: paper and backtest sessions "
+            f"run on binance and binanceusdm (asked for {mode})"
         )
     return cast(ExchangeId, exchange_id)
 
 
 def ccxt_class_for(exchange_id: str, market_type: MarketType | str = MarketType.SPOT) -> str:
-    """The ccxt class for an allowed venue (binance SPOT -> ``binance``, binanceusdm FUTURES
-    -> ``binanceusdm``)."""
+    """The ccxt class for a registered venue (binance SPOT -> ``binance``, binanceusdm
+    FUTURES -> ``binanceusdm``, bybit SPOT -> ``bybit``); the pair-only check — the
+    caller's session gate owns the mode."""
     mt = _market_type(market_type)
-    validate_venue(exchange_id, mt)
+    validate_venue(exchange_id, mt, mode=None)
     return _EXCHANGE_CLASS_MAPS[mt][exchange_id]
 
 
 def _venue_market_type(exchange_id: str) -> MarketType:
-    """The market type an allowed exchange id trades: binanceusdm is the USD⌂-M perps venue."""
-    return MarketType.FUTURES if exchange_id in USDM_EXCHANGE_CLASS_MAP else MarketType.SPOT
+    """The market type an exchange id trades: binanceusdm is the USD⌂-M perps venue."""
+    return _registry_market_type(exchange_id)
 
 
 def venue_market_type(exchange_id: str) -> MarketType:
@@ -90,8 +118,11 @@ def venue_market_type(exchange_id: str) -> MarketType:
 
 
 def _venue_options(exchange_id: str, market_type: MarketType) -> dict[str, Any]:
-    validate_venue(exchange_id, market_type)
-    return dict(SPOT_OPTIONS if market_type is MarketType.SPOT else USDM_OPTIONS)
+    spec = find_venue(exchange_id, market_type)
+    if spec is None:
+        validate_venue(exchange_id, market_type, mode=None)
+        raise UnsupportedVenueError(f"{exchange_id} {market_type.value} has no venue spec")
+    return dict(spec.client_options)
 
 
 def map_credentials(stored: Mapping[str, Any]) -> dict[str, str]:
@@ -112,11 +143,12 @@ def build_readonly_client(
     testnet: bool,
     market_type: MarketType | str = MarketType.SPOT,
 ) -> ExchangeClient:
-    """Account-read client (balance, orders); the sandbox only if *testnet*."""
+    """Account-read client (balance, orders, the key-permission re-fetch); the sandbox
+    only if *testnet*. The keyed ceremony path is live-mode: the mode caps admit bybit."""
     from hydra.execution.exchange_client import ExchangeClient
 
     mt = _market_type(market_type)
-    eid = validate_venue(exchange_id, mt)
+    eid = validate_venue(exchange_id, mt, mode="live")
     return ExchangeClient(
         exchange_id=eid,
         config=map_credentials(stored_creds),
@@ -132,11 +164,13 @@ def build_trading_client(
     testnet: bool,
     market_type: MarketType | str = MarketType.SPOT,
 ) -> ExchangeClient:
-    """The keyed live client (orders, trades, balance); same class the read-only path uses."""
+    """The keyed live client (orders, trades, balance); same class the read-only path uses.
+
+    The keyed client exists only to trade live, so the mode caps admit the live-only venue."""
     from hydra.execution.exchange_client import ExchangeClient
 
     mt = _market_type(market_type)
-    eid = validate_venue(exchange_id, mt)
+    eid = validate_venue(exchange_id, mt, mode="live")
     return ExchangeClient(
         exchange_id=eid,
         config=map_credentials(stored_creds),
@@ -217,7 +251,7 @@ def build_live_executor(
     from hydra.risk.market_rules import MarketRules
 
     mt = _market_type(market_type)
-    eid = validate_venue(exchange_id, mt)
+    eid = validate_venue(exchange_id, mt, mode="live")
     bad = sorted(k for k, v in market_rules.items() if not isinstance(v, MarketRules))
     if bad:
         raise ValueError(f"live trading needs full MarketRules for: {', '.join(bad)}")

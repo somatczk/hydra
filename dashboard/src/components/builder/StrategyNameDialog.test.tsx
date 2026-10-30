@@ -324,6 +324,19 @@ describe('StrategyNameDialog', () => {
 });
 
 describe('StrategyNameDialog perps fields (P4-F: venue / market_type / leverage / isolated)', () => {
+  it('offers the registered venues only — bybit live-only, Kraken and OKX gone (P7-F)', async () => {
+    m = await render({ initialName: 'Venue bot' });
+
+    const dialog = () => m!.container.querySelector('dialog') as HTMLDialogElement;
+    const options = () =>
+      Array.from(dialog().querySelectorAll('select')[0].querySelectorAll('option')).map(
+        (o) => o.textContent,
+      );
+    expect(options()).toEqual(['Binance', 'Binance USD⌂-M (perps)', 'Bybit (live only)']);
+    expect(dialog().textContent).not.toContain('Kraken');
+    expect(dialog().textContent).not.toContain('OKX');
+  });
+
   it('offers the binanceusdm venue and shows the perps region only for it', async () => {
     m = await render({ initialName: 'Perp bot' });
 

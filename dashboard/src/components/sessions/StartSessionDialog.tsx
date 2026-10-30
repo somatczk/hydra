@@ -213,7 +213,7 @@ export function StartSessionDialog({ strategyId, onClose }: StartSessionDialogPr
       {picked && (
         <p>
           {known
-            ? `${known.name} · ${perp ? 'Binance USD⌂-M perps' : 'Binance spot'} · ${known.symbol} · ${known.timeframes.primary} · ${livePicked ? 'LIVE' : 'PAPER'}`
+            ? `${known.name} · ${perp ? 'Binance USD⌂-M perps' : known.exchange_id === 'bybit' ? 'Bybit spot (live only)' : 'Binance spot'} · ${known.symbol} · ${known.timeframes.primary} · ${livePicked ? 'LIVE' : 'PAPER'}`
             : detail instanceof Error
               ? `Strategy details couldn't be read: ${describeApiError(detail, 'unknown error')}`
               : 'Reading the strategy…'}

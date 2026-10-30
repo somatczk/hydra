@@ -1,8 +1,10 @@
-"""Exchange-side protective stops on Binance spot: the P3-B placement seam.
+"""The Binance-spot protective adapter: the P3-B placement seam.
 
-Everything here works against an *injected* ``ExchangeClient``; this module never builds or
-keys a client (the keyed acquisition is P3-A's). It owns four contracts the live executor
-(P3-A) builds on:
+``venue_stops`` dispatches on the registry's per-venue protective kind and routes the
+binance venue here (bybit's conditional pair lives there); everything in this module is
+the binance spot implementation. It works against an *injected* ``ExchangeClient``; this
+module never builds or keys a client (the keyed acquisition is P3-A's). It owns four
+contracts the live executor (P3-A) builds on:
 
 * ``arm_exchange_stop`` — the placement ladder: OCO order-list first, then a stop-only
   ``STOP_LOSS``, then the 5 % default stop; every rung is tried only after a *definitive*
@@ -96,10 +98,17 @@ class TradeClient(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ExchangeStopPlacement:
-    """One resting exchange-side protective order (or OCO list) for a held long."""
+    """One resting exchange-side protective order — or group — for a held long.
+
+    ``kind``: ``oco`` is a Binance order list, ``stop`` a single stop order (binance, or
+    a bybit rung that degraded to the stop alone), ``trailing`` binance's single
+    trailing leg, ``pair`` the bybit TP+SL conditional pair whose ``order_id`` is
+    hydra's own group id (bybit has no list id) and whose ``leg_ids`` are the two legs'
+    exchange ids (P7-F).
+    """
 
     order_id: str
-    kind: Literal["oco", "stop", "trailing"]
+    kind: Literal["oco", "stop", "trailing", "pair"]
     leg_ids: tuple[str, ...] = ()
     quantity: Decimal = Decimal("0")
     stop_price: Decimal | None = None

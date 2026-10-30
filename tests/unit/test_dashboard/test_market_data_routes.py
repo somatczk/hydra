@@ -121,12 +121,19 @@ class TestOrderBook:
         assert resp.status_code == 422
         assert resp.json()["detail"]["state"] == "invalid"
 
-    @pytest.mark.parametrize("exchange", ["bybit", "__class__", "okx"])
+    @pytest.mark.parametrize("exchange", ["__class__", "okx", "kraken"])
     def test_exchange_allowlist(self, factory: _Factory, exchange: str) -> None:
         resp = TestClient(_make_app()).get(f"/api/market/orderbook?exchange={exchange}")
         assert resp.status_code == 422
         assert resp.json()["detail"]["code"] == "exchange_not_allowed"
         assert factory.created == []
+
+    def test_bybit_order_book_is_allowed(self, factory: _Factory) -> None:
+        """P7-F: bybit spot joins the order book through the registry allowlist."""
+        resp = TestClient(_make_app()).get("/api/market/orderbook?exchange=bybit&symbol=BTCUSDT")
+        assert resp.status_code == 200
+        assert resp.json()["exchange"] == "bybit"
+        assert len(factory.created) == 1
 
     def test_binanceusdm_order_book_is_allowed(self, factory: _Factory) -> None:
         """P4-B: the USD⌂-M perps venue serves order books too (public fapi depth)."""

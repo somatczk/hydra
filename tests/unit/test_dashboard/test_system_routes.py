@@ -619,6 +619,73 @@ async def _fake_get_account_api_restrictions(fake: FakeBinance, *args: Any) -> d
 FakeBinance.sapiGetAccountApiRestrictions = _fake_get_account_api_restrictions
 
 
+BYBIT_KEY_INFO: dict[str, Any] = {
+    "retCode": 0,
+    "retMsg": "",
+    "result": {
+        "id": "2208369",
+        "note": "testnet",
+        "readOnly": 0,
+        "permissions": {
+            "ContractTrade": [],
+            "Spot": ["SpotTrade"],
+            "Wallet": ["AccountTransfer"],
+            "Options": [],
+        },
+        "ips": ["91.0.0.1"],
+    },
+}
+
+
+class FakeBybit:
+    """Stand-in for ``ccxt.async_support.bybit``: the Settings-connect network boundary.
+
+    ``permissions`` answers the GET /v5/user/query-api document (the Bybit apikey-info
+    permission model) — spot trading is 'SpotTrade' in permissions['Spot'] and a
+    withdraw-capable key carries 'Withdraw' in permissions['Wallet']."""
+
+    error: ClassVar[BaseException | None] = None
+    key_info: ClassVar[dict[str, Any]] = dict(BYBIT_KEY_INFO)
+    instances: ClassVar[list[FakeBybit]] = []
+
+    def __init__(self, opts: dict[str, Any]) -> None:
+        self.opts = opts
+        self.closed = False
+        self.balance_calls = 0
+        self.query_calls = 0
+        FakeBybit.instances.append(self)
+
+    async def fetch_balance(self) -> dict[str, Any]:
+        self.balance_calls += 1
+        if FakeBybit.error is not None:
+            raise FakeBybit.error
+        return {"free": {"USDT": 12.5, "BTC": 0.0}}
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def _fake_query_api(fake: FakeBybit, *args: Any) -> dict[str, Any]:
+    fake.query_calls += 1
+    if FakeBybit.error is not None:
+        raise FakeBybit.error
+    return dict(FakeBybit.key_info)
+
+
+# ccxt's camelCase implicit API name, bound as an attribute (pep8-naming flags the def)
+FakeBybit.privateGetV5UserQueryApi = _fake_query_api
+
+
+@pytest.fixture()
+def bybit(monkeypatch: pytest.MonkeyPatch) -> type[FakeBybit]:
+    """The bybit venue's client stand-in; a trade-only spot key by default (P7-F)."""
+    FakeBybit.error = None
+    FakeBybit.key_info = dict(BYBIT_KEY_INFO)
+    FakeBybit.instances = []
+    monkeypatch.setattr(ccxt.async_support, "bybit", FakeBybit)
+    return FakeBybit
+
+
 @pytest.fixture()
 def binance(monkeypatch: pytest.MonkeyPatch) -> type[FakeBinance]:
     FakeBinance.error = None
@@ -672,7 +739,7 @@ class TestExchanges:
     def test_states_without_stored_keys(self, client: TestClient) -> None:
         data = client.get("/api/system/exchanges").json()
         assert [e["id"] for e in data] == ["binance", "binanceusdm", "bybit", "kraken", "okx"]
-        assert [e["supported"] for e in data] == [True, True, False, False, False]
+        assert [e["supported"] for e in data] == [True, True, True, False, False]
         for entry in data:
             assert entry["credential_state"] == "missing"
             assert entry["api_key_set"] is False
@@ -878,13 +945,14 @@ class TestExchangeConnect:
         assert resp.status_code == 502
         assert db.credentials == {}
 
-    @pytest.mark.parametrize("exchange", ["bybit", "kraken", "okx"])
+    @pytest.mark.parametrize("exchange", ["kraken", "okx"])
     def test_other_exchanges_are_400_before_any_call(
         self, db: FakeSystemDb, client: TestClient, exchange: str
     ) -> None:
         resp = _connect(client, exchange, passphrase=API_SECRET)
         assert resp.status_code == 400
         assert _detail(resp)["code"] == "unsupported_exchange"
+        assert "not scheduled" in _detail(resp)["message"]
         assert FakeBinance.instances == []
         assert db.credentials == {}
 
@@ -1027,7 +1095,7 @@ class TestExchangeConnect:
         assert client.delete("/api/system/exchanges/unknown/connect").status_code == 404
 
     def test_balance_for_unsupported_exchange_is_400(self, client: TestClient) -> None:
-        resp = client.get("/api/system/exchanges/bybit/balance")
+        resp = client.get("/api/system/exchanges/kraken/balance")
         assert resp.status_code == 400
 
     def test_balance_without_keys_is_404(self, client: TestClient) -> None:
@@ -1134,6 +1202,74 @@ class TestConnectBinanceUsdm:
         resp = client.delete("/api/system/exchanges/binanceusdm/connect")
         assert (resp.status_code, _detail(resp)["code"]) == (409, "credential_delete_gated")
         assert "binanceusdm" in db.credentials  # nothing was deleted
+
+
+@pytest.mark.usefixtures("bybit")
+class TestConnectBybit:
+    """P7-F: bybit connects through Settings — the mainnet query-api read stores the
+    same canonical record, a withdraw-capable key is refused storing nothing, and
+    testnet stores no permission record at all."""
+
+    def _mainnet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cfg = system.current_config().model_copy(deep=True)
+        cfg.trading.testnet = False
+        monkeypatch.setattr(system, "current_config", lambda: cfg)
+
+    def test_testnet_keys_are_checked_then_stored(
+        self, db: FakeSystemDb, client: TestClient
+    ) -> None:
+        resp = _connect(client, "bybit")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert (body["id"], body["name"]) == ("bybit", "Bybit")
+        assert body["message"] == "Bybit testnet accepted these keys; they are stored"
+        [probe] = FakeBybit.instances
+        assert probe.balance_calls == 1
+        assert probe.query_calls == 0  # the query-api read is mainnet-only
+        assert probe.opts["sandbox"] is True
+        assert probe.closed is True
+        stored = db.credentials["bybit"]
+        assert decrypt(stored["encrypted_key"]) == API_KEY
+        assert stored["validated_environment"] == "testnet"
+        assert stored["validated_permissions"] is None
+
+    def test_mainnet_keys_connect_with_the_canonical_record(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mainnet(monkeypatch)
+        resp = _connect(client, "bybit")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trade_enabled"] is True
+        assert body["ip_restrict"] is True
+        assert json.loads(db.credentials["bybit"]["validated_permissions"]) == {
+            "enable_spot_and_margin_trading": True,
+            "enable_withdrawals": False,
+            "ip_restrict": True,
+        }
+        [probe] = FakeBybit.instances
+        assert probe.query_calls == 1  # the v5 query-api read, not a Binance sapi call
+        assert probe.closed is True
+
+    def test_mainnet_withdrawal_keys_are_refused_and_nothing_is_stored(
+        self, db: FakeSystemDb, app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mainnet(monkeypatch)
+        FakeBybit.key_info = {
+            "retCode": 0,
+            "result": {
+                "permissions": {"Spot": ["SpotTrade"], "Wallet": ["AccountTransfer", "Withdraw"]},
+                "ips": [],
+            },
+        }
+        resp = _connect(client, "bybit")
+        assert resp.status_code == 422
+        assert _detail(resp)["code"] == "credentials_can_withdraw"
+        assert "Bybit mainnet reports these keys can withdraw" in _detail(resp)["message"]
+        assert db.credentials == {}
+        assert not any(sql.startswith("INSERT") for sql in db.statements)
+        assert app.state.exchange_credentials == {}
+        assert FakeBybit.instances[0].closed is True
 
 
 @pytest.mark.usefixtures("binance")

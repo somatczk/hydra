@@ -145,6 +145,7 @@ async def test_recovery_resumes_paper_and_errors_live_rows_without_credentials(
     write_strategy(strategies_dir, "paper-a")
     write_strategy(strategies_dir, "live-b")
     write_strategy(strategies_dir, "bybit-c", exchange_id="bybit")
+    write_strategy(strategies_dir, "bybit-live", exchange_id="bybit")
     write_strategy(strategies_dir, "old-d")
     write_strategy(strategies_dir, "broken-e")
     restore_from["s1"] = await _account_with_long(h.end)
@@ -153,6 +154,7 @@ async def test_recovery_resumes_paper_and_errors_live_rows_without_credentials(
         _row("s1", "paper-a", created_by="service:mcp"),
         _row("s2", "live-b", mode="live"),
         _row("s3", "bybit-c", exchange="bybit"),
+        _row("s6", "bybit-live", mode="live", exchange="bybit"),
         _row("s4", "old-d"),
         _row("s5", "broken-e"),
     ]
@@ -166,7 +168,14 @@ async def test_recovery_resumes_paper_and_errors_live_rows_without_credentials(
         assert sessions["s2"].status == "error"
         assert "live setup failed" in (sessions["s2"].error_message or "")
         assert not sessions["s2"].task_alive
-        assert sessions["s3"].status == "error" and "binance SPOT" in sessions["s3"].error_message
+        assert (
+            sessions["s3"].status == "error" and "live-only venue" in sessions["s3"].error_message
+        )
+        # a stored bybit LIVE row recovers THROUGH the venue gate (the mode cap admits
+        # it) and dies at the credentials check like any live row without keys
+        assert sessions["s6"].status == "error"
+        assert "live setup failed" in (sessions["s6"].error_message or "")
+        assert "live-only" not in (sessions["s6"].error_message or "")
         assert (sessions["s4"].status, sessions["s4"].error_message) == ("error", PRE_P1_STATE)
         assert sessions["s5"].status == "error"
         assert "could not be restored" in sessions["s5"].error_message
@@ -175,6 +184,7 @@ async def test_recovery_resumes_paper_and_errors_live_rows_without_credentials(
             "s1": "running",
             "s2": "error",
             "s3": "error",
+            "s6": "error",
             "s4": "error",
             "s5": "error",
         }

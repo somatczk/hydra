@@ -37,11 +37,7 @@ from hydra.execution.errors import (
     ExchangeRateLimitedError,
     SubmitUnknownError,
 )
-from hydra.execution.exchange_stops import (
-    ExchangeStopPlacement,
-    StopUnplaceableError,
-    arm_exchange_stop,
-)
+from hydra.execution.exchange_stops import ExchangeStopPlacement, StopUnplaceableError
 from hydra.execution.fill_rules import Liquidity
 from hydra.execution.live_orders import (
     TERMINAL_STATUSES,
@@ -68,6 +64,12 @@ from hydra.execution.paper_trading import (
 )
 from hydra.execution.paper_trading import _exchange_id as _stored_exchange_id
 from hydra.execution.protective_orders import ProtectionSpec
+from hydra.execution.venue_stops import (
+    arm_protective_stop,
+    cancel_bybit_leg,
+    fetch_bybit_leg,
+    is_pair_venue,
+)
 from hydra.risk.market_rules import MarketRules
 
 if TYPE_CHECKING:
@@ -175,6 +177,9 @@ class LiveTradingExecutor(PaperTradingExecutor):
             resolve_grace if resolve_grace is not None else max(2.0 * poll_interval, 10.0)
         )
         self._source = "live"
+        # the registry's protective kind: bybit's pair lifecycle (leg reads, sibling
+        # cancels) replaces the binance OCO-list machinery on every branch below
+        self._pair_venue = is_pair_venue(self._exchange_id)
         store: LiveOrderStore
         if self._db_pool is not None:
             store = PgLiveOrderStore(self._db_pool)
@@ -260,6 +265,9 @@ class LiveTradingExecutor(PaperTradingExecutor):
         tag = str(params.get("tag") or "")
         reduce_only = bool(params.get("reduce_only"))
         cid = new_client_order_id()
+        # the venue's client-id field: binance's raw newClientOrderId, ccxt's unified
+        # clientOrderId (bybit's orderLinkId) — the id every later read resolves by
+        cid_param = "clientOrderId" if self._pair_venue else "newClientOrderId"
         await self._live_orders.create(
             LiveOrderRecord(
                 client_order_id=cid,
@@ -285,7 +293,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
                 quantity,
                 price,
                 None,
-                {"newClientOrderId": cid},
+                {cid_param: cid},
             )
         except Exception as exc:
             raise await self._fail_submit(cid, otype, exc) from exc
@@ -338,6 +346,24 @@ class LiveTradingExecutor(PaperTradingExecutor):
         rules = cast(MarketRules, self._market_rules[canon])
         cid = new_client_order_id()
         leg_cids = (new_client_order_id(), new_client_order_id())
+        # bybit: every order this row may place gets its own client id — bybit refuses a
+        # reused orderLinkId — so the pair's legs plus the two single-stop rungs are all
+        # recorded before the first wire call (the poller resolves by them)
+        pair_leg_cids: tuple[str, ...]
+        fallback_cids: tuple[str, ...]
+        row_leg_ids: tuple[str, ...]
+        if self._pair_venue:
+            fallback_cids = (new_client_order_id(), new_client_order_id())
+            if otype == OrderType.OCO.value:
+                pair_leg_cids = (leg_cids[1], leg_cids[0])
+                row_leg_ids = leg_cids + fallback_cids
+            else:
+                pair_leg_cids = ()
+                row_leg_ids = fallback_cids
+        else:
+            pair_leg_cids = ()
+            fallback_cids = ()
+            row_leg_ids = leg_cids if otype == OrderType.OCO.value else ()
         await self._live_orders.create(
             LiveOrderRecord(
                 client_order_id=cid,
@@ -353,15 +379,39 @@ class LiveTradingExecutor(PaperTradingExecutor):
                 status=LiveOrderStatus.PENDING_SUBMIT,
                 reduce_only=True,
                 tag=tag,
-                leg_client_order_ids=leg_cids if otype == OrderType.OCO.value else (),
+                leg_client_order_ids=row_leg_ids,
                 submitted_at=datetime.now(UTC),
             )
         )
-        wrapped = _ClientIdClient(self.exchange_client, cid, leg_cids)
         try:
-            placement = await arm_exchange_stop(
-                wrapped, rules, self._name(canon), quantity, spec, mark, entry
-            )
+            if self._pair_venue:
+                placement = await arm_protective_stop(
+                    self._exchange_id,
+                    self.exchange_client,
+                    rules,
+                    self._name(canon),
+                    quantity,
+                    spec,
+                    mark,
+                    entry,
+                    group_cid=cid,
+                    pair_leg_cids=pair_leg_cids,
+                    fallback_cids=fallback_cids,
+                )
+            else:
+                placement = await arm_protective_stop(
+                    self._exchange_id,
+                    _ClientIdClient(self.exchange_client, cid, leg_cids),
+                    rules,
+                    self._name(canon),
+                    quantity,
+                    spec,
+                    mark,
+                    entry,
+                    group_cid=cid,
+                    pair_leg_cids=(),
+                    fallback_cids=(),
+                )
         except StopUnplaceableError as exc:
             await self._live_orders.mark_submit_failed(cid, str(exc))
             raise
@@ -370,7 +420,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
                 # StopBreachedError and the ladder's own ValueErrors: the wiring decides (R18)
                 raise
             raise await self._fail_submit(cid, otype, exc) from exc
-        list_id = str(placement.order_id) if placement.kind == "oco" else None
+        list_id = str(placement.order_id) if placement.kind in ("oco", "pair") else None
         if not await self._live_orders.mark_ack(
             cid, str(placement.order_id), LiveOrderStatus.NEW, order_list_id=list_id
         ):
@@ -433,7 +483,9 @@ class LiveTradingExecutor(PaperTradingExecutor):
         A submit still in flight answers AMBIGUOUS (F11): the row stays for the
         resolution path — a definitive CANCELLED while the submit can still land would
         hide a resting order. A row that never acked has no exchange id, so its cancel
-        goes out by client id and an OrderNotFound answer is ambiguous too.
+        goes out by client id and an OrderNotFound answer is ambiguous too. A bybit
+        pair row cancels BOTH legs (bybit has no list-cancel; the not-found of a leg
+        that never landed is a quiet no-op).
         """
         row = await self._live_orders.by_exchange_order_id(order_id, self._session_id)
         if row is None:
@@ -452,20 +504,39 @@ class LiveTradingExecutor(PaperTradingExecutor):
             LiveOrderStatus.SUBMITTING,
         ):
             return {"id": order_id, "status": "AMBIGUOUS"}
-        target = order_id if row is None or row.exchange_order_id is None else row.exchange_order_id
-        try:
-            if row is not None and row.order_type == OrderType.OCO.value:
-                await self.exchange_client.cancel_order_list(target, self._name(row.symbol))
+        if row is not None and self._pair_venue:
+            if row.leg_client_order_ids:
+                # bybit's pair or single conditional: no list id exists, so every leg
+                # cancels through its own client id — a degraded rung's unused leg
+                # cids answer not-found, quietly
+                for leg_cid in row.leg_client_order_ids:
+                    try:
+                        await cancel_bybit_leg(self.exchange_client, leg_cid, row.symbol)
+                    except Exception as exc:
+                        if _order_not_found(exc):
+                            logger.info("Bybit leg %s already gone on the exchange", leg_cid)
+                        else:
+                            raise
             else:
-                await self.exchange_client.cancel_order(target, symbol)
-        except Exception as exc:
-            if _order_not_found(exc):
-                if row is not None and row.exchange_order_id is None:
-                    # never acked: "not found" does not mean the submit cannot land
-                    return {"id": order_id, "status": "AMBIGUOUS"}
-                logger.info("Live cancel of %s: already gone on the exchange", order_id)
-                return {"id": order_id, "status": "CANCELLED"}
-            raise
+                target = order_id if row.exchange_order_id is None else row.exchange_order_id
+                await self.exchange_client.cancel_order(target, row.symbol, None)
+        else:
+            target = (
+                order_id if row is None or row.exchange_order_id is None else row.exchange_order_id
+            )
+            try:
+                if row is not None and row.order_type == OrderType.OCO.value:
+                    await self.exchange_client.cancel_order_list(target, self._name(row.symbol))
+                else:
+                    await self.exchange_client.cancel_order(target, symbol)
+            except Exception as exc:
+                if _order_not_found(exc):
+                    if row is not None and row.exchange_order_id is None:
+                        # never acked: "not found" does not mean the submit cannot land
+                        return {"id": order_id, "status": "AMBIGUOUS"}
+                    logger.info("Live cancel of %s: already gone on the exchange", order_id)
+                    return {"id": order_id, "status": "CANCELLED"}
+                raise
         if row is not None:
             outcome = await self._live_orders.apply_status(
                 row.client_order_id, LiveOrderStatus.CANCELED
@@ -558,10 +629,15 @@ class LiveTradingExecutor(PaperTradingExecutor):
         exchange_order_id = str(trade.get("order") or info.get("orderId") or "")
         list_id = str(info.get("orderListId") or "")
         row = None
+        leg_cid: str | None = None
         if exchange_order_id:
             row = await self._live_orders.by_exchange_order_id(exchange_order_id, self._session_id)
         if row is None and list_id not in ("", "-1"):
             row = await self._live_orders.by_order_list_id(list_id, self._session_id)
+        if row is None and self._pair_venue:
+            # bybit has no list id and the pair's row id is hydra's own group id, so a
+            # leg's trade maps to its row only through the order's client id
+            row, leg_cid = await self._cross_check_trade_order(canon, trade)
         if row is None:
             return None  # R5: the user's orders never enter the session ledger
         if row.session_id != self._session_id:
@@ -596,10 +672,48 @@ class LiveTradingExecutor(PaperTradingExecutor):
         )
         if not await self._live_orders.record_fill(fill):
             return None  # already claimed: applied, or waiting for its own retry
-        return await self._apply_claimed_fill(fill, row)
+        return await self._apply_claimed_fill(fill, row, filled_leg_cid=leg_cid)
 
-    async def _apply_claimed_fill(self, fill: LiveFillRecord, row: LiveOrderRecord) -> PaperFill:
-        """Apply one claimed fill to the ledger, then confirm it as applied (F2)."""
+    async def _cross_check_trade_order(
+        self, canon: str, trade: Mapping[str, Any]
+    ) -> tuple[LiveOrderRecord | None, str | None]:
+        """Fetch the trade's order and map its client id to a leg or a mid-submit row."""
+        order_id = str(trade.get("order") or "")
+        if not order_id:
+            return None, None
+        try:
+            resp = await self.exchange_client.fetch_order(order_id, self._name(canon), None)
+        except Exception as exc:
+            logger.info("Live trade order %s unreadable for the cross-check: %s", order_id, exc)
+            return None, None
+        client_id = str(resp.get("clientOrderId") or "")
+        if not client_id:
+            return None, None
+        by_client = await self._live_orders.by_client_order_id(client_id)
+        if by_client is not None and by_client.session_id == self._session_id:
+            return by_client, None
+        # the pair row may already be terminal (the sweep refreshes statuses before
+        # it collects), so search every tracked row, not just the open ones
+        for row in await self._live_orders.orders(self._session_id, limit=200):
+            if client_id in row.leg_client_order_ids:
+                return row, client_id
+        return None, None
+
+    async def _apply_claimed_fill(
+        self,
+        fill: LiveFillRecord,
+        row: LiveOrderRecord,
+        *,
+        filled_leg_cid: str | None = None,
+    ) -> PaperFill:
+        """Apply one claimed fill to the ledger, then confirm it as applied (F2).
+
+        A bybit pair applies its own terminal status here (the exchange never cancels
+        the sibling: hydra does) and cancels every other leg of the group — the fill
+        path's half of the both-paths sibling-cancel; the reconcile path proves the
+        same ending from the leg reads when the fill happened while the engine was
+        down. The not-found of a leg that never landed is a quiet no-op.
+        """
         parent = row.exchange_order_id if row.order_type == OrderType.OCO.value else None
         applied = await self.apply_exchange_fill(
             symbol=fill.symbol,
@@ -615,8 +729,46 @@ class LiveTradingExecutor(PaperTradingExecutor):
             parent_order_id=parent,
             timestamp=fill.timestamp,
         )
+        if self._pair_venue and row.order_type == OrderType.OCO.value:
+            filled_qty = row.filled_quantity + fill.quantity
+            status = (
+                LiveOrderStatus.FILLED
+                if filled_qty >= row.quantity
+                else LiveOrderStatus.PARTIALLY_FILLED
+            )
+            await self._live_orders.apply_status(
+                row.client_order_id,
+                status,
+                filled_quantity=filled_qty,
+                average_fill_price=fill.price,
+            )
+            await self._cancel_bybit_siblings(row, filled_leg_cid)
         await self._live_orders.mark_fill_applied(fill)
         return applied
+
+    async def _cancel_bybit_siblings(
+        self, row: LiveOrderRecord, filled_leg_cid: str | None
+    ) -> None:
+        """SIBLING-CANCEL (the fill path): a pair leg filled — cancel every OTHER leg
+        of the group that still rests. The unused rung cids of a degraded ladder rest
+        nothing, so only what actually rests is cancelled: never a not-found no-op."""
+        if not row.leg_client_order_ids:
+            return
+        try:
+            resting = {
+                str(o.get("clientOrderId") or "")
+                for o in await self.exchange_client.fetch_open_orders(row.symbol, conditional=True)
+            }
+        except Exception:
+            logger.exception("Bybit resting legs of %s unreadable", row.symbol)
+            return
+        for leg_cid in row.leg_client_order_ids:
+            if leg_cid == filled_leg_cid or leg_cid not in resting:
+                continue
+            try:
+                await cancel_bybit_leg(self.exchange_client, leg_cid, row.symbol)
+            except Exception:
+                logger.exception("Bybit sibling-cancel of %s failed", leg_cid)
 
     # ------------------------------------------------------------------
     # Flatten and reads
@@ -691,6 +843,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
                     "status": row.status.value,
                     "filled_quantity": row.filled_quantity,
                     "client_order_id": row.client_order_id,
+                    "leg_ids": list(row.leg_client_order_ids),
                 }
             )
         return out
@@ -796,7 +949,7 @@ def _placement_response(
         "stop_price": None if placement.stop_price is None else float(placement.stop_price),
         "status": "PENDING",
         "filled": False,
-        "oco_link": str(placement.order_id) if placement.kind == "oco" else None,
+        "oco_link": str(placement.order_id) if placement.kind in ("oco", "pair") else None,
         "client_order_id": cid,
         "legs": legs,
     }
@@ -875,17 +1028,24 @@ class LiveOrderPoller:
     async def _resolve_unsettled(self) -> None:
         store = self._executor.live_orders
         client = self._executor.exchange_client
+        pair_venue = getattr(self._executor, "_pair_venue", False)
         deadline = datetime.now(UTC) - timedelta(seconds=self._resolve_grace)
         for row in await store.unsettled(self._executor._session_id, deadline):
             if row.order_type == OrderType.OCO.value or row.order_list_id is not None:
-                await self._resolve_oco_row(row)
+                if pair_venue:
+                    await self._resolve_bybit_pair_row(row)
+                else:
+                    await self._resolve_oco_row(row)
                 continue
+            # the venue's client-id read: binance maps clientOrderId to
+            # origClientOrderId; bybit reads the row's orderLinkId directly
+            params = (
+                {"orderLinkId": row.client_order_id}
+                if pair_venue
+                else {"clientOrderId": row.client_order_id}
+            )
             try:
-                resp = await client.fetch_order(
-                    row.client_order_id,
-                    row.symbol,
-                    params={"clientOrderId": row.client_order_id},
-                )
+                resp = await client.fetch_order(row.client_order_id, row.symbol, params)
             except Exception as exc:
                 if _order_not_found(exc):
                     await self._note_missing(row)
@@ -905,6 +1065,35 @@ class LiveOrderPoller:
                 logger.info(
                     "Live submit %s could not be resolved: the row moved on", row.client_order_id
                 )
+
+    async def _resolve_bybit_pair_row(self, row: LiveOrderRecord) -> None:
+        """A bybit pair row resolves through its legs' client ids in the conditional
+        (tpslOrder) namespace — never a list id, which bybit does not have. With no
+        positive evidence it stays unknown, exactly like the OCO rule (F9)."""
+        store = self._executor.live_orders
+        client = self._executor.exchange_client
+        try:
+            resting = await client.fetch_open_orders(row.symbol, conditional=True)
+        except Exception as exc:
+            logger.info("Live bybit pair %s legs unreadable: %s", row.client_order_id, exc)
+            return
+        for leg in resting:
+            cid = str(leg.get("clientOrderId") or "")
+            if cid and cid in row.leg_client_order_ids:
+                resolved = await store.resolve_unknown(
+                    row.client_order_id, str(leg["id"]), LiveOrderStatus.NEW
+                )
+                logger.info(
+                    "Live bybit pair %s resolved by its resting leg (%s)",
+                    row.client_order_id,
+                    resolved,
+                )
+                return
+        if not await self._trades_cross_check(row):
+            logger.info(
+                "Live bybit pair %s has no resting leg or trades yet: stays unknown",
+                row.client_order_id,
+            )
 
     async def _note_missing(self, row: LiveOrderRecord) -> None:
         """One -2013 is evidence, not a verdict (F8): N consecutive across a window,
@@ -1019,9 +1208,13 @@ class LiveOrderPoller:
     async def _refresh_open_statuses(self) -> None:
         store = self._executor.live_orders
         client = self._executor.exchange_client
+        pair_venue = getattr(self._executor, "_pair_venue", False)
         for row in await store.refreshable(self._executor._session_id):
             if row.order_list_id is not None:
-                await self._refresh_oco_row(row)
+                if pair_venue:
+                    await self._refresh_bybit_pair_row(row)
+                else:
+                    await self._refresh_oco_row(row)
                 continue
             try:
                 resp = await client.fetch_order(str(row.exchange_order_id), row.symbol)
@@ -1073,6 +1266,60 @@ class LiveOrderPoller:
                 filled_quantity=_opt_d(filled.get("filled")),
                 average_fill_price=_opt_d(filled.get("average")),
             )
+        elif statuses and all(s == LiveOrderStatus.CANCELED for s in statuses):
+            await store.apply_status(row.client_order_id, LiveOrderStatus.CANCELED)
+
+    async def _refresh_bybit_pair_row(self, row: LiveOrderRecord) -> None:
+        """An acked bybit pair refreshes through its legs: resting while any leg is in
+        the conditional namespace; once none rests, each leg is read by its client id
+        (positive proof only) — a proven-filled leg applies FILLED and cancels the
+        siblings (the reconcile path's half of the both-paths sibling-cancel), every
+        leg cancelled applies CANCELED, an unreadable leg leaves the row as it is."""
+        store = self._executor.live_orders
+        client = self._executor.exchange_client
+        import ccxt
+
+        try:
+            resting = {
+                str(o.get("clientOrderId") or "")
+                for o in await client.fetch_open_orders(row.symbol, conditional=True)
+            }
+        except Exception as exc:
+            logger.info("Live bybit pair %s legs unreadable: %s", row.exchange_order_id, exc)
+            return
+        if any(cid in resting for cid in row.leg_client_order_ids):
+            return
+        legs: list[dict[str, Any]] = []
+        for leg_cid in row.leg_client_order_ids:
+            try:
+                legs.append(await fetch_bybit_leg(client, leg_cid, row.symbol))
+            except ccxt.OrderNotFound:
+                continue  # that rung's leg never landed: nothing to prove about it
+            except Exception:
+                logger.info("Live bybit pair leg %s unreadable", leg_cid)
+                return  # leave the row exactly as it is
+        if not legs:
+            return  # no leg ever answered: the resolution path owns this row
+        statuses = [map_ccxt_status(leg.get("status"), leg.get("filled")) for leg in legs]
+        if LiveOrderStatus.FILLED in statuses:
+            filled = next(
+                leg for leg, s in zip(legs, statuses, strict=False) if s == LiveOrderStatus.FILLED
+            )
+            await store.apply_status(
+                row.client_order_id,
+                LiveOrderStatus.FILLED,
+                filled_quantity=_opt_d(filled.get("filled")),
+                average_fill_price=_opt_d(filled.get("average")),
+            )
+            for leg, status in zip(legs, statuses, strict=False):
+                if str(leg.get("clientOrderId") or "") == str(filled.get("clientOrderId") or ""):
+                    continue
+                if status in TERMINAL_STATUSES:
+                    continue  # already ended: never a second cancel call
+                try:
+                    await cancel_bybit_leg(client, str(leg.get("clientOrderId") or ""), row.symbol)
+                except Exception:
+                    logger.exception("Bybit sibling-cancel failed during the refresh")
         elif statuses and all(s == LiveOrderStatus.CANCELED for s in statuses):
             await store.apply_status(row.client_order_id, LiveOrderStatus.CANCELED)
 

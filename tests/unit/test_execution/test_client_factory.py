@@ -44,7 +44,7 @@ def test_binanceusdm_futures_is_the_second_venue() -> None:
     [
         ("binance", MarketType.FUTURES),
         ("binanceusdm", MarketType.SPOT),
-        ("bybit", MarketType.SPOT),
+        ("bybit", MarketType.FUTURES),
         ("kraken", MarketType.SPOT),
         ("okx", MarketType.FUTURES),
         ("binance", "margin"),
@@ -58,12 +58,50 @@ def test_other_venues_are_refused(exchange_id: str, market_type: Any) -> None:
         client_factory.ccxt_class_for(exchange_id, market_type)
 
 
-def test_the_refusal_names_both_venues() -> None:
-    with pytest.raises(UnsupportedVenueError, match="binance FUTURES is not supported") as err:
+def test_the_refusal_names_the_venues_and_the_unregistered() -> None:
+    """K/O are named 'not scheduled' (the honest README); bybit FUTURES is refused —
+    bybit is a spot-only venue."""
+    with pytest.raises(UnsupportedVenueError, match="binance FUTURES is not supported"):
         client_factory.validate_venue("binance", MarketType.FUTURES)
-    assert "binance SPOT and binanceusdm FUTURES" in str(err.value)
+    with pytest.raises(UnsupportedVenueError, match="not scheduled"):
+        client_factory.validate_venue("kraken", MarketType.SPOT)
+    with pytest.raises(UnsupportedVenueError, match="okx FUTURES is not supported"):
+        client_factory.validate_venue("okx", MarketType.FUTURES)
     with pytest.raises(UnsupportedVenueError, match="binanceusdm SPOT is not supported"):
         client_factory.validate_venue("binanceusdm", MarketType.SPOT)
+
+
+class TestTheModeCaps:
+    """The registry's per-venue mode caps (P7-F): bybit is LIVE-ONLY."""
+
+    def test_bybit_spot_paper_and_backtest_are_refused(self) -> None:
+        with pytest.raises(UnsupportedVenueError, match="live-only venue") as err:
+            client_factory.validate_venue("bybit", MarketType.SPOT)
+        assert "paper and backtest" in str(err.value)
+
+    def test_bybit_spot_live_is_admitted(self) -> None:
+        assert client_factory.validate_venue("bybit", MarketType.SPOT, mode="live") == "bybit"
+        assert client_factory.ccxt_class_for("bybit", MarketType.SPOT) == "bybit"
+
+    def test_binance_admits_both_modes(self) -> None:
+        assert client_factory.validate_venue("binance", MarketType.SPOT, mode="paper") == "binance"
+        assert client_factory.validate_venue("binance", MarketType.SPOT, mode="live") == "binance"
+        assert (
+            client_factory.validate_venue("binanceusdm", MarketType.FUTURES, mode="live")
+            == "binanceusdm"
+        )
+
+    @pytest.mark.parametrize(
+        "builder",
+        [
+            client_factory.build_readonly_client,
+            client_factory.build_trading_client,
+        ],
+    )
+    def test_the_keyed_client_builders_are_the_live_path(self, builder: Any) -> None:
+        """The keyed ceremony path admits the live-only venue (mode caps: live)."""
+        client = builder("bybit", {"api_key": "k", "api_secret": "s"}, testnet=True)
+        assert client._exchange_id == "bybit"
 
 
 def test_map_credentials() -> None:
@@ -92,11 +130,33 @@ async def test_readonly_client_is_spot_and_sandbox_only_on_testnet(testnet: bool
         await client.close()
 
 
-def test_readonly_client_refuses_other_venues() -> None:
+def test_readonly_client_refuses_unregistered_venues() -> None:
     with pytest.raises(UnsupportedVenueError):
         client_factory.build_readonly_client(
-            "bybit", {"api_key": "k", "api_secret": "s"}, testnet=True
+            "kraken", {"api_key": "k", "api_secret": "s"}, testnet=True
         )
+
+
+@pytest.mark.parametrize("testnet", [True, False])
+async def test_bybit_clients_build_the_bybit_class(testnet: bool) -> None:
+    """bybit SPOT joins the venue set (P7-F): offline construction of the real ccxt
+    class, the spot options pinned by the registry (bybit's own default is 'swap')."""
+    for client in (
+        client_factory.build_readonly_client(
+            "bybit", {"api_key": "k", "api_secret": "s"}, testnet=testnet
+        ),
+        client_factory.build_trading_client(
+            "bybit", {"api_key": "k", "api_secret": "s"}, testnet=testnet
+        ),
+    ):
+        exchange = client._get_exchange()
+        try:
+            assert type(exchange).__name__ == "bybit"
+            assert (exchange.apiKey, exchange.secret) == ("k", "s")
+            assert exchange.isSandboxModeEnabled is testnet
+            assert exchange.options["defaultType"] == "spot"
+        finally:
+            await client.close()
 
 
 @pytest.mark.parametrize("testnet", [True, False])
@@ -151,16 +211,47 @@ def test_build_live_executor_constructs_the_live_executor() -> None:
     assert executor.get_account_snapshot().quote_free == Decimal("100")
 
 
-def test_build_live_executor_refuses_other_venues() -> None:
+def test_build_live_executor_admits_bybit_live() -> None:
+    """The mode caps' admission: only ``build_live_executor`` passes live, so bybit —
+    the live-only venue — builds its live spot executor (P7-F)."""
+    fake = object()
+    executor = client_factory.build_live_executor(
+        "bybit",
+        client=fake,
+        market_rules={"BTCUSDT": _rules()},
+        db_pool=object(),
+        strategy_id="s",
+        session_id="sess",
+        initial_quote=Decimal("100"),
+        poll_interval=5.0,
+    )
+    assert executor.exchange_client is fake
+    assert executor._pair_venue is True
+    assert executor.get_account_snapshot().quote_free == Decimal("100")
+
+
+def test_build_live_executor_refuses_unregistered_venues() -> None:
     with pytest.raises(UnsupportedVenueError):
         client_factory.build_live_executor(
-            "bybit",
+            "kraken",
             client=object(),
             market_rules={"BTCUSDT": _rules()},
             db_pool=object(),
             strategy_id="s",
             session_id="sess",
             initial_quote=Decimal("100"),
+        )
+
+
+def test_build_live_executor_refuses_the_paper_only_path_for_bybit() -> None:
+    """The paper builders keep today's semantics: bybit paper executors are refused."""
+    with pytest.raises(UnsupportedVenueError, match="live-only"):
+        client_factory.build_paper_executor(
+            "bybit", {"USDT": Decimal("100")}, object(), "s", "sess"
+        )
+    with pytest.raises(UnsupportedVenueError):
+        client_factory.build_perp_paper_executor(
+            "bybit", {"USDT": Decimal("100")}, object(), "s", "sess"
         )
 
 
@@ -212,6 +303,17 @@ def test_feed_and_rest_factories_build_spot_classes() -> None:
         assert inst.options["fetchMarkets"]["types"] == ["spot"]
     with pytest.raises(UnsupportedVenueError):
         client_factory.feed_exchange_factory("kraken")
+
+
+def test_feed_and_rest_factories_build_the_bybit_class() -> None:
+    """bybit's public feed and REST clients: the registry's options pin the spot
+    category (bybit's own defaultType default is 'swap')."""
+    feed = client_factory.feed_exchange_factory("bybit")()
+    rest = client_factory.rest_exchange_factory("bybit")
+    for inst in (feed, rest):
+        assert inst.id == "bybit"
+        assert inst.options["defaultType"] == "spot"
+        assert inst.options["fetchMarkets"]["types"] == ["spot"]
 
 
 def test_feed_and_rest_factories_build_the_usdm_class_for_binanceusdm() -> None:

@@ -1,9 +1,11 @@
 """Lot-size, min-notional and trailing bounds from public ccxt market metadata (no API keys).
 
-Spot rules come from Binance spot markets (binance); USD⌂-M perp rules from
-binanceusdm's linear swap markets — whose trailing stops are the fapi
-TRAILING_STOP_MARKET ``callbackRate`` PERCENT bounds, not spot's per-symbol
-TRAILING_DELTA bips.
+Spot rules come from Binance spot markets (binance) and bybit spot markets (bybit, P7-F);
+USD⌂-M perp rules from binanceusdm's linear swap markets — whose trailing stops are the
+fapi TRAILING_STOP_MARKET ``callbackRate`` PERCENT bounds, not spot's per-symbol
+TRAILING_DELTA bips. The trailing form per venue comes from the registry
+(``hydra.core.venues``): bybit has no percent trail, so its rules carry no trailing bounds
+and the protective ladder falls back to the fixed stop.
 """
 
 from __future__ import annotations
@@ -15,9 +17,18 @@ from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
+from hydra.core.types import MarketType
+from hydra.core.venues import (
+    TrailingKind,
+    find_venue,
+    registered_venue_ids,
+    venue_market_type,
+)
+
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXCHANGES = frozenset({"binance", "binanceusdm"})
+SUPPORTED_EXCHANGES = registered_venue_ids()
+"""The registered venue ids — market rules exist only for them (binance, binanceusdm, bybit)."""
 
 MarketsLoader = Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]]
 
@@ -76,8 +87,10 @@ class MarketRules:
     ) -> MarketRules:
         """Build from a ccxt market dict in TICK_SIZE precision mode (precision.amount = step).
 
-        Spot venues keep the TRAILING_DELTA bips; the USD⌂-M perp venue gets the fapi
-        callbackRate percent bounds instead — the spot filter is never mapped onto it.
+        The trailing bounds come from the venue's registry trailing kind: binance spot
+        keeps the TRAILING_DELTA bips; the USD⌂-M perp venue gets the fapi callbackRate
+        percent bounds instead (the spot filter is never mapped onto it); bybit has no
+        percent trail at all.
         """
         precision = market.get("precision") or {}
         limits = market.get("limits") or {}
@@ -86,7 +99,14 @@ class MarketRules:
             raise MarketRulesUnavailableError(
                 f"{market.get('id')}: no amount step in market metadata"
             )
-        usdm = exchange_id == "binanceusdm"
+        spec = find_venue(exchange_id, venue_market_type(exchange_id))
+        trailing_bips = None
+        trailing_callback = None
+        if spec is not None:
+            if spec.trailing_kind is TrailingKind.BIPS_FILTER:
+                trailing_bips = _trailing_delta_bips(market)
+            elif spec.trailing_kind is TrailingKind.CALLBACK_RATE_PCT:
+                trailing_callback = USDM_CALLBACK_RATE_PCT
         return cls(
             symbol=str(market["id"]),
             amount_step=step,
@@ -94,8 +114,8 @@ class MarketRules:
             min_notional=_dec((limits.get("cost") or {}).get("min")) or Decimal("0"),
             max_market_qty=_dec((limits.get("market") or {}).get("max")),
             price_tick=_dec(precision.get("price")),
-            trailing_delta_bips=None if usdm else _trailing_delta_bips(market),
-            trailing_callback_rate_pct=USDM_CALLBACK_RATE_PCT if usdm else None,
+            trailing_delta_bips=trailing_bips,
+            trailing_callback_rate_pct=trailing_callback,
         )
 
     def floor_qty(self, qty: Decimal) -> Decimal:
@@ -125,29 +145,11 @@ class MarketRules:
         return None
 
 
-async def binance_spot_markets(exchange_id: str) -> list[Mapping[str, Any]]:
-    """Public Binance spot load_markets (no keys); refuses every other venue."""
-    if exchange_id != "binance":
-        raise UnsupportedExchangeError(f"no binance spot market rules for exchange {exchange_id!r}")
-    return await _load_public_markets("binance")
-
-
-async def binance_usdm_markets(exchange_id: str) -> list[Mapping[str, Any]]:
-    """Public Binance USD⌂-M linear perp load_markets (no keys); refuses every other venue.
-
-    The binanceusdm class loads only linear swap markets (``fetchMarkets`` types
-    ``['linear']``, verified against the installed ccxt describe()).
-    """
-    if exchange_id != "binanceusdm":
-        raise UnsupportedExchangeError(f"no binanceusdm market rules for exchange {exchange_id!r}")
-    return await _load_public_markets("binanceusdm")
-
-
-async def _load_public_markets(class_name: str) -> list[Mapping[str, Any]]:
-    """One public ``load_markets`` on the venue's ccxt class, closed after."""
+async def _load_public_markets(class_name: str, options: dict[str, Any]) -> list[Mapping[str, Any]]:
+    """One public ``load_markets`` on the venue's ccxt class and options, closed after."""
     import ccxt.async_support as ccxt_async
 
-    client = getattr(ccxt_async, class_name)({"enableRateLimit": True})
+    client = getattr(ccxt_async, class_name)({"enableRateLimit": True, "options": dict(options)})
     try:
         markets = await client.load_markets()
     finally:
@@ -155,22 +157,36 @@ async def _load_public_markets(class_name: str) -> list[Mapping[str, Any]]:
     return list(markets.values())
 
 
+async def public_venue_markets(exchange_id: str) -> list[Mapping[str, Any]]:
+    """One public ``load_markets`` on the registry's ccxt class and options (no keys).
+
+    binanceusdm keeps its linear filter through the registry options
+    (``fetchMarkets types ['linear']``); bybit's options pin the spot category.
+    """
+    spec = find_venue(exchange_id, venue_market_type(exchange_id))
+    if spec is None:
+        raise UnsupportedExchangeError(f"no market rules for exchange {exchange_id!r}")
+    return await _load_public_markets(spec.ccxt_class, dict(spec.client_options))
+
+
 _DEFAULT_MARKETS_LOADERS: Mapping[str, MarketsLoader] = {
-    "binance": binance_spot_markets,
-    "binanceusdm": binance_usdm_markets,
+    "binance": public_venue_markets,
+    "binanceusdm": public_venue_markets,
+    "bybit": public_venue_markets,
 }
 
 
 async def load_public_markets(exchange_id: str) -> list[Mapping[str, Any]]:
-    """The per-exchange public loader: Binance spot, USD⌂-M linear perps on binanceusdm."""
+    """The per-exchange public loader: Binance spot, USD⌂-M linear perps on binanceusdm,
+    bybit spot — every registered venue, through the registry's ccxt class."""
     if exchange_id not in SUPPORTED_EXCHANGES:
         raise UnsupportedExchangeError(f"no market rules for exchange {exchange_id!r}")
     return list(await _DEFAULT_MARKETS_LOADERS[exchange_id](exchange_id))
 
 
 def _is_rules_market(exchange_id: str, market: Mapping[str, Any]) -> bool:
-    """Spot markets on binance; linear swap markets on binanceusdm (the perp rules)."""
-    if exchange_id == "binanceusdm":
+    """Spot markets on the spot venues; linear swap markets on binanceusdm (the perp rules)."""
+    if venue_market_type(exchange_id) is MarketType.FUTURES:
         return bool(market.get("linear")) and bool(market.get("swap"))
     return market.get("spot", True)
 
@@ -225,7 +241,7 @@ class MarketRulesCache:
 
     @staticmethod
     def _market_noun(exchange_id: str) -> str:
-        return "linear" if exchange_id == "binanceusdm" else "spot"
+        return "linear" if venue_market_type(exchange_id) is MarketType.FUTURES else "spot"
 
 
 async def load_market_rules(

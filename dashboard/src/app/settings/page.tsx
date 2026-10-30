@@ -133,7 +133,7 @@ function mapApiExchanges(data: ApiExchange[]): Exchange[] {
 }
 
 function validationText(exchange: Exchange): string {
-  if (!exchange.supported) return 'Not supported yet (Binance only)';
+  if (!exchange.supported) return 'Not supported and not scheduled (Binance, USD⌂-M and Bybit)';
   if (exchange.credentialState === 'undecryptable') return 'Stored keys cannot be decrypted';
   if (!exchange.validatedAt) return exchange.apiKeySet ? 'Never validated' : 'Not connected';
   if (exchange.validatedEnvironment !== exchange.environment) {

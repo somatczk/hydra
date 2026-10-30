@@ -15,9 +15,8 @@ from hydra.risk.market_rules import (
     MarketRulesCache,
     MarketRulesUnavailableError,
     UnsupportedExchangeError,
-    binance_spot_markets,
-    binance_usdm_markets,
     load_market_rules,
+    public_venue_markets,
 )
 from hydra.risk.sizing import size_entry
 
@@ -71,6 +70,40 @@ BINANCEUSDM_BTCUSDT_PERP: dict[str, Any] = {
 
 def _rules() -> MarketRules:
     return MarketRules.from_ccxt_market(BINANCE_BTCUSDT)
+
+
+# The bybit v5 spot BTCUSDT instrument (the /v5/market/instruments-info shape ccxt
+# parses): lot step 0.00001, min qty 0.00001, min notional 1 USDT — the same
+# TICK_SIZE precision mode as Binance, so the lot/tick math ports unchanged. Bybit
+# has no percent trailing, so a TRAILING_DELTA-shaped filter is placed in the dict
+# to pin that the registry's trailing kind NONE never reads it.
+BYBIT_BTCUSDT: dict[str, Any] = {
+    "id": "BTCUSDT",
+    "symbol": "BTC/USDT",
+    "spot": True,
+    "swap": False,
+    "linear": False,
+    "inverse": False,
+    "type": "spot",
+    "precision": {"amount": 0.00001, "price": 0.01},
+    "limits": {
+        "amount": {"min": 0.00001, "max": 1000.0},
+        "market": {"min": 0.0, "max": 100.0},
+        "cost": {"min": 1.0, "max": None},
+    },
+    "info": {
+        "symbol": "BTCUSDT",
+        "lotSizeFilter": {"qtyStep": "0.00001", "minOrderQty": "0.00001"},
+        "priceFilter": {"tickSize": "0.01"},
+        "filters": [
+            {
+                "filterType": "TRAILING_DELTA",
+                "minTrailingBelowDelta": "10",
+                "maxTrailingBelowDelta": "2000",
+            }
+        ],
+    },
+}
 
 
 def _size(sleeve: str, mult: str = "1", quote: str = "100000") -> Decimal | None:
@@ -178,9 +211,11 @@ class _Loader:
 
 
 class TestLoader:
-    async def test_non_binance_rejected(self) -> None:
+    async def test_unregistered_venues_rejected(self) -> None:
         with pytest.raises(UnsupportedExchangeError):
-            await load_market_rules("bybit", ["BTCUSDT"], loader=_Loader())
+            await load_market_rules("kraken", ["BTCUSDT"], loader=_Loader())
+        with pytest.raises(UnsupportedExchangeError):
+            await load_market_rules("okx", ["BTCUSDT"], loader=_Loader())
 
     async def test_unknown_symbol_rejected(self) -> None:
         with pytest.raises(MarketRulesUnavailableError, match="DOGEUSDT"):
@@ -225,7 +260,46 @@ class TestUsdmMarketRules:
         rules = MarketRules.from_ccxt_market(BINANCEUSDM_BTCUSDT_PERP, "binanceusdm")
         assert rules.trailing_delta_bips is None
         assert rules.trailing_callback_rate_pct == USDM_CALLBACK_RATE_PCT
-        assert rules.trailing_callback_rate_pct == (Decimal("0.1"), Decimal("10"))
+
+
+class TestBybitMarketRules:
+    """The bybit venue (P7-F): the same TICK_SIZE precision math, and the registry's
+    trailing kind NONE — the protective ladder falls back to the fixed stop."""
+
+    def test_from_ccxt_market_maps_the_spot_filters(self) -> None:
+        rules = MarketRules.from_ccxt_market(BYBIT_BTCUSDT, "bybit")
+        assert rules.symbol == "BTCUSDT"
+        assert rules.amount_step == Decimal("0.00001")
+        assert rules.min_qty == Decimal("0.00001")
+        assert rules.min_notional == Decimal("1.0")
+        assert rules.price_tick == Decimal("0.01")
+
+    def test_floor_qty_and_validate_open_with_real_numbers(self) -> None:
+        rules = MarketRules.from_ccxt_market(BYBIT_BTCUSDT, "bybit")
+        assert rules.floor_qty(Decimal("0.000037")) == Decimal("0.00003")
+        assert rules.validate_open(Decimal("0.00003"), Decimal("30000")) == (
+            "BTCUSDT: notional 0.90000 below min notional 1.0"
+        )
+        assert rules.validate_open(Decimal("0.00004"), Decimal("30000")) is None
+
+    def test_no_trailing_bounds_are_invented_for_bybit(self) -> None:
+        """The red pin: bybit has no percent trail (its createTrailingAmountOrder is
+        amount-based), so a raw TRAILING_DELTA-shaped filter must never become bounds —
+        the ladder falls back to the fixed stop."""
+        rules = MarketRules.from_ccxt_market(BYBIT_BTCUSDT, "bybit")
+        assert rules.trailing_delta_bips is None
+        assert rules.trailing_callback_rate_pct is None
+
+    async def test_bybit_rules_load_through_the_default_loader(self) -> None:
+        async def bybit_loader(exchange_id: str) -> list[dict[str, Any]]:
+            assert exchange_id == "bybit"
+            return [BYBIT_BTCUSDT]
+
+        cache = MarketRulesCache(loader=bybit_loader)
+        rules = await cache.get("bybit", ["BTCUSDT"])
+        assert rules["BTCUSDT"].amount_step == Decimal("0.00001")
+        assert rules["BTCUSDT"].min_notional == Decimal("1.0")
+        assert rules["BTCUSDT"].trailing_delta_bips is None
 
     def test_spot_rules_never_get_the_callback_rate_bounds(self) -> None:
         rules = MarketRules.from_ccxt_market(
@@ -288,11 +362,11 @@ class TestUsdmLoader:
         )
         assert rules["BTCUSDT"].trailing_callback_rate_pct == USDM_CALLBACK_RATE_PCT
 
-    async def test_the_public_loaders_refuse_the_other_venue(self) -> None:
-        with pytest.raises(UnsupportedExchangeError, match="no binanceusdm market rules"):
-            await binance_usdm_markets("binance")
-        with pytest.raises(UnsupportedExchangeError, match="no binance spot market rules"):
-            await binance_spot_markets("binanceusdm")
+    async def test_the_public_loader_refuses_unregistered_venues(self) -> None:
+        with pytest.raises(UnsupportedExchangeError, match="no market rules for exchange"):
+            await public_venue_markets("kraken")
+        with pytest.raises(UnsupportedExchangeError, match="no market rules for exchange"):
+            await public_venue_markets("okx")
 
     async def test_the_default_cache_loader_dispatches_per_exchange(self) -> None:
         """The undecorated cache (the backtest runner's) dispatches per exchange id."""
@@ -300,11 +374,6 @@ class TestUsdmLoader:
 
         cache = MarketRulesCache()
         assert cache._loader is market_rules.load_public_markets
-        assert market_rules._DEFAULT_MARKETS_LOADERS["binance"] is (
-            market_rules.binance_spot_markets
-        )
-        assert market_rules._DEFAULT_MARKETS_LOADERS["binanceusdm"] is (
-            market_rules.binance_usdm_markets
-        )
+        assert market_rules._DEFAULT_MARKETS_LOADERS["bybit"] is (market_rules.public_venue_markets)
         with pytest.raises(UnsupportedExchangeError):
-            await market_rules.load_public_markets("bybit")
+            await market_rules.load_public_markets("kraken")

@@ -36,7 +36,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from hydra.core import metrics
 from hydra.core.events import BarEvent, Event, FeedStatusEvent, PriceEvent
 from hydra.core.logging import get_logger
-from hydra.core.types import OHLCV, ExchangeId, Symbol, Timeframe
+from hydra.core.types import OHLCV, ExchangeId, MarketType, Symbol, Timeframe
+from hydra.core.venues import find_venue, registered_venues, venue_market_type
 from hydra.data.backfill import error_is, fetch_closed_bars
 from hydra.data.bars import (
     ClosedBarAssembler,
@@ -125,30 +126,33 @@ class InsufficientHistoryError(Exception):
         )
 
 
-_FUTURES_VENUES: frozenset[str] = frozenset({"binanceusdm"})
+_FUTURES_VENUES: frozenset[str] = frozenset(
+    {
+        exchange_id
+        for exchange_id, market_type in registered_venues()
+        if market_type is MarketType.FUTURES
+    }
+)
 """The FUTURES venues: their feeds resolve linear swap markets, never spot."""
-
-_SPOT_REST_OPTIONS: dict[str, Any] = {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}}
-_USDM_REST_OPTIONS: dict[str, Any] = {
-    "defaultType": "swap",
-    "defaultSubType": "linear",
-    "fetchMarkets": {"types": ["linear"]},
-}
 
 
 def _venue_rest_options(exchange_id: str) -> dict[str, Any]:
-    return dict(_USDM_REST_OPTIONS if exchange_id in _FUTURES_VENUES else _SPOT_REST_OPTIONS)
+    """The venue's registry client options: bybit's own defaultType is 'swap', so the
+    registry pins its spot feed to the spot category (P7-F)."""
+    spec = find_venue(exchange_id, venue_market_type(exchange_id))
+    return {} if spec is None else dict(spec.client_options)
 
 
 def _default_rest_factory(exchange_id: str) -> Any:
     import ccxt.async_support as ccxt_async
 
-    cls = getattr(ccxt_async, exchange_id)
+    spec = find_venue(exchange_id, venue_market_type(exchange_id))
+    cls = getattr(ccxt_async, exchange_id if spec is None else spec.ccxt_class)
     return cls({"enableRateLimit": True, "options": _venue_rest_options(exchange_id)})
 
 
 def _is_venue_market(exchange_id: str, market: Mapping[str, Any]) -> bool:
-    """Spot markets on binance; linear swap markets on the FUTURES venues."""
+    """Spot markets on the spot venues; linear swap markets on the FUTURES venues."""
     if exchange_id in _FUTURES_VENUES:
         return market.get("swap") is True and market.get("linear") is True
     return market.get("spot") is True

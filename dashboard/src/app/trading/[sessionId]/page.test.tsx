@@ -146,6 +146,15 @@ describe('session detail', () => {
     expect(text()).not.toContain('Real money on Binance');
   });
 
+  it('names the venue a live bybit session runs on and charts it under the BYBIT prefix', async () => {
+    setup(detail({ trading_mode: 'live', exchange_id: 'bybit' }));
+    m = await page();
+    const account = document.getElementById('account-heading')?.parentElement?.textContent ?? '';
+    expect(account).toContain('Real money on Bybit.');
+    const src = m.container.querySelector('iframe')?.getAttribute('src') ?? '';
+    expect(decodeURIComponent(src)).toContain('symbol=BYBIT:BTCUSDT');
+  });
+
   it('names the positions at stake in the stop confirm and sends one DELETE', async () => {
     setup(detail({ positions: [HELD] }), { [`DELETE /api/trading/sessions/${ID}`]: session({ status: 'stopped' }) });
     m = await page();

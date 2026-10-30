@@ -27,6 +27,7 @@ import yaml
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
 from hydra.core.types import ExchangeId, MarketType, OrderType, Side
+from hydra.core.venues import SessionMode
 from hydra.execution import client_factory, session_store
 from hydra.execution.client_factory import ClientFactory
 from hydra.execution.errors import (
@@ -337,8 +338,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
                         f"Strategy {strategy_id} already has a running session"
                     )
             cfg = self._find_strategy_config(strategy_id)
+            mode: SessionMode = "live" if trading_mode == "live" else "paper"
             exchange_id = client_factory.validate_venue(
-                cfg.exchange.exchange_id, cfg.exchange.market_type
+                cfg.exchange.exchange_id, cfg.exchange.market_type, mode=mode
             )
             if trading_mode == "live":
                 return await self._start_live_session(cfg, exchange_id, actor)
@@ -687,7 +689,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
 
         is_perp = client_factory.venue_market_type(session.exchange_id) is MarketType.FUTURES
         exchange_id = client_factory.validate_venue(
-            session.exchange_id, client_factory.venue_market_type(session.exchange_id)
+            session.exchange_id,
+            client_factory.venue_market_type(session.exchange_id),
+            mode="live",
         )
         rules_error: Exception | None = None
         rules: dict[str, Any] | None = None
@@ -739,7 +743,9 @@ class SessionManager(SessionRecoveryMixin, SessionHealthMixin):
             if session.paper_capital is None or session.paper_capital <= 0:
                 raise LiveCapitalUnavailableError("the session row has no live allocation")
             cfg = self._recovery_config(session)
-            client_factory.validate_venue(session.exchange_id, cfg.exchange.market_type)
+            client_factory.validate_venue(
+                session.exchange_id, cfg.exchange.market_type, mode="live"
+            )
             if is_perp:
                 _validate_perp_leverage(cfg, await self._ensure_live_risk())
                 await client.set_one_way_position_mode()
