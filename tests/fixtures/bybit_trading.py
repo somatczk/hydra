@@ -19,11 +19,15 @@ on-box testnet battery runs:
   or by the order's client id.
 * ``fetch_open_orders`` honours the ``orderFilter`` param: ``tpslOrder`` reads the
   conditional namespace, the plain read the regular orders — the two namespaces are
-  separate, exactly as the drift pass and the verify read assume.
-* ``fetch_order`` answers by ``orderId`` or, with ``params.orderLinkId``, by client id
-  alone — the primitive ``venue_stops.fetch_bybit_leg`` rides.
+  separate, exactly as the drift pass and the verify read assume. An ``orderLinkId`` param
+  reads that one order WHATEVER its status (``/v5/order/realtime`` by-id semantics — the
+  primitive ``venue_stops.fetch_bybit_leg`` rides through the wrapper).
+* ``fetch_order`` is ccxt's real bybit shape: the id ALWAYS rides ``orderId`` on the wire,
+  so a None id is the 10001 the real exchange answers — a by-client-id read can never go
+  through it.
 * ``cancel_order``/``cancel_all_orders`` cancel through the named ``orderFilter`` only:
-  a tpsl leg is invisible to the plain sweep, so the missing second sweep is caught.
+  a tpsl leg is invisible to the plain sweep, so the missing second sweep is caught; a
+  cancel reaches any active order (unfilled or partially filled), as bybit documents.
 
 Failure modes are scriptable per call, mirroring the Binance fake: ``timeout_after_land``
 creates (and fills) the order but raises ``ccxt.RequestTimeout`` anyway — the critical
@@ -349,7 +353,11 @@ class FakeBybitTradingClient:
             target = self.order_by_client_id(str(params["orderLinkId"]))
         elif order_id is not None:
             target = self.orders.get(order_id)
-        if target is None or target["orderFilter"] != order_filter or target["status"] != "New":
+        if (
+            target is None
+            or target["orderFilter"] != order_filter
+            or target["status"] not in ("New", "PartiallyFilled")
+        ):
             raise ccxt.OrderNotFound(f"bybit {{10001}}s order not exists: {order_id}")
         target["status"] = "Cancelled"
         return {"id": str(target["orderId"]), "status": "canceled"}
@@ -375,18 +383,29 @@ class FakeBybitTradingClient:
     ) -> list[dict[str, Any]]:
         params = dict(params or {})
         order_filter = str(params.get("orderFilter") or "Order")
+        link_id = params.get("orderLinkId")
+        if link_id is not None:
+            # /v5/order/realtime: a query by orderLinkId answers whatever the status
+            target = self.order_by_client_id(str(link_id))
+            if (
+                target is None
+                or target["symbol"] != symbol
+                or target["orderFilter"] != order_filter
+            ):
+                return []
+            return [self._unified(target)]
         return [self._unified(o) for o in self._open_raw(symbol, order_filter)]
 
     async def fetch_order(
         self, order_id: str | None, symbol: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        """ccxt's real bybit ``fetch_order``: the id ALWAYS rides ``orderId`` on the wire,
+        so a None id is the 10001 the real exchange answers — never a by-link lookup."""
         params = dict(params or {})
+        if order_id is None:
+            raise ccxt.BadRequest("bybit {10001} params err: orderId is None")
         order_filter = str(params.get("orderFilter") or "Order")
-        target: dict[str, Any] | None = None
-        if params.get("orderLinkId") is not None:
-            target = self.order_by_client_id(str(params["orderLinkId"]))
-        elif order_id is not None:
-            target = self.orders.get(order_id)
+        target = self.orders.get(order_id)
         if target is None or target["symbol"] != symbol or target["orderFilter"] != order_filter:
             raise ccxt.OrderNotFound(f"bybit {{10001}}s order not exists: {order_id}")
         return self._unified(target)

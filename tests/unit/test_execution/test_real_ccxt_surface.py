@@ -292,6 +292,86 @@ async def test_bybit_routes_the_conditional_read_to_the_tpsl_namespace() -> None
         await exchange.close()
 
 
+async def test_bybit_by_client_id_reads_never_put_an_orderid_on_the_wire() -> None:
+    """The #210/#218 class, pinned on a fresh real bybit (construction-only): ccxt 4.5.88's
+    bybit ``fetch_order`` ALWAYS sets ``request['orderId'] = id``, so a by-client-id read
+    routed through it put the literal ``orderId=None`` on the wire (10001 on the real
+    exchange — every by-cid leg read failed). The wrapper must route the by-cid read
+    through ``fetch_open_orders``, which passes ``orderLinkId`` through untouched."""
+    exchange = ccxt.async_support.bybit({"apiKey": "x", "secret": "y"})
+    try:
+        # a UTA account: the capability flags a real session caches after its first check
+        exchange.options["enableUnifiedMargin"] = False
+        exchange.options["enableUnifiedAccount"] = True
+        exchange.set_markets(
+            [
+                {
+                    "id": "BTCUSDT",
+                    "symbol": "BTC/USDT",
+                    "base": "BTC",
+                    "quote": "USDT",
+                    "type": "spot",
+                    "spot": True,
+                    "swap": False,
+                    "future": False,
+                    "option": False,
+                    "margin": False,
+                    "linear": False,
+                    "inverse": False,
+                    "contract": False,
+                }
+            ]
+        )
+        requests: list[dict[str, Any]] = []
+
+        async def _realtime(request: Any = None, params: Any = None) -> dict[str, Any]:
+            requests.append(dict(request or {}))
+            return {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "orderId": "bybit-1",
+                            "orderLinkId": "hyd-sl-1",
+                            "orderFilter": "tpslOrder",
+                            "orderType": "Market",
+                            "side": "Sell",
+                            "orderStatus": "New",
+                            "qty": "0.00999",
+                            "price": "",
+                            "triggerPrice": "95000.00",
+                            "reduceOnly": True,
+                            "createdTime": "1786000000000",
+                        }
+                    ]
+                },
+                "retExtInfo": {},
+                "time": 1,
+            }
+
+        exchange.privateGetV5OrderRealtime = _realtime
+        client = ExchangeClient("bybit", {}, market_type=MarketType.SPOT)
+        client._exchange = exchange
+
+        order = await client.fetch_order(
+            None, "BTC/USDT", {"acknowledged": True, "orderLinkId": "hyd-sl-1"}
+        )
+        assert order["id"] == "bybit-1"
+        assert order["clientOrderId"] == "hyd-sl-1"
+        [wire] = requests
+        assert "orderId" not in wire, f"no exchange id may ride a by-cid read: {wire}"
+        assert wire == {
+            "symbol": "BTCUSDT",
+            "category": "spot",
+            "orderLinkId": "hyd-sl-1",
+            "orderFilter": "tpslOrder",
+        }, f"the by-cid read's wire params: {wire}"
+    finally:
+        await exchange.close()
+
+
 async def test_the_oco_list_surface_refuses_non_binance_venues() -> None:
     """The guard: create_oco/cancel_order_list/fetch_open_order_lists are Binance-spot
     calls; a bybit client refuses them BEFORE any exchange call — the pair path provably

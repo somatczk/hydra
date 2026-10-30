@@ -177,8 +177,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
             resolve_grace if resolve_grace is not None else max(2.0 * poll_interval, 10.0)
         )
         self._source = "live"
-        # the registry's protective kind: bybit's pair lifecycle (leg reads, sibling
-        # cancels) replaces the binance OCO-list machinery on every branch below
+        # the registry's kind: bybit's pair lifecycle replaces the binance OCO machinery
         self._pair_venue = is_pair_venue(self._exchange_id)
         store: LiveOrderStore
         if self._db_pool is not None:
@@ -265,8 +264,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
         tag = str(params.get("tag") or "")
         reduce_only = bool(params.get("reduce_only"))
         cid = new_client_order_id()
-        # the venue's client-id field: binance's raw newClientOrderId, ccxt's unified
-        # clientOrderId (bybit's orderLinkId) — the id every later read resolves by
+        # the venue's client-id field: binance newClientOrderId, bybit's orderLinkId
         cid_param = "clientOrderId" if self._pair_venue else "newClientOrderId"
         await self._live_orders.create(
             LiveOrderRecord(
@@ -346,9 +344,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
         rules = cast(MarketRules, self._market_rules[canon])
         cid = new_client_order_id()
         leg_cids = (new_client_order_id(), new_client_order_id())
-        # bybit: every order this row may place gets its own client id — bybit refuses a
-        # reused orderLinkId — so the pair's legs plus the two single-stop rungs are all
-        # recorded before the first wire call (the poller resolves by them)
+        # bybit: every order this row may place gets its own cid (the poller resolves by them)
         pair_leg_cids: tuple[str, ...]
         fallback_cids: tuple[str, ...]
         row_leg_ids: tuple[str, ...]
@@ -506,9 +502,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
             return {"id": order_id, "status": "AMBIGUOUS"}
         if row is not None and self._pair_venue:
             if row.leg_client_order_ids:
-                # bybit's pair or single conditional: no list id exists, so every leg
-                # cancels through its own client id — a degraded rung's unused leg
-                # cids answer not-found, quietly
+                # bybit's no-list-id conditional: every leg cancels through its own cid
                 for leg_cid in row.leg_client_order_ids:
                     try:
                         await cancel_bybit_leg(self.exchange_client, leg_cid, row.symbol)
@@ -635,8 +629,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
         if row is None and list_id not in ("", "-1"):
             row = await self._live_orders.by_order_list_id(list_id, self._session_id)
         if row is None and self._pair_venue:
-            # bybit has no list id and the pair's row id is hydra's own group id, so a
-            # leg's trade maps to its row only through the order's client id
+            # bybit has no list id: a leg's trade maps to its row through the client id
             row, leg_cid = await self._cross_check_trade_order(canon, trade)
         if row is None:
             return None  # R5: the user's orders never enter the session ledger
@@ -692,8 +685,7 @@ class LiveTradingExecutor(PaperTradingExecutor):
         by_client = await self._live_orders.by_client_order_id(client_id)
         if by_client is not None and by_client.session_id == self._session_id:
             return by_client, None
-        # the pair row may already be terminal (the sweep refreshes statuses before
-        # it collects), so search every tracked row, not just the open ones
+        # the pair row may already be terminal: search every tracked row, not just open ones
         for row in await self._live_orders.orders(self._session_id, limit=200):
             if client_id in row.leg_client_order_ids:
                 return row, client_id
@@ -1037,8 +1029,11 @@ class LiveOrderPoller:
                 else:
                     await self._resolve_oco_row(row)
                 continue
-            # the venue's client-id read: binance maps clientOrderId to
-            # origClientOrderId; bybit reads the row's orderLinkId directly
+            if pair_venue and row.leg_client_order_ids:
+                # a bybit single conditional rests under a leg cid, never the group cid
+                await self._resolve_bybit_pair_row(row)
+                continue
+            # the venue's client-id read: binance origClientOrderId, bybit the orderLinkId
             params = (
                 {"orderLinkId": row.client_order_id}
                 if pair_venue
@@ -1067,9 +1062,11 @@ class LiveOrderPoller:
                 )
 
     async def _resolve_bybit_pair_row(self, row: LiveOrderRecord) -> None:
-        """A bybit pair row resolves through its legs' client ids in the conditional
-        (tpslOrder) namespace — never a list id, which bybit does not have. With no
-        positive evidence it stays unknown, exactly like the OCO rule (F9)."""
+        """A bybit pair or single-conditional row resolves through its legs' client ids
+        in the conditional (tpslOrder) namespace — never a list id, which bybit does not
+        have, and never the group cid, which is not the wire's orderLinkId of a single
+        conditional. With no positive evidence it stays unknown, exactly like the OCO
+        rule (F9)."""
         store = self._executor.live_orders
         client = self._executor.exchange_client
         try:

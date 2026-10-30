@@ -94,8 +94,7 @@ class ExchangeClient:
         if exchange_cls is None:
             raise ValueError(f"Unknown exchange class: {class_name}")
 
-        # the registry's client options: bybit's own defaultType is 'swap', so the spot
-        # venue must be pinned to the spot category here (P7-F)
+        # the registry's client options pin bybit's 'swap' defaultType to spot (P7-F)
         opts: dict[str, Any] = {
             "enableRateLimit": True,
             "options": dict(self._venue().client_options),
@@ -355,25 +354,39 @@ class ExchangeClient:
 
         Bybit reads add ``acknowledged`` (ccxt refuses the realtime read without it) and
         fall back from the ``tpslOrder`` filter to the regular one — a triggered
-        conditional order graduates there. *order_id* is ``None`` only on a
-        ``params['orderLinkId']`` lookup (``venue_stops.fetch_bybit_leg``): the link id
-        alone goes on the wire.
+        conditional order graduates there. A ``params['orderLinkId']`` lookup rides the
+        same realtime endpoint through ``fetch_open_orders`` instead: ccxt's bybit
+        ``fetch_order`` writes ``orderId`` on the wire unconditionally, so an id-less read
+        through it would send the literal ``orderId=None`` — the link id alone identifies
+        the order (``venue_stops.fetch_bybit_leg``, which bybit answers whatever the
+        order's status).
         """
         exchange = self._get_exchange()
         merged: dict[str, Any] = dict(params or {})
         if self._exchange_id == "bybit":
             import ccxt
 
+            if merged.get("orderLinkId") is not None:
+                link_params = {k: v for k, v in merged.items() if k != "acknowledged"}
+                for order_filter in ("tpslOrder", "Order"):
+                    with observe_exchange_call(self._exchange_id, "fetch_order"):
+                        found: list[dict[str, Any]] = await exchange.fetch_open_orders(
+                            symbol, None, None, {**link_params, "orderFilter": order_filter}
+                        )
+                    if found:
+                        return found[0]
+                raise ccxt.OrderNotFound(
+                    f"bybit order with orderLinkId {merged['orderLinkId']} was not found"
+                )
             merged["acknowledged"] = True
-            wire_id = None if merged.get("orderLinkId") is not None else order_id
             with observe_exchange_call(self._exchange_id, "fetch_order"):
                 try:
                     result: dict[str, Any] = await exchange.fetch_order(
-                        wire_id, symbol, {**merged, "orderFilter": "tpslOrder"}
+                        order_id, symbol, {**merged, "orderFilter": "tpslOrder"}
                     )
                 except ccxt.OrderNotFound:
                     result = await exchange.fetch_order(
-                        wire_id, symbol, {**merged, "orderFilter": "Order"}
+                        order_id, symbol, {**merged, "orderFilter": "Order"}
                     )
             return result
         with observe_exchange_call(self._exchange_id, "fetch_order"):

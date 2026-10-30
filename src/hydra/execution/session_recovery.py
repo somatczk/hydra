@@ -170,8 +170,7 @@ class SessionRecoveryMixin:
             await self._recover_live_one(session)
             return
         risk = self._require_risk()
-        # the row's own mode: a stored bybit LIVE row recovers through the live-only cap
-        # while a bybit paper row (which no start could ever have written) is errored here
+        # the row's own mode: a bybit LIVE row recovers live; a bybit paper row is errored
         exchange_id: ExchangeId = client_factory.validate_venue(
             session.exchange_id,
             client_factory.venue_market_type(session.exchange_id),

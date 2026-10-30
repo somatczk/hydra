@@ -153,8 +153,7 @@ async def _drift_pass(
         try:
             raw = await client.fetch_open_orders(symbol)
             if pair_venue:
-                # bybit's conditional legs rest behind the tpslOrder filter: the drift
-                # pass must see them, or every correctly resting pair looks untracked
+                # bybit's conditional legs rest behind the tpslOrder filter: read it too
                 raw += await client.fetch_open_orders(symbol, conditional=True)
             legs.extend(normalize_open_orders(str(executor._exchange_id), raw))
         except Exception as exc:
@@ -220,7 +219,11 @@ async def _tracked(store: LiveOrderStore, leg: dict[str, Any]) -> bool:
     if oco_id and await store.tracked_by_order_list_id(str(oco_id)):
         return True
     client_id = str(leg.get("client_order_id") or "")
-    return bool(client_id) and await store.by_client_order_id(client_id) is not None
+    if not client_id:
+        return False
+    if await store.by_client_order_id(client_id) is not None:
+        return True
+    return await store.tracked_by_leg_client_order_id(client_id)
 
 
 def _leg_matches_row(leg: dict[str, Any], row: LiveOrderRecord) -> bool:

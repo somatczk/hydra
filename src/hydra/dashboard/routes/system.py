@@ -37,9 +37,7 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Exchange definitions: id -> display name; Binance spot + Binance USD⌂-M perps are
-# connectable (P4-F closes the futures-keys gap), and bybit SPOT joins live-only (P7-F);
-# kraken and okx keep the refusal — no testnet or no key-permission endpoint (the README)
+# Exchange definitions: id -> display name; binance + bybit spot connect, kraken/okx refused
 _EXCHANGE_DEFS: dict[str, str] = {
     "binance": "Binance",
     "binanceusdm": "Binance USD⌂-M",

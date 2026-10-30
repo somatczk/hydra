@@ -18,6 +18,7 @@ import pytest
 
 from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.types import MarketType, OrderType
+from hydra.execution.errors import SubmitUnknownError
 from hydra.execution.exchange_client import ExchangeClient
 from hydra.execution.exchange_stops import StopBreachedError, StopUnplaceableError
 from hydra.execution.live_executor import LiveOrderPoller, LiveTradingExecutor
@@ -435,6 +436,98 @@ async def test_the_reconcile_driven_path_cancels_the_sibling() -> None:
     row = await ex.live_orders.by_order_list_id(resp["id"], ex._session_id)
     assert row is not None and row.status is LiveOrderStatus.FILLED
     assert not await ex.get_positions("BTCUSDT")
+
+
+async def test_a_healthy_resting_pair_reconciles_ok_never_untracked() -> None:
+    """F1's red/green: a correctly RESTING pair is tracked through its legs' own client
+    ids — a healthy live session reconciles ``ok``, never a mismatch that names the
+    resting legs "untracked exchange orders (not managed)" and pages forever."""
+    fake = FakeBybitTradingClient()
+    client = _client(fake)
+    ex = _executor(client)
+    await _buy_filled(ex)
+    await _place_pair(ex)
+    poller, _ = _poller(ex)
+    assert len(fake._open_raw("BTCUSDT", "tpslOrder")) == 2  # both legs rest
+
+    status = await reconcile_live_session(ex.live_orders, client, ex, poller=poller)
+
+    assert status.state == "ok", status.detail
+
+
+async def test_a_landed_single_stop_timeout_resolves_by_its_leg_cid() -> None:
+    """F2's red/green: a single-stop row (a stop-only or trailing spec — a NON-OCO
+    pair-venue row) whose create landed but timed out resolves by its leg cid. The row
+    must never take a lying REJECTED "not found on exchange" while the stop rests there."""
+    fake = FakeBybitTradingClient()
+    client = _client(fake)
+    ex = _executor(client)
+    await _buy_filled(ex)
+    inner = fake.create_order
+
+    async def land_then_timeout(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        await inner(*args, **kwargs)
+        raise ccxt.RequestTimeout("bybit POST /v5/order/create request timed out")
+
+    fake.create_order = land_then_timeout
+    with pytest.raises(SubmitUnknownError):
+        await ex.create_order(
+            "BTCUSDT",
+            "SELL",
+            OrderType.STOP_MARKET.value,
+            D("0.00999"),
+            stop_price=SL_ASKED,
+            params={"tag": "protective"},
+        )
+    [rung] = fake._open_raw("BTCUSDT", "tpslOrder")  # the stop LANDED and rests
+    poller, _ = _poller(ex)
+    for _ in range(3):  # the three sweeps that must not resolve to a rejection
+        await poller.sweep()
+
+    rows = [
+        r
+        for r in await ex.live_orders.orders(ex._session_id)
+        if r.order_type == OrderType.STOP_MARKET.value
+    ]
+    assert [row.status for row in rows] == [LiveOrderStatus.NEW]
+    assert rows[0].exchange_order_id == rung["orderId"]
+    assert fake.orders[rung["orderId"]]["status"] == "New"  # it still protects
+
+
+async def test_the_refresh_path_cancels_the_part_filled_sibling_exactly_once() -> None:
+    """F5: the refresh half of the both-paths sibling-cancel, driven directly — a TP leg
+    filled and a sibling that left the resting list part-filled while no sweep applied the
+    fill. The leg reads (the F3 seam) prove the ending, the row takes FILLED, and EXACTLY
+    ONE cancel reaches the exchange: the part-filled sibling, by its client id."""
+    fake = FakeBybitTradingClient()
+    counting = _CancelCounting(fake)
+    client = _client(counting)
+    ex = _executor(client)
+    await _buy_filled(ex)
+    await _place_pair(ex)
+    poller, _ = _poller(ex)
+    legs = fake._open_raw("BTCUSDT", "tpslOrder")
+    tp_leg = next(leg for leg in legs if leg["triggerDirection"] == 1)
+    sl_leg = next(leg for leg in legs if leg["triggerDirection"] == 2)
+
+    await fake.fill_order(tp_leg["orderId"], price="103000")
+    await fake.fill_order(sl_leg["orderId"], price="95000", quantity="0.004")
+    assert fake._open_raw("BTCUSDT", "tpslOrder") == []  # neither rests anymore
+
+    await poller._refresh_open_statuses()
+
+    row = next(
+        r
+        for r in await ex.live_orders.orders(ex._session_id)
+        if r.order_type == OrderType.OCO.value
+    )
+    assert row.status is LiveOrderStatus.FILLED
+    assert row.filled_quantity == D("0.00999")  # the proven leg's fill, not the sibling's
+    [(order_id, symbol, params)] = counting.calls
+    assert order_id is None and symbol == "BTCUSDT"
+    assert params == {"orderLinkId": sl_leg["clientOrderId"], "orderFilter": "tpslOrder"}
+    assert fake.orders[sl_leg["orderId"]]["status"] == "Cancelled"
+    assert fake.orders[tp_leg["orderId"]]["status"] == "Filled"  # never a second cancel
 
 
 async def test_the_kill_switch_sweep_cancels_both_namespaces() -> None:
