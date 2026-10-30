@@ -55,6 +55,7 @@ from hydra.execution.perp_live import (
     normalize_perp_leg,
     verify_perp_ladder,
 )
+from hydra.execution.perp_trading import PerpPaperTradingExecutor
 from hydra.execution.protective_orders import ProtectionSpec
 from hydra.ml.consumers import validate_session_ml
 from hydra.ml.serving import MlServingError
@@ -432,7 +433,7 @@ async def get_session_detail(mgr: Any, session_id: str) -> dict[str, Any]:
     ):
         # not isinstance: LiveTradingExecutor subclasses the paper executor (R12)
         await _live_exchange_state(detail, session, executor)
-    elif isinstance(executor, PaperTradingExecutor):
+    elif isinstance(executor, (PaperTradingExecutor, PerpPaperTradingExecutor)):
         rt = session._runtime
         detail["open_orders"] = [
             json_safe_open_order(
