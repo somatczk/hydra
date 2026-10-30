@@ -46,6 +46,8 @@ from hydra.risk.pretrade import (
     PreTradeRiskManager,
     RiskConfig,
     RiskDecision,
+    StrategyLimits,
+    effective_limits,
     gross_exposure,
 )
 from hydra.risk.sizing import size_entry
@@ -206,6 +208,7 @@ class RiskService:
         self._flattening = False
         self._last_flatten: datetime | None = None
         self._sessions: dict[str, _Session] = {}
+        self._strategy_overrides: dict[str, StrategyLimits] = {}
         self._marks: dict[tuple[str, str], Decimal] = {}
         self._mark_ts: dict[tuple[str, str], datetime] = {}
         self._live_priced: set[tuple[str, str]] = set()
@@ -243,6 +246,7 @@ class RiskService:
         """
         try:
             loaded = await self._store.load_config()
+            overrides = await self._store.load_strategy_overrides()
             state = await self._store.load_state()
         except Exception as exc:
             self._loaded = False
@@ -251,6 +255,7 @@ class RiskService:
                 raise
             raise RiskStateUnavailableError(str(exc)) from exc
         self._apply_config(loaded.config)
+        self._strategy_overrides = overrides
         if state.paper_capital is None:
             state.paper_capital = loaded.paper_capital
         self._paper_capital = state.paper_capital
@@ -281,7 +286,9 @@ class RiskService:
             await self.evaluate()
             return
         loaded = await self._store.load_config()
+        overrides = await self._store.load_strategy_overrides()
         self._apply_config(loaded.config)
+        self._strategy_overrides = overrides
         if loaded.kill_switch and not self._kill_switch:
             self._kill_switch = True
             metrics.set_kill_switch_active(True)
@@ -610,6 +617,7 @@ class RiskService:
             market_rules=session.rules,
             quote_currency=QUOTE,
             leverage=session.leverage,
+            strategy_limits=self._strategy_overrides.get(session.strategy_id, StrategyLimits()),
         )
 
     def _openings(self, session: _Session, now: datetime) -> int:
@@ -653,9 +661,10 @@ class RiskService:
         if mark is None or rules is None:
             return None
         sleeve, _, balances = await self._session_equity(session)
-        cap = self._config.max_position_pct * (
-            Decimal(session.leverage) if session.leverage > 1 else Decimal("1")
-        )
+        # min first (the strategy override), multiply second (leverage, then the CB multiplier)
+        cap = effective_limits(
+            self._config, self._strategy_overrides.get(session.strategy_id, StrategyLimits())
+        ).max_position_pct * (Decimal(session.leverage) if session.leverage > 1 else Decimal("1"))
         return size_entry(
             sleeve_equity=sleeve,
             fraction=min(strategy_fraction, cap),

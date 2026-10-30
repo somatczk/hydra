@@ -5,12 +5,14 @@ import Link from 'next/link';
 import { actorLabel, type RiskEvent } from '@/components/activity/ActivityLog';
 import { BreakerTable } from '@/components/risk/BreakerTable';
 import { LimitsSheet } from '@/components/risk/LimitsSheet';
+import { StrategyLimitsSheet } from '@/components/risk/StrategyLimitsSheet';
 import { KillSwitchControl } from '@/components/shell/KillSwitchControl';
 import { OutcomePanel } from '@/components/shell/OutcomePanel';
 import { useShellStatus } from '@/components/shell/ShellStatusProvider';
 import { Button } from '@/components/ui/Button';
 import { DataCard } from '@/components/ui/DataCard';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { Select } from '@/components/ui/Select';
 import { TypedConfirm } from '@/components/ui/TypedConfirm';
 import { usePoll } from '@/hooks/usePoll';
 import { fetchApi } from '@/lib/api';
@@ -22,11 +24,17 @@ import {
   ledgerResetOutcome,
   limitsOutcome,
   releaseOutcome,
+  strategyOverrideOutcome,
   type KillSwitchResponse,
   type Outcome,
   type Result,
 } from '@/lib/outcomes';
-import type { RiskLimitValues, RiskLimitsUpdate } from '@/lib/riskLimits';
+import {
+  type RiskConfigResponse,
+  type RiskLimitsUpdate,
+  type StrategyOverrideRow,
+  type StrategyOverrideValues,
+} from '@/lib/riskLimits';
 
 interface RiskStatus {
   current_drawdown: number;
@@ -47,6 +55,11 @@ interface VarEstimate {
   var_99: number;
   cvar_95: number;
   sample_days: number;
+}
+
+interface StrategyOption {
+  id: string;
+  name: string;
 }
 
 const MIN_VAR_SAMPLE_DAYS = 5;
@@ -78,7 +91,8 @@ export default function RiskPage() {
   const { live, sessions, now } = shell;
   const status = usePoll<RiskStatus>('/api/risk/status?source=paper', 10_000);
   const events = usePoll<RiskEvent[]>('/api/risk/events?limit=500', 30_000);
-  const config = usePoll<RiskLimitValues>('/api/risk/config', 30_000);
+  const config = usePoll<RiskConfigResponse>('/api/risk/config', 30_000);
+  const strategies = usePoll<StrategyOption[]>('/api/strategies', 30_000);
   const varEstimate = usePoll<VarEstimate>('/api/risk/var?source=paper', 30_000);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -139,6 +153,42 @@ export default function RiskPage() {
       if ('ok' in result) setReloadFailed(null);
       setOutcome(o);
     }
+    void Promise.all([config.refetch(), events.refetch()]);
+    return 'ok' in result;
+  };
+
+  const strategyOptions = (() => {
+    const byId = new Map<string, string>();
+    for (const s of strategies.data ?? []) byId.set(s.id, s.name);
+    for (const o of config.data?.overrides ?? []) if (!byId.has(o.strategy_id)) byId.set(o.strategy_id, o.strategy_id);
+    return [...byId].map(([id, name]) => ({ id, name }));
+  })();
+  const [strategyId, setStrategyId] = useState<string>('');
+  const selected = strategyOptions.find((s) => s.id === (strategyId || strategyOptions[0]?.id)) ?? null;
+  const selectedId = selected?.id ?? '';
+  const storedOverride: StrategyOverrideRow | undefined = config.data?.overrides.find(
+    (o) => o.strategy_id === selectedId,
+  );
+  const stored: StrategyOverrideValues = storedOverride ?? {
+    max_position_pct: null,
+    max_risk_per_trade: null,
+    max_concurrent_positions: null,
+  };
+
+  const saveStrategyOverride = async (update: StrategyOverrideValues): Promise<boolean> => {
+    const id = selectedId;
+    retry.current = () => saveStrategyOverride(update);
+    const result = await settle(fetchApi(`/api/risk/config/${id}`, { method: 'PUT', ...json(update) }));
+    setOutcome(strategyOverrideOutcome(result, id, 'save'));
+    void Promise.all([config.refetch(), events.refetch()]);
+    return 'ok' in result;
+  };
+
+  const clearStrategyOverride = async (): Promise<boolean> => {
+    const id = selectedId;
+    retry.current = () => clearStrategyOverride();
+    const result = await settle(fetchApi(`/api/risk/config/${id}`, { method: 'DELETE' }));
+    setOutcome(strategyOverrideOutcome(result, id, 'clear'));
     void Promise.all([config.refetch(), events.refetch()]);
     return 'ok' in result;
   };
@@ -279,6 +329,51 @@ export default function RiskPage() {
           )}
           {config.data ? (
             <LimitsSheet cfg={config.data} onSave={saveLimits} />
+          ) : config.state === 'loading' ? (
+            <p className="text-sm text-ink-2">Loading…</p>
+          ) : (
+            <DataStateErrorCard error={config.error} fallback="Failed to load risk limits" onRetry={() => void config.refetch()} />
+          )}
+        </DataCard>
+      </section>
+
+      <section id="strategy-limits" aria-labelledby="strategy-limits-h" className="scroll-mt-20">
+        <DataCard>
+          <h2 id="strategy-limits-h" className="mb-3 text-sm font-semibold text-ink-1">
+            Per-strategy limits
+          </h2>
+          <p className="mb-3 text-sm text-ink-2">
+            A strategy can tighten three of the global limits for its own entries: position size, risk per trade
+            and concurrent positions. Everything else stays account-level.
+          </p>
+          {config.data ? (
+            <div className="flex flex-col gap-3">
+              {strategyOptions.length > 0 ? (
+                <Select
+                  label="Strategy"
+                  options={strategyOptions.map((s) => ({ value: s.id, label: s.name }))}
+                  value={selectedId}
+                  onChange={(e) => setStrategyId(e.target.value)}
+                />
+              ) : (
+                <p className="text-sm text-ink-2">No strategies yet.</p>
+              )}
+              {selected ? (
+                <StrategyLimitsSheet
+                  strategyId={selectedId}
+                  cfg={config.data}
+                  stored={stored}
+                  onSave={saveStrategyOverride}
+                  onClear={clearStrategyOverride}
+                />
+              ) : (
+                <DataStateErrorCard
+                  error={strategies.error}
+                  fallback="Failed to load strategies"
+                  onRetry={() => void strategies.refetch()}
+                />
+              )}
+            </div>
           ) : config.state === 'loading' ? (
             <p className="text-sm text-ink-2">Loading…</p>
           ) : (

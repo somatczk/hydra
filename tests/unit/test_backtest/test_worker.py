@@ -136,11 +136,18 @@ class _Pool:
 class _BarsThenFailingWrites:
     """Serves stored bars to the loader; the result INSERT fails like a dropped connection."""
 
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        strategy_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._rows = rows
+        self._strategy_rows = strategy_rows if strategy_rows is not None else []
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
-        assert "FROM ts.ohlcv_1m" in query
+        if "FROM risk_config" in query:  # the worker's strategy-override read
+            return self._strategy_rows
+        assert "FROM ts.ohlcv_1m" in query, query
         return self._rows
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
@@ -158,8 +165,12 @@ class _BarsThenFailingWrites:
 
 
 class _BarsThenRecordedWrites(_BarsThenFailingWrites):
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        super().__init__(rows)
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        strategy_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(rows, strategy_rows)
         self.inserts: list[tuple[str, tuple[Any, ...]]] = []
 
     async def execute(self, query: str, *args: Any) -> str:
@@ -436,6 +447,55 @@ async def test_fetch_fresh_maps_to_the_engine_force(strategies_dir: Path) -> Non
     assert outcome.result_id == "bt-task-unit"
 
 
+async def test_a_backtest_min_renders_the_strategy_override_into_the_runners_config(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A limited strategy backtests under its real caps: min(global, override), tighter-only."""
+    _write_strategy(strategies_dir, "saw")
+    body = BacktestRunRequest(strategy_id="saw", start_date="2026-01-01", end_date="2026-01-03")
+    pf = await _preflighted("saw", body)
+    rows = _saw_rows(datetime(2026, 1, 1, tzinfo=UTC), 60, timedelta(hours=1))
+    strategy_rows = [
+        {
+            "scope": "strategy:saw",
+            "max_position_pct": Decimal("0.04"),
+            "max_risk_per_trade": Decimal("0.09"),  # looser than the global: never applied
+            "max_concurrent_positions": 3,
+        },
+        {  # another strategy's row: never picked up
+            "scope": "strategy:other",
+            "max_position_pct": Decimal("0.01"),
+            "max_risk_per_trade": None,
+            "max_concurrent_positions": None,
+        },
+    ]
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 60)])
+    run = worker.JobRun()
+
+    seen: list[Any] = []
+    real_runner = worker.BacktestRunner
+
+    class _RecordingRunner(real_runner):
+        async def run(self, *args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs.get("risk_config"))
+            return await super().run(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "BacktestRunner", _RecordingRunner)
+    outcome = await worker.run_backtest_job(
+        _Pool(_BarsThenRecordedWrites(rows, strategy_rows)), engine, _job(body, pf.config), run
+    )
+    assert outcome.result_id == "bt-task-unit"
+    assert len(seen) == 1
+    risk_config = seen[0]
+    # min first: the override tightens 0.10 -> 0.04 and 10 -> 3; the looser
+    # risk-per-trade (0.09 > the global 0.02) never loosens; the non-overridable
+    # caps pass the global through untouched
+    assert risk_config.max_position_pct == Decimal("0.04")
+    assert risk_config.max_risk_per_trade == Decimal("0.02")
+    assert risk_config.max_concurrent_positions == 3
+    assert risk_config.max_portfolio_heat == Decimal("0.30")
+
+
 async def test_hyperopt_handler_ensures_bars_through_the_engine(strategies_dir: Path) -> None:
     _write_strategy(strategies_dir, "saw")
     body = HyperoptRunRequest(
@@ -617,6 +677,8 @@ class _FetchConn(_BarsThenRecordedWrites):
             return self.detect_answers.pop(0)
         if "unnest" in query:
             return []
+        if "FROM risk_config" in query:  # the worker's strategy-override read
+            return self._strategy_rows
         assert "ORDER BY timestamp ASC" in query, query
         return self._rows
 

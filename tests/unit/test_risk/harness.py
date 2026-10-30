@@ -125,7 +125,9 @@ class Account:
     buses: dict[str, FillBus] = field(default_factory=dict)
     bar: int = 0
 
-    async def add_session(self, sid: str, capital: str, *, fee: str = "0") -> PaperTradingExecutor:
+    async def add_session(
+        self, sid: str, capital: str, *, fee: str = "0", strategy_id: str = ""
+    ) -> PaperTradingExecutor:
         ex = YieldingPaperExecutor(
             exchange_id="binance",
             initial_balances={"USDT": Decimal(capital)},
@@ -138,7 +140,12 @@ class Account:
             if price is not None:
                 await ex.on_closed_bar(sym, flat_bar(price, T0 + timedelta(hours=self.bar)))
         await self.svc.register_session(
-            sid, ex, allocated=Decimal(capital), symbols=[BTC], exchange_id="binance"
+            sid,
+            ex,
+            allocated=Decimal(capital),
+            symbols=[BTC],
+            exchange_id="binance",
+            strategy_id=strategy_id,
         )
         bus = FillBus(self.svc, sid)
         self.executors[sid] = ex

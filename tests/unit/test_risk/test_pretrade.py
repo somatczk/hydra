@@ -16,7 +16,9 @@ from hydra.risk.pretrade import (
     PortfolioState,
     PreTradeRiskManager,
     RiskConfig,
+    StrategyLimits,
     classify_intent,
+    effective_limits,
 )
 
 BTC = Symbol("BTCUSDT")
@@ -209,6 +211,94 @@ class TestOpeningChecks:
     def test_rate_limit(self) -> None:
         state = _state(opening_orders_last_minute=6)
         assert _check(_order("0.01"), state, max_orders_per_minute=6)[1] == "rate_limit"
+
+
+class TestStrategyOverrides:
+    """Tighter-only per-strategy caps: enforced = min(global, override) at check time.
+
+    Real numbers: sleeve equity 10000, global max_position_pct 0.10 (cap 1000), a
+    strategy override of 0.05 (cap 500), and an entry whose notional is 800.
+    """
+
+    OVER = StrategyLimits(max_position_pct=Decimal("0.05"))
+
+    def _ostate(self, **kw: Any) -> PortfolioState:
+        base: dict[str, Any] = {"marks": {"BTCUSDT": Decimal("80000")}}
+        base.update(kw)
+        return _state(**base)
+
+    def test_notional_800_passes_the_global_but_not_the_strategy_cap(self) -> None:
+        order = _order("0.01")  # 0.01 x 80000 = 800
+        assert _check(order, self._ostate())[0] is True  # 800 <= the global 1000
+        ok, check, reason = _check(order, self._ostate(strategy_limits=self.OVER))
+        assert (ok, check) == (False, "position_size")
+        assert "(500.00" in reason  # 800 > the strategy cap 500
+
+    def test_a_looser_override_never_loosens_the_global_cap(self) -> None:
+        loose = StrategyLimits(max_position_pct=Decimal("0.20"))
+        order = _order("0.01875")  # notional 1500
+        ok, check, reason = _check(order, self._ostate(strategy_limits=loose))
+        assert (ok, check) == (False, "position_size")
+        assert "(1000.00" in reason  # the global 0.10 binds, not the stored 0.20
+        assert _check(_order("0.01"), self._ostate(strategy_limits=loose))[0] is True
+
+    def test_the_override_min_composes_with_the_breaker_multiplier(self) -> None:
+        """min FIRST, multiply SECOND: 0.05 x tier-1 0.5 x 10000 = 250."""
+        tier1 = CircuitBreakerRestrictions(tier=1, position_size_multiplier=Decimal("0.5"))
+        assert _check(_order("0.00375"), self._ostate(restrictions=tier1))[0] is True
+        both = self._ostate(restrictions=tier1, strategy_limits=self.OVER)
+        ok, check, reason = _check(_order("0.00375"), both)  # notional 300
+        assert (ok, check) == (False, "position_size")
+        assert "(250.00" in reason
+        assert _check(_order("0.003"), both)[0] is True  # notional 240 <= 250
+
+    def test_risk_per_trade_override(self) -> None:
+        override = StrategyLimits(max_risk_per_trade=Decimal("0.01"))
+        stop = _order("0.01", stop_price=Decimal("69000"))  # loss to stop = 0.01 x 11000 = 110
+        assert _check(stop, self._ostate(), max_risk_per_trade=Decimal("0.02"))[0] is True
+        ok, check, reason = _check(
+            stop, self._ostate(strategy_limits=override), max_risk_per_trade=Decimal("0.02")
+        )
+        assert (ok, check) == (False, "risk_per_trade")
+        assert "(100.00" in reason  # 110 > the strategy cap 0.01 x 10000
+
+    def test_concurrent_positions_override(self) -> None:
+        others = [_long("0.001", symbol=s) for s in ("ETHUSDT", "SOLUSDT")]
+        state = self._ostate(account_positions=others)
+        assert _check(_order("0.001"), state)[0] is True  # 2 < the global 10
+        override = StrategyLimits(max_concurrent_positions=2)
+        ok, check, reason = _check(
+            _order("0.001"), self._ostate(account_positions=others, strategy_limits=override)
+        )
+        assert (ok, check) == (False, "concurrent_positions")
+        assert "max 2" in reason
+
+    def test_exit_never_blocked_by_an_override(self) -> None:
+        tight = StrategyLimits(max_position_pct=Decimal("0.001"), max_concurrent_positions=1)
+        state = self._ostate(positions=[_long("0.01", entry="80000")], strategy_limits=tight)
+        exit_order = _order("0.01", Side.SELL, reduce_only=True)
+        assert _check(exit_order, state) == (True, "reduce", "reducing order: entry checks exempt")
+
+    def test_effective_limits_only_touches_the_three_caps(self) -> None:
+        cfg = RiskConfig()
+        tighter = effective_limits(cfg, StrategyLimits(Decimal("0.01"), Decimal("0.005"), 2))
+        assert (
+            tighter.max_position_pct,
+            tighter.max_risk_per_trade,
+            tighter.max_concurrent_positions,
+        ) == (Decimal("0.01"), Decimal("0.005"), 2)
+        # everything else is account-level by construction
+        assert (
+            tighter.max_portfolio_heat,
+            tighter.max_daily_loss_pct,
+            tighter.max_drawdown_pct,
+            tighter.max_perp_leverage,
+        ) == (
+            cfg.max_portfolio_heat,
+            cfg.max_daily_loss_pct,
+            cfg.max_drawdown_pct,
+            cfg.max_perp_leverage,
+        )
 
 
 class TestFuturesMargin:

@@ -66,6 +66,7 @@ from hydra.ml.features import FeatureSpec
 from hydra.ml.registry import ModelRegistration, ModelRegistry
 from hydra.ml.serving import MlServingError
 from hydra.ml.training import ModelTrainer
+from hydra.risk.pretrade import StrategyLimits, effective_limits
 from hydra.risk.state import PgRiskStateStore
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.ml_access import bound_providers
@@ -271,6 +272,10 @@ async def run_backtest_job(
     has it attached first (``_attach_ml``) and bound for this run only: Production, or
     the request's pinned ``model_version_id`` of any stage; the served versions ride the
     job's provenance.
+
+    The strategy's stored override is min-rendered into the risk config (tighter-only),
+    so a limited strategy backtests under its real caps, exactly as a live session of
+    it would be checked.
     """
     body = BacktestRunRequest.model_validate(jobs.json_value(job["request"]))
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
@@ -293,7 +298,11 @@ async def run_backtest_job(
     def _report(pct: float) -> None:
         run.progress = round(30.0 + pct * 60.0, 1)
 
-    risk_config = (await PgRiskStateStore(pool).load_config()).config
+    store = PgRiskStateStore(pool)
+    risk_config = effective_limits(
+        (await store.load_config()).config,
+        (await store.load_strategy_overrides()).get(config.id, StrategyLimits()),
+    )
     with bound_providers(models):
         result = await BacktestRunner().run(
             strategy_class=strategy_cls,

@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { buildRiskLimitsUpdate, fractionToPercentInput, limitChanges, limitText, riskLimitsToForm } from './riskLimits';
+import {
+  buildRiskLimitsUpdate,
+  buildStrategyOverrideUpdate,
+  effectiveOverride,
+  fractionToPercentInput,
+  hasOverride,
+  limitChanges,
+  limitText,
+  riskLimitsToForm,
+  strategyLimitText,
+  strategyOverrideToForm,
+} from './riskLimits';
 
 const CFG = {
   max_position_pct: 0.1,
@@ -84,5 +95,79 @@ describe('limitChanges', () => {
 
   it('is empty for an empty update', () => {
     expect(limitChanges(CFG, {})).toEqual([]);
+  });
+});
+
+describe('effectiveOverride', () => {
+  it('takes the tighter of the stored override and the global, per cap', () => {
+    expect(
+      effectiveOverride(CFG, {
+        max_position_pct: 0.05,
+        max_risk_per_trade: 0.009,
+        max_concurrent_positions: 2,
+      }),
+    ).toEqual({ max_position_pct: 0.05, max_risk_per_trade: 0.005, max_concurrent_positions: 2 });
+  });
+
+  it('falls back to the global for every cap left unset', () => {
+    expect(effectiveOverride(CFG, { max_position_pct: null, max_risk_per_trade: null, max_concurrent_positions: null })).toEqual({
+      max_position_pct: CFG.max_position_pct,
+      max_risk_per_trade: CFG.max_risk_per_trade,
+      max_concurrent_positions: CFG.max_concurrent_positions,
+    });
+  });
+});
+
+describe('buildStrategyOverrideUpdate', () => {
+  const EMPTY = { max_position_pct: '', max_risk_per_trade: '', max_concurrent_positions: '' };
+
+  it('turns empty fields into nulls (no override) and numbers into API units', () => {
+    expect(buildStrategyOverrideUpdate({ ...EMPTY, max_position_pct: '5' }, CFG)).toEqual({
+      ok: true,
+      update: { max_position_pct: 0.05, max_risk_per_trade: null, max_concurrent_positions: null },
+      clamped: [],
+    });
+    expect(buildStrategyOverrideUpdate({ ...EMPTY, max_concurrent_positions: '2' }, CFG)).toEqual({
+      ok: true,
+      update: { max_position_pct: null, max_risk_per_trade: null, max_concurrent_positions: 2 },
+      clamped: [],
+    });
+  });
+
+  it('clamps a looser entry to the global value and names the field', () => {
+    expect(buildStrategyOverrideUpdate({ ...EMPTY, max_position_pct: '50' }, CFG)).toEqual({
+      ok: true,
+      update: { max_position_pct: CFG.max_position_pct, max_risk_per_trade: null, max_concurrent_positions: null },
+      clamped: ['max_position_pct'],
+    });
+    expect(buildStrategyOverrideUpdate({ ...EMPTY, max_concurrent_positions: '9' }, CFG)).toEqual({
+      ok: true,
+      update: { max_position_pct: null, max_risk_per_trade: null, max_concurrent_positions: CFG.max_concurrent_positions },
+      clamped: ['max_concurrent_positions'],
+    });
+  });
+
+  it.each([
+    ['max_position_pct', 'abc'],
+    ['max_concurrent_positions', '2.5'],
+  ])('refuses a non-number in %s', (field, value) => {
+    expect(buildStrategyOverrideUpdate({ ...EMPTY, [field]: value }, CFG)).toEqual({ ok: false, field });
+  });
+});
+
+describe('strategy override text', () => {
+  it('shows an unset cap as a dash and a stored one exactly', () => {
+    expect(strategyLimitText('max_position_pct', null)).toBe('—');
+    expect(strategyLimitText('max_position_pct', 0.05)).toBe('5%');
+    expect(strategyLimitText('max_concurrent_positions', 2)).toBe('2');
+    expect(hasOverride({ max_position_pct: null, max_risk_per_trade: null, max_concurrent_positions: null })).toBe(false);
+    expect(hasOverride({ max_position_pct: 0.05, max_risk_per_trade: null, max_concurrent_positions: null })).toBe(true);
+  });
+
+  it('round-trips a stored override through the form', () => {
+    const over = { max_position_pct: 0.05, max_risk_per_trade: null, max_concurrent_positions: 2 };
+    const form = strategyOverrideToForm(over);
+    expect(form).toEqual({ max_position_pct: '5', max_risk_per_trade: '', max_concurrent_positions: '2' });
+    expect(buildStrategyOverrideUpdate(form, CFG)).toEqual({ ok: true, update: over, clamped: [] });
   });
 });

@@ -37,6 +37,20 @@ SPOT_MAX_LEVERAGE = Decimal("1")
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class StrategyLimits:
+    """The three per-strategy overridable caps; None means no override stored.
+
+    Only position size, risk per trade and concurrent positions are overridable —
+    heat, drawdown tiers, daily loss, perp leverage and the kill switch are
+    account-level by construction and have no strategy counterpart.
+    """
+
+    max_position_pct: Decimal | None = None
+    max_risk_per_trade: Decimal | None = None
+    max_concurrent_positions: int | None = None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PortfolioState:
     """What the checks see for one order.
@@ -70,6 +84,8 @@ class PortfolioState:
     spendable_balance: Decimal | None = None
     """The quote actually payable for a new order's margin (a perp wallet); None falls back
     to ``balances``, whose perp ``get_balance`` cash an open short inflates."""
+    strategy_limits: StrategyLimits = field(default_factory=StrategyLimits)
+    """The ordering session's strategy override (tighter-only); empty when none is stored."""
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +117,36 @@ class RiskConfig:
     max_perp_leverage: int = 3
     """The account-wide leverage cap for USD⌂-M perp entries (the user's answer 3; the
     column arrives with a later migration when the cap is first raised — P4-C adds none)."""
+
+
+# ---------------------------------------------------------------------------
+# Per-strategy overrides (tighter-only)
+# ---------------------------------------------------------------------------
+
+
+def effective_limits(config: RiskConfig, override: StrategyLimits) -> RiskConfig:
+    """Tighter-only: each overridable cap enforces min(global, override) at check time.
+
+    An unset field passes the global value through. Breaker multipliers and leverage
+    multiply after the min, so an override never relaxes a tier's halving.
+    """
+    return RiskConfig(
+        max_position_pct=(
+            config.max_position_pct
+            if override.max_position_pct is None
+            else min(config.max_position_pct, override.max_position_pct)
+        ),
+        max_risk_per_trade=(
+            config.max_risk_per_trade
+            if override.max_risk_per_trade is None
+            else min(config.max_risk_per_trade, override.max_risk_per_trade)
+        ),
+        max_concurrent_positions=(
+            config.max_concurrent_positions
+            if override.max_concurrent_positions is None
+            else min(config.max_concurrent_positions, override.max_concurrent_positions)
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +414,7 @@ class PreTradeRiskManager:
     ) -> tuple[str, str] | None:
         notional = order.quantity * self._ref(order, state)
         sleeve = self._sleeve(state)
+        cap_pct = effective_limits(self._config, state.strategy_limits).max_position_pct
         multiplier = (
             state.restrictions.position_size_multiplier
             if state.restrictions is not None
@@ -376,11 +423,11 @@ class PreTradeRiskManager:
         # a perp entry's notional carries the session's leverage; spot stays at 1x
         if order.market_type == MarketType.FUTURES:
             multiplier *= Decimal(state.leverage)
-        cap = self._config.max_position_pct * multiplier * sleeve
+        cap = cap_pct * multiplier * sleeve
         if sleeve <= 0 or notional > cap:
             return "position_size", (
                 f"position notional {notional:f} exceeds max_position_pct "
-                f"{self._config.max_position_pct} x size multiplier {multiplier} "
+                f"{cap_pct} x size multiplier {multiplier} "
                 f"of sleeve equity {sleeve} ({cap:f})"
             )
         return None
@@ -391,11 +438,11 @@ class PreTradeRiskManager:
         if order.stop_price is None:
             return None
         loss = order.quantity * abs(self._ref(order, state) - order.stop_price)
-        cap = self._config.max_risk_per_trade * self._sleeve(state)
+        risk_pct = effective_limits(self._config, state.strategy_limits).max_risk_per_trade
+        cap = risk_pct * self._sleeve(state)
         if loss > cap:
             return "risk_per_trade", (
-                f"loss to stop {loss:f} exceeds max_risk_per_trade "
-                f"{self._config.max_risk_per_trade} of sleeve ({cap:f})"
+                f"loss to stop {loss:f} exceeds max_risk_per_trade {risk_pct} of sleeve ({cap:f})"
             )
         return None
 
@@ -424,10 +471,11 @@ class PreTradeRiskManager:
             for p in self._account_positions(state)
             if p.direction != Direction.FLAT and p.quantity > 0
         )
-        if open_count >= self._config.max_concurrent_positions:
-            return "concurrent_positions", (
-                f"{open_count} open positions >= max {self._config.max_concurrent_positions}"
-            )
+        max_positions = effective_limits(
+            self._config, state.strategy_limits
+        ).max_concurrent_positions
+        if open_count >= max_positions:
+            return "concurrent_positions", (f"{open_count} open positions >= max {max_positions}")
         return None
 
     def _check_balance(self, order: OrderRequest, state: PortfolioState) -> tuple[str, str] | None:

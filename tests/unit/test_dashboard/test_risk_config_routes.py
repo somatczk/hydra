@@ -16,7 +16,7 @@ from hydra.core.types import Side
 from hydra.dashboard.api import app
 from hydra.dashboard.routes.risk import router
 from hydra.execution.paper_trading import PaperTradingExecutor
-from hydra.risk.pretrade import OPEN
+from hydra.risk.pretrade import OPEN, StrategyLimits
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore, LoadedConfig, risk_config_from_row
 from hydra.services.trader import LocalTrader
@@ -115,20 +115,44 @@ class TestSpotOnlyConfigContract:
         resp = client.put("/api/risk/config", json=body)
         assert resp.status_code == 422
 
-    def test_strategy_override_put_is_501(self, client: TestClient) -> None:
-        resp = client.put("/api/risk/config/strat-x", json={"max_position_pct": 0.2})
-        assert resp.status_code == 501
+    def test_strategy_override_put_without_db_is_503_not_501(self, client: TestClient) -> None:
+        """The 501 is gone: without a DB the real PUT answers unavailable, never refused."""
+        app.state.db_pool = None
+        resp = client.put("/api/risk/config/strat-x", json={"max_position_pct": 0.05})
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["state"] == "unavailable"
 
 
 class _RowStore(InMemoryRiskStateStore):
-    """Reads limits from the same row the route's UPDATE writes."""
+    """Reads limits from the same rows the route's writes land on."""
 
-    def __init__(self, row: dict[str, Any]) -> None:
+    def __init__(
+        self, row: dict[str, Any], strategy_rows: list[dict[str, Any]] | None = None
+    ) -> None:
         super().__init__(paper_capital=Decimal("10000"))
         self.row = row
+        self.strategy_rows = strategy_rows if strategy_rows is not None else []
 
     async def load_config(self) -> LoadedConfig:
         return LoadedConfig(risk_config_from_row(self.row), False, self.paper_capital)
+
+    async def load_strategy_overrides(self) -> dict[str, StrategyLimits]:
+        def _dec(r: dict[str, Any], key: str) -> Decimal | None:
+            value = r.get(key)
+            return None if value is None else Decimal(str(value))
+
+        return {
+            str(r["scope"])[len("strategy:") :]: StrategyLimits(
+                max_position_pct=_dec(r, "max_position_pct"),
+                max_risk_per_trade=_dec(r, "max_risk_per_trade"),
+                max_concurrent_positions=(
+                    None
+                    if r.get("max_concurrent_positions") is None
+                    else int(r["max_concurrent_positions"])
+                ),
+            )
+            for r in self.strategy_rows
+        }
 
 
 class _Mgr:
@@ -155,12 +179,14 @@ async def test_put_reload_propagates_to_risk_service() -> None:
         "kill_switch_active": False,
     }
 
-    async def execute(query: str, *args: Any) -> None:
+    async def execute(query: str, *args: Any) -> str:
         names = re.findall(r"(\w+) = \$\d", query.split("WHERE")[0])
         row.update({n: v for n, v in zip(names, args, strict=False)})
+        return "OK"
 
     conn = MagicMock()
     conn.fetchrow = AsyncMock(side_effect=lambda *a: dict(row))
+    conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(side_effect=execute)
     pool = MagicMock()
     pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
@@ -194,3 +220,94 @@ async def test_put_reload_propagates_to_risk_service() -> None:
     assert svc.config.max_consecutive_losses == 3
     decision = await svc.check(probe, "s1", OPEN)
     assert (decision.approved, decision.check) == (False, "position_size")
+
+
+async def test_strategy_override_tightens_the_running_service_without_a_restart() -> None:
+    """The mid-session tightening: PUT, reload, refuse; DELETE, reload, allow again."""
+    row: dict[str, Any] = {
+        "scope": "global",
+        "max_position_pct": Decimal("0.10"),
+        "max_risk_per_trade": Decimal("0.02"),
+        "max_portfolio_heat": Decimal("0.30"),
+        "max_daily_loss_pct": Decimal("0.03"),
+        "max_drawdown_pct": Decimal("0.15"),
+        "max_concurrent_positions": 10,
+        "max_consecutive_losses": 5,
+        "kill_switch_active": False,
+    }
+    strategy_rows: list[dict[str, Any]] = []
+
+    async def execute(query: str, *args: Any) -> str:
+        if "INSERT INTO risk_config" in query:
+            strategy_rows[:] = [r for r in strategy_rows if r["scope"] != args[0]]
+            strategy_rows.append(
+                {
+                    "scope": args[0],
+                    "max_position_pct": args[1],
+                    "max_risk_per_trade": args[2],
+                    "max_concurrent_positions": args[3],
+                }
+            )
+            return "INSERT 0 1"
+        if "DELETE FROM risk_config" in query:
+            strategy_rows[:] = [r for r in strategy_rows if r["scope"] != args[0]]
+            return "DELETE 1"
+        return "OK"
+
+    def _fetchrow(query: str, scope: str) -> dict[str, Any] | None:
+        if scope == "global":
+            return dict(row)
+        return next((dict(r) for r in strategy_rows if r["scope"] == scope), None)
+
+    conn = MagicMock()
+    conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+    conn.fetch = AsyncMock(side_effect=lambda *a, **k: [dict(r) for r in strategy_rows])
+    conn.execute = AsyncMock(side_effect=execute)
+    pool = MagicMock()
+    pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+    pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    clock = Clock()
+    svc = RiskService(_RowStore(row, strategy_rows), clock=clock, market_rules=rules_cache(clock))
+    await svc.load()
+    await svc.recovery_complete()
+    ex = PaperTradingExecutor(initial_balances={"USDT": Decimal("10000")})
+    await svc.register_session(
+        "s1",
+        ex,
+        allocated=Decimal("10000"),
+        symbols=["BTCUSDT"],
+        exchange_id="binance",
+        strategy_id="saw",
+    )
+    await svc.on_mark("binance", "BTCUSDT", Decimal("60000"), T0)
+    probe = order(Side.BUY, "0.01")  # notional 600 against the global cap 1000
+    assert (await svc.check(probe, "s1", OPEN)).approved is True
+
+    test_app = FastAPI()
+    test_app.state.db_pool = pool
+    test_app.state.session_manager = _Mgr(svc)
+    test_app.state.trader = LocalTrader(pool, _Mgr(svc))
+    test_app.include_router(router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=test_app), base_url="http://t"
+    ) as c:
+        resp = await c.put("/api/risk/config/saw", json={"max_position_pct": 0.05})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["overrides"]["max_position_pct"] == 0.05
+        assert body["effective"]["max_position_pct"] == 0.05
+
+        # mid-session tightening, no restart: the same probe that passed is now refused
+        decision = await svc.check(probe, "s1", OPEN)
+        assert (decision.approved, decision.check) == (False, "position_size")
+
+        # a looser stored value never loosens past the global
+        resp = await c.put("/api/risk/config/saw", json={"max_position_pct": 0.50})
+        assert resp.json()["effective"]["max_position_pct"] == 0.10
+        assert (await svc.check(probe, "s1", OPEN)).approved is True
+
+        resp = await c.delete("/api/risk/config/saw")
+        assert resp.status_code == 200
+        assert resp.json()["overrides"]["max_position_pct"] is None
+    assert (await svc.check(probe, "s1", OPEN)).approved is True

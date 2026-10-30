@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any, Literal
@@ -16,7 +17,13 @@ from hydra.dashboard.routes._db import (
     request_trader,
     require_pool,
 )
-from hydra.risk.state import RiskStateUnavailableError, fetch_risk_events
+from hydra.dashboard.security import audit
+from hydra.risk.state import (
+    RiskStateUnavailableError,
+    fetch_risk_events,
+    parse_strategy_scope,
+    strategy_scope,
+)
 from hydra.services.live_gate import read_live_state
 from hydra.services.perps_gate import read_perps_state
 
@@ -76,6 +83,25 @@ class VarEstimate(BaseModel):
     sample_days: int
 
 
+class StrategyOverride(BaseModel):
+    """One stored per-strategy override; None means that cap is not overridden."""
+
+    strategy_id: str
+    max_position_pct: float | None = None
+    max_risk_per_trade: float | None = None
+    max_concurrent_positions: int | None = None
+
+
+class StrategyOverrideUpdate(BaseModel):
+    """The three overridable caps; the PUT replaces the whole stored override."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_position_pct: float | None = Field(None, ge=0, le=1)
+    max_risk_per_trade: float | None = Field(None, ge=0, le=1)
+    max_concurrent_positions: int | None = Field(None, ge=1, le=100)
+
+
 class RiskConfig(BaseModel):
     scope: str = "global"
     max_position_pct: float
@@ -86,6 +112,16 @@ class RiskConfig(BaseModel):
     max_concurrent_positions: int
     max_consecutive_losses: int
     kill_switch_active: bool
+    # additive (P7-B): every stored per-strategy override row
+    overrides: list[StrategyOverride] = []
+
+
+class StrategyRiskConfig(BaseModel):
+    """What one strategy runs under: the stored override and what is actually enforced."""
+
+    strategy_id: str
+    overrides: StrategyOverride
+    effective: StrategyOverride
 
 
 class RiskConfigUpdate(BaseModel):
@@ -246,6 +282,87 @@ async def _get_risk_config_from_db(pool: Any, scope: str = "global") -> dict[str
     return None if row is None else dict(row)
 
 
+async def _load_strategy_rows(pool: Any) -> list[dict[str, Any]]:
+    """Every stored ``strategy:<id>`` row; ``kill_switch_active`` is never selected."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT scope, max_position_pct, max_risk_per_trade, max_concurrent_positions "
+            "FROM risk_config WHERE scope LIKE 'strategy:%' ORDER BY scope"
+        )
+    return [dict(r) for r in rows]
+
+
+def _override_row_to_model(row: dict[str, Any]) -> StrategyOverride:
+    return StrategyOverride(
+        strategy_id=parse_strategy_scope(str(row["scope"])),
+        **_override_fields(row),
+    )
+
+
+_OVERRIDE_COLUMNS = ("max_position_pct", "max_risk_per_trade", "max_concurrent_positions")
+
+
+def _override_fields(row: dict[str, Any] | None) -> dict[str, Any]:
+    """The three nullable caps of one strategy row; a missing row overrides nothing."""
+    if row is None:
+        return dict.fromkeys(_OVERRIDE_COLUMNS)
+    return {
+        k: None
+        if row.get(k) is None
+        else int(row[k])
+        if k == "max_concurrent_positions"
+        else float(row[k])
+        for k in _OVERRIDE_COLUMNS
+    }
+
+
+def _strategy_view(
+    strategy_id: str, global_row: dict[str, Any], stored: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Stored override plus the enforced (tighter-of-the-two) limits for one strategy."""
+    fields = _override_fields(stored)
+    effective = {
+        key: float(global_row[key]) if value is None else min(value, float(global_row[key]))
+        for key, value in fields.items()
+    }
+    return {
+        "strategy_id": strategy_id,
+        "overrides": {"strategy_id": strategy_id, **fields},
+        "effective": {"strategy_id": strategy_id, **effective},
+    }
+
+
+async def _reload_engine(request: Request, actor: str) -> None:
+    """The reload every risk-config write shares: hand the saved rows to the running engine.
+
+    No new TraderBackend op — the global PUT's ``reload_paper_capital`` re-reads the
+    overrides with the config (a store error answers 503 ``risk_reload_failed``).
+    """
+    try:
+        await request_trader(request).reload_paper_capital(actor)
+    except _STORE_ERRORS as exc:
+        logger.exception("Risk config saved but the engine did not reload it")
+        raise api_error(
+            503,
+            "risk_reload_failed",
+            "Limits were saved but the running engine could not reload them",
+            "unavailable",
+        ) from exc
+
+
+async def _append_override_event(
+    conn: Any, kind: str, actor: str, strategy_id: str, details: dict[str, Any]
+) -> None:
+    await conn.execute(
+        "INSERT INTO risk_events (scope, kind, tier, actor, reason, details) "
+        "VALUES ('paper', $1, NULL, $2, $3, $4::jsonb)",
+        kind,
+        actor,
+        f"per-strategy override for {strategy_id}",
+        json.dumps(details),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Status, circuit breakers, events, VaR
 # ---------------------------------------------------------------------------
@@ -341,13 +458,17 @@ def _no_fields() -> HTTPException:
 
 @router.get("/config", response_model=RiskConfig)
 async def get_risk_config(request: Request) -> dict[str, Any]:
-    """Get global risk limits from DB."""
+    """Get global risk limits, plus every stored per-strategy override row."""
     pool = require_pool(request)
     async with db_errors_to_503("reading risk config"):
         row = await _get_risk_config_from_db(pool)
+        strategy_rows = await _load_strategy_rows(pool)
     if row is None:
         raise _risk_config_missing()
-    return _row_to_config(row)
+    return {
+        **_row_to_config(row),
+        "overrides": [_override_row_to_model(r) for r in strategy_rows],
+    }
 
 
 @router.put("/config", response_model=RiskConfig)
@@ -361,36 +482,97 @@ async def update_risk_config(body: RiskConfigUpdate, request: Request) -> dict[s
     async with db_errors_to_503("updating risk config"):
         await _apply_risk_config_update(pool, "global", updates)
 
-    try:
-        await request_trader(request).reload_paper_capital(_actor(request))
-    except _STORE_ERRORS as exc:
-        logger.exception("Risk config saved but the engine did not reload it")
-        raise api_error(
-            503,
-            "risk_reload_failed",
-            "Limits were saved but the running engine could not reload them",
-            "unavailable",
-        ) from exc
-
+    await _reload_engine(request, _actor(request))
     return await get_risk_config(request)
 
 
-@router.get("/config/{strategy_id}", response_model=RiskConfig)
+@router.get("/config/{strategy_id}", response_model=StrategyRiskConfig)
 async def get_strategy_risk_config(strategy_id: str, request: Request) -> dict[str, Any]:
-    """Per-strategy overrides are not enforced in P1; this returns the global limits that are."""
-    return await get_risk_config(request)
+    """The stored override and the effective (tighter-only) limits for one strategy."""
+    pool = require_pool(request)
+    async with db_errors_to_503("reading strategy overrides"):
+        global_row = await _get_risk_config_from_db(pool)
+        if global_row is None:
+            raise _risk_config_missing()
+        stored = await _get_risk_config_from_db(pool, strategy_scope(strategy_id))
+    return _strategy_view(strategy_id, global_row, stored)
 
 
-@router.put("/config/{strategy_id}", status_code=501)
-async def update_strategy_risk_config(strategy_id: str) -> None:
-    """Per-strategy overrides are not enforced in P1, so writing them is refused."""
-    raise api_error(
-        501,
-        "not_implemented",
-        "Per-strategy risk overrides are not enforced yet; only global limits apply",
-        "not_implemented",
+@router.put("/config/{strategy_id}", response_model=StrategyRiskConfig)
+async def update_strategy_risk_config(
+    strategy_id: str, body: StrategyOverrideUpdate, request: Request
+) -> dict[str, Any]:
+    """Replace one strategy's override (tighter-only at check time); the engine reloads it.
+
+    The body replaces the whole stored override: a field left out or set to null clears
+    that cap. Any in-bounds value is accepted — the enforced limit is always
+    min(global, override) — and a value looser than the global one has no effect.
+    """
+    pool = require_pool(request)
+    if not body.model_fields_set:
+        raise _no_fields()
+    updates = body.model_dump()
+    actor = _actor(request)
+    async with (
+        db_errors_to_503("saving strategy overrides"),
+        pool.acquire() as conn,
+        conn.transaction(),
+    ):
+        await conn.execute(
+            "INSERT INTO risk_config "
+            "(scope, max_position_pct, max_risk_per_trade, max_concurrent_positions) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (scope) DO UPDATE SET "
+            "max_position_pct = $2, max_risk_per_trade = $3, "
+            "max_concurrent_positions = $4, updated_at = now()",
+            strategy_scope(strategy_id),
+            updates["max_position_pct"],
+            updates["max_risk_per_trade"],
+            updates["max_concurrent_positions"],
+        )
+        await _append_override_event(conn, "strategy_override_set", actor, strategy_id, updates)
+    audit(
+        getattr(request.state, "principal", None),
+        "strategy_override_set",
+        strategy_id=strategy_id,
+        **updates,
+    )
+    await _reload_engine(request, actor)
+    return await get_strategy_risk_config(strategy_id, request)
+
+
+@router.delete("/config/{strategy_id}", response_model=StrategyRiskConfig)
+async def delete_strategy_risk_config(strategy_id: str, request: Request) -> dict[str, Any]:
+    """Clear one strategy's override; the global limits apply again after the reload.
+
+    Clearing matters: a stale row would keep clamping after the global limit loosens.
+    """
+    pool = require_pool(request)
+    actor = _actor(request)
+    async with (
+        db_errors_to_503("clearing strategy overrides"),
+        pool.acquire() as conn,
+        conn.transaction(),
+    ):
+        result = await conn.execute(
+            "DELETE FROM risk_config WHERE scope = $1", strategy_scope(strategy_id)
+        )
+        if str(result).strip() == "DELETE 0":
+            raise api_error(
+                404,
+                "strategy_override_not_found",
+                f"No stored override for strategy '{strategy_id}'",
+                "not_found",
+                strategy_id=strategy_id,
+            )
+        await _append_override_event(conn, "strategy_override_cleared", actor, strategy_id, {})
+    audit(
+        getattr(request.state, "principal", None),
+        "strategy_override_cleared",
         strategy_id=strategy_id,
     )
+    await _reload_engine(request, actor)
+    return await get_strategy_risk_config(strategy_id, request)
 
 
 @router.get("/live-status", response_model=RiskStatusLive)

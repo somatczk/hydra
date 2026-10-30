@@ -585,6 +585,24 @@ export function limitsOutcome(result: Result<unknown>): Outcome {
   return notConfirmed('the limits were saved', err);
 }
 
+/** The per-strategy override save/clear: the same reload-failure vocabulary as the global limits. */
+export function strategyOverrideOutcome(result: Result<unknown>, strategyId: string, action: 'save' | 'clear'): Outcome {
+  if ('ok' in result) return ok(action === 'save' ? `Override for ${strategyId} saved.` : `Override for ${strategyId} removed.`);
+  const err = result.err;
+  if (isSignedOut(err)) return signedOut('save again');
+  const d = parseErrorDetail(err);
+  if (d?.code === 'risk_reload_failed') {
+    return {
+      tone: 'danger',
+      title: 'Saved, but not in force.',
+      lines: ["The running engine didn't reload the override, so the previous limits are still enforced."],
+      actions: [retry],
+    };
+  }
+  if (d && !unreachable(err)) return { tone: 'danger', title: d.message, lines: [], actions: [], inline: d.state === 'invalid' };
+  return notConfirmed(action === 'save' ? 'the override was saved' : 'the override was removed', err);
+}
+
 /** R24: the live executors' failure copy — never 'Ask for a new one.' (a re-request would place a
  * second live order while the first may exist unwatched); null for every other action. */
 export function liveUnknownLine(action: string | undefined): string | null {
