@@ -125,6 +125,7 @@ async def pool(database_dsn: str) -> AsyncIterator[Any]:
     try:
         async with db_pool.acquire() as conn:
             await conn.execute("TRUNCATE ts.ohlcv_1m")
+            await conn.execute("TRUNCATE ts.funding_rates")
             await conn.execute("TRUNCATE backtest_results CASCADE")
             await conn.execute("TRUNCATE backtest_jobs CASCADE")
         yield db_pool
@@ -775,10 +776,11 @@ async def test_a_perp_backtest_job_runs_through_the_queue(
     assert persisted == len(result["trades"])
 
 
-async def test_a_futures_hyperopt_is_queued(
+async def test_a_futures_hyperopt_runs_through_the_queue(
     client: httpx.AsyncClient, pool: Any, strategies_dir: Path
 ) -> None:
     await _seed(pool, "binanceusdm", Timeframe.H1, _saw(H1_START, H1_COUNT, timedelta(hours=1)))
+    funding_rows = await _seed_perp_funding(pool, H1_COUNT // 8)
     _write_perp_strategy(strategies_dir, "perp-ho")
     resp = await client.post(
         "/api/backtest/hyperopt",
@@ -793,3 +795,16 @@ async def test_a_futures_hyperopt_is_queued(
         },
     )
     assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    assert await worker.run_once(pool) == task_id  # fetch_engine=None: stored funding only
+    progress = (await client.get(f"/api/backtest/hyperopt/{task_id}")).json()
+    assert progress["status"] == "completed", progress
+
+    # the optimizer jobs get the plain backtest's funding preflight: the trials accrue
+    # only from the stored rows, and the run's detail records what was loaded
+    async with pool.acquire() as conn:
+        detail = await conn.fetchrow("SELECT detail FROM backtest_jobs WHERE id = $1", task_id)
+    job_detail = detail["detail"]
+    if isinstance(job_detail, str):
+        job_detail = json.loads(job_detail)
+    assert job_detail["funding"] == {"state": "fetch_skipped", "rows_loaded": funding_rows}

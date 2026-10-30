@@ -907,8 +907,7 @@ class PerpPaperTradingExecutor:
             held = _ZERO if pos is None else abs(pos.qty)
             check_qty = min(order.quantity, held)
             if check_qty <= 0:
-                # nothing left to reduce (the position was liquidated under it): the
-                # order is dropped with a CANCELLED record so tracking sees it go
+                # nothing left to reduce — dropped with a CANCELLED record so tracking sees it go
                 self._remove_order(order)
                 return PaperFill(
                     order_id=order.order_id,

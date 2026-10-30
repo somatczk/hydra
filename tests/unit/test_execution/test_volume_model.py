@@ -254,6 +254,33 @@ class TestSpotRestingSlices:
         assert await ex.fetch_open_orders(BTC) == []
         assert ex.get_account_snapshot().quote_locked == D("0")
 
+    async def test_a_resting_stop_over_a_zero_volume_bar_stays_resting(self) -> None:
+        ex = await spot_long("10")
+        await ex.create_order(BTC, "SELL", "STOP_MARKET", D("10"), stop_price=D("95"))
+
+        # gaps under the stop with nothing traded: the trigger fires but slices 0 of it
+        assert await ex.on_closed_bar(BTC, falling(1, "94", "0")) == []
+        [(order)] = await ex.fetch_open_orders(BTC)
+        assert (order["type"], order["amount"]) == ("STOP_MARKET", 10.0)
+        snap = ex.get_account_snapshot()
+        assert (snap.quote_locked, snap.base_totals["BTC"]) == (D("0"), D("10"))
+        assert ex._ledger.get_locked("BTC") == D("10")
+        assert await ex.fetch_balance() == {"USDT": D("98997.999")}
+
+        # a volume-bearing bar later fills the same order: 2 of 10 at 93 slipped 0.1 %
+        (fill,) = await ex.on_closed_bar(BTC, falling(2, "93", "20"))
+        assert (fill.quantity, fill.price, fill.reason, fill.liquidity) == (
+            D("2"),
+            D("92.907"),
+            "stop_loss",
+            "taker",
+        )
+        [(order)] = await ex.fetch_open_orders(BTC)
+        assert (order["id"], order["amount"]) == (fill.order_id, 8.0)
+        assert ex._ledger.get_locked("BTC") == D("8")
+        assert ex.get_account_snapshot().base_totals["BTC"] == D("8")
+        assert await ex.fetch_balance() == {"USDT": D("99183.627186")}
+
 
 class TestPerpMarketCap:
     async def test_a_perp_market_buy_fills_the_slice_and_cancels_the_remainder(self) -> None:
@@ -350,3 +377,42 @@ class TestPerpRestingSlices:
         assert (fill.quantity, fill.side) == (D("4"), "SELL")
         assert await ex.fetch_open_orders(BTC) == []
         assert ex.get_account_snapshot().base_totals["BTC"] == 0
+
+    async def test_a_perp_resting_stop_over_a_zero_volume_bar_stays_resting(self) -> None:
+        ex = await perp_long("10")
+        await ex.create_order(
+            BTC,
+            "SELL",
+            "STOP_MARKET",
+            D("10"),
+            stop_price=D("95"),
+            params={"reduce_only": True},
+        )
+
+        # triggers under the stop, nothing traded: no slice, the position untouched
+        assert await ex.on_closed_bar(BTC, falling(1, "94", "0")) == []
+        [(order)] = await ex.fetch_open_orders(BTC)
+        assert (order["type"], order["amount"]) == ("STOP_MARKET", 10.0)
+        snap = ex.get_account_snapshot()
+        assert (snap.wallet_available, snap.margin_used, snap.base_totals["BTC"]) == (
+            D("98997.999"),
+            D("1001.000"),
+            D("10"),
+        )
+
+        # a volume-bearing bar later fills the same order: 2 of 10 at 93 slipped 0.1 %
+        (fill,) = await ex.on_closed_bar(BTC, falling(2, "93", "20"))
+        assert (fill.quantity, fill.price, fill.reason, fill.liquidity) == (
+            D("2"),
+            D("92.907"),
+            "stop_loss",
+            "taker",
+        )
+        [(order)] = await ex.fetch_open_orders(BTC)
+        assert (order["id"], order["amount"]) == (fill.order_id, 8.0)
+        snap = ex.get_account_snapshot()
+        assert (snap.wallet_available, snap.margin_used, snap.base_totals["BTC"]) == (
+            D("99183.627186"),
+            D("800.800"),
+            D("8"),
+        )
