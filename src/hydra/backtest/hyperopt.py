@@ -22,6 +22,7 @@ import itertools
 import json
 import logging
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -40,6 +41,7 @@ from hydra.backtest.validation import (
     probabilistic_sharpe,
 )
 from hydra.core.types import OHLCV, Timeframe
+from hydra.execution.perp_trading import FundingRow
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.builtin.ml_ensemble import STRATEGY_CLASS as ML_NATIVE_CLASS
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy, bindable_params, param_bindings
@@ -370,6 +372,7 @@ class HyperoptRunner:
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
         on_trial_complete: Any = None,
+        funding: Mapping[str, Sequence[FundingRow]] | None = None,
     ) -> HyperoptResult:
         """Optimise on the first 80 % of ``bars`` and re-run the best config on the rest.
 
@@ -396,6 +399,7 @@ class HyperoptRunner:
             symbol=symbol,
             timeframe=timeframe,
             on_trial_complete=on_trial_complete,
+            funding=funding,
         )
         result.train_start = train_bars[0].timestamp
         result.train_end = train_bars[-1].timestamp
@@ -418,6 +422,7 @@ class HyperoptRunner:
             symbol=symbol,
             timeframe=timeframe,
             warmup_bars=len(warm),
+            funding=funding,
         )
         result.holdout_psr = probabilistic_sharpe(
             daily_returns(result.holdout.equity_curve, result.holdout.timestamps)
@@ -436,6 +441,7 @@ class HyperoptRunner:
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
         on_trial_complete: Any = None,
+        funding: Mapping[str, Sequence[FundingRow]] | None = None,
     ) -> HyperoptResult:
         """Run the trial loop over ``bars`` (no holdout split).
 
@@ -460,6 +466,7 @@ class HyperoptRunner:
                 symbol=symbol,
                 timeframe=timeframe,
                 on_trial_complete=on_trial_complete,
+                funding=funding,
             )
 
         return await self._run_grid(
@@ -472,6 +479,7 @@ class HyperoptRunner:
             symbol=symbol,
             timeframe=timeframe,
             on_trial_complete=on_trial_complete,
+            funding=funding,
         )
 
     # ------------------------------------------------------------------
@@ -489,6 +497,7 @@ class HyperoptRunner:
         symbol: str,
         timeframe: Timeframe,
         on_trial_complete: Any,
+        funding: Mapping[str, Sequence[FundingRow]] | None,
     ) -> HyperoptResult:
         try:
             import optuna
@@ -521,6 +530,7 @@ class HyperoptRunner:
                 symbol=symbol,
                 timeframe=timeframe,
                 cache=cache,
+                funding=funding,
             )
             if outcome.status == "ok":
                 study.tell(trial, outcome.sharpe)
@@ -566,6 +576,7 @@ class HyperoptRunner:
         symbol: str,
         timeframe: Timeframe,
         on_trial_complete: Any,
+        funding: Mapping[str, Sequence[FundingRow]] | None,
     ) -> HyperoptResult:
         combinations = param_space.grid_combinations()
         total = min(len(combinations), max_trials)
@@ -584,6 +595,7 @@ class HyperoptRunner:
                 symbol=symbol,
                 timeframe=timeframe,
                 cache=cache,
+                funding=funding,
             )
             record = _record(trial_num, params, outcome)
             trial_records.append(record)
@@ -622,6 +634,7 @@ class HyperoptRunner:
         symbol: str,
         timeframe: Timeframe,
         cache: dict[str, _CachedTrial],
+        funding: Mapping[str, Sequence[FundingRow]] | None,
     ) -> tuple[_CachedTrial, BacktestResult | None]:
         """Backtest one parameter set (or reuse the cached outcome for a repeat).
 
@@ -646,6 +659,7 @@ class HyperoptRunner:
                 commission=self._commission,
                 symbol=symbol,
                 timeframe=timeframe,
+                funding=funding,
             )
         except Exception as exc:
             logger.debug("Trial with params %s failed", params, exc_info=True)

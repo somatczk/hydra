@@ -15,6 +15,7 @@ parameter set trades in-sample fails the whole run with an error naming the fold
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -32,6 +33,7 @@ from hydra.backtest.runner import BacktestRunner
 from hydra.backtest.validation import daily_returns, probabilistic_sharpe
 from hydra.core.types import OHLCV, Timeframe
 from hydra.data.bars import timeframe_seconds
+from hydra.execution.perp_trading import FundingRow
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.context import StrategyContext
@@ -169,6 +171,7 @@ class WalkForwardAnalyzer:
         anchored: bool = False,
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
+        funding: Mapping[str, Sequence[FundingRow]] | None = None,
     ) -> WalkForwardResult:
         """Run exactly ``fold_count`` walk-forward folds over ``bars``.
 
@@ -178,6 +181,8 @@ class WalkForwardAnalyzer:
         up from the train tail. Rolling windows step by the out-of-sample length.
         ``max_trials`` caps the trials per fold (grid search is additionally capped by
         the true combination count). A range too short for the folds gives no folds.
+        ``funding`` is the full-window perp funding mapping: every run's executor accrues
+        only the rows inside its own bars, so fold windows never share a settlement.
         """
         empty = WalkForwardResult(anchored=anchored)
         if not bars:
@@ -212,6 +217,7 @@ class WalkForwardAnalyzer:
                     max_trials=max_trials,
                     symbol=symbol,
                     timeframe=timeframe,
+                    funding=funding,
                 )
             except NoEligibleTrialError as exc:
                 raise ValueError(f"fold {fold_idx}: no parameter set traded in-sample") from exc
@@ -232,6 +238,7 @@ class WalkForwardAnalyzer:
                 symbol=symbol,
                 timeframe=timeframe,
                 warmup_bars=len(warm),
+                funding=funding,
             )
 
             folds.append(

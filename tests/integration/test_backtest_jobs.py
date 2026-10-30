@@ -775,10 +775,10 @@ async def test_a_perp_backtest_job_runs_through_the_queue(
     assert persisted == len(result["trades"])
 
 
-async def test_a_spot_hyperopt_still_refuses_futures_strategies(
+async def test_a_futures_hyperopt_is_queued(
     client: httpx.AsyncClient, pool: Any, strategies_dir: Path
 ) -> None:
-    await _seed_hourly(pool)
+    await _seed(pool, "binanceusdm", Timeframe.H1, _saw(H1_START, H1_COUNT, timedelta(hours=1)))
     _write_perp_strategy(strategies_dir, "perp-ho")
     resp = await client.post(
         "/api/backtest/hyperopt",
@@ -792,5 +792,4 @@ async def test_a_spot_hyperopt_still_refuses_futures_strategies(
             "end_date": "2026-01-31",
         },
     )
-    assert resp.status_code == 422
-    assert "plain backtests only" in resp.text
+    assert resp.status_code == 202, resp.text

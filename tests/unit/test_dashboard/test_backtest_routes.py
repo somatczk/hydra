@@ -207,14 +207,14 @@ class TestLoadBacktestStrategy:
         assert exc.value.status_code == 422
         assert "not supported by the backtester" in exc.value.detail["message"]
 
-    def test_futures_is_422(self, strategies_dir: Path) -> None:
+    def test_futures_loads_for_every_job_kind(self, strategies_dir: Path) -> None:
         _write_strategy(
-            strategies_dir, "perp", exchange={"exchange_id": "binance", "market_type": "FUTURES"}
+            strategies_dir,
+            "perp",
+            exchange={"exchange_id": "binanceusdm", "market_type": "FUTURES"},
         )
-        with pytest.raises(ServiceError) as exc:
-            _load_backtest_strategy("perp")
-        assert exc.value.status_code == 422
-        assert "futures" in exc.value.detail["message"]
+        _, config = _load_backtest_strategy("perp")
+        assert config.exchange.market_type == "FUTURES"
 
     def test_malformed_config_is_422(self, strategies_dir: Path) -> None:
         _write_strategy(strategies_dir, "broken", symbols=5)
