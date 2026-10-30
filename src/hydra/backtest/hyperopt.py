@@ -32,7 +32,7 @@ import numpy as np
 
 from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.metrics import BacktestResult
-from hydra.backtest.runner import BacktestRunner
+from hydra.backtest.runner import BacktestRunner, strategy_warmup
 from hydra.backtest.validation import (
     daily_returns,
     deflated_sharpe,
@@ -47,7 +47,6 @@ from hydra.strategy.builtin.ml_ensemble import STRATEGY_CLASS as ML_NATIVE_CLASS
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy, bindable_params, param_bindings
 from hydra.strategy.condition_schema import RuleSet
 from hydra.strategy.config import StrategyConfig
-from hydra.strategy.context import StrategyContext
 
 if TYPE_CHECKING:
     import optuna as _optuna_type
@@ -296,6 +295,8 @@ class HyperoptResult:
                 "total_return": float(self.holdout.total_return),
                 "max_drawdown": float(self.holdout.max_drawdown),
                 "total_trades": self.holdout.total_trades,
+                "benchmark_return": float(self.holdout.benchmark_return),
+                "benchmark_sharpe": self.holdout.benchmark_sharpe,
             }
         return {
             "best_params": self.best_params,
@@ -414,10 +415,7 @@ class HyperoptRunner:
         best_config = base_config.model_copy(
             update={"parameters": {**base_config.parameters, **result.best_params}}
         )
-        required_history = int(
-            strategy_class(config=best_config, context=StrategyContext()).required_history
-        )
-        warm = train_bars[-required_history:] if required_history > 0 else []
+        warm = train_bars[max(len(train_bars) - strategy_warmup(strategy_class, best_config), 0) :]
         result.holdout = await self._runner.run(
             strategy_class=strategy_class,
             strategy_config=best_config,
@@ -449,11 +447,15 @@ class HyperoptRunner:
         on_trial_complete: Any = None,
         funding: Mapping[str, Sequence[FundingRow]] | None = None,
         extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None = None,
+        lead_bars: Sequence[OHLCV] = (),
     ) -> HyperoptResult:
         """Run the trial loop over ``bars`` (no holdout split).
 
         The walk-forward analyser calls this once per fold on the fold's in-sample
-        window. Raises NoEligibleTrialError when no trial completes with a trade.
+        window. Every trial measures only the bars its strategy can trade: its warm-up
+        comes from the tail of ``lead_bars`` (bars just before ``bars``) and, for what
+        they cannot cover, from the start of ``bars``. Raises NoEligibleTrialError when no
+        trial completes with a trade.
         """
         if not bars:
             return HyperoptResult()
@@ -475,6 +477,7 @@ class HyperoptRunner:
                 on_trial_complete=on_trial_complete,
                 funding=funding,
                 extra_bars=extra_bars,
+                lead_bars=lead_bars,
             )
 
         return await self._run_grid(
@@ -489,6 +492,7 @@ class HyperoptRunner:
             on_trial_complete=on_trial_complete,
             funding=funding,
             extra_bars=extra_bars,
+            lead_bars=lead_bars,
         )
 
     # ------------------------------------------------------------------
@@ -508,6 +512,7 @@ class HyperoptRunner:
         on_trial_complete: Any,
         funding: Mapping[str, Sequence[FundingRow]] | None,
         extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None,
+        lead_bars: Sequence[OHLCV],
     ) -> HyperoptResult:
         try:
             import optuna
@@ -542,6 +547,7 @@ class HyperoptRunner:
                 cache=cache,
                 funding=funding,
                 extra_bars=extra_bars,
+                lead_bars=lead_bars,
             )
             if outcome.status == "ok":
                 study.tell(trial, outcome.sharpe)
@@ -589,6 +595,7 @@ class HyperoptRunner:
         on_trial_complete: Any,
         funding: Mapping[str, Sequence[FundingRow]] | None,
         extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None,
+        lead_bars: Sequence[OHLCV],
     ) -> HyperoptResult:
         combinations = param_space.grid_combinations()
         total = min(len(combinations), max_trials)
@@ -609,6 +616,7 @@ class HyperoptRunner:
                 cache=cache,
                 funding=funding,
                 extra_bars=extra_bars,
+                lead_bars=lead_bars,
             )
             record = _record(trial_num, params, outcome)
             trial_records.append(record)
@@ -649,12 +657,14 @@ class HyperoptRunner:
         cache: dict[str, _CachedTrial],
         funding: Mapping[str, Sequence[FundingRow]] | None,
         extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None,
+        lead_bars: Sequence[OHLCV],
     ) -> tuple[_CachedTrial, BacktestResult | None]:
         """Backtest one parameter set (or reuse the cached outcome for a repeat).
 
         The trial config is a full copy of the base config with only ``parameters``
         merged, so position_sizing, filters, risk, schedule, ml_overlay and enabled
-        stay exactly as the operator wrote them (BT-8).
+        stay exactly as the operator wrote them (BT-8). The trial's own warm-up (its
+        override headroom included) is replayed but never scored.
         """
         key = json.dumps(params, sort_keys=True, default=str)
         cached = cache.get(key)
@@ -665,14 +675,16 @@ class HyperoptRunner:
         trial_config = base_config.model_copy(update={"parameters": merged_params})
 
         try:
+            warmup = strategy_warmup(strategy_class, trial_config)
             result = await self._runner.run(
                 strategy_class=strategy_class,
                 strategy_config=trial_config,
-                bars=bars,
+                bars=[*lead_bars[max(len(lead_bars) - warmup, 0) :], *bars],
                 initial_capital=initial_capital,
                 commission=self._commission,
                 symbol=symbol,
                 timeframe=timeframe,
+                warmup_bars=warmup,
                 funding=funding,
                 extra_bars=extra_bars,
             )

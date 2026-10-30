@@ -26,6 +26,12 @@ Test files without a `tests/` prefix are in `tests/unit/test_backtest/`.
   protective exits are the paper session's code; an in-memory `RiskService` runs on bar time with the drawdown
   tiers off; metric writes are muted. Never add a backtest-only fill path
   (`test_execution_parity.py`, `test_perp_backtest.py::test_perp_paper_equals_perp_backtest_on_the_same_bars`).
+- A run scores only the bars its strategy can trade: the warm-up (`runner.strategy_warmup`, the instance's
+  `required_history`, override headroom included) is replayed with `warmup_bars` but excluded from equity, metrics and
+  the benchmark. Plain backtests, hyperopt trials and walk-forward in-sample trials pass it (in-sample trials warm from
+  the bars before the window when a rolling fold has them: `optimise(lead_bars=...)`); the holdout and OOS runs warm
+  from the preceding window. A window the warm-up consumes whole is a `no_trades` trial. Never run with `warmup_bars=0`
+  on a strategy that gates on `required_history` (`test_warmup_convention.py`).
 - Metric definitions and undefined cases (None or 0, never inf) live only in the `metrics.py` docstring; change
   it with the code (`test_metrics.py`).
 - Hyperopt keeps a fixed final 20 % holdout (`HOLDOUT_FRACTION`) that no trial sees; crashing, idle and

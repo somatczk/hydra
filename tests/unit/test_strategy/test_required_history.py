@@ -68,6 +68,14 @@ class TestRulesRequiredHistory:
         )
         assert rules_required_history(RuleSet(**short_exit)) == 202
 
+    def test_keltner_needs_the_larger_of_its_ema_and_atr_windows_not_their_sum(self) -> None:
+        keltner = _rules(
+            _cond("close", {}, "greater_than", "keltner_upper:ema_period=30,atr_period=10")
+        )
+        assert rules_required_history(RuleSet(**keltner)) == max(3 * 30, 6 * 10) + 2
+        defaults = _rules(_cond("close", {}, "less_than", "keltner_lower"))
+        assert rules_required_history(RuleSet(**defaults)) == max(3 * 20, 6 * 10) + 2
+
     def test_an_unparsable_value_reference_raises(self) -> None:
         bad = _rules(_cond("close", {}, "greater_than", "sma:period=abc"))
         with pytest.raises(ValueError, match="abc"):

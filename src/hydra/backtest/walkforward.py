@@ -5,7 +5,9 @@ in-sample and one out-of-sample window in bars so the in-sample window plus
 ``fold_count`` out-of-sample windows tile the whole range. Per fold: optimise on the
 in-sample window with the caller's parameter space, freeze the best parameters, then run
 them out-of-sample warmed up with ``required_history`` in-sample bars (the warm-up bars
-only seed the context: no on_bar, no orders, no equity points). The out-of-sample
+only seed the context: no on_bar, no orders, no equity points). In-sample trials are
+warmed the same way: from the bars before the window (rolling folds after the first), else
+from the window's own first bars, so no run scores bars its strategy cannot trade. The out-of-sample
 equity curves are stitched with their timestamps and aggregated; the result carries the
 probabilistic Sharpe of the stitched curve and the OOS/IS efficiency. Rolling (default)
 and anchored (IS always starts at bar 0) windows are supported. A fold in which no
@@ -29,14 +31,13 @@ from hydra.backtest.hyperopt import (
     ParameterSpace,
 )
 from hydra.backtest.metrics import BacktestResult, calculate_metrics
-from hydra.backtest.runner import BacktestRunner
+from hydra.backtest.runner import BacktestRunner, strategy_warmup
 from hydra.backtest.validation import daily_returns, probabilistic_sharpe
 from hydra.core.types import OHLCV, Timeframe
 from hydra.data.bars import timeframe_seconds
 from hydra.execution.perp_trading import FundingRow
 from hydra.strategy.base import BaseStrategy
 from hydra.strategy.config import StrategyConfig
-from hydra.strategy.context import StrategyContext
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,8 @@ class WalkForwardResult:
                 "out_of_sample_return": float(f.out_of_sample_metrics.total_return),
                 "out_of_sample_drawdown": float(f.out_of_sample_metrics.max_drawdown),
                 "out_of_sample_trades": f.out_of_sample_metrics.total_trades,
+                "out_of_sample_benchmark_return": float(f.out_of_sample_metrics.benchmark_return),
+                "out_of_sample_benchmark_sharpe": f.out_of_sample_metrics.benchmark_sharpe,
                 "selected_params": f.selected_params,
                 "n_trials": f.n_trials,
                 "is_start": _iso(f.is_start),
@@ -221,6 +224,7 @@ class WalkForwardAnalyzer:
                     timeframe=timeframe,
                     funding=funding,
                     extra_bars=extra_bars,
+                    lead_bars=bars[:is_start_idx],
                 )
             except NoEligibleTrialError as exc:
                 raise ValueError(f"fold {fold_idx}: no parameter set traded in-sample") from exc
@@ -228,10 +232,7 @@ class WalkForwardAnalyzer:
             best_config = strategy_config.model_copy(
                 update={"parameters": {**strategy_config.parameters, **best.best_params}}
             )
-            required_history = int(
-                strategy_class(config=best_config, context=StrategyContext()).required_history
-            )
-            warm = bars[max(0, is_end - required_history) : is_end] if required_history > 0 else []
+            warm = bars[max(0, is_end - strategy_warmup(strategy_class, best_config)) : is_end]
             oos_result = await self._runner.run(
                 strategy_class=strategy_class,
                 strategy_config=best_config,

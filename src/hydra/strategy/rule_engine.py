@@ -49,6 +49,13 @@ bring an EMA within 0.1 % of its value on unlimited history; a Wilder average (a
 the span of a 2N-1 EMA) needs six windows for about 1 %, and ADX, a Wilder average of DX
 whose first value comes two windows in, needs eight."""
 
+PARAM_MULTIPLE: dict[str, dict[str, int]] = {
+    name: {"ema_period": 3, "atr_period": 6} for name in ("keltner_upper", "keltner_lower")
+}
+"""Per-window multiples for an indicator that runs independent smoothers side by side: Keltner's
+EMA needs three spans and its ATR six, and they converge in parallel, so the lookback is the
+larger of the two, not their sum times six."""
+
 
 def _get_indicator_values(
     ctx: StrategyContext,
@@ -167,12 +174,16 @@ def indicator_lookback(name: str, params: Mapping[str, object]) -> int:
     func = getattr(ind_lib, name, None)
     if not inspect.isfunction(func):
         return 0
+    per_param = PARAM_MULTIPLE.get(name)
     window = 0
     for key, param in inspect.signature(func).parameters.items():
         value = params.get(key, param.default)
         if param.annotation in (int, "int") and type(value) is int:
-            window += value
-    return window * WINDOW_MULTIPLE.get(name, 1) + 2
+            if per_param is None:
+                window += value
+            else:
+                window = max(window, value * per_param.get(key, 1))
+    return (window if per_param else window * WINDOW_MULTIPLE.get(name, 1)) + 2
 
 
 def rules_required_history(rules: RuleSet) -> int:

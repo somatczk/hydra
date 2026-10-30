@@ -47,7 +47,7 @@ Test files without a `tests/` prefix are in `tests/unit/test_strategy/`.
 - `StrategyContext` caches indicator arrays per (symbol, timeframe, name, params) and drops them in `add_bar`; bars
   written any other way would serve stale indicators.
 - Builder and MCP saves write `required_history` from `rule_engine.rules_required_history`: the longest indicator
-  lookback over every condition and value reference (EMA windows x3, Wilder smoothers x6, ADX x8), at least 50. An
+  lookback over every condition and value reference (EMA windows x3, Wilder smoothers x6, ADX x8; Keltner the larger of its EMA x3 and ATR x6), at least 50. An
   update re-derives it and keeps a larger stored value; a YAML import keeps its own. Every shipped rule config
   declares at least its derived value (`tests/unit/test_strategy/test_required_history.py`,
   `tests/unit/test_strategy/test_shipped_configs.py`). A new indicator needs its lookback there.

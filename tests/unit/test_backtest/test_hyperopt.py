@@ -223,10 +223,10 @@ async def test_optimiser_never_sees_the_holdout() -> None:
         max_trials=5,
     )
 
-    # 400 trial bars + 100 holdout bars; the 10 warm-up bars never reach on_bar
-    assert len(_RecordingStrategy.seen) == 500
-    assert all(ts < bars[400].timestamp for ts in _RecordingStrategy.seen[:400])
-    assert all(ts >= bars[400].timestamp for ts in _RecordingStrategy.seen[400:])
+    # the trial replays 400 train bars minus its 10 warm-up bars, the holdout run 100 bars
+    assert len(_RecordingStrategy.seen) == 490
+    assert all(ts < bars[400].timestamp for ts in _RecordingStrategy.seen[:390])
+    assert all(ts >= bars[400].timestamp for ts in _RecordingStrategy.seen[390:])
     # the holdout run starts with the 10 train-tail bars already in its context
     assert _RecordingStrategy.first_context == [bars[0].timestamp, bars[390].timestamp]
     assert result.train_start == bars[0].timestamp

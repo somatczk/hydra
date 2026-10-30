@@ -188,6 +188,9 @@ class HyperoptHoldoutResponse(BaseModel):
     total_return: float
     max_drawdown: float
     total_trades: int
+    # buy-and-hold over the same traded bars; absent on results stored before this field
+    benchmark_return: float | None = None
+    benchmark_sharpe: float | None = None
 
 
 class HyperoptResultResponse(BaseModel):
@@ -386,6 +389,8 @@ class FoldMetricsResponse(BaseModel):
     out_of_sample_return: float
     out_of_sample_drawdown: float
     out_of_sample_trades: int
+    out_of_sample_benchmark_return: float | None = None
+    out_of_sample_benchmark_sharpe: float | None = None
     selected_params: dict[str, Any] = Field(default_factory=dict)
     n_trials: int = 0
     is_start: datetime | None = None

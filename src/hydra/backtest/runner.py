@@ -71,6 +71,15 @@ for _name in (
     logging.getLogger(_name).addFilter(_QuietWhileMuted())
 
 
+def strategy_warmup(strategy_class: type[BaseStrategy], config: StrategyConfig) -> int:
+    """The bars ``config`` needs before it can trade: its instance's ``required_history``.
+
+    It includes a rule-based strategy's per-trial override headroom, so it is the one
+    number every run uses both to size the context and to keep warm-up out of the metrics.
+    """
+    return int(strategy_class(config=config, context=StrategyContext()).required_history)
+
+
 class StrategyError(RuntimeError):
     """The strategy raised during the run; the backtest has no result."""
 
@@ -100,6 +109,10 @@ class BacktestRunner:
         extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None = None,
     ) -> BacktestResult:
         """Replay ``bars[warmup_bars:]``; the first ``warmup_bars`` only seed the context.
+
+        Metrics, equity and the benchmark cover the replayed bars only, so a caller with no
+        bars before its window passes ``strategy_warmup`` as ``warmup_bars``; a window the
+        warm-up consumes whole returns an empty result with no trades.
 
         Equity has one point per traded primary bar (the last after the end-of-data
         close-out) and ``Trade.pnl`` is net of both fees. Raises StrategyError when the
@@ -192,9 +205,7 @@ class BacktestRunner:
                 clients=ClientFactory(),
                 hydra_config=_ENGINE_CONFIG,
                 db_pool=None,
-                required_history=int(
-                    strategy_class(config=cfg, context=StrategyContext()).required_history
-                ),
+                required_history=strategy_warmup(strategy_class, cfg),
                 on_failure=on_failure,
                 clock=lambda: now[0].timestamp(),
             )
