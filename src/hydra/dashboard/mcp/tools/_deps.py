@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+from decimal import Decimal
 from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -102,10 +103,20 @@ def invalid_arguments(exc: ValidationError) -> ToolError:
     )
 
 
+def _json_default(value: Any) -> Any:
+    """The tool-boundary egress rule: a Decimal renders as the same JSON number the
+    routes' float-typed response models serve (never a string); anything else stays str."""
+    if isinstance(value, Decimal):
+        return float(value)
+    return str(value)
+
+
 def json_text(value: Any) -> str:
     """One JSON text block for any tool result.
 
     The SDK splits a list result into one content block per item; serializing here
     keeps every call to exactly one block carrying the whole (list or dict) result.
+    ``_json_default`` is the egress contract: the backend's Decimal interior floats
+    here, exactly as the REST models float it.
     """
-    return json.dumps(value, indent=2, default=str)
+    return json.dumps(value, indent=2, default=_json_default)

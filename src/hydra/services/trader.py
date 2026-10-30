@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 _STORE_ERRORS: tuple[type[BaseException], ...] = (RiskStateUnavailableError, *DB_ERRORS)
 _CENTS = Decimal("0.01")
+_PCT4 = Decimal("0.0001")
+_HUNDRED = Decimal("100")
 
 
 @runtime_checkable
@@ -78,15 +80,11 @@ class TraderBackend(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _f(value: Decimal | None) -> float | None:
-    return None if value is None else float(value)
-
-
 def _restrictions(r: CircuitBreakerRestrictions) -> dict[str, Any]:
     return {
         "active_tier": r.tier,
         "can_open_new_trades": r.can_open_new_trades,
-        "size_multiplier": float(r.position_size_multiplier),
+        "size_multiplier": r.position_size_multiplier,
         "must_flatten": r.must_flatten,
         "is_shutdown": r.is_shutdown,
         "daily_halt_until": r.daily_halt_until,
@@ -95,13 +93,13 @@ def _restrictions(r: CircuitBreakerRestrictions) -> dict[str, Any]:
 
 
 def _breakers(svc: RiskService) -> list[dict[str, Any]]:
-    drawdown_pct = round(float(svc.account().drawdown) * 100, 2)
+    drawdown_pct = (svc.account().drawdown * _HUNDRED).quantize(_CENTS)
     return [
         {
             "tier": b.tier,
             "label": b.label,
-            "threshold": f"{float(b.threshold) * 100:.2f}% drawdown",
-            "threshold_pct": round(float(b.threshold) * 100, 4),
+            "threshold": f"{(b.threshold * _HUNDRED).quantize(_CENTS)}% drawdown",
+            "threshold_pct": (b.threshold * _HUNDRED).quantize(_PCT4),
             "current_value": drawdown_pct,
             "status": b.status,
             "active_since": b.active_since,
@@ -112,7 +110,13 @@ def _breakers(svc: RiskService) -> list[dict[str, Any]]:
 
 
 def _account_fields(svc: RiskService) -> dict[str, Any]:
-    """The RiskStatus-shaped fields of one scope's service (drawdown, daily loss, tiers)."""
+    """The RiskStatus-shaped fields of one scope's service (drawdown, daily loss, tiers).
+
+    The percent derivations are exact Decimal math quantized at the cent — a hostile
+    half (0.02675 -> 2.68) no longer lands on the float product's wrong side — and the
+    dict carries Decimals that every egress floats: the routes' float-typed response
+    models, the trader server's JSON encoder and the MCP tools' dump.
+    """
     view = svc.account()
     cfg = view.config
     start = view.day_start_equity
@@ -122,15 +126,15 @@ def _account_fields(svc: RiskService) -> dict[str, Any]:
         else None
     )
     return {
-        "current_drawdown": round(float(view.drawdown) * 100, 2),
-        "max_drawdown_limit": float(cfg.max_drawdown_pct) * 100,
-        "daily_loss": None if daily_loss is None else round(float(daily_loss), 2),
+        "current_drawdown": (view.drawdown * _HUNDRED).quantize(_CENTS),
+        "max_drawdown_limit": (cfg.max_drawdown_pct * _HUNDRED).quantize(_CENTS),
+        "daily_loss": None if daily_loss is None else daily_loss.quantize(_CENTS),
         "daily_loss_limit": (
-            None if start is None else round(float(start * cfg.max_daily_loss_pct), 2)
+            None if start is None else (start * cfg.max_daily_loss_pct).quantize(_CENTS)
         ),
-        "equity": _f(view.equity),
-        "peak_equity": _f(view.peak_equity),
-        "day_start_equity": _f(start),
+        "equity": view.equity,
+        "peak_equity": view.peak_equity,
+        "day_start_equity": start,
         "consecutive_losses": view.consecutive_losses,
         "max_consecutive_losses": cfg.max_consecutive_losses,
         "circuit_breakers": _breakers(svc),

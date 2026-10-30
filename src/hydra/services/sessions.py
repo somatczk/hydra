@@ -165,7 +165,7 @@ def session_to_dict(session: Any, *, reconcile_state: str | None = None) -> dict
         "exchange_id": session.exchange_id,
         "symbols": session.symbols,
         "timeframe": session.timeframe,
-        "paper_capital": float(session.paper_capital) if session.paper_capital else None,
+        "paper_capital": session.paper_capital or None,
         "started_at": session.started_at.isoformat() if session.started_at else None,
         "stopped_at": session.stopped_at.isoformat() if session.stopped_at else None,
         "error_message": session.error_message,
@@ -563,20 +563,22 @@ async def _live_order_rows(mgr: Any, session: Any) -> list[LiveOrderRecord]:
 
 
 def live_order_row(row: LiveOrderRecord) -> dict[str, Any]:
-    """One tracked live order in the pinned seam #2 shape (16 fields)."""
+    """One tracked live order in the pinned seam #2 shape (16 fields).
+
+    The numeric fields pass through as the store's exact Decimals; every egress floats
+    them (the route's model fields, the trader server's encoder, the MCP tools' dump).
+    """
     return {
         "client_order_id": row.client_order_id,
         "exchange_order_id": row.exchange_order_id,
         "symbol": row.symbol,
         "side": row.side,
         "order_type": row.order_type,
-        "quantity": float(row.quantity),
-        "price": None if row.price is None else float(row.price),
-        "stop_price": None if row.stop_price is None else float(row.stop_price),
-        "filled_quantity": float(row.filled_quantity),
-        "average_fill_price": (
-            None if row.average_fill_price is None else float(row.average_fill_price)
-        ),
+        "quantity": row.quantity,
+        "price": row.price,
+        "stop_price": row.stop_price,
+        "filled_quantity": row.filled_quantity,
+        "average_fill_price": row.average_fill_price,
         "status": row.status.value,
         "tag": row.tag,
         "actor": row.actor,
@@ -912,12 +914,12 @@ async def submit_manual_order(mgr: Any, order: QuickTradeRequest) -> dict[str, A
         "symbol": order.symbol,
         "side": side.value,
         "order_type": order.order_type,
-        "quantity": float(result.quantity),
-        "price": float(order.price) if order.price is not None else None,
+        "quantity": result.quantity,
+        "price": order.price,
         "status": result.status,
         "protection": result.protection,
         "protective_order_id": result.protective_order_id,
         "exit_orders_deferred": side == Side.BUY and result.protection == "pending",
-        "fill_price": float(result.fill_price) if result.fill_price is not None else None,
+        "fill_price": result.fill_price,
         "mark_source": result.mark_source,
     }

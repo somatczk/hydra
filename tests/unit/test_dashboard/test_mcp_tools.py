@@ -457,6 +457,21 @@ def test_engine_state_falls_back_to_the_imported_module_app(
     assert _deps.db_pool() is sentinel
 
 
+def test_json_text_renders_decimals_as_json_numbers() -> None:
+    """P7-B4: the tool-boundary egress floats a Decimal (the routes' float-typed
+    contract, byte-identical to a float interior) — never a JSON string."""
+    body = {"quantity": Decimal("0.5"), "fill_price": Decimal("100.1"), "price": None}
+
+    payload = json.loads(_deps.json_text(body))
+
+    assert (payload["quantity"], payload["fill_price"], payload["price"]) == (
+        0.5,
+        100.1,
+        None,
+    )
+    assert isinstance(payload["fill_price"], float)
+
+
 def test_tools_list_advertises_the_42_tools(mcp: _McpClient) -> None:
     names = {tool["name"] for tool in mcp.list_tools()}
     assert names == B1_TOOLS | B2_TOOLS | LIVE_TOOLS | MODEL_TOOLS
