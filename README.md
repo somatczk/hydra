@@ -325,7 +325,7 @@ Each PR that changes one of these rows updates the row.
 ## Roadmap
 
 Hydra is being rebuilt in phases, each ending in a release. All planned phases have shipped; the current release is
-2.9.0.
+2.9.1.
 
 | Phase | Release | What it delivered |
 |-------|---------|-------------------|
@@ -338,6 +338,7 @@ Hydra is being rebuilt in phases, each ending in a release. All planned phases h
 | P4 Perps | 2.8.0 | Binance USD⌂-M perps end to end: paper sessions and backtests (isolated margin, 1-3x leverage, long and short, funding from settled rates, liquidation), the separate perps arming ceremony, the live perps executor. |
 | P5 ML | 2.8.0 | The honest dataset and walk-forward training, the versioned model registry, the training job and ONNX export, the ML veto overlay and the ML-native strategy, drift detection, the Models page. |
 | Research hardening | 2.9.0 | Regime and momentum indicators (ADX, rate of change, lagged close, Bollinger width, ATR %, Donchian highs and lows), computed vectorised; entry schedules; explicit parameter bindings whose tuned values round-trip through the builder; warm-up history derived from the rules; several backtest workers sharing one queue and fetching each dataset once; walk-forward folds that mean what they say; model registry tools over MCP and version-pinned research runs; the agent instructions and this README. |
+| Perp research | 2.9.1 | Hyperopt and walk-forward for USD⌂-M perp strategies, with settled funding charged in every trial, holdout and fold. |
 
 **Deferred and known gaps** (the [Status](#status) table has the full list):
 
