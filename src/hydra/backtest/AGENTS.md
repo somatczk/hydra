@@ -52,8 +52,10 @@ Test files without a `tests/` prefix are in `tests/unit/test_backtest/`.
   `::test_a_worker_whose_lease_expired_abandons_the_running_job`). `WORKER_ID` must be unique per live worker.
 - The worker never migrates; it waits for the Alembic head (`tests/integration/test_backtest_jobs.py::test_worker_waits_for_schema`).
   `python -m hydra.backtest.worker check` (the healthcheck) passes while the heartbeat file is at most 90 s old.
-- USD-M perp strategies run as plain backtests only; hyperopt and walk-forward refuse them
-  (`tests/integration/test_backtest_jobs.py::test_a_spot_hyperopt_still_refuses_futures_strategies`).
+- USD-M perp strategies run in every job kind: the worker's funding preflight (`worker._funding_preflight`) loads the
+  job window's rows once and hyperopt and walk-forward pass them to every runner call; the executor accrues only rows
+  inside each run's own bars (`tests/unit/test_backtest/test_perp_research.py`,
+  `tests/unit/test_services/test_research.py::test_hyperopt_and_walkforward_accept_a_futures_strategy`).
 
 ## Where things are
 

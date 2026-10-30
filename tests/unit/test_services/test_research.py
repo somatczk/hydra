@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
-from hydra.backtest.jobs import Preflight, WalkForwardRunRequest
+from hydra.backtest.jobs import HyperoptRunRequest, Preflight, WalkForwardRunRequest
 from hydra.core.types import Timeframe
 from hydra.services import research
 from hydra.services.errors import ServiceError
@@ -172,3 +173,55 @@ def test_strategy_params_seed_from_the_stored_top_level_values(strategies_dir: P
     assert params["rsi_low"]["max"] == 60
     # a non-numeric stored value falls back to the condition's own
     assert params["rsi_len"]["default"] == 14.0
+
+
+class _StoredBars:
+    """A repository stub: every window has dense stored bars, so only the strategy gate decides."""
+
+    @classmethod
+    def from_pool(cls, _pool: object) -> _StoredBars:
+        return cls()
+
+    async def get_bar_range(self, *_args: object) -> tuple[datetime, datetime, int]:
+        return datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 12, 31, tzinfo=UTC), 366
+
+
+async def test_hyperopt_and_walkforward_accept_a_futures_strategy(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = {
+        "id": "perp-x",
+        "name": "Perp",
+        "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        "symbols": ["BTCUSDT"],
+        "exchange": {"exchange_id": "binanceusdm", "market_type": "FUTURES", "leverage": 2},
+        "timeframes": {"primary": "1d"},
+        "parameters": {"rules": _SMA_RULES, "sma_period": 5},
+    }
+    (strategies_dir / "perp-x.yaml").write_text(yaml.safe_dump(config))
+    queued: list[tuple[str, str]] = []
+
+    async def enqueue(
+        _pool: object, kind: str, _body: object, strategy_config: Any, *_rest: object
+    ) -> str:
+        queued.append((kind, strategy_config["exchange"]["market_type"]))
+        return f"{kind}-1"
+
+    monkeypatch.setattr(research.jobs, "enqueue", enqueue)
+    monkeypatch.setattr("hydra.services.backtest.MarketDataRepository", _StoredBars)
+    space = [{"name": "sma_period", "type": "int", "low": 4, "high": 5}]
+
+    await research.submit_hyperopt(
+        object(),
+        HyperoptRunRequest.model_validate(
+            {
+                "strategy_id": "perp-x",
+                "param_space": space,
+                "max_trials": 2,
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+            }
+        ),
+    )
+    await research.submit_walkforward(object(), _wfo_body(strategy_id="perp-x"))
+    assert queued == [("hyperopt", "FUTURES"), ("walkforward", "FUTURES")]

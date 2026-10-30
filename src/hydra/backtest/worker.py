@@ -234,6 +234,27 @@ async def _ensure_bars(
 # ---------------------------------------------------------------------------
 
 
+async def _funding_preflight(
+    pool: Any,
+    fetch_engine: OnDemandFetchService | None,
+    config: StrategyConfig,
+    body: BacktestRunRequest | HyperoptRunRequest | WalkForwardRunRequest,
+    run: JobRun,
+) -> dict[str, list[Any]] | None:
+    """A FUTURES config's funding rows for the job window, recorded on the run; None for spot."""
+    if config.exchange.market_type is not MarketType.FUTURES:
+        return None
+    provider = fetch_engine.client_provider() if fetch_engine is not None else None
+    funding, funding_state = await perp_funding.prepare_backtest_funding(
+        pool, provider, config.symbols[0], body.start_date, body.end_date
+    )
+    run.detail["funding"] = {
+        "state": funding_state,
+        "rows_loaded": sum(len(rows) for rows in funding.values()),
+    }
+    return funding
+
+
 async def run_backtest_job(
     pool: Any, fetch_engine: OnDemandFetchService | None, job: Mapping[str, Any], run: JobRun
 ) -> JobOutcome:
@@ -261,16 +282,7 @@ async def run_backtest_job(
     run.detail["provenance"] = {**jobs.provenance_payload(provenance, config), "ml_models": served}
     run.progress = 30.0
 
-    funding: dict[str, list[Any]] | None = None
-    if config.exchange.market_type is MarketType.FUTURES:
-        provider = fetch_engine.client_provider() if fetch_engine is not None else None
-        funding, funding_state = await perp_funding.prepare_backtest_funding(
-            pool, provider, config.symbols[0], body.start_date, body.end_date
-        )
-        run.detail["funding"] = {
-            "state": funding_state,
-            "rows_loaded": sum(len(rows) for rows in funding.values()),
-        }
+    funding = await _funding_preflight(pool, fetch_engine, config, body, run)
 
     def _report(pct: float) -> None:
         run.progress = round(30.0 + pct * 60.0, 1)
@@ -313,6 +325,7 @@ async def run_hyperopt_job(
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
     provenance_dict = {**jobs.provenance_payload(provenance, config), "ml_models": served}
     run.detail["provenance"] = provenance_dict
+    funding = await _funding_preflight(pool, fetch_engine, config, body, run)
 
     space = ParameterSpace(
         params=[
@@ -345,6 +358,7 @@ async def run_hyperopt_job(
             symbol=config.symbols[0],
             timeframe=config.timeframes.primary,
             on_trial_complete=_on_trial,
+            funding=funding,
         )
     payload = result.to_dict()
     payload["provenance"] = provenance_dict
@@ -363,6 +377,7 @@ async def run_walkforward_job(
     await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
     run.detail["provenance"] = {**jobs.provenance_payload(provenance, config), "ml_models": served}
+    funding = await _funding_preflight(pool, fetch_engine, config, body, run)
 
     windows = fold_windows(
         provenance.bar_count,
@@ -394,6 +409,7 @@ async def run_walkforward_job(
             anchored=body.anchored,
             symbol=config.symbols[0],
             timeframe=config.timeframes.primary,
+            funding=funding,
         )
     run.detail["fold_count"] = len(result.folds)
     return JobOutcome(result=result.to_dict())
