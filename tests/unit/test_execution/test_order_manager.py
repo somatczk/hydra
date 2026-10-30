@@ -239,16 +239,57 @@ class _Bus:
         self.events.append(event)
 
 
-def _flat(price: str, hour: int) -> OHLCV:
+def _flat(price: str, hour: int, volume: Decimal = Decimal("1000")) -> OHLCV:
     p = Decimal(price)
     return OHLCV(
         open=p,
         high=p,
         low=p,
         close=p,
-        volume=Decimal("1"),
+        volume=volume,
         timestamp=datetime(2026, 10, 20, hour, tzinfo=UTC),
     )
+
+
+class TestParticipationCappedMarketFill:
+    async def test_the_fill_event_carries_the_filled_slice(self) -> None:
+        ex = PaperTradingExecutor(initial_balances={"USDT": Decimal("10000")})
+        bus = _Bus()
+        om = OrderManager(ex, bus, session_id="s1")
+        await ex.on_closed_bar("BTCUSDT", _flat("100", 1, volume=Decimal("100")))
+
+        order_id = await om.submit_order(_make_order(quantity=Decimal("15")))
+
+        assert order_id is not None
+        [event] = [e for e in bus.events if isinstance(e, OrderFillEvent)]
+        # the cap filled 10 of the 15 requested: the event reports the slice
+        assert (event.quantity, event.price) == (Decimal("10"), Decimal("100.100"))
+        assert om.get_order_status(order_id) == OrderStatus.FILLED
+
+    async def test_a_wholly_cancelled_market_order_marks_cancelled_and_publishes(self) -> None:
+        """A zero-volume bar absorbs none of the order: the executor answers CANCELLED
+        and the tracked order must go CANCELLED with an OrderCancelEvent naming the
+        reason — never rest SUBMITTED as a phantom the cleanup keeps retrying."""
+        ex = PaperTradingExecutor(initial_balances={"USDT": Decimal("10000")})
+        bus = _Bus()
+        om = OrderManager(ex, bus, session_id="s1")
+        await ex.on_closed_bar("BTCUSDT", _flat("100", 1, volume=Decimal("0")))
+
+        order_id = await om.submit_order(_make_order(quantity=Decimal("5")))
+
+        assert order_id is not None
+        assert om.get_order_status(order_id) == OrderStatus.CANCELLED
+        [event] = [e for e in bus.events if isinstance(e, OrderCancelEvent)]
+        assert (event.order_id, event.reason) == (order_id, "participation_cap")
+        # nothing traded: the only record is the CANCELLED remainder, nothing was locked
+        [record] = ex.get_fills()
+        assert (record.status, record.reason, record.fee, record.fill_seq) == (
+            "CANCELLED",
+            "participation_cap",
+            Decimal("0"),
+            0,
+        )
+        assert await ex.fetch_balance() == {"USDT": Decimal("10000")}
 
 
 class TestExternalFills:

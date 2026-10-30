@@ -172,6 +172,7 @@ class WalkForwardAnalyzer:
         symbol: str = "BTCUSDT",
         timeframe: Timeframe = Timeframe.H1,
         funding: Mapping[str, Sequence[FundingRow]] | None = None,
+        extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None = None,
     ) -> WalkForwardResult:
         """Run exactly ``fold_count`` walk-forward folds over ``bars``.
 
@@ -181,8 +182,9 @@ class WalkForwardAnalyzer:
         up from the train tail. Rolling windows step by the out-of-sample length.
         ``max_trials`` caps the trials per fold (grid search is additionally capped by
         the true combination count). A range too short for the folds gives no folds.
-        ``funding`` is the full-window perp funding mapping: every run's executor accrues
-        only the rows inside its own bars, so fold windows never share a settlement.
+        ``funding`` and ``extra_bars`` serve every fold — the full-range funding dict
+        accrues only the rows inside each run's own bars (fold windows never share a
+        settlement), and the runner clips each extra stream to the window it replays.
         """
         empty = WalkForwardResult(anchored=anchored)
         if not bars:
@@ -218,6 +220,7 @@ class WalkForwardAnalyzer:
                     symbol=symbol,
                     timeframe=timeframe,
                     funding=funding,
+                    extra_bars=extra_bars,
                 )
             except NoEligibleTrialError as exc:
                 raise ValueError(f"fold {fold_idx}: no parameter set traded in-sample") from exc
@@ -239,6 +242,7 @@ class WalkForwardAnalyzer:
                 timeframe=timeframe,
                 warmup_bars=len(warm),
                 funding=funding,
+                extra_bars=extra_bars,
             )
 
             folds.append(

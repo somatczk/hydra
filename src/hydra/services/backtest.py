@@ -111,6 +111,8 @@ class JobProvenanceModel(DataProvenanceModel):
     hydra_version: str | None = None
     config_hash: str | None = None
     ml_models: list[MlModelProvenance] | None = None
+    # the per-timeframe counts of the replayed non-primary (confirmation/entry) streams
+    extra_bar_counts: dict[str, int] | None = None
 
 
 class BacktestTradeRecord(BaseModel):
@@ -266,9 +268,11 @@ async def _preflight(
 
     The data leg is config-gated: with ``auto_fetch`` on (``data.auto_fetch_enabled``)
     a missing range never 422s — the job is queued and the worker owns availability;
-    off, the exact P0-B 422 ``no_market_data`` with the available range. ``read_span``
-    keeps the stored-span read for callers that size from it (the walk-forward
-    fast-fail) even while fetching.
+    off, the exact P0-B 422 ``no_market_data`` with the available range. Every
+    declared timeframe is its own stream: a confirmation or entry timeframe with no
+    stored data 422s naming it — an empty confirmation stream would silently never
+    veto. ``read_span`` keeps the stored-span read for callers that size from it (the
+    walk-forward fast-fail) even while fetching.
     """
     strategy_cls, config = _load_backtest_strategy(strategy_id)
     tf = timeframe or config.timeframes.primary
@@ -291,6 +295,13 @@ async def _preflight(
             if stored is None and require_data and not auto_fetch:
                 missing = await no_market_data(repo, exchange, symbol, tf, start, end)
                 raise ServiceError(422, missing.to_detail())
+            if require_data and not auto_fetch:
+                for extra_tf in config.all_timeframes():
+                    if extra_tf == tf:
+                        continue
+                    if await repo.get_bar_range(exchange, symbol, extra_tf, start, end) is None:
+                        missing = await no_market_data(repo, exchange, symbol, extra_tf, start, end)
+                        raise ServiceError(422, missing.to_detail())
     return Preflight(strategy_cls, config, exchange, symbol, tf, pool, stored)
 
 

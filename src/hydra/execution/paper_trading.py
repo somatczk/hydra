@@ -11,9 +11,16 @@ fill price.
 Market orders fill with slippage at the latest traded price set by ``set_mark`` since the last
 closed bar, else at that bar's close. Resting orders are evaluated only by ``on_closed_bar``
 with the rules in ``hydra.execution.fill_rules``; an order placed at a live mark sees only the
-move from that mark to the close of the bar it was placed in. With a DB pool, every change
+move from that mark to the close of the bar it was placed in. Every order is capped to
+``max_participation`` (10 % by default) of the volume of the bar it fills on: an entry market
+order fills the fillable slice and cancels the remainder; a resting order fills its slice and
+the remainder keeps working, same order id. With a DB pool, every change
 is persisted (``hydra.execution.paper_store``) before the call returns; ``restore`` rebuilds the
 account after a restart.
+
+A market order that would *open* exposure on a mark the feed went stale over is refused: an
+entry at a stale price is a bet on an outage. Reduce-only exits and ``flatten`` keep filling at
+the stale mark, labelled ``stale_live`` — an exit at a stale price beats an unexitable position.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from typing import Any, Literal, Protocol, cast, get_args
 from hydra.core import metrics
 from hydra.core.types import OHLCV, Direction, ExchangeId, OrderType, Position, Symbol
 from hydra.execution import fill_rules, paper_store
-from hydra.execution.fill_rules import FillPrice, Liquidity
+from hydra.execution.fill_rules import DEFAULT_MAX_PARTICIPATION, FillPrice, Liquidity
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +235,19 @@ class _Ledger:
         self.locked[asset] = self.get_locked(asset) + amount
         self.locks[lock_id] = _Lock(asset, amount)
 
+    def consume(self, lock_id: str, amount: Decimal) -> None:
+        """Free *amount* of a lock for the fill that spends it (a partial fill's slice).
+
+        The lock shrinks in place — the rest keeps locking what still rests — and the
+        freed funds return to free, so ``locked == sum(locks)`` holds either side.
+        """
+        held = self.locks[lock_id]
+        if amount > held.amount:
+            raise LedgerInvariantError(f"lock {lock_id} holds {held.amount}, consumed {amount}")
+        held.amount -= amount
+        self.locked[held.asset] = self.get_locked(held.asset) - amount
+        self.credit(held.asset, amount)
+
     def release(self, lock_id: str) -> None:
         held = self.locks.pop(lock_id, None)
         if held is None:
@@ -301,6 +321,7 @@ class PaperTradingExecutor:
         step_size: Decimal | None = None,
         min_notional: Decimal | None = None,
         market_rules: Mapping[str, SpotMarketRules] | None = None,
+        max_participation: Decimal = DEFAULT_MAX_PARTICIPATION,
     ) -> None:
         default_fee = Decimal("0.001") if fee_pct is None else fee_pct
         self._maker_fee = default_fee if maker_fee is None else maker_fee
@@ -313,6 +334,9 @@ class PaperTradingExecutor:
         ):
             if not _ZERO <= value < _ONE:
                 raise ValueError(f"{name} must be in [0, 1), got {value}")
+        if not _ZERO <= max_participation <= _ONE:
+            raise ValueError(f"max_participation must be in [0, 1], got {max_participation}")
+        self._max_participation = max_participation
         if db_pool is not None and not session_id:
             raise ValueError("a paper executor with a DB pool needs a session_id")
         self._exchange_id: ExchangeId = exchange_id
@@ -341,6 +365,7 @@ class PaperTradingExecutor:
         self._live_marks: dict[str, Decimal] = {}
         self._stale_marks: set[str] = set()
         self._last_bar_ts: dict[str, datetime] = {}
+        self._bar_volume: dict[str, Decimal] = {}
         self._names: dict[str, str] = {}
         self._fill_seq = 0
         self._order_seq = 0
@@ -450,13 +475,85 @@ class PaperTradingExecutor:
             mark, source = self._market_mark(canon)
             if mark is None or mark <= 0:
                 raise ValueError(f"No market price available for {symbol}")
+            reduce_only = bool((params or {}).get("reduce_only"))
+            if source == "stale_live" and s == "BUY" and not reduce_only:
+                raise OrderRejectedError(
+                    f"refusing a market BUY on {symbol}: the mark {mark} is stale "
+                    f"(feed outage); reduce-only exits still fill, labelled"
+                )
             fp = fill_rules.market_fill(s, mark, self._slippage_pct)
             self._check_rules(canon, quantity, fp.price)
-            fill = self._fill_from_free(
-                canon, s, OrderType.MARKET, quantity, fp, "market", str(uuid.uuid4()), source
+            volume = self._bar_volume.get(canon)
+            # the cap sizes entries only: an exit must never be unfillable
+            opening = s == "BUY" and not reduce_only
+            fillable = (
+                quantity
+                if volume is None or not opening
+                else fill_rules.participation_fillable(quantity, volume, self._max_participation)
             )
-            await self._persist(snapshot_at=fill.timestamp)
-            return {**self._fill_response(fill), "mark_source": source}
+            if fillable > 0:
+                fill = self._fill_from_free(
+                    canon,
+                    s,
+                    OrderType.MARKET,
+                    fillable,
+                    fp,
+                    "market",
+                    str(uuid.uuid4()),
+                    source,
+                )
+                if fillable < quantity:
+                    self._filled.append(
+                        self._participation_cancel(
+                            s,
+                            OrderType.MARKET,
+                            fill.symbol,
+                            fill.price,
+                            quantity - fillable,
+                            fill.timestamp,
+                        )
+                    )
+                    logger.warning(
+                        "Paper market %s %s: volume %s filled %s of %s; the remainder cancelled",
+                        s,
+                        symbol,
+                        volume,
+                        fillable,
+                        quantity,
+                    )
+                await self._persist(snapshot_at=fill.timestamp)
+                resp = {**self._fill_response(fill), "mark_source": source}
+                if fillable < quantity:
+                    resp["requested_quantity"] = float(quantity)
+                    resp["participation_capped"] = True
+                return resp
+            # a bar with no volume absorbs nothing: the whole order is cancelled
+            cancel = self._participation_cancel(
+                s, OrderType.MARKET, self._name(canon), fp.price, quantity, self._bar_time(canon)
+            )
+            self._filled.append(cancel)
+            logger.warning(
+                "Paper market %s %s: the last bar's volume %s absorbs none of %s",
+                s,
+                symbol,
+                volume,
+                quantity,
+            )
+            await self._persist(snapshot_at=None)
+            return {
+                "id": cancel.order_id,
+                "symbol": self._name(canon),
+                "side": s,
+                "type": OrderType.MARKET,
+                "amount": float(quantity),
+                "quantity": 0.0,
+                "price": float(fp.price),
+                "status": "CANCELLED",
+                "filled": False,
+                "reason": "participation_cap",
+                "requested_quantity": float(quantity),
+                "participation_capped": True,
+            }
 
         if otype == OrderType.OCO:
             return await self._create_oco(canon, s, quantity, price, stop_price)
@@ -643,13 +740,15 @@ class PaperTradingExecutor:
         A bar at or before the last processed timestamp is ignored. Orders placed after the
         previous bar are eligible; one placed at a live mark sees this bar as the path from that
         mark to the close (its earlier range came before the order). At most one leg of an OCO
-        fills. The result also carries
+        fills. Each fill is capped to ``max_participation`` of the bar's volume; a resting
+        order's remainder keeps working, same order id. The result also carries
         ``status="CANCELLED"`` records for BUYs dropped on a gap. While halted, only SELLs run.
         """
         canon = self._symbol(symbol)
         last = self._last_bar_ts.get(canon)
         if last is not None and ohlcv.timestamp <= last:
             return []
+        self._bar_volume[canon] = ohlcv.volume
         fills: list[PaperFill] = []
         seen_oco: set[str] = set()
         for order in sorted((o for o in self._pending if o.symbol == canon), key=lambda o: o.seq):
@@ -690,18 +789,24 @@ class PaperTradingExecutor:
             if outcome is None:
                 return None
             stop_won, fp = outcome
-            return self._fill_resting(sl if stop_won else tp, fp, bar.timestamp)
+            return self._fill_resting(sl if stop_won else tp, fp, bar.timestamp, bar.volume)
 
         if order.order_type == OrderType.LIMIT:
             if order.price is None:
                 raise LedgerInvariantError(f"LIMIT {order.order_id} has no price")
             limit = fill_rules.limit_fill(order.side, order.price, bar)
-            return None if limit is None else self._fill_resting(order, limit, bar.timestamp)
+            return (
+                None
+                if limit is None
+                else self._fill_resting(order, limit, bar.timestamp, bar.volume)
+            )
         if order.order_type == OrderType.STOP_MARKET:
             if order.stop_price is None:
                 raise LedgerInvariantError(f"STOP_MARKET {order.order_id} has no stop")
             stop = fill_rules.stop_market_fill(order.side, order.stop_price, bar, slip)
-            return None if stop is None else self._fill_resting(order, stop, bar.timestamp)
+            return (
+                None if stop is None else self._fill_resting(order, stop, bar.timestamp, bar.volume)
+            )
         if order.order_type == OrderType.STOP_LIMIT:
             if order.stop_price is None or order.price is None:
                 raise LedgerInvariantError(f"STOP_LIMIT {order.order_id} has no prices")
@@ -709,7 +814,7 @@ class PaperTradingExecutor:
             if sl_outcome is None:
                 return None
             if sl_outcome.fill is not None:
-                return self._fill_resting(order, sl_outcome.fill, bar.timestamp)
+                return self._fill_resting(order, sl_outcome.fill, bar.timestamp, bar.volume)
             order.order_type = OrderType.LIMIT
             order.stop_price = None
             return None
@@ -717,25 +822,48 @@ class PaperTradingExecutor:
             raise LedgerInvariantError(f"TRAILING_STOP {order.order_id} has no peak")
         trail = fill_rules.trailing_fill(order.side, order.extreme, order.trail_pct, bar, slip)
         order.extreme = trail.extreme
-        return None if trail.fill is None else self._fill_resting(order, trail.fill, bar.timestamp)
+        return (
+            None
+            if trail.fill is None
+            else self._fill_resting(order, trail.fill, bar.timestamp, bar.volume)
+        )
 
-    def _fill_resting(self, order: _PendingOrder, fp: FillPrice, ts: datetime) -> PaperFill:
-        self._remove_order(order)
+    def _fill_resting(
+        self, order: _PendingOrder, fp: FillPrice, ts: datetime, volume: Decimal
+    ) -> PaperFill | None:
+        """Fill one bar's slice of a resting order; the remainder keeps working, same id.
+
+        The slice is capped to ``max_participation`` of the bar's volume. A partial
+        OCO leg fill drops its sibling and continues standalone — a documented deviation
+        (Binance cancels the whole list). A BUY slice that free balance plus its lock
+        cannot pay cancels the remainder (the gap rule: the lock funds what it covers,
+        the difference draws from free).
+        """
+        slice_qty = fill_rules.participation_fillable(
+            order.quantity, volume, self._max_participation
+        )
+        if slice_qty <= 0:
+            return None
+        parent = order.oco_id
         if order.side == "BUY":
-            need = order.quantity * fp.price * (_ONE + self._fee_rate(fp.liquidity))
-            if self._ledger.get_free(self._quote) < need:
+            need = slice_qty * fp.price * (_ONE + self._fee_rate(fp.liquidity))
+            held = self._ledger.locks[order.lock_id].amount
+            covered = min(need, held)
+            if self._ledger.get_free(self._quote) + covered < need:
+                self._remove_order(order)
                 logger.warning(
-                    "Paper %s %s cancelled: gap fill at %s needs %s %s, free %s",
+                    "Paper %s %s cancelled: gap fill at %s needs %s %s, free %s, locked %s",
                     order.order_type,
                     order.order_id,
                     fp.price,
                     need,
                     self._quote,
                     self._ledger.get_free(self._quote),
+                    held,
                 )
                 return PaperFill(
                     order_id=order.order_id,
-                    parent_order_id=order.oco_id,
+                    parent_order_id=parent,
                     symbol=self._name(order.symbol),
                     side=order.side,
                     order_type=order.order_type,
@@ -751,17 +879,60 @@ class PaperTradingExecutor:
                     fill_seq=0,
                     status="CANCELLED",
                 )
-        parent = order.oco_id
+            self._ledger.consume(order.lock_id, covered)
+        else:
+            # the base lock funds the exit slice; the rest keeps locking what still rests
+            self._ledger.consume(order.lock_id, slice_qty)
+        if slice_qty < order.quantity:
+            if parent is not None:
+                self._detach_oco(order)
+            order.quantity -= slice_qty
+        else:
+            self._remove_order(order)
         return self._apply_fill(
             order.symbol,
             order.side,
             order.order_type,
-            order.quantity,
+            slice_qty,
             fp,
             order.reason,
             order.order_id,
             parent,
             ts,
+        )
+
+    def _detach_oco(self, order: _PendingOrder) -> None:
+        """A partial OCO leg fill: drop the sibling (the shared lock stays) and go standalone."""
+        self._pending = [o for o in self._pending if o.oco_id != order.oco_id or o is order]
+        order.oco_id = None
+
+    def _participation_cancel(
+        self,
+        side: str,
+        order_type: str,
+        name: str,
+        price: Decimal,
+        remainder: Decimal,
+        ts: datetime,
+    ) -> PaperFill:
+        """A market order's uncapped remainder: nothing traded, cancelled at the fill price."""
+        return PaperFill(
+            order_id=str(uuid.uuid4()),
+            parent_order_id=None,
+            symbol=name,
+            side=side,
+            order_type=order_type,
+            quantity=remainder,
+            price=price,
+            fee=_ZERO,
+            fee_currency=self._quote,
+            liquidity="taker",
+            gross_pnl=None,
+            net_pnl=None,
+            reason="participation_cap",
+            timestamp=ts,
+            fill_seq=0,
+            status="CANCELLED",
         )
 
     # ------------------------------------------------------------------
@@ -1220,6 +1391,7 @@ class PaperTradingExecutor:
             "maker_fee": str(self._maker_fee),
             "taker_fee": str(self._taker_fee),
             "slippage_pct": str(self._slippage_pct),
+            "max_participation": str(self._max_participation),
             "step_size": _opt_s(self._step_size),
             "min_notional": _opt_s(self._min_notional),
             "free": {a: str(v) for a, v in sorted(self._ledger.free.items())},
@@ -1296,6 +1468,7 @@ class PaperTradingExecutor:
                 maker_fee=_d(state["maker_fee"]),
                 taker_fee=_d(state["taker_fee"]),
                 quote_asset=str(state["quote_asset"]),
+                max_participation=_d(state.get("max_participation", DEFAULT_MAX_PARTICIPATION)),
                 step_size=_opt_d(state["step_size"]),
                 min_notional=_opt_d(state["min_notional"]),
                 market_rules=market_rules,
@@ -1432,8 +1605,8 @@ class PaperTradingExecutor:
             "reason": fill.reason,
             "fill_seq": fill.fill_seq,
             "timestamp": fill.timestamp.isoformat(),
-            "status": "FILLED",
-            "filled": True,
+            "status": fill.status,
+            "filled": fill.status == "FILLED",
         }
 
     def _pending_response(self, order: _PendingOrder) -> dict[str, Any]:

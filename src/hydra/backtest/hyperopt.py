@@ -373,12 +373,16 @@ class HyperoptRunner:
         timeframe: Timeframe = Timeframe.H1,
         on_trial_complete: Any = None,
         funding: Mapping[str, Sequence[FundingRow]] | None = None,
+        extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None = None,
     ) -> HyperoptResult:
         """Optimise on the first 80 % of ``bars`` and re-run the best config on the rest.
 
         The final ``HOLDOUT_FRACTION`` of the bars is never passed to any optimisation
         trial. The holdout run is warmed up with ``required_history`` bars from the end
         of the train window, so the first holdout bar trades with a full context.
+        ``funding`` and ``extra_bars`` ride every trial and the holdout alike: the
+        full-range funding dict serves every sub-window (the reader filters by window),
+        and the runner clips each stream to the window it replays.
         """
         if not bars:
             return HyperoptResult()
@@ -400,6 +404,7 @@ class HyperoptRunner:
             timeframe=timeframe,
             on_trial_complete=on_trial_complete,
             funding=funding,
+            extra_bars=extra_bars,
         )
         result.train_start = train_bars[0].timestamp
         result.train_end = train_bars[-1].timestamp
@@ -423,6 +428,7 @@ class HyperoptRunner:
             timeframe=timeframe,
             warmup_bars=len(warm),
             funding=funding,
+            extra_bars=extra_bars,
         )
         result.holdout_psr = probabilistic_sharpe(
             daily_returns(result.holdout.equity_curve, result.holdout.timestamps)
@@ -442,6 +448,7 @@ class HyperoptRunner:
         timeframe: Timeframe = Timeframe.H1,
         on_trial_complete: Any = None,
         funding: Mapping[str, Sequence[FundingRow]] | None = None,
+        extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None = None,
     ) -> HyperoptResult:
         """Run the trial loop over ``bars`` (no holdout split).
 
@@ -467,6 +474,7 @@ class HyperoptRunner:
                 timeframe=timeframe,
                 on_trial_complete=on_trial_complete,
                 funding=funding,
+                extra_bars=extra_bars,
             )
 
         return await self._run_grid(
@@ -480,6 +488,7 @@ class HyperoptRunner:
             timeframe=timeframe,
             on_trial_complete=on_trial_complete,
             funding=funding,
+            extra_bars=extra_bars,
         )
 
     # ------------------------------------------------------------------
@@ -498,6 +507,7 @@ class HyperoptRunner:
         timeframe: Timeframe,
         on_trial_complete: Any,
         funding: Mapping[str, Sequence[FundingRow]] | None,
+        extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None,
     ) -> HyperoptResult:
         try:
             import optuna
@@ -531,6 +541,7 @@ class HyperoptRunner:
                 timeframe=timeframe,
                 cache=cache,
                 funding=funding,
+                extra_bars=extra_bars,
             )
             if outcome.status == "ok":
                 study.tell(trial, outcome.sharpe)
@@ -577,6 +588,7 @@ class HyperoptRunner:
         timeframe: Timeframe,
         on_trial_complete: Any,
         funding: Mapping[str, Sequence[FundingRow]] | None,
+        extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None,
     ) -> HyperoptResult:
         combinations = param_space.grid_combinations()
         total = min(len(combinations), max_trials)
@@ -596,6 +608,7 @@ class HyperoptRunner:
                 timeframe=timeframe,
                 cache=cache,
                 funding=funding,
+                extra_bars=extra_bars,
             )
             record = _record(trial_num, params, outcome)
             trial_records.append(record)
@@ -635,6 +648,7 @@ class HyperoptRunner:
         timeframe: Timeframe,
         cache: dict[str, _CachedTrial],
         funding: Mapping[str, Sequence[FundingRow]] | None,
+        extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None,
     ) -> tuple[_CachedTrial, BacktestResult | None]:
         """Backtest one parameter set (or reuse the cached outcome for a repeat).
 
@@ -660,6 +674,7 @@ class HyperoptRunner:
                 symbol=symbol,
                 timeframe=timeframe,
                 funding=funding,
+                extra_bars=extra_bars,
             )
         except Exception as exc:
             logger.debug("Trial with params %s failed", params, exc_info=True)

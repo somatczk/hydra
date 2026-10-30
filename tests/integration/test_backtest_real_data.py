@@ -456,6 +456,44 @@ async def test_bare_end_date_includes_that_whole_day(
     assert prov["last_ts"] == "2026-01-12T23:00:00+00:00"
 
 
+async def test_a_confirmation_timeframe_without_stored_bars_is_422_by_name(
+    client: httpx.AsyncClient, pool: Any, strategies_dir: Path
+) -> None:
+    """An empty confirmation stream would silently never veto — the submit refuses
+    naming the timeframe instead."""
+    await _seed_hourly(pool)
+    _write_strategy(strategies_dir, "mtf", timeframes={"primary": "1h", "confirmation": "4h"})
+
+    resp = await client.post(
+        "/api/backtest/run",
+        json={"strategy_id": "mtf", "start_date": "2026-01-01", "end_date": "2026-01-31"},
+    )
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "no_market_data"
+    assert detail["timeframe"] == "4h"
+    assert "4h" in detail["message"]
+
+
+async def test_a_confirmation_timeframe_reaches_the_replay_and_the_provenance(
+    client: httpx.AsyncClient, pool: Any, strategies_dir: Path
+) -> None:
+    """Both declared streams are fetched, loaded and replayed; the provenance records
+    the per-timeframe counts."""
+    await _seed_hourly(pool)
+    await _seed(pool, "binance", Timeframe.H4, _saw(H1_START, H1_COUNT // 4, timedelta(hours=4)))
+    _write_strategy(strategies_dir, "mtf-ok", timeframes={"primary": "1h", "confirmation": "4h"})
+
+    status = await _run(
+        client, pool, strategy_id="mtf-ok", start_date="2026-01-01", end_date="2026-01-31"
+    )
+
+    prov = (await client.get(f"/api/backtest/status/{status['task_id']}")).json()["provenance"]
+    assert prov["bar_count"] == H1_COUNT
+    assert prov["extra_bar_counts"] == {"4h": H1_COUNT // 4}
+
+
 async def test_request_timeframe_overrides_primary_and_is_recorded(
     client: httpx.AsyncClient, pool: Any, strategies_dir: Path
 ) -> None:

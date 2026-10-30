@@ -319,8 +319,23 @@ class OrderManager:
         self._orders[order_id] = tracked
 
         status_str = str(resp.get("status", "")).upper()
+        if status_str == "CANCELLED":
+            # a market order the volume cap wholly refused: never rested, never filled
+            tracked.status = OrderStatus.CANCELLED
+            await self._event_bus.publish(
+                OrderCancelEvent(
+                    order_id=order_id,
+                    symbol=order.symbol,
+                    exchange_id=order.exchange_id,
+                    reason=str(resp.get("reason") or "participation_cap"),
+                )
+            )
+            return order_id
         if status_str == "FILLED" or resp.get("filled", False):
             tracked.status = OrderStatus.FILLED
+            # the executor's quantity is what actually filled (a capped entry's slice)
+            filled_qty = _dec(resp.get("quantity"))
+            event_qty = filled_qty if filled_qty is not None else order.quantity
             fill_price = _dec(resp.get("average")) or _dec(resp.get("price")) or Decimal("0")
             raw_fee = resp.get("fee")
             if isinstance(raw_fee, dict):
@@ -338,7 +353,7 @@ class OrderManager:
                     symbol=order.symbol,
                     side=order.side,
                     order_type=order.order_type,
-                    quantity=order.quantity,
+                    quantity=event_qty,
                     price=fill_price,
                     fee=fee,
                     fee_currency=fee_currency,

@@ -130,7 +130,7 @@ def _bars(end: datetime) -> list[OHLCV]:
                 high=D(str(round(max(o, c) * (1 + wick), 2))),
                 low=D(str(round(min(o, c) * (1 - wick), 2))),
                 close=D(str(c)),
-                volume=D("100"),
+                volume=D("1000"),
                 timestamp=start + i * H,
             )
         )

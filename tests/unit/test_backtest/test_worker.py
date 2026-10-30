@@ -339,6 +339,26 @@ async def test_the_fetch_phase_maps_the_engine_progress_onto_the_band() -> None:
     assert run.detail["fetch"] == emits[-1]
 
 
+async def test_the_fetch_phase_covers_every_declared_timeframe() -> None:
+    """A confirmation timeframe is its own stream: the engine is asked for it too."""
+    run = worker.JobRun()
+    config = StrategyConfig(
+        id="fetch",
+        name="Fetch",
+        strategy_class="hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+        symbols=["BTCUSDT"],
+        timeframes={"primary": "1h", "confirmation": "4h"},
+        parameters={"rules": _RULES, "required_history": 10},
+    )
+    engine = _FakeEngine(emits=[_progress("fetching", 0, weight=0), _progress("fetched", 20)])
+
+    await worker._ensure_bars(object(), engine, config, _T0, _T1, run)
+
+    assert [c["timeframe"] for c in engine.calls] == [Timeframe.H1, Timeframe.H4]
+    assert all(c["start"] == _T0 and c["end"] == _T1 for c in engine.calls)
+    assert run.progress == 20.0
+
+
 async def test_a_data_fetch_error_fails_the_phase_retryable_with_the_reason() -> None:
     run = worker.JobRun()
     error = DataFetchError(

@@ -191,7 +191,7 @@ class TestBarRouting:
             high=D("100"),
             low=D("100"),
             close=D("100"),
-            volume=D("1"),
+            volume=D("1000"),
             timestamp=primed + timedelta(hours=1),
         )
         await runtime.bus.publish(

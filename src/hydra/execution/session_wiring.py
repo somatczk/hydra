@@ -347,7 +347,7 @@ class SessionRuntime:
             except Exception:
                 logger.exception("Publishing paper fill %s failed", fill.order_id)
             if fill.status == "CANCELLED":
-                await self._release_manual(fill.parent_order_id or fill.order_id, "gap_cancel")
+                await self._release_manual(fill.parent_order_id or fill.order_id, fill.reason)
         await self._check_live_coverage()
         self.session.last_bar_at = datetime.now(UTC)
         try:

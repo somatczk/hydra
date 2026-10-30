@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
@@ -250,11 +251,17 @@ def config_hash(config: StrategyConfig) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
-def provenance_payload(provenance: DataProvenance, config: StrategyConfig) -> dict[str, Any]:
+def provenance_payload(
+    provenance: DataProvenance,
+    config: StrategyConfig,
+    extra_bars: Mapping[Timeframe, Sequence[OHLCV]] | None = None,
+) -> dict[str, Any]:
     """The provenance dict persisted on the job row, including the code and config it ran."""
     payload: dict[str, Any] = provenance.to_dict()
     payload["hydra_version"] = version("hydra")
     payload["config_hash"] = config_hash(config)
+    if extra_bars:
+        payload["extra_bar_counts"] = {str(tf): len(bars) for tf, bars in extra_bars.items()}
     return payload
 
 
@@ -271,25 +278,29 @@ async def ensure_job_bars(
     end: datetime,
     *,
     force: bool = False,
-    on_progress: ProgressCallback | None = None,
+    progress_for: Callable[[Timeframe], ProgressCallback] | None = None,
 ) -> None:
     """Fetch the range's missing bars through the injected on-demand engine.
 
+    Every declared timeframe (primary, confirmation, entry) is its own stream —
+    the same streams the live feed delivers — so each is fetched for the window.
     ``force=True`` is the ``fetch_fresh`` meaning: refetch the whole grid-rounded
     range. Bars the exchange genuinely lacks stay missing — the loader after this
     raises the P0-B vocabulary, never a synthetic fallback.
     """
     repo = MarketDataRepository.from_pool(pool)
-    await fetch_engine.ensure_available(
-        repo,
-        config.exchange.exchange_id,
-        config.symbols[0],
-        config.timeframes.primary,
-        start,
-        end,
-        force=force,
-        on_progress=on_progress,
-    )
+    for timeframe in config.all_timeframes():
+        on_progress = None if progress_for is None else progress_for(timeframe)
+        await fetch_engine.ensure_available(
+            repo,
+            config.exchange.exchange_id,
+            config.symbols[0],
+            timeframe,
+            start,
+            end,
+            force=force,
+            on_progress=on_progress,
+        )
 
 
 async def load_job_bars(
@@ -305,6 +316,32 @@ async def load_job_bars(
         start,
         end,
     )
+
+
+async def load_job_extra_bars(
+    pool: Any, config: StrategyConfig, start: datetime, end: datetime
+) -> dict[Timeframe, list[OHLCV]]:
+    """The declared non-primary streams for the window; a missing one refuses by name.
+
+    A confirmation or entry timeframe with nothing stored raises ``NoMarketDataError``
+    naming that timeframe — an empty confirmation stream would silently never veto,
+    which is not a backtest of the declared strategy.
+    """
+    repo = MarketDataRepository.from_pool(pool)
+    extras: dict[Timeframe, list[OHLCV]] = {}
+    for timeframe in config.all_timeframes():
+        if timeframe == config.timeframes.primary:
+            continue
+        bars, _ = await load_bars(
+            repo,
+            config.exchange.exchange_id,
+            config.symbols[0],
+            timeframe,
+            start,
+            end,
+        )
+        extras[timeframe] = bars
+    return extras
 
 
 def _timestamped(values: list[Decimal], timestamps: list[datetime]) -> list[dict[str, Any]]:

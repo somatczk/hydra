@@ -136,6 +136,20 @@ async def test_default_stop_gaps_at_the_open_like_paper() -> None:
     assert paper is not None and float(paper.price) == 90.0
 
 
+async def test_a_stop_crossed_in_a_missing_bar_gap_fills_at_the_after_gap_open() -> None:
+    # hour 4 is missing from the stored stream; the entry fills at the signal bar's
+    # close (100) and the default stop 95 crossed while no bar was published, so it
+    # fills on the after-gap bar at its OPEN — the exact worse-of price
+    bars = [_bar(i, "100") for i in range(4)]
+    bars.append(_bar(5, "90", "91", "89", "90.5"))
+
+    result = await _run(_strategy({0}), bars)
+
+    assert _kinds(result) == [("entry", "Buy", 100.0), ("exit", "Sell", 90.0)]
+    paper = fill_rules.stop_market_fill("SELL", D("95.00"), bars[-1], D("0"))
+    assert paper is not None and float(paper.price) == 90.0
+
+
 async def test_risk_block_stop_and_take_profit_as_oco() -> None:
     risk = {
         "stop_loss_method": "fixed_pct",

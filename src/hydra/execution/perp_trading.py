@@ -15,7 +15,12 @@ mark. Funding values the position at the mark carried into the bar (no intrabar 
 a position closed by its stop cannot be liquidated in the same bar, and a liquidated
 position pays no funding for its final bar. Funding accruals are recorded as ``FUNDING``
 fills on the account (visible in ``get_fills``) but are not order fills — they never
-publish ``OrderFillEvent``s. A liquidation force-closes the position at its liquidation
+publish ``OrderFillEvent``s. Every order is capped to ``max_participation`` (10 % by
+default) of the volume of the bar it fills on: an opening market order fills the fillable
+slice and cancels the uncapped opening; a resting order fills its slice and the remainder
+keeps working, same order id. A market order that would open exposure on a mark the feed
+went stale over is refused; reduce-only exits and ``flatten`` keep filling at the stale
+mark, labelled. A liquidation force-closes the position at its liquidation
 price (the maintenance margin is the liquidation fee, the wallet gets nothing back), is
 recorded on the account, and halts the session — the halt, the fill and the closed
 position persist before anything else can touch the account, so a liquidated session
@@ -42,7 +47,7 @@ from hydra.core import metrics
 from hydra.core.types import OHLCV, Direction, ExchangeId, OrderType, Position, Symbol
 from hydra.execution import fill_rules, paper_store
 from hydra.execution.errors import UnsupportedVenueError
-from hydra.execution.fill_rules import FillPrice, Liquidity
+from hydra.execution.fill_rules import DEFAULT_MAX_PARTICIPATION, FillPrice, Liquidity
 from hydra.execution.paper_trading import (
     InsufficientBalanceError,
     LedgerInvariantError,
@@ -267,6 +272,7 @@ class PerpPaperTradingExecutor:
         leverage: int = 1,
         maintenance_margin_rate: Decimal = MAINTENANCE_MARGIN_RATE,
         funding_reader: FundingReader | None = None,
+        max_participation: Decimal = DEFAULT_MAX_PARTICIPATION,
     ) -> None:
         if exchange_id != PERP_EXCHANGE_ID:
             raise UnsupportedVenueError(
@@ -278,6 +284,9 @@ class PerpPaperTradingExecutor:
             raise ValueError(
                 f"maintenance_margin_rate must be in (0, 1), got {maintenance_margin_rate}"
             )
+        if not _ZERO <= max_participation <= _ONE:
+            raise ValueError(f"max_participation must be in [0, 1], got {max_participation}")
+        self._max_participation = max_participation
         # the USD⌂-M taker/maker defaults match CommissionConfig's futures rates, so a
         # session and a backtest on the same bars price fees identically
         self._maker_fee = _resolve_fee(maker_fee, fee_pct, Decimal("0.0002"))
@@ -321,6 +330,7 @@ class PerpPaperTradingExecutor:
         self._live_marks: dict[str, Decimal] = {}
         self._stale_marks: set[str] = set()
         self._last_bar_ts: dict[str, datetime] = {}
+        self._bar_volume: dict[str, Decimal] = {}
         self._names: dict[str, str] = {}
         self._fill_seq = 0
         self._order_seq = 0
@@ -466,23 +476,93 @@ class PerpPaperTradingExecutor:
             mark, source = self._market_mark(canon)
             if mark is None or mark <= 0:
                 raise ValueError(f"No market price available for {symbol}")
+            open_qty = self._open_qty(canon, s, quantity)
+            if source == "stale_live" and open_qty > 0:
+                raise OrderRejectedError(
+                    f"refusing a market {s} on {symbol}: the mark {mark} is stale "
+                    f"(feed outage); reduce-only exits still fill, labelled"
+                )
             fp = fill_rules.market_fill(s, mark, self._slippage_pct)
             self._check_rules(canon, quantity, fp.price)
-            self._require_fill_margin(canon, s, quantity, fp)
-            fill = self._apply_fill(
-                canon,
+            volume = self._bar_volume.get(canon)
+            fillable_open = (
+                open_qty
+                if volume is None
+                else fill_rules.participation_fillable(open_qty, volume, self._max_participation)
+            )
+            fill_qty = quantity - open_qty + fillable_open
+            if fill_qty > 0:
+                self._require_fill_margin(canon, s, fill_qty, fp)
+                fill = self._apply_fill(
+                    canon,
+                    s,
+                    OrderType.MARKET,
+                    fill_qty,
+                    fp,
+                    "market",
+                    str(uuid.uuid4()),
+                    None,
+                    self._bar_time(canon),
+                    source,
+                )
+                if fillable_open < open_qty:
+                    self._filled.append(
+                        self._participation_cancel(
+                            s,
+                            OrderType.MARKET,
+                            fill.symbol,
+                            fill.price,
+                            quantity - fill_qty,
+                            fill.timestamp,
+                        )
+                    )
+                    logger.warning(
+                        "Perp market %s %s: volume %s filled %s of the %s opening; "
+                        "the uncapped opening cancelled",
+                        s,
+                        symbol,
+                        volume,
+                        fillable_open,
+                        open_qty,
+                    )
+                await self._persist(snapshot_at=fill.timestamp)
+                resp = {**self._fill_response(fill), "mark_source": source}
+                if fillable_open < open_qty:
+                    resp["requested_quantity"] = float(quantity)
+                    resp["participation_capped"] = True
+                return resp
+            # a bar with no volume absorbs nothing: the whole order is cancelled
+            cancel = self._participation_cancel(
                 s,
                 OrderType.MARKET,
+                self._name(canon),
+                fp.price,
                 quantity,
-                fp,
-                "market",
-                str(uuid.uuid4()),
-                None,
                 self._bar_time(canon),
-                source,
             )
-            await self._persist(snapshot_at=fill.timestamp)
-            return {**self._fill_response(fill), "mark_source": source}
+            self._filled.append(cancel)
+            logger.warning(
+                "Perp market %s %s: the last bar's volume %s absorbs none of %s",
+                s,
+                symbol,
+                volume,
+                quantity,
+            )
+            await self._persist(snapshot_at=None)
+            return {
+                "id": cancel.order_id,
+                "symbol": self._name(canon),
+                "side": s,
+                "type": OrderType.MARKET,
+                "amount": float(quantity),
+                "quantity": 0.0,
+                "price": float(fp.price),
+                "status": "CANCELLED",
+                "filled": False,
+                "reason": "participation_cap",
+                "requested_quantity": float(quantity),
+                "participation_capped": True,
+            }
 
         if otype == OrderType.OCO:
             return await self._create_oco(canon, s, quantity, price, stop_price)
@@ -501,6 +581,13 @@ class PerpPaperTradingExecutor:
         if pos is None or pos.qty == 0:
             return True
         return (pos.qty > 0) == (side == "BUY")
+
+    def _open_qty(self, canon: str, side: str, quantity: Decimal) -> Decimal:
+        """The part of an order that opens or increases exposure (a flip opens its remainder)."""
+        pos = self._positions.get(canon)
+        if pos is None or pos.qty == _ZERO or (pos.qty > 0) == (side == "BUY"):
+            return quantity
+        return max(quantity - abs(pos.qty), _ZERO)
 
     def _require_fill_margin(self, canon: str, side: str, quantity: Decimal, fp: FillPrice) -> None:
         """Refuse upfront any fill whose open leg the wallet could not fund atomically.
@@ -695,14 +782,16 @@ class PerpPaperTradingExecutor:
         The sequence is fixed: resting orders first, then liquidation, then funding, then
         the mark — a position closed by its stop cannot be liquidated in the same bar, and
         a liquidated position pays no funding for its final bar. Orders placed after the
-        previous bar see only the path from their placement mark to the close. Funding
-        accruals are recorded on the account but are not order fills, so they are not
-        returned here.
+        previous bar see only the path from their placement mark to the close. Each fill
+        is capped to ``max_participation`` of the bar's volume; a resting order's
+        remainder keeps working, same order id. Funding accruals are recorded on the
+        account but are not order fills, so they are not returned here.
         """
         canon = self._symbol(symbol)
         last = self._last_bar_ts.get(canon)
         if last is not None and ohlcv.timestamp <= last:
             return []
+        self._bar_volume[canon] = ohlcv.volume
         fills: list[PaperFill] = []
         seen_oco: set[str] = set()
         for order in sorted((o for o in self._pending if o.symbol == canon), key=lambda o: o.seq):
@@ -751,18 +840,24 @@ class PerpPaperTradingExecutor:
             )
             if fp is None:
                 raise LedgerInvariantError(f"OCO {order.oco_id} chose a leg it did not trigger")
-            return self._fill_resting(sl if stop_first else tp, fp, bar.timestamp)
+            return self._fill_resting(sl if stop_first else tp, fp, bar.timestamp, bar.volume)
 
         if order.order_type == OrderType.LIMIT:
             if order.price is None:
                 raise LedgerInvariantError(f"LIMIT {order.order_id} has no price")
             limit = fill_rules.limit_fill(order.side, order.price, bar)
-            return None if limit is None else self._fill_resting(order, limit, bar.timestamp)
+            return (
+                None
+                if limit is None
+                else self._fill_resting(order, limit, bar.timestamp, bar.volume)
+            )
         if order.order_type == OrderType.STOP_MARKET:
             if order.stop_price is None:
                 raise LedgerInvariantError(f"STOP_MARKET {order.order_id} has no stop")
             stop = fill_rules.stop_market_fill(order.side, order.stop_price, bar, slip)
-            return None if stop is None else self._fill_resting(order, stop, bar.timestamp)
+            return (
+                None if stop is None else self._fill_resting(order, stop, bar.timestamp, bar.volume)
+            )
         if order.order_type == OrderType.STOP_LIMIT:
             if order.stop_price is None or order.price is None:
                 raise LedgerInvariantError(f"STOP_LIMIT {order.order_id} has no prices")
@@ -770,7 +865,7 @@ class PerpPaperTradingExecutor:
             if sl_outcome is None:
                 return None
             if sl_outcome.fill is not None:
-                return self._fill_resting(order, sl_outcome.fill, bar.timestamp)
+                return self._fill_resting(order, sl_outcome.fill, bar.timestamp, bar.volume)
             order.order_type = OrderType.LIMIT
             order.stop_price = None
             return None
@@ -778,18 +873,66 @@ class PerpPaperTradingExecutor:
             if order.stop_price is None:
                 raise LedgerInvariantError(f"TAKE_PROFIT_MARKET {order.order_id} has no trigger")
             profit = _take_profit_fill(order.side, order.stop_price, bar, slip)
-            return None if profit is None else self._fill_resting(order, profit, bar.timestamp)
+            return (
+                None
+                if profit is None
+                else self._fill_resting(order, profit, bar.timestamp, bar.volume)
+            )
         if order.extreme is None or order.trail_pct is None:
             raise LedgerInvariantError(f"TRAILING_STOP {order.order_id} has no peak")
         trail = fill_rules.trailing_fill(order.side, order.extreme, order.trail_pct, bar, slip)
         order.extreme = trail.extreme
-        return None if trail.fill is None else self._fill_resting(order, trail.fill, bar.timestamp)
+        return (
+            None
+            if trail.fill is None
+            else self._fill_resting(order, trail.fill, bar.timestamp, bar.volume)
+        )
 
-    def _fill_resting(self, order: _PendingOrder, fp: FillPrice, ts: datetime) -> PaperFill:
-        self._remove_order(order)
+    def _fill_resting(
+        self, order: _PendingOrder, fp: FillPrice, ts: datetime, volume: Decimal
+    ) -> PaperFill | None:
+        """Fill one bar's slice of a resting order; the remainder keeps working, same id.
+
+        The slice is capped to ``max_participation`` of the bar's volume and a
+        reduce-only slice never exceeds the position left. The wallet check stays
+        atomic on the whole remaining order — a flip whose open leg the wallet cannot
+        fund cancels untouched, never half-executes its close leg slice by slice.
+        A partial OCO leg fill drops its sibling and continues standalone — a
+        documented deviation (Binance cancels the whole list).
+        """
+        held = _ZERO
+        check_qty = order.quantity
+        if order.reduce_only:
+            pos = self._positions.get(order.symbol)
+            held = _ZERO if pos is None else abs(pos.qty)
+            check_qty = min(order.quantity, held)
+            if check_qty <= 0:
+                # nothing left to reduce (the position was liquidated under it): the
+                # order is dropped with a CANCELLED record so tracking sees it go
+                self._remove_order(order)
+                return PaperFill(
+                    order_id=order.order_id,
+                    parent_order_id=order.oco_id,
+                    symbol=self._name(order.symbol),
+                    side=order.side,
+                    order_type=order.order_type,
+                    quantity=order.quantity,
+                    price=fp.price,
+                    fee=_ZERO,
+                    fee_currency=self._quote,
+                    liquidity=fp.liquidity,
+                    gross_pnl=None,
+                    net_pnl=None,
+                    reason="position_gone",
+                    timestamp=ts,
+                    fill_seq=0,
+                    status="CANCELLED",
+                )
+        parent = order.oco_id
         try:
-            self._require_fill_margin(order.symbol, order.side, order.quantity, fp)
+            self._require_fill_margin(order.symbol, order.side, check_qty, fp)
         except InsufficientBalanceError as exc:
+            self._remove_order(order)
             logger.warning(
                 "Perp %s %s cancelled: fill at %s %s",
                 order.order_type,
@@ -799,7 +942,7 @@ class PerpPaperTradingExecutor:
             )
             return PaperFill(
                 order_id=order.order_id,
-                parent_order_id=order.oco_id,
+                parent_order_id=parent,
                 symbol=self._name(order.symbol),
                 side=order.side,
                 order_type=order.order_type,
@@ -815,16 +958,61 @@ class PerpPaperTradingExecutor:
                 fill_seq=0,
                 status="CANCELLED",
             )
+        slice_qty = fill_rules.participation_fillable(check_qty, volume, self._max_participation)
+        if slice_qty <= 0:
+            return None
+        # a reduce-only slice that closes the position takes the dead remainder with it
+        final = slice_qty >= order.quantity or (order.reduce_only and slice_qty >= held)
+        if final:
+            self._remove_order(order)
+        else:
+            if parent is not None:
+                self._detach_oco(order)
+            order.quantity -= slice_qty
         return self._apply_fill(
             order.symbol,
             order.side,
             order.order_type,
-            order.quantity,
+            slice_qty,
             fp,
             order.reason,
             order.order_id,
-            order.oco_id,
+            parent,
             ts,
+        )
+
+    def _detach_oco(self, order: _PendingOrder) -> None:
+        """A partial OCO leg fill: drop the sibling and go standalone (no locks to keep)."""
+        self._pending = [o for o in self._pending if o.oco_id != order.oco_id or o is order]
+        order.oco_id = None
+
+    def _participation_cancel(
+        self,
+        side: str,
+        order_type: str,
+        name: str,
+        price: Decimal,
+        remainder: Decimal,
+        ts: datetime,
+    ) -> PaperFill:
+        """A market order's uncapped opening remainder: nothing traded, cancelled."""
+        return PaperFill(
+            order_id=str(uuid.uuid4()),
+            parent_order_id=None,
+            symbol=name,
+            side=side,
+            order_type=order_type,
+            quantity=remainder,
+            price=price,
+            fee=_ZERO,
+            fee_currency=self._quote,
+            liquidity="taker",
+            gross_pnl=None,
+            net_pnl=None,
+            reason="participation_cap",
+            timestamp=ts,
+            fill_seq=0,
+            status="CANCELLED",
         )
 
     def _check_liquidation(self, canon: str, bar: OHLCV) -> list[PaperFill]:
@@ -1337,6 +1525,7 @@ class PerpPaperTradingExecutor:
             "maker_fee": str(self._maker_fee),
             "taker_fee": str(self._taker_fee),
             "slippage_pct": str(self._slippage_pct),
+            "max_participation": str(self._max_participation),
             "step_size": _opt_s(self._step_size),
             "min_notional": _opt_s(self._min_notional),
             "leverage": self._leverage,
@@ -1418,6 +1607,7 @@ class PerpPaperTradingExecutor:
                 maker_fee=_d(state["maker_fee"]),
                 taker_fee=_d(state["taker_fee"]),
                 quote_asset=str(state["quote_asset"]),
+                max_participation=_d(state.get("max_participation", DEFAULT_MAX_PARTICIPATION)),
                 step_size=_opt_d(state["step_size"]),
                 min_notional=_opt_d(state["min_notional"]),
                 market_rules=market_rules,
@@ -1570,8 +1760,8 @@ class PerpPaperTradingExecutor:
             "reason": fill.reason,
             "fill_seq": fill.fill_seq,
             "timestamp": fill.timestamp.isoformat(),
-            "status": "FILLED",
-            "filled": True,
+            "status": fill.status,
+            "filled": fill.status == "FILLED",
         }
 
     def _pending_response(self, order: _PendingOrder) -> dict[str, Any]:
