@@ -1,10 +1,13 @@
 """The trader process startup, after the backtest worker's pattern (D5).
 
 ``main()`` loads the config, validates the credential key, creates the pool with a retry
-budget, waits for the schema at the Alembic head (the API process owns migrations, like the
-engine the worker waits for), starts the engine (``SessionManager.startup()``: risk state,
-recovery, display rows) and serves the internal API on :8000 with the full-check
-HealthMonitor until SIGTERM — then shuts the engine down gracefully. Every Production
+budget, pings Redis with the same budget when the opt-in event fan-out is on
+(``events.bus: redis``: unreachable Redis refuses startup — the sessions it would start
+mirror their events there), waits for the schema at the Alembic head (the API process
+owns migrations, like the engine the worker waits for), starts the engine
+(``SessionManager.startup()``: risk state, recovery, display rows) and serves the
+internal API on :8000 with the full-check HealthMonitor until SIGTERM — then shuts the
+engine down gracefully. Every Production
 model's feature drift is measured once at startup (``measure_startup_drift``, P5-D —
 startup-only, never a periodic task) as a task ``_serve`` starts beside the heartbeat
 loop, so a slow scan never delays serving or the heartbeat. The heartbeat file
@@ -29,6 +32,7 @@ from hydra.data.migrations.runner import current_revision, head_revision
 logger = logging.getLogger(__name__)
 
 DB_CONNECT_BUDGET_S = 30.0
+REDIS_CONNECT_BUDGET_S = 30.0
 HEARTBEAT_MAX_AGE_S = 90.0
 HEARTBEAT_TOUCH_S = 10.0
 SCHEMA_POLL_S = 2.0
@@ -341,6 +345,23 @@ async def _serve(cfg: Any, pool: Any, mgr: Any) -> None:
         logger.info("Trader process shut down")
 
 
+async def _require_redis(cfg: Any) -> None:
+    """Ping Redis when the fan-out flag is on; an unreachable server refuses startup.
+
+    The sessions this process would start mirror their events to Redis, so with the
+    flag on Redis is tier-1 and its outage crash-loops the trader like a DB outage;
+    with the flag off this is a no-op.
+    """
+    from hydra.core.event_bus import require_redis
+
+    if cfg.events.bus != "redis":
+        return
+    secret = cfg.redis_url
+    if secret is None:  # unreachable: the config cross-validation requires it
+        raise SystemExit("events.bus 'redis' requires REDIS_URL")
+    await require_redis(secret.get_secret_value(), budget_s=REDIS_CONNECT_BUDGET_S)
+
+
 async def main() -> None:
     from hydra.core.config import load_config
     from hydra.core.encryption import require_credential_key
@@ -358,6 +379,7 @@ async def main() -> None:
     )
     pool = await _create_pool(dsn)
     try:
+        await _require_redis(cfg)
         await wait_for_schema(dsn)
         mgr = SessionManager(db_pool=pool, config=cfg)
         await mgr.startup()

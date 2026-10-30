@@ -16,7 +16,7 @@ from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from pydantic import ValidationError
 
-from hydra.core.config import ConfigError
+from hydra.core.config import ConfigError, HydraConfig
 from hydra.core.encryption import CredentialKeyError, encrypt
 from hydra.dashboard import lifespan
 
@@ -373,6 +373,76 @@ async def test_a_raising_refresh_never_fails_startup() -> None:
     assert attempts == [1]
     assert app.state.universe_refresher is refresher
     await lifespan._stop_universe_refresher(app)
+
+
+# ---------------------------------------------------------------------------
+# The opt-in Redis fan-out (P7-E): flag on makes Redis tier-1 at startup
+# ---------------------------------------------------------------------------
+
+
+def _closed_redis_url() -> str:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"redis://127.0.0.1:{probe.getsockname()[1]}"
+
+
+async def test_the_fanout_flag_off_never_pings_redis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def explode(url: str, *, budget_s: float = 30.0) -> None:
+        raise AssertionError("the flag is off: Redis must not be pinged")
+
+    monkeypatch.setattr(lifespan, "require_redis", explode)
+    await lifespan._require_redis(HydraConfig())
+
+
+async def test_the_fanout_flag_on_refuses_startup_when_redis_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import redis
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.setenv("HYDRA_EVENTS__BUS", "redis")
+    monkeypatch.setenv("REDIS_URL", _closed_redis_url())
+    monkeypatch.setattr(lifespan, "REDIS_CONNECT_BUDGET_S", 0.2)
+    app = FastAPI()
+    with pytest.raises(redis.exceptions.ConnectionError):
+        async with lifespan.run(app):
+            pytest.fail("startup must not complete")
+    assert app.state.session_manager is None
+
+
+async def test_a_reachable_redis_lets_startup_through_the_fanout_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The happy path of the ping step: budget spent, startup proceeds (dev mode)."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    calls: list[str] = []
+
+    async def fake_require_redis(url: str, *, budget_s: float = 30.0) -> None:
+        calls.append(url)
+
+    monkeypatch.setattr(lifespan, "require_redis", fake_require_redis)
+    monkeypatch.setenv("HYDRA_EVENTS__BUS", "redis")
+    monkeypatch.setenv("REDIS_URL", "redis://hydra-redis:6379")
+    app = FastAPI()
+    async with lifespan.run(app):
+        assert calls == ["redis://hydra-redis:6379"]
+
+
+async def test_the_redis_bus_without_redis_url_is_a_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.setenv("HYDRA_EVENTS__BUS", "redis")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    app = FastAPI()
+    with pytest.raises(ValidationError, match="REDIS_URL"):
+        async with lifespan.run(app):
+            pytest.fail("startup must not complete")
 
 
 # ---------------------------------------------------------------------------

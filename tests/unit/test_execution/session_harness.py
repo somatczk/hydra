@@ -122,6 +122,8 @@ class Harness:
     store: InMemoryRiskStateStore | None = None
     markets: dict[str, dict[str, Any]] | None = None
     """The fakes' market set; None serves the default binance set (spot + the BTC perp)."""
+    config: HydraConfig | None = None
+    """Overrides the manager's HydraConfig (None: the default, in-process bus)."""
     _next: dict[str, datetime] = field(default_factory=dict)
 
     def clients(self) -> ClientFactory:
@@ -155,7 +157,7 @@ class Harness:
         )
         self.mgr = SessionManager(
             db_pool=None,
-            config=HydraConfig(),
+            config=self.config or HydraConfig(),
             clients=self.clients(),
             risk_store=self.store,
             **kwargs,

@@ -15,12 +15,16 @@ from typing import Any
 
 import pytest
 from prometheus_client import REGISTRY
+from pydantic import SecretStr
 
+from hydra.core.config import EventsConfig, HydraConfig
 from hydra.core.events import BarEvent, FeedStatusEvent, OrderFillEvent
 from hydra.core.types import OHLCV, Direction, Symbol, Timeframe
+from hydra.execution import session_wiring
 from hydra.strategy.builtin.rule_based import RuleBasedStrategy
 from hydra.strategy.config import config_hash
 from tests.unit.test_execution.session_harness import (
+    NEVER,
     Harness,
     executor,
     held,
@@ -388,3 +392,143 @@ class TestLiveCoverage:
         await h.bar(session, "100")
         assert await held(session) == D("1.00000")
         assert self._gap(session) is None
+
+
+class _StubMirror:
+    """The publisher stand-in at the wiring seam: records, never touches Redis."""
+
+    def __init__(self, redis_url: str) -> None:
+        self.url = redis_url
+        self.connected = False
+        self.closed = False
+        self.connect_raises = False
+        self.on_event_raises = False
+
+    async def connect(self) -> None:
+        if self.connect_raises:
+            raise RuntimeError("redis unreachable")
+        self.connected = True
+
+    async def on_event(self, event: Any) -> None:
+        if self.on_event_raises:
+            raise RuntimeError("mirror bug")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestEventFanoutMirror:
+    """The opt-in Redis mirror at the wiring seam (P7-E): flag off is byte-identical,
+    flag on subscribes it last, fails the start before the feed, and shuts down clean."""
+
+    @staticmethod
+    def _fanout_config() -> HydraConfig:
+        return HydraConfig(
+            REDIS_URL=SecretStr("redis://127.0.0.1:6379"),
+            events=EventsConfig(bus="redis"),
+        )
+
+    async def _fanout_harness(
+        self,
+        strategies_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        connect_raises: bool = False,
+    ) -> tuple[Harness, list[_StubMirror]]:
+        created: list[_StubMirror] = []
+
+        def make(redis_url: str) -> _StubMirror:
+            mirror = _StubMirror(redis_url)
+            mirror.connect_raises = connect_raises
+            created.append(mirror)
+            return mirror
+
+        monkeypatch.setattr(session_wiring, "RedisEventPublisher", make)
+        harness = Harness(strategies_dir, config=self._fanout_config())
+        await harness.start()
+        return harness, created
+
+    async def test_the_flag_off_wires_no_mirror(self, h: Harness, strategies_dir: Path) -> None:
+        session = await h.session(
+            write_strategy(strategies_dir, "nofanout", entry_long=ENTRY_AT_100)
+        )
+        runtime = session._runtime
+        assert runtime is not None
+        assert runtime.mirror is None
+        assert runtime.bus.subscriber_count("*") == 0
+        await h.bar(session, "100")
+        assert [f[0] for f in _fills(session)] == ["BUY"]
+
+    async def test_the_flag_on_subscribes_the_mirror_last_and_connects_it(
+        self, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h, mirrors = await self._fanout_harness(strategies_dir, monkeypatch)
+        try:
+            session = await h.session(
+                write_strategy(strategies_dir, "fanout", entry_long=ENTRY_AT_100)
+            )
+            runtime = session._runtime
+            assert runtime is not None
+            assert runtime.mirror is mirrors[0]
+            assert mirrors[0].url == "redis://127.0.0.1:6379"
+            assert mirrors[0].connected is True
+            # the mirror is the bus's wildcard subscriber, subscribed after 'price':
+            # the network leg never sits between trading handlers
+            assert runtime.bus.subscriber_count("*") == 1
+            assert list(runtime.bus._subscribers)[-1] == "*"
+            assert "price" in runtime.bus._subscribers
+        finally:
+            await h.close()
+        assert mirrors[0].closed is True
+
+    async def test_shutdown_unsubscribes_the_mirror(
+        self, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h, mirrors = await self._fanout_harness(strategies_dir, monkeypatch)
+        try:
+            session = await h.session(
+                write_strategy(strategies_dir, "fanout-stop", entry_long=ENTRY_AT_100)
+            )
+            runtime = session._runtime
+            assert runtime is not None
+            await h.mgr.stop_session(session.session_id)
+            assert runtime.bus.subscriber_count("*") == 0
+        finally:
+            await h.close()
+        assert mirrors[0].closed is True
+
+    async def test_a_raising_mirror_callback_never_fails_the_bar(
+        self, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h, mirrors = await self._fanout_harness(strategies_dir, monkeypatch)
+        try:
+            session = await h.session(
+                write_strategy(strategies_dir, "fanout-broken", entry_long=ENTRY_AT_100)
+            )
+            assert mirrors[0].connected is True
+            mirrors[0].on_event_raises = True
+            await h.bar(session, "100")
+            assert [f[0] for f in _fills(session)] == ["BUY"]
+            assert session.status == "running"
+            assert session.last_bar_at is not None
+        finally:
+            await h.close()
+
+    async def test_an_unreachable_redis_fails_the_start_before_the_feed_connects(
+        self, strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h, mirrors = await self._fanout_harness(strategies_dir, monkeypatch, connect_raises=True)
+        try:
+            with pytest.raises(RuntimeError, match="redis unreachable"):
+                await h.session(write_strategy(strategies_dir, "fanout-dead", entry_long=NEVER))
+            assert mirrors[0].closed is True  # the failed start shut the mirror down
+            assert h.ws == []  # the feed never connected: no ws client was built
+        finally:
+            await h.close()
+
+    def test_the_backtest_engine_config_pins_the_memory_bus(self) -> None:
+        """Backtests never mirror: the runner's engine config is a bare model_construct,
+        which cannot read the environment, and its events section defaults to memory."""
+        from hydra.backtest.runner import _ENGINE_CONFIG
+
+        assert _ENGINE_CONFIG.events.bus == "memory"

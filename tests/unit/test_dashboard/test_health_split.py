@@ -22,7 +22,7 @@ from prometheus_client import REGISTRY
 from pydantic import SecretStr
 
 from hydra.core import metrics
-from hydra.core.config import HydraConfig, TraderConfig
+from hydra.core.config import EventsConfig, HydraConfig, TraderConfig
 from hydra.dashboard.health import REQUIRED_CHECKS, SPLIT_CHECKS, HealthMonitor
 from hydra.dashboard.routes import health as health_routes
 from hydra.execution.session_manager import HealthSnapshot
@@ -117,6 +117,53 @@ class TestCheckSets:
         app = FastAPI()
         app.state.config = HydraConfig(HYDRA_API_TOKEN=SecretStr(TOKEN))
         assert HealthMonitor(app, checks=SPLIT_CHECKS)._checks == SPLIT_CHECKS
+
+
+class TestRedisCheck:
+    """P7-E: the redis check exists exactly when the fan-out dependency exists."""
+
+    @staticmethod
+    def _fanout_app(redis_url: str) -> FastAPI:
+        app = FastAPI()
+        app.state.config = HydraConfig(
+            HYDRA_API_TOKEN=SecretStr(TOKEN),
+            REDIS_URL=SecretStr(redis_url),
+            events=EventsConfig(bus="redis"),
+        )
+        app.state.db_pool = FakePool()
+        return app
+
+    @staticmethod
+    def _closed_redis_port() -> int:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_the_engine_set_gains_redis_while_the_fanout_is_on(self) -> None:
+        monitor = HealthMonitor(self._fanout_app("redis://127.0.0.1:6379"))
+        assert monitor._checks == (*REQUIRED_CHECKS, "redis")
+
+    def test_the_split_set_never_gains_the_redis_check(self, stub_trader: StubTrader) -> None:
+        """The API beside a remote trader keeps its own set: the trader check embeds
+        the trader's own redis result."""
+        app = FastAPI()
+        app.state.config = HydraConfig(
+            HYDRA_API_TOKEN=SecretStr(TOKEN),
+            REDIS_URL=SecretStr("redis://127.0.0.1:6379"),
+            events=EventsConfig(bus="redis"),
+            trader=TraderConfig(url=stub_trader.url),
+        )
+        app.state.db_pool = FakePool()
+        assert HealthMonitor(app)._checks == SPLIT_CHECKS
+
+    async def test_an_unreachable_redis_fails_readiness(self) -> None:
+        monitor = HealthMonitor(self._fanout_app(f"redis://127.0.0.1:{self._closed_redis_port()}"))
+        result = await monitor.run_once()
+        assert result.ready is False
+        assert result.checks["redis"]["ok"] is False
+        assert result.checks["redis"]["required"] is True
+        assert isinstance(result.checks["redis"]["error"], str)
+        assert REGISTRY.get_sample_value("hydra_ready", {"check": "redis"}) == 0.0
 
 
 class TestTraderCheck:

@@ -1,7 +1,9 @@
 """Engine startup and shutdown.
 
 Startup order: config, logging, credential key, DB pool, Alembic migrations, stored credentials,
-system config, then one of two modes behind the same routes: with ``trader.url`` set (the D5
+system config, then the Redis ping when the opt-in event fan-out is on (``events.bus: redis``:
+Redis becomes tier-1 and an unreachable server refuses startup, like the database), then one of
+two modes behind the same routes: with ``trader.url`` set (the D5
 process split) a :class:`~hydra.dashboard.trader_client.RemoteTrader` is bound on
 ``app.state.trader`` and no ``SessionManager`` is ever constructed in this process; unset, the
 single-process engine starts here (``SessionManager.startup()``: risk state, recovery, display
@@ -40,7 +42,8 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 
-from hydra.core.config import HydraConfig, load_config
+from hydra.core.config import ConfigError, HydraConfig, load_config
+from hydra.core.event_bus import require_redis
 from hydra.dashboard.deps import bind_config
 from hydra.dashboard.routes import market_data
 from hydra.execution.client_factory import ClientFactory
@@ -51,6 +54,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DB_CONNECT_BUDGET_S = 30.0
+REDIS_CONNECT_BUDGET_S = 30.0
 _RETRY_MAX_DELAY_S = 5.0
 
 
@@ -82,6 +86,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             await _run_migrations(dsn)
             await _load_exchange_credentials(app)
             await _load_system_config(app)
+        await _require_redis(cfg)
         if cfg.trader.url is not None:
             # the split (D5): no SessionManager here — every engine op goes through RemoteTrader
             from hydra.dashboard.trader_client import RemoteTrader
@@ -161,6 +166,20 @@ async def _run_migrations(dsn: str) -> None:
 
     await asyncio.to_thread(upgrade_to_head, dsn)
     logger.info("Database schema at revision %s", await current_revision(dsn))
+
+
+async def _require_redis(cfg: HydraConfig) -> None:
+    """Ping Redis when the fan-out flag is on; an unreachable server refuses startup.
+
+    The fan-out makes Redis tier-1 exactly when it is on: with the flag off this is a
+    no-op and a Redis outage changes nothing (the health ping keeps its old meaning).
+    """
+    if cfg.events.bus != "redis":
+        return
+    secret = cfg.redis_url
+    if secret is None:  # unreachable: the config cross-validation requires it
+        raise ConfigError("events.bus 'redis' requires REDIS_URL")
+    await require_redis(secret.get_secret_value(), budget_s=REDIS_CONNECT_BUDGET_S)
 
 
 async def _load_exchange_credentials(app: FastAPI) -> None:

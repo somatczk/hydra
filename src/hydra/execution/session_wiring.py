@@ -4,8 +4,11 @@ Wiring order (fixed): the session's closed-bar handler is subscribed before the 
 paper executor evaluates resting orders and marks to a bar before any strategy sees that bar;
 every fill is published before the strategy runs. Then signals, fills, feed status and live
 prices (the executor's market-fill mark only; risk marks and resting orders stay on closed bars).
-A live session's runtime also starts the LiveOrderPoller (the single fill source) in ``wire``
-and sets the ``_live_coverage`` producer B's dead-man hook reads per closed bar.
+When the opt-in Redis fan-out is on (``events.bus: redis``), the mirror is subscribed last, as
+the bus's ``'*'`` callback, so the network leg never sits between trading handlers — the trading
+bus itself stays in-memory. A live session's runtime also starts the LiveOrderPoller (the single
+fill source) in ``wire`` and sets the ``_live_coverage`` producer B's dead-man hook reads per
+closed bar.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
-from hydra.core.event_bus import InMemoryEventBus
+from hydra.core.event_bus import InMemoryEventBus, RedisEventPublisher
 from hydra.core.events import (
     BarEvent,
     EntrySignal,
@@ -160,6 +163,14 @@ class SessionRuntime:
         self.primary: Timeframe = cfg.timeframes.primary
         self.required_history = required_history
         self.bus = InMemoryEventBus()
+        # the opt-in fan-out (P7-E): None unless events.bus is 'redis'; the trading
+        # bus above stays in-memory either way
+        self.mirror: RedisEventPublisher | None = None
+        if hydra_config.events.bus == "redis":
+            secret = hydra_config.redis_url
+            if secret is None:  # unreachable: the config cross-validation requires it
+                raise ValueError("events.bus 'redis' requires REDIS_URL")
+            self.mirror = RedisEventPublisher(secret.get_secret_value())
         self.feed = ExchangeFeedManager(
             event_bus=self.bus,
             exchange_factories={self.exchange_id: clients.ws_factory(self.exchange_id)},
@@ -242,6 +253,9 @@ class SessionRuntime:
         await self.bus.subscribe("order_cancel", self._on_cancel)
         await self.bus.subscribe("feed_status", self._on_feed_status)
         await self.bus.subscribe("price", self._on_price)
+        if self.mirror is not None:
+            # last: the network leg never sits between trading handlers
+            await self.bus.subscribe("*", self.mirror.on_event)
         if isinstance(self.executor, (LiveTradingExecutor, LivePerpTradingExecutor)):
             poller: LiveOrderPoller = (
                 LivePerpOrderPoller(
@@ -269,7 +283,13 @@ class SessionRuntime:
                 await self._process_closed_bar(symbol, bars[-1])
 
     async def connect(self) -> None:
-        """Start the live feed (ValueError: a symbol is not exactly one active spot market)."""
+        """Start the live feed (ValueError: a symbol is not exactly one active spot market).
+
+        With the fan-out on, the mirror connects first (ping + retry budget): a session
+        start with Redis unreachable fails before the feed connects.
+        """
+        if self.mirror is not None:
+            await self.mirror.connect()
         await self.feed.connect(self.exchange_id, self.cfg.symbols, self.cfg.all_timeframes())
 
     async def run(self) -> None:
@@ -277,7 +297,10 @@ class SessionRuntime:
         await self._done.wait()
 
     async def shutdown(self) -> None:
-        """Stop the poller, the feed and the engine; positions are left to the caller."""
+        """Stop the poller, the feed, the engine and the mirror.
+
+        Positions are left to the caller.
+        """
         if self._poller is not None:
             await self._poller.stop()
             self._poller = None
@@ -290,6 +313,15 @@ class SessionRuntime:
             await self.engine.stop()
         except Exception:
             logger.exception("Engine stop failed for %s", self.session.session_id)
+        if self.mirror is not None:
+            try:
+                await self.bus.unsubscribe("*", self.mirror.on_event)
+            except Exception:
+                logger.exception("Mirror unsubscribe failed for %s", self.session.session_id)
+            try:
+                await self.mirror.close()
+            except Exception:
+                logger.exception("Mirror close failed for %s", self.session.session_id)
 
     async def flatten(self) -> FlattenResult:
         return await flatten_session(self)

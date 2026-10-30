@@ -16,6 +16,7 @@ from hydra.core.config import (
     _DEFAULT_CONFIG_DIR,
     ConfigError,
     DataConfig,
+    EventsConfig,
     HydraConfig,
     _deep_merge,
     load_config,
@@ -516,6 +517,37 @@ class TestBacktestFields:
         monkeypatch.setenv("HYDRA_BACKTEST__JOB_LEASE_S", "30")
         with pytest.raises(ValidationError):
             load_config()
+
+
+class TestEventsFields:
+    """The event fan-out flag (P7-E): opt-in, default memory, redis requires REDIS_URL."""
+
+    def test_the_default_bus_is_memory(self) -> None:
+        assert load_config().events.bus == "memory"
+
+    def test_the_env_override_selects_redis(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_EVENTS__BUS", "redis")
+        monkeypatch.setenv("REDIS_URL", "redis://hydra-redis:6379")
+        cfg = load_config()
+        assert cfg.events.bus == "redis"
+        assert cfg.redis_url is not None
+
+    def test_the_redis_bus_without_redis_url_names_both(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            HydraConfig(events=EventsConfig(bus="redis"))
+        message = str(exc_info.value.errors()[0]["msg"])
+        assert "events.bus 'redis' requires REDIS_URL" in message
+
+    def test_an_unknown_bus_value_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_EVENTS__BUS", "kafka")
+        with pytest.raises(ValidationError):
+            load_config()
+
+    def test_an_unknown_events_key_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HYDRA_EVENTS__NOPE", "x")
+        with pytest.raises(ValidationError) as exc_info:
+            load_config()
+        assert (("events", "nope"), "extra_forbidden") in _loc_types(exc_info.value)
 
 
 def test_repo_base_yaml_sections_match_model() -> None:
