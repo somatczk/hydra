@@ -93,11 +93,12 @@ async def load_session_trades(db_pool: Any, session: TradingSession) -> list[dic
                     "id": str(row["id"]),
                     "symbol": row["symbol"],
                     "side": row["side"],
-                    "quantity": float(row["quantity"]) if row["quantity"] else 0,
-                    "price": float(row["price"]) if row["price"] else 0,
-                    "fee": float(row["fee"]) if row["fee"] else 0,
-                    "pnl": float(row["pnl"]) if row["pnl"] else 0,
-                    "net_pnl": float(row["net_pnl"]) if row["net_pnl"] is not None else None,
+                    # the NUMERIC columns' Decimals pass through; a zero keeps today's int 0
+                    "quantity": row["quantity"] or 0,
+                    "price": row["price"] or 0,
+                    "fee": row["fee"] or 0,
+                    "pnl": row["pnl"] or 0,
+                    "net_pnl": row["net_pnl"],
                     "reason": row["reason"],
                     "timestamp": row["timestamp"].isoformat() if row["timestamp"] else None,
                 }

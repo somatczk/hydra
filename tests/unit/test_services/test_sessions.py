@@ -22,7 +22,11 @@ from hydra.core.config import HydraConfig
 from hydra.core.event_bus import InMemoryEventBus
 from hydra.core.events import OrderFillEvent
 from hydra.core.types import MarketType, OrderType, Side, Symbol, Timeframe
-from hydra.dashboard.routes.trading import SessionDetailResponse
+from hydra.dashboard.routes.trading import (
+    LiveOrderItem,
+    QuickTradeResponse,
+    SessionDetailResponse,
+)
 from hydra.data.ingestion import InsufficientHistoryError
 from hydra.execution.errors import (
     DuplicateSessionError,
@@ -63,6 +67,18 @@ pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
 
 D = Decimal
 _NOW = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
+
+
+def _floated(value: Any) -> Any:
+    """The same shape with every Decimal floated — what a float interior would serve."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _floated(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_floated(v) for v in value]
+    return value
+
 
 _LIVE_RULES = MarketRules(
     symbol="BTCUSDT",
@@ -258,7 +274,7 @@ async def test_start_passes_the_actor_and_returns_created_by() -> None:
     d = await _start(mgr)
     assert mgr.start_actor == "user:soma"
     assert d["created_by"] == "user:soma"
-    assert (d["session_id"], d["status"], d["paper_capital"]) == ("s1", "running", 250.0)
+    assert (d["session_id"], d["status"], d["paper_capital"]) == ("s1", "running", D("250"))
 
 
 async def test_start_without_a_manager_is_the_503_envelope() -> None:
@@ -535,15 +551,21 @@ async def test_quick_trade_returns_the_route_response_dict() -> None:
         "symbol": "BTCUSDT",
         "side": "BUY",
         "order_type": "MARKET",
-        "quantity": 0.5,
+        "quantity": D("0.5"),
         "price": None,
         "status": "FILLED",
         "protection": "armed",
         "protective_order_id": "p1",
         "exit_orders_deferred": False,
-        "fill_price": 100.1,
+        "fill_price": D("100.1"),
         "mark_source": "last_close",
     }
+    # the egress contract: the route's float-typed model renders the same bytes a
+    # float interior gave (a bare Decimal would serialize as a JSON string)
+    assert QuickTradeResponse.model_validate(d).model_dump_json() == (
+        QuickTradeResponse.model_validate(_floated(d)).model_dump_json()
+    )
+    assert QuickTradeResponse.model_validate(d).fill_price == 100.1
 
 
 def test_quick_trade_model_is_forbid_extra_and_validates_like_the_route() -> None:
@@ -716,7 +738,7 @@ async def test_quick_trade_round_trip_on_the_real_seam(h: Harness, strategies_di
     order = QuickTradeRequest(session_id=session.session_id, side="buy", quantity="0.5")
     d = await sessions_svc.submit_manual_order(h.mgr, order)
 
-    assert (d["status"], d["protection"], d["fill_price"]) == ("FILLED", "armed", 100.1)
+    assert (d["status"], d["protection"], d["fill_price"]) == ("FILLED", "armed", D("100.1"))
     assert await held(session) == D("0.5")
 
 
@@ -1339,8 +1361,10 @@ class TestSessionDetailA7:
 
         assert [o["client_order_id"] for o in detail["orders"]] == ["hyd-stopped"]
         assert detail["orders"][0]["status"] == "filled"
-        assert detail["orders"][0]["quantity"] == 0.01
+        assert detail["orders"][0]["quantity"] == D("0.01")
         assert detail["orders"][0]["submitted_at"] == (_NOW - timedelta(hours=2)).isoformat()
+        # the egress contract: the route's float-typed model fields coerce the Decimals
+        assert LiveOrderItem.model_validate(detail["orders"][0]).quantity == 0.01
 
     async def test_without_a_pool_a_stopped_live_session_has_no_orders(self) -> None:
         """The degenerate leg: no executor, no pool — nothing to read, honestly empty."""

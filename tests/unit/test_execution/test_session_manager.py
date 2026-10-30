@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,9 @@ import yaml
 
 from hydra.core import metrics
 from hydra.core.config import HydraConfig
+from hydra.dashboard.routes.trading import TradeItem
 from hydra.data.ingestion import InsufficientHistoryError
-from hydra.execution import client_factory, exchange_client
+from hydra.execution import client_factory, exchange_client, session_store
 from hydra.execution.errors import (
     ConfigReloadRefusedError,
     DuplicateSessionError,
@@ -24,7 +26,7 @@ from hydra.execution.errors import (
     UnsupportedStrategyError,
     UnsupportedVenueError,
 )
-from hydra.execution.session_manager import SessionManager
+from hydra.execution.session_manager import SessionManager, TradingSession
 from tests.unit.test_execution.session_harness import (
     Harness,
     executor,
@@ -34,6 +36,8 @@ from tests.unit.test_execution.session_harness import (
 )
 
 pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
+
+D = Decimal
 
 
 @pytest.fixture()
@@ -249,6 +253,67 @@ class TestDetailAndHealth:
         await h.mgr.stop_session(session.session_id)
         (stopped,) = (await h.mgr.health_snapshot()).sessions
         assert (stopped.desired, stopped.supervised) == (False, False)
+
+
+class _TradesPool:
+    """Serves the stopped-session trade rows load_session_trades SELECTs."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    def acquire(self) -> _TradesPool:
+        return self
+
+    async def __aenter__(self) -> _TradesPool:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def fetch(self, sql: str, *args: object) -> list[dict[str, Any]]:
+        assert "FROM trades" in sql
+        return self.rows
+
+
+async def test_load_session_trades_serves_the_numeric_columns_as_decimals() -> None:
+    """P7-B4: the stopped-session trade rows carry the NUMERIC columns' Decimals and the
+    route model floats them at egress — byte-identical to a float interior; a zero
+    keeps today's int 0."""
+    session = TradingSession("s1", "saw", "paper", status="stopped")
+    row: dict[str, Any] = {
+        "id": 7,
+        "symbol": "BTCUSDT",
+        "side": "SELL",
+        "quantity": D("0.5"),
+        "price": D("90"),
+        "fee": D("0.045"),
+        "pnl": D("-5"),
+        "net_pnl": D("-5.095"),
+        "reason": "stop_loss",
+        "timestamp": datetime(2026, 10, 1, tzinfo=UTC),
+    }
+    zero = {**row, "id": 8, "quantity": D("0"), "net_pnl": D("0")}
+
+    trades = await session_store.load_session_trades(_TradesPool([row, zero]), session)
+
+    assert isinstance(trades[0]["quantity"], Decimal)
+    assert (trades[0]["quantity"], trades[0]["price"], trades[0]["net_pnl"]) == (
+        D("0.5"),
+        D("90"),
+        D("-5.095"),
+    )
+    assert (trades[1]["quantity"], trades[1]["net_pnl"]) == (0, D("0"))
+    floated = {
+        **trades[0],
+        "quantity": 0.5,
+        "price": 90.0,
+        "fee": 0.045,
+        "pnl": -5.0,
+        "net_pnl": -5.095,
+    }
+    assert TradeItem.model_validate(trades[0]).model_dump_json() == (
+        TradeItem.model_validate(floated).model_dump_json()
+    )
 
 
 async def test_session_error_is_counted(h: Harness, strategies_dir: Path) -> None:
