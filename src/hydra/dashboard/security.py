@@ -7,7 +7,7 @@ mount runs its own constant-time bearer check against ``HYDRA_MCP_TOKEN``
 
 - ``service``: ``Authorization: Bearer <HYDRA_API_TOKEN>`` (constant-time compare);
 - ``user``: a ``Remote-User`` header from a TCP peer inside ``api.trusted_proxy_cidrs``
-  (Traefik after Authelia forwardAuth; only in ``proxy`` mode);
+  (Traefik after Authentik forwardAuth; only in ``proxy`` mode);
 - ``dev``: anyone, in ``api.auth_mode: dev`` (local compose only; logged at CRITICAL).
 
 Browser principals (``user``, ``dev``) must also pass the CSRF checks on non-safe methods

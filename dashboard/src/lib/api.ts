@@ -91,7 +91,7 @@ async function request(path: string, options?: RequestInit): Promise<Response> {
   const url = `${API_BASE}${path}`;
   const t0 = performance.now();
   const headers: Record<string, string> = {
-    // Authelia answers 401, not a redirect to its login page, to a request that doesn't accept HTML.
+    // The sign-in portal redirects even a JSON request; the redirect is caught below as signed out.
     accept: 'application/json',
     ...(typeof options?.body === 'string' ? { 'content-type': 'application/json' } : {}),
     ...apiHeaders(method),

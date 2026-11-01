@@ -408,7 +408,7 @@ Production runs as a Docker Compose stack in the [romulus](https://github.com/so
 
 In production the API and the trader are separate containers of the engine image (`HYDRA_TRADER__URL` points the
 API at the trader), the dashboard sits behind the same host, and the API sits behind a Traefik reverse proxy with
-Authelia login. Prometheus alert rules and a Grafana dashboard live in [`deploy/`](deploy/); the running Prometheus,
+Authentik login. Prometheus alert rules and a Grafana dashboard live in [`deploy/`](deploy/); the running Prometheus,
 Alertmanager and Grafana are in romulus. `deploy/compose.yml` is a local full-stack approximation, not the
 deployment.
 

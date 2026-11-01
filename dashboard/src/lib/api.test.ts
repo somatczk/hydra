@@ -78,7 +78,7 @@ describe('fetchApi headers', () => {
 describe('fetchApi signed-out detection (E-1)', () => {
   const caught = (p: Promise<unknown>) => p.then(() => null, (e: unknown) => e);
 
-  it('asks for JSON so Authelia answers 401 instead of redirecting to its login page', async () => {
+  it('asks for JSON', async () => {
     await fetchApi('/api/x');
     expect(sentHeaders().get('accept')).toBe('application/json');
   });
