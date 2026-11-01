@@ -182,7 +182,7 @@ describe('isSignedOut', () => {
   });
 
   it('is true for any 401, whatever its body', () => {
-    expect(isSignedOut(new ApiError(401, '<!DOCTYPE html><title>Login - Authelia</title>'))).toBe(true);
+    expect(isSignedOut(new ApiError(401, '<!DOCTYPE html><title>authentik</title>'))).toBe(true);
   });
 
   it('known limit until E-1: a redirect to the sign-in page reaches us as a JSON SyntaxError, not a 401', () => {

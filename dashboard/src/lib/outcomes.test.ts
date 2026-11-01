@@ -109,7 +109,7 @@ describe('killSwitchOutcome', () => {
   });
 
   it('C-KS-7 on a direct 401, C-KS-5 on a network error, a 502 and engine_not_ready', () => {
-    expect(killSwitchOutcome({ err: new ApiError(401, '<html>Authelia</html>') }, [], NOW).title).toBe(
+    expect(killSwitchOutcome({ err: new ApiError(401, '<html>authentik</html>') }, [], NOW).title).toBe(
       "Not sent: you're signed out.",
     );
     for (const err of [
