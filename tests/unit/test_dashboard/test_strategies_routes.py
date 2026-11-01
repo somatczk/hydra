@@ -1300,22 +1300,108 @@ class TestUniverseWriteGate:
                 assert f"Invalid exchange: {exchange_id}" in str(resp.json()["detail"])
         assert list(tmp_path.glob("*.yaml")) == []
 
-    def test_an_alpaca_save_or_update_is_refused_by_name(self, tmp_path: Path) -> None:
-        """alpaca is registered backtest-only with no ccxt client: until S1 (c) validates
-        its tickers and timeframe, a save or update on it is refused, even of a universe
-        member, and nothing is written."""
-        (tmp_path / "gate.yaml").write_text(_rule_based_yaml("gate_1"))
-        stored = (tmp_path / "gate.yaml").read_text()
-        body = _save_body(symbol="BTCUSDT", exchange_id="alpaca")
+    @staticmethod
+    def _stock_body(symbol: str = "AAPL/USD", timeframe: str = "1d") -> dict[str, Any]:
+        return {
+            **_save_body(symbol=symbol, exchange_id="alpaca"),
+            "timeframes": {"primary": timeframe},
+        }
+
+    def test_an_alpaca_save_skips_the_universe_and_writes_the_yaml(self, tmp_path: Path) -> None:
+        """US stocks have no top-100 universe: AAPL/USD is in none, and saves anyway."""
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
             client = TestClient(_make_app(pool=seeded_universe_pool()))
-            saved = client.post("/api/strategies/save", json=body)
-            updated = client.put("/api/strategies/gate_1", json=body)
+            resp = client.post("/api/strategies/save", json=self._stock_body("BRK.B/USD"))
+        assert resp.status_code == 201
+        (written,) = tmp_path.glob("*.yaml")
+        stored = yaml.safe_load(written.read_text())
+        assert stored["exchange"] == {"exchange_id": "alpaca", "market_type": "SPOT"}
+        assert (stored["symbols"], stored["timeframes"]) == (["BRK.B/USD"], {"primary": "1d"})
+
+    def test_an_alpaca_save_or_update_off_1d_is_timeframe_not_supported(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "gate.yaml").write_text(_rule_based_yaml("gate_1"))
+        stored = (tmp_path / "gate.yaml").read_text()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            saved = client.post("/api/strategies/save", json=self._stock_body(timeframe="1h"))
+            updated = client.put("/api/strategies/gate_1", json=self._stock_body(timeframe="1h"))
         for resp in (saved, updated):
             assert resp.status_code == 422
-            assert resp.json()["detail"] == "Invalid exchange: alpaca"
+            assert resp.json()["detail"] == {
+                "code": "timeframe_not_supported",
+                "message": "alpaca serves 1d bars only, not 1h",
+                "state": "invalid",
+                "timeframe": "1h",
+            }
         assert [p.name for p in tmp_path.glob("*.yaml")] == ["gate.yaml"]
         assert (tmp_path / "gate.yaml").read_text() == stored
+
+    @pytest.mark.parametrize(
+        "symbol",
+        ["aapl/USD", "AAPL", "AAPL/USDT", "BTCUSDT", "TOOLONGTICK/USD", "AA PL/USD", ".A/USD"],
+    )
+    def test_an_alpaca_save_needs_a_ticker_over_usd(self, tmp_path: Path, symbol: str) -> None:
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            resp = client.post("/api/strategies/save", json=self._stock_body(symbol))
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {
+            "code": "invalid_symbol",
+            "message": f"{symbol!r} is not a US stock symbol: use TICKER/USD, e.g. AAPL/USD",
+            "state": "invalid",
+            "symbol": symbol,
+        }
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    @pytest.mark.parametrize(
+        ("exchange", "symbol", "timeframe", "detail"),
+        [
+            ("kraken", "BTCUSDT", "1h", "Invalid exchange: kraken"),
+            ("okx", "BTCUSDT", "1h", "Invalid exchange: okx"),
+            ("alpaca", "AAPL/USD", "1h", "alpaca serves 1d bars only, not 1h"),
+            ("alpaca", "BTCUSDT", "1d", "'BTCUSDT' is not a US stock symbol"),
+        ],
+    )
+    def test_an_import_gets_the_save_venue_gate(
+        self, tmp_path: Path, exchange: str, symbol: str, timeframe: str, detail: str
+    ) -> None:
+        """An imported YAML meets the same venue, symbol and timeframe checks as a save, so
+        kraken and okx (unregistered) are refused at import now, not just at start."""
+        upload = yaml.safe_dump(
+            {
+                "name": "Imported",
+                "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+                "symbols": [symbol],
+                "exchange": {"exchange_id": exchange, "market_type": "SPOT"},
+                "timeframes": {"primary": timeframe},
+            }
+        ).encode()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            resp = TestClient(_make_app()).post(
+                "/api/strategies/import", files={"file": ("imported.yaml", upload)}
+            )
+        assert resp.status_code == 422
+        assert detail in str(resp.json()["detail"])
+        assert list(tmp_path.glob("*.yaml")) == []
+
+    def test_an_alpaca_import_on_1d_is_written(self, tmp_path: Path) -> None:
+        upload = yaml.safe_dump(
+            {
+                "name": "Stocks",
+                "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+                "symbols": ["SPY/USD"],
+                "exchange": {"exchange_id": "alpaca", "market_type": "SPOT"},
+                "timeframes": {"primary": "1d"},
+            }
+        ).encode()
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            resp = TestClient(_make_app()).post(
+                "/api/strategies/import", files={"file": ("stocks.yaml", upload)}
+            )
+        assert resp.status_code == 201
+        assert [p.name for p in tmp_path.glob("*.yaml")] == [f"{resp.json()['id']}.yaml"]
 
     def test_update_with_a_member_symbol_round_trips(self, tmp_path: Path) -> None:
         (tmp_path / "gate.yaml").write_text(_rule_based_yaml("gate_1"))

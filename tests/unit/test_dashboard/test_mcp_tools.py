@@ -917,17 +917,45 @@ def test_strategy_save_with_an_empty_name_names_the_offending_field(mcp: _McpCli
     assert envelope["detail"]["message"].startswith("name:")
 
 
-def test_strategy_save_on_alpaca_is_the_422_envelope_naming_it(
+def test_strategy_save_on_alpaca_off_1d_is_the_422_envelope(
     mcp: _McpClient, strategies_dir: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(engine_app.state, "db_pool", seeded_universe_pool())
     is_error, text = mcp.call(
         "strategy_save",
-        {"name": "Stocks", "exchange_id": "alpaca", "symbol": "BTCUSDT", "rules": _RULES},
+        {"name": "Stocks", "exchange_id": "alpaca", "symbol": "AAPL/USD", "rules": _RULES},
     )
     assert is_error
     envelope = json.loads(text.removeprefix("Error executing tool strategy_save: "))
-    assert envelope == {"status": 422, "detail": "Invalid exchange: alpaca"}
+    assert envelope == {
+        "status": 422,
+        "detail": {
+            "code": "timeframe_not_supported",
+            "message": "alpaca serves 1d bars only, not 1h",
+            "state": "invalid",
+            "timeframe": "1h",
+        },
+    }
+    assert list(strategies_dir.glob("*.yaml")) == []
+
+
+def test_strategy_import_refuses_an_unregistered_venue(
+    mcp: _McpClient, strategies_dir: Any
+) -> None:
+    """strategy_import meets the save's venue gate: kraken is not registered, so its YAML
+    is refused at import instead of written and refused at every start."""
+    upload = yaml.safe_dump(
+        {
+            "name": "Kraken",
+            "strategy_class": "hydra.strategy.builtin.rule_based.RuleBasedStrategy",
+            "symbols": ["BTCUSDT"],
+            "exchange": {"exchange_id": "kraken", "market_type": "SPOT"},
+        }
+    )
+    is_error, text = mcp.call("strategy_import", {"filename": "k.yaml", "yaml_content": upload})
+    assert is_error
+    envelope = json.loads(text.removeprefix("Error executing tool strategy_import: "))
+    assert envelope == {"status": 422, "detail": "Invalid exchange: kraken"}
     assert list(strategies_dir.glob("*.yaml")) == []
 
 

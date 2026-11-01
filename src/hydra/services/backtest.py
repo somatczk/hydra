@@ -304,6 +304,14 @@ async def _preflight(
     exchange = config.exchange.exchange_id
     symbol = config.symbols[0]
     if exchange == "alpaca":
+        if consumed_model_names(config):
+            raise service_error(
+                422,
+                "ml_not_supported",
+                "alpaca strategies cannot consume a model: the ML feature spec is built on "
+                "24/7 crypto bars",
+                "invalid",
+            )
         await require_alpaca_connected(pool)
     stored = None
     if require_data or read_span:
