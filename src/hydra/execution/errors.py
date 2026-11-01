@@ -24,6 +24,12 @@ class UnsupportedVenueError(ValueError):
     code = "unsupported_venue"
 
 
+class AlpacaNotConnectedError(RuntimeError):
+    """No stored Alpaca paper key: alpaca's data reads need one (connect it in Settings)."""
+
+    code = "alpaca_not_connected"
+
+
 class LiveNotArmedError(RuntimeError):
     """The ``live_armed`` system_config row is absent or off: no live session may start."""
 
