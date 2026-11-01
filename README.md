@@ -330,7 +330,7 @@ Each PR that changes one of these rows updates the row.
 ## Roadmap
 
 Hydra is being rebuilt in phases, each ending in a release. All planned phases have shipped; the current release is
-3.1.0.
+3.2.0.
 
 | Phase | Release | What it delivered |
 |-------|---------|-------------------|
@@ -347,6 +347,7 @@ Hydra is being rebuilt in phases, each ending in a release. All planned phases h
 | Backtest realism | 2.9.2 | Fills capped to a share of each bar's volume, multi-timeframe replay, no entries on a stale mark, metrics that score only the bars a strategy can trade, buy-and-hold benchmarks on every holdout and fold, per-strategy limits on position size, risk per trade and concurrent positions, strict mypy on every package and one order-book client. |
 | Venues and push | 3.0.0 | Bybit spot as a second, live-only venue behind one venue registry and a multi-venue arming ceremony; VaR, the exchange ingest and the route interiors in exact Decimal; the opt-in Redis Streams event fan-out; the `/ws/risk` push and session status ticks; the Telegram risk-event alerter; the hedge-mode perps trading screen. |
 | S1 US stocks (backtest) | 3.1.0 | US stocks and ETFs from Alpaca, backtest only: the paper key in Settings, split-adjusted daily SIP bars fetched on demand, USD accounts in whole shares with no fees, a 252-day year, ticker saves without the crypto universe. Also window-independent vwap/obv (ML feature spec v4: models trained on v3 need a retrain), majority-class ML scoring and return-based correlation. |
+| Dashboard and MCP sign-in | 3.2.0 | Five dashboard destinations (Home, Strategies, Money, Inbox, System) in both the desktop rail and the phone tab bar; Home grouped by account with paper and live money on separate lines; colour that carries meaning only, light and dark themes, vendored fonts. The MCP endpoint behind Authentik OAuth: tokens checked against the issuer's keys, RFC 9728 discovery, MCP callers kept as service principals. |
 
 **Deferred and known gaps** (the [Status](#status) table has the full list):
 
