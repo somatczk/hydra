@@ -52,7 +52,9 @@ def _approval_store() -> ApprovalStore:
 @server.tool(name="model_list", structured_output=False)
 async def model_list() -> str:
     """List every registered model version (name, version, stage Staging|Production|
-    Archived, metrics, feature spec, drift, training job), in name-then-version order."""
+    Archived, metrics, feature spec, drift, training job), in name-then-version order.
+    Read ``oos_accuracy`` against ``oos_majority_rate`` (the no-skill bar); ``oos_up_rate``
+    (``oos_base_rate`` on older versions) is the up-fraction, not a bar."""
     try:
         return _deps.json_text(await models_svc.list_models(_deps.db_pool(), _models_dir()))
     except ServiceError as exc:

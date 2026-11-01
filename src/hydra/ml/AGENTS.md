@@ -29,8 +29,11 @@ Test files without a `tests/` prefix are in `tests/unit/test_ml/`.
   including the feed/auto source mix; same rows plus same spec give a byte-identical matrix
   (`test_dataset.py::test_same_rows_and_spec_hash_produce_byte_identical_matrix`).
 - Training classifies the sign of the forward return and evaluates walk-forward with an embargo of one horizon;
-  it reports OOS accuracy next to the base rate and the mean signed return, no Sharpe
-  (`test_training.py::test_embargo_is_the_horizon_between_train_end_and_test_start`, `::test_no_fake_sharpe`).
+  the first fold trains on at least a third of the rows. It reports OOS accuracy next to the per-fold
+  majority-class rate (the no-skill bar, `majority_rate`; `up_rate` is only the up-fraction) and the mean signed
+  return, no Sharpe (`test_training.py::test_embargo_is_the_horizon_between_train_end_and_test_start`,
+  `::test_the_no_skill_bar_is_the_majority_class_not_the_up_fraction`,
+  `::test_no_fold_trains_on_a_sliver_of_a_box_sized_dataset`, `::test_no_fake_sharpe`).
 - xgboost, onnxmltools (the `ml-training` extra) and onnxruntime are imported inside functions, never at module
   top, so `hydra.ml` imports without the extra.
 - Exports embed the spec in the ONNX metadata; an export without a spec carries `feature_version=0` and serving

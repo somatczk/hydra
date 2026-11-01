@@ -52,10 +52,11 @@ function model(over: Record<string, unknown> = {}): Record<string, unknown> {
     metrics: {
       folds: 5,
       oos_accuracy: 0.512,
-      oos_base_rate: 0.498,
+      oos_majority_rate: 0.523,
+      oos_up_rate: 0.477,
       oos_mean_signed_return: 0.00042,
     },
-    feature_spec: { spec_version: 3 },
+    feature_spec: { spec_version: 4 },
     drift: 0.15,
     drift_status: 'low',
     artifact_file: 'abc123.onnx',
@@ -161,7 +162,9 @@ describe('ModelsPage registry table', () => {
     expect(text).toContain('job:ml-abc12345');
     expect(text).toContain('ml-abc12345');
     expect(text).toContain('51.20%');
-    expect(text).toContain('49.80%');
+    expect(text).toContain('No-skill');
+    expect(text).toContain('52.30%');
+    expect(text).not.toContain('47.70%');
     expect(text).toContain('+0.04%');
     expect(text).toContain('0.150');
     expect(text).toContain('Low');
@@ -185,6 +188,17 @@ describe('ModelsPage registry table', () => {
     expect(text).toContain('Unknown');
     expect(text).toContain('upload:dev');
     expect(text).not.toContain('job:');
+  });
+
+  it('never shows a stored up-fraction as the no-skill bar', async () => {
+    const c = await open({
+      '/api/models': [model({ metrics: { folds: 5, oos_accuracy: 0.497, oos_base_rate: 0.494 } })],
+    });
+
+    const text = c.textContent ?? '';
+    expect(text).toContain('49.70%');
+    expect(text).not.toContain('49.40%');
+    expect(text).toContain('N/A');
   });
 
   it('colours the drift badge at the 0.2/0.25 bands the backend serves', async () => {
@@ -299,7 +313,7 @@ describe('ModelsPage retrain', () => {
         progress: polls === 0 ? 40 : 100,
         error: null,
         result: polls === 0 ? null : { name: 'alpha', version: 3, stage: 'staging' },
-        metrics: polls === 0 ? null : { oos_accuracy: 0.53, oos_base_rate: 0.5, oos_mean_signed_return: 0.0007 },
+        metrics: polls === 0 ? null : { oos_accuracy: 0.53, oos_majority_rate: 0.5, oos_mean_signed_return: 0.0007 },
         provenance: null,
       }),
     }, {
@@ -347,7 +361,7 @@ describe('ModelsPage retrain', () => {
           progress: polls === 2 ? 40 : 100,
           error: null,
           result: polls === 2 ? null : { name: 'alpha', version: 3, stage: 'staging' },
-          metrics: polls === 2 ? null : { oos_accuracy: 0.53, oos_base_rate: 0.5, oos_mean_signed_return: 0.0007 },
+          metrics: polls === 2 ? null : { oos_accuracy: 0.53, oos_majority_rate: 0.5, oos_mean_signed_return: 0.0007 },
           provenance: null,
         };
       },
@@ -390,7 +404,7 @@ describe('ModelsPage retrain', () => {
           progress: 100,
           error: null,
           result: { name: 'alpha', version: 3, stage: 'staging' },
-          metrics: { oos_accuracy: 0.53, oos_base_rate: 0.5, oos_mean_signed_return: 0.0007 },
+          metrics: { oos_accuracy: 0.53, oos_majority_rate: 0.5, oos_mean_signed_return: 0.0007 },
           provenance: null,
         };
       },
