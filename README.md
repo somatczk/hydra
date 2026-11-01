@@ -326,7 +326,7 @@ Each PR that changes one of these rows updates the row.
 ## Roadmap
 
 Hydra is being rebuilt in phases, each ending in a release. All planned phases have shipped; the current release is
-2.9.2.
+3.0.0.
 
 | Phase | Release | What it delivered |
 |-------|---------|-------------------|
@@ -341,14 +341,13 @@ Hydra is being rebuilt in phases, each ending in a release. All planned phases h
 | Research hardening | 2.9.0 | Regime and momentum indicators (ADX, rate of change, lagged close, Bollinger width, ATR %, Donchian highs and lows), computed vectorised; entry schedules; explicit parameter bindings whose tuned values round-trip through the builder; warm-up history derived from the rules; several backtest workers sharing one queue and fetching each dataset once; walk-forward folds that mean what they say; model registry tools over MCP and version-pinned research runs; the agent instructions and this README. |
 | Perp research | 2.9.1 | Hyperopt and walk-forward for USD⌂-M perp strategies, with settled funding charged in every trial, holdout and fold. |
 | Backtest realism | 2.9.2 | Fills capped to a share of each bar's volume, multi-timeframe replay, no entries on a stale mark, metrics that score only the bars a strategy can trade, buy-and-hold benchmarks on every holdout and fold, per-strategy limits on position size, risk per trade and concurrent positions, strict mypy on every package and one order-book client. |
+| Venues and push | 3.0.0 | Bybit spot as a second, live-only venue behind one venue registry and a multi-venue arming ceremony; VaR, the exchange ingest and the route interiors in exact Decimal; the opt-in Redis Streams event fan-out; the `/ws/risk` push and session status ticks; the Telegram risk-event alerter; the hedge-mode perps trading screen. |
 
 **Deferred and known gaps** (the [Status](#status) table has the full list):
 
-- The real-time risk push (`/ws/risk`) is deferred with no phase assigned; the risk pages poll.
 - Manual and quick-trade orders on perps sessions are long-only (strategies still trade both sides, and the kill
   switch and strategy exits still close shorts).
 - Kraken and OKX are not supported and not scheduled; Bybit shipped live-only (see the Status table).
-- Unscheduled: Decimal for every financial value.
 
 ## Quick start
 
