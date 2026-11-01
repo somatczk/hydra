@@ -28,8 +28,14 @@ from hydra.data.errors import DataFetchError
 from hydra.data.on_demand import OnDemandFetchService
 from hydra.data.storage import MarketDataRepository
 from hydra.data.universe import EXCHANGE_ID as UNIVERSE_VENUE
-from hydra.execution.client_factory import RestHandle, SharedRestClients, validate_venue
+from hydra.execution.client_factory import (
+    RestHandle,
+    SharedRestClients,
+    build_alpaca_data_client,
+    validate_venue,
+)
 from hydra.execution.errors import (
+    AlpacaNotConnectedError,
     ConfigReloadRefusedError,
     SessionNotRunningError,
     UnsupportedVenueError,
@@ -891,14 +897,18 @@ class _PreviewFetchClients:
 
     One refcounted pool for the process lifetime (the worker's pattern): the first
     preview fetch constructs the exchange client — ``load_markets`` is paid once per
-    process, not per preview — and the handles are held until the process exits.
+    process, not per preview — and the handles are held until the process exits. alpaca
+    is never pooled: its client is built from the stored key (*db_pool*) on every call.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, db_pool: Any = None) -> None:
         self._pool = SharedRestClients()
         self._handles: dict[ExchangeId, RestHandle] = {}
+        self._db_pool = db_pool
 
     async def client(self, exchange_id: ExchangeId) -> Any:
+        if exchange_id == "alpaca":
+            return await build_alpaca_data_client(self._db_pool)
         handle = self._handles.get(exchange_id)
         if handle is None:
             handle = await self._pool.handle(exchange_id)
@@ -913,7 +923,7 @@ class _PreviewFetchClients:
 _PREVIEW_ENGINE: OnDemandFetchService | None = None
 
 
-def preview_fetch_engine(cfg: DataConfig) -> OnDemandFetchService | None:
+def preview_fetch_engine(cfg: DataConfig, db_pool: Any = None) -> OnDemandFetchService | None:
     """The engine process's one preview fetch engine; ``None`` while the kill switch is on.
 
     Constructed exactly once per process (the one-instance contract: one weight budget,
@@ -925,7 +935,7 @@ def preview_fetch_engine(cfg: DataConfig) -> OnDemandFetchService | None:
     if not cfg.auto_fetch_enabled:
         return None
     if _PREVIEW_ENGINE is None:
-        clients = _PreviewFetchClients()
+        clients = _PreviewFetchClients(db_pool)
         _PREVIEW_ENGINE = OnDemandFetchService.from_config(cfg, clients.client)
     return _PREVIEW_ENGINE
 
@@ -955,6 +965,8 @@ async def _fetched_latest_bars(
         raise ServiceError(503, exc.to_detail()) from exc
     except NoMarketDataError as exc:
         raise ServiceError(422, exc.to_detail()) from exc
+    except AlpacaNotConnectedError as exc:
+        raise service_error(422, exc.code, str(exc), "invalid") from exc
     try:
         async with db_errors("re-loading market data for preview"):
             return await load_latest_bars(

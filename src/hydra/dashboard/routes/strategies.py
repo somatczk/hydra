@@ -144,7 +144,8 @@ async def preview_signals(body: PreviewRequest, request: Request) -> PreviewResp
     engine = getattr(request.app.state, "fetch_engine", None)
     if engine is None:
         cfg = getattr(request.app.state, "config", None)
-        engine = svc.preview_fetch_engine(cfg.data) if cfg is not None else None
+        pool = request_pool(request)
+        engine = svc.preview_fetch_engine(cfg.data, pool) if cfg is not None else None
     return await svc.preview_signals(request_pool(request), body, fetch_engine=engine)
 
 

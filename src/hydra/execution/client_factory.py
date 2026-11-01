@@ -30,11 +30,12 @@ from hydra.core.venues import (
 )
 from hydra.core.venues import venue_market_type as _registry_market_type
 from hydra.data.storage import MarketDataRepository
-from hydra.execution.errors import UnsupportedVenueError
+from hydra.execution.errors import AlpacaNotConnectedError, UnsupportedVenueError
 from hydra.execution.paper_trading import PaperTradingExecutor, SpotMarketRules
 from hydra.execution.perp_trading import default_funding_reader
 
 if TYPE_CHECKING:
+    from hydra.data.alpaca import AlpacaClient
     from hydra.execution.exchange_client import ExchangeClient
     from hydra.execution.perp_trading import FundingReader, PerpPaperTradingExecutor
 
@@ -188,6 +189,22 @@ def build_trading_client(
         testnet=testnet,
         market_type=mt,
     )
+
+
+async def build_alpaca_data_client(pool: Any) -> AlpacaClient:
+    """Alpaca's data and paper-account client from the stored key, read and decrypted per call,
+    so a reconnected key takes effect on the next fetch (AlpacaNotConnectedError when none)."""
+    from hydra.core.encryption import decrypt
+    from hydra.data.alpaca import AlpacaClient
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT encrypted_key, encrypted_secret FROM exchange_credentials "
+            "WHERE exchange_id = 'alpaca'"
+        )
+    if row is None:
+        raise AlpacaNotConnectedError("alpaca is not connected: store its paper key in Settings")
+    return AlpacaClient(decrypt(str(row["encrypted_key"])), decrypt(str(row["encrypted_secret"])))
 
 
 def build_paper_executor(

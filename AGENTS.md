@@ -123,10 +123,11 @@ git status --porcelain --untracked-files=all # must print nothing after the test
   (`bybit`) is LIVE ONLY (the registry's per-venue mode caps in `hydra.core.venues` refuse a bybit paper or backtest
   start by name), enforced by `client_factory.validate_venue` and its `mode` keyword. Alpaca (`alpaca`, US stocks) is
   registered BACKTEST ONLY with no ccxt client: every ccxt path refuses it by name (`ccxt_venue_ids()` is the ccxt
-  set; `spot_venue_ids()` holds only the spot venues that run live). Kraken and OKX are not registered
-  (no testnet or no key-permission endpoint — the README says why). Every paper entry gets a protective stop (strategy
-  `risk:` block, 5 % default); live sessions must never hold a position without a confirmed exchange-side protective
-  order (`src/hydra/execution/AGENTS.md`, `docs/live-trading.md`).
+  set; `spot_venue_ids()` holds only the spot venues that run live); its data comes from `hydra.data.alpaca` (httpx,
+  ccxt-shaped) built per call from the stored paper key by `client_factory.build_alpaca_data_client`. Kraken and OKX
+  are not registered (no testnet or no key-permission endpoint — the README says why). Every paper entry gets a
+  protective stop (strategy `risk:` block, 5 % default); live sessions must never hold a position without a
+  confirmed exchange-side protective order (`src/hydra/execution/AGENTS.md`, `docs/live-trading.md`).
 - **Live gate.** The persisted `live_armed` row is the single spot live gate, written ON only by the arm executor and
   OFF also by the ungated disarm route; perps have their own `perps_armed` row and ceremony. Gated actions go through
   one in-memory approval store with one-time 6-digit codes typed by a `user`/`dev` principal

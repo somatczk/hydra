@@ -58,7 +58,13 @@ from hydra.data.errors import DataFetchError, NoMarketDataError
 from hydra.data.migrations.runner import current_revision, head_revision
 from hydra.data.on_demand import OnDemandFetchService, ProgressCallback
 from hydra.data.storage import MarketDataRepository
-from hydra.execution.client_factory import RestHandle, RestPoolFactory, SharedRestClients
+from hydra.execution.client_factory import (
+    RestHandle,
+    RestPoolFactory,
+    SharedRestClients,
+    build_alpaca_data_client,
+)
+from hydra.execution.errors import AlpacaNotConnectedError
 from hydra.ml.consumers import LiveFeaturesPredictor, attach_research_ml
 from hydra.ml.dataset import DatasetBuilder
 from hydra.ml.export import export_xgboost_to_onnx, validate_onnx_export
@@ -111,18 +117,22 @@ class _WorkerFetchClients:
 
     One refcounted pool per worker process: the first fetching job constructs the
     exchange client — ``load_markets`` is paid once per worker, not per job — and
-    shutdown releases the held handle, which closes the client.
+    shutdown releases the held handle, which closes the client. alpaca is never pooled:
+    its client is built from the stored key (*db_pool*) on every call.
     """
 
-    def __init__(self, rest_factory: RestPoolFactory | None = None) -> None:
+    def __init__(self, rest_factory: RestPoolFactory | None = None, *, db_pool: Any = None) -> None:
         if rest_factory is None:
             self._pool = SharedRestClients()
         else:
             self._pool = SharedRestClients(rest_factory)
         self._handles: dict[ExchangeId, RestHandle] = {}
+        self._db_pool = db_pool
 
     async def client(self, exchange_id: ExchangeId) -> Any:
         """The pooled client for one exchange, constructed on first use."""
+        if exchange_id == "alpaca":
+            return await build_alpaca_data_client(self._db_pool)
         handle = self._handles.get(exchange_id)
         if handle is None:
             handle = await self._pool.handle(exchange_id)
@@ -237,6 +247,22 @@ async def _ensure_bars(
 # ---------------------------------------------------------------------------
 
 
+async def _alpaca_provenance(pool: Any, config: StrategyConfig) -> dict[str, Any]:
+    """One asset lookup per alpaca job, before any fetch: the ticker must be a us_equity.
+    Its asset id and the split adjustment ride the run's provenance; ``{}`` elsewhere."""
+    if config.exchange.exchange_id != "alpaca":
+        return {}
+    import ccxt
+    from cryptography.fernet import InvalidToken
+
+    try:
+        client = await build_alpaca_data_client(pool)
+        asset = await client.fetch_asset(config.symbols[0])
+    except (AlpacaNotConnectedError, InvalidToken, ccxt.BaseError) as exc:
+        raise JobError(f"alpaca asset check for {config.symbols[0]} failed: {exc!r}") from exc
+    return {"alpaca_asset_id": str(asset["id"]), "adjustment": "split"}
+
+
 async def _funding_preflight(
     pool: Any,
     fetch_engine: OnDemandFetchService | None,
@@ -281,6 +307,7 @@ async def run_backtest_job(
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
     models, served = await _attach_ml(pool, config, body.model_version_id)
+    venue = await _alpaca_provenance(pool, config)
 
     await _ensure_bars(
         pool, fetch_engine, config, body.start_date, body.end_date, run, force=body.fetch_fresh
@@ -290,6 +317,7 @@ async def run_backtest_job(
     run.detail["provenance"] = {
         **jobs.provenance_payload(provenance, config, extras),
         "ml_models": served,
+        **venue,
     }
     run.progress = 30.0
 
@@ -343,6 +371,7 @@ async def run_hyperopt_job(
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
     models, served = await _attach_ml(pool, config, body.model_version_id)
+    venue = await _alpaca_provenance(pool, config)
 
     await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
@@ -350,6 +379,7 @@ async def run_hyperopt_job(
     provenance_dict = {
         **jobs.provenance_payload(provenance, config, extras),
         "ml_models": served,
+        **venue,
     }
     run.detail["provenance"] = provenance_dict
     funding = await _funding_preflight(pool, fetch_engine, config, body, run)
@@ -408,6 +438,7 @@ async def run_walkforward_job(
     config = StrategyConfig.model_validate(jobs.json_value(job["strategy_config"]))
     strategy_cls = import_backtest_strategy(config.strategy_class)
     models, served = await _attach_ml(pool, config, body.model_version_id)
+    venue = await _alpaca_provenance(pool, config)
 
     await _ensure_bars(pool, fetch_engine, config, body.start_date, body.end_date, run)
     bars, provenance = await jobs.load_job_bars(pool, config, body.start_date, body.end_date)
@@ -415,6 +446,7 @@ async def run_walkforward_job(
     run.detail["provenance"] = {
         **jobs.provenance_payload(provenance, config, extras),
         "ml_models": served,
+        **venue,
     }
     funding = await _funding_preflight(pool, fetch_engine, config, body, run)
 
@@ -934,7 +966,7 @@ async def main() -> None:
         raise SystemExit(2)
 
     pool = await _create_pool(dsn)
-    fetch_clients = _WorkerFetchClients()
+    fetch_clients = _WorkerFetchClients(db_pool=pool)
     try:
         await wait_for_schema(dsn)
         lease_s = cfg.backtest.job_lease_s

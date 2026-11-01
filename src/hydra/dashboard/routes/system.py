@@ -16,7 +16,7 @@ from urllib.parse import unquote, urlsplit
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from hydra.core.venues import ccxt_venue_ids, registered_venue_ids
+from hydra.core.venues import ccxt_venue_ids, find_venue, registered_venue_ids, venue_market_type
 from hydra.dashboard.deps import current_config
 from hydra.dashboard.routes._db import (
     ServiceErrorRoute,
@@ -43,10 +43,11 @@ _EXCHANGE_DEFS: dict[str, str] = {
     "binance": "Binance",
     "binanceusdm": "Binance USD⌂-M",
     "bybit": "Bybit",
+    "alpaca": "Alpaca",
     "kraken": "Kraken",
     "okx": "OKX",
 }
-_SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance", "binanceusdm", "bybit"})
+_SUPPORTED_EXCHANGES: frozenset[str] = frozenset({"binance", "binanceusdm", "bybit", "alpaca"})
 CONNECT_TIMEOUT_S = 10.0
 
 TradingMode = Literal["paper", "live"]
@@ -493,7 +494,7 @@ def _require_supported(exchange_id: str) -> str:
             400,
             "unsupported_exchange",
             f"{_EXCHANGE_DEFS[exchange_id]} is not supported and not scheduled; supported "
-            "connections are Binance, Binance USD⌂-M and Bybit",
+            "connections are Binance, Binance USD⌂-M, Bybit and Alpaca",
             "invalid",
         )
     return exchange_id
@@ -512,6 +513,15 @@ def _venue(exchange_id: str, environment: Environment) -> str:
     return f"{_EXCHANGE_DEFS[exchange_id]} {environment}"
 
 
+def _venue_environment(exchange_id: str) -> Environment:
+    """The environment a venue's keys are checked against: a venue that never trades live
+    (alpaca, a paper key) is always ``testnet``; every other follows the platform's."""
+    spec = find_venue(exchange_id, venue_market_type(exchange_id))
+    if spec is not None and "live" not in spec.allowed_modes:
+        return "testnet"
+    return current_environment()
+
+
 @router.get("/exchanges", response_model=list[ExchangeStatus])
 async def get_exchanges(request: Request) -> list[dict[str, Any]]:
     """Stored-credential state per exchange; connected means the keys passed a read-only check."""
@@ -523,10 +533,10 @@ async def get_exchanges(request: Request) -> list[dict[str, Any]]:
         )
     stored = {row["exchange_id"]: row for row in rows}
     errors = _get_credential_errors(request)
-    environment = current_environment()
 
     results: list[dict[str, Any]] = []
     for exchange_id, display_name in _EXCHANGE_DEFS.items():
+        environment = _venue_environment(exchange_id)
         state: CredentialState
         if exchange_id not in stored:
             state = "missing"
@@ -587,7 +597,7 @@ async def connect_exchange(
         "api_secret": body.api_secret,
         "passphrase": body.passphrase or None,
     }
-    environment = current_environment()
+    environment = _venue_environment(exchange)
     restrictions = await _check_credentials(exchange, creds, environment)
 
     from hydra.core.encryption import encrypt
@@ -957,10 +967,14 @@ def _get_exchange_clients(request: Request) -> dict[str, Any]:
 def _readonly_client(exchange_id: str, creds: dict[str, Any], environment: Environment) -> Any:
     """E's read-only client for the venue (SPOT, or USD⌂-M FUTURES for binanceusdm).
 
-    The sandbox is used on ``testnet``.
+    The sandbox is used on ``testnet``; alpaca's is its paper-account adapter.
     """
-    from hydra.execution.client_factory import build_readonly_client, venue_market_type
+    from hydra.execution.client_factory import build_readonly_client
 
+    if exchange_id == "alpaca":
+        from hydra.data.alpaca import AlpacaClient
+
+        return AlpacaClient(str(creds["api_key"]), str(creds["api_secret"]))
     return build_readonly_client(
         exchange_id,
         creds,
@@ -1015,7 +1029,6 @@ async def _check_credentials(
     stored — so a connected key is trade-only.
     """
     from hydra.core.types import MarketType
-    from hydra.execution.client_factory import venue_market_type
     from hydra.services.live_gate import normalize_restrictions
 
     name = _venue(exchange_id, environment)

@@ -52,6 +52,7 @@ services:
     environment:
       DATABASE_URL: postgresql://hydra:${HYDRA_DB_PASSWORD:-hydra_dev}@timescaledb:5432/hydra
       REDIS_URL: redis://redis:6379
+      HYDRA_CREDENTIAL_KEY: ${HYDRA_CREDENTIAL_KEY:?HYDRA_CREDENTIAL_KEY missing (see .env.example)}
     depends_on:
       timescaledb:
         condition: service_healthy

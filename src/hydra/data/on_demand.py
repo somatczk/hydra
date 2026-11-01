@@ -32,6 +32,7 @@ from typing import Any, Literal
 from hydra.core.config import DataConfig
 from hydra.core.logging import get_logger
 from hydra.core.types import ExchangeId, Timeframe
+from hydra.core.venues import AssetClass, find_venue, venue_market_type
 from hydra.data.backfill import (
     MAX_PAGE_SIZE,
     ExchangeBackfillService,
@@ -206,6 +207,10 @@ class OnDemandFetchService:
         ``state: "waiting"`` to ``on_progress``.
         """
         call = _Call(started=self._clock())
+        # US stocks refetch the whole window every run: weekends would count as gaps, and the
+        # upsert re-scales stored history after a new split
+        spec = find_venue(exchange, venue_market_type(exchange))
+        force = force or (spec is not None and spec.asset_class is AssetClass.US_EQUITY)
         grid_start = ceil_to_tf(start, timeframe)
         grid_end = floor_to_tf(end, timeframe)
         lock_key = (exchange, symbol, timeframe)

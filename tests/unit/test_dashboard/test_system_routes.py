@@ -8,6 +8,7 @@ Fernet encryption, P1-E's ``build_readonly_client`` and ``ExchangeClient``, and 
 
 from __future__ import annotations
 
+import functools
 import json
 import secrets
 from decimal import Decimal
@@ -17,15 +18,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import ccxt
 import ccxt.async_support
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import hydra.data.alpaca as alpaca_module
 from hydra.core.encryption import decrypt
 from hydra.dashboard.routes import system
 from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.system import router
+from hydra.data.alpaca import AlpacaClient
 from hydra.risk.service import RiskService
 from hydra.risk.state import InMemoryRiskStateStore, LoadedConfig, RiskStateUnavailableError
 from hydra.services.trader import LocalTrader
@@ -738,8 +742,15 @@ def _live_session(session_id: str = "s-live") -> dict[str, Any]:
 class TestExchanges:
     def test_states_without_stored_keys(self, client: TestClient) -> None:
         data = client.get("/api/system/exchanges").json()
-        assert [e["id"] for e in data] == ["binance", "binanceusdm", "bybit", "kraken", "okx"]
-        assert [e["supported"] for e in data] == [True, True, True, False, False]
+        assert [e["id"] for e in data] == [
+            "binance",
+            "binanceusdm",
+            "bybit",
+            "alpaca",
+            "kraken",
+            "okx",
+        ]
+        assert [e["supported"] for e in data] == [True, True, True, True, False, False]
         for entry in data:
             assert entry["credential_state"] == "missing"
             assert entry["api_key_set"] is False
@@ -1212,6 +1223,80 @@ class TestConnectBinanceUsdm:
         resp = client.delete("/api/system/exchanges/binanceusdm/connect")
         assert (resp.status_code, _detail(resp)["code"]) == (409, "credential_delete_gated")
         assert "binanceusdm" in db.credentials  # nothing was deleted
+
+
+class _AlpacaAccount:
+    """The paper-api account endpoint behind the real AlpacaClient; records each request."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.status != 200:
+            return httpx.Response(self.status, json={"message": "unauthorized"})
+        return httpx.Response(200, json={"cash": "100000", "status": "ACTIVE"})
+
+
+class TestConnectAlpaca:
+    """S1-b: alpaca connects its paper key through Settings. A backtest-only venue is
+    always checked as testnet (one paper account read, no permission read), so its row
+    stores no permissions record and is never trade-capable."""
+
+    def _serve(self, monkeypatch: pytest.MonkeyPatch, status: int = 200) -> _AlpacaAccount:
+        account = _AlpacaAccount(status)
+        monkeypatch.setattr(
+            alpaca_module,
+            "AlpacaClient",
+            functools.partial(AlpacaClient, transport=httpx.MockTransport(account)),
+        )
+        return account
+
+    @pytest.mark.parametrize("platform_testnet", [True, False])
+    def test_the_paper_key_is_checked_as_testnet_then_stored(
+        self,
+        db: FakeSystemDb,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        platform_testnet: bool,
+    ) -> None:
+        cfg = system.current_config().model_copy(deep=True)
+        cfg.trading.testnet = platform_testnet
+        monkeypatch.setattr(system, "current_config", lambda: cfg)
+        account = self._serve(monkeypatch)
+        resp = _connect(client, "alpaca")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert (body["id"], body["name"], body["environment"]) == ("alpaca", "Alpaca", "testnet")
+        assert body["message"] == "Alpaca testnet accepted these keys; they are stored"
+        assert (body["trade_enabled"], body["ip_restrict"]) == (None, None)
+        [request] = account.requests
+        assert str(request.url) == "https://paper-api.alpaca.markets/v2/account"
+        assert request.headers["APCA-API-KEY-ID"] == API_KEY
+        stored = db.credentials["alpaca"]
+        assert decrypt(stored["encrypted_secret"]) == API_SECRET
+        assert stored["validated_environment"] == "testnet"
+        assert stored["validated_permissions"] is None
+        [row] = [e for e in client.get("/api/system/exchanges").json() if e["id"] == "alpaca"]
+        assert (row["environment"], row["connected"], row["trade_enabled"]) == (
+            "testnet",
+            True,
+            None,
+        )
+
+    def test_a_rejected_key_is_422_and_nothing_is_stored(
+        self, db: FakeSystemDb, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._serve(monkeypatch, status=401)
+        resp = _connect(client, "alpaca")
+        assert resp.status_code == 422
+        assert _detail(resp)["code"] == "credentials_rejected"
+        assert _detail(resp)["message"] == (
+            "Alpaca testnet rejected these API keys (key, secret or permissions); "
+            "nothing was stored"
+        )
+        assert "alpaca" not in db.credentials
 
 
 @pytest.mark.usefixtures("bybit")
