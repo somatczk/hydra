@@ -91,9 +91,8 @@ def mount_mcp(
 def log_mcp_posture(cfg: HydraConfig) -> None:
     """One startup line for the MCP surface (the REST posture line lives in security.py)."""
     logger.info(
-        "MCP server mounted at %s: Authentik OAuth (issuer %s, audience %s), allowed hosts: %s",
+        "MCP server mounted at %s: Authentik OAuth, resource %s, allowed hosts: %s",
         MCP_PATH_PREFIX,
-        cfg.mcp.oauth_issuer,
-        cfg.mcp.oauth_audience,
+        cfg.mcp.resource_url,
         ", ".join(cfg.mcp.allowed_hosts),
     )
