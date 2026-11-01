@@ -250,6 +250,31 @@ describe('the L4 delete for trade-capable keys (UI-4c)', () => {
   });
 });
 
+describe('ExchangeConnectDialog alpaca (S1: the paper key for US stock bars)', () => {
+  it('asks for the paper-trading key, says it only fetches bars, and posts to the alpaca route', async () => {
+    fetchApi.mockImplementation(routeFetch({}, calls, { 'POST /api/system/exchanges/alpaca/connect': { message: 'stored' } }));
+    page = await mount(
+      <ExchangeConnectDialog
+        open
+        onClose={vi.fn()}
+        onUpdated={vi.fn()}
+        exchange={{ id: 'alpaca', name: 'Alpaca', connected: false, environment: 'testnet' }}
+      />,
+    );
+    const text = page.container.textContent ?? '';
+    expect(text).toContain('Use your Alpaca paper-trading API key');
+    expect(text).toContain('uses it only to fetch daily US stock bars for backtests — it never places an order.');
+    expect(page.container.querySelector('[data-testid="connect-target"]')?.textContent).toBe(
+      'The keys are checked against the Alpaca paper API (shown as testnet); live-account keys are rejected there.',
+    );
+    expect(text).not.toContain('testnet.binance.vision');
+    await typeInto(inputByLabel(page.container, 'API Key'), 'key');
+    await typeInto(inputByLabel(page.container, 'API Secret'), 'secret');
+    await click(buttonByText(page.container, 'Check and save keys'));
+    expect(calls.filter((c) => c.path === '/api/system/exchanges/alpaca/connect')).toHaveLength(1);
+  });
+});
+
 describe('ExchangeConnectDialog perps venue (P4-F: the futures-keys connect gap)', () => {
   function showPerps(connected = false, tradeEnabled: boolean | null = null) {
     return mount(

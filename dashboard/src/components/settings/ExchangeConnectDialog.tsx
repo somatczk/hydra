@@ -49,6 +49,8 @@ interface ExchangeConnectDialogProps {
 
 /** The perps venue's connect copy: its keys are the live perp trading keys. */
 const isPerpsVenue = (id: string) => id === 'binanceusdm';
+/** S1: alpaca's key is a paper key that only fetches US stock bars for backtests. */
+const isStockDataVenue = (id: string) => id === 'alpaca';
 
 export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: ExchangeConnectDialogProps) {
   const { toast } = useToast();
@@ -314,7 +316,14 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
       onConfirm={handleConnect}
       onClose={onClose}
     >
-      {isPerpsVenue(exchange.id) ? (
+      {isStockDataVenue(exchange.id) ? (
+        <p>
+          Use your Alpaca <strong>paper-trading</strong> API key (the Paper Trading dashboard on
+          alpaca.markets). Hydra checks it with one read of the paper account before storing it,
+          encrypted, and uses it only to fetch daily US stock bars for backtests — it never places
+          an order.
+        </p>
+      ) : isPerpsVenue(exchange.id) ? (
         <>
           <p>
             Use a <strong>trade-only</strong> Binance USD⌂-M key: withdrawals disabled and futures
@@ -343,10 +352,14 @@ export function ExchangeConnectDialog({ open, onClose, exchange, onUpdated }: Ex
       </>
       )}
       <p className="text-xs text-ink-2" data-testid="connect-target">
-        The keys are checked against {exchange.name} {exchange.environment}
-        {exchange.environment === 'testnet'
-          ? ' with keys from testnet.binance.vision; mainnet keys are rejected there.'
-          : ' with keys from your mainnet account.'}
+        {isStockDataVenue(exchange.id)
+          ? 'The keys are checked against the Alpaca paper API (shown as testnet); live-account keys are rejected there.'
+          : <>
+              The keys are checked against {exchange.name} {exchange.environment}
+              {exchange.environment === 'testnet'
+                ? ' with keys from testnet.binance.vision; mainnet keys are rejected there.'
+                : ' with keys from your mainnet account.'}
+            </>}
       </p>
       {exchange.credentialState === 'undecryptable' && (
         <p className="text-xs text-caution">

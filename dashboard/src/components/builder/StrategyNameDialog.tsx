@@ -29,7 +29,11 @@ const EXCHANGE_OPTIONS = [
   { value: 'binance', label: 'Binance' },
   { value: 'binanceusdm', label: 'Binance USD⌂-M (perps)' },
   { value: 'bybit', label: 'Bybit (live only)' },
+  { value: 'alpaca', label: 'Alpaca US stocks (backtest only)' },
 ];
+
+/** S1: US stocks are TICKER/USD on daily bars; the engine re-checks both (422). */
+const STOCK_QUOTE = '/USD';
 
 const LEVERAGE_OPTIONS = [
   { value: '1', label: '1× (no leverage)' },
@@ -90,8 +94,18 @@ export function StrategyNameDialog({
 
   const isEditing = !!editingId;
   const perps = exchangeId === 'binanceusdm';
-  /* The write gate at the UI layer: only universe members are committable; an unreadable universe leaves the refusal to the engine's 422. */
-  const symbolGateBlocks = universe !== null && !symbolInUniverse(symbol.trim(), universe);
+  const stocks = exchangeId === 'alpaca';
+  const ticker = symbol.endsWith(STOCK_QUOTE) ? symbol.slice(0, -STOCK_QUOTE.length) : symbol;
+  /* The write gate at the UI layer: only universe members are committable; an unreadable universe leaves the refusal to the engine's 422. US stocks have no universe. */
+  const symbolGateBlocks =
+    stocks ? !ticker.trim() : universe !== null && !symbolInUniverse(symbol.trim(), universe);
+  const badTimeframe = stocks && state.timeframes.primary !== '1d';
+
+  const changeExchange = (next: string) => {
+    // a crypto pair is never a ticker and back: switching asset class starts the symbol over
+    if ((next === 'alpaca') !== stocks) setSymbol(next === 'alpaca' ? '' : 'BTCUSDT');
+    setExchangeId(next);
+  };
   const gate = saveError !== null ? parseErrorDetail(saveError) : null;
   const isUniverseGate = gate?.code === 'symbol_not_in_universe';
   const badSchedule = scheduleProblem(state.schedule, state.timeframes.primary);
@@ -175,7 +189,7 @@ export function StrategyNameDialog({
       secondaryLabel="Cancel"
       pendingLabel="Saving…"
       pendingHint="Closing this won't cancel the save."
-      primaryDisabled={!name.trim() || symbolGateBlocks || badSchedule !== null}
+      primaryDisabled={!name.trim() || symbolGateBlocks || badSchedule !== null || badTimeframe}
       onConfirm={handleSave}
       onClose={onClose}
     >
@@ -196,9 +210,19 @@ export function StrategyNameDialog({
           label="Exchange"
           options={EXCHANGE_OPTIONS}
           value={exchangeId}
-          onChange={(e) => setExchangeId(e.target.value)}
+          onChange={(e) => changeExchange(e.target.value)}
         />
-        <UniversePicker open={open} value={symbol} onChange={setSymbol} onUniverse={handleUniverse} />
+        {stocks ? (
+          <Input
+            label="Ticker"
+            value={ticker}
+            onChange={(e) => setSymbol(`${e.target.value.trim().toUpperCase()}${STOCK_QUOTE}`)}
+            placeholder="AAPL"
+            hint="A US stock or ETF ticker, quoted in USD. Daily bars: 1d only."
+          />
+        ) : (
+          <UniversePicker open={open} value={symbol} onChange={setSymbol} onUniverse={handleUniverse} />
+        )}
       </div>
 
       {/* P4-F: the perps fields (venue-gated); the symbol section above is owned by P6-UI. */}
@@ -231,6 +255,12 @@ export function StrategyNameDialog({
         />
         <span className="text-sm text-ink-2">Enable strategy immediately</span>
       </label>
+
+      {badTimeframe && (
+        <p role="alert" className="text-sm text-danger">
+          Alpaca serves daily bars only: set the primary timeframe to 1d.
+        </p>
+      )}
 
       {badSchedule && (
         <p role="alert" className="text-sm text-danger">
