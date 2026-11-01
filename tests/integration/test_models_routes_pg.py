@@ -39,6 +39,7 @@ from hydra.dashboard.routes._db import install_error_handlers
 from hydra.dashboard.routes.models import router
 from hydra.data.migrations.runner import upgrade_to_head
 from hydra.data.storage import MarketDataRepository
+from hydra.ml.features import DEFAULT_FEATURE_SPEC
 from hydra.ml.registry import ModelRegistration, ModelRegistry, ModelVersion
 from tests.fixtures.ml_onnx import ml_pipeline_fakes, reduce_max_onnx
 
@@ -387,7 +388,7 @@ class TestRetrainRoundTrip:
 
         session = ort.InferenceSession(str(artifact), providers=["CPUExecutionProvider"])
         metadata = session.get_modelmeta().custom_metadata_map
-        assert metadata["feature_version"] == "3"
+        assert metadata["feature_version"] == str(DEFAULT_FEATURE_SPEC.spec_version)
         assert metadata["horizon"] == "1"
         assert json.loads(metadata["feature_names"])
 
