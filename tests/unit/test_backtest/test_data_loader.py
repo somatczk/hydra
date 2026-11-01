@@ -199,3 +199,29 @@ async def test_a_no_data_read_touches_nothing() -> None:
     with pytest.raises(NoMarketDataError):
         await load_bars(_as_repo(repo), "binance", "BTCUSDT", Timeframe.H1, T0, T0)
     assert repo.touched == []
+
+
+def _days(*dates: str) -> list[OHLCV]:
+    return [_bar(datetime.fromisoformat(f"{d}T00:00:00+00:00")) for d in dates]
+
+
+# 2024-03-22 (Fri) .. 2024-04-02 (Tue): a weekend, Good Friday (03-29, NYSE closed), a weekend
+_SESSIONS = ("2024-03-22", "2024-03-25", "2024-03-26", "2024-03-27", "2024-03-28", "2024-04-01")
+
+
+def test_stock_gaps_skip_weekends_but_count_holidays() -> None:
+    bars = _days(*_SESSIONS)
+    assert validate_bars(bars, Timeframe.D1, weekdays_only=True) == 1  # Good Friday
+    assert validate_bars(bars, Timeframe.D1) == 2  # 24/7 counting: both weekend runs
+
+
+async def test_load_bars_counts_alpaca_gaps_on_weekdays_only() -> None:
+    bars = _days(*_SESSIONS)
+    start, end = bars[0].timestamp, bars[-1].timestamp
+    _, alpaca = await load_bars(
+        _as_repo(_FakeRepo(bars, None)), "alpaca", "AAPL/USD", Timeframe.D1, start, end
+    )
+    _, binance = await load_bars(
+        _as_repo(_FakeRepo(bars, None)), "binance", "BTCUSDT", Timeframe.D1, start, end
+    )
+    assert (alpaca.gap_count, binance.gap_count) == (1, 2)
