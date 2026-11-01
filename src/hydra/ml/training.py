@@ -4,8 +4,9 @@ The objective is classification on the sign of the forward return (rows whose
 target is zero or undefined are dropped); ``predict_proba`` is the confidence the
 serving overlay consumes. Evaluation is walk-forward with an embargo of one
 horizon between each train end and test start, and it reports only what the data
-can honestly support: per-fold OOS accuracy next to the OOS base rate, and the
-mean signed forward return of trading the predicted direction. The ML library
+can honestly support: per-fold OOS accuracy next to the majority-class rate (the
+no-skill accuracy) and the up-fraction, and the mean signed forward return of
+trading the predicted direction. The ML library
 imports are lazy so the module imports without the ml-training extra installed.
 """
 
@@ -73,7 +74,8 @@ def _walk_forward_split(
 
     Each fold trains on everything up to a cutoff and tests on the next block,
     skipping ``embargo`` rows after the cutoff so no test row's forward-return
-    window overlaps a train row's.
+    window overlaps a train row's. The first fold trains on at least a third of
+    the rows, so no fold's accuracy comes from a model fit on a sliver.
     """
     if embargo < 0:
         msg = f"embargo must be >= 0, got {embargo}"
@@ -84,10 +86,11 @@ def _walk_forward_split(
         test_idx = np.arange(cut + embargo, n_samples)
         return [(train_idx, test_idx)] if cut > 0 and len(test_idx) > 0 else []
 
-    test_size = (n_samples - min_train_size) // n_splits
+    first_train = max(min_train_size, n_samples // 3)
+    test_size = (n_samples - first_train) // n_splits
     splits: list[tuple[ndarray, ndarray]] = []
     for i in range(n_splits):
-        train_end = min_train_size + i * test_size
+        train_end = first_train + i * test_size
         test_start = train_end + embargo
         test_end = min(train_end + test_size, n_samples)
         if train_end >= n_samples or test_start >= test_end:
@@ -106,12 +109,16 @@ def _evaluate_predictions(
     y_pred: ndarray,
     forward_returns: ndarray,
 ) -> dict[str, float]:
-    """OOS sign accuracy next to the base rate, and the mean signed forward return."""
+    """OOS sign accuracy next to the majority-class rate (always predicting the more
+    frequent sign: the no-skill bar) and the up-fraction, and the mean signed forward return.
+    """
     if len(y_true) == 0:
-        return {"accuracy": 0.0, "base_rate": 0.0, "mean_signed_return": 0.0}
+        return {"accuracy": 0.0, "majority_rate": 0.0, "up_rate": 0.0, "mean_signed_return": 0.0}
+    up_rate = float(np.mean(y_true == 1.0))
     return {
         "accuracy": float(np.mean(y_true == y_pred)),
-        "base_rate": float(np.mean(y_true == 1.0)),
+        "majority_rate": max(up_rate, float(np.mean(y_true == -1.0))),
+        "up_rate": up_rate,
         "mean_signed_return": float(np.mean(y_pred * forward_returns)),
     }
 
@@ -124,10 +131,12 @@ def _summarize_folds(fold_metrics: list[dict[str, float]], embargo: int) -> dict
         "folds": len(fold_metrics),
         "embargo": embargo,
         "oos_accuracy": float(np.mean([m["accuracy"] for m in fold_metrics])),
-        "oos_base_rate": float(np.mean([m["base_rate"] for m in fold_metrics])),
+        "oos_majority_rate": float(np.mean([m["majority_rate"] for m in fold_metrics])),
+        "oos_up_rate": float(np.mean([m["up_rate"] for m in fold_metrics])),
         "oos_mean_signed_return": float(np.mean([m["mean_signed_return"] for m in fold_metrics])),
         "fold_accuracy": [m["accuracy"] for m in fold_metrics],
-        "fold_base_rate": [m["base_rate"] for m in fold_metrics],
+        "fold_majority_rate": [m["majority_rate"] for m in fold_metrics],
+        "fold_up_rate": [m["up_rate"] for m in fold_metrics],
         "fold_mean_signed_return": [m["mean_signed_return"] for m in fold_metrics],
     }
 

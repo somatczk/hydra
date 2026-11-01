@@ -49,7 +49,9 @@ async def _attach_fixture(models_dir: Path) -> None:
     from hydra.ml.consumers import attach_native_provider
     from hydra.ml.serving import attach_artifact
 
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     models_dir.mkdir(parents=True, exist_ok=True)
     (models_dir / "fixture.onnx").write_bytes(confidence_onnx(meta, N_FEATURES))
     attach_native_provider(await attach_artifact(models_dir, "fixture.onnx", MODEL))

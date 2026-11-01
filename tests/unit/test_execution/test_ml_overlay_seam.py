@@ -90,7 +90,9 @@ def _bars(n: int) -> list[OHLCV]:
 
 
 def _write_model(models_dir: Path, name: str, scale: float) -> None:
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     models_dir.mkdir(parents=True, exist_ok=True)
     (models_dir / f"{name}.onnx").write_bytes(confidence_onnx(meta, N_FEATURES, scale=scale))
 

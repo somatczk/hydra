@@ -29,7 +29,7 @@ interface ApiModel {
   metrics: {
     folds?: number | null;
     oos_accuracy?: number | null;
-    oos_base_rate?: number | null;
+    oos_majority_rate?: number | null; // the no-skill bar: each fold's majority-class rate, averaged
     oos_mean_signed_return?: number | null;
     [key: string]: unknown;
   };
@@ -119,7 +119,7 @@ function fraction(v: unknown): number | null {
 
 function metricCell(
   metrics: ApiModel['metrics'],
-  key: 'oos_accuracy' | 'oos_base_rate',
+  key: 'oos_accuracy' | 'oos_majority_rate',
 ): string {
   const value = fraction(metrics[key]);
   return pct(value == null ? null : value * 100) ?? 'N/A';
@@ -343,7 +343,7 @@ export default function ModelsPage() {
       ),
     },
     { key: 'accuracy', header: 'OOS Acc', numeric: true, render: (row: ApiModel) => metricCell(row.metrics, 'oos_accuracy') },
-    { key: 'baseRate', header: 'Base Rate', numeric: true, hideOnMobile: true, render: (row: ApiModel) => metricCell(row.metrics, 'oos_base_rate') },
+    { key: 'noSkill', header: 'No-skill', numeric: true, hideOnMobile: true, render: (row: ApiModel) => metricCell(row.metrics, 'oos_majority_rate') },
     { key: 'signedReturn', header: 'Signed Ret', numeric: true, hideOnMobile: true, render: (row: ApiModel) => signedReturnCell(row.metrics) },
     {
       key: 'drift',
@@ -463,7 +463,7 @@ export default function ModelsPage() {
               {task.status === 'completed' && task.metrics && (
                 <p className="text-sm text-ink-2">
                   OOS accuracy {metricCell(task.metrics as ApiModel['metrics'], 'oos_accuracy')}
-                  {' · '}base rate {metricCell(task.metrics as ApiModel['metrics'], 'oos_base_rate')}
+                  {' · '}no-skill {metricCell(task.metrics as ApiModel['metrics'], 'oos_majority_rate')}
                   {' · '}signed return {signedReturnCell(task.metrics as ApiModel['metrics'])}
                 </p>
               )}
@@ -516,8 +516,8 @@ export default function ModelsPage() {
               running sessions keep the model they pinned.
             </p>
             <p>
-              OOS accuracy {metricCell(dialog.model.metrics, 'oos_accuracy')} against a base rate of{' '}
-              {metricCell(dialog.model.metrics, 'oos_base_rate')} over{' '}
+              OOS accuracy {metricCell(dialog.model.metrics, 'oos_accuracy')} against a no-skill
+              (majority-class) rate of {metricCell(dialog.model.metrics, 'oos_majority_rate')} over{' '}
               {fraction(dialog.model.metrics.folds) ?? 0} folds.
             </p>
           </>

@@ -101,6 +101,26 @@ def drift_fields(version: ModelVersion) -> tuple[float | None, DriftStatus]:
         return None, "unknown"
 
 
+def with_majority_rate(metrics: Any) -> Any:
+    """Training metrics with the majority-class (no-skill) rate the accuracy is read against.
+
+    Versions trained before it was recorded carry only the per-fold up-fraction
+    (``fold_base_rate``); the trainer drops flat targets, so each fold's majority rate is
+    exactly ``max(b, 1 - b)`` and is derived here, never the up-fraction itself.
+    """
+    if not isinstance(metrics, dict) or "oos_majority_rate" in metrics:
+        return metrics
+    ups = metrics.get("fold_base_rate")
+    if not isinstance(ups, list) or not ups or not all(type(u) in (int, float) for u in ups):
+        return metrics
+    majority = [max(u, 1.0 - u) for u in ups]
+    return {
+        **metrics,
+        "fold_majority_rate": majority,
+        "oos_majority_rate": sum(majority) / len(majority),
+    }
+
+
 def version_response(version: ModelVersion, models_dir: Path) -> dict[str, Any]:
     drift, drift_status = drift_fields(version)
     return {
@@ -109,7 +129,7 @@ def version_response(version: ModelVersion, models_dir: Path) -> dict[str, Any]:
         "version": version.version,
         "stage": stage_label(version.stage),
         "model_type": version.model_type,
-        "metrics": version.metrics,
+        "metrics": with_majority_rate(version.metrics),
         "feature_spec": version.feature_spec,
         "drift": drift,
         "drift_status": drift_status,
@@ -368,7 +388,7 @@ async def retrain_status(pool: Any, task_id: str) -> dict[str, Any]:
         "result": result,
         "fetch": detail.get("fetch"),
         "provenance": detail.get("provenance"),
-        "metrics": detail.get("metrics"),
+        "metrics": with_majority_rate(detail.get("metrics")),
     }
 
 

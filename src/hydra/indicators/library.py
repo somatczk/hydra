@@ -440,14 +440,27 @@ def keltner_lower(
 # ===========================================================================
 
 
-def obv(close: ndarray, volume: ndarray) -> ndarray:
-    """On Balance Volume."""
+def _rolling_sum(values: ndarray, period: int) -> ndarray:
+    """Each ``period``-wide window summed in order from 0.0: no window reads the array start."""
+    acc = np.zeros(len(values) - period + 1, dtype=np.float64)
+    for k in range(period):
+        acc += values[k : len(acc) + k]
+    return acc
+
+
+def obv(close: ndarray, volume: ndarray, period: int = 20) -> ndarray:
+    """On Balance Volume over the last ``period`` bars: each close move's signed volume, summed.
+
+    NaN until ``period`` moves exist (index ``period``). Rolling, so the value never depends on how
+    much history the array holds.
+    """
     close = close.astype(np.float64)
     volume = volume.astype(np.float64)
-    prev, cur = close[:-1], close[1:]
-    # cumsum adds in order; -0.0 is the exact additive identity for an unchanged close
-    step = np.where(cur > prev, volume[1:], np.where(cur < prev, -volume[1:], -0.0))
-    result: ndarray = np.cumsum(np.concatenate((volume[:1], step)))
+    result = np.full(len(close), np.nan, dtype=np.float64)
+    if 0 < period < len(close):
+        prev, cur = close[:-1], close[1:]
+        step = np.where(cur > prev, volume[1:], np.where(cur < prev, -volume[1:], 0.0))
+        result[period:] = _rolling_sum(step, period)
     return result
 
 
@@ -456,14 +469,22 @@ def vwap(
     low: ndarray,
     close: ndarray,
     volume: ndarray,
+    period: int = 20,
 ) -> ndarray:
-    """Volume Weighted Average Price (intraday, cumulative)."""
+    """Volume Weighted Average Price of the typical price over the last ``period`` bars.
+
+    NaN during warm-up and where the window traded no volume. Rolling, so the value never depends
+    on how much history the array holds.
+    """
     tp = (high.astype(np.float64) + low.astype(np.float64) + close.astype(np.float64)) / 3.0
     vol = volume.astype(np.float64)
-    cum_tp_vol = np.cumsum(tp * vol)
-    cum_vol = np.cumsum(vol)
-    result = np.where(cum_vol != 0, cum_tp_vol / cum_vol, np.nan)
-    return result.astype(np.float64)
+    result = np.full(len(tp), np.nan, dtype=np.float64)
+    if 0 < period <= len(tp):
+        tp_vol = _rolling_sum(tp * vol, period)
+        vol_sum = _rolling_sum(vol, period)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            result[period - 1 :] = np.where(vol_sum != 0, tp_vol / vol_sum, np.nan)
+    return result
 
 
 def mfi(

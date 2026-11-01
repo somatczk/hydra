@@ -603,7 +603,9 @@ async def test_imported_ml_strategies_backtest_once_the_model_is_promoted(
     """
     models_dir = Path(mcp_cfg.ml.models_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     blob = confidence_onnx(meta, len(DEFAULT_FEATURE_SPEC.feature_names))
     (models_dir / "alpha-v1.onnx").write_bytes(blob)
     staged = pool.conn.add(1, "staging", artifact="alpha-v1.onnx")
@@ -647,7 +649,9 @@ async def test_imported_ml_strategies_backtest_once_the_model_is_promoted(
 def _staged_alpha(pool: _RegistryPool, models_dir: Path) -> str:
     """A Staging-only 'alpha' v1 whose artifact is really on the mount; never promoted."""
     models_dir.mkdir(parents=True, exist_ok=True)
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     blob = confidence_onnx(meta, len(DEFAULT_FEATURE_SPEC.feature_names))
     (models_dir / "alpha-v1.onnx").write_bytes(blob)
     staged = pool.conn.add(1, "staging", artifact="alpha-v1.onnx")

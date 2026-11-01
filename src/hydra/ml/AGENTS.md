@@ -18,15 +18,22 @@ Test files without a `tests/` prefix are in `tests/unit/test_ml/`.
 
 - One frozen `FeatureSpec` (`features.py`) pins the windows, the horizon, the feature names and a version that bumps
   whenever the feature set changes. `build_features` and `build_live_features` share one path, so the last training
-  row equals the live vector (`test_features.py::test_last_training_row_equals_live_vector_exactly`).
+  row equals the live vector (`test_features.py::test_last_training_row_equals_live_vector_exactly`). No feature
+  sums from the array start (VWAP and OBV are rolling): a 20,000-bar and a 2,000-bar build agree on the same bar
+  (`test_features.py::test_a_long_training_window_and_a_short_serving_window_agree_on_the_volume_block`). The
+  builder refuses a spec of any other version
+  (`test_features.py::test_an_old_spec_version_is_refused_not_rebuilt_with_new_features`).
 - The grid is 1h; 4h and 1d features are timestamp-joined and visible only once their bar has closed, never
   count-aligned (`test_features.py::test_no_lookahead_boundary`).
 - The dataset reads stored bars through an injected `MarketDataRepository` and reports provenance per timeframe,
   including the feed/auto source mix; same rows plus same spec give a byte-identical matrix
   (`test_dataset.py::test_same_rows_and_spec_hash_produce_byte_identical_matrix`).
 - Training classifies the sign of the forward return and evaluates walk-forward with an embargo of one horizon;
-  it reports OOS accuracy next to the base rate and the mean signed return, no Sharpe
-  (`test_training.py::test_embargo_is_the_horizon_between_train_end_and_test_start`, `::test_no_fake_sharpe`).
+  the first fold trains on at least a third of the rows. It reports OOS accuracy next to the per-fold
+  majority-class rate (the no-skill bar, `majority_rate`; `up_rate` is only the up-fraction) and the mean signed
+  return, no Sharpe (`test_training.py::test_embargo_is_the_horizon_between_train_end_and_test_start`,
+  `::test_the_no_skill_bar_is_the_majority_class_not_the_up_fraction`,
+  `::test_no_fold_trains_on_a_sliver_of_a_box_sized_dataset`, `::test_no_fake_sharpe`).
 - xgboost, onnxmltools (the `ml-training` extra) and onnxruntime are imported inside functions, never at module
   top, so `hydra.ml` imports without the extra.
 - Exports embed the spec in the ONNX metadata; an export without a spec carries `feature_version=0` and serving

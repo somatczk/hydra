@@ -228,6 +228,46 @@ class TestVersionResponse:
         assert response["trained_at"] == "2026-10-28T12:00:00+00:00"
         assert response["training_job_id"] == "ml-abc12345"
 
+    def test_a_version_trained_before_the_majority_rate_gets_it_from_its_folds(
+        self, tmp_path: Path
+    ) -> None:
+        """research-sol-1h-h24 as stored on the box: 0.497 accuracy read against the 0.494
+        up-fraction; against each fold's majority class the bar is 0.511."""
+        stored = {
+            "folds": 5,
+            "oos_accuracy": 0.497467071935157,
+            "oos_base_rate": 0.49422492401215806,
+            "fold_base_rate": [
+                0.4992401215805471,
+                0.4698581560283688,
+                0.5086119554204661,
+                0.4891084093211753,
+                0.504305977710233,
+            ],
+        }
+        metrics = version_response(_version(metrics=stored), tmp_path)["metrics"]
+        assert metrics["fold_majority_rate"] == pytest.approx(
+            [
+                0.5007598784194529,
+                0.5301418439716312,
+                0.5086119554204661,
+                0.5108915906788247,
+                0.504305977710233,
+            ],
+            abs=1e-15,
+        )
+        assert metrics["oos_majority_rate"] == pytest.approx(0.5109422492401217, abs=1e-15)
+        assert metrics["oos_accuracy"] - metrics["oos_majority_rate"] == pytest.approx(
+            -0.013475, abs=1e-6
+        )
+        assert metrics["oos_base_rate"] == stored["oos_base_rate"]
+
+    def test_metrics_without_folds_or_already_scored_pass_through(self, tmp_path: Path) -> None:
+        bare = {"folds": 5, "oos_accuracy": 0.51}
+        assert version_response(_version(metrics=bare), tmp_path)["metrics"] == bare
+        scored = {"oos_accuracy": 0.51, "oos_majority_rate": 0.53, "fold_base_rate": [0.4]}
+        assert version_response(_version(metrics=scored), tmp_path)["metrics"] == scored
+
     def test_every_stage_has_its_label(self, tmp_path: Path) -> None:
         assert version_response(_version(stage="production"), tmp_path)["stage"] == "Production"
         assert version_response(_version(stage="archived"), tmp_path)["stage"] == "Archived"

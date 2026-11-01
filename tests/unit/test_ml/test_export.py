@@ -68,7 +68,7 @@ def _patch_onnxmltools(model: _FakeOnnxModel) -> dict[str, MagicMock]:
 
 def _spec() -> FeatureSpec:
     return FeatureSpec(
-        spec_version=3,
+        spec_version=DEFAULT_FEATURE_SPEC.spec_version,
         horizon=4,
         window_1h=2000,
         window_4h=500,
@@ -90,8 +90,8 @@ class TestExportXGBoost:
         assert result == output_path
         assert output_path.read_bytes() == b"fake_onnx_bytes"
         assert onnx_model.metadata_props.as_dict() == {
-            "feature_version": "3",
-            "spec_version": "3",
+            "feature_version": "4",
+            "spec_version": "4",
             "horizon": "4",
             "feature_names": json.dumps(["f0", "f1", "f2"]),
         }

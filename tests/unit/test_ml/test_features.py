@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -150,8 +151,8 @@ class TestFeatureSpec:
         assert "fear_greed_norm" not in names
 
     def test_spec_is_hashable_and_equal_specs_hash_equal(self) -> None:
-        spec_a = FeatureSpec(3, 4, 2000, 500, 120, tuple(_all_feature_names()))
-        spec_b = FeatureSpec(3, 4, 2000, 500, 120, tuple(_all_feature_names()))
+        spec_a = FeatureSpec(4, 4, 2000, 500, 120, tuple(_all_feature_names()))
+        spec_b = FeatureSpec(4, 4, 2000, 500, 120, tuple(_all_feature_names()))
         assert spec_a == DEFAULT_FEATURE_SPEC
         assert hash(spec_a) == hash(spec_b)
 
@@ -357,7 +358,7 @@ class TestFeatureMatrixShape:
             build_features(DEFAULT_FEATURE_SPEC, shuffled, [], [])
 
     def test_spec_name_mismatch_is_refused(self) -> None:
-        stale = FeatureSpec(2, 4, 2000, 500, 120, tuple(_all_feature_names()[:-1]))
+        stale = FeatureSpec(4, 4, 2000, 500, 120, tuple(_all_feature_names()[:-1]))
         with pytest.raises(ValueError, match="bump spec_version"):
             build_features(
                 stale,
@@ -533,6 +534,50 @@ class TestTrainingServingParity:
         fm = build_features(DEFAULT_FEATURE_SPEC, bars_1h, bars_4h, bars_1d)
         live = build_live_features(DEFAULT_FEATURE_SPEC, bars_1h, bars_4h, bars_1d)
         np.testing.assert_allclose(fm.features[-1], live, rtol=0.0, atol=0.0)
+
+    def test_a_long_training_window_and_a_short_serving_window_agree_on_the_volume_block(
+        self,
+    ) -> None:
+        """Training reads up to 20,000 1h bars, serving the spec's 2,000: rows ending on the
+        same bar see the same rolling VWAP deviation and OBV flow, bit for bit. Every other
+        column is at most a converged smoother apart (the 1d EMAs on a 120-day window)."""
+        bars_1h = _make_bars(20_000)
+        bars_4h = _make_bars(5_000, interval_hours=4)
+        bars_1d = _make_bars(834, interval_hours=24)
+        short_1h = bars_1h[-2_000:]
+        start = short_1h[0].timestamp
+        short_4h = [b for b in bars_4h if b.timestamp >= start - 500 * 4 * H]
+        short_1d = [b for b in bars_1d if b.timestamp >= start - timedelta(days=120)]
+        long_rows = build_features(DEFAULT_FEATURE_SPEC, bars_1h, bars_4h, bars_1d).features
+        short_rows = build_features(DEFAULT_FEATURE_SPEC, short_1h, short_4h, short_1d).features
+        tail_long, tail_short = long_rows[-1_000:], short_rows[-1_000:]
+        names = list(DEFAULT_FEATURE_SPEC.feature_names)
+        for name in ("vwap_dev_1h", "obv_flow10_1h"):
+            col = names.index(name)
+            assert np.isfinite(tail_short[:, col]).all(), name
+            assert np.array_equal(tail_long[:, col], tail_short[:, col]), name
+        np.testing.assert_allclose(tail_long, tail_short, rtol=1e-3, atol=1e-9)
+
+    def test_obv_flow_is_the_signed_share_of_the_last_10_bars_volume(self) -> None:
+        closes = [100, 101, 100, 100, 102, 103, 101, 104, 105, 104, 106, 107]
+        volumes = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
+        bars = [
+            _bar(T0 + i * H, c, v) for i, (c, v) in enumerate(zip(closes, volumes, strict=True))
+        ]
+        fm = build_features(DEFAULT_FEATURE_SPEC, bars, [], [])
+        flow = fm.features[:, fm.feature_names.index("obv_flow10_1h")]
+        assert np.isnan(flow[:10]).all()
+        # bars 1-10: up 10, down 20, flat 30, up 40, 50, down 60, up 70, 80, down 90, up 100
+        assert flow[10] == pytest.approx((10 - 20 + 40 + 50 - 60 + 70 + 80 - 90 + 100) / 550)
+        # bars 2-11: drops bar 1's +10, adds bar 11's +110
+        assert flow[11] == pytest.approx((-20 + 40 + 50 - 60 + 70 + 80 - 90 + 100 + 110) / 650)
+
+    def test_an_old_spec_version_is_refused_not_rebuilt_with_new_features(self) -> None:
+        """A registry row trained on v3 (the start-anchored VWAP and OBV) must not be
+        scored or served on v4 features under its own spec."""
+        old = replace(DEFAULT_FEATURE_SPEC, spec_version=3)
+        with pytest.raises(ValueError, match="needs a retrain on the current spec"):
+            build_features(old, _make_bars(200), [], [])
 
     def test_live_vector_shape(self) -> None:
         bars_1h = _make_bars(200)

@@ -134,6 +134,24 @@ class TestWalkForwardSplit:
         assert int(train_idx[-1]) == 39
         assert int(test_idx[0]) == 42
 
+    def test_no_fold_trains_on_a_sliver_of_a_box_sized_dataset(self) -> None:
+        """SOL 1h h24 on 20,000 bars: fold 1 used to train on 100 rows (about 4 independent
+        24h labels) and counted as much as the others. It now trains on a third of the rows."""
+        splits = _walk_forward_split(19_976, embargo=24)
+        assert [len(train) for train, _ in splits] == [6_658, 9_321, 11_984, 14_647, 17_310]
+        assert [(int(test[0]), int(test[-1]) + 1) for _, test in splits] == [
+            (6_682, 9_321),
+            (9_345, 11_984),
+            (12_008, 14_647),
+            (14_671, 17_310),
+            (17_334, 19_973),
+        ]
+
+    def test_a_small_dataset_keeps_the_minimum_train_size(self) -> None:
+        splits = _walk_forward_split(250, embargo=1)
+        assert [len(train) for train, _ in splits] == [100, 130, 160, 190, 220]
+        assert [len(test) for _, test in splits] == [29] * 5
+
     def test_negative_embargo_is_refused(self) -> None:
         with pytest.raises(ValueError, match="embargo"):
             _walk_forward_split(500, embargo=-1)
@@ -150,19 +168,36 @@ class TestEvaluatePredictions:
         fwd = np.array([0.01, -0.01, 0.02, -0.02])
         metrics = _evaluate_predictions(y, y, fwd)
         assert metrics["accuracy"] == 1.0
-        assert metrics["base_rate"] == 0.5
+        assert metrics["majority_rate"] == metrics["up_rate"] == 0.5
         assert metrics["mean_signed_return"] == pytest.approx(0.015)
 
-    def test_constant_up_predictor_matches_the_base_rate(self) -> None:
+    def test_constant_up_predictor_matches_the_majority_rate_on_an_up_majority(self) -> None:
         y = np.array([1.0, -1.0, -1.0, 1.0, 1.0])
         fwd = np.array([0.01, -0.01, -0.02, 0.02, 0.01])
         metrics = _evaluate_predictions(y, np.ones(5), fwd)
-        assert metrics["accuracy"] == metrics["base_rate"] == 0.6
+        assert metrics["accuracy"] == metrics["majority_rate"] == metrics["up_rate"] == 0.6
         assert metrics["mean_signed_return"] == pytest.approx(0.01 / 5)
+
+    def test_the_no_skill_bar_is_the_majority_class_not_the_up_fraction(self) -> None:
+        """SOL h24 on the box: 0.497 accuracy read against the 0.494 up-fraction looked like
+        +0.3 pp; against always predicting down (0.506) it is 0.9 pp below no skill."""
+        y = np.array([1.0] * 494 + [-1.0] * 506)
+        pred = y.copy()
+        pred[:503] *= -1.0  # 497 of 1000 right
+        metrics = _evaluate_predictions(y, pred, np.zeros(1000))
+        assert metrics["accuracy"] == 0.497
+        assert metrics["up_rate"] == 0.494
+        assert metrics["majority_rate"] == 0.506
+        assert metrics["accuracy"] - metrics["majority_rate"] == pytest.approx(-0.009)
 
     def test_empty_arrays(self) -> None:
         metrics = _evaluate_predictions(np.array([]), np.array([]), np.array([]))
-        assert metrics == {"accuracy": 0.0, "base_rate": 0.0, "mean_signed_return": 0.0}
+        assert metrics == {
+            "accuracy": 0.0,
+            "majority_rate": 0.0,
+            "up_rate": 0.0,
+            "mean_signed_return": 0.0,
+        }
 
     def test_no_fake_sharpe(self) -> None:
         y = np.array([1.0, -1.0])
@@ -191,18 +226,18 @@ class TestTrainXGBoost:
         assert result.metrics["oos_accuracy"] == 1.0
         assert result.metrics["fold_accuracy"] == [1.0] * 5
         assert result.metrics["oos_mean_signed_return"] == pytest.approx(0.01, abs=1e-12)
-        assert result.metrics["oos_base_rate"] == 0.5
+        assert result.metrics["oos_majority_rate"] == result.metrics["oos_up_rate"] == 0.5
         # the embargo equals the horizon and there is no fake sharpe anywhere
         assert result.metrics["embargo"] == 1
         assert "sharpe" not in result.metrics
 
-    def test_constant_predictor_is_the_base_rate_with_zero_return(self) -> None:
+    def test_constant_predictor_is_the_no_skill_rate_with_zero_return(self) -> None:
         model = _constant_up_model()
         with patch.dict("sys.modules", {"xgboost": _mock_xgb_module(model)}):
             result = ModelTrainer().train_xgboost(_alternating_matrix())
 
         assert result.metrics["oos_accuracy"] == 0.5
-        assert result.metrics["oos_base_rate"] == 0.5
+        assert result.metrics["oos_majority_rate"] == 0.5
         assert result.metrics["fold_accuracy"] == [0.5] * 5
         # always trading up on a balanced +/-1% dataset earns exactly nothing
         assert result.metrics["oos_mean_signed_return"] == pytest.approx(0.0, abs=1e-12)

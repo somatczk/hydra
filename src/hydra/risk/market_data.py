@@ -15,6 +15,9 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+MIN_CORRELATION_RETURNS = 20
+"""Daily log returns a pair needs before its correlation counts (the 30-day fetch gives 29)."""
+
 
 @dataclass
 class RiskMarketData:
@@ -38,7 +41,8 @@ async def fetch_risk_market_data(
     symbols:
         List of trading symbols to fetch data for.
     correlation_threshold:
-        Pearson correlation above which two symbols are considered highly correlated.
+        Pearson correlation of daily log returns above which two symbols are considered
+        highly correlated.
     """
     result = RiskMarketData()
 
@@ -64,19 +68,20 @@ async def fetch_risk_market_data(
                 avg_vol = sum(volumes) / len(volumes)
                 result.average_volume[symbol] = Decimal(str(round(avg_vol, 2)))
 
-            if closes:
+            if closes and min(closes) > 0:
                 close_series[symbol] = closes
 
         except Exception:
             logger.warning("Failed to fetch OHLCV for %s", symbol, exc_info=True)
 
-    # Compute correlation matrix
+    # Correlate daily returns: the price levels of any two trending coins correlate.
     if len(close_series) >= 2:
         syms = list(close_series.keys())
         min_len = min(len(v) for v in close_series.values())
-        if min_len >= 5:
-            matrix = np.array([close_series[s][-min_len:] for s in syms])
-            corr = np.corrcoef(matrix)
+        if min_len - 1 >= MIN_CORRELATION_RETURNS:
+            matrix = np.array([close_series[s][-min_len:] for s in syms], dtype=np.float64)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                corr = np.corrcoef(np.diff(np.log(matrix), axis=1))
 
             for i, sym_i in enumerate(syms):
                 correlated = []

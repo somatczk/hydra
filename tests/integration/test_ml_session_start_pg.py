@@ -66,7 +66,9 @@ async def pool(fresh_database: str) -> AsyncIterator[Any]:
 
 
 def _fixture_bytes() -> bytes:
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     return confidence_onnx(meta, N_FEATURES)
 
 
@@ -103,7 +105,7 @@ async def _register(pool: Any, models_dir: Path, name: str, *, promote_version: 
             name=name,
             model_type="onnx",
             metrics={},
-            feature_spec={"spec_version": 3},
+            feature_spec={"spec_version": DEFAULT_FEATURE_SPEC.spec_version},
             artifact_path=artifact,
             artifact_sha256=hashlib.sha256(blob).hexdigest(),
             trained_at=TRAINED_AT,

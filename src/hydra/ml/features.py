@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 from numpy import ndarray
+from numpy.lib.stride_tricks import sliding_window_view
 
 from hydra.core.types import OHLCV
 from hydra.data.bars import timeframe_seconds
@@ -179,7 +180,7 @@ def _volume_names(tf_label: str) -> list[str]:
     return [
         f"vol_sma20_ratio_{tf_label}",
         f"vwap_dev_{tf_label}",
-        f"obv_roc10_{tf_label}",
+        f"obv_flow10_{tf_label}",
         f"mfi_14_{tf_label}",
     ]
 
@@ -206,7 +207,7 @@ def _all_feature_names() -> list[str]:
 
 
 DEFAULT_FEATURE_SPEC = FeatureSpec(
-    spec_version=3,
+    spec_version=4,
     horizon=4,
     window_1h=2000,
     window_4h=500,
@@ -460,23 +461,21 @@ def _volume_features(
         vol_ratio = np.where(vol_sma != 0, volume / vol_sma, np.nan)
     cols.append(vol_ratio.astype(np.float64))
 
-    # VWAP deviation
-    vwap_vals = vwap(high, low, close, volume)
+    # Deviation from the rolling 24-bar VWAP
+    vwap_vals = vwap(high, low, close, volume, 24)
     with np.errstate(divide="ignore", invalid="ignore"):
         vwap_dev = np.where(vwap_vals != 0, (close - vwap_vals) / vwap_vals, np.nan)
     cols.append(vwap_dev.astype(np.float64))
 
-    # OBV rate of change over 10 periods
-    obv_vals = obv(close, volume)
-    obv_roc = np.full(n, np.nan, dtype=np.float64)
+    # Signed share of the last 10 bars' volume: 10-bar OBV over the same bars' total volume
+    obv_flow = np.full(n, np.nan, dtype=np.float64)
     if n > 10:
+        volume_10 = sliding_window_view(volume, 10).sum(axis=1)[1:]
         with np.errstate(divide="ignore", invalid="ignore"):
-            obv_roc[10:] = np.where(
-                obv_vals[:-10] != 0,
-                (obv_vals[10:] - obv_vals[:-10]) / np.abs(obv_vals[:-10]),
-                np.nan,
+            obv_flow[10:] = np.where(
+                volume_10 != 0, obv(close, volume, 10)[10:] / volume_10, np.nan
             )
-    cols.append(obv_roc)
+    cols.append(obv_flow)
 
     # MFI(14)
     mfi_vals = mfi(high, low, close, volume, 14)
@@ -613,6 +612,12 @@ def _compute_all_features(
     """Compute the full feature matrix (n_1h_bars, n_features) and its names."""
     if not bars_1h:
         msg = "bars_1h is empty: nothing to build features from"
+        raise ValueError(msg)
+    if spec.spec_version != DEFAULT_FEATURE_SPEC.spec_version:
+        msg = (
+            f"feature spec v{spec.spec_version} is not the v{DEFAULT_FEATURE_SPEC.spec_version} "
+            "this builder computes: a model trained on it needs a retrain on the current spec"
+        )
         raise ValueError(msg)
     for bars, label in ((bars_1h, PRIMARY_TF), (bars_4h, "4h"), (bars_1d, "1d")):
         _require_ascending(bars, label)

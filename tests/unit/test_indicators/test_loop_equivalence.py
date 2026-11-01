@@ -1,7 +1,8 @@
 """The vectorized indicators equal their loop originals bit for bit.
 
 The ``_ref_*`` functions are the loop implementations as they were before vectorizing, copied
-verbatim. Equality is exact: values, NaN positions and the sign of zeros.
+verbatim; ``_ref_obv`` and ``_ref_vwap`` are the rolling definitions written as loops. Equality
+is exact: values, NaN positions and the sign of zeros.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from hydra.indicators.library import (
     rolling_min,
     sma,
     supertrend,
+    vwap,
     williams_r,
 )
 
@@ -238,22 +240,37 @@ def _ref_rolling_min(data: ndarray, period: int) -> ndarray:
     return result
 
 
-def _ref_obv(close: ndarray, volume: ndarray) -> ndarray:
-    """On Balance Volume."""
+def _ref_obv(close: ndarray, volume: ndarray, period: int) -> ndarray:
+    """On Balance Volume over the last ``period`` close moves, as a loop."""
     close = close.astype(np.float64)
     volume = volume.astype(np.float64)
     n = len(close)
     result = np.full(n, np.nan, dtype=np.float64)
-    if n == 0:
-        return result
-    result[0] = volume[0]
-    for i in range(1, n):
-        if close[i] > close[i - 1]:
-            result[i] = result[i - 1] + volume[i]
-        elif close[i] < close[i - 1]:
-            result[i] = result[i - 1] - volume[i]
-        else:
-            result[i] = result[i - 1]
+    for i in range(period, n) if period > 0 else ():
+        total = 0.0
+        for j in range(i - period + 1, i + 1):
+            if close[j] > close[j - 1]:
+                total += volume[j]
+            elif close[j] < close[j - 1]:
+                total += -volume[j]
+            else:
+                total += 0.0
+        result[i] = total
+    return result
+
+
+def _ref_vwap(high: ndarray, low: ndarray, close: ndarray, volume: ndarray, period: int) -> ndarray:
+    """Rolling VWAP of the typical price, as a loop."""
+    tp = (high.astype(np.float64) + low.astype(np.float64) + close.astype(np.float64)) / 3.0
+    vol = volume.astype(np.float64)
+    n = len(tp)
+    result = np.full(n, np.nan, dtype=np.float64)
+    for i in range(period - 1, n) if period > 0 else ():
+        tp_vol = vol_sum = 0.0
+        for j in range(i - period + 1, i + 1):
+            tp_vol += tp[j] * vol[j]
+            vol_sum += vol[j]
+        result[i] = tp_vol / vol_sum if vol_sum != 0 else np.nan
     return result
 
 
@@ -341,7 +358,8 @@ def test_matches_the_loop_reference(kind: str, period: int) -> None:
         _same(williams_r(h, lo, c, period), _ref_williams_r(h, lo, c, period))
         _same(cci(h, lo, c, period), _ref_cci(h, lo, c, period))
         _same(mfi(h, lo, c, v, period), _ref_mfi(h, lo, c, v, period))
-        _same(obv(c, v), _ref_obv(c, v))
+        _same(obv(c, v, period), _ref_obv(c, v, period))
+        _same(vwap(h, lo, c, v, period), _ref_vwap(h, lo, c, v, period))
         _same(supertrend(h, lo, c, period, 3.0), _ref_supertrend(h, lo, c, period, 3.0))
         new_ichi = ichimoku(h, lo, c, period, period + 1, 2 * period)
         ref_ichi = _ref_ichimoku(h, lo, c, period, period + 1, 2 * period)
@@ -358,7 +376,8 @@ def test_the_reference_values_are_not_all_nan() -> None:
         williams_r(h, lo, c, 14),
         cci(h, lo, c, 20),
         mfi(h, lo, c, v, 14),
-        obv(c, v),
+        obv(c, v, 14),
+        vwap(h, lo, c, v, 14),
         supertrend(h, lo, c, 10)[0],
         ichimoku(h, lo, c)["senkou_span_b"],
     ):
@@ -378,6 +397,8 @@ def test_period_zero_matches_the_loop_reference() -> None:
     _same(rolling_max(c, 0), _ref_rolling_max(c, 0))
     _same(rolling_min(c, 0), _ref_rolling_min(c, 0))
     _same(mfi(h, lo, c, v, 0), _ref_mfi(h, lo, c, v, 0))
+    _same(obv(c, v, 0), _ref_obv(c, v, 0))
+    _same(vwap(h, lo, c, v, 0), _ref_vwap(h, lo, c, v, 0))
     for new, ref in ((williams_r, _ref_williams_r), (ichimoku, _ref_ichimoku)):
         with pytest.raises(ValueError):
             ref(h, lo, c, 0)

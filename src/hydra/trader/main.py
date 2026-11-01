@@ -123,8 +123,8 @@ async def measure_startup_drift(pool: Any) -> None:
     training job (the request's symbol, the strategy config's exchange), rebuild
     the recent feature window through the DatasetBuilder (the frozen spec off
     the registry row, at the spec's own window sizes — the same shape the
-    training reference was computed over, so start-anchored features like the
-    OBV rate of change stay comparable), score the quantile-PSI against the
+    training reference was computed over; a spec older than the builder's
+    refuses, so its drift stays unknown), score the quantile-PSI against the
     stored reference deciles, write the drift jsonb onto the row and set the
     drift gauges — the only producer, here in the trader, never inside
     ``hydra.ml`` (§8). Startup-only by the user's cut: no periodic re-run, and

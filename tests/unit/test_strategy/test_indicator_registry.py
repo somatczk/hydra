@@ -207,3 +207,18 @@ class TestCategories:
         indicators = get_all_indicators()
         obv_ind = next(ind for ind in indicators if ind.name == "obv")
         assert obv_ind.category == "volume"
+
+    def test_obv_and_vwap_offer_a_bounded_period(self) -> None:
+        """Both are rolling: the builder shows a period (default 20, 2-200) like any window."""
+        by_name = {ind.name: ind for ind in get_all_indicators()}
+        for name in ("obv", "vwap"):
+            assert by_name[name].params == [
+                ParamInfo(
+                    name="period",
+                    type="int",
+                    default=20,
+                    min=2,
+                    max=200,
+                    description="Parameter: period",
+                )
+            ]
