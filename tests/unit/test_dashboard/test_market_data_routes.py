@@ -128,6 +128,15 @@ class TestOrderBook:
         assert resp.json()["detail"]["code"] == "exchange_not_allowed"
         assert factory.created == []
 
+    def test_alpaca_order_book_is_refused_with_the_ccxt_venues(self, factory: _Factory) -> None:
+        """alpaca is registered but has no ccxt client: the order book never builds one."""
+        resp = TestClient(_make_app()).get("/api/market/orderbook?exchange=alpaca&symbol=AAPLUSD")
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "exchange_not_allowed"
+        assert detail["allowed"] == ["binance", "binanceusdm", "bybit"]
+        assert factory.created == []
+
     def test_bybit_order_book_is_allowed(self, factory: _Factory) -> None:
         """P7-F: bybit spot joins the order book through the registry allowlist."""
         resp = TestClient(_make_app()).get("/api/market/orderbook?exchange=bybit&symbol=BTCUSDT")
@@ -199,9 +208,13 @@ class TestOrderBookBuildsThroughClientFactory:
         asyncio.run(close_market_clients(app))
 
     def test_order_book_allowlist_matches_the_factory_venues(self) -> None:
+        """Every venue the factory has a ccxt class for, and nothing else (alpaca)."""
         from hydra.execution import client_factory
 
-        assert {eid for eid, _ in client_factory.ALLOWED_VENUES} == market_data._ALLOWED_EXCHANGES
+        allowed = market_data._ALLOWED_EXCHANGES
+        classes = {*client_factory.SPOT_EXCHANGE_CLASS_MAP, *client_factory.USDM_EXCHANGE_CLASS_MAP}
+        assert classes == allowed
+        assert {eid for eid, _ in client_factory.ALLOWED_VENUES} - allowed == {"alpaca"}
 
     def test_the_route_file_builds_no_ccxt_client_of_its_own(self) -> None:
         source = Path(market_data.__file__).read_text()

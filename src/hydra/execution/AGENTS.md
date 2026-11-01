@@ -14,9 +14,11 @@ uv run pytest tests/integration/test_session_recovery_pg.py -m integration   # n
 ## Invariants
 
 - `client_factory` is the only place that builds exchange clients, executors and feed clients on the
-  session path; `ALLOWED_VENUES` is binance SPOT, binanceusdm FUTURES and bybit SPOT (live only — the
+  session path; `ALLOWED_VENUES` is binance SPOT, binanceusdm FUTURES, bybit SPOT (live only — the
   registry's mode caps: `validate_venue`'s `mode` keyword refuses a bybit paper or backtest start by
-  name), anything else is `UnsupportedVenueError`
+  name) and alpaca SPOT (backtest only, no ccxt client: `ccxt_class_for` refuses it by name, and the feed
+  factory resolves its class only when the feed opens, so a backtest runtime builds), anything else is
+  `UnsupportedVenueError`
   (`tests/unit/test_execution/test_session_split.py::test_only_client_factory_constructs_exchange_clients`,
   `tests/unit/test_execution/test_client_factory.py`).
 - Backtest and paper share one execution path; a change to fills or the paper executor must keep

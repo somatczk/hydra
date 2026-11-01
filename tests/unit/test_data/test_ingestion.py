@@ -760,6 +760,8 @@ async def test_default_rest_factory_builds_the_venues_class() -> None:
         assert bybit.options["fetchMarkets"]["types"] == ["spot"]
     finally:
         await bybit.close()
+    with pytest.raises(ValueError, match="alpaca has no ccxt client"):
+        ingestion._default_rest_factory("alpaca")
 
 
 async def test_consumer_lag_marks_stale_then_live() -> None:

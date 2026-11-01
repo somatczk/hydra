@@ -1300,6 +1300,23 @@ class TestUniverseWriteGate:
                 assert f"Invalid exchange: {exchange_id}" in str(resp.json()["detail"])
         assert list(tmp_path.glob("*.yaml")) == []
 
+    def test_an_alpaca_save_or_update_is_refused_by_name(self, tmp_path: Path) -> None:
+        """alpaca is registered backtest-only with no ccxt client: until S1 (c) validates
+        its tickers and timeframe, a save or update on it is refused, even of a universe
+        member, and nothing is written."""
+        (tmp_path / "gate.yaml").write_text(_rule_based_yaml("gate_1"))
+        stored = (tmp_path / "gate.yaml").read_text()
+        body = _save_body(symbol="BTCUSDT", exchange_id="alpaca")
+        with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):
+            client = TestClient(_make_app(pool=seeded_universe_pool()))
+            saved = client.post("/api/strategies/save", json=body)
+            updated = client.put("/api/strategies/gate_1", json=body)
+        for resp in (saved, updated):
+            assert resp.status_code == 422
+            assert resp.json()["detail"] == "Invalid exchange: alpaca"
+        assert [p.name for p in tmp_path.glob("*.yaml")] == ["gate.yaml"]
+        assert (tmp_path / "gate.yaml").read_text() == stored
+
     def test_update_with_a_member_symbol_round_trips(self, tmp_path: Path) -> None:
         (tmp_path / "gate.yaml").write_text(_rule_based_yaml("gate_1"))
         with patch("hydra.services.strategies._CONFIG_DIR", tmp_path):

@@ -19,6 +19,7 @@ from typing import Any
 
 from hydra.core.types import MarketType
 from hydra.core.venues import (
+    AssetClass,
     TrailingKind,
     find_venue,
     registered_venue_ids,
@@ -28,7 +29,8 @@ from hydra.core.venues import (
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXCHANGES = registered_venue_ids()
-"""The registered venue ids — market rules exist only for them (binance, binanceusdm, bybit)."""
+"""The registered venue ids — market rules exist only for them (binance, binanceusdm, bybit
+from ccxt metadata; alpaca's are static)."""
 
 MarketsLoader = Callable[[str], Awaitable[Iterable[Mapping[str, Any]]]]
 
@@ -166,6 +168,8 @@ async def public_venue_markets(exchange_id: str) -> list[Mapping[str, Any]]:
     spec = find_venue(exchange_id, venue_market_type(exchange_id))
     if spec is None:
         raise UnsupportedExchangeError(f"no market rules for exchange {exchange_id!r}")
+    if spec.ccxt_class is None:
+        raise UnsupportedExchangeError(f"{exchange_id!r} has no ccxt markets")
     return await _load_public_markets(spec.ccxt_class, dict(spec.client_options))
 
 
@@ -178,9 +182,11 @@ _DEFAULT_MARKETS_LOADERS: Mapping[str, MarketsLoader] = {
 
 async def load_public_markets(exchange_id: str) -> list[Mapping[str, Any]]:
     """The per-exchange public loader: Binance spot, USD⌂-M linear perps on binanceusdm,
-    bybit spot — every registered venue, through the registry's ccxt class."""
+    bybit spot — every registered ccxt venue, through the registry's ccxt class."""
     if exchange_id not in SUPPORTED_EXCHANGES:
         raise UnsupportedExchangeError(f"no market rules for exchange {exchange_id!r}")
+    if exchange_id not in _DEFAULT_MARKETS_LOADERS:
+        raise UnsupportedExchangeError(f"{exchange_id!r} has no ccxt markets")
     return list(await _DEFAULT_MARKETS_LOADERS[exchange_id](exchange_id))
 
 
@@ -193,6 +199,17 @@ def _is_rules_market(exchange_id: str, market: Mapping[str, Any]) -> bool:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _us_equity_rules(symbol: str) -> MarketRules:
+    """Whole shares at a cent tick, no minimum notional: the static US_EQUITY rules."""
+    return MarketRules(
+        symbol=symbol.replace("/", ""),
+        amount_step=Decimal("1"),
+        min_qty=Decimal("1"),
+        min_notional=Decimal("0"),
+        price_tick=Decimal("0.01"),
+    )
 
 
 class MarketRulesCache:
@@ -212,6 +229,9 @@ class MarketRulesCache:
     async def get(self, exchange_id: str, symbols: Iterable[str]) -> dict[str, MarketRules]:
         if exchange_id not in SUPPORTED_EXCHANGES:
             raise UnsupportedExchangeError(f"no market rules for exchange {exchange_id!r}")
+        spec = find_venue(exchange_id, venue_market_type(exchange_id))
+        if spec is not None and spec.asset_class is AssetClass.US_EQUITY:
+            return {symbol: _us_equity_rules(symbol) for symbol in symbols}
         now = self._clock()
         cached = self._cache.get(exchange_id)
         if cached is None or now - cached[0] >= self._ttl:

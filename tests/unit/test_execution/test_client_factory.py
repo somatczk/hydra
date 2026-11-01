@@ -45,6 +45,7 @@ def test_binanceusdm_futures_is_the_second_venue() -> None:
         ("binance", MarketType.FUTURES),
         ("binanceusdm", MarketType.SPOT),
         ("bybit", MarketType.FUTURES),
+        ("alpaca", MarketType.FUTURES),
         ("kraken", MarketType.SPOT),
         ("okx", MarketType.FUTURES),
         ("binance", "margin"),
@@ -83,9 +84,41 @@ class TestTheModeCaps:
         assert client_factory.validate_venue("bybit", MarketType.SPOT, mode="live") == "bybit"
         assert client_factory.ccxt_class_for("bybit", MarketType.SPOT) == "bybit"
 
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_alpaca_paper_and_live_are_refused_by_name(self, mode: Any) -> None:
+        with pytest.raises(UnsupportedVenueError) as err:
+            client_factory.validate_venue("alpaca", MarketType.SPOT, mode=mode)
+        assert str(err.value) == f"alpaca SPOT runs backtest only (asked for {mode})"
+
+    def test_alpaca_backtests_but_has_no_ccxt_client(self) -> None:
+        assert client_factory.validate_venue("alpaca", MarketType.SPOT, mode="backtest") == "alpaca"
+        with pytest.raises(UnsupportedVenueError, match="alpaca SPOT has no ccxt client"):
+            client_factory.ccxt_class_for("alpaca", MarketType.SPOT)
+        with pytest.raises(UnsupportedVenueError, match="alpaca SPOT has no ccxt client"):
+            client_factory.rest_exchange_factory("alpaca")
+        feed = client_factory.feed_exchange_factory("alpaca")  # built lazily: a backtest runtime
+        with pytest.raises(UnsupportedVenueError, match="alpaca SPOT has no ccxt client"):
+            feed()
+        with pytest.raises(UnsupportedVenueError, match="alpaca SPOT runs backtest only"):
+            client_factory.build_readonly_client(
+                "alpaca", {"api_key": "k", "api_secret": "s"}, testnet=True
+            )
+
+    def test_bybit_backtest_keeps_the_live_only_message(self) -> None:
+        with pytest.raises(UnsupportedVenueError) as err:
+            client_factory.validate_venue("bybit", MarketType.SPOT, mode="backtest")
+        assert str(err.value) == (
+            "bybit SPOT is a live-only venue: paper and backtest sessions "
+            "run on binance and binanceusdm (asked for backtest)"
+        )
+
     def test_binance_admits_both_modes(self) -> None:
         assert client_factory.validate_venue("binance", MarketType.SPOT, mode="paper") == "binance"
         assert client_factory.validate_venue("binance", MarketType.SPOT, mode="live") == "binance"
+        assert (
+            client_factory.validate_venue("binanceusdm", MarketType.FUTURES, mode="backtest")
+            == "binanceusdm"
+        )
         assert (
             client_factory.validate_venue("binanceusdm", MarketType.FUTURES, mode="live")
             == "binanceusdm"

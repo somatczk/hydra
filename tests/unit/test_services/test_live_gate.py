@@ -583,6 +583,17 @@ class TestTheArmLoop:
         }
         assert FakeBybit.instances == []
 
+    async def test_a_stored_alpaca_key_never_enters_the_arm_loop(
+        self, binance: type[FakeBinance], bybit: type[FakeBybit]
+    ) -> None:
+        """alpaca is backtest-only: the loop covers only the spot venues that run live, so
+        a stored alpaca row is never read and arming binance passes."""
+        assert frozenset({"binance", "bybit"}) == live_gate.LIVE_VENUES
+        db = _Db(credentials={"binance": _creds_row(), "alpaca": _creds_row()})
+        checked = await require_live_capable_credentials(db)
+        assert set(checked) == {"binance"}
+        assert [args for _sql, args in db.statements if args == ("alpaca",)] == []
+
     async def test_bybit_trade_only_keys_pass_and_are_refetched(
         self, binance: type[FakeBinance], bybit: type[FakeBybit]
     ) -> None:

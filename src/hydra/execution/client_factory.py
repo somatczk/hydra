@@ -8,7 +8,8 @@ the keyed client from stored credentials and ``build_live_executor`` the live se
 builds the live perp executor — the perp margin sleeve at the strategy's 1-3x isolated
 leverage — instead of refusing the venue. P7-F adds bybit SPOT, LIVE ONLY: the registry
 (``hydra.core.venues``) owns every venue fact, and ``validate_venue`` gains the mode caps —
-paper and backtest still run on Binance alone.
+paper and backtest still run on Binance alone. S1 registers alpaca SPOT, backtest only and
+with no ccxt client: ``ccxt_class_for`` refuses it by name.
 """
 
 from __future__ import annotations
@@ -40,18 +41,19 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 ALLOWED_VENUES: frozenset[tuple[str, MarketType]] = registered_venues()
-"""The registered venue pairs — binance SPOT, binanceusdm FUTURES and bybit SPOT (P7-F)."""
+"""The registered venue pairs — binance SPOT, binanceusdm FUTURES, bybit SPOT (P7-F) and
+alpaca SPOT (backtest only, no ccxt client)."""
 
 SPOT_EXCHANGE_CLASS_MAP: dict[str, str] = {
     spec.exchange_id: spec.ccxt_class
     for (_eid, market_type), spec in VENUES.items()
-    if market_type is MarketType.SPOT
+    if market_type is MarketType.SPOT and spec.ccxt_class is not None
 }
 
 USDM_EXCHANGE_CLASS_MAP: dict[str, str] = {
     spec.exchange_id: spec.ccxt_class
     for (_eid, market_type), spec in VENUES.items()
-    if market_type is MarketType.FUTURES
+    if market_type is MarketType.FUTURES and spec.ccxt_class is not None
 }
 
 _EXCHANGE_CLASS_MAPS: dict[MarketType, dict[str, str]] = {
@@ -88,12 +90,17 @@ def validate_venue(
         raise UnsupportedVenueError(
             f"{exchange_id} {mt.value} is not supported and not scheduled: "
             "the supported venues are binance SPOT, binanceusdm FUTURES "
-            "(USD⌂-M perps) and bybit SPOT (live only)"
+            "(USD⌂-M perps), bybit SPOT (live only) and alpaca SPOT (backtest only)"
         )
     if mode is not None and mode not in spec.allowed_modes:
+        if spec.allowed_modes == {"live"}:
+            raise UnsupportedVenueError(
+                f"{exchange_id} {mt.value} is a live-only venue: paper and backtest sessions "
+                f"run on binance and binanceusdm (asked for {mode})"
+            )
         raise UnsupportedVenueError(
-            f"{exchange_id} {mt.value} is a live-only venue: paper and backtest sessions "
-            f"run on binance and binanceusdm (asked for {mode})"
+            f"{exchange_id} {mt.value} runs {' and '.join(sorted(spec.allowed_modes))} only "
+            f"(asked for {mode})"
         )
     return cast(ExchangeId, exchange_id)
 
@@ -101,10 +108,14 @@ def validate_venue(
 def ccxt_class_for(exchange_id: str, market_type: MarketType | str = MarketType.SPOT) -> str:
     """The ccxt class for a registered venue (binance SPOT -> ``binance``, binanceusdm
     FUTURES -> ``binanceusdm``, bybit SPOT -> ``bybit``); the pair-only check — the
-    caller's session gate owns the mode."""
+    caller's session gate owns the mode. A registered venue with no ccxt client (alpaca)
+    is refused by name."""
     mt = _market_type(market_type)
     validate_venue(exchange_id, mt, mode=None)
-    return _EXCHANGE_CLASS_MAPS[mt][exchange_id]
+    cls_name = _EXCHANGE_CLASS_MAPS[mt].get(exchange_id)
+    if cls_name is None:
+        raise UnsupportedVenueError(f"{exchange_id} {mt.value} has no ccxt client")
+    return cls_name
 
 
 def _venue_market_type(exchange_id: str) -> MarketType:
@@ -284,14 +295,17 @@ def build_live_executor(
 
 
 def feed_exchange_factory(exchange_id: str) -> Callable[[], Any]:
-    """Factory for the ccxt.pro client of a session's market-data feed (the venue's class)."""
+    """Factory for the ccxt.pro client of a session's market-data feed (the venue's class).
+
+    The pair is checked here, the class on call: a backtest builds a runtime without ever
+    opening the feed, so a venue with no ccxt client (alpaca) still backtests."""
     mt = _venue_market_type(exchange_id)
-    cls_name = ccxt_class_for(exchange_id, mt)
+    validate_venue(exchange_id, mt, mode=None)
 
     def _ccxt_factory() -> Any:
         import ccxt.pro
 
-        cls = getattr(ccxt.pro, cls_name)
+        cls = getattr(ccxt.pro, ccxt_class_for(exchange_id, mt))
         return cls({"enableRateLimit": True, "options": _venue_options(exchange_id, mt)})
 
     return _ccxt_factory

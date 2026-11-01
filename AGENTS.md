@@ -121,7 +121,9 @@ git status --porcelain --untracked-files=all # must print nothing after the test
   the same paper session runtime (`src/hydra/backtest/AGENTS.md`).
 - **Venues.** Binance spot (`binance`) and Binance USD⌂-M perps (`binanceusdm`) run paper and live; Bybit spot
   (`bybit`) is LIVE ONLY (the registry's per-venue mode caps in `hydra.core.venues` refuse a bybit paper or backtest
-  start by name), enforced by `client_factory.validate_venue` and its `mode` keyword. Kraken and OKX are not registered
+  start by name), enforced by `client_factory.validate_venue` and its `mode` keyword. Alpaca (`alpaca`, US stocks) is
+  registered BACKTEST ONLY with no ccxt client: every ccxt path refuses it by name (`ccxt_venue_ids()` is the ccxt
+  set; `spot_venue_ids()` holds only the spot venues that run live). Kraken and OKX are not registered
   (no testnet or no key-permission endpoint — the README says why). Every paper entry gets a protective stop (strategy
   `risk:` block, 5 % default); live sessions must never hold a position without a confirmed exchange-side protective
   order (`src/hydra/execution/AGENTS.md`, `docs/live-trading.md`).

@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from hydra.core.venues import ccxt_venue_ids, registered_venue_ids
 from hydra.dashboard.deps import current_config
 from hydra.dashboard.routes._db import (
     ServiceErrorRoute,
@@ -1056,6 +1057,13 @@ async def _check_credentials(
 
 async def _get_exchange_client(exchange_id: str, request: Request) -> Any:
     """Return (or create and cache) the read-only client for a connected exchange."""
+    if exchange_id in registered_venue_ids() - ccxt_venue_ids():
+        raise api_error(
+            400,
+            "unsupported_exchange",
+            f"{exchange_id} has no exchange client: account reads need a ccxt venue",
+            "invalid",
+        )
     exchange = _require_supported(exchange_id)
     clients = _get_exchange_clients(request)
     if exchange in clients:
