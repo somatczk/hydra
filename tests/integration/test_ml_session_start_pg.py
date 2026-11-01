@@ -66,7 +66,9 @@ async def pool(fresh_database: str) -> AsyncIterator[Any]:
 
 
 def _fixture_bytes() -> bytes:
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     return confidence_onnx(meta, N_FEATURES)
 
 

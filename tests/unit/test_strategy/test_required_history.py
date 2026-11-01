@@ -52,6 +52,13 @@ class TestRulesRequiredHistory:
     def test_a_wilder_rsi_needs_six_windows(self) -> None:
         assert rules_required_history(RuleSet(**RSI_DIP)) == 6 * 14 + 2
 
+    def test_a_rolling_vwap_or_obv_needs_its_window_and_the_previous_bar(self) -> None:
+        rules = _rules(
+            _cond("close", {}, "crosses_above", "vwap:period=120"),
+            _cond("obv", {"period": 80}, "greater_than", 0),
+        )
+        assert rules_required_history(RuleSet(**rules)) == 120 + 2
+
     def test_short_rules_and_no_rules_keep_the_floor_of_50(self) -> None:
         bollinger = _rules(_cond("close", {}, "less_than", "bollinger_lower:period=20,std_dev=2"))
         assert rules_required_history(RuleSet(**bollinger)) == 50

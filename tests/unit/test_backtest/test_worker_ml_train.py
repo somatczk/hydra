@@ -448,8 +448,8 @@ async def test_the_round_trip_trains_exports_and_registers(models_dir: Path) -> 
 
     session = ort.InferenceSession(str(artifact), providers=["CPUExecutionProvider"])
     metadata = session.get_modelmeta().custom_metadata_map
-    assert metadata["feature_version"] == "3"
-    assert metadata["spec_version"] == "3"
+    assert metadata["feature_version"] == "4"
+    assert metadata["spec_version"] == "4"
     assert metadata["horizon"] == "1"
     assert metadata["feature_names"] == json.dumps(list(jobs.DEFAULT_FEATURE_SPEC.feature_names))
     x = np.linspace(-1.0, 1.0, 128, dtype=np.float32).reshape(4, 32)
@@ -482,7 +482,7 @@ async def test_the_round_trip_trains_exports_and_registers(models_dir: Path) -> 
     assert args[8] == "job:ml-unit0001"
     assert args[9] == "ml-unit0001"
     assert json.loads(args[3])["folds"] == metrics["folds"]
-    assert json.loads(args[4])["spec_version"] == 3
+    assert json.loads(args[4])["spec_version"] == 4
     assert json.loads(args[4])["horizon"] == 1
 
 

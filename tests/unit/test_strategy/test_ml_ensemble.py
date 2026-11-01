@@ -64,7 +64,9 @@ async def _attach(tmp_path: Any) -> None:
     from hydra.ml.consumers import attach_native_provider
     from hydra.ml.serving import attach_artifact
 
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     (tmp_path / "fixture.onnx").write_bytes(confidence_onnx(meta, N_FEATURES))
     attached = await attach_artifact(tmp_path, "fixture.onnx", MODEL)
     attach_native_provider(attached)

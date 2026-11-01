@@ -13,7 +13,7 @@ from hydra.core.types import OHLCV, Timeframe
 from hydra.data.errors import NoMarketDataError
 from hydra.data.storage import MarketDataRepository
 from hydra.ml.dataset import DatasetBuilder, DatasetProvenance
-from hydra.ml.features import FeatureSpec, _all_feature_names
+from hydra.ml.features import DEFAULT_FEATURE_SPEC, FeatureSpec, _all_feature_names
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 H = timedelta(hours=1)
@@ -84,7 +84,7 @@ def _as_repo(fake: _FakeRepo) -> MarketDataRepository:
 
 def _spec(horizon: int = 1, w1: int = 500, w4: int = 100, w1d: int = 30) -> FeatureSpec:
     return FeatureSpec(
-        spec_version=3,
+        spec_version=DEFAULT_FEATURE_SPEC.spec_version,
         horizon=horizon,
         window_1h=w1,
         window_4h=w4,
@@ -144,7 +144,7 @@ class TestDatasetBuild:
         np.testing.assert_array_equal(matrix.target[:-2], np.sign(np.asarray(expected_fwd)))
         # the zero forward return (100 -> 100 after two bars) is sign 0, for the trainer to drop
         assert matrix.target[0] == 0.0
-        assert provenance.spec_version == 3
+        assert provenance.spec_version == 4
         assert provenance.horizon == 2
 
     async def test_missing_primary_bars_raise_no_market_data(self) -> None:
@@ -213,7 +213,7 @@ class TestProvenance:
         assert provenance.to_dict() == {
             "exchange": "binance",
             "symbol": "BTCUSDT",
-            "spec_version": 3,
+            "spec_version": 4,
             "horizon": 1,
             "coverage": [by_tf["1h"].to_dict(), by_tf["4h"].to_dict(), by_tf["1d"].to_dict()],
         }

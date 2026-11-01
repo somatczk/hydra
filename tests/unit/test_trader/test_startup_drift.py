@@ -461,6 +461,34 @@ class TestStartupDriftMeasurement:
         assert conn.drift_writes == []
         assert _gauge("hydra_ml_drift_psi", "alpha") is None
 
+    async def test_a_model_on_an_older_feature_spec_stays_unknown(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A v3 row (start-anchored VWAP/OBV) is never rebuilt on v4 features and scored."""
+        walk = _market(_stationary_closes(_WALK_HOURS, seed=42))
+        quantiles = _reference_quantiles(walk)
+        old_spec = dict(SPEC.to_dict())
+        old_spec["spec_version"] = 3
+        old_spec["reference_quantiles"] = [list(q) if q is not None else None for q in quantiles]
+        conn = _FakeConn(
+            [
+                {
+                    **_model_row(
+                        "alpha", training_job_id="task-drift-0001", reference_quantiles=quantiles
+                    ),
+                    "feature_spec": json.dumps(old_spec),
+                }
+            ],
+            {"task-drift-0001": _job_row()},
+            _bars_table(walk),
+        )
+
+        await trader_main.measure_startup_drift(_FakePool(conn))
+
+        assert conn.drift_writes == []
+        assert _gauge("hydra_ml_drift_psi", "alpha") is None
+        assert "needs a retrain on the current spec" in caplog.text
+
     async def test_no_production_models_is_a_quiet_no_op(self) -> None:
         conn = _FakeConn([], {}, {})
 

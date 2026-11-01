@@ -87,8 +87,8 @@ _DESCRIPTION_MAP: dict[str, str] = {
     "rolling_low": "Lowest low of the previous N bars (Donchian lower on lows)",
     "keltner_upper": "Upper Keltner Channel (EMA + ATR multiple)",
     "keltner_lower": "Lower Keltner Channel (EMA - ATR multiple)",
-    "obv": "On Balance Volume",
-    "vwap": "Volume Weighted Average Price",
+    "obv": "On Balance Volume: signed volume summed over the last N bars",
+    "vwap": "Volume Weighted Average Price over the last N bars",
     "mfi": "Money Flow Index (0-100 oscillator)",
 }
 

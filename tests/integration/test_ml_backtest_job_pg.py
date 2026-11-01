@@ -194,7 +194,9 @@ async def _register(
     promote: bool = True,
     artifact_name: str | None = None,
 ) -> ModelVersion:
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     blob = confidence_onnx(meta, N_FEATURES, scale=scale)
     models_dir.mkdir(parents=True, exist_ok=True)
     artifact = models_dir / (artifact_name or f"{name}.onnx")

@@ -268,7 +268,9 @@ class TestSessionsNeverTakeAModelPin:
     async def test_a_pin_in_the_start_payload_never_serves_a_staging_version(
         self, strategy_dir: Path, tmp_path: Path
     ) -> None:
-        meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+        meta = frozen_spec_metadata(
+            list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+        )
         blob = confidence_onnx(meta, len(DEFAULT_FEATURE_SPEC.feature_names))
         (tmp_path / "alpha-v2.onnx").write_bytes(blob)
         staging = {

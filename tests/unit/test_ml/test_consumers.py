@@ -88,7 +88,9 @@ def _series(closes: list[float]) -> list[OHLCV]:
 
 
 def _write_fixture(models_dir: Path, *, name: str = "fixture.onnx", scale: float = 0.01) -> bytes:
-    meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+    meta = frozen_spec_metadata(
+        list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+    )
     blob = confidence_onnx(meta, N_FEATURES, scale=scale)
     models_dir.mkdir(parents=True, exist_ok=True)
     (models_dir / name).write_bytes(blob)
@@ -365,6 +367,19 @@ class TestAttachPipeline:
         assert exc.value.kind == "spec_mismatch"
         assert "frozen spec" in str(exc.value)
 
+    async def test_an_artifact_trained_on_the_v3_spec_refuses(self, tmp_path: Path) -> None:
+        """A model trained before the rolling VWAP/OBV features is never served v4 vectors."""
+        v3_names = [
+            "obv_roc10_1h" if n == "obv_flow10_1h" else n
+            for n in DEFAULT_FEATURE_SPEC.feature_names
+        ]
+        meta = frozen_spec_metadata(v3_names, 3, 4)
+        (tmp_path / "v3.onnx").write_bytes(confidence_onnx(meta, N_FEATURES))
+        with pytest.raises(MlServingError) as exc:
+            await attach_artifact(tmp_path, "v3.onnx", MODEL)
+        assert exc.value.kind == "spec_mismatch"
+        assert "(v3, 67 features) does not match the frozen spec v4" in str(exc.value)
+
     async def test_a_spec_less_artifact_refuses(self, tmp_path: Path) -> None:
         (tmp_path / "specless.onnx").write_bytes(confidence_onnx({}, N_FEATURES))
         with pytest.raises(MlServingError) as exc:
@@ -390,7 +405,9 @@ class TestAttachPipeline:
 
         from tests.fixtures.ml_onnx import two_output_classifier_onnx
 
-        meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+        meta = frozen_spec_metadata(
+            list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+        )
         (tmp_path / "xgb.onnx").write_bytes(
             two_output_classifier_onnx(meta, N_FEATURES, scale=0.01)
         )
@@ -450,7 +467,9 @@ class TestMidSessionPromote:
             return _Acquire()
 
     def _write_version(self, models_dir: Path, name: str, scale: float) -> tuple[str, str]:
-        meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+        meta = frozen_spec_metadata(
+            list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+        )
         blob = confidence_onnx(meta, N_FEATURES, scale=scale)
         (models_dir / f"{name}.onnx").write_bytes(blob)
         return f"{name}.onnx", hashlib.sha256(blob).hexdigest()
@@ -736,7 +755,9 @@ class TestResearchPin:
     def _row(
         self, models_dir: Path, version: int, stage: str, scale: float, name: str = MODEL
     ) -> dict[str, Any]:
-        meta = frozen_spec_metadata(list(DEFAULT_FEATURE_SPEC.feature_names), 3, 4)
+        meta = frozen_spec_metadata(
+            list(DEFAULT_FEATURE_SPEC.feature_names), DEFAULT_FEATURE_SPEC.spec_version, 4
+        )
         blob = confidence_onnx(meta, N_FEATURES, scale=scale)
         artifact = f"{name}-v{version}.onnx"
         (models_dir / artifact).write_bytes(blob)

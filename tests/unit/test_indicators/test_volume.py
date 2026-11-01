@@ -3,71 +3,79 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from hydra.indicators.library import mfi, obv, vwap
 
 
 class TestOBV:
-    """On Balance Volume tests."""
+    """On Balance Volume over a rolling window."""
 
-    def test_obv_increases_on_up_close(self) -> None:
-        """OBV should increase when close > prev close."""
-        close = np.array([10.0, 11.0, 12.0, 13.0, 14.0])
-        volume = np.array([100.0, 200.0, 150.0, 300.0, 250.0])
-        result = obv(close, volume)
-        # Each bar close > prev close, so OBV accumulates
-        for i in range(1, len(result)):
-            assert result[i] > result[i - 1]
+    def test_sums_the_signed_volume_of_the_last_period_moves(self) -> None:
+        close = np.array([10.0, 11.0, 10.5, 10.5, 12.0, 11.0])
+        volume = np.array([100.0, 200.0, 150.0, 300.0, 250.0, 50.0])
+        result = obv(close, volume, period=3)
+        # signed steps from bar 1: +200, -150, 0, +250, -50
+        assert np.isnan(result[:3]).all()
+        assert result[3:].tolist() == [
+            200.0 - 150.0 + 0.0,
+            -150.0 + 0.0 + 250.0,
+            0.0 + 250.0 - 50.0,
+        ]
 
-    def test_obv_decreases_on_down_close(self) -> None:
-        """OBV should decrease when close < prev close."""
-        close = np.array([14.0, 13.0, 12.0, 11.0, 10.0])
-        volume = np.array([100.0, 200.0, 150.0, 300.0, 250.0])
-        result = obv(close, volume)
-        for i in range(1, len(result)):
-            assert result[i] < result[i - 1]
+    def test_the_value_does_not_depend_on_bars_before_the_window(self) -> None:
+        close = np.array([10.0, 11.0, 10.5, 10.5, 12.0, 11.0])
+        volume = np.array([100.0, 200.0, 150.0, 300.0, 250.0, 50.0])
+        assert obv(close, volume, period=3)[-1] == obv(close[-4:], volume[-4:], period=3)[-1]
 
-    def test_obv_flat_on_equal_close(self) -> None:
-        """OBV unchanged when close == prev close."""
-        close = np.array([10.0, 10.0, 10.0])
-        volume = np.array([100.0, 200.0, 300.0])
-        result = obv(close, volume)
-        np.testing.assert_allclose(result[0], 100.0)
-        np.testing.assert_allclose(result[1], 100.0)
-        np.testing.assert_allclose(result[2], 100.0)
-
-    def test_obv_empty(self) -> None:
-        close = np.array([], dtype=np.float64)
-        volume = np.array([], dtype=np.float64)
-        result = obv(close, volume)
-        assert len(result) == 0
+    def test_too_short_or_empty_is_all_nan(self) -> None:
+        assert np.isnan(obv(np.array([1.0, 2.0]), np.array([5.0, 5.0]), period=2)).all()
+        assert len(obv(np.array([], dtype=np.float64), np.array([], dtype=np.float64))) == 0
 
 
 class TestVWAP:
-    """Volume Weighted Average Price tests."""
+    """Volume Weighted Average Price over a rolling window."""
 
-    def test_vwap_between_high_and_low(self) -> None:
-        """VWAP should be between high and low for each bar (cumulative)."""
+    def test_weights_the_typical_price_of_the_last_period_bars(self) -> None:
         high = np.array([105.0, 108.0, 107.0, 110.0])
         low = np.array([95.0, 98.0, 97.0, 100.0])
         close = np.array([100.0, 103.0, 102.0, 105.0])
         volume = np.array([1000.0, 1500.0, 800.0, 2000.0])
-        result = vwap(high, low, close, volume)
-        # VWAP is cumulative; at each point it should be between
-        # the overall min low and max high seen so far
-        for i in range(len(result)):
-            assert result[i] >= np.min(low[: i + 1])
-            assert result[i] <= np.max(high[: i + 1])
+        result = vwap(high, low, close, volume, period=2)
+        tp = (high + low + close) / 3.0
+        assert np.isnan(result[0])
+        for i in range(1, 4):
+            want = (tp[i - 1] * volume[i - 1] + tp[i] * volume[i]) / (volume[i - 1] + volume[i])
+            assert result[i] == pytest.approx(want, rel=1e-15)
+        assert result[3] == pytest.approx((102.0 * 800.0 + 105.0 * 2000.0) / 2800.0, rel=1e-15)
 
-    def test_vwap_single_bar(self) -> None:
-        """VWAP of a single bar should be the typical price."""
-        high = np.array([110.0])
-        low = np.array([90.0])
-        close = np.array([100.0])
-        volume = np.array([1000.0])
-        result = vwap(high, low, close, volume)
-        expected = (110 + 90 + 100) / 3.0
-        np.testing.assert_allclose(result[0], expected)
+    def test_a_window_without_volume_is_nan(self) -> None:
+        price = np.array([100.0, 101.0, 102.0])
+        result = vwap(price, price, price, np.array([5.0, 0.0, 0.0]), period=2)
+        assert result[1] == 100.0 and np.isnan(result[2])
+
+    def test_a_single_bar_window_is_the_typical_price(self) -> None:
+        result = vwap(np.array([110.0]), np.array([90.0]), np.array([100.0]), np.array([1000.0]), 1)
+        assert result[0] == pytest.approx(100.0)
+
+
+def test_obv_and_vwap_do_not_depend_on_how_much_history_is_loaded() -> None:
+    """A sweep (20,000 bars) and a live session (2,000) ending on one bar read the same line."""
+    rng = np.random.default_rng(7)
+    n = 20_000
+    close = 40_000 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
+    high = close * (1 + np.abs(rng.normal(0, 0.003, n)))
+    low = close * (1 - np.abs(rng.normal(0, 0.003, n)))
+    volume = np.abs(rng.normal(500, 200, n))
+    short = slice(n - 2_000, n)
+    for period in (2, 20, 200):
+        long_obv = obv(close, volume, period)
+        short_obv = obv(close[short], volume[short], period)
+        assert np.array_equal(long_obv[-1_500:], short_obv[-1_500:])
+        long_vwap = vwap(high, low, close, volume, period)
+        short_vwap = vwap(high[short], low[short], close[short], volume[short], period)
+        assert np.array_equal(long_vwap[-1_500:], short_vwap[-1_500:])
+        assert np.isfinite(short_vwap[-1_500:]).all() and np.isfinite(short_obv[-1_500:]).all()
 
 
 class TestMFI:
