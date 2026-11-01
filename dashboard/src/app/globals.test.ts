@@ -40,9 +40,9 @@ const walk = (dir: string) => {
 walk(join(here, '..'));
 const THEMES = { light, dark: blocks('.dark')[0] };
 
-/** 05 §2.1 claims: text roles ≥ 4.5:1 (1.4.3), control outlines ≥ 3:1 (1.4.11). */
+/** Text roles ≥ 4.5:1 (1.4.3), control outlines ≥ 3:1 (1.4.11); P&L colours are text too. */
 const PAIRS: Array<[fg: string, bg: string, min: number]> = [
-  ...['ink-1', 'ink-2', 'accent', 'caution', 'danger', 'live'].flatMap((fg) =>
+  ...['ink-1', 'ink-2', 'accent', 'caution', 'danger', 'live', 'up', 'down'].flatMap((fg) =>
     ['canvas', 'surface', 'raised'].map((bg): [string, string, number] => [fg, bg, 4.5]),
   ),
   ['ink-1', 'hover', 4.5],
@@ -84,7 +84,7 @@ describe('design tokens', () => {
       expect(css, name).toContain(`--color-${name}: var(--${name});`);
       expect(aliases[name], name).toMatch(/^var\(--[a-z0-9-]+\)$/);
     }
-    expect(css).toContain('--font-display: var(--font-sans);');
+    expect(css).toContain('--font-display: var(--font-barlow-condensed)');
   });
 
   it('every alias used as text colour resolves to a token ≥ 4.5:1 on canvas, surface and raised', () => {

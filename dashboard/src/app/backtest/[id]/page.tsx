@@ -33,7 +33,6 @@ import { fetchApi } from '@/lib/api';
 import { money, signed, signedLabel } from '@/lib/format';
 import { useToast } from '@/components/ui/Toast';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
-import { ResearchNav } from '@/components/research/ResearchNav';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
 import {
@@ -416,7 +415,6 @@ export default function BacktestDetailPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/backtest" />
       {shared && (
         <p className="rounded-lg border border-line bg-raised px-4 py-3 text-sm text-ink-2" data-testid="shared-banner">
           Shared backtest result, read-only. {SHARE_CAVEAT}

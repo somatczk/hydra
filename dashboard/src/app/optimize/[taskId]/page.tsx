@@ -13,7 +13,6 @@ import { describeApiError, stateFromError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 import { pct, utc } from '@/lib/format';
 import { usePoll } from '@/hooks/usePoll';
-import { ResearchNav } from '@/components/research/ResearchNav';
 import { JobRow } from '@/components/research/JobRow';
 import { WalkForwardResults, type WalkForwardResult } from '@/components/research/WalkForwardResults';
 import {
@@ -283,7 +282,6 @@ function HyperoptView({ taskId }: { taskId: string }) {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/optimize" />
       <RunHeader
         title="Hyperopt run"
         strategy={progress.strategy_id}
@@ -450,7 +448,6 @@ function WalkforwardView({ taskId }: { taskId: string }) {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/optimize" />
       <RunHeader
         title="Walk-forward run"
         strategy={row?.strategy_id}

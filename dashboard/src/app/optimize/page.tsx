@@ -14,7 +14,6 @@ import { ErrorCard } from '@/components/ui/ErrorCard';
 import { describeApiError, parseErrorDetail } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 import { usePoll } from '@/hooks/usePoll';
-import { ResearchNav } from '@/components/research/ResearchNav';
 import { JobRow } from '@/components/research/JobRow';
 import { ParamSpaceEditor } from '@/components/research/ParamSpaceEditor';
 import { ModelVersionSelect } from '@/components/research/ModelVersionSelect';
@@ -338,7 +337,6 @@ export default function OptimizePage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/optimize" />
       <div>
         <h1 className="text-xl font-semibold text-ink-1">Strategy optimiser</h1>
         <p className="mt-1 text-sm text-ink-2">

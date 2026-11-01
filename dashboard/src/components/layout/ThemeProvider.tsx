@@ -23,9 +23,8 @@ const STORAGE_KEY = 'hydra-theme';
 
 function getSystemTheme(): 'light' | 'dark' {
   if (typeof window === 'undefined') return 'dark';
-  return window.matchMedia('(prefers-color-scheme: dark)').matches
-    ? 'dark'
-    : 'light';
+  // jsdom has no matchMedia; dark is the fallback, as in the inline script.
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches === false ? 'light' : 'dark';
 }
 
 function resolveTheme(theme: Theme): 'light' | 'dark' {
@@ -42,13 +41,13 @@ export function useTheme(): ThemeContextValue {
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>('dark');
+  const [theme, setThemeState] = useState<Theme>('system');
   const [resolved, setResolved] = useState<'light' | 'dark'>('dark');
 
   /* Same choice as the inline script in app/layout.tsx; re-applied in case hydration recovery reset <html>. */
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY) as Theme | null;
-    const t = stored && ['light', 'dark', 'system'].includes(stored) ? stored : 'dark';
+    const t = stored && ['light', 'dark', 'system'].includes(stored) ? stored : 'system';
     const r = resolveTheme(t);
     setThemeState(t);
     setResolved(r);
@@ -58,7 +57,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   /* Listen for system theme changes when in 'system' mode */
   useEffect(() => {
     if (theme !== 'system') return;
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const mq = window.matchMedia?.('(prefers-color-scheme: dark)');
+    if (!mq) return;
     const handler = () => {
       const r = getSystemTheme();
       setResolved(r);

@@ -24,8 +24,19 @@ TypeScript 6 API package (`typescript` is aliased to `@typescript/typescript6`).
   the server's error state).
 - Build UI from the house components in `src/components/ui` (exported from `index.ts`: `Button`, `Input`,
   `Select`, `DataCard`/`StatCard`, `Table`, `StatusBadge`, `ToastProvider`/`useToast`, `ErrorCard`,
-  `DataStateBadge`/`DataStateErrorCard`; also `Section`, `Readout`, `TypedConfirm` for typed confirmations) before
-  adding a native widget or a new component.
+  `DataStateBadge`/`DataStateErrorCard`, `Pnl` for any signed money amount; also `Section`, `Readout`, `TypedConfirm`
+  for typed confirmations) before adding a native widget or a new component.
+- Colour carries meaning only. There is no brand accent (`accent` is ink, so a link keeps its
+  underline), P&L uses `Pnl` (`text-up` / `text-down`, the sign always shown), warnings use `caution` / `danger`, and
+  LIVE is an inverted ink stamp plus words, never a colour alone. Sections are ruled, not cards. Every token pair is
+  contrast-checked in both themes (`src/app/globals.test.ts`); add a new token there. Light and dark follow the
+  system setting unless the user picks one.
+- Fonts are vendored OFL files in `src/app/fonts` (Public Sans body, Barlow Condensed display), loaded with
+  `next/font/local`. A new face is a vendored file with its licence, never a font CDN (`font-src 'self'`).
+- Navigation is the five destinations in `src/components/layout/navItems.ts` (Home, Strategies, Money, Inbox,
+  System). The rail and the phone tab bar render the same list; a destination's children show in the rail while it
+  is active and as `SubNav` on a phone. A new page goes under a destination's `under`/`children`, so a phone reaches it too
+  (`src/components/layout/nav.test.tsx`).
 - Production responses carry the CSP in `next.config.ts`: first-party scripts only, `connect-src 'self'`, and
   `frame-src` limited to TradingView (the `/trading` chart is a cross-origin iframe). Dev builds send no CSP.
   A new third-party origin is a reviewed CSP change (`src/lib/securityHeaders.test.ts`).

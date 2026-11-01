@@ -14,12 +14,12 @@ vi.mock('@/lib/api', async (orig) => ({
 
 const { Sidebar } = await import('./Sidebar');
 const { BottomTabBar } = await import('./BottomTabBar');
+const { SubNav } = await import('./SubNav');
 const { AppLayout } = await import('./AppLayout');
 const { ThemeProvider } = await import('./ThemeProvider');
 const { isActive, navItems, pageTitle } = await import('./navItems');
 
-const RAIL = ['Status', 'Sessions', 'Risk', 'Activity', 'Research', 'Data', 'Settings'];
-const TABS = ['Status', 'Sessions', 'Risk', 'Research', 'Settings'];
+const DESTINATIONS = ['Home', 'Strategies', 'Money', 'Inbox', 'System'];
 const SRC = path.join(process.cwd(), 'src');
 
 let m: Mounted;
@@ -44,54 +44,61 @@ async function bars(at: string) {
 }
 
 describe('navigation', () => {
-  it('renders six destinations in the rail (Activity and Data rail-only) and exactly five in the tab bar', async () => {
+  it('renders the same five destinations in the rail and the tab bar, so nothing is unreachable on a phone', async () => {
     const { rail, tabs } = await bars('/');
-    expect(topLabels(rail)).toEqual(RAIL);
-    expect(topLabels(tabs)).toEqual(TABS);
-    for (const a of tabs.querySelectorAll('a')) expect(a.className).toContain('min-h-14');
-    expect(m.container.textContent).not.toMatch(/More|Models/);
+    expect(topLabels(rail)).toEqual(DESTINATIONS);
+    expect(topLabels(tabs)).toEqual(DESTINATIONS);
+    for (const a of tabs.querySelectorAll('a')) expect(a.className).toContain('min-h-16');
   });
 
   it.each([
-    ['/', 'Status'],
-    ['/portfolio', 'Status'],
-    ['/trading', 'Sessions'],
-    ['/trading/abc', 'Sessions'],
-    ['/risk', 'Risk'],
-    ['/builder', 'Research'],
-    ['/templates', 'Research'],
-    ['/settings', 'Settings'],
-  ])('marks %s as under %s in both the rail and the tab bar', async (at, label) => {
+    ['/', 'Home', 'Home'],
+    ['/portfolio', 'Money', 'Money'],
+    ['/activity', 'Inbox', 'Inbox'],
+    ['/activity/approvals/abc', 'Inbox', 'Inbox'],
+    ['/builder', 'Strategies', 'Strategies'],
+    ['/strategies', 'Strategies', 'Strategies'],
+    ['/trading/abc', 'Sessions', 'Strategies'],
+    ['/models', 'Models', 'Strategies'],
+    ['/settings', 'Settings', 'System'],
+    ['/risk', 'Risk', 'System'],
+    ['/data', 'Data', 'System'],
+  ])('marks %s as %s in the rail and %s in the tab bar', async (at, inRail, inTabs) => {
     const { rail, tabs } = await bars(at);
-    expect(current(tabs)).toEqual([label]);
-    expect(current(rail)).toEqual([label]);
+    expect(current(rail)).toEqual([inRail]);
+    expect(current(tabs)).toEqual([inTabs]);
   });
 
-  it.each([
-    ['/activity', 'Activity'],
-    ['/activity/approvals/abc', 'Activity'],
-    ['/data', 'Data'],
-  ])('marks the rail-only %s only in the rail, never in the tab bar', async (at, label) => {
-    const { rail, tabs } = await bars(at);
-    expect(current(rail)).toEqual([label]);
-    expect(current(tabs)).toEqual([]);
-  });
-
-  it('shows Research children in the rail only while Research is active, marking the child', async () => {
+  it('shows a destination\'s children in the rail only while it is active, marking the child', async () => {
     let { rail } = await bars('/backtest/run-1');
     expect(current(rail)).toEqual(['Backtests']);
-    expect(rail.textContent).toContain('StrategiesBacktestsOptimize');
+    expect(rail.textContent).toContain('StrategiesSessionsBacktestsOptimizeModelsTemplates');
     m.unmount();
     ({ rail } = await bars('/risk'));
     expect(rail.textContent).not.toContain('Backtests');
+    expect(rail.textContent).toContain('SettingsRiskData');
+  });
+
+  it('gives the phone the active destination\'s children as a sub-nav, and none where there are no children', async () => {
+    pathname = '/optimize/task-1';
+    m = await mount(<SubNav />);
+    const sub = m.container.querySelector('nav[aria-label="Strategies"]');
+    expect(sub?.className).toContain('lg:hidden');
+    expect(current(sub as Element)).toEqual(['Optimize']);
+    m.unmount();
+    pathname = '/data';
+    m = await mount(<SubNav />);
+    expect(current(m.container.querySelector('nav[aria-label="System"]') as Element)).toEqual(['Data']);
+    m.unmount();
+    pathname = '/';
+    m = await mount(<SubNav />);
+    expect(m.container.querySelector('nav')).toBeNull();
   });
 
   it('matches nothing for routes outside the destinations', () => {
-    expect(navItems.filter((item) => isActive('/models', item))).toEqual([]);
-    expect(navItems.filter((item) => isActive('/', item)).map((i) => i.label)).toEqual(['Status']);
+    expect(navItems.filter((item) => isActive('/', item)).map((i) => i.label)).toEqual(['Home']);
     expect(navItems.filter((item) => isActive('/riskier', item))).toEqual([]);
-    expect(navItems.filter((item) => isActive('/activity', item)).map((i) => i.label)).toEqual(['Activity']);
-    expect(navItems.filter((item) => isActive('/data', item)).map((i) => i.label)).toEqual(['Data']);
+    expect(navItems.filter((item) => isActive('/portfolios', item))).toEqual([]);
   });
 
   it('has no single-key shortcuts left (WCAG 2.1.4)', () => {
@@ -112,7 +119,7 @@ describe('shell tab order', () => {
       (el) => el.tabIndex >= 0 && !el.closest('dialog:not([open])') && !(el as HTMLButtonElement).disabled,
     );
 
-  it.each(['/', '/trading', '/trading/abc', '/risk', '/activity', '/strategies', '/backtest', '/portfolio', '/settings', '/models'])(
+  it.each(['/', '/trading', '/trading/abc', '/risk', '/activity', '/strategies', '/backtest', '/portfolio', '/settings', '/models', '/data'])(
     'reaches the kill-switch control second on %s, before the nav and main',
     async (at) => {
       pathname = at;
@@ -149,11 +156,12 @@ describe('shell tab order', () => {
 });
 
 describe('pageTitle', () => {
-  it('names /portfolio Performance while it stays under Status, and otherwise uses the destination label', () => {
-    expect(pageTitle('/portfolio')).toBe('Performance');
-    expect(isActive('/portfolio', navItems[0])).toBe(true);
-    expect(pageTitle('/')).toBe('Status');
-    expect(pageTitle('/backtest/abc')).toBe('Research');
-    expect(pageTitle('/activity/approvals/abc')).toBe('Activity');
+  it('uses the active child when there is one, else the destination', () => {
+    expect(pageTitle('/')).toBe('Home');
+    expect(pageTitle('/portfolio')).toBe('Money');
+    expect(pageTitle('/backtest/abc')).toBe('Backtests');
+    expect(pageTitle('/builder')).toBe('Strategies');
+    expect(pageTitle('/activity/approvals/abc')).toBe('Inbox');
+    expect(pageTitle('/risk')).toBe('Risk');
   });
 });

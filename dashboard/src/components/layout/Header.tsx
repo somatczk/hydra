@@ -13,7 +13,7 @@ import { useShellStatus } from '@/components/shell/ShellStatusProvider';
 import { DataStateBadge } from '@/components/ui/DataStateBadge';
 import { cn } from '@/components/ui/cn';
 import { fetchAgeLabel, type PollState } from '@/lib/apiState';
-import { modeBadge, plural } from '@/lib/derive';
+import { accounts, modeBadge, plural } from '@/lib/derive';
 import { utc } from '@/lib/format';
 
 const Skeleton = () => <span aria-hidden="true" className="inline-block h-4 w-20 animate-pulse rounded bg-hover" />;
@@ -72,6 +72,18 @@ export function Header() {
     </Cell>
   );
 
+  const accountCells = (sessions.data ? accounts(sessions.data) : []).map((a) => (
+    <Cell key={a.key} href="/#running-now">
+      <span className="font-semibold">{a.venue}</span>{' '}
+      {a.mode === 'live' ? (
+        <span className="bg-live px-1.5 font-display text-[13px] font-semibold tracking-wider text-on-live">LIVE</span>
+      ) : (
+        'paper'
+      )}{' '}
+      · {a.sessions.length} running
+    </Cell>
+  ));
+
   const polls = [live, sessions, config];
   const fetched = polls.map((p) => p.fetchedAt).filter((t): t is number => t !== null);
   const age = polls.some(loading)
@@ -105,6 +117,7 @@ export function Header() {
         <KillSwitchControl />
         {breaker}
         {sessionsCell}
+        {accountCells}
         {dataCell}
         {needsCell}
         <button

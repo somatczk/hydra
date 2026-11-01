@@ -17,7 +17,6 @@ import { Section } from '@/components/ui/Section';
 import { fetchApi } from '@/lib/api';
 import { money, signed, signedLabel } from '@/lib/format';
 import { logger } from '@/lib/logger';
-import { ResearchNav } from '@/components/research/ResearchNav';
 import {
   type TimeResolution,
   type EquityPoint,
@@ -236,7 +235,6 @@ function BacktestCompareContent() {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/backtest" />
       <div>
         <h1 className="text-xl font-semibold text-ink-1">Backtest comparison</h1>
         <p className="text-sm text-ink-2 mt-1">

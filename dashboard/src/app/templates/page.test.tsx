@@ -83,13 +83,12 @@ describe('TemplatesPage error states', () => {
 });
 
 describe('TemplatesPage content', () => {
-  it('has one h1, the phone Research nav, and the real template fields', async () => {
+  it('has one h1 and the real template fields', async () => {
     fetchApi.mockImplementation(routeFetch(baseRoutes(), calls));
     page = await mount(<TemplatesPage />);
 
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
     expect(page.container.querySelector('h1')?.textContent).toBe('Templates');
-    expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Templates');
     const text = page.container.textContent ?? '';
     expect(text).toContain('RSI Momentum');
     expect(text).toContain('BTCUSDT · 1h');

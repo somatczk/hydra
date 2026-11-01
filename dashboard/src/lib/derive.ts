@@ -31,6 +31,37 @@ export interface SessionResponse {
 
 export type TradingMode = 'paper' | 'live';
 
+const VENUES: Record<string, string> = {
+  binance: 'Binance spot',
+  binanceusdm: 'Binance perps',
+  bybit: 'Bybit spot',
+  alpaca: 'Alpaca stocks',
+};
+
+export const venueLabel = (exchangeId: string): string => VENUES[exchangeId] ?? exchangeId;
+
+/** A venue × mode pair with its running sessions. */
+export interface Account {
+  key: string;
+  venue: string;
+  mode: TradingMode;
+  sessions: SessionResponse[];
+}
+
+/** Running sessions grouped by account, live first. Any mode but 'paper' counts as live (never PAPER over real money). */
+export function accounts(sessions: SessionResponse[]): Account[] {
+  const byKey = new Map<string, Account>();
+  for (const s of sessions) {
+    if (s.status !== 'running') continue;
+    const mode: TradingMode = s.trading_mode === 'paper' ? 'paper' : 'live';
+    const key = `${s.exchange_id}:${mode}`;
+    const acct = byKey.get(key) ?? { key, venue: venueLabel(s.exchange_id), mode, sessions: [] };
+    acct.sessions.push(s);
+    byKey.set(key, acct);
+  }
+  return [...byKey.values()].sort((a, b) => (a.mode === b.mode ? a.venue.localeCompare(b.venue) : a.mode === 'live' ? -1 : 1));
+}
+
 /** A7 reconcile read (pinned seam #2): `never` = no pass has run yet; `detail` carries the mismatch reasons. */
 export interface ReconcileState {
   state: 'ok' | 'mismatch' | 'unknown' | 'never';

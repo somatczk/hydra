@@ -1,47 +1,51 @@
 @import "tailwindcss";
 
-/* Calm instrument panel: role tokens (05 §2.1). Light here, dark (default) under .dark. */
+/* Light (ledger paper) and dark themes. Colour carries meaning only; links and primary actions are ink. */
 :root {
-  --canvas: #f5f6f8;
-  --surface: #ffffff;
+  --canvas: #f2f3ee;
+  --surface: #fafaf7;
   --raised: #ffffff;
-  --hover: #eceef2;
-  --line: #e3e5ea;
-  --line-strong: #8a8d97;
-  --ink-1: #16171a;
-  --ink-2: #555863;
-  --ink-3: #8a8d97;
-  --accent: #3949c7;
-  --on-accent: #ffffff;
-  --caution: #8a5700;
-  --caution-soft: #fbf1dc;
-  --danger: #b3261e;
-  --danger-soft: #fbe9e7;
-  --live: #0f766e;
-  --on-live: #ffffff;
-  --live-soft: #e6f4f1;
+  --hover: #e6e8e0;
+  --line: #d3d6cc;
+  --line-strong: #858a80;
+  --ink-1: #1b1f1a;
+  --ink-2: #545a52;
+  --ink-3: #858a80;
+  --accent: #1b1f1a;
+  --on-accent: #f2f3ee;
+  --caution: #8a5a00;
+  --caution-soft: #f3e6c4;
+  --danger: #b0251b;
+  --danger-soft: #f6dcd8;
+  --live: #1b1f1a;
+  --on-live: #f2f3ee;
+  --live-soft: #e6e8e0;
+  --up: #17663d;
+  --down: #b0251b;
   color-scheme: light;
 }
 
 .dark {
-  --canvas: #0f1012;
-  --surface: #17181b;
-  --raised: #1f2024;
-  --hover: #25262b;
-  --line: #2c2e33;
-  --line-strong: #6b6e78;
-  --ink-1: #ececf0;
-  --ink-2: #a3a5ad;
-  --ink-3: #6b6e78;
-  --accent: #8fa2ff;
-  --on-accent: #0f1012;
-  --caution: #e3b341;
-  --caution-soft: #33280f;
-  --danger: #ff7b72;
-  --danger-soft: #3a1715;
-  --live: #2dd4bf;
-  --on-live: #0f1012;
-  --live-soft: #0a2e28;
+  --canvas: #141613;
+  --surface: #1a1d19;
+  --raised: #20231f;
+  --hover: #262a24;
+  --line: #2e322c;
+  --line-strong: #6d7368;
+  --ink-1: #e9ebe4;
+  --ink-2: #a2a89d;
+  --ink-3: #6d7368;
+  --accent: #e9ebe4;
+  --on-accent: #141613;
+  --caution: #e8b84a;
+  --caution-soft: #33290f;
+  --danger: #ff8b7e;
+  --danger-soft: #3a1916;
+  --live: #e9ebe4;
+  --on-live: #141613;
+  --live-soft: #262a24;
+  --up: #6fcf8f;
+  --down: #ff8b7e;
   color-scheme: dark;
 }
 
@@ -86,6 +90,8 @@
   --color-live: var(--live);
   --color-on-live: var(--on-live);
   --color-live-soft: var(--live-soft);
+  --color-up: var(--up);
+  --color-down: var(--down);
 
   --color-bg-primary: var(--bg-primary);
   --color-bg-secondary: var(--bg-secondary);
@@ -106,9 +112,9 @@
   --color-accent-primary: var(--accent-primary);
   --color-accent-primary-hover: var(--accent-primary-hover);
 
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-sans: var(--font-public-sans), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
-  --font-display: var(--font-sans);
+  --font-display: var(--font-barlow-condensed), var(--font-public-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 body {
@@ -118,6 +124,20 @@ body {
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+@layer base {
+  h1,
+  h2 {
+    font-family: var(--font-display);
+  }
+
+  /* Ink links keep an underline so they stay distinguishable from text (WCAG 1.4.1). */
+  a.text-accent {
+    text-decoration-line: underline;
+    text-decoration-color: var(--line-strong);
+    text-underline-offset: 3px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

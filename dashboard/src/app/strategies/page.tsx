@@ -15,7 +15,6 @@ import { logger } from '@/lib/logger';
 import { pct, signed, signedLabel, utc } from '@/lib/format';
 import type { SessionResponse } from '@/lib/derive';
 import { useShellStatus } from '@/components/shell/ShellStatusProvider';
-import { ResearchNav } from '@/components/research/ResearchNav';
 import { StartSessionDialog } from '@/components/sessions/StartSessionDialog';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
 import { StrategyDriftPanel, type StrategyDrift } from '@/components/strategies/StrategyDriftPanel';
@@ -212,7 +211,6 @@ export default function StrategiesPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/strategies" />
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-semibold text-ink-1">Strategies</h1>

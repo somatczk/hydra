@@ -6,7 +6,6 @@ import { LayoutTemplate, Download } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
-import { ResearchNav } from '@/components/research/ResearchNav';
 import { usePoll } from '@/hooks/usePoll';
 import { fetchApi } from '@/lib/api';
 import { useToast } from '@/components/ui/Toast';
@@ -83,7 +82,6 @@ export default function TemplatesPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/templates" />
       <div>
         <h1 className="text-xl font-semibold text-ink-1">Templates</h1>
         <p className="mt-1 text-sm text-ink-2">

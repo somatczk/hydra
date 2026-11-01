@@ -69,21 +69,23 @@ afterEach(() => {
   page = null;
 });
 
-describe('Status page', () => {
-  it('owns the title and a single h1', async () => {
+const headline = (c: HTMLElement) => c.querySelector('h1')?.textContent ?? '';
+
+describe('Home page', () => {
+  it('owns the title and a single h1 that says what runs and what needs you', async () => {
     const c = await show();
-    expect(metadata.title).toBe('Status');
+    expect(metadata.title).toBe('Home');
     expect(c.querySelectorAll('h1')).toHaveLength(1);
-    expect(c.querySelector('h1')?.textContent).toBe('Status');
+    expect(headline(c)).toBe('1 session running. Nothing needs you.');
+    expect(c.querySelector('h1 a[href="/trading"]')).not.toBeNull();
+    expect(c.querySelector('h1 a[href="#needs-you"]')).not.toBeNull();
   });
 
-  it('answers the four questions as links', async () => {
+  it('answers the safety and data questions as links', async () => {
     const c = await show();
-    expect(tile(c, 'Running')).toContain('1 session running');
     expect(tile(c, 'Safe')).toContain('Kill switch off · Tier 0 · Drawdown 1.84% of 15.00% · New entries allowed');
     expect(tile(c, 'Data')).toContain('On time · 1 of 1 sessions');
     expect(tile(c, 'Data')).toContain('Feed check passed');
-    expect(tile(c, 'Needs you')).toContain('Nothing needs you');
   });
 
   it('shows the paper account from the paper source and never calls live-metrics or news', async () => {
@@ -113,8 +115,8 @@ describe('Status page', () => {
       '/api/trading/sessions': [session({ session_id: 'run-a', status: 'error', error_message: 'feed lost' })],
       '/api/system/config': unavailable(),
     });
-    expect(tile(c, 'Needs you')).toContain('?');
-    expect(tile(c, 'Needs you')).not.toContain('Nothing needs you');
+    expect(headline(c)).toContain('Needs you: ?');
+    expect(headline(c)).not.toContain('Nothing needs you');
     expect(c.textContent).toContain("Couldn't check everything: settings unavailable");
     expect(c.querySelector('li a[href="/trading/run-a"]')?.textContent).toContain('SMA cross stopped with an error: feed lost');
   });
@@ -125,7 +127,7 @@ describe('Status page', () => {
       '/api/activity/approvals': [approval],
       '/api/trading/sessions': [session({ session_id: 'run-a', status: 'error', error_message: 'feed lost' })],
     });
-    expect(tile(c, 'Needs you')).toContain('2 things need you');
+    expect(headline(c)).toContain('2 things need you');
     const rows = Array.from(c.querySelectorAll('#needs-you li a'));
     expect(rows[0]?.getAttribute('href')).toBe('/activity/approvals/apr-1');
     expect(rows[0]?.textContent).toContain('Claude asks to release the kill switch');
@@ -213,12 +215,38 @@ describe('Status page', () => {
     expect(c.textContent).toContain('Unrealised is marked at the last closed bar.');
   });
 
-  it('mounts neither the sessions table nor the equity poll on a phone', async () => {
+  it('groups running sessions by account, live first, with the LIVE stamp and a separate live money line', async () => {
+    const c = await show({
+      '/api/risk/live-status': liveStatus({ live_armed: true }),
+      '/api/trading/sessions': [
+        session({ session_id: 'run-a', strategy_name: 'SMA cross', exchange_id: 'binance', trading_mode: 'paper' }),
+        session({ session_id: 'run-b', strategy_name: 'Breakout', exchange_id: 'bybit', trading_mode: 'live' }),
+      ],
+      '/api/trading/sessions/run-b/detail': () => detail({ session_id: 'run-b', last_bar_at: new Date().toISOString() }),
+      '/api/portfolio/summary?source=live': { ...SUMMARY, total_value: 2418.4 },
+    });
+    const captions = Array.from(c.querySelectorAll('#running-now caption')).map((x) => x.textContent);
+    expect(captions).toEqual(['Bybit spot LIVE · 1 session', 'Binance spot paper · 1 session']);
+    expect(c.querySelector('#money')?.textContent).toContain('LIVE 2,418.40 USDT');
+    expect(calls.some((x) => x.path === '/api/portfolio/summary?source=live')).toBe(true);
+  });
+
+  it('never asks for live money or shows a LIVE stamp when everything is paper', async () => {
+    const c = await show();
+    expect(calls.some((x) => x.path.includes('source=live'))).toBe(false);
+    expect(c.textContent).not.toMatch(/\bLIVE\b/);
+  });
+
+  it('lists running sessions on a phone without the table or the equity poll', async () => {
     const mm = vi.fn().mockReturnValue({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() });
     vi.stubGlobal('matchMedia', mm);
     try {
       const c = await show();
       expect(c.querySelector('table')).toBeNull();
+      const row = c.querySelector('#running-now li a[href="/trading/run-a"]')?.textContent ?? '';
+      expect(row).toContain('SMA cross');
+      expect(row).toContain('0 positions');
+      expect(row).toContain('on time');
       expect(calls.some((x) => x.path.includes('equity-curve'))).toBe(false);
     } finally {
       vi.unstubAllGlobals();

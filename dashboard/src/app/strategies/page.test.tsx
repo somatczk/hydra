@@ -396,7 +396,7 @@ describe('StrategiesPage post-reload state', () => {
 });
 
 describe('StrategiesPage research hygiene', () => {
-  it('has one h1, the phone Research nav, and no Start Live, Risk Overrides or Stop', async () => {
+  it('has one h1, and no Start Live, Risk Overrides or Stop', async () => {
     const routes = baseRoutes();
     routes['/api/system/config'] = { trading_mode: 'live', paper_capital: 2500 };
     routes['/api/trading/sessions'] = [RUNNING_SESSION];
@@ -405,7 +405,6 @@ describe('StrategiesPage research hygiene', () => {
     page = await mountPage();
 
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
-    expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Strategies');
     const text = page.container.textContent ?? '';
     expect(text).not.toContain('Start Live');
     expect(text).not.toContain('Risk Overrides');

@@ -52,6 +52,16 @@ afterEach(() => {
 });
 
 describe('Header', () => {
+  it('names each running account with its count, stamping LIVE only on a live one', async () => {
+    setup({
+      '/api/trading/sessions': [session(), session({ session_id: 's2' }), liveSession({ session_id: 's3', exchange_id: 'bybit' })],
+    });
+    m = await shell();
+    const h = header();
+    expect(h).toContain('Bybit spot LIVE · 1 running');
+    expect(h).toContain('Binance spot paper · 2 running');
+  });
+
   it('renders the strip in order, with the destination as the app-bar title and no h1 of its own', async () => {
     setup();
     m = await shell();

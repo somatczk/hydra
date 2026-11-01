@@ -30,6 +30,7 @@ vi.mock('next/navigation', () => ({
 const { ThemeProvider } = await import('@/components/layout/ThemeProvider');
 const { ShellStatusProvider } = await import('@/components/shell/ShellStatusProvider');
 const pages: Array<[string, () => Promise<{ default: () => ReactNode }>]> = [
+  ['/', () => import('@/app/page')],
   ['/portfolio', () => import('@/app/portfolio/page')],
   ['/settings', () => import('@/app/settings/page')],
   ['/strategies', () => import('@/app/strategies/page')],
@@ -51,6 +52,17 @@ afterEach(() => {
 });
 
 const populated: Array<[string, () => Promise<{ default: () => ReactNode }>, Routes, string]> = [
+  [
+    '/',
+    () => import('@/app/page'),
+    {
+      '/api/risk/live-status': liveStatus(),
+      '/api/trading/sessions': [session({ session_id: 'home-1' })],
+      '/api/system/config': platformConfig(),
+      '/api/trading/sessions/home-1/detail': detail({ session_id: 'home-1', last_bar_at: new Date().toISOString() }),
+    },
+    'Running now',
+  ],
   [
     '/portfolio',
     () => import('@/app/portfolio/page'),

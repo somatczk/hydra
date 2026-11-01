@@ -42,7 +42,7 @@ export function Readout({
       {sub && <span className="text-xs text-ink-2">{sub}</span>}
     </>
   );
-  const box = cn('flex min-h-12 flex-col gap-1 rounded-lg border border-line bg-surface p-3', className);
+  const box = cn('flex min-h-12 flex-col gap-1 border-t border-line py-3', className);
   return href ? (
     <Link href={href} className={cn(box, 'hover:bg-hover')}>
       {body}
