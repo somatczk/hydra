@@ -326,6 +326,46 @@ class TestPreflightErrors:
         assert resp.status_code == 503
         assert resp.json()["detail"]["state"] == "unavailable"
 
+    @pytest.mark.parametrize("row", [None, {"validated_at": None}])
+    @pytest.mark.parametrize(
+        ("path", "body"),
+        [
+            ("/api/backtest/run", _run_body("stocks")),
+            ("/api/backtest/hyperopt", _hyperopt_body("stocks")),
+            ("/api/backtest/walkforward", _walkforward_body("stocks")),
+        ],
+    )
+    def test_an_alpaca_job_without_a_connected_key_is_422_and_queues_nothing(
+        self, strategies_dir: Path, path: str, body: dict[str, Any], row: Any
+    ) -> None:
+        """alpaca's bars and asset check read its stored paper key: no key, no job."""
+        _write_strategy(
+            strategies_dir,
+            "stocks",
+            symbols=["AAPL/USD"],
+            exchange={"exchange_id": "alpaca", "market_type": "SPOT"},
+            timeframes={"primary": "1d"},
+        )
+
+        statements: list[str] = []
+
+        class _Credentials:
+            async def fetchrow(self, sql: str, *args: Any) -> Any:
+                statements.append(sql)
+                return row
+
+        client = TestClient(_make_app(pool=_Pool(_Credentials())))
+        resp = client.post(path, json=body)
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {
+            "code": "alpaca_not_connected",
+            "message": "alpaca is not connected: store its paper key in Settings",
+            "state": "invalid",
+        }
+        assert statements == [
+            "SELECT validated_at FROM exchange_credentials WHERE exchange_id = 'alpaca'"
+        ]
+
     def test_unsupported_class_is_422_before_db(
         self, client: TestClient, strategies_dir: Path
     ) -> None:

@@ -44,6 +44,10 @@ Test files without a `tests/` prefix are in `tests/unit/test_data/`.
   lacks are reported, and only zero stored bars raise `NoMarketDataError`
   (`test_on_demand.py::test_fetches_exactly_the_missing_range`, `::test_accepted_gaps_are_reported_not_raised`).
 - `data` may not import `execution`: REST clients are injected by the caller (`uv run lint-imports`).
+- `alpaca.py` is alpaca's ccxt-shaped client (httpx, ccxt error classes): 1Day split-adjusted SIP bars with `end`
+  16 minutes behind now, each labelled 00:00 UTC of its New York session date (`test_alpaca.py`). A US_EQUITY
+  dataset refetches its whole window on every `ensure_available`, so a split re-scales stored rows in place and the
+  ledger's row count holds (`tests/integration/test_alpaca_fetch_pg.py`).
 - Funding rows are what the exchange settled, inserted only when missing; an absent row means the perp executor
   skips that accrual, never an interpolated rate (`test_funding.py`).
 - The universe is the top 100 Binance SPOT USDT pairs by 24 h quote volume, stablecoin, fiat and leveraged-token

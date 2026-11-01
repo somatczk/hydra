@@ -253,6 +253,22 @@ def _load_backtest_strategy(strategy_id: str) -> tuple[type[BaseStrategy], Strat
         raise _invalid_strategy(strategy_id, str(exc)) from exc
 
 
+async def require_alpaca_connected(pool: Any) -> None:
+    """alpaca's bars and asset check read its stored paper key: without one the job is a
+    422 ``alpaca_not_connected`` before anything is queued."""
+    async with db_errors("reading the alpaca credentials"), pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT validated_at FROM exchange_credentials WHERE exchange_id = 'alpaca'"
+        )
+    if row is None or row["validated_at"] is None:
+        raise service_error(
+            422,
+            "alpaca_not_connected",
+            "alpaca is not connected: store its paper key in Settings",
+            "invalid",
+        )
+
+
 async def _preflight(
     pool: Any,
     strategy_id: str,
@@ -287,6 +303,8 @@ async def _preflight(
     pool = require_pool(pool)
     exchange = config.exchange.exchange_id
     symbol = config.symbols[0]
+    if exchange == "alpaca":
+        await require_alpaca_connected(pool)
     stored = None
     if require_data or read_span:
         repo = MarketDataRepository.from_pool(pool)

@@ -35,6 +35,7 @@ from hydra.execution.client_factory import (
     validate_venue,
 )
 from hydra.execution.errors import (
+    AlpacaNotConnectedError,
     ConfigReloadRefusedError,
     SessionNotRunningError,
     UnsupportedVenueError,
@@ -964,6 +965,8 @@ async def _fetched_latest_bars(
         raise ServiceError(503, exc.to_detail()) from exc
     except NoMarketDataError as exc:
         raise ServiceError(422, exc.to_detail()) from exc
+    except AlpacaNotConnectedError as exc:
+        raise service_error(422, exc.code, str(exc), "invalid") from exc
     try:
         async with db_errors("re-loading market data for preview"):
             return await load_latest_bars(
