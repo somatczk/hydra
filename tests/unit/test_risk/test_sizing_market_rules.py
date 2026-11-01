@@ -368,6 +368,30 @@ class TestUsdmLoader:
         with pytest.raises(UnsupportedExchangeError, match="no market rules for exchange"):
             await public_venue_markets("okx")
 
+    async def test_alpaca_rules_are_static_whole_shares_and_never_load_markets(self) -> None:
+        async def no_loader(exchange_id: str) -> Iterable[Mapping[str, Any]]:
+            pytest.fail(f"loaded {exchange_id} markets")
+
+        rules = await MarketRulesCache(loader=no_loader).get("alpaca", ["AAPL/USD"])
+        assert rules == {
+            "AAPL/USD": MarketRules(
+                symbol="AAPLUSD",
+                amount_step=Decimal("1"),
+                min_qty=Decimal("1"),
+                min_notional=Decimal("0"),
+                price_tick=Decimal("0.01"),
+            )
+        }
+        assert rules["AAPL/USD"].floor_qty(Decimal("19.87")) == Decimal("19")
+
+    async def test_the_public_loaders_refuse_alpaca_by_name(self) -> None:
+        from hydra.risk import market_rules
+
+        with pytest.raises(UnsupportedExchangeError, match="'alpaca' has no ccxt markets"):
+            await public_venue_markets("alpaca")
+        with pytest.raises(UnsupportedExchangeError, match="'alpaca' has no ccxt markets"):
+            await market_rules.load_public_markets("alpaca")
+
     async def test_the_default_cache_loader_dispatches_per_exchange(self) -> None:
         """The undecorated cache (the backtest runner's) dispatches per exchange id."""
         from hydra.risk import market_rules

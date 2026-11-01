@@ -32,7 +32,8 @@ uv run mypy src/hydra/execution/ src/hydra/risk/ --strict   # part of CI's stric
   keeps the breaker tier (`tests/unit/test_risk/test_risk_service.py::TestPaperReset`).
 - Sizes are `Decimal` base units (`sizing.py`); market rules come from public ccxt metadata, no keys
   (`market_rules.py`), for the registered venues only — binance, binanceusdm and bybit (the registry's
-  venue ids). Perp trailing bounds are the fapi `callbackRate` percent, not spot's bips; bybit has no
+  ccxt venue ids); alpaca's US_EQUITY rules are static (whole shares, a 0.01 tick, no minimum notional)
+  and never load markets. Perp trailing bounds are the fapi `callbackRate` percent, not spot's bips; bybit has no
   percent trail at all (the registry's trailing kind NONE), so its rules carry no trailing bounds and the
   protective ladder falls back to the fixed stop.
 

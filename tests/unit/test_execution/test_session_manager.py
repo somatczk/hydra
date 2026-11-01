@@ -117,6 +117,21 @@ class TestStartGates:
         assert construction_spy.calls == []
         assert h.ws == []
 
+    @pytest.mark.parametrize("trading_mode", ["paper", "live"])
+    async def test_an_alpaca_start_is_refused_by_name_before_anything_is_built(
+        self, h: Harness, strategies_dir: Path, construction_spy: _Spy, trading_mode: str
+    ) -> None:
+        """alpaca is backtest-only: the mode cap refuses a paper or live start (live before
+        any credential read) and names the venue."""
+        assert h.mgr is not None
+        sid = write_strategy(strategies_dir, "s-alpaca", exchange_id="alpaca")
+        with pytest.raises(UnsupportedVenueError) as err:
+            await h.mgr.start_session(sid, trading_mode)
+        assert str(err.value) == f"alpaca SPOT runs backtest only (asked for {trading_mode})"
+        assert construction_spy.calls == []
+        assert h.ws == []
+        assert h.mgr.list_sessions() == []
+
     @pytest.mark.parametrize(
         "strategy_class",
         [

@@ -147,7 +147,10 @@ def _default_rest_factory(exchange_id: str) -> Any:
     import ccxt.async_support as ccxt_async
 
     spec = find_venue(exchange_id, venue_market_type(exchange_id))
-    cls = getattr(ccxt_async, exchange_id if spec is None else spec.ccxt_class)
+    cls_name = exchange_id if spec is None else spec.ccxt_class
+    if cls_name is None:
+        raise ValueError(f"{exchange_id} has no ccxt client: no public market-data feed")
+    cls = getattr(ccxt_async, cls_name)
     return cls({"enableRateLimit": True, "options": _venue_rest_options(exchange_id)})
 
 

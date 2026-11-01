@@ -31,8 +31,9 @@ ExchangeId = Literal[
     "gateio",
     "mexc",
     "bitget",
+    "alpaca",
 ]
-"""Supported exchange identifiers (binanceusdm = Binance USD⌂-M futures)."""
+"""Supported exchange identifiers (binanceusdm = Binance USD⌂-M futures, alpaca = US stocks)."""
 
 
 # ---------------------------------------------------------------------------

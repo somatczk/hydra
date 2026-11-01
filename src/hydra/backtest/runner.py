@@ -116,8 +116,9 @@ class BacktestRunner:
 
         Equity has one point per traded primary bar (the last after the end-of-data
         close-out) and ``Trade.pnl`` is net of both fees. Raises StrategyError when the
-        strategy raises, UnsupportedVenueError for any pair ``validate_venue`` refuses —
-        everything but Binance SPOT and Binance USD⌂-M FUTURES (``binanceusdm``). A
+        strategy raises, UnsupportedVenueError for any pair ``validate_venue`` refuses for
+        ``backtest`` — everything but Binance SPOT, Binance USD⌂-M FUTURES (``binanceusdm``)
+        and alpaca SPOT. A
         FUTURES config runs on the perp paper executor (P4-C): the strategy's leverage,
         isolated margin, liquidation, and funding only from the rows *funding* carries
         (skip-when-absent); a SPOT config runs the spot executor exactly as before.
@@ -134,7 +135,9 @@ class BacktestRunner:
                 "timeframes": strategy_config.timeframes.model_copy(update={"primary": timeframe}),
             }
         )
-        exchange_id = validate_venue(cfg.exchange.exchange_id, cfg.exchange.market_type)
+        exchange_id = validate_venue(
+            cfg.exchange.exchange_id, cfg.exchange.market_type, mode="backtest"
+        )
         traded = bars[warmup_bars:]
         if not traded:
             return calculate_metrics(equity_curve=[initial_capital], trades=[], timeframe=timeframe)

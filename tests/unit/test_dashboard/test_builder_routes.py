@@ -358,6 +358,24 @@ class TestPreviewSignals:
         assert response.status_code == 422
         assert response.json()["detail"]["code"] == "unsupported_venue"
 
+    def test_preview_on_bybit_names_the_live_only_venue(self, client: TestClient) -> None:
+        request = self._valid_preview_request()
+        request["exchange_id"] = "bybit"
+        response = client.post("/api/strategies/preview", json=request)
+        assert response.status_code == 422
+        assert response.json()["detail"]["message"] == (
+            "bybit SPOT is a live-only venue: paper and backtest sessions "
+            "run on binance and binanceusdm (asked for backtest)"
+        )
+
+    def test_preview_on_alpaca_passes_the_backtest_cap(self, client: TestClient) -> None:
+        """alpaca backtests: the venue gate admits it and the preview reaches the bar store."""
+        request = self._valid_preview_request()
+        request["exchange_id"] = "alpaca"
+        response = client.post("/api/strategies/preview", json=request)
+        assert response.status_code == 503
+        assert response.json()["detail"]["state"] == "unavailable"
+
     def test_preview_invalid_comparator_returns_422(self, client: TestClient) -> None:
         """Invalid comparator in preview returns 422."""
         request = self._valid_preview_request()

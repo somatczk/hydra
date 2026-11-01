@@ -980,7 +980,7 @@ async def preview_signals(
     except (ValueError, KeyError) as exc:
         raise service_error(422, "invalid_rules", f"Invalid rules: {exc}", "invalid") from exc
     try:
-        validate_venue(body.exchange_id)
+        validate_venue(body.exchange_id, mode="backtest")
     except UnsupportedVenueError as exc:
         raise service_error(422, exc.code, str(exc), "invalid") from exc
 

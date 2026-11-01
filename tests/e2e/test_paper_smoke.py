@@ -570,16 +570,18 @@ async def test_paper_sessions_refuse_the_non_binance_venues(
     romulus_env: str, strategies_dir: Path
 ) -> None:
     """P7-F's honest refusal, at the P1 acceptance surface: bybit is LIVE-ONLY (a paper
-    start names the mode cap; the e2e itself stays on Binance's replayed bars), and
-    Kraken and OKX are not registered at all — every refusal comes before anything is
-    built, and the messages say exactly which case it is."""
+    start names the mode cap; the e2e itself stays on Binance's replayed bars), alpaca is
+    backtest-only (S1), and Kraken and OKX are not registered at all — every refusal comes
+    before anything is built, and the messages say exactly which case it is."""
     write_strategy(strategies_dir, STRATEGY_ID)
     write_strategy(strategies_dir, "smoke-bybit", exchange_id="bybit")
+    write_strategy(strategies_dir, "smoke-alpaca", exchange_id="alpaca")
     write_strategy(strategies_dir, "smoke-kraken", exchange_id="kraken")
     write_strategy(strategies_dir, "smoke-okx", exchange_id="okx")
     async with engine(romulus_env, ReplayMarket(WARMUP), MonitorClock()) as eng:
         for sid, phrase in (
             ("smoke-bybit", "live-only venue"),
+            ("smoke-alpaca", "alpaca SPOT runs backtest only (asked for paper)"),
             ("smoke-kraken", "not supported and not scheduled"),
             ("smoke-okx", "not supported and not scheduled"),
         ):

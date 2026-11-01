@@ -1098,6 +1098,16 @@ class TestExchangeConnect:
         resp = client.get("/api/system/exchanges/kraken/balance")
         assert resp.status_code == 400
 
+    @pytest.mark.parametrize("read", ["balance", "orders"])
+    def test_alpaca_account_reads_are_400_naming_it(self, client: TestClient, read: str) -> None:
+        """alpaca is registered but has no ccxt client: no account read builds one."""
+        resp = client.get(f"/api/system/exchanges/alpaca/{read}")
+        assert resp.status_code == 400
+        assert _detail(resp)["code"] == "unsupported_exchange"
+        assert _detail(resp)["message"] == (
+            "alpaca has no exchange client: account reads need a ccxt venue"
+        )
+
     def test_balance_without_keys_is_404(self, client: TestClient) -> None:
         resp = client.get("/api/system/exchanges/binance/balance")
         assert resp.status_code == 404

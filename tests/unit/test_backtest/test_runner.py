@@ -23,6 +23,7 @@ from hydra.backtest.metrics import BacktestResult
 from hydra.backtest.runner import BacktestRunner, StrategyError
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal, OrderFillEvent
 from hydra.core.types import OHLCV, Direction, MarketType, Position, Side
+from hydra.execution import client_factory
 from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.paper_trading import PaperFill, PaperTradingExecutor
 from hydra.risk.pretrade import RiskConfig
@@ -317,6 +318,36 @@ async def test_bybit_config_is_rejected_as_the_live_only_venue() -> None:
     config = _config(exchange={"exchange_id": "bybit", "market_type": "SPOT"})
     with pytest.raises(UnsupportedVenueError, match="live-only venue"):
         await _run(config=config)
+
+
+async def test_an_alpaca_strategy_builds_its_runtime_without_ccxt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """alpaca is backtest-only with no ccxt client: the runner builds the paper runtime
+    (static whole-share rules, the feed's class never resolved) and the first bar reaches
+    the executor, which still books in USDT — the USD quote is S1 (c), so the run stops
+    there by name, flat."""
+
+    def no_ccxt(*args: Any, **kwargs: Any) -> str:
+        pytest.fail(f"resolved a ccxt class for {args}")
+
+    monkeypatch.setattr(client_factory, "ccxt_class_for", no_ccxt)
+    config = _config(
+        exchange={"exchange_id": "alpaca", "market_type": "SPOT"},
+        parameters={
+            "required_history": 2,
+            "rules": {
+                "entry_long": _rule("greater_than", 1000),
+                "exit_long": _rule("greater_than", 2000),
+            },
+        },
+    )
+    result = await _run(config=config, symbol="AAPL/USD")
+    assert result.stopped_reason == (
+        "paper executor failed on a closed bar: AAPL/USD is not a USDT-quoted spot symbol"
+    )
+    assert result.trades == []
+    assert result.equity_curve == [D("10000")]
 
 
 async def test_position_sizing_is_honoured() -> None:
