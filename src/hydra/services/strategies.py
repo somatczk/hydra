@@ -22,7 +22,7 @@ from hydra.backtest.data import (
 )
 from hydra.core.config import DataConfig
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
-from hydra.core.venues import registered_venue_ids
+from hydra.core.venues import ccxt_venue_ids
 from hydra.data.bars import timeframe_seconds
 from hydra.data.errors import DataFetchError
 from hydra.data.on_demand import OnDemandFetchService
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config" / "strategies"
 _RULE_BASED_CLASS = "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
 _VALID_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d", "1w"}
-_VALID_EXCHANGES = registered_venue_ids()
+_VALID_EXCHANGES = ccxt_venue_ids()
 """The registry's venue ids — you can only save what can start. Kraken and OKX are NOT
 registered (no testnet or no key-permission endpoint — the honest README), so a save
 naming them is refused here instead of saving a strategy no session could ever run."""
