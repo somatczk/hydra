@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -22,7 +22,13 @@ from hydra.backtest.data import (
 )
 from hydra.core.config import DataConfig
 from hydra.core.types import OHLCV, ExchangeId, Timeframe
-from hydra.core.venues import ccxt_venue_ids
+from hydra.core.venues import (
+    AssetClass,
+    VenueSpec,
+    find_venue,
+    registered_venue_ids,
+    venue_market_type,
+)
 from hydra.data.bars import timeframe_seconds
 from hydra.data.errors import DataFetchError
 from hydra.data.on_demand import OnDemandFetchService
@@ -69,16 +75,58 @@ logger = logging.getLogger(__name__)
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config" / "strategies"
 _RULE_BASED_CLASS = "hydra.strategy.builtin.rule_based.RuleBasedStrategy"
 _VALID_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d", "1w"}
-_VALID_EXCHANGES = ccxt_venue_ids()
-"""The registry's venue ids — you can only save what can start. Kraken and OKX are NOT
-registered (no testnet or no key-permission endpoint — the honest README), so a save
-naming them is refused here instead of saving a strategy no session could ever run."""
+_VALID_EXCHANGES = registered_venue_ids()
+"""The registry's venue ids — you can only save what can run. Kraken and OKX are NOT
+registered (no testnet or no key-permission endpoint — the honest README), so a save or
+import naming them is refused here instead of storing a strategy nothing could ever run."""
+_US_TICKER = re.compile(r"[A-Z][A-Z0-9.]{0,9}/USD")
+"""A US stock symbol: an uppercase ticker (``BRK.B`` included) quoted in USD."""
 _PERP_EXCHANGES = {"binanceusdm"}
 
 _SAVE_MARKET_RULES = MarketRulesCache()
 """The save-time venue-existence check's rules cache: one public ``load_markets`` per
 venue per day, the same TTL the session start pays. The test suites swap the loader
 (the ``offline_market_rules`` fixture); nothing here ever needs a key."""
+
+
+def _require_venue_accepts(
+    exchange_id: str, symbols: Iterable[str], timeframes: Iterable[str]
+) -> VenueSpec:
+    """The venue gate a save, an update and an import share: a registered venue, the
+    timeframes it serves (422 ``timeframe_not_supported``) and, on a US_EQUITY venue, a
+    TICKER/USD symbol (422 ``invalid_symbol``) — this is where user text becomes a ticker."""
+    spec = find_venue(exchange_id, venue_market_type(exchange_id))
+    if exchange_id not in _VALID_EXCHANGES or spec is None:
+        raise ServiceError(422, f"Invalid exchange: {exchange_id}")
+    for timeframe in timeframes:
+        if spec.timeframes is not None and timeframe not in spec.timeframes:
+            raise service_error(
+                422,
+                "timeframe_not_supported",
+                f"{exchange_id} serves {', '.join(sorted(spec.timeframes))} bars only, "
+                f"not {timeframe}",
+                "invalid",
+                timeframe=timeframe,
+            )
+    if spec.asset_class is AssetClass.US_EQUITY:
+        for symbol in symbols:
+            if not _US_TICKER.fullmatch(symbol):
+                raise service_error(
+                    422,
+                    "invalid_symbol",
+                    f"{symbol!r} is not a US stock symbol: use TICKER/USD, e.g. AAPL/USD",
+                    "invalid",
+                    symbol=symbol,
+                )
+    return spec
+
+
+async def _require_listed(pool: Any, spec: VenueSpec, symbol: str) -> None:
+    """A crypto symbol must be in the top-100 universe and listed on the venue; a US stock
+    has neither check (no universe; its ticker is checked once per job against Alpaca)."""
+    if spec.asset_class is AssetClass.CRYPTO:
+        await universe.validate_symbol(pool, symbol)
+        await _require_venue_lists_symbol(spec.exchange_id, symbol)
 
 
 async def _require_venue_lists_symbol(exchange_id: str, symbol: str) -> None:
@@ -798,8 +846,8 @@ async def update_strategy(pool: Any, strategy_id: str, body: SaveRequest) -> Sav
     if body.timeframes.primary not in _VALID_TIMEFRAMES:
         raise ServiceError(422, f"Invalid timeframe: {body.timeframes.primary}")
 
-    await universe.validate_symbol(pool, body.symbol)
-    await _require_venue_lists_symbol(body.exchange_id, body.symbol)
+    spec = _require_venue_accepts(body.exchange_id, [body.symbol], [body.timeframes.primary])
+    await _require_listed(pool, spec, body.symbol)
 
     existing_enabled = data.get("enabled", False)
     # a larger hand-set (YAML-imported) value survives a builder edit
@@ -1100,8 +1148,10 @@ async def save_strategy(pool: Any, request: SaveRequest) -> SaveResponse:
     if request.timeframes.primary not in _VALID_TIMEFRAMES:
         raise ServiceError(422, f"Invalid timeframe: {request.timeframes.primary}")
 
-    await universe.validate_symbol(pool, request.symbol)
-    await _require_venue_lists_symbol(request.exchange_id, request.symbol)
+    spec = _require_venue_accepts(
+        request.exchange_id, [request.symbol], [request.timeframes.primary]
+    )
+    await _require_listed(pool, spec, request.symbol)
 
     strategy_id = _name_to_id(request.name)
     unique_suffix = uuid.uuid4().hex[:6]
@@ -1176,6 +1226,15 @@ def import_strategy(filename: str | None, content: bytes) -> SaveResponse:
     data["id"] = strategy_id
     data.setdefault("enabled", False)
     data.setdefault("name", original_name)
+    from hydra.strategy.config import StrategyConfig
+
+    try:
+        config = StrategyConfig.model_validate(data)
+    except (ValidationError, ValueError, TypeError) as exc:
+        raise ServiceError(422, f"Invalid strategy config: {exc}") from exc
+    _require_venue_accepts(
+        config.exchange.exchange_id, config.symbols, [str(tf) for tf in config.all_timeframes()]
+    )
 
     dest = _CONFIG_DIR / f"{strategy_id}.yaml"
     _write_validated(dest, data)

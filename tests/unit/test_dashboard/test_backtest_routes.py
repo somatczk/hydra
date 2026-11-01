@@ -366,6 +366,37 @@ class TestPreflightErrors:
             "SELECT validated_at FROM exchange_credentials WHERE exchange_id = 'alpaca'"
         ]
 
+    def test_an_alpaca_job_that_consumes_a_model_is_422_and_queues_nothing(
+        self, strategies_dir: Path
+    ) -> None:
+        """The ML feature spec is built on 24/7 crypto bars: an alpaca strategy with the
+        overlay on is refused before the credential read and before anything is queued."""
+        _write_strategy(
+            strategies_dir,
+            "stocks_ml",
+            symbols=["AAPL/USD"],
+            exchange={"exchange_id": "alpaca", "market_type": "SPOT"},
+            timeframes={"primary": "1d"},
+            ml_overlay={"enabled": True, "model_name": "veto"},
+        )
+        statements: list[str] = []
+
+        class _Credentials:
+            async def fetchrow(self, sql: str, *args: Any) -> Any:
+                statements.append(sql)
+                return {"validated_at": datetime(2026, 11, 1, tzinfo=UTC)}
+
+        client = TestClient(_make_app(pool=_Pool(_Credentials())))
+        resp = client.post("/api/backtest/run", json=_run_body("stocks_ml"))
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {
+            "code": "ml_not_supported",
+            "message": "alpaca strategies cannot consume a model: the ML feature spec is built "
+            "on 24/7 crypto bars",
+            "state": "invalid",
+        }
+        assert statements == []
+
     def test_unsupported_class_is_422_before_db(
         self, client: TestClient, strategies_dir: Path
     ) -> None:

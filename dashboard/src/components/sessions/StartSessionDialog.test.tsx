@@ -296,3 +296,29 @@ describe('StartSessionDialog bybit strategy (P7-F: the live-only venue)', () => 
     expect(text()).not.toContain('Binance spot');
   });
 });
+
+describe('StartSessionDialog alpaca strategy (S1: backtest only)', () => {
+  it('names the backtest-only venue on the strategy line, never Binance', async () => {
+    fetchApi.mockImplementation(
+      routeFetch(
+        {
+          '/api/risk/live-status': liveStatus({ live_armed: false }),
+          '/api/trading/sessions': [],
+          '/api/system/config': platformConfig(),
+          '/api/strategies/stocks': {
+            id: 'stocks',
+            name: 'Stocks',
+            symbol: 'AAPL/USD',
+            timeframes: { primary: '1d' },
+            exchange_id: 'alpaca',
+          },
+        },
+        calls,
+      ),
+    );
+    m = await mount(<ShellStatusProvider><StartSessionDialog strategyId="stocks" onClose={vi.fn()} /></ShellStatusProvider>);
+    await flush();
+    expect(text()).toContain('Stocks · Alpaca US stocks (backtest only) · AAPL/USD · 1d · PAPER');
+    expect(text()).not.toContain('Binance spot');
+  });
+});

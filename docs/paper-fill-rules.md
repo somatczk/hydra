@@ -60,3 +60,23 @@ non-primary timeframe (confirmation, entry) merged with the primary stream in th
 bar's close time, the higher timeframe first on ties — so a confirmation bar closing at T is in the context before the
 primary bar closing at T is evaluated, and no bar closes in the future of what a decision saw. Backtest results stored
 before the volume model are not comparable with new ones.
+
+## US stocks (Alpaca, backtest only)
+
+An alpaca strategy backtests on the same executor and rules, with these venue facts:
+
+- **Daily bars, market-on-close entries.** Bars are 1Day, split-adjusted, each labelled 00:00 UTC of its New York
+  session date. An entry fills at the signal bar's close, slipped 0.1 % — the closing auction is assumed reachable,
+  which is optimistic by the overnight gap a real next-morning order would pay. Next-open fills are decided with the
+  live order semantics in S2.
+- **Gaps fill at the open.** A stop the next session opens through fills at that open (the worse of stop and open),
+  slipped 0.1 %: an overnight gap down through a 5 % stop sells at open × (1 − 0.001), not at the stop.
+- **No fees.** US_EQUITY trades charge no commission by default; the SEC fee and FINRA TAF on sells are ignored (a
+  `shortcut:` in the runner). P&L is (exit − entry) × quantity after slippage.
+- **Whole shares in USD.** The account is quoted and booked in USD; quantities floor to whole shares (static rules:
+  step 1, minimum 1 share, $0.01 tick, no minimum notional). $100,000 × 10 % at $523.07 buys 19 shares.
+- **A 252-day year.** Metrics annualise over 252 trading days, not 365, and weekends are not data gaps (exchange
+  holidays still count as one).
+- **Data caveats.** Alpaca's 1Day volume includes extended-hours trading, about 3 % above regular-session volume
+  on a sampled day; the volume fill cap and the volume indicators see it. The 1Day close is Alpaca's consolidated
+  last sale, which can differ from the official closing-auction price.

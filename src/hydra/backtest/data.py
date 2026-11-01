@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import pairwise
 from typing import Any, Literal
 
 from hydra.core.logging import get_logger
 from hydra.core.types import OHLCV, Timeframe
+from hydra.core.venues import AssetClass, find_venue, venue_market_type
 from hydra.data.errors import NoMarketDataError as NoMarketDataError
 from hydra.data.storage import MarketDataRepository
 
@@ -40,6 +41,8 @@ class DataProvenance:
     first_ts: datetime
     last_ts: datetime
     gap_count: int
+    """Runs of missing bar slots; on a US_EQUITY venue only runs that skip a weekday (a
+    weekend is no gap, an exchange holiday still counts as one)."""
     requested_start: datetime | None = None
     requested_end: datetime | None = None
     data_source: Literal["db"] = "db"
@@ -63,8 +66,11 @@ class InvalidMarketDataError(Exception):
     """Stored bars are not strictly increasing in time."""
 
 
-def validate_bars(bars: list[OHLCV], timeframe: Timeframe) -> int:
-    """Raise on duplicate or out-of-order timestamps; return the number of gaps."""
+def validate_bars(bars: list[OHLCV], timeframe: Timeframe, *, weekdays_only: bool = False) -> int:
+    """Raise on duplicate or out-of-order timestamps; return the number of gaps.
+
+    ``weekdays_only`` (US stocks) counts a gap only when a missing slot falls on a weekday.
+    """
     step = TIMEFRAME_SECONDS[timeframe]
     gaps = 0
     for prev, cur in pairwise(bars):
@@ -75,9 +81,23 @@ def validate_bars(bars: list[OHLCV], timeframe: Timeframe) -> int:
                 f"(previous {prev.timestamp.isoformat()})"
             )
             raise InvalidMarketDataError(msg)
-        if delta > step:
+        if delta > step and (not weekdays_only or _skips_a_weekday(prev, cur, step)):
             gaps += 1
     return gaps
+
+
+def _skips_a_weekday(prev: OHLCV, cur: OHLCV, step: int) -> bool:
+    slot = prev.timestamp + timedelta(seconds=step)
+    while slot < cur.timestamp:
+        if slot.weekday() < 5:
+            return True
+        slot += timedelta(seconds=step)
+    return False
+
+
+def _is_us_equity(exchange: str) -> bool:
+    spec = find_venue(exchange, venue_market_type(exchange))
+    return spec is not None and spec.asset_class is AssetClass.US_EQUITY
 
 
 async def no_market_data(
@@ -109,7 +129,7 @@ def _provenance(
         bar_count=len(bars),
         first_ts=bars[0].timestamp,
         last_ts=bars[-1].timestamp,
-        gap_count=validate_bars(bars, timeframe),
+        gap_count=validate_bars(bars, timeframe, weekdays_only=_is_us_equity(exchange)),
         requested_start=start,
         requested_end=end,
     )

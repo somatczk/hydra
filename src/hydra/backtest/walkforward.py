@@ -34,6 +34,7 @@ from hydra.backtest.metrics import BacktestResult, calculate_metrics
 from hydra.backtest.runner import BacktestRunner, strategy_warmup
 from hydra.backtest.validation import daily_returns, probabilistic_sharpe
 from hydra.core.types import OHLCV, Timeframe
+from hydra.core.venues import VENUES
 from hydra.data.bars import timeframe_seconds
 from hydra.execution.perp_trading import FundingRow
 from hydra.strategy.base import BaseStrategy
@@ -157,7 +158,7 @@ class WalkForwardAnalyzer:
         commission: CommissionConfig | None = None,
         initial_capital: Decimal = Decimal("100000"),
     ) -> None:
-        self._commission = commission or CommissionConfig()
+        self._commission = commission
         self._initial_capital = initial_capital
         self._runner = BacktestRunner()
 
@@ -281,6 +282,9 @@ class WalkForwardAnalyzer:
             trades=all_oos_trades,
             timeframe=timeframe,
             timestamps=all_oos_timestamps,
+            year_days=VENUES[
+                (strategy_config.exchange.exchange_id, strategy_config.exchange.market_type)
+            ].year_days,
         )
         oos_psr = probabilistic_sharpe(daily_returns(all_oos_equity, all_oos_timestamps))
         is_sharpes = [f.in_sample_metrics.sharpe_ratio for f in folds]

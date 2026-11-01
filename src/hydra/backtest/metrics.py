@@ -3,8 +3,9 @@
 All financial quantities use Decimal; array maths uses numpy float64. This docstring is the one
 place the definitions live.
 
-Conventions: crypto trades 24/7, so a year is 365 days and periods per year
-``ppy = 365 * 86400 / timeframe_seconds`` (8760 for 1h, 365 for 1d). ``e_0..e_n`` is the equity
+Conventions: a year is the venue's ``year_days`` — 365 for crypto, which trades 24/7, and 252
+trading days for US stocks — and periods per year ``ppy = year_days * 86400 / timeframe_seconds``
+(8760 for crypto 1h, 365 for crypto 1d, 252 for stock 1d). ``e_0..e_n`` is the equity
 curve, ``r_i = e_i / e_{i-1} - 1`` the per-bar simple returns (N = n of them), rf = 0.
 Annualisation counts bars, so data gaps (provenance ``gap_count``) are not calendar-corrected.
 
@@ -413,6 +414,7 @@ def calculate_metrics(
     timestamps: list[datetime] | None = None,
     benchmark_prices: list[Decimal] | None = None,
     initial_capital: Decimal = Decimal("100000"),
+    year_days: int = 365,
 ) -> BacktestResult:
     """Compute all backtest metrics (definitions in the module docstring).
 
@@ -423,7 +425,7 @@ def calculate_metrics(
             msg = f"{name} has {len(series)} points, equity_curve has {len(equity_curve)}"
             raise ValueError(msg)
     tf_seconds = timeframe_seconds(timeframe)
-    ppy = 365 * 86400 / tf_seconds
+    ppy = year_days * 86400 / tf_seconds
     equity_arr = _decimal_to_float_array(equity_curve)
     returns = _compute_returns(equity_arr)
 

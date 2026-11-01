@@ -323,6 +323,46 @@ describe('StrategyNameDialog', () => {
   });
 });
 
+describe('StrategyNameDialog US stocks (S1: alpaca, backtest only)', () => {
+  const DAILY: BuilderState = { ...STATE, timeframes: { primary: '1d' } };
+  const lastBody = () =>
+    JSON.parse(String(calls.filter((c) => c.init?.method === 'POST').at(-1)?.init?.body)) as Record<string, unknown>;
+
+  it('swaps the universe picker for a ticker input and saves TICKER/USD with no universe gate', async () => {
+    m = await render({ initialName: 'Stocks', state: DAILY });
+
+    await pickByLabel(dialog(), 'Exchange', 'alpaca');
+    const ticker = inputByLabel(dialog(), 'Ticker');
+    expect(ticker.value).toBe('');
+    expect(dialog().textContent).toContain('Daily bars: 1d only.');
+    expect(Array.from(dialog().querySelectorAll('label')).map((l) => l.textContent)).not.toContain('Symbol');
+    expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(true); // no ticker yet
+
+    await typeInto(ticker, 'brk.b');
+    expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(false); // not a universe member, still savable
+    await click(buttonByText(dialog(), 'Save strategy'));
+    expect(lastBody()).toMatchObject({ exchange_id: 'alpaca', symbol: 'BRK.B/USD', timeframes: { primary: '1d' } });
+    expect(saved).toEqual([['Stocks', 'strat-7']]);
+  });
+
+  it('holds the save off a 1d primary timeframe and says why', async () => {
+    m = await render({ initialName: 'Stocks' }); // the builder state is on 4h
+    await pickByLabel(dialog(), 'Exchange', 'alpaca');
+    await typeInto(inputByLabel(dialog(), 'Ticker'), 'AAPL');
+
+    expect(buttonByText(dialog(), 'Save strategy').disabled).toBe(true);
+    expect(dialog().textContent).toContain('Alpaca serves daily bars only: set the primary timeframe to 1d.');
+  });
+
+  it('shows a stored stock strategy by its ticker and starts a crypto pair over on the way back', async () => {
+    m = await render({ editingId: 'strat-9', initialName: 'Saw', initialExchangeId: 'alpaca', initialSymbol: 'SPY/USD', state: DAILY });
+    expect(inputByLabel(dialog(), 'Ticker').value).toBe('SPY');
+
+    await pickByLabel(dialog(), 'Exchange', 'binance');
+    expect(symbolInput().value).toBe('BTCUSDT');
+  });
+});
+
 describe('StrategyNameDialog perps fields (P4-F: venue / market_type / leverage / isolated)', () => {
   it('offers the registered venues only — bybit live-only, Kraken and OKX gone (P7-F)', async () => {
     m = await render({ initialName: 'Venue bot' });
@@ -332,7 +372,12 @@ describe('StrategyNameDialog perps fields (P4-F: venue / market_type / leverage 
       Array.from(dialog().querySelectorAll('select')[0].querySelectorAll('option')).map(
         (o) => o.textContent,
       );
-    expect(options()).toEqual(['Binance', 'Binance USD⌂-M (perps)', 'Bybit (live only)']);
+    expect(options()).toEqual([
+      'Binance',
+      'Binance USD⌂-M (perps)',
+      'Bybit (live only)',
+      'Alpaca US stocks (backtest only)',
+    ]);
     expect(dialog().textContent).not.toContain('Kraken');
     expect(dialog().textContent).not.toContain('OKX');
   });
