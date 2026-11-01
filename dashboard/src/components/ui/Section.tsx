@@ -8,19 +8,19 @@ interface SectionProps {
   className?: string;
 }
 
-/** A card at ≥1024 px; full-bleed with dividers below (rounded- stays: pageHarness.sectionText walks up to it). */
+/** An h2, an action slot and content under a rule. */
 export function Section({ title, action, children, className }: SectionProps) {
   const id = useId();
   return (
     <section
       aria-labelledby={id}
       className={cn(
-        '-mx-4 border-y border-line bg-surface px-4 py-4 lg:mx-0 lg:rounded-lg lg:border lg:p-5',
+        'border-t border-line pt-4 pb-2',
         className,
       )}
     >
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h2 id={id} className="text-sm font-semibold text-ink-1">
+        <h2 id={id} className="text-xl font-semibold text-ink-1">
           {title}
         </h2>
         {action}

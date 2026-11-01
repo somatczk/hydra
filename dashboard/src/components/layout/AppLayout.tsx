@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
 import { BottomTabBar } from './BottomTabBar';
+import { SubNav } from './SubNav';
 import { KillSwitchOutcome } from '@/components/shell/KillSwitchControl';
 import { ShellStatusProvider } from '@/components/shell/ShellStatusProvider';
 
@@ -22,6 +23,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
         <Sidebar />
         <BottomTabBar />
         <main id="main" tabIndex={-1} className="px-4 py-6 pb-24 outline-none lg:pb-6 lg:pl-62 lg:pr-6">
+          <SubNav />
           <KillSwitchOutcome />
           {children}
         </main>

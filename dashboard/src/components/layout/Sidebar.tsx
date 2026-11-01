@@ -3,10 +3,9 @@
 import { usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { cn } from '@/components/ui/cn';
-import { HydraLogo } from '@/components/icons/HydraLogo';
 import { isActive, navItems } from './navItems';
 
-/** ≥1024 px rail: every destination (six, incl. the rail-only Activity); Research shows its children while active. */
+/** ≥1024 px rail: the five destinations as text; the active one shows its children. */
 export function Sidebar() {
   const pathname = usePathname();
 
@@ -15,13 +14,10 @@ export function Sidebar() {
       aria-label="Main"
       className="fixed left-0 top-0 z-40 flex h-full w-56 flex-col border-r border-line bg-canvas max-lg:hidden"
     >
-      <Link href="/" className="flex h-14 items-center gap-2.5 px-5">
-        <span className="flex h-7 w-7 items-center justify-center rounded bg-accent">
-          <HydraLogo className="h-4 w-4 text-on-accent" />
-        </span>
-        <span className="text-base font-semibold text-ink-1">Hydra</span>
+      <Link href="/" className="flex h-16 items-center px-6 font-display text-2xl font-semibold text-ink-1">
+        Hydra
       </Link>
-      <ul className="flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-2">
+      <ul className="flex flex-1 flex-col gap-0.5 overflow-y-auto px-6 py-2">
         {navItems.map((item) => {
           const active = isActive(pathname, item);
           const childActive = item.children?.some((c) => isActive(pathname, c)) ?? false;
@@ -31,15 +27,14 @@ export function Sidebar() {
                 href={item.href}
                 aria-current={active && !childActive ? 'page' : undefined}
                 className={cn(
-                  'flex h-9 items-center gap-3 rounded px-3 text-sm font-medium',
-                  active ? 'bg-hover text-ink-1' : 'text-ink-2 hover:bg-hover hover:text-ink-1',
+                  '-ml-3 flex h-10 items-center pl-3 text-[15px]',
+                  active ? 'font-semibold text-ink-1 shadow-[inset_3px_0_0_var(--ink-1)]' : 'text-ink-2 hover:text-ink-1',
                 )}
               >
-                <item.icon className="h-[18px] w-[18px] shrink-0" aria-hidden="true" />
                 {item.label}
               </Link>
               {active && item.children && (
-                <ul className="mt-1 flex flex-col gap-0.5 pl-9">
+                <ul className="mb-2 flex flex-col">
                   {item.children.map((child) => {
                     const here = isActive(pathname, child);
                     return (
@@ -48,8 +43,8 @@ export function Sidebar() {
                           href={child.href}
                           aria-current={here ? 'page' : undefined}
                           className={cn(
-                            'flex h-8 items-center rounded px-2 text-sm',
-                            here ? 'font-medium text-ink-1' : 'text-ink-2 hover:text-ink-1',
+                            'flex h-8 items-center pl-3 text-sm',
+                            here ? 'font-semibold text-ink-1 underline decoration-2 underline-offset-4' : 'text-ink-2 hover:text-ink-1',
                           )}
                         >
                           {child.label}
@@ -63,7 +58,7 @@ export function Sidebar() {
           );
         })}
       </ul>
-      <p className="border-t border-line px-5 py-3 text-xs text-ink-2">Hydra v{process.env.APP_VERSION}</p>
+      <p className="px-6 py-3 text-xs text-ink-2">Hydra v{process.env.APP_VERSION}</p>
     </nav>
   );
 }

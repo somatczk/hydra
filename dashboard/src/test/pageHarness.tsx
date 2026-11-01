@@ -161,10 +161,10 @@ export async function click(el: HTMLElement): Promise<void> {
   await flush();
 }
 
-/** Text of the closest card-like block containing `heading`. */
+/** Text of the closest section or card-like block containing `heading`. */
 export function sectionText(container: HTMLElement, heading: string): string {
   const h = Array.from(container.querySelectorAll('h2, h3, p')).find((n) => n.textContent === heading);
   let node: HTMLElement | null = h as HTMLElement | null;
-  while (node && !node.className.includes('rounded-')) node = node.parentElement;
+  while (node && node.tagName !== 'SECTION' && !node.className.includes('rounded-')) node = node.parentElement;
   return node?.textContent ?? '';
 }

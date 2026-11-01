@@ -234,15 +234,12 @@ describe('OptimizePage segmented control', () => {
     );
   });
 
-  it('has one h1 and the phone Research nav with Optimize current', async () => {
+  it('has one h1', async () => {
     serve();
     page = await mount(<OptimizePage />);
 
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
     expect(page.container.querySelector('h1')?.textContent).toBe('Strategy optimiser');
-    expect(
-      page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent,
-    ).toBe('Optimize');
   });
 });
 

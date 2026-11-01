@@ -1,44 +1,40 @@
-import {
-  CandlestickChart,
-  Database,
-  FlaskConical,
-  History,
-  LayoutDashboard,
-  Settings,
-  ShieldAlert,
-  type LucideIcon,
-} from 'lucide-react';
-
 export interface NavItem {
   label: string;
   href: string;
-  icon: LucideIcon;
-  /** Rail-only (03 §3): the phone tab bar slices these out, so the rail can hold more than five destinations. */
-  railOnly?: boolean;
-  /** Other routes that live under this destination (03 §3). */
+  /** Other routes that live under this destination. */
   under?: string[];
+  /** Shown in the rail while the destination is active, and as the phone sub-nav. */
   children?: Array<{ label: string; href: string }>;
 }
 
-/** The destinations; the rail renders all of them, the tab bar only the non-railOnly ones. */
+/** The five destinations; the rail and the phone tab bar both render all of them. */
 export const navItems: NavItem[] = [
-  { label: 'Status', href: '/', icon: LayoutDashboard, under: ['/portfolio'] },
-  { label: 'Sessions', href: '/trading', icon: CandlestickChart },
-  { label: 'Risk', href: '/risk', icon: ShieldAlert },
-  { label: 'Activity', href: '/activity', icon: History, railOnly: true },
+  { label: 'Home', href: '/' },
   {
-    label: 'Research',
+    label: 'Strategies',
     href: '/strategies',
-    icon: FlaskConical,
-    under: ['/builder', '/templates', '/backtest', '/optimize'],
+    under: ['/builder', '/templates', '/backtest', '/optimize', '/models', '/trading'],
     children: [
       { label: 'Strategies', href: '/strategies' },
+      { label: 'Sessions', href: '/trading' },
       { label: 'Backtests', href: '/backtest' },
       { label: 'Optimize', href: '/optimize' },
+      { label: 'Models', href: '/models' },
+      { label: 'Templates', href: '/templates' },
     ],
   },
-  { label: 'Data', href: '/data', icon: Database, railOnly: true },
-  { label: 'Settings', href: '/settings', icon: Settings },
+  { label: 'Money', href: '/portfolio' },
+  { label: 'Inbox', href: '/activity' },
+  {
+    label: 'System',
+    href: '/settings',
+    under: ['/risk', '/data'],
+    children: [
+      { label: 'Settings', href: '/settings' },
+      { label: 'Risk', href: '/risk' },
+      { label: 'Data', href: '/data' },
+    ],
+  },
 ];
 
 const within = (pathname: string, href: string) =>
@@ -51,6 +47,8 @@ export function isActive(pathname: string, item: Pick<NavItem, 'href' | 'under'>
 export const activeItem = (pathname: string): NavItem | undefined =>
   navItems.find((item) => isActive(pathname, item));
 
-/** App-bar title: /portfolio sits under Status but is named Performance. */
-export const pageTitle = (pathname: string): string | undefined =>
-  within(pathname, '/portfolio') ? 'Performance' : activeItem(pathname)?.label;
+/** App-bar title: the active child's label when there is one, else the destination's. */
+export function pageTitle(pathname: string): string | undefined {
+  const item = activeItem(pathname);
+  return item?.children?.find((c) => within(pathname, c.href))?.label ?? item?.label;
+}

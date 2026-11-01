@@ -249,12 +249,11 @@ describe('BacktestPage history values', () => {
     expect(cells.filter((c) => c === '— NO DATA')).toHaveLength(2);
   });
 
-  it('has one h1, the Research nav and a real link to the result', async () => {
+  it('has one h1 and a real link to the result', async () => {
     serve();
     page = await mount(<BacktestPage />);
 
     expect(page.container.querySelectorAll('h1')).toHaveLength(1);
-    expect(page.container.querySelector('nav[aria-label="Research"] [aria-current="page"]')?.textContent).toBe('Backtests');
     expect(page.container.querySelector('tbody a[href="/backtest/bt-task-1"]')?.textContent).toBe('View');
   });
 

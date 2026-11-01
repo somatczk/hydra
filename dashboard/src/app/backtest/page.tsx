@@ -18,7 +18,6 @@ import { describeApiError } from '@/lib/apiState';
 import { logger } from '@/lib/logger';
 import { signed } from '@/lib/format';
 import { usePoll } from '@/hooks/usePoll';
-import { ResearchNav } from '@/components/research/ResearchNav';
 import { JobRow } from '@/components/research/JobRow';
 import { ModelVersionSelect } from '@/components/research/ModelVersionSelect';
 import { ConfirmDialog } from '@/components/shell/ConfirmDialog';
@@ -321,7 +320,6 @@ function BacktestPageContent() {
 
   return (
     <div className="flex flex-col gap-6">
-      <ResearchNav current="/backtest" />
       <h1 className="text-xl font-semibold text-ink-1">Backtests</h1>
       {/* Runner form */}
       <Section title="Run Backtest">

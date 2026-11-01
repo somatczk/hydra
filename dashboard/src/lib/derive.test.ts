@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  accounts,
   actionPhrase,
   askPhrase,
   breakerRow,
@@ -32,6 +33,27 @@ const NOW = Date.parse('2026-10-21T14:40:00Z');
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
 const MIN = 60_000;
 const HOUR = 60 * MIN;
+
+describe('accounts', () => {
+  it('groups running sessions by venue and mode, live first, and drops stopped ones', () => {
+    const got = accounts([
+      session({ session_id: 'a', exchange_id: 'binance', trading_mode: 'paper' }),
+      session({ session_id: 'b', exchange_id: 'bybit', trading_mode: 'live' }),
+      session({ session_id: 'c', exchange_id: 'binance', trading_mode: 'paper' }),
+      session({ session_id: 'd', exchange_id: 'binanceusdm', trading_mode: 'paper', status: 'stopped' }),
+      session({ session_id: 'e', exchange_id: 'alpaca', trading_mode: 'paper' }),
+    ]);
+    expect(got.map((a) => [a.venue, a.mode, a.sessions.map((s) => s.session_id)])).toEqual([
+      ['Bybit spot', 'live', ['b']],
+      ['Alpaca stocks', 'paper', ['e']],
+      ['Binance spot', 'paper', ['a', 'c']],
+    ]);
+  });
+
+  it('never files an unrecognised mode under paper', () => {
+    expect(accounts([session({ trading_mode: 'margin' })])[0].mode).toBe('live');
+  });
+});
 
 describe('timeframeSeconds / isOverdue', () => {
   it('reads every core.types Timeframe (core/types.py:42-51) and rejects others', () => {

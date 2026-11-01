@@ -1,16 +1,17 @@
 'use client';
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react';
 import Link from 'next/link';
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, XAxis, YAxis } from 'recharts';
 import { Button } from '@/components/ui/Button';
 import { DataStateBadge, DataStateErrorCard } from '@/components/ui/DataStateBadge';
+import { Pnl } from '@/components/ui/Pnl';
 import { useShellStatus } from '@/components/shell/ShellStatusProvider';
 import { usePoll } from '@/hooks/usePoll';
 import { fetchApi } from '@/lib/api';
 import { fetchAgeLabel } from '@/lib/apiState';
-import { age, money, signed, utc } from '@/lib/format';
-import { isOverdue, plural, sessionName, type SessionDetail } from '@/lib/derive';
+import { age, money, utc } from '@/lib/format';
+import { accounts, isOverdue, modeBadge, plural, sessionName, type Account as Acct, type SessionDetail, type SessionResponse } from '@/lib/derive';
 import { AttentionList } from './AttentionList';
 import { Readout } from './Readout';
 import { Section } from './Section';
@@ -18,6 +19,7 @@ import {
   dataView,
   needsAnswer,
   recentEvents,
+  type Answer,
   runningAnswer,
   safeAnswer,
   type ReadinessLite,
@@ -101,112 +103,191 @@ function AgeLine({ fetchedAt, state, now, onRetry }: { fetchedAt: number | null;
   );
 }
 
-function Account() {
+function MoneyLine({ source, label }: { source: 'paper' | 'live'; label: ReactNode }) {
   const { now } = useShellStatus();
-  const summary = usePoll<Summary>('/api/portfolio/summary?source=paper', 15_000);
+  const summary = usePoll<Summary>(`/api/portfolio/summary?source=${source}`, 15_000);
   const s = summary.data;
+  if (!s && summary.state !== 'loading') {
+    return <DataStateErrorCard error={summary.error} fallback="Account couldn't be loaded" onRetry={() => void summary.refetch()} />;
+  }
+  if (!s) return <p className="text-sm text-ink-2">Loading…</p>;
+  if (s.total_value <= 0) {
+    return (
+      <p className="flex items-center gap-2 text-sm text-ink-1">
+        <DataStateBadge state="unknown" />
+        Account value couldn&apos;t be determined
+      </p>
+    );
+  }
   return (
-    <Section
-      title="Paper account"
-      action={<Link href="/portfolio" className="text-sm text-accent hover:underline">Performance ›</Link>}
-    >
-      {!s && summary.state !== 'loading' ? (
-        <DataStateErrorCard error={summary.error} fallback="Account couldn't be loaded" onRetry={() => void summary.refetch()} />
-      ) : !s ? (
-        <p className="text-sm text-ink-2">Loading…</p>
-      ) : s.total_value <= 0 ? (
-        <p className="flex items-center gap-2 text-sm text-ink-1">
-          <DataStateBadge state="unknown" />
-          Account value couldn&apos;t be determined
+    <div className="flex min-w-0 flex-col gap-2">
+      <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        {label}{' '}
+        <span className="font-display text-3xl font-medium text-ink-1">{money(s.total_value)}</span>{' '}
+        <span className="text-sm text-ink-2">USDT</span>
+        <AgeLine fetchedAt={summary.fetchedAt} state={summary.state} now={now} onRetry={() => void summary.refetch()} />
+      </p>
+      <dl className="grid max-w-md grid-cols-2 gap-x-4 text-sm">
+        <dt className="border-t border-line py-1 text-ink-2">Realised today</dt>
+        <dd className="border-t border-line py-1 text-right"><Pnl value={s.daily_pnl} unit="USDT" /></dd>
+        <dt className="border-t border-line py-1 text-ink-2">Unrealised</dt>
+        <dd className="border-t border-line py-1 text-right"><Pnl value={s.unrealized_pnl} unit="USDT" /></dd>
+        <dt className="border-t border-line py-1 text-ink-2">Realised</dt>
+        <dd className="border-t border-line py-1 text-right"><Pnl value={s.realized_pnl} unit="USDT" /></dd>
+        <dt className="border-y border-line py-1 text-ink-2">Fees</dt>
+        <dd className="border-y border-line py-1 text-right text-ink-1">{money(s.total_fees)} USDT</dd>
+      </dl>
+      <p className="text-xs text-ink-2">Unrealised: mark time not reported.</p>
+      {s.paper_capital_pending !== null && (
+        <p className="text-sm text-caution">
+          Paper capital change to {money(s.paper_capital_pending)} USDT waits for a ledger reset
         </p>
-      ) : (
-        <div className="flex flex-col gap-2">
-          <AgeLine fetchedAt={summary.fetchedAt} state={summary.state} now={now} onRetry={() => void summary.refetch()} />
-          <p className="flex items-baseline gap-2">
-            <span className="text-2xl font-semibold text-ink-1">{money(s.total_value)}</span>
-            <span className="text-sm text-ink-2">USDT</span>
-          </p>
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-            <dt className="text-ink-2">Realised today</dt>
-            <dd className="text-right text-ink-1">{signed(s.daily_pnl)} USDT</dd>
-            <dt className="text-ink-2">Unrealised</dt>
-            <dd className="text-right text-ink-1">{signed(s.unrealized_pnl)} USDT</dd>
-            <dt className="text-ink-2">Realised</dt>
-            <dd className="text-right text-ink-1">{signed(s.realized_pnl)} USDT</dd>
-            <dt className="text-ink-2">Fees</dt>
-            <dd className="text-right text-ink-1">{money(s.total_fees)} USDT</dd>
-          </dl>
-          <p className="text-xs text-ink-2">Unrealised: mark time not reported.</p>
-          {s.paper_capital_pending !== null && (
-            <p className="text-sm text-caution">
-              Paper capital change to {money(s.paper_capital_pending)} USDT waits for a ledger reset
-            </p>
-          )}
-        </div>
       )}
-    </Section>
+    </div>
   );
 }
 
-function SessionsTable({ details, ready }: { details: Details; ready: boolean }) {
-  const { sessions, now } = useShellStatus();
-  const running = sessions.data?.filter((x) => x.status === 'running') ?? [];
+const LiveStamp = () => (
+  <span className="bg-live px-1.5 font-display text-sm font-semibold tracking-wider text-on-live">LIVE</span>
+);
+
+/** Paper and live money side by side, never summed; the live line exists only when something is live. */
+function Money({ live }: { live: boolean }) {
   return (
-    <Section title="Running sessions" className="lg:col-span-8">
-      {running.length === 0 ? (
+    <section id="money" aria-labelledby="money-h" className="flex flex-col gap-3">
+      <div className="flex items-baseline gap-3">
+        <h2 id="money-h" className="text-xl font-semibold text-ink-1">Money</h2>
+        <Link href="/portfolio" className="text-sm text-accent">Performance</Link>
+      </div>
+      <div className="flex flex-wrap gap-x-12 gap-y-6">
+        {live && <MoneyLine source="live" label={<LiveStamp />} />}
+        <MoneyLine source="paper" label={<span className="font-medium text-ink-2">Paper</span>} />
+      </div>
+    </section>
+  );
+}
+
+function AccountCaption({ a }: { a: Acct }) {
+  return (
+    <span className="flex flex-wrap items-center gap-2 text-sm">
+      <span className="font-semibold text-ink-1">{a.venue}</span>{' '}
+      {a.mode === 'live' ? <LiveStamp /> : <span className="text-ink-2">paper</span>}{' '}
+      <span className="text-ink-2">· {plural(a.sessions.length, 'session')}</span>
+    </span>
+  );
+}
+
+function rowView(s: SessionResponse, details: Details, ready: boolean, now: number) {
+  const d = details.get(s.session_id);
+  const row = d && !(d instanceof Error) ? d : null;
+  const overdue = row ? isOverdue(row.last_bar_at, s.timeframe, now) : null;
+  const lastBar = row
+    ? row.last_bar_at
+      ? `${age(now - Date.parse(row.last_bar_at), now)} · ${overdue ? 'overdue' : 'on time'}`
+      : 'No closed bar yet'
+    : null;
+  return { row, lastBar, failed: !row && (ready || d !== undefined) };
+}
+
+const Unreadable = () => (
+  <span className="flex items-center gap-2"><DataStateBadge state="unknown" />Couldn&apos;t read this session</span>
+);
+
+function AccountTable({ a, details, ready, now }: { a: Acct; details: Details; ready: boolean; now: number }) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[680px] text-left text-sm">
+        <caption className="pb-2 text-left"><AccountCaption a={a} /></caption>
+        <thead className="text-xs text-ink-2">
+          <tr className="border-b border-line-strong">
+            {['Name', 'Market', 'Last bar', 'Entries', 'Stop failures', 'Positions', 'Unrealised (USDT)'].map((h) => (
+              <th key={h} scope="col" title={h.startsWith('Unrealised') ? 'Marked at the last closed bar' : undefined} className={h.startsWith('Unrealised') ? 'whitespace-nowrap py-2 text-right font-medium' : 'whitespace-nowrap py-2 pr-3 font-medium'}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {a.sessions.map((s) => {
+            const { row, lastBar, failed } = rowView(s, details, ready, now);
+            return (
+              <tr key={s.session_id} className={row?.protection_failures.length ? 'border-b border-line bg-caution-soft' : 'border-b border-line'}>
+                <td className="py-2.5 pr-3">
+                  <Link href={`/trading/${s.session_id}`} className="text-accent">{sessionName(s)}</Link>
+                </td>
+                <td className="whitespace-nowrap pr-3 text-ink-2">{s.symbols.join(', ')} · {s.timeframe}</td>
+                {row ? (
+                  <>
+                    <td className="whitespace-nowrap pr-3 text-ink-2">{lastBar}</td>
+                    <td className="whitespace-nowrap pr-3">{row.entries_paused ?? 'allowed'}</td>
+                    <td className={row.protection_failures.length ? 'pr-3 font-semibold text-danger' : 'pr-3'}>{row.protection_failures.length}</td>
+                    <td className="whitespace-nowrap pr-3">{plural(row.positions.length, 'position')}</td>
+                    <td className="text-right font-medium"><Pnl value={row.positions.reduce((n, p) => n + p.unrealized_pnl, 0)} /></td>
+                  </>
+                ) : (
+                  <td colSpan={5}>{failed ? <Unreadable /> : 'Loading…'}</td>
+                )}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AccountList({ a, details, ready, now }: { a: Acct; details: Details; ready: boolean; now: number }) {
+  return (
+    <div className="flex flex-col">
+      <h3 className="border-b border-line-strong pb-1.5"><AccountCaption a={a} /></h3>
+      <ul>
+        {a.sessions.map((s) => {
+          const { row, lastBar, failed } = rowView(s, details, ready, now);
+          const stopFailed = (row?.protection_failures.length ?? 0) > 0;
+          return (
+            <li key={s.session_id} className="border-b border-line">
+              <Link href={`/trading/${s.session_id}`} className="flex min-h-14 items-center justify-between gap-3 py-1.5">
+                <span className="flex min-w-0 flex-col">
+                  <span className="truncate font-medium text-ink-1">{sessionName(s)}</span>
+                  <span className={stopFailed ? 'text-xs font-semibold text-danger' : 'text-xs text-ink-2'}>
+                    {row
+                      ? `${s.symbols.join(', ')} · ${plural(row.positions.length, 'position')} · ${stopFailed ? 'stop failed' : lastBar}`
+                      : failed ? <Unreadable /> : 'Loading…'}
+                  </span>
+                </span>
+                {row && <Pnl className="shrink-0 font-medium" value={row.positions.reduce((n, p) => n + p.unrealized_pnl, 0)} />}
+              </Link>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function RunningNow({ details, ready, desktop }: { details: Details; ready: boolean; desktop: boolean }) {
+  const { sessions, now } = useShellStatus();
+  const groups = sessions.data ? accounts(sessions.data) : [];
+  return (
+    <section id="running-now" aria-labelledby="running-now-h" className="flex min-w-0 flex-col gap-5 lg:col-span-8">
+      <h2 id="running-now-h" className="text-xl font-semibold text-ink-1">Running now</h2>
+      {groups.length === 0 ? (
         <p className="text-sm text-ink-2">
-          {sessions.data ? 'Nothing is running. Start a paper session from a strategy.' : "Couldn't read sessions."}
+          {sessions.data
+            ? 'Nothing is running. Start a paper session from a strategy.'
+            : sessions.state === 'loading'
+              ? 'Loading…'
+              : "Couldn't read sessions."}
         </p>
       ) : (
-        <table className="w-full text-left text-sm">
-          <thead className="text-xs text-ink-2">
-            <tr>
-              {['Name', 'Market', 'Started', 'Last bar', 'Entries', 'Stop failures', 'Positions', 'Unrealised (USDT)'].map((h) => (
-                <th key={h} scope="col" title={h.startsWith('Unrealised') ? 'Marked at the last closed bar' : undefined} className="pb-2 pr-3 font-medium">{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {running.map((s) => {
-              const d = details.get(s.session_id);
-              const row = d && !(d instanceof Error) ? d : null;
-              const overdue = row ? isOverdue(row.last_bar_at, s.timeframe, now) : null;
-              return (
-                <tr key={s.session_id} className="border-t border-line">
-                  <td className="py-2 pr-3">
-                    <Link href={`/trading/${s.session_id}`} className="text-accent hover:underline">{sessionName(s)}</Link>
-                  </td>
-                  <td className="pr-3">{s.symbols.join(', ')} · {s.timeframe}</td>
-                  <td className="pr-3">{utc(s.started_at, now) ?? '—'}</td>
-                  {row ? (
-                    <>
-                      <td className="pr-3">
-                        {row.last_bar_at
-                          ? `${age(now - Date.parse(row.last_bar_at), now)} · ${overdue ? 'overdue' : 'on time'}`
-                          : 'No closed bar yet'}
-                      </td>
-                      <td className="pr-3">{row.entries_paused ?? 'allowed'}</td>
-                      <td className="pr-3">{row.protection_failures.length}</td>
-                      <td className="pr-3">{plural(row.positions.length, 'position')}</td>
-                      <td>{signed(row.positions.reduce((n, p) => n + p.unrealized_pnl, 0))}</td>
-                    </>
-                  ) : (
-                    <td colSpan={5}>
-                      {ready || d ? (
-                        <span className="flex items-center gap-2"><DataStateBadge state="unknown" />Couldn&apos;t read this session</span>
-                      ) : (
-                        'Loading…'
-                      )}
-                    </td>
-                  )}
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        groups.map((a) =>
+          desktop ? (
+            <AccountTable key={a.key} a={a} details={details} ready={ready} now={now} />
+          ) : (
+            <AccountList key={a.key} a={a} details={details} ready={ready} now={now} />
+          ),
+        )
       )}
-      {running.length > 0 && <p className="mt-2 text-xs text-ink-2">Unrealised is marked at the last closed bar.</p>}
-    </Section>
+      {groups.length > 0 && <p className="text-xs text-ink-2">Unrealised is marked at the last closed bar.</p>}
+    </section>
   );
 }
 
@@ -219,7 +300,7 @@ function Equity() {
     return `Equity from ${money(values[0])} to ${money(values[values.length - 1])} USDT, peak ${money(Math.max(...values))} USDT.`;
   }, [pts]);
   return (
-    <Section title="Equity" className="lg:col-span-12">
+    <Section title="Paper equity">
       {!pts && curve.state !== 'loading' ? (
         <DataStateErrorCard error={curve.error} fallback="Equity history couldn't be loaded" onRetry={() => void curve.refetch()} />
       ) : !pts ? (
@@ -262,40 +343,52 @@ export function StatusPage() {
   const need = needsAnswer(needs, [live, sessions, config, approvals].some((p) => p.state === 'loading'));
   const hist = recentEvents(events.data, now);
 
+  const headPart = (a: Answer, fallback: string) => (
+    <>
+      {a.state !== 'ok' && <DataStateBadge state={a.state} />}
+      {a.value ?? fallback}
+    </>
+  );
+
   return (
-    <div className="flex flex-col gap-4">
-      <h1 className="text-xl font-semibold text-ink-1">Status</h1>
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Readout label="Running" {...run} state={run.state} href="/trading" />
-        <Readout label="Safe" {...safe} href="/risk" />
-        <Readout label="Data" {...data} href="/trading" />
-        <Readout label="Needs you" {...need} href="#needs-you" />
-      </div>
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-        {desktop && <SessionsTable details={details} ready={ready} />}
-        <div className="flex flex-col gap-4 lg:col-span-4">
-          <Section title="Needs you" id="needs-you">
-            <AttentionList
-              needs={needs}
-              loading={[live, sessions, config, approvals].some((p) => p.state === 'loading')}
-              history={
-                hist === null ? (
-                  'Risk events couldn’t be read.'
-                ) : hist === 0 ? (
-                  'No risk events since yesterday.'
-                ) : (
-                  <>
-                    Since yesterday: {plural(hist, 'risk event')} ·{' '}
-                    <Link href="/activity" className="text-accent hover:underline">Activity log ›</Link>
-                  </>
-                )
-              }
-            />
-          </Section>
-          <Account />
+    <div className="flex flex-col gap-10">
+      <div className="flex flex-col gap-4">
+        <h1 className="font-display text-4xl font-semibold leading-tight text-ink-1 lg:text-5xl">
+          <Link href="/trading" className="hover:underline">{headPart(run, 'Checking sessions')}</Link>.{' '}
+          <Link href="#needs-you" className={need.tone === 'none' ? 'hover:underline' : 'underline decoration-caution decoration-[3px] underline-offset-4'}>
+            {headPart({ ...need, value: need.value === '?' ? 'Needs you: ?' : need.value }, 'Checking what needs you')}
+          </Link>
+          .
+        </h1>
+        <div className="grid grid-cols-1 lg:grid-cols-2 lg:gap-x-8">
+          <Readout label="Safe" {...safe} href="/risk" />
+          <Readout label="Data" {...data} href="/trading" />
         </div>
-        {desktop && <Equity />}
       </div>
+      <div className="grid grid-cols-1 gap-10 lg:grid-cols-12 lg:gap-x-12">
+        <RunningNow details={details} ready={ready} desktop={desktop} />
+        <section id="needs-you" aria-labelledby="needs-you-h" className="flex min-w-0 flex-col gap-4 lg:col-span-4">
+          <h2 id="needs-you-h" className="text-xl font-semibold text-ink-1">Needs you</h2>
+          <AttentionList
+            needs={needs}
+            loading={[live, sessions, config, approvals].some((p) => p.state === 'loading')}
+            history={
+              hist === null ? (
+                events.state === 'loading' ? 'Checking risk events…' : 'Risk events couldn’t be read.'
+              ) : hist === 0 ? (
+                'No risk events since yesterday.'
+              ) : (
+                <>
+                  Since yesterday: {plural(hist, 'risk event')} ·{' '}
+                  <Link href="/activity" className="text-accent">Activity log</Link>
+                </>
+              )
+            }
+          />
+        </section>
+      </div>
+      <Money live={modeBadge(live.data, sessions.data) === 'live'} />
+      {desktop && <Equity />}
     </div>
   );
 }

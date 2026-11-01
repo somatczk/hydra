@@ -3,7 +3,7 @@ import Link from 'next/link';
 import { DataStateBadge } from '@/components/ui/DataStateBadge';
 import type { NeedsYou } from '@/lib/derive';
 
-/** The Needs-you rows (06 §2): each an `<a>`; "?" never becomes "nothing". */
+/** The Needs-you rows, numbered as a queue: each an `<a>`; "?" never becomes "nothing". */
 export function AttentionList({
   needs,
   loading,
@@ -20,15 +20,16 @@ export function AttentionList({
       ) : (
         <>
           {needs.items.length > 0 && (
-            <ul className="flex flex-col divide-y divide-line rounded-lg border border-line">
-              {needs.items.map((n) => (
-                <li key={`${n.kind}:${n.href}`}>
-                  <Link href={n.href} className="flex min-h-12 items-center px-3 py-2 text-sm text-ink-1 hover:bg-hover">
+            <ol className="flex flex-col border-t-2 border-ink-1">
+              {needs.items.map((n, i) => (
+                <li key={`${n.kind}:${n.href}`} className="border-b border-line">
+                  <Link href={n.href} className="flex min-h-12 items-baseline gap-3 py-2.5 text-sm text-ink-1 hover:bg-hover">
+                    <span aria-hidden="true" className="font-display text-2xl font-semibold leading-none text-ink-2">{i + 1}</span>
                     {n.text}
                   </Link>
                 </li>
               ))}
-            </ul>
+            </ol>
           )}
           {needs.count === null ? (
             <p className="flex flex-wrap items-center gap-2 text-sm text-ink-1">
