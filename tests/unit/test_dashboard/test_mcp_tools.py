@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import re
-import secrets
 import sys
 import types
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -46,12 +45,13 @@ from hydra.execution.session_manager import TradingSession
 from hydra.services import strategies as strategy_svc
 from hydra.services.errors import ServiceError, error_detail
 from hydra.services.trader import LocalTrader
+from tests.fixtures.mcp_oauth import OAUTH_ENV, TOKEN, FakeIssuer
 from tests.fixtures.universe import OFFLINE_RANKED_AT, seeded_universe_pool
 from tests.unit.test_execution.session_harness import Harness, held, write_strategy
 
 from .conftest import TEST_API_TOKEN
 
-TEST_MCP_TOKEN = "m" + secrets.token_urlsafe(48)
+TEST_MCP_TOKEN = TOKEN
 ACCEPT_BOTH = "application/json, text/event-stream"
 INITIALIZE = {
     "jsonrpc": "2.0",
@@ -212,13 +212,12 @@ def mcp(bind_api_config: Bind) -> Iterator[_McpClient]:
     """The mounted MCP app over a TestClient, with the engine state the tools resolve."""
     cfg = bind_api_config(
         HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        **OAUTH_ENV,
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Iterator[None]:
-        mount = mount_mcp(app, cfg)
+        mount = mount_mcp(app, cfg, transport=FakeIssuer().transport)
         async with mount.session_manager.run():
             yield
 
@@ -296,7 +295,7 @@ async def _async_mcp(cfg: HydraConfig) -> AsyncIterator[_AsyncMcpClient]:
     mounted = FastAPI()
     install_security(mounted)
     mounted.state.config = cfg
-    mount = mount_mcp(mounted, cfg)
+    mount = mount_mcp(mounted, cfg, transport=FakeIssuer().transport)
     async with (
         mount.session_manager.run(),
         httpx.AsyncClient(
@@ -577,8 +576,7 @@ def test_data_coverage_reads_the_estimate_from_the_engine_config(
     baked-in constant."""
     cfg = bind_api_config(
         HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        **OAUTH_ENV,
         HYDRA_DATA__ROW_BYTES_ESTIMATE="250",
     )
     assert cfg.data.row_bytes_estimate == 250
@@ -1249,8 +1247,7 @@ async def test_strategy_reload_round_trip_applies_a_params_only_change(
     with from_hash/to_hash and audits as the MCP principal (the S4 acceptance round trip)."""
     cfg = bind_api_config(
         HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        **OAUTH_ENV,
     )
     h = Harness(strategies_dir)
     await h.start()
@@ -1303,8 +1300,7 @@ def mcp_cfg(bind_api_config: Bind) -> HydraConfig:
     return bind_api_config(
         HYDRA_API__AUTH_MODE="dev",
         HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        **OAUTH_ENV,
     )
 
 

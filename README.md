@@ -40,6 +40,7 @@ Next.js dashboard, background workers and a TimescaleDB database.
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Deployment](#deployment)
+- [Connecting an MCP client](#connecting-an-mcp-client)
 - [Working on the code](#working-on-the-code)
 - [License](#license)
 
@@ -67,7 +68,8 @@ Next.js dashboard, background workers and a TimescaleDB database.
   and a kill switch, all persisted.
 - **Dashboard.** Portfolio, sessions, builder, backtests, optimisation, models, data, risk and an activity trail of
   who did what, usable on a phone.
-- **AI assistant access (MCP).** Research, strategy, session, risk and model tools over a bearer-token MCP endpoint.
+- **AI assistant access (MCP).** Research, strategy, session, risk and model tools over an MCP endpoint you sign
+  in to through Authentik (OAuth).
 - **Operations.** Prometheus metrics with alert rules, a Grafana dashboard, liveness and readiness probes, JSON logs.
 
 ## How it fits together
@@ -89,7 +91,7 @@ flowchart LR
 
     you --> dash
     dash -->|"HTTP and WebSocket"| api
-    ai -->|"bearer token"| api
+    ai -->|"Authentik OAuth token"| api
     api -->|"internal API"| trader
     api --> db
     trader --> db
@@ -101,8 +103,8 @@ flowchart LR
 ```
 
 - The **API** is the only public surface. Every route except the health probes and metrics needs an authenticated
-  caller (a reverse-proxy login, or a bearer token for services); the MCP endpoint exists only when its own token is
-  configured.
+  caller (a reverse-proxy login, or a bearer token for services); the MCP endpoint exists only when its Authentik
+  OAuth settings are configured, and accepts only Authentik access tokens.
 - The **trader** owns every running session. In the default single-process layout, API and trader run in one
   process; in production they are two containers of the same image, and the database is the only state they share.
 - The **backtest worker** runs queued backtests, optimisations and ML training jobs. Jobs are durable: they survive
@@ -301,7 +303,7 @@ Each PR that changes one of these rows updates the row.
 | Dashboard | Portfolio summary, drawdown and daily P&L across paper sessions | ✅ **Working**. The paper account curve follows the risk ledger: the capital in force at each time plus every session's result, so a pending capital change moves nothing and a reset drops the results of sessions stopped before it. Drawdown and returns are measured within reset segments, so a capital change is neither. Daily P&L is net realized P&L per UTC day. The curve is hourly, so a fall and recovery inside one hour is not in the drawdown. | `tests/unit/test_dashboard/test_portfolio_routes.py::test_reset_rebases_without_rewriting_history`, `::test_pending_capital_change_does_not_move_the_account`, `::test_snapshots_fold_to_one_point_per_hour`, `::test_live_metrics_twr_seeds_sessions_from_before_the_window`, `::test_daily_pnl_is_net_of_fees_per_utc_day`, `::test_two_interleaved_sleeves_are_not_an_80pct_drawdown`, `::test_daily_pnl_counts_stopped_sessions_and_nets_fees`, `::test_mark_is_the_positions_own_exchange_and_session_timeframe`, `::test_bad_date_is_422_envelope`, `tests/integration/test_system_config_persistence.py::test_portfolio_reads_on_the_real_schema` |
 | Dashboard | Real-time WebSocket updates | ✅ **Working**. Trade fills, session status changes and risk updates are pushed in both process layouts: one relay per app polls `trades` every 2 s (the fill tick per new row, a `session_status` tick when a session leaves the running set, in the `broadcast_status` vocabulary so the session page just re-fetches), and the risk relay polls the risk tables every 2 s for `/ws/risk` (a `risk_event` tick per new `risk_events` row plus a diffed `risk_state` heartbeat). The risk page re-fetches on a risk event with a 500 ms debounce, merges the heartbeat as the fresher of it and its 10 s poll, and shows the push provenance; every 10–15 s poll stays as the honest fallback. Feed staleness stays on the polls (in-memory trader state a DB relay cannot see), and rows written while an app was down are never re-announced: each cursor anchors at `MAX(id)` at startup. | `tests/unit/test_dashboard/test_ws_relay.py`, `tests/unit/test_dashboard/test_risk_relay.py`, `tests/integration/test_ws_relay_pg.py`, `tests/integration/test_risk_relay_pg.py`, `dashboard/src/lib/riskWs.test.ts`, `cd dashboard && npm test` |
 | Dashboard | TradingView charts | ✅ **Working (third-party data)**. A session page shows TradingView's own Binance chart in a sandboxed cross-origin iframe, so no TradingView script runs in the dashboard, and production responses carry a CSP. The chart is not Hydra's stored bars; every other chart is Recharts. The CSP still allows inline scripts: a nonce-based policy is not built. | `dashboard/src/lib/securityHeaders.test.ts`, `cd dashboard && npm test` |
-| Interfaces | MCP server | ✅ **Working**. The engine serves MCP at `/mcp/` only when its own token is set; with no token the route does not exist. The token must differ from the API token, grants MCP access only and needs an allowed-hosts list, and every request is checked: a missing or wrong token and a disallowed host are refused. claude.ai custom connectors (OAuth) are deferred; today the client is Claude Code with a static bearer token. | `tests/unit/test_dashboard/test_lifespan.py`, `tests/unit/test_core/test_config.py`, `tests/unit/test_dashboard/test_auth_coverage.py`, `tests/unit/test_dashboard/test_mcp_transport.py` |
+| Interfaces | MCP server | ✅ **Working**. The engine serves MCP at `/mcp/` only when its Authentik OAuth settings (issuer, client id, public resource URL, allowed hosts) are set; otherwise the route does not exist. Clients sign in through Authentik (Claude Code with a pre-registered client id; claude.ai custom connectors with the client id and secret) and send the access token; every request is checked: a missing, expired, wrongly signed token, one for another issuer or client, or a disallowed host is refused, and an unreachable Authentik is a 503, never a pass. The two RFC 9728 metadata paths are public so clients can find Authentik. A signed-in assistant is a service principal: it can never approve its own gated actions. | `tests/unit/test_dashboard/test_mcp_oauth.py`, `tests/unit/test_dashboard/test_mcp_transport.py`, `tests/unit/test_dashboard/test_lifespan.py`, `tests/unit/test_core/test_config.py`, `tests/unit/test_dashboard/test_auth_coverage.py` |
 | Interfaces | MCP tools | ✅ **Working**. 42 tools over the same service layer as the API: 23 for research and strategies, 10 for sessions and risk, 2 code-gated live tools and 7 for models. Five tools only create an approval a human confirms with a one-time code: kill-switch release, live session start, live order, model promote and rollback; the live ones refuse at once when live is not armed, and quick trade refuses live sessions. Turning the kill switch on is immediate. There is no tool to arm or disarm. Every call is audited as Claude, and sessions it starts are labelled as Claude's. | `tests/unit/test_dashboard/test_mcp_tools.py::test_tools_list_advertises_the_42_tools`, `::test_on_is_immediate_latches_and_is_attributed_then_release_is_gated`, `::test_live_session_start_is_gated_then_executes_on_approval`, `::test_quick_trade_on_a_live_session_is_the_409_envelope`, `tests/unit/test_dashboard/test_mcp_model_tools.py::test_promote_is_gated_then_promotes_on_the_humans_code`, `tests/integration/test_mcp_tools_pg.py` |
 | Security | API authentication | ✅ **Working (engine)**. Every route and WebSocket except the health probes and `/metrics` needs a caller: the proxy's signed-in user, trusted only from the listed proxy addresses (forwarded headers cannot fake the peer, and startup warns about wide ranges), or the API token for services. With neither configured the API refuses everything; the API docs are protected too. Dev mode trusts everyone and logs a critical warning. Production also depends on the homelab deploy providing the proxy network and auth settings. | `tests/unit/test_dashboard/test_auth_coverage.py`, `tests/unit/test_dashboard/test_security.py` |
 | Security | CSRF and WebSocket Origin | ✅ **Working**. Browser requests that change state need a custom header, an allowed Origin if one is sent, and a same-origin fetch; WebSocket upgrades need an allowed Origin, and a refused one gets a proper error. CORS allows only the configured origins. | `tests/unit/test_dashboard/test_csrf.py` |
@@ -317,7 +319,7 @@ Each PR that changes one of these rows updates the row.
 | Engineering | trader/api process split (`HYDRA_TRADER__URL`) | ✅ **Working**. Unset, one process runs everything. Set, the API process never runs the engine and forwards each trading operation to the trader process over an internal token-gated API; errors keep their shape. A refused connection means unreachable, but a timed-out call (20 s by default) may still be running, so check the session or order before resubmitting. The database is the only durable shared state; Redis carries only the opt-in event fan-out mirror (off by default), never a trading decision. | `tests/unit/test_dashboard/test_trader_server.py`, `tests/unit/test_dashboard/test_trader_client.py`, `tests/unit/test_dashboard/test_lifespan.py`, `tests/unit/test_services/test_trader_backend.py` |
 | Engineering | Split layout in CI and deploy | ✅ **Working**. CI boots both processes against one TimescaleDB and proves start, detail, the WebSocket fill push and stop across the boundary, plus the kill-switch latch with the trader unreachable. The trader container needs the worker-style healthcheck (`python -m hydra.trader check`): the engine image's default one flaps while the trader waits for the schema and can crash-loop it. | `tests/e2e/test_split_smoke.py`, `make smoke` |
 | Engineering | End-to-end paper smoke | ✅ **Working**. Boots the real app on TimescaleDB with the production env shape and token auth, replays committed Binance BTCUSDT 1-minute bars and checks over HTTP: an entry with its stop, the exit with exact prices, fees and P&L, a risk rejection, the kill switch, the Binance-only and live gates, a restart with no zombie, and readiness failing once the feed stalls. | `make smoke`, `tests/e2e/test_paper_smoke.py`, `tests/e2e/data/binance_btcusdt_1m.json` |
-| Engineering | Images publish only after CI passes | ✅ **Working**. Images publish only from pushes to `main` (or manual runs on `main`) after every other CI job passes, and only when an image input changed. PRs build and start every image: the engine must be live and ready, serve one real MCP tool call, and run as the two-process split with JSON logs. Base images are pinned by digest, so publish rebuilds on the base the smoke tested. | `tests/unit/test_repo/test_ci_gating.py::test_publish_needs_every_other_job_and_runs_only_on_main_pushes`, `::test_publish_skips_pushes_that_change_no_image_input`, `tests/unit/test_repo/test_toolchain_pins.py::test_published_images_pin_one_base_digest_per_image` |
+| Engineering | Images publish only after CI passes | ✅ **Working**. Images publish only from pushes to `main` (or manual runs on `main`) after every other CI job passes, and only when an image input changed. PRs build and start every image: the engine must be live and ready and run as the two-process split with JSON logs. Base images are pinned by digest, so publish rebuilds on the base the smoke tested. | `tests/unit/test_repo/test_ci_gating.py::test_publish_needs_every_other_job_and_runs_only_on_main_pushes`, `::test_publish_skips_pushes_that_change_no_image_input`, `tests/unit/test_repo/test_toolchain_pins.py::test_published_images_pin_one_base_digest_per_image` |
 | Engineering | Python and uv pinned in one place | ✅ **Working**. CI and the images use Python 3.14 from `.python-version` and uv 0.13.3; older uv versions are refused, and every install is locked. | `tests/unit/test_repo/test_toolchain_pins.py` |
 | Engineering | JSON logs carry level, logger, timestamp and tracebacks | ✅ **Working**. Every log record, startup lines included, is one JSON line with its traceback; the image smoke fails on any non-JSON engine or worker line. | `tests/unit/test_core/test_logging.py` |
 | Engineering | Every module has tests | ✅ **Working**. The Discord and Slack notifier's payload shapes, success and failure statuses, fire-and-forget contract and dispatcher channel independence run against a local HTTP server on 127.0.0.1 — no external call, no httpx mock. Hyperopt and validation have their own. | `tests/unit/test_ops/test_notifications.py`, `tests/unit/test_backtest/test_hyperopt.py`, `tests/unit/test_backtest/test_validation.py`, `tests/integration/test_backtest_real_data.py::test_hyperopt_grid_runs_on_stored_bars_reproducibly` |
@@ -387,8 +389,8 @@ dependencies only. The engine creates its database schema on first start.
 - **Overrides.** Any key can be set from the environment as `HYDRA_<SECTION>__<KEY>`, for example
   `HYDRA_TRADING__TESTNET=false`, `HYDRA_LOGGING__LEVEL=DEBUG` or
   `HYDRA_API__CORS_ORIGINS=https://a.example,https://b.example`.
-- **Infrastructure comes only from the environment**: `DATABASE_URL`, `REDIS_URL`, `HYDRA_CREDENTIAL_KEY`,
-  `HYDRA_API_TOKEN` (and `HYDRA_MCP_TOKEN` to enable the MCP endpoint). Putting them, or `database:`, `redis:` or
+- **Infrastructure comes only from the environment**: `DATABASE_URL`, `REDIS_URL`, `HYDRA_CREDENTIAL_KEY` and
+  `HYDRA_API_TOKEN`. Putting them, or `database:`, `redis:` or
   `exchanges:`, in YAML is a startup error.
 - **Fail fast.** An unknown key at any depth, an unknown or retired `HYDRA_*` variable (the message names the
   replacement, for example `HYDRA_CORS_ORIGINS` -> `HYDRA_API__CORS_ORIGINS`), an unresolved `${VAR}` or an invalid
@@ -399,6 +401,9 @@ dependencies only. The engine creates its database schema on first start.
   re-entered.
 - **Strategies** are YAML files in `config/strategies/`; the dashboard's builder writes them, and `config/templates/`
   holds the starting points.
+- **MCP** is configured under `mcp` (`HYDRA_MCP__OAUTH_ISSUER`, `HYDRA_MCP__OAUTH_AUDIENCE`, `HYDRA_MCP__RESOURCE_URL`,
+  `HYDRA_MCP__ALLOWED_HOSTS`); without the OAuth settings there is no `/mcp`. See
+  [Connecting an MCP client](#connecting-an-mcp-client).
 
 ## Deployment
 
@@ -409,9 +414,34 @@ Production runs as a Docker Compose stack in the [romulus](https://github.com/so
 
 In production the API and the trader are separate containers of the engine image (`HYDRA_TRADER__URL` points the
 API at the trader), the dashboard sits behind the same host, and the API sits behind a Traefik reverse proxy with
-Authentik login. Prometheus alert rules and a Grafana dashboard live in [`deploy/`](deploy/); the running Prometheus,
+Authentik login (MCP clients sign in to Authentik themselves; see the next section). Prometheus alert rules and a Grafana dashboard live in [`deploy/`](deploy/); the running Prometheus,
 Alertmanager and Grafana are in romulus. `deploy/compose.yml` is a local full-stack approximation, not the
 deployment.
+
+## Connecting an MCP client
+
+`/mcp` is an OAuth 2.1 resource server and Authentik is the authorization server. Authentik has no dynamic client
+registration, so every client uses the pre-registered public client `hydra-mcp` (PKCE, no secret; romulus
+`configs/authentik/blueprints/applications.yaml`). Clients find Authentik through the public RFC 9728 metadata at
+`/.well-known/oauth-protected-resource/mcp`.
+
+- **Engine settings.** `HYDRA_MCP__OAUTH_ISSUER` is the provider's issuer exactly as Authentik states it, trailing
+  slash included (`https://sso.example.com/application/o/hydra-mcp/`). `HYDRA_MCP__OAUTH_AUDIENCE` is the client id
+  (`hydra-mcp`), `HYDRA_MCP__RESOURCE_URL` the public URL of `/mcp` (`https://trading.example.com/mcp`) and
+  `HYDRA_MCP__ALLOWED_HOSTS` its host (`trading.example.com`); `HYDRA_MCP__REQUIRED_SCOPES` is optional. Set the
+  first three together or not at all. The engine must be able to reach the issuer's discovery document and keys;
+  if it cannot, MCP calls answer 503 `auth_unavailable`.
+- **Claude Code.** Add the server, then run `/mcp` in Claude Code and sign in to Authentik in the browser it opens:
+
+  ```bash
+  claude mcp add --transport http --client-id hydra-mcp --callback-port 8765 hydra https://trading.example.com/mcp
+  ```
+
+  Any free local port works for `--callback-port`; the client accepts `http://localhost:<port>/callback`.
+- **claude.ai.** Settings > Connectors > Add custom connector. URL: `https://trading.example.com/mcp`. Under Advanced
+  settings, OAuth Client ID: `hydra-mcp`, OAuth Client Secret: empty. Connect and sign in to Authentik.
+- **Who can sign in.** Members of the Authentik groups bound to the `hydra-mcp` application. A signed-in assistant
+  is a service principal: its gated actions wait for the code you type in the dashboard.
 
 ## Working on the code
 

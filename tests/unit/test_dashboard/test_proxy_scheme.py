@@ -11,7 +11,6 @@ everything as it was on any other input.
 
 from __future__ import annotations
 
-import secrets
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -22,12 +21,12 @@ from httpx import Response
 from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
 from hydra.dashboard.mcp import mount_mcp
+from tests.fixtures.mcp_oauth import OAUTH_ENV, FakeIssuer
 
 from .conftest import TEST_API_TOKEN
 
 TRAEFIK = ("10.10.13.2", 41000)  # the pinned static Traefik address the /32 trusts
 OUTSIDER = ("10.10.16.2", 41000)  # the test edge subnet, but outside the /32
-MCP_TEST_TOKEN = "m" + secrets.token_urlsafe(48)
 NO_SLASH_MCP = "/mcp"  # the recorded bug: the no-slash MCP URL redirect
 PLAIN_API = "/api/strategies/indicators"  # an authenticated route that needs no DB
 REDIRECTS = (NO_SLASH_MCP, PLAIN_API + "/")  # 307 probes: mount redirect + a plain /api one
@@ -47,11 +46,10 @@ def trusted_proxy(bind_api_config: Bind) -> Iterator[HydraConfig]:
         HYDRA_API__AUTH_MODE="proxy",
         HYDRA_API__TRUSTED_PROXY_CIDRS="10.10.13.2/32",
         HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=MCP_TEST_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        **OAUTH_ENV,
     )
     routes_before = list(app.router.routes)
-    mount_mcp(app, cfg)
+    mount_mcp(app, cfg, transport=FakeIssuer().transport)
     yield cfg
     app.router.routes[:] = routes_before
 

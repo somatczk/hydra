@@ -144,7 +144,8 @@ git status --porcelain --untracked-files=all # must print nothing after the test
   to "read it from the config": `src/hydra/core/encryption.py` reads `HYDRA_CREDENTIAL_KEY` (env-only by
   construction) after the lifespan has validated it.
 - **API.** One pure-ASGI auth middleware (`src/hydra/dashboard/security.py`) covers every route and WebSocket except
-  `PUBLIC_PATHS`; the MCP server mounts at `/mcp/` only when `HYDRA_MCP_TOKEN` is set. Errors use one envelope,
+  `PUBLIC_PATHS`; the MCP server mounts at `/mcp/` only when MCP OAuth (`mcp.oauth_issuer`, Authentik) is set, and
+  checks Authentik access tokens itself. Errors use one envelope,
   `{"detail": {"code", "message", "state", ...}}`: services raise `hydra.services.errors.ServiceError`, routes turn it
   into the HTTP error, and the frontend reads it with `dashboard/src/lib/apiState.ts`. Reuse both
   (`src/hydra/dashboard/AGENTS.md`).
@@ -187,9 +188,7 @@ git status --porcelain --untracked-files=all # must print nothing after the test
   containers with `HYDRA_REQUIRE_INFRA=1`, `paper-smoke` ("Paper Smoke", `make smoke`, the P1 acceptance test), and
   `image-smoke`: each image is built without pushing and started (engine against the services with `DATABASE_URL`,
   `REDIS_URL` and a throwaway `HYDRA_CREDENTIAL_KEY`; `/livez` and `/readyz` must be green and every engine and
-  backtest log line must be JSON; a committed throwaway `HYDRA_MCP_TOKEN` mounts `/mcp` and
-  `.github/scripts/mcp_image_smoke.py` drives one real tool call). PR runs read the image build cache but do not
-  write it.
+  backtest log line must be JSON). PR runs read the image build cache but do not write it.
 - `publish` needs every other job and runs only on pushes to `main` and manual dispatch on `main`: it builds
   `hydra-engine`, `hydra-dashboard`, `hydra-backtest`, pushes `main` and `sha-<7>`, and pushes the version tag only if
   it does not exist yet; version tags never move. A push that changes no image input (`IMAGE_INPUTS`, which includes
@@ -206,4 +205,6 @@ auto-merge. It runs the split layout: the engine container with `HYDRA_TRADER__U
 trader runs beside it as the same image with `command: python -m hydra.trader`. Romulus mounts only
 `config/strategies` over the image's `config/`. The engine reads infra only from `DATABASE_URL`, `REDIS_URL`,
 `HYDRA_CREDENTIAL_KEY` (required with a DB; a comma list rotates) and `HYDRA_API_TOKEN`, plus behaviour overrides as
-`HYDRA_<SECTION>__<KEY>`. `HYDRA_DB_*` and `HYDRA_REDIS_URL` are test-infra env only (`tests/infra.py`).
+`HYDRA_<SECTION>__<KEY>`. MCP is an OAuth resource server for Authentik's `hydra-mcp` provider
+(`HYDRA_MCP__OAUTH_ISSUER`, `HYDRA_MCP__OAUTH_AUDIENCE`, `HYDRA_MCP__RESOURCE_URL`; README "Connecting an MCP
+client"). `HYDRA_DB_*` and `HYDRA_REDIS_URL` are test-infra env only (`tests/infra.py`).

@@ -7,8 +7,8 @@ two modes behind the same routes: with ``trader.url`` set (the D5
 process split) a :class:`~hydra.dashboard.trader_client.RemoteTrader` is bound on
 ``app.state.trader`` and no ``SessionManager`` is ever constructed in this process; unset, the
 single-process engine starts here (``SessionManager.startup()``: risk state, recovery, display
-rows) with its ``LocalTrader`` backend. Then the MCP mount (only when ``HYDRA_MCP_TOKEN`` is set:
-no token, no ``/mcp`` surface) and the HealthMonitor (first readiness run; ``/livez`` turns
+rows) with its ``LocalTrader`` backend. Then the MCP mount (only when MCP OAuth is configured:
+no ``/mcp`` surface) and the HealthMonitor (first readiness run; ``/livez`` turns
 green — the engine-side full set, or the split set with the remote-trader check), then the
 universe refresher (the daily top-100 ranking, only with a pool; a refresh failure logs a
 warning and retries hourly, never blocking startup or readiness), then the data-cache
@@ -22,7 +22,7 @@ connected, so it starts here rather than on the first connection, and a failed p
 retried on its next tick, never blocking startup). Shutdown cancels the risk relay first,
 then the funding
 refresher, then the universe refresher, then the cache sweeper, then closes the MCP session
-manager, unmounts ``/mcp`` and
+manager, unmounts ``/mcp`` and its OAuth metadata and
 resets ``app.state.mcp`` (the session manager is
 single-use, so a re-entered lifespan remounts a fresh transport instead of finding the closed
 mount shadowing it), then stops the monitor. Any startup error propagates, so uvicorn exits
@@ -103,7 +103,7 @@ async def run(app: FastAPI) -> AsyncIterator[None]:
             app.state.trader = backend
         else:
             await _init_session_manager(app, cfg, clients)
-        if cfg.mcp_token is not None:
+        if cfg.mcp.oauth_issuer is not None:
             from hydra.dashboard.mcp import mount_mcp
 
             app.state.mcp = mount_mcp(app, cfg)
@@ -379,17 +379,20 @@ async def _start_funding_refresher(app: FastAPI) -> None:
 
 
 def _unmount_mcp(app: FastAPI) -> None:
-    """Detach the ``/mcp`` mount and reset ``app.state.mcp`` to the no-token value.
+    """Detach the ``/mcp`` mount and its metadata routes and reset ``app.state.mcp`` to None.
 
     The session manager is single-use, so leaving the mount behind would shadow the fresh
     one a re-entered lifespan attaches (the first, closed match wins in the route list).
     """
     from starlette.routing import Mount
 
-    from hydra.dashboard.security import MCP_PATH_PREFIX
+    from hydra.dashboard.security import MCP_PATH_PREFIX, PROTECTED_RESOURCE_PATH
 
     app.router.routes[:] = [
-        r for r in app.router.routes if not (isinstance(r, Mount) and r.path == MCP_PATH_PREFIX)
+        r
+        for r in app.router.routes
+        if not (isinstance(r, Mount) and r.path == MCP_PATH_PREFIX)
+        and not getattr(r, "path", "").startswith(PROTECTED_RESOURCE_PATH)
     ]
     app.state.mcp = None
 

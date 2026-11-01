@@ -52,12 +52,13 @@ from hydra.execution.client_factory import ClientFactory, bars_repository
 from hydra.execution.session_manager import SessionManager
 from hydra.risk.state import fetch_risk_events
 from hydra.services.trader import LocalTrader
+from tests.fixtures.mcp_oauth import OAUTH_ENV, TOKEN, FakeIssuer
 from tests.unit.test_execution.session_harness import Harness, write_strategy
 
 pytestmark = pytest.mark.integration
 
 TEST_API_TOKEN = secrets.token_urlsafe(32)
-TEST_MCP_TOKEN = "m" + secrets.token_urlsafe(48)
+TEST_MCP_TOKEN = TOKEN
 ACCEPT_BOTH = "application/json, text/event-stream"
 INITIALIZE = {
     "jsonrpc": "2.0",
@@ -180,8 +181,8 @@ def _bind_engine_state(
     for name in ("HYDRA_ENV", "HYDRA_CONFIG_DIR", "DATABASE_URL", "REDIS_URL", "HYDRA_API_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HYDRA_API_TOKEN", TEST_API_TOKEN)
-    monkeypatch.setenv("HYDRA_MCP_TOKEN", TEST_MCP_TOKEN)
-    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    for name, value in OAUTH_ENV.items():
+        monkeypatch.setenv(name, value)
     cfg = load_config()
     # engine_app serves the approve POST below; its middleware and deps read the config
     monkeypatch.setattr(engine_app.state, "config", cfg)
@@ -199,7 +200,7 @@ async def _mcp_session(cfg: HydraConfig) -> AsyncIterator[_McpClient]:
     mounted = FastAPI()
     install_security(mounted)
     mounted.state.config = cfg
-    mount = mount_mcp(mounted, cfg)
+    mount = mount_mcp(mounted, cfg, transport=FakeIssuer().transport)
     async with (
         mount.session_manager.run(),
         httpx.AsyncClient(

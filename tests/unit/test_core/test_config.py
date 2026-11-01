@@ -186,8 +186,6 @@ class TestFailFast:
             ("DATABASE_URL: postgresql://x/y\n", "DATABASE_URL"),
             ("credential_key: abc\n", "HYDRA_CREDENTIAL_KEY"),
             ("api_token: abc\n", "HYDRA_API_TOKEN"),
-            ("mcp_token: abc\n", "HYDRA_MCP_TOKEN"),
-            ("hydra_mcp_token: abc\n", "HYDRA_MCP_TOKEN"),
             ("exchanges: {}\n", "Settings page"),
         ],
     )
@@ -281,6 +279,7 @@ class TestHydraEnvNames:
             ("HYDRA_TRUSTED_PROXY_CIDRS", "HYDRA_API__TRUSTED_PROXY_CIDRS"),
             ("HYDRA_LOG_LEVEL", "HYDRA_LOGGING__LEVEL"),
             ("HYDRA_DATABASE_DSN", "DATABASE_URL"),
+            ("HYDRA_MCP_TOKEN", "HYDRA_MCP__OAUTH_ISSUER"),
         ],
     )
     def test_retired_name_fails_with_its_replacement(
@@ -380,74 +379,84 @@ class TestApiAuthFields:
 
 
 # ---------------------------------------------------------------------------
-# MCP fields (env-only token; the transport mounts only when it is set)
+# MCP fields (Authentik OAuth; the transport mounts only when it is configured)
 # ---------------------------------------------------------------------------
+
+OAUTH = {
+    "HYDRA_MCP__OAUTH_ISSUER": "https://auth.example.com/application/o/hydra-mcp/",
+    "HYDRA_MCP__OAUTH_AUDIENCE": "hydra-mcp",
+    "HYDRA_MCP__RESOURCE_URL": "https://trading.example.com/mcp",
+    "HYDRA_MCP__ALLOWED_HOSTS": "trading.example.com",
+}
 
 
 class TestMcpFields:
-    def test_short_mcp_token_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HYDRA_MCP_TOKEN", "short")
-        monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "trading.example.com")
-        with pytest.raises(ValidationError, match="32 characters"):
-            load_config()
+    def _set(self, monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
 
-    @pytest.mark.parametrize("value", ["", "   "])
-    def test_blank_token_is_unset(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-        monkeypatch.setenv("HYDRA_MCP_TOKEN", value)
+    def test_unset_means_no_oauth(self) -> None:
         cfg = load_config()
-        assert cfg.mcp_token is None
+        assert (cfg.mcp.oauth_issuer, cfg.mcp.oauth_audience, cfg.mcp.resource_url) == (
+            None,
+            None,
+            None,
+        )
         assert cfg.mcp.allowed_hosts == []
 
-    def test_token_without_allowed_hosts_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HYDRA_MCP_TOKEN", "x" * 48)
-        with pytest.raises(ValidationError, match="HYDRA_MCP__ALLOWED_HOSTS"):
+    def test_full_oauth_loads_verbatim(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._set(monkeypatch, **OAUTH, HYDRA_MCP__REQUIRED_SCOPES="openid, hydra:mcp ,")
+        cfg = load_config()
+        assert cfg.mcp.oauth_issuer == "https://auth.example.com/application/o/hydra-mcp/"
+        assert cfg.mcp.oauth_audience == "hydra-mcp"
+        assert cfg.mcp.resource_url == "https://trading.example.com/mcp"
+        assert cfg.mcp.required_scopes == ["openid", "hydra:mcp"]
+
+    @pytest.mark.parametrize(
+        "drop", ["HYDRA_MCP__OAUTH_ISSUER", "HYDRA_MCP__OAUTH_AUDIENCE", "HYDRA_MCP__RESOURCE_URL"]
+    )
+    def test_half_configured_oauth_fails(self, monkeypatch: pytest.MonkeyPatch, drop: str) -> None:
+        self._set(monkeypatch, **{k: v for k, v in OAUTH.items() if k != drop})
+        with pytest.raises(ValidationError, match="half configured"):
             load_config()
 
-    def test_token_equal_to_api_token_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        token = "y" * 48
-        monkeypatch.setenv("HYDRA_API_TOKEN", token)
-        monkeypatch.setenv("HYDRA_MCP_TOKEN", token)
-        monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "trading.example.com")
-        with pytest.raises(ValidationError, match="must differ from HYDRA_API_TOKEN"):
+    def test_blank_issuer_counts_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._set(monkeypatch, **{**OAUTH, "HYDRA_MCP__OAUTH_ISSUER": "  "})
+        with pytest.raises(ValidationError, match="set oauth_issuer too"):
+            load_config()
+
+    def test_oauth_without_allowed_hosts_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._set(monkeypatch, **{k: v for k, v in OAUTH.items() if "ALLOWED" not in k})
+        with pytest.raises(ValidationError, match=r"mcp\.allowed_hosts"):
+            load_config()
+
+    def test_a_plain_http_issuer_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._set(monkeypatch, **{**OAUTH, "HYDRA_MCP__OAUTH_ISSUER": "http://auth.example.com/"})
+        with pytest.raises(ValidationError, match="https"):
             load_config()
 
     @pytest.mark.parametrize(
-        ("api_value", "mcp_value"),
+        "url",
         [
-            pytest.param("y" * 48, " " + "y" * 48, id="mcp-token-padded-left"),
-            pytest.param("y" * 48, "y" * 48 + " ", id="mcp-token-padded-right"),
-            pytest.param(" " + "y" * 48, "y" * 48, id="api-token-padded-left"),
+            "http://trading.example.com/mcp",
+            "https://trading.example.com/mcp/",
+            "https://trading.example.com/",
+            "https://trading.example.com/api/mcp",
         ],
     )
-    def test_whitespace_padded_tokens_must_differ(
-        self, monkeypatch: pytest.MonkeyPatch, api_value: str, mcp_value: str
+    def test_resource_url_must_be_the_https_mcp_path(
+        self, monkeypatch: pytest.MonkeyPatch, url: str
     ) -> None:
-        """Copy-paste padding must not defeat the A7 guard: strip-compare both sides."""
-        monkeypatch.setenv("HYDRA_API_TOKEN", api_value)
-        monkeypatch.setenv("HYDRA_MCP_TOKEN", mcp_value)
-        monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "trading.example.com")
-        with pytest.raises(ValidationError, match="must differ from HYDRA_API_TOKEN"):
+        self._set(monkeypatch, **{**OAUTH, "HYDRA_MCP__RESOURCE_URL": url})
+        with pytest.raises(ValidationError, match="resource_url"):
             load_config()
-
-    def test_valid_token_and_hosts_load(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HYDRA_MCP_TOKEN", "z" * 48)
-        monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "trading.example.com")
-        cfg = load_config()
-        assert cfg.mcp_token is not None
-        assert cfg.mcp_token.get_secret_value() == "z" * 48
-        assert cfg.mcp.allowed_hosts == ["trading.example.com"]
 
     def test_allowed_hosts_csv_parsing(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HYDRA_MCP_TOKEN", "z" * 48)
-        monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "trading.example.com, localhost , ,")
-        cfg = load_config()
-        assert cfg.mcp.allowed_hosts == ["trading.example.com", "localhost"]
-
-    def test_unknown_nested_mcp_key_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HYDRA_MCP__FOO", "x")
-        with pytest.raises(ValidationError) as exc_info:
-            load_config()
-        assert (("mcp", "foo"), "extra_forbidden") in _loc_types(exc_info.value)
+        self._set(
+            monkeypatch,
+            **{**OAUTH, "HYDRA_MCP__ALLOWED_HOSTS": "trading.example.com, localhost , ,"},
+        )
+        assert load_config().mcp.allowed_hosts == ["trading.example.com", "localhost"]
 
 
 class TestDataFields:

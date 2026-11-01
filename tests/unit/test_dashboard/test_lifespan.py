@@ -19,8 +19,9 @@ from pydantic import ValidationError
 from hydra.core.config import ConfigError, HydraConfig
 from hydra.core.encryption import CredentialKeyError, encrypt
 from hydra.dashboard import lifespan
+from tests.fixtures.mcp_oauth import OAUTH_ENV, TOKEN, FakeIssuer, serve_lifespan_issuer
 
-MCP_TEST_TOKEN = "t" * 48
+MCP_TEST_TOKEN = TOKEN
 MCP_INITIALIZE = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -193,26 +194,32 @@ async def test_system_config_values_are_json_decoded() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _oauth_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configure MCP OAuth and serve the lifespan's token checks from an in-process issuer."""
+    for name, value in OAUTH_ENV.items():
+        monkeypatch.setenv(name, value)
+    serve_lifespan_issuer(monkeypatch, FakeIssuer())
+
+
 def _mcp_mounts(app: FastAPI) -> list[Any]:
     """The routes the lifespan attached at ``/mcp`` (only the mount ever matches)."""
     return [r for r in app.router.routes if getattr(r, "path", "") == "/mcp"]
 
 
-async def test_no_mcp_token_mounts_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_no_mcp_oauth_mounts_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     app = FastAPI()
     async with lifespan.run(app):
         assert getattr(app.state, "mcp", None) is None
         assert not [r for r in app.router.routes if getattr(r, "path", "") == "/mcp"]
 
 
-async def test_mcp_token_mounts_the_transport(
+async def test_mcp_oauth_mounts_the_transport(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
-    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    _oauth_env(monkeypatch)
     app = FastAPI()
     with caplog.at_level(logging.ERROR, logger="hydra.dashboard.mcp"):
         async with lifespan.run(app):
@@ -238,10 +245,9 @@ async def test_mcp_token_mounts_the_transport(
 async def test_mcp_mount_is_unmounted_after_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After the lifespan exits the surface is gone: no route, no state, /mcp 404s."""
+    """After the lifespan exits the surface is gone: no route, no state, /mcp and metadata 404."""
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
-    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    _oauth_env(monkeypatch)
     app = FastAPI()
     async with lifespan.run(app):
         assert len(_mcp_mounts(app)) == 1
@@ -256,6 +262,8 @@ async def test_mcp_mount_is_unmounted_after_shutdown(
             json=MCP_INITIALIZE,
         )
         assert response.status_code == 404
+        metadata = await client.get("/.well-known/oauth-protected-resource/mcp")
+        assert metadata.status_code == 404
 
 
 async def test_mcp_lifespan_reentry_serves_a_fresh_mount(
@@ -263,8 +271,7 @@ async def test_mcp_lifespan_reentry_serves_a_fresh_mount(
 ) -> None:
     """run() is re-enterable on one app: the closed mount must not shadow the new one."""
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
-    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    _oauth_env(monkeypatch)
     app = FastAPI()
     for _ in range(2):
         async with lifespan.run(app):
@@ -296,8 +303,7 @@ async def test_startup_failure_after_mount_still_unmounts(
             pass
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("HYDRA_MCP_TOKEN", MCP_TEST_TOKEN)
-    monkeypatch.setenv("HYDRA_MCP__ALLOWED_HOSTS", "testserver")
+    _oauth_env(monkeypatch)
     app = FastAPI()
     app.state.health_monitor_factory = lambda _app: BrokenMonitor()
     with pytest.raises(RuntimeError, match="monitor exploded"):
@@ -402,7 +408,7 @@ async def test_the_fanout_flag_on_refuses_startup_when_redis_is_unreachable(
     import redis
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     monkeypatch.setenv("HYDRA_EVENTS__BUS", "redis")
     monkeypatch.setenv("REDIS_URL", _closed_redis_url())
     monkeypatch.setattr(lifespan, "REDIS_CONNECT_BUDGET_S", 0.2)
@@ -418,7 +424,7 @@ async def test_a_reachable_redis_lets_startup_through_the_fanout_flag(
 ) -> None:
     """The happy path of the ping step: budget spent, startup proceeds (dev mode)."""
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     calls: list[str] = []
 
     async def fake_require_redis(url: str, *, budget_s: float = 30.0) -> None:
@@ -436,7 +442,7 @@ async def test_the_redis_bus_without_redis_url_is_a_config_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     monkeypatch.setenv("HYDRA_EVENTS__BUS", "redis")
     monkeypatch.delenv("REDIS_URL", raising=False)
     app = FastAPI()
@@ -463,7 +469,7 @@ async def test_remote_mode_binds_a_remote_trader_and_never_builds_an_engine(
         raise AssertionError("a SessionManager was constructed in the API process")
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     monkeypatch.setenv("HYDRA_TRADER__URL", "http://trader:8000")
     monkeypatch.setenv("HYDRA_API_TOKEN", "t" * 48)
     monkeypatch.setattr(session_manager_mod, "SessionManager", no_engine)
@@ -486,7 +492,7 @@ async def test_single_process_mode_still_builds_the_local_engine(
     from hydra.services.trader import LocalTrader
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     monkeypatch.delenv("HYDRA_TRADER__URL", raising=False)
     app = FastAPI()
     async with lifespan.run(app):
@@ -576,7 +582,7 @@ async def test_the_sweeper_starts_after_the_refresher_and_stops_before_the_pool(
         monkeypatch.setattr(lifespan, name, _recorder(order, label))
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     app = FastAPI()
     async with lifespan.run(app):
         assert order == ["start-monitor", "start-refresher", "start-sweeper", "start-funding"]
@@ -653,7 +659,7 @@ async def test_a_running_lifespan_leaves_no_funding_refresher_without_a_pool(
 ) -> None:
     """Dev mode (no DATABASE_URL) starts no funding task; state stays None."""
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     app = FastAPI()
     async with lifespan.run(app):
         assert getattr(app.state, "funding_refresher", None) is None
@@ -727,7 +733,7 @@ async def test_a_running_lifespan_starts_the_risk_relay_and_stops_it(
             self.closed = True
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     app = FastAPI()
     fake = _FakeRiskRelay()
     app.state.risk_relay_factory = lambda _app: fake
@@ -745,7 +751,7 @@ async def test_a_running_lifespan_leaves_no_risk_relay_without_a_pool(
 ) -> None:
     """Dev mode (no DATABASE_URL) starts no risk relay; state stays None."""
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("HYDRA_MCP_TOKEN", raising=False)
+    monkeypatch.delenv("HYDRA_MCP__OAUTH_ISSUER", raising=False)
     app = FastAPI()
     async with lifespan.run(app):
         assert getattr(app.state, "risk_relay", None) is None
