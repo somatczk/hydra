@@ -77,6 +77,6 @@ An alpaca strategy backtests on the same executor and rules, with these venue fa
   step 1, minimum 1 share, $0.01 tick, no minimum notional). $100,000 × 10 % at $523.07 buys 19 shares.
 - **A 252-day year.** Metrics annualise over 252 trading days, not 365, and weekends are not data gaps (exchange
   holidays still count as one).
-- **Data caveats.** Alpaca's 1Day volume includes extended-hours trading, so the volume cap and the volume
-  indicators see a few percent more than regular-session volume (about 3 % on a sampled AAPL session). The 1Day
-  close is Alpaca's consolidated last sale, which can differ from the official closing-auction price.
+- **Data caveats.** Alpaca's 1Day volume includes extended-hours trading, about 3 % above regular-session volume
+  on a sampled day; the volume fill cap and the volume indicators see it. The 1Day close is Alpaca's consolidated
+  last sale, which can differ from the official closing-auction price.
