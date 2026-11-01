@@ -720,3 +720,14 @@ class TestReferenceValues:
             ann = result.annualized_return
             for value in (ann, result.sharpe_ratio, result.sortino_ratio, result.calmar_ratio):
                 assert value is None or math.isfinite(value)
+
+
+def test_stock_daily_metrics_annualise_over_252_trading_days() -> None:
+    """The venue's year_days sets ppy: on the same daily curve the Sharpe ratios differ by
+    exactly sqrt(252 / 365) and annualized_return compounds over 252 bars, not 365."""
+    curve = [Decimal(v) for v in ("100000", "101000", "100500", "102000", "101800", "103000")]
+    crypto = calculate_metrics(curve, [], timeframe=Timeframe.D1)
+    stocks = calculate_metrics(curve, [], timeframe=Timeframe.D1, year_days=252)
+    assert stocks.sharpe_ratio / crypto.sharpe_ratio == pytest.approx(math.sqrt(252 / 365))
+    assert float(stocks.annualized_return) == pytest.approx(1.03 ** (252 / 5) - 1)
+    assert float(crypto.annualized_return) == pytest.approx(1.03 ** (365 / 5) - 1)

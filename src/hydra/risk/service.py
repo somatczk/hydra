@@ -29,6 +29,7 @@ from typing import Any, Literal, Protocol
 from hydra.core import metrics
 from hydra.core.events import OrderFillEvent
 from hydra.core.types import Direction, OrderRequest, Position
+from hydra.core.venues import find_venue, venue_market_type
 from hydra.risk.circuit_breakers import (
     TIER_ACTIONS,
     TIER_LABELS,
@@ -63,6 +64,14 @@ logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("hydra.audit")
 
 QUOTE = "USDT"
+
+
+def _quote(exchange_id: str) -> str:
+    """The session venue's quote currency: USDT for the crypto venues, USD for alpaca."""
+    spec = find_venue(exchange_id, venue_market_type(exchange_id))
+    return QUOTE if spec is None else spec.quote_asset
+
+
 ENGINE_ACTOR = "risk_engine"
 SYSTEM_ACTOR = "system"
 RATE_WINDOW = timedelta(minutes=1)
@@ -389,7 +398,7 @@ class RiskService:
         balances = await session.executor.get_balance()
         positions = await session.executor.get_positions()
         marks = self._marks_for(session.exchange_id)
-        equity = balances.get(QUOTE, Decimal("0"))
+        equity = balances.get(_quote(session.exchange_id), Decimal("0"))
         for pos in positions:
             if pos.direction == Direction.FLAT or pos.quantity <= 0:
                 continue
@@ -606,7 +615,7 @@ class RiskService:
             portfolio_value=snap.equity,
             positions=positions,
             balances=balances,
-            spendable_balance=free.get(QUOTE),
+            spendable_balance=free.get(_quote(session.exchange_id)),
             marks=self._marks_for(session.exchange_id),
             sleeve_equity=sleeve,
             account_positions=account_positions,
@@ -615,7 +624,7 @@ class RiskService:
             state_available=self.available,
             opening_orders_last_minute=self._openings(session, now),
             market_rules=session.rules,
-            quote_currency=QUOTE,
+            quote_currency=_quote(session.exchange_id),
             leverage=session.leverage,
             strategy_limits=self._strategy_overrides.get(session.strategy_id, StrategyLimits()),
         )
@@ -671,7 +680,7 @@ class RiskService:
             mark=mark,
             size_multiplier=self._cb.restrictions(self._clock()).position_size_multiplier,
             rules=rules,
-            quote_balance=balances.get(QUOTE, Decimal("0")),
+            quote_balance=balances.get(_quote(session.exchange_id), Decimal("0")),
             fee_buffer=self._config.fee_buffer,
         )
 

@@ -22,7 +22,7 @@ from hydra.backtest.fills import CommissionConfig
 from hydra.backtest.metrics import BacktestResult
 from hydra.backtest.runner import BacktestRunner, StrategyError
 from hydra.core.events import BarEvent, EntrySignal, ExitSignal, OrderFillEvent
-from hydra.core.types import OHLCV, Direction, MarketType, Position, Side
+from hydra.core.types import OHLCV, Direction, MarketType, Position, Side, Timeframe
 from hydra.execution import client_factory
 from hydra.execution.errors import UnsupportedVenueError
 from hydra.execution.paper_trading import PaperFill, PaperTradingExecutor
@@ -320,13 +320,30 @@ async def test_bybit_config_is_rejected_as_the_live_only_venue() -> None:
         await _run(config=config)
 
 
-async def test_an_alpaca_strategy_builds_its_runtime_without_ccxt(
+# five NYSE sessions of daily bars (00:00 UTC of the session date), warm-up flat at 500
+_DAY = timedelta(days=1)
+_D0 = datetime(2024, 3, 4, tzinfo=UTC)
+STOCK_BARS = [
+    OHLCV(open=D(o), high=D(h), low=D(lo), close=D(c), volume=D("1000"), timestamp=_D0 + i * _DAY)
+    for i, (o, h, lo, c) in enumerate(
+        [
+            ("500", "500", "500", "500"),
+            ("500", "500", "500", "500"),
+            ("523.07", "523.07", "523.07", "523.07"),  # the signal bar: entry at its close
+            ("525", "531", "524", "530"),
+            ("480", "485", "470", "475"),  # gaps down through the 5 % stop
+        ]
+    )
+]
+
+
+async def test_an_alpaca_daily_backtest_trades_whole_shares_in_usd_without_fees(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """alpaca is backtest-only with no ccxt client: the runner builds the paper runtime
-    (static whole-share rules, the feed's class never resolved) and the first bar reaches
-    the executor, which still books in USDT — the USD quote is S1 (c), so the run stops
-    there by name, flat."""
+    """alpaca on the paper core with no ccxt client (the feed class never resolves): the
+    USD quote, whole shares ($100k x 10 % / $523.07 -> 19), a market-on-close entry at
+    523.07 x 1.001, the gap through the 5 % stop filled at the open x (1 - 0.001), and
+    zero fees, so pnl = (exit - entry) x qty."""
 
     def no_ccxt(*args: Any, **kwargs: Any) -> str:
         pytest.fail(f"resolved a ccxt class for {args}")
@@ -337,17 +354,37 @@ async def test_an_alpaca_strategy_builds_its_runtime_without_ccxt(
         parameters={
             "required_history": 2,
             "rules": {
-                "entry_long": _rule("greater_than", 1000),
+                "entry_long": _rule("greater_than", 510),
                 "exit_long": _rule("greater_than", 2000),
             },
         },
     )
-    result = await _run(config=config, symbol="AAPL/USD")
-    assert result.stopped_reason == (
-        "paper executor failed on a closed bar: AAPL/USD is not a USDT-quoted spot symbol"
+    result = await BacktestRunner().run(
+        RuleBasedStrategy,
+        config,
+        STOCK_BARS,
+        initial_capital=D("100000"),
+        symbol="AAPL/USD",
+        timeframe=Timeframe.D1,
+        warmup_bars=2,
     )
-    assert result.trades == []
-    assert result.equity_curve == [D("10000")]
+    entry, exit_ = D("523.07") * D("1.001"), D("480") * D("0.999")
+    assert (entry, exit_) == (D("523.59307"), D("479.520"))
+    assert _fills(result) == [
+        (STOCK_BARS[2].timestamp.isoformat(), "Buy", 19.0, 523.59307, 0.0),
+        (STOCK_BARS[4].timestamp.isoformat(), "Sell", 19.0, 479.52, 0.0),
+    ]
+    [trade] = result.trades
+    assert (trade.entry_price, trade.exit_price, trade.quantity) == (entry, exit_, D("19"))
+    assert trade.fees == 0
+    assert trade.pnl == (exit_ - entry) * 19 == D("-837.38833")
+    cash = D("100000") - 19 * entry
+    assert result.equity_curve == [
+        cash + 19 * D("523.07"),
+        cash + 19 * D("530"),
+        D("100000") + trade.pnl,
+    ]
+    assert result.stopped_reason is None
 
 
 async def test_position_sizing_is_honoured() -> None:

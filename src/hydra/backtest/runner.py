@@ -27,6 +27,7 @@ from hydra.core import metrics
 from hydra.core.config import HydraConfig
 from hydra.core.events import BarEvent
 from hydra.core.types import OHLCV, Direction, MarketType, Symbol, Timeframe
+from hydra.core.venues import VENUES, AssetClass
 from hydra.data.bars import close_time, timeframe_seconds
 from hydra.execution.client_factory import ClientFactory, validate_venue
 from hydra.execution.fill_rules import DEFAULT_MAX_PARTICIPATION
@@ -53,6 +54,7 @@ _MARKET_RULES = MarketRulesCache()
 _ENGINE_CONFIG = HydraConfig.model_construct()
 _NO_DRAWDOWN_TIERS = Decimal(1000)  # tier 1 needs a 200x drawdown: unreachable on spot
 _YIELD_EVERY = 100
+_ZERO_FEES = CommissionConfig(spot_maker=Decimal(0), spot_taker=Decimal(0))
 
 
 class _QuietWhileMuted(logging.Filter):
@@ -138,9 +140,19 @@ class BacktestRunner:
         exchange_id = validate_venue(
             cfg.exchange.exchange_id, cfg.exchange.market_type, mode="backtest"
         )
+        venue = VENUES[(exchange_id, cfg.exchange.market_type)]
         traded = bars[warmup_bars:]
         if not traded:
-            return calculate_metrics(equity_curve=[initial_capital], trades=[], timeframe=timeframe)
+            return calculate_metrics(
+                equity_curve=[initial_capital],
+                trades=[],
+                timeframe=timeframe,
+                year_days=venue.year_days,
+            )
+        if commission is None and venue.asset_class is AssetClass.US_EQUITY:
+            # shortcut: US stocks trade fee-free here; the SEC fee and FINRA TAF on sells are
+            # ignored, model them if a strategy's sell notional makes them material
+            commission = _ZERO_FEES
         comm = commission or CommissionConfig()
         step = timedelta(seconds=timeframe_seconds(timeframe))
         now = [traded[0].timestamp]
@@ -178,7 +190,8 @@ class BacktestRunner:
             else:
                 executor = PaperTradingExecutor(
                     exchange_id=exchange_id,
-                    initial_balances={"USDT": initial_capital},
+                    initial_balances={venue.quote_asset: initial_capital},
+                    quote_asset=venue.quote_asset,
                     slippage_pct=slippage_pct,
                     strategy_id=cfg.id,
                     session_id=session_id,
@@ -290,6 +303,7 @@ class BacktestRunner:
             timestamps=timestamps,
             benchmark_prices=[b.close for b in traded[: len(equity)]],
             initial_capital=initial_capital,
+            year_days=venue.year_days,
         )
         result.stopped_reason = stopped_reason
         result.transactions = transactions

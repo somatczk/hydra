@@ -359,7 +359,7 @@ class HyperoptRunner:
         commission: CommissionConfig | None = None,
     ) -> None:
         self._runner = backtest_runner or BacktestRunner()
-        self._commission = commission or CommissionConfig()
+        self._commission = commission
 
     async def run(
         self,
