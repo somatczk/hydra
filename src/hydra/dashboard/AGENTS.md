@@ -12,7 +12,8 @@ uv run mypy src/hydra/dashboard/ --strict   # the package is on CI's strict line
 
 ## Invariants
 - Auth is one pure-ASGI middleware, `security.py`. Every HTTP and WebSocket path needs a principal except
-  `PUBLIC_PATHS` (`/livez`, `/readyz`, `/metrics`) and the MCP mount (`MCP_PATH_PREFIX`, `/mcp` and `/mcp/...`)
+  `PUBLIC_PATHS` (`/livez`, `/readyz`, `/metrics` and the two RFC 9728 metadata paths
+  `/.well-known/oauth-protected-resource[/mcp]`) and the MCP mount (`MCP_PATH_PREFIX`, `/mcp` and `/mcp/...`)
   (`test_auth_coverage.py::test_public_paths_are_exactly_the_reviewed_list`, `::test_every_operation_needs_credentials`).
 - Principals: `service` (bearer `HYDRA_API_TOKEN`, constant-time compare), `user` (`Remote-User` from a TCP peer in
   `api.trusted_proxy_cidrs`, proxy mode only), `dev` (anyone, `api.auth_mode: dev`, local compose only).
@@ -28,10 +29,14 @@ uv run mypy src/hydra/dashboard/ --strict   # the package is on CI's strict line
   request with `deps.current_config`.
 - With `trader.url` set the lifespan binds `trader_client.RemoteTrader` and never builds a SessionManager; a
   transport error or timeout is 503 `engine_unreachable` (`test_trader_client.py`).
-- MCP: one shared `MCPServer('hydra')` in `mcp/__init__.py`, mounted at `/mcp/` only when the env-only
-  `HYDRA_MCP_TOKEN` is set (at least 32 chars, different from `HYDRA_API_TOKEN`, needs `mcp.allowed_hosts`).
-  `mcp/auth.py` does its own constant-time bearer check and binds `Principal('service', 'mcp')`; no CSRF, WebSocket
-  upgrades closed (`test_mcp_transport.py::test_no_token_mounts_no_mcp_surface`, `::test_bearer_failures_are_401_envelopes`).
+- MCP: one shared `MCPServer('hydra')` in `mcp/__init__.py`, mounted at `/mcp/` (plus its RFC 9728 metadata) only
+  when MCP OAuth is configured (`mcp.oauth_issuer`, `mcp.oauth_audience`, `mcp.resource_url`, all or none; needs
+  `mcp.allowed_hosts`). Authentik is the authorization server; `mcp/auth.py` verifies each access token with
+  `mcp/tokens.py` (RS256 via the issuer's JWKS, exact `iss`, `aud`, `exp`, required scopes) and binds
+  `Principal('service', 'mcp')`, never `user`, so an agent cannot approve its own gated actions; no CSRF, WebSocket
+  upgrades closed (`test_mcp_oauth.py`, `test_mcp_transport.py::test_no_oauth_mounts_no_mcp_surface`,
+  `::test_bearer_failures_are_401_envelopes_naming_the_metadata`). Tests sign tokens against
+  `tests/fixtures/mcp_oauth.py`'s in-process issuer and pass its `transport` to `mount_mcp`.
 - New MCP tools go in a module under `mcp/tools/` (`live`, `models`, `research`, `risk`, `sessions`,
   `strategies`; shared engine bindings in `_deps.py`), imported by `mcp/tools/__init__.py`. A gated tool creates an
   approval in the engine's `ApprovalStore` and answers `approval_required`; the action runs only through the

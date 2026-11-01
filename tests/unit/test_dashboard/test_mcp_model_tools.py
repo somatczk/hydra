@@ -37,10 +37,11 @@ from hydra.services import models as models_svc
 from hydra.strategy.builtin.ml_ensemble import DEFAULT_REQUIRED_HISTORY, STRATEGY_CLASS
 from hydra.strategy.config import StrategyConfig
 from hydra.strategy.ml_access import MlModelNotAttachedError, _reset_providers, provider_for
+from tests.fixtures.mcp_oauth import OAUTH_ENV
 from tests.fixtures.ml_onnx import confidence_onnx, frozen_spec_metadata
 
 from .conftest import TEST_API_TOKEN
-from .test_mcp_tools import MODEL_TOOLS, TEST_MCP_TOKEN, Bind, _async_mcp
+from .test_mcp_tools import MODEL_TOOLS, Bind, _async_mcp
 
 _UNIVERSE = {
     "exchange_id": "binance",
@@ -248,8 +249,7 @@ def mcp_cfg(bind_api_config: Bind) -> HydraConfig:
     return bind_api_config(
         HYDRA_API__AUTH_MODE="dev",
         HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        **OAUTH_ENV,
     )
 
 

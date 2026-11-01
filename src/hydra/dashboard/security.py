@@ -1,9 +1,9 @@
 """API authentication, CSRF and CORS for the engine, as pure ASGI middleware.
 
-Every HTTP and WebSocket request needs a principal, except the paths in ``PUBLIC_PATHS`` and the
-paths owned by the MCP mount (``/mcp`` and ``/mcp/...``, when ``HYDRA_MCP_TOKEN`` is set): the
-mount runs its own constant-time bearer check against ``HYDRA_MCP_TOKEN``
-(``hydra.dashboard.mcp.auth``), a different token from ``HYDRA_API_TOKEN``.
+Every HTTP and WebSocket request needs a principal, except the paths in ``PUBLIC_PATHS`` (the
+probes, metrics and the two RFC 9728 OAuth metadata documents for ``/mcp``) and the paths owned
+by the MCP mount (``/mcp`` and ``/mcp/...``, when MCP OAuth is configured): the mount checks
+Authentik access tokens itself (``hydra.dashboard.mcp.auth``).
 
 - ``service``: ``Authorization: Bearer <HYDRA_API_TOKEN>`` (constant-time compare);
 - ``user``: a ``Remote-User`` header from a TCP peer inside ``api.trusted_proxy_cidrs``
@@ -43,8 +43,17 @@ from hydra.dashboard.routes._db import ErrorState, error_detail, unauthenticated
 logger = logging.getLogger(__name__)
 audit_logger = get_logger("hydra.audit")
 
-PUBLIC_PATHS: frozenset[str] = frozenset({"/livez", "/readyz", "/metrics"})
 MCP_PATH_PREFIX = "/mcp"
+PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
+PUBLIC_PATHS: frozenset[str] = frozenset(
+    {
+        "/livez",
+        "/readyz",
+        "/metrics",
+        PROTECTED_RESOURCE_PATH,
+        PROTECTED_RESOURCE_PATH + MCP_PATH_PREFIX,
+    }
+)
 SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 CSRF_HEADER = "x-hydra-request"
 ALLOWED_FETCH_SITES: frozenset[str] = frozenset({"same-origin", "none"})

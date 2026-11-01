@@ -3,13 +3,13 @@
 The positive tests run through a real FastAPI app assembled the way the engine assembles
 it — the real SecurityMiddleware (so the ``/mcp`` bypass is on the request path), the real
 mount and the real session manager entered by the app's lifespan — while the no-token case
-runs against the real API app. Bearer failures are asserted on the shared error envelope.
+runs against the real API app. Tokens are real RS256 access tokens checked against the
+in-process issuer of ``tests.fixtures.mcp_oauth``; failures are asserted on the shared envelope.
 """
 
 from __future__ import annotations
 
 import json
-import secrets
 from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -24,10 +24,12 @@ from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
 from hydra.dashboard.mcp import mount_mcp
 from hydra.dashboard.security import install_security
+from tests.fixtures.mcp_oauth import ISSUER, OAUTH_ENV, RESOURCE_URL, TOKEN, FakeIssuer, mint
 
 from .conftest import TEST_API_TOKEN
 
-TEST_MCP_TOKEN = "m" + secrets.token_urlsafe(48)
+TEST_MCP_TOKEN = TOKEN
+METADATA_URL = "https://testserver/.well-known/oauth-protected-resource/mcp"
 ACCEPT_BOTH = "application/json, text/event-stream"
 INITIALIZE = {
     "jsonrpc": "2.0",
@@ -43,12 +45,13 @@ INITIALIZE = {
 Bind = Callable[..., HydraConfig]
 
 
-def _mounted_app(cfg: HydraConfig) -> FastAPI:
+def _mounted_app(cfg: HydraConfig, issuer: FakeIssuer | None = None) -> FastAPI:
     """A FastAPI app with the security stack and the MCP mount, as the engine assembles it."""
+    transport = (issuer or FakeIssuer()).transport
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Iterator[None]:
-        mount = mount_mcp(app, cfg)
+        mount = mount_mcp(app, cfg, transport=transport)
         async with mount.session_manager.run():
             yield
 
@@ -83,20 +86,17 @@ def _sse_json(response: Response) -> Any:
 
 @pytest.fixture()
 def mcp_app(bind_api_config: Bind) -> FastAPI:
-    cfg = bind_api_config(
-        HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
-    )
+    cfg = bind_api_config(HYDRA_API_TOKEN=TEST_API_TOKEN, **OAUTH_ENV)
     return _mounted_app(cfg)
 
 
-def test_no_token_mounts_no_mcp_surface() -> None:
-    """Without HYDRA_MCP_TOKEN nothing is mounted: /mcp 404s for an authenticated caller."""
+def test_no_oauth_mounts_no_mcp_surface() -> None:
+    """Without MCP OAuth nothing is mounted: /mcp and its metadata 404 for any caller."""
     assert getattr(app.state, "mcp", None) is None
     client = TestClient(app)  # the conftest's default: the REST bearer service principal
     assert client.get("/mcp").status_code == 404
     assert client.post("/mcp/", json=INITIALIZE).status_code == 404
+    assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 404
 
 
 def test_initialize_returns_server_info_and_capabilities(mcp_app: FastAPI) -> None:
@@ -134,23 +134,30 @@ def test_tools_list_returns_the_registered_tools(mcp_app: FastAPI) -> None:
     assert {"live_session_start", "live_order"} <= set(names)
 
 
+NO_TOKEN = f'Bearer resource_metadata="{METADATA_URL}"'
+BAD_TOKEN = f'Bearer error="invalid_token", resource_metadata="{METADATA_URL}"'
+
+
 @pytest.mark.parametrize(
-    ("headers", "code"),
+    ("headers", "challenge"),
     [
-        pytest.param({}, "invalid_token", id="no-authorization"),
+        pytest.param({}, NO_TOKEN, id="no-authorization"),
+        pytest.param({"Authorization": "Basic dXNlcjpwYXNz"}, NO_TOKEN, id="non-bearer"),
         pytest.param(
             {"Authorization": f"Bearer {TEST_API_TOKEN}"},
-            "invalid_token",
-            id="rest-api-token-is-not-the-mcp-token",
+            BAD_TOKEN,
+            id="rest-api-token-is-not-an-access-token",
         ),
+        pytest.param({"Authorization": f"Bearer {'wrong' * 12}"}, BAD_TOKEN, id="wrong-token"),
         pytest.param(
-            {"Authorization": f"Bearer {'wrong' * 12}"}, "invalid_token", id="wrong-token"
+            {"Authorization": f"Bearer {mint(aud='another-client')}"},
+            BAD_TOKEN,
+            id="token-for-another-client",
         ),
-        pytest.param({"Authorization": "Basic dXNlcjpwYXNz"}, "invalid_token", id="non-bearer"),
     ],
 )
-def test_bearer_failures_are_401_envelopes(
-    mcp_app: FastAPI, headers: dict[str, str], code: str
+def test_bearer_failures_are_401_envelopes_naming_the_metadata(
+    mcp_app: FastAPI, headers: dict[str, str], challenge: str
 ) -> None:
     with TestClient(mcp_app) as client:
         response = client.post(
@@ -160,9 +167,38 @@ def test_bearer_failures_are_401_envelopes(
         )
     assert response.status_code == 401
     detail = response.json()["detail"]
-    assert detail["code"] == code
+    assert detail["code"] == "invalid_token"
     assert detail["state"] == "unauthenticated"
-    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.headers["www-authenticate"] == challenge
+
+
+def test_protected_resource_metadata_is_public_at_both_paths(mcp_app: FastAPI) -> None:
+    """RFC 9728 discovery: no credentials, the resource and its Authentik issuer, nothing else."""
+    with TestClient(mcp_app) as client:
+        for path in (
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+        ):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            body = response.json()
+            assert body["resource"] == RESOURCE_URL
+            assert body["authorization_servers"] == [ISSUER]
+            assert body["bearer_methods_supported"] == ["header"]
+            assert "jwks_uri" not in body
+
+
+def test_unreachable_issuer_is_a_503_never_a_pass(bind_api_config: Bind) -> None:
+    cfg = bind_api_config(HYDRA_API_TOKEN=TEST_API_TOKEN, **OAUTH_ENV)
+    issuer = FakeIssuer()
+    issuer.down = True
+    with TestClient(_mounted_app(cfg, issuer)) as client:
+        response = _post_mcp(client, INITIALIZE)
+    assert response.status_code == 503
+    assert (response.json()["detail"]["code"], response.json()["detail"]["state"]) == (
+        "auth_unavailable",
+        "unavailable",
+    )
 
 
 def test_duplicate_authorization_header_is_400(mcp_app: FastAPI) -> None:
@@ -186,24 +222,11 @@ def test_duplicate_authorization_header_is_400(mcp_app: FastAPI) -> None:
 def test_disallowed_host_is_421(bind_api_config: Bind) -> None:
     """The SDK's DNS-rebinding protection: a Host outside allowed_hosts is misdirected."""
     cfg = bind_api_config(
-        HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=TEST_MCP_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="other.example",
+        HYDRA_API_TOKEN=TEST_API_TOKEN, **{**OAUTH_ENV, "HYDRA_MCP__ALLOWED_HOSTS": "other.example"}
     )
     with TestClient(_mounted_app(cfg)) as client:  # TestClient sends Host: testserver
         response = _post_mcp(client, INITIALIZE)
     assert response.status_code == 421
-
-
-def test_mount_without_config_refuses_everything(bind_api_config: Bind) -> None:
-    """No config on the app: the gate stays closed (auth_not_configured)."""
-    cfg = bind_api_config(HYDRA_MCP_TOKEN=TEST_MCP_TOKEN, HYDRA_MCP__ALLOWED_HOSTS="testserver")
-    unconfigured = _mounted_app(cfg)
-    unconfigured.state.config = None
-    with TestClient(unconfigured) as client:
-        response = _post_mcp(client, INITIALIZE)
-    assert response.status_code == 401
-    assert response.json()["detail"]["code"] == "auth_not_configured"
 
 
 @pytest.mark.parametrize(

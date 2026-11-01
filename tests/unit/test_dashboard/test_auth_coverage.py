@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import secrets
 from collections.abc import AsyncIterator, Callable
 
 import pytest
@@ -25,10 +24,17 @@ from hydra.core.config import HydraConfig
 from hydra.dashboard.api import app
 from hydra.dashboard.mcp import mount_mcp
 from hydra.dashboard.security import PUBLIC_PATHS
+from tests.fixtures.mcp_oauth import OAUTH_ENV, FakeIssuer
 
 from .conftest import TEST_API_TOKEN
 
-EXPECTED_PUBLIC = {"/livez", "/readyz", "/metrics"}
+EXPECTED_PUBLIC = {
+    "/livez",
+    "/readyz",
+    "/metrics",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp",
+}
 DOC_PATHS = ["/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"]
 EXPECTED_WS = {"/ws/market", "/ws/trades", "/ws/portfolio", "/ws/signals", "/ws/risk"}
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
@@ -174,7 +180,6 @@ def test_validation_errors_use_the_envelope_through_the_full_stack() -> None:
 # The MCP mount's share of the surface (the /mcp bypass is reviewed, not public)
 # ---------------------------------------------------------------------------
 
-MCP_TEST_TOKEN = "m" + secrets.token_urlsafe(48)
 MCP_JSON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 
 
@@ -190,11 +195,10 @@ def test_anonymous_mcp_request_is_refused_by_the_mounts_own_token_check(
     """The SecurityMiddleware bypass must not open a door: the mount 401s everything itself."""
     cfg = bind_api_config(
         HYDRA_API_TOKEN=TEST_API_TOKEN,
-        HYDRA_MCP_TOKEN=MCP_TEST_TOKEN,
-        HYDRA_MCP__ALLOWED_HOSTS="testserver",
+        **OAUTH_ENV,
     )
     routes_before = list(app.router.routes)
-    mount_mcp(app, cfg)
+    mount_mcp(app, cfg, transport=FakeIssuer().transport)
     try:
         anonymous = TestClient(app).post("/mcp/", json={}, headers=MCP_JSON_HEADERS)
         rest_service = TestClient(app).post(
@@ -204,7 +208,7 @@ def test_anonymous_mcp_request_is_refused_by_the_mounts_own_token_check(
         )
         assert anonymous.status_code == 401
         assert anonymous.json()["detail"]["code"] == "invalid_token"
-        assert rest_service.status_code == 401  # the REST token is not the MCP token
+        assert rest_service.status_code == 401  # the REST token is not an Authentik token
         assert rest_service.json()["detail"]["code"] == "invalid_token"
     finally:
         app.router.routes[:] = routes_before
