@@ -205,4 +205,6 @@ auto-merge. It runs the split layout: the engine container with `HYDRA_TRADER__U
 trader runs beside it as the same image with `command: python -m hydra.trader`. Romulus mounts only
 `config/strategies` over the image's `config/`. The engine reads infra only from `DATABASE_URL`, `REDIS_URL`,
 `HYDRA_CREDENTIAL_KEY` (required with a DB; a comma list rotates) and `HYDRA_API_TOKEN`, plus behaviour overrides as
-`HYDRA_<SECTION>__<KEY>`. `HYDRA_DB_*` and `HYDRA_REDIS_URL` are test-infra env only (`tests/infra.py`).
+`HYDRA_<SECTION>__<KEY>`. MCP is an OAuth resource server for Authentik's `hydra-mcp` provider
+(`HYDRA_MCP__OAUTH_ISSUER`, `HYDRA_MCP__OAUTH_AUDIENCE`, `HYDRA_MCP__RESOURCE_URL`; README "Connecting an MCP
+client"). `HYDRA_DB_*` and `HYDRA_REDIS_URL` are test-infra env only (`tests/infra.py`).

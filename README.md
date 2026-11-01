@@ -40,6 +40,7 @@ Next.js dashboard, background workers and a TimescaleDB database.
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Deployment](#deployment)
+- [Connecting an MCP client](#connecting-an-mcp-client)
 - [Working on the code](#working-on-the-code)
 - [License](#license)
 
@@ -90,7 +91,7 @@ flowchart LR
 
     you --> dash
     dash -->|"HTTP and WebSocket"| api
-    ai -->|"bearer token"| api
+    ai -->|"Authentik OAuth token"| api
     api -->|"internal API"| trader
     api --> db
     trader --> db
@@ -302,7 +303,7 @@ Each PR that changes one of these rows updates the row.
 | Dashboard | Portfolio summary, drawdown and daily P&L across paper sessions | ✅ **Working**. The paper account curve follows the risk ledger: the capital in force at each time plus every session's result, so a pending capital change moves nothing and a reset drops the results of sessions stopped before it. Drawdown and returns are measured within reset segments, so a capital change is neither. Daily P&L is net realized P&L per UTC day. The curve is hourly, so a fall and recovery inside one hour is not in the drawdown. | `tests/unit/test_dashboard/test_portfolio_routes.py::test_reset_rebases_without_rewriting_history`, `::test_pending_capital_change_does_not_move_the_account`, `::test_snapshots_fold_to_one_point_per_hour`, `::test_live_metrics_twr_seeds_sessions_from_before_the_window`, `::test_daily_pnl_is_net_of_fees_per_utc_day`, `::test_two_interleaved_sleeves_are_not_an_80pct_drawdown`, `::test_daily_pnl_counts_stopped_sessions_and_nets_fees`, `::test_mark_is_the_positions_own_exchange_and_session_timeframe`, `::test_bad_date_is_422_envelope`, `tests/integration/test_system_config_persistence.py::test_portfolio_reads_on_the_real_schema` |
 | Dashboard | Real-time WebSocket updates | ✅ **Working**. Trade fills, session status changes and risk updates are pushed in both process layouts: one relay per app polls `trades` every 2 s (the fill tick per new row, a `session_status` tick when a session leaves the running set, in the `broadcast_status` vocabulary so the session page just re-fetches), and the risk relay polls the risk tables every 2 s for `/ws/risk` (a `risk_event` tick per new `risk_events` row plus a diffed `risk_state` heartbeat). The risk page re-fetches on a risk event with a 500 ms debounce, merges the heartbeat as the fresher of it and its 10 s poll, and shows the push provenance; every 10–15 s poll stays as the honest fallback. Feed staleness stays on the polls (in-memory trader state a DB relay cannot see), and rows written while an app was down are never re-announced: each cursor anchors at `MAX(id)` at startup. | `tests/unit/test_dashboard/test_ws_relay.py`, `tests/unit/test_dashboard/test_risk_relay.py`, `tests/integration/test_ws_relay_pg.py`, `tests/integration/test_risk_relay_pg.py`, `dashboard/src/lib/riskWs.test.ts`, `cd dashboard && npm test` |
 | Dashboard | TradingView charts | ✅ **Working (third-party data)**. A session page shows TradingView's own Binance chart in a sandboxed cross-origin iframe, so no TradingView script runs in the dashboard, and production responses carry a CSP. The chart is not Hydra's stored bars; every other chart is Recharts. The CSP still allows inline scripts: a nonce-based policy is not built. | `dashboard/src/lib/securityHeaders.test.ts`, `cd dashboard && npm test` |
-| Interfaces | MCP server | ✅ **Working**. The engine serves MCP at `/mcp/` only when its Authentik OAuth settings (issuer, client id, public resource URL, allowed hosts) are set; otherwise the route does not exist. Clients sign in through Authentik (Claude Code with a pre-registered client id; claude.ai custom connectors with the client id and secret) and send the access token; every request is checked: a missing, expired, wrongly signed token, one for another issuer or client, or a disallowed host is refused, and an unreachable Authentik is a 503, never a pass. The two RFC 9728 metadata paths are public so clients can find Authentik. A signed-in agent is still a service principal: it can never approve its own gated actions. There is no static MCP token any more; the CI image smoke no longer drives an MCP tool call (the unit and integration tests do). | `tests/unit/test_dashboard/test_mcp_oauth.py`, `tests/unit/test_dashboard/test_mcp_transport.py`, `tests/unit/test_dashboard/test_lifespan.py`, `tests/unit/test_core/test_config.py`, `tests/unit/test_dashboard/test_auth_coverage.py` |
+| Interfaces | MCP server | ✅ **Working**. The engine serves MCP at `/mcp/` only when its Authentik OAuth settings (issuer, client id, public resource URL, allowed hosts) are set; otherwise the route does not exist. Clients sign in through Authentik (Claude Code with a pre-registered client id; claude.ai custom connectors with the client id and secret) and send the access token; every request is checked: a missing, expired, wrongly signed token, one for another issuer or client, or a disallowed host is refused, and an unreachable Authentik is a 503, never a pass. The two RFC 9728 metadata paths are public so clients can find Authentik. A signed-in assistant is a service principal: it can never approve its own gated actions. | `tests/unit/test_dashboard/test_mcp_oauth.py`, `tests/unit/test_dashboard/test_mcp_transport.py`, `tests/unit/test_dashboard/test_lifespan.py`, `tests/unit/test_core/test_config.py`, `tests/unit/test_dashboard/test_auth_coverage.py` |
 | Interfaces | MCP tools | ✅ **Working**. 42 tools over the same service layer as the API: 23 for research and strategies, 10 for sessions and risk, 2 code-gated live tools and 7 for models. Five tools only create an approval a human confirms with a one-time code: kill-switch release, live session start, live order, model promote and rollback; the live ones refuse at once when live is not armed, and quick trade refuses live sessions. Turning the kill switch on is immediate. There is no tool to arm or disarm. Every call is audited as Claude, and sessions it starts are labelled as Claude's. | `tests/unit/test_dashboard/test_mcp_tools.py::test_tools_list_advertises_the_42_tools`, `::test_on_is_immediate_latches_and_is_attributed_then_release_is_gated`, `::test_live_session_start_is_gated_then_executes_on_approval`, `::test_quick_trade_on_a_live_session_is_the_409_envelope`, `tests/unit/test_dashboard/test_mcp_model_tools.py::test_promote_is_gated_then_promotes_on_the_humans_code`, `tests/integration/test_mcp_tools_pg.py` |
 | Security | API authentication | ✅ **Working (engine)**. Every route and WebSocket except the health probes and `/metrics` needs a caller: the proxy's signed-in user, trusted only from the listed proxy addresses (forwarded headers cannot fake the peer, and startup warns about wide ranges), or the API token for services. With neither configured the API refuses everything; the API docs are protected too. Dev mode trusts everyone and logs a critical warning. Production also depends on the homelab deploy providing the proxy network and auth settings. | `tests/unit/test_dashboard/test_auth_coverage.py`, `tests/unit/test_dashboard/test_security.py` |
 | Security | CSRF and WebSocket Origin | ✅ **Working**. Browser requests that change state need a custom header, an allowed Origin if one is sent, and a same-origin fetch; WebSocket upgrades need an allowed Origin, and a refused one gets a proper error. CORS allows only the configured origins. | `tests/unit/test_dashboard/test_csrf.py` |
@@ -400,6 +401,9 @@ dependencies only. The engine creates its database schema on first start.
   re-entered.
 - **Strategies** are YAML files in `config/strategies/`; the dashboard's builder writes them, and `config/templates/`
   holds the starting points.
+- **MCP** is configured under `mcp` (`HYDRA_MCP__OAUTH_ISSUER`, `HYDRA_MCP__OAUTH_AUDIENCE`, `HYDRA_MCP__RESOURCE_URL`,
+  `HYDRA_MCP__ALLOWED_HOSTS`); without the OAuth settings there is no `/mcp`. See
+  [Connecting an MCP client](#connecting-an-mcp-client).
 
 ## Deployment
 
@@ -410,9 +414,34 @@ Production runs as a Docker Compose stack in the [romulus](https://github.com/so
 
 In production the API and the trader are separate containers of the engine image (`HYDRA_TRADER__URL` points the
 API at the trader), the dashboard sits behind the same host, and the API sits behind a Traefik reverse proxy with
-Authentik login. Prometheus alert rules and a Grafana dashboard live in [`deploy/`](deploy/); the running Prometheus,
+Authentik login (MCP clients sign in to Authentik themselves; see the next section). Prometheus alert rules and a Grafana dashboard live in [`deploy/`](deploy/); the running Prometheus,
 Alertmanager and Grafana are in romulus. `deploy/compose.yml` is a local full-stack approximation, not the
 deployment.
+
+## Connecting an MCP client
+
+`/mcp` is an OAuth 2.1 resource server and Authentik is the authorization server. Authentik has no dynamic client
+registration, so every client uses the pre-registered public client `hydra-mcp` (PKCE, no secret; romulus
+`configs/authentik/blueprints/applications.yaml`). Clients find Authentik through the public RFC 9728 metadata at
+`/.well-known/oauth-protected-resource/mcp`.
+
+- **Engine settings.** `HYDRA_MCP__OAUTH_ISSUER` is the provider's issuer exactly as Authentik states it, trailing
+  slash included (`https://sso.example.com/application/o/hydra-mcp/`). `HYDRA_MCP__OAUTH_AUDIENCE` is the client id
+  (`hydra-mcp`), `HYDRA_MCP__RESOURCE_URL` the public URL of `/mcp` (`https://trading.example.com/mcp`) and
+  `HYDRA_MCP__ALLOWED_HOSTS` its host (`trading.example.com`); `HYDRA_MCP__REQUIRED_SCOPES` is optional. Set the
+  first three together or not at all. The engine must be able to reach the issuer's discovery document and keys;
+  if it cannot, MCP calls answer 503 `auth_unavailable`.
+- **Claude Code.** Add the server, then run `/mcp` in Claude Code and sign in to Authentik in the browser it opens:
+
+  ```bash
+  claude mcp add --transport http --client-id hydra-mcp --callback-port 8765 hydra https://trading.example.com/mcp
+  ```
+
+  Any free local port works for `--callback-port`; the client accepts `http://localhost:<port>/callback`.
+- **claude.ai.** Settings > Connectors > Add custom connector. URL: `https://trading.example.com/mcp`. Under Advanced
+  settings, OAuth Client ID: `hydra-mcp`, OAuth Client Secret: empty. Connect and sign in to Authentik.
+- **Who can sign in.** Members of the Authentik groups bound to the `hydra-mcp` application. A signed-in assistant
+  is a service principal: its gated actions wait for the code you type in the dashboard.
 
 ## Working on the code
 
