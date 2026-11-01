@@ -17,6 +17,9 @@ The paper executor (`src/hydra/execution/paper_trading.py`) simulates a Binance 
   bar, so they fill at its close. A market order that would *open* exposure on a mark the feed went stale over is
   refused naming the stale mark — an entry at a stale price is a bet on an outage. Reduce-only exits and `flatten`
   still fill at the stale mark, labelled `stale_live`: an exit at a stale price beats an unexitable position.
+- **Slippage is assumed, not measured.** Every taker fill (market, stop, OCO stop leg, trailing) moves 0.1 % against
+  the trader on top of the fee, per side, in paper spot, paper perps and backtests alike; no session or backtest sets
+  another value. Paper and backtest P&L carry that fixed cost but cannot measure real slippage: only live fills can.
 - **Volume cap.** No order takes more than `max_participation` (10% by default) of the volume of the bar it fills on
   — `fill_rules.participation_fillable`. An entry market order fills the fillable slice; the uncapped remainder is
   cancelled (`status="CANCELLED"`, reason `participation_cap`, nothing traded) and the create response carries
