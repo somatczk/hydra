@@ -41,6 +41,17 @@ ExchangeId = Literal[
 # ---------------------------------------------------------------------------
 
 
+_TIMEFRAME_SECONDS = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+    "1w": 604800,
+}
+
+
 class Timeframe(StrEnum):
     """OHLCV bar timeframe."""
 
@@ -51,6 +62,11 @@ class Timeframe(StrEnum):
     H4 = "4h"
     D1 = "1d"
     W1 = "1w"
+
+    @property
+    def seconds(self) -> int:
+        """The bar's length; a bar labelled ``t`` (its open) closes at ``t + seconds``."""
+        return _TIMEFRAME_SECONDS[self.value]
 
 
 class Side(StrEnum):
