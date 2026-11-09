@@ -39,6 +39,12 @@ Test files without a `tests/` prefix are in `tests/unit/test_strategy/`.
   (`indicator_registry.py`). Prefix helpers with `_`, list a multi-output function in `MULTI_OUTPUT`, add a new
   indicator to `_CATEGORY_MAP`, and keep it evaluable with its defaults
   (`test_indicator_registry.py::test_every_offered_indicator_evaluates_in_a_context`).
+- A feature (a registered `hydra.core.features` ref) is the indicator `feature.<ref>`, with at most one transform
+  param (`zscore`, `pct_change`, `diff`, 1-200 bars). `StrategyContext.add_feature` stores rows; each bar reads the
+  newest event whose `available_at` is at or before the bar's close (open + `Timeframe.seconds`), so a revision
+  counts only from its own `available_at`, and NaN once that event is older than `max_age`. NaN makes the
+  condition false. An unregistered ref fails the build (`tests/unit/test_strategy/test_features.py`). Registered
+  refs are not offered to the builder yet.
 - Indicators fill warm-up with NaN and never look ahead; Donchian `rolling_*` cover the N bars before the current
   one; vectorized versions equal their loop originals bit for bit
   (`tests/unit/test_indicators/test_regime.py::test_no_lookahead`,

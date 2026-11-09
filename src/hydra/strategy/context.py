@@ -12,12 +12,15 @@ import inspect
 import logging
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Mapping
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import numpy as np
 from numpy import ndarray
 
+from hydra.core.features import FEATURES
+from hydra.core.features import PREFIX as FEATURE_PREFIX
 from hydra.core.types import OHLCV, OrderRequest, Position, Timeframe
 from hydra.indicators import library as ind_lib
 
@@ -42,7 +45,11 @@ PARAM_LIMITS: dict[str, tuple[float, float]] = {
     "d_period": (2, 100),
     "ema_period": (2, 200),
     "atr_period": (2, 200),
+    "zscore": (1, 200),
+    "pct_change": (1, 200),
+    "diff": (1, 200),
 }
+_TRANSFORMS = ("zscore", "pct_change", "diff")
 _FIELDS = ("close", "high", "low", "volume")
 _signature = functools.cache(inspect.signature)
 
@@ -55,8 +62,62 @@ def _frozen(columns: Iterable[ndarray]) -> dict[str, ndarray]:
     return {"data": arrays["close"], **arrays}
 
 
+def feature_transform(
+    data: ndarray, zscore: int = 0, pct_change: int = 0, diff: int = 0
+) -> ndarray:
+    """A feature's bar-aligned values, optionally transformed over the last N bars (no lookahead).
+
+    A window holding a NaN (before the first value, or a stale bar) yields NaN.
+    """
+    n = len(data)
+    out = np.full(n, np.nan)
+    if diff:
+        if n > diff:
+            out[diff:] = data[diff:] - data[:-diff]
+    elif pct_change:
+        if n > pct_change:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[pct_change:] = data[pct_change:] / data[:-pct_change] - 1.0
+    elif zscore:
+        if n >= zscore:
+            windows = np.lib.stride_tricks.sliding_window_view(data, zscore)
+            std = windows.std(axis=1)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[zscore - 1 :] = (data[zscore - 1 :] - windows.mean(axis=1)) / std
+    else:
+        out[:] = data
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
+def _resolve_feature(name: str, params: Mapping[str, object]) -> Callable[..., Any]:
+    ref = name.removeprefix(FEATURE_PREFIX)
+    if ref not in FEATURES:
+        msg = f"Unknown feature: {ref}"
+        raise ValueError(msg)
+    for key, value in params.items():
+        if key not in _TRANSFORMS:
+            msg = (
+                f"Feature {name!r} has no parameter {key!r} (transforms: {', '.join(_TRANSFORMS)})"
+            )
+            raise ValueError(msg)
+        if isinstance(value, bool) or not isinstance(value, int):
+            msg = f"Feature {name!r} parameter {key!r} must be an integer, got {value!r}"
+            raise ValueError(msg)
+        lo, hi = PARAM_LIMITS[key]
+        if not lo <= value <= hi:
+            msg = f"Feature {name!r} parameter {key!r} must be in [{lo}, {hi}], got {value!r}"
+            raise ValueError(msg)
+    if len(params) > 1:
+        msg = f"Feature {name!r} takes one transform, got {sorted(params)}"
+        raise ValueError(msg)
+    return feature_transform
+
+
 def resolve_indicator(name: str, params: Mapping[str, object]) -> Callable[..., Any]:
     """Return the library function for *name*, or raise ValueError if it cannot take *params*."""
+    if name.startswith(FEATURE_PREFIX):
+        return _resolve_feature(name, params)
     if name in MULTI_OUTPUT:
         msg = f"Indicator {name!r} has several outputs: {MULTI_OUTPUT[name]}"
         raise ValueError(msg)
@@ -116,6 +177,8 @@ class StrategyContext:
         self._open_orders: dict[str, list[OrderRequest]] = {}
         # Portfolio value
         self._portfolio_value: Decimal = Decimal("100000")
+        # ponytail: (ref, symbol) -> rows by available_at, never trimmed; trim if they grow
+        self._features: dict[tuple[str, str], list[tuple[datetime, datetime, float]]] = {}
 
     # -- Bar data access -----------------------------------------------------
 
@@ -166,6 +229,49 @@ class StrategyContext:
         all_bars = self._bars.get(symbol, {}).get(str(timeframe), [])
         return all_bars[-1] if all_bars else None
 
+    # -- Features (ts.features rows, point in time) ---------------------------
+
+    def add_feature(
+        self, ref: str, symbol: str, *, ts: datetime, available_at: datetime, value: float
+    ) -> None:
+        """Store one feature row (used by the engine); *symbol* is '' for a market feature.
+
+        A row with a stored ``(available_at, ts)`` replaces it. Drops the cached values that
+        read it: every symbol's for a market feature.
+        """
+        rows = self._features.setdefault((ref, symbol), [])
+        row = (available_at, ts, float(value))
+        i = bisect_left(rows, row[:2], key=lambda r: r[:2])
+        if i < len(rows) and rows[i][:2] == row[:2]:
+            rows[i] = row
+        else:
+            rows.insert(i, row)
+        name = FEATURE_PREFIX + ref
+        stale = [
+            k for k in self._indicator_cache if k[2] == name and (not symbol or k[0] == symbol)
+        ]
+        for k in stale:
+            del self._indicator_cache[k]
+
+    def _feature_values(self, ref: str, symbol: str, timeframe: Timeframe) -> ndarray:
+        """*ref* as of each bar's close: the newest event published by then, NaN when stale."""
+        fd = FEATURES[ref]
+        rows = self._features.get((ref, symbol if fd.scope == "symbol" else ""), [])
+        bars = self._bars.get(symbol, {}).get(str(timeframe), [])
+        step = timedelta(seconds=Timeframe(timeframe).seconds)
+        out = np.full(len(bars), np.nan)
+        best: tuple[datetime, datetime, float] | None = None
+        j = 0
+        for i, bar in enumerate(bars):
+            close = bar.timestamp + step
+            while j < len(rows) and rows[j][0] <= close:
+                if best is None or (rows[j][1], rows[j][0]) > (best[1], best[0]):
+                    best = rows[j]
+                j += 1
+            if best is not None and close - best[1] <= fd.max_age:
+                out[i] = best[2]
+        return out
+
     # -- Indicator computation (cached) --------------------------------------
 
     def indicator(self, name: str, symbol: str, timeframe: Timeframe, **params: Any) -> ndarray:
@@ -180,6 +286,11 @@ class StrategyContext:
             return self._indicator_cache[key]
 
         func = resolve_indicator(name, params)
+        if name.startswith(FEATURE_PREFIX):
+            ref = name.removeprefix(FEATURE_PREFIX)
+            values: ndarray = func(self._feature_values(ref, symbol, timeframe), **params)
+            self._indicator_cache[key] = values
+            return values
         all_bars = self._bars.get(symbol, {}).get(str(timeframe), [])
         if not all_bars:
             empty = np.array([], dtype=np.float64)
