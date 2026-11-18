@@ -13,6 +13,7 @@ from collections.abc import Mapping
 import numpy as np
 from numpy import ndarray
 
+from hydra.core.features import PREFIX as FEATURE_PREFIX
 from hydra.core.types import Timeframe
 from hydra.indicators import library as ind_lib
 from hydra.strategy.condition_schema import (
@@ -22,7 +23,7 @@ from hydra.strategy.condition_schema import (
     LogicOperator,
     RuleSet,
 )
-from hydra.strategy.context import StrategyContext
+from hydra.strategy.context import StrategyContext, feature_transform
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ def indicator_lookback(name: str, params: Mapping[str, object]) -> int:
     times its ``WINDOW_MULTIPLE``, plus the first valid bar and the previous bar a cross
     compares. An unknown name is 0: validation reports it, not this.
     """
-    func = getattr(ind_lib, name, None)
+    func = feature_transform if name.startswith(FEATURE_PREFIX) else getattr(ind_lib, name, None)
     if not inspect.isfunction(func):
         return 0
     per_param = PARAM_MULTIPLE.get(name)
